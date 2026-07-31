@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { superDiff } from "../src/diff.ts"
-import { bumpProductSubmodules, createProductFixture } from "./fixture.ts"
+import { bumpProductSubmodules, createProductFixture, createRepository, git } from "./fixture.ts"
 
 const roots: string[] = []
 
@@ -22,5 +22,21 @@ describe("superDiff", () => {
 
     expect(result.paths).toEqual(["packages/alpha/alpha.ts", "vendor/beta/new-beta.ts"])
     expect(result.consultedRepositories.map(({ path }) => path)).toEqual([".", "packages/alpha", "vendor/beta"])
+  })
+
+  test("fails loudly when a gitlink is added without an old commit range", () => {
+    const fixture = mkdtempSync(join(tmpdir(), "git-super-added-link-"))
+    roots.push(fixture)
+    const dependency = join(fixture, "dependency")
+    const product = join(fixture, "product")
+    createRepository(dependency, "dependency.ts", "export const value = 1\n")
+    createRepository(product, "root.ts", "export const root = 1\n")
+    const base = git(product, "rev-parse", "HEAD")
+    git(product, "-c", "protocol.file.allow=always", "submodule", "add", "-q", dependency, "vendor/dependency")
+    git(product, "commit", "-q", "-am", "add dependency")
+
+    expect(() => superDiff({ repo: product, refs: [`${base}..HEAD`] })).toThrow(
+      "is an added or removed gitlink; no old/new commit range exists",
+    )
   })
 })

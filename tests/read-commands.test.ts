@@ -7,7 +7,7 @@ import { commands } from "../src/commands.ts"
 import { runCli } from "../src/cli.ts"
 import { superIsAncestor } from "../src/merge-base.ts"
 import { superStatus } from "../src/status.ts"
-import { bumpProductSubmodules, createProductFixture, git } from "./fixture.ts"
+import { advanceRepository, bumpProductSubmodules, createProductFixture, git } from "./fixture.ts"
 
 const roots: string[] = []
 
@@ -53,6 +53,32 @@ describe("Phase 1 read commands", () => {
     expect(result.isAncestor).toBe(true)
     expect(result.owningRepository).toBe("packages/alpha")
     expect(result.comparedTo).not.toBe(productHead)
+  })
+
+  test("status expands a staged gitlink pin instead of returning the opaque submodule path", () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-staged-pin-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const alphaHead = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 4\n")
+    git(join(fixture.product, "packages/alpha"), "fetch", "-q", "origin")
+    git(join(fixture.product, "packages/alpha"), "checkout", "-q", alphaHead)
+    git(fixture.product, "add", "packages/alpha")
+
+    expect(superStatus({ repo: fixture.product }).records).toEqual(["M  packages/alpha/alpha.ts"])
+  })
+
+  test("merge-base refuses when no consulted repository owns the commit", () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-missing-owner-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+
+    expect(() =>
+      superIsAncestor({
+        repo: fixture.product,
+        ancestor: "f".repeat(40),
+        descendant: fixture.productBase,
+      }),
+    ).toThrow("no consulted repository owns commit")
   })
 
   test("dispatches through the Silvery command tree and preserves JSON and NUL output parity", async () => {
