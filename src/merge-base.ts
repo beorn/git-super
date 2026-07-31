@@ -1,6 +1,6 @@
 import { join } from "node:path"
 import type { ConsultedRepository } from "./diff.ts"
-import { GitError, repositoryRoot, runGit, tryGit } from "./git.ts"
+import { gitError, repositoryRoot, runGit, tryGit } from "./git.ts"
 
 export type SuperIsAncestorOptions = Readonly<{
   repo: string
@@ -25,7 +25,7 @@ function isAncestor(root: string, ancestor: string, descendant: string): boolean
   const result = tryGit(root, ["merge-base", "--is-ancestor", ancestor, descendant])
   if (result.exitCode === 0) return true
   if (result.exitCode === 1) return false
-  throw new GitError(root, ["merge-base", "--is-ancestor", ancestor, descendant], result.exitCode, result.stderr)
+  throw gitError(root, ["merge-base", "--is-ancestor", ancestor, descendant], result.exitCode, result.stderr)
 }
 
 function treeGitlinks(root: string, ref: string): TreeGitlink[] {

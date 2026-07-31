@@ -16,20 +16,19 @@ function gitEnvironment(): NodeJS.ProcessEnv {
   return environment
 }
 
-export class GitError extends Error {
-  readonly args: readonly string[]
-  readonly cwd: string
-  readonly exitCode: number
-  readonly stderr: string
+export type GitError = Error &
+  Readonly<{
+    args: readonly string[]
+    cwd: string
+    exitCode: number
+    stderr: string
+  }>
 
-  constructor(cwd: string, args: readonly string[], exitCode: number, stderr: string) {
-    super(`git ${args.join(" ")} failed in ${cwd} (exit ${exitCode})${stderr ? `\n${stderr}` : ""}`)
-    this.name = "GitError"
-    this.args = args
-    this.cwd = cwd
-    this.exitCode = exitCode
-    this.stderr = stderr
-  }
+export function gitError(cwd: string, args: readonly string[], exitCode: number, stderr: string): GitError {
+  return Object.assign(
+    new Error(`git ${args.join(" ")} failed in ${cwd} (exit ${exitCode})${stderr ? `\n${stderr}` : ""}`),
+    { name: "GitError", args, cwd, exitCode, stderr },
+  )
 }
 
 export type GitResult = Readonly<{
@@ -54,7 +53,7 @@ export function tryGit(cwd: string, args: readonly string[]): GitResult {
 
 export function runGit(cwd: string, args: readonly string[]): string {
   const result = tryGit(cwd, args)
-  if (result.exitCode !== 0) throw new GitError(cwd, args, result.exitCode, result.stderr)
+  if (result.exitCode !== 0) throw gitError(cwd, args, result.exitCode, result.stderr)
   return result.stdout
 }
 
