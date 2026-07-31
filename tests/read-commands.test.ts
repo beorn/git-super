@@ -103,13 +103,12 @@ describe("Phase 1 read commands", () => {
     const jsonOut = outputSink()
     const jsonErr = outputSink()
     expect(await runCli(["--repo", fixture.product, "diff", "--name-only", range, "--json"], jsonOut, jsonErr)).toBe(0)
-    const json = JSON.parse(jsonOut.output)
+    const json = JSON.parse(jsonOut.output) as {
+      paths: string[]
+      consultedRepositories: Array<{ path: string }>
+    }
     expect(json.paths).toEqual(["packages/alpha/alpha.ts", "vendor/beta/new-beta.ts"])
-    expect(json.consultedRepositories.map(({ path }: { path: string }) => path)).toEqual([
-      ".",
-      "packages/alpha",
-      "vendor/beta",
-    ])
+    expect(json.consultedRepositories.map(({ path }) => path)).toEqual([".", "packages/alpha", "vendor/beta"])
     expect(jsonErr.output).toBe("")
 
     const nulOut = outputSink()
