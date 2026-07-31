@@ -1,0 +1,41 @@
+{
+  "name": "git-super",
+  "version": "0.1.0",
+  "description": "Git commands that treat superprojects and submodule interiors as one product",
+  "license": "MIT",
+  "repository": "github:beorn/git-super",
+  "bin": {
+    "git-super": "bin/git-super"
+  },
+  "files": [
+    "bin",
+    "src",
+    "LICENSE",
+    "README.md"
+  ],
+  "type": "module",
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "lint": "oxlint src tests",
+    "format": "oxfmt --check .",
+    "fix": "oxfmt --write . && oxlint --fix src tests",
+    "check": "bun test && bun run typecheck && bun run lint && bun run format"
+  },
+  "dependencies": {
+    "@silvery/command": "0.23.2",
+    "@silvery/commander": "0.23.2",
+    "react": "19.2.0",
+    "silvery": "0.23.2"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14",
+    "@types/react": "19.2.0",
+    "oxfmt": "0.38.0",
+    "oxlint": "1.71.0",
+    "typescript": "^6.0.3"
+  },
+  "engines": {
+    "bun": ">=1.3.0"
+  }
+}
