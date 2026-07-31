@@ -25,6 +25,15 @@ function outputSink(): { output: string; write(value: string): void } {
 }
 
 describe("Phase 1 read commands", () => {
+  test("routes help to stdout without contaminating stderr", async () => {
+    const stdout = outputSink()
+    const stderr = outputSink()
+
+    expect(await runCli(["-h"], stdout, stderr)).toBe(0)
+    expect(stdout.output).toContain("Usage: git super [options] [command]")
+    expect(stderr.output).toBe("")
+  })
+
   test("status prefixes tracked and untracked changes inside every checked-out submodule", () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-status-"))
     roots.push(fixtureRoot)

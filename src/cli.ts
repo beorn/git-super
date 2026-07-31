@@ -67,7 +67,7 @@ export async function runCli(argv: readonly string[], stdout: OutputSink, stderr
     .option("--json", "emit one stable JSON result")
     .exitOverride()
     .configureOutput({
-      writeOut: (value) => stderr.write(value),
+      writeOut: (value) => stdout.write(value),
       writeErr: (value) => stderr.write(value),
     })
 
