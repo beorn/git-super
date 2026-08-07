@@ -3,11 +3,19 @@
  * @level l1
  * @consumer Yrd worktree and deployment stores
  */
-import { mkdtemp, rm } from "node:fs/promises"
+import { existsSync } from "node:fs"
+import { mkdtemp, rm, writeFile } from "node:fs/promises"
+import { spawnSync } from "node:child_process"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { describe, expect, it } from "vitest"
-import { createGitWorktreeStore } from "../src/worktree.ts"
+import { createGitWorktreeStore, createLocalGitWorktreeStore } from "../src/worktree.ts"
+
+function git(repo: string, args: readonly string[]): string {
+  const result = spawnSync("git", ["-C", repo, ...args], { encoding: "utf8" })
+  if (result.status !== 0) throw new Error(result.stderr || `git ${args.join(" ")} failed`)
+  return result.stdout
+}
 
 describe("createGitWorktreeStore", () => {
   it("requires exactly one injected Git execution capability", () => {
@@ -51,6 +59,30 @@ describe("createGitWorktreeStore", () => {
       })
     } finally {
       await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  it("adds and fully removes a real linked worktree through the local adapter", async () => {
+    const root = await mkdtemp(join(tmpdir(), "git super worktree "))
+    const repo = join(root, "owner")
+    const linked = join(root, "linked worktree")
+    git(root, ["init", "-q", "-b", "main", repo])
+    git(repo, ["config", "user.email", "test@example.com"])
+    git(repo, ["config", "user.name", "Test"])
+    await writeFile(join(repo, "seed.txt"), "seed\n")
+    git(repo, ["add", "seed.txt"])
+    git(repo, ["commit", "-q", "-m", "seed"])
+
+    try {
+      const store = createLocalGitWorktreeStore({ repo })
+      await store.add({ kind: "detached", path: linked, ref: "HEAD" })
+      expect(existsSync(linked)).toBe(true)
+
+      await store.remove(linked)
+      expect(existsSync(linked)).toBe(false)
+      expect(git(repo, ["worktree", "list", "--porcelain"])).not.toContain(linked)
+    } finally {
+      await rm(root, { recursive: true, force: true })
     }
   })
 })
