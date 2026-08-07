@@ -13,22 +13,18 @@ export type SubmoduleTreeConflict = Readonly<{
   stages: readonly SubmoduleConflictStage[]
 }>
 
-export type SubmodulePinResolution = Readonly<{
-  kind: "pin"
-  path: string
-  sha: string
-}>
-
-export type SubmoduleCommitResolution = Readonly<{
-  kind: "compose"
-  path: string
-  origin: string
-  baseSha: string
-  currentSha: string
-  incomingSha: string
-}>
-
-export type SubmoduleResolution = SubmodulePinResolution | SubmoduleCommitResolution
+export type SubmoduleResolution =
+  | Readonly<{ kind: "pin"; path: string; sha: string }>
+  | Readonly<{
+      kind: "compose"
+      path: string
+      origin: string
+      baseSha: string
+      currentSha: string
+      incomingSha: string
+    }>
+export type SubmodulePinResolution = Extract<SubmoduleResolution, { kind: "pin" }>
+export type SubmoduleCommitResolution = Extract<SubmoduleResolution, { kind: "compose" }>
 
 export type SubmoduleCompositionConflict = Readonly<{
   kind: "content" | "invalid-gitlink"
@@ -66,12 +62,7 @@ export type SubmoduleReviewedBlob = Readonly<{ path: string; oid: string; conten
 
 export type SubmoduleExecutedResolution =
   | SubmodulePinResolution
-  | Readonly<{
-      kind: "compose"
-      path: string
-      sha: string
-      reviewedBlobs: readonly SubmoduleReviewedBlob[]
-    }>
+  | (SubmoduleCommitResolution & Readonly<{ sha: string; reviewedBlobs: readonly SubmoduleReviewedBlob[] }>)
 
 export type SubmoduleCompositionExecution =
   | Readonly<{ status: "composed"; resolutions: readonly SubmoduleExecutedResolution[] }>
@@ -92,7 +83,6 @@ export type SubmoduleCompositionExecutionOptions = Readonly<{
   }>
   commit: Readonly<{
     author: Readonly<{ name: string; email: string }>
-    committer?: Readonly<{ name: string; email: string }>
     message(resolution: SubmoduleCommitResolution): string
   }>
   reviewPath?: (path: string) => boolean
@@ -108,11 +98,13 @@ type GitlinkStages = Readonly<{ baseSha: string; currentSha: string; incomingSha
  * resolutions. The caller owns authored messages, refs, refusals, and policy.
  */
 export function planSubmoduleComposition(conflicts: readonly SubmoduleTreeConflict[]): SubmoduleCompositionPlan {
-  const duplicates = new Set(duplicateConflictPaths(conflicts))
+  const seen = new Set<string>()
   const parsed = new Map<string, GitlinkStages>()
   const refused = new Map<string, SubmoduleCompositionConflict>()
 
   for (const conflict of conflicts) {
+    if (seen.has(conflict.path)) refused.set(conflict.path, { kind: "invalid-gitlink", path: conflict.path })
+    seen.add(conflict.path)
     const stages = parseGitlinkStages(conflict)
     if (stages === undefined) {
       refused.set(conflict.path, {
@@ -122,17 +114,17 @@ export function planSubmoduleComposition(conflicts: readonly SubmoduleTreeConfli
       continue
     }
     parsed.set(conflict.path, stages)
-    if (duplicates.has(conflict.path) || (directPin(stages) === undefined && !validOrigin(conflict.origin))) {
+    if (directPin(stages) === undefined && !validOrigin(conflict.origin)) {
       refused.set(conflict.path, { kind: "invalid-gitlink", path: conflict.path })
     }
   }
 
   if (refused.size > 0) {
-    return { status: "refused", conflicts: [...refused.values()].toSorted(compareConflicts) }
+    return { status: "refused", conflicts: [...refused.values()].toSorted((a, b) => compareText(a.path, b.path)) }
   }
 
   const resolutions: SubmoduleResolution[] = []
-  for (const conflict of conflicts.toSorted(compareConflictPaths)) {
+  for (const conflict of conflicts.toSorted((a, b) => compareText(a.path, b.path))) {
     const stages = parsed.get(conflict.path)
     if (stages === undefined) throw new Error(`git-super: missing planned gitlink stages for '${conflict.path}'`)
     const pin = directPin(stages)
@@ -190,7 +182,7 @@ async function composeSubmoduleCommit(
     operation = "inspect repository depth"
     const shallow = await requiredGit(context, store, ["rev-parse", "--is-shallow-repository"], operation)
     if (shallow !== "false") {
-      return unavailable(resolution.path, operation, "the submodule store is shallow")
+      return refused("unavailable", resolution.path, operation, "the submodule store is shallow")
     }
 
     operation = "verify planned commits"
@@ -201,7 +193,8 @@ async function composeSubmoduleCommit(
     operation = "verify the planned merge base"
     for (const parent of [resolution.currentSha, resolution.incomingSha]) {
       if (!(await isAncestor(context, store, resolution.baseSha, parent))) {
-        return unavailable(
+        return refused(
+          "unavailable",
           resolution.path,
           operation,
           `planned base '${resolution.baseSha}' is not an ancestor of parent '${parent}'`,
@@ -212,7 +205,7 @@ async function composeSubmoduleCommit(
     operation = "find a merge base"
     const mergeBase = await runGit(context, store, ["merge-base", resolution.currentSha, resolution.incomingSha])
     if (mergeBase.code === 1 && settled(mergeBase)) {
-      return unavailable(resolution.path, operation, "the submodule histories have no merge base")
+      return refused("unavailable", resolution.path, operation, "the submodule histories have no merge base")
     }
     if (!settled(mergeBase) || mergeBase.code !== 0) throw new Error(gitDetail(mergeBase))
     objectId(mergeBase.stdout, operation)
@@ -226,7 +219,7 @@ async function composeSubmoduleCommit(
       resolution.incomingSha,
     ])
     if (merged.code === 1 && settled(merged)) {
-      return conflict(resolution.path, operation, gitDetail(merged))
+      return refused("conflict", resolution.path, operation, gitDetail(merged))
     }
     if (!settled(merged) || merged.code !== 0) throw new Error(gitDetail(merged))
     const tree = objectId(merged.stdout.split(/\r?\n/u)[0] ?? "", operation)
@@ -238,10 +231,10 @@ async function composeSubmoduleCommit(
     const sha = await createCompositionCommit(context, store, resolution, tree, options.commit)
     return {
       status: "composed",
-      resolution: { kind: "compose", path: resolution.path, sha, reviewedBlobs },
+      resolution: { ...resolution, sha, reviewedBlobs },
     }
   } catch (cause) {
-    return unavailable(resolution.path, operation, messageOf(cause))
+    return refused("unavailable", resolution.path, operation, messageOf(cause))
   }
 }
 
@@ -368,14 +361,13 @@ async function createCompositionCommit(
   const currentTime = await commitTime(context, store, resolution.currentSha)
   const incomingTime = await commitTime(context, store, resolution.incomingSha)
   const date = `${Math.max(currentTime, incomingTime)} +0000`
-  const committer = commit.committer ?? commit.author
   const env = {
     ...context.env,
     GIT_AUTHOR_NAME: commit.author.name,
     GIT_AUTHOR_EMAIL: commit.author.email,
     GIT_AUTHOR_DATE: date,
-    GIT_COMMITTER_NAME: committer.name,
-    GIT_COMMITTER_EMAIL: committer.email,
+    GIT_COMMITTER_NAME: commit.author.name,
+    GIT_COMMITTER_EMAIL: commit.author.email,
     GIT_COMMITTER_DATE: date,
   }
   return objectId(
@@ -398,20 +390,13 @@ async function commitTime(context: GitContext, store: string, sha: string): Prom
   return timestamp
 }
 
-function conflict(
+function refused(
+  kind: "conflict" | "unavailable",
   path: string,
   operation: string,
   detail: string,
 ): Extract<SubmoduleCompositionExecution, { status: "refused" }> {
-  return { status: "refused", failure: { kind: "conflict", path, operation, detail } }
-}
-
-function unavailable(
-  path: string,
-  operation: string,
-  detail: string,
-): Extract<SubmoduleCompositionExecution, { status: "refused" }> {
-  return { status: "refused", failure: { kind: "unavailable", path, operation, detail } }
+  return { status: "refused", failure: { kind, path, operation, detail } }
 }
 
 function messageOf(cause: unknown): string {
@@ -420,22 +405,12 @@ function messageOf(cause: unknown): string {
 
 function parseGitlinkStages(conflict: SubmoduleTreeConflict): GitlinkStages | undefined {
   if (conflict.path.length === 0 || conflict.path.includes("\0") || conflict.stages.length !== 3) return undefined
-  const stages = new Map<number, SubmoduleConflictStage>()
-  for (const stage of conflict.stages) {
-    if (
-      (stage.stage !== 1 && stage.stage !== 2 && stage.stage !== 3) ||
-      stage.mode !== GITLINK_MODE ||
-      !OBJECT_ID.test(stage.oid) ||
-      stages.has(stage.stage)
-    ) {
-      return undefined
-    }
-    stages.set(stage.stage, stage)
-  }
-  const base = stages.get(1)
-  const current = stages.get(2)
-  const incoming = stages.get(3)
+  if (conflict.stages.some((stage) => stage.mode !== GITLINK_MODE || !OBJECT_ID.test(stage.oid))) return undefined
+  const base = conflict.stages.find(({ stage }) => stage === 1)
+  const current = conflict.stages.find(({ stage }) => stage === 2)
+  const incoming = conflict.stages.find(({ stage }) => stage === 3)
   if (base === undefined || current === undefined || incoming === undefined) return undefined
+  if (new Set(conflict.stages.map(({ stage }) => stage)).size !== 3) return undefined
   return { baseSha: base.oid, currentSha: current.oid, incomingSha: incoming.oid }
 }
 
@@ -448,24 +423,6 @@ function directPin(stages: GitlinkStages): string | undefined {
 
 function validOrigin(origin: string | undefined): origin is string {
   return origin !== undefined && origin.length > 0 && !origin.includes("\0")
-}
-
-function duplicateConflictPaths(conflicts: readonly SubmoduleTreeConflict[]): string[] {
-  const seen = new Set<string>()
-  const duplicates = new Set<string>()
-  for (const conflict of conflicts) {
-    if (seen.has(conflict.path)) duplicates.add(conflict.path)
-    seen.add(conflict.path)
-  }
-  return [...duplicates]
-}
-
-function compareConflictPaths(left: SubmoduleTreeConflict, right: SubmoduleTreeConflict): number {
-  return compareText(left.path, right.path)
-}
-
-function compareConflicts(left: SubmoduleCompositionConflict, right: SubmoduleCompositionConflict): number {
-  return compareText(left.path, right.path)
 }
 
 function hasGitlinkStage(conflict: SubmoduleTreeConflict): boolean {
