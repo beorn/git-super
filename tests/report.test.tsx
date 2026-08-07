@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test"
+import { expect, test } from "vitest"
 import { renderConsultedRepositories } from "../src/report.tsx"
 
 test("renders a structured consulted-repositories witness with Silvery", async () => {

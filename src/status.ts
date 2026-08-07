@@ -1,5 +1,5 @@
 import { join, posix } from "node:path"
-import type { ConsultedRepository } from "./diff.ts"
+import { recursiveNameStatusDiff, type ConsultedRepository } from "./diff.ts"
 import { repositoryRoot, runGit } from "./git.ts"
 
 export type SuperStatusOptions = Readonly<{ repo: string }>
@@ -20,7 +20,9 @@ function indexGitlinks(root: string): Gitlink[] {
   return fields
     .map((field) => {
       const match = /^160000 ([0-9a-f]{40}) 0\t(.+)$/u.exec(field)
-      return match ? { indexPin: match[1]!, path: match[2]! } : undefined
+      const indexPin = match?.[1]
+      const path = match?.[2]
+      return indexPin === undefined || path === undefined ? undefined : { indexPin, path }
     })
     .filter((value): value is Gitlink => value !== undefined)
     .sort((left, right) => left.path.localeCompare(right.path))
@@ -50,48 +52,46 @@ function prefixPorcelain(record: string, prefix: string): string {
 
 function diffRecords(root: string, from: string, to: string, column: "index" | "worktree", prefix: string): string[] {
   if (from === to) return []
-  const fields = nulFields(runGit(root, ["diff", "--name-status", "-z", "--no-renames", `${from}..${to}`]))
-  const records: string[] = []
-  for (let index = 0; index < fields.length; index += 2) {
-    const status = fields[index]
-    const path = fields[index + 1]
-    if (status === undefined || path === undefined) throw new Error("git super: malformed nested name-status diff")
+  return recursiveNameStatusDiff({
+    repo: root,
+    prefix,
+    refs: [`${from}..${to}`],
+    consulted: { path: prefix, root, from, to },
+  }).entries.map(({ status, path }) => {
     const code = status[0] ?? "M"
-    records.push(`${column === "index" ? code : " "}${column === "worktree" ? code : " "} ${posix.join(prefix, path)}`)
-  }
-  return records
+    return `${column === "index" ? code : " "}${column === "worktree" ? code : " "} ${path}`
+  })
 }
 
-export function superStatus(options: SuperStatusOptions): SuperStatusResult {
-  const root = repositoryRoot(options.repo)
+function statusRepository(root: string, prefix: string, consulted: ConsultedRepository): SuperStatusResult {
   const gitlinks = indexGitlinks(root)
   const gitlinkPaths = new Set(gitlinks.map(({ path }) => path))
   const rootRecords = parsePorcelain(
     runGit(root, ["-c", "status.renames=false", "status", "--porcelain=v1", "-z", "--untracked-files=all"]),
-  ).filter((record) => !gitlinkPaths.has(record.slice(3)))
-  const consultedRepositories: ConsultedRepository[] = [{ path: ".", root }]
+  )
+    .filter((record) => !gitlinkPaths.has(record.slice(3)))
+    .map((record) => prefixPorcelain(record, prefix))
+  const consultedRepositories: ConsultedRepository[] = [consulted]
   const nestedRecords: string[] = []
 
   for (const gitlink of gitlinks) {
     const nestedRoot = repositoryRoot(join(root, gitlink.path))
+    const nestedPrefix = posix.join(prefix, gitlink.path)
     const checkoutPin = runGit(nestedRoot, ["rev-parse", "HEAD"]).trim()
     const headPin = treeGitlink(root, "HEAD", gitlink.path)
     if (headPin === undefined) {
-      throw new Error(`git super: ${gitlink.path} is an added gitlink; status cannot infer an old commit range`)
+      throw new Error(`git super: ${nestedPrefix} is an added gitlink; status cannot infer an old commit range`)
     }
-    nestedRecords.push(...diffRecords(nestedRoot, headPin, gitlink.indexPin, "index", gitlink.path))
-    nestedRecords.push(...diffRecords(nestedRoot, gitlink.indexPin, checkoutPin, "worktree", gitlink.path))
-    nestedRecords.push(
-      ...parsePorcelain(
-        runGit(nestedRoot, ["-c", "status.renames=false", "status", "--porcelain=v1", "-z", "--untracked-files=all"]),
-      ).map((record) => prefixPorcelain(record, gitlink.path)),
-    )
-    consultedRepositories.push({
-      path: gitlink.path,
+    nestedRecords.push(...diffRecords(nestedRoot, headPin, gitlink.indexPin, "index", nestedPrefix))
+    nestedRecords.push(...diffRecords(nestedRoot, gitlink.indexPin, checkoutPin, "worktree", nestedPrefix))
+    const nested = statusRepository(nestedRoot, nestedPrefix, {
+      path: nestedPrefix,
       root: nestedRoot,
       from: gitlink.indexPin,
       to: checkoutPin,
     })
+    nestedRecords.push(...nested.records)
+    consultedRepositories.push(...nested.consultedRepositories)
   }
 
   return {
@@ -100,4 +100,9 @@ export function superStatus(options: SuperStatusOptions): SuperStatusResult {
     ),
     consultedRepositories,
   }
+}
+
+export function superStatus(options: SuperStatusOptions): SuperStatusResult {
+  const root = repositoryRoot(options.repo)
+  return statusRepository(root, "", { path: ".", root })
 }

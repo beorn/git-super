@@ -1,9 +1,16 @@
-import { afterEach, describe, expect, test } from "bun:test"
+import { afterEach, describe, expect, test } from "vitest"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { superDiff } from "../src/diff.ts"
-import { bumpProductSubmodules, createProductFixture, createRepository, git } from "./fixture.ts"
+import {
+  addNestedAlphaSubmodule,
+  bumpNestedAlphaSubmodule,
+  bumpProductSubmodules,
+  createProductFixture,
+  createRepository,
+  git,
+} from "./fixture.ts"
 
 const roots: string[] = []
 
@@ -38,5 +45,24 @@ describe("superDiff", () => {
     expect(() => superDiff({ repo: product, refs: [`${base}..HEAD`] })).toThrow(
       "is an added or removed gitlink; no old/new commit range exists",
     )
+  })
+
+  test("recursively expands a moved gitlink inside a moved submodule", () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-nested-diff-"))
+    roots.push(fixtureRoot)
+    const fixture = addNestedAlphaSubmodule(createProductFixture(fixtureRoot))
+    const head = bumpNestedAlphaSubmodule(fixture)
+
+    const result = superDiff({
+      repo: fixture.product,
+      refs: [`${fixture.productWithNestedBase}..${head}`],
+    })
+
+    expect(result.paths).toEqual(["packages/alpha/apps/maddoc/leaf.ts"])
+    expect(result.consultedRepositories.map(({ path }) => path)).toEqual([
+      ".",
+      "packages/alpha",
+      "packages/alpha/apps/maddoc",
+    ])
   })
 })

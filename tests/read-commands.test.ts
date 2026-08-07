@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test"
+import { afterEach, describe, expect, test } from "vitest"
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -7,7 +7,13 @@ import { commands } from "../src/commands.ts"
 import { runCli } from "../src/cli.ts"
 import { superIsAncestor } from "../src/merge-base.ts"
 import { superStatus } from "../src/status.ts"
-import { advanceRepository, bumpProductSubmodules, createProductFixture, git } from "./fixture.ts"
+import {
+  addNestedAlphaSubmodule,
+  advanceRepository,
+  bumpProductSubmodules,
+  createProductFixture,
+  git,
+} from "./fixture.ts"
 
 const roots: string[] = []
 
@@ -45,6 +51,32 @@ describe("Phase 1 read commands", () => {
 
     expect(result.records).toEqual(["?? packages/alpha/new-alpha.ts", " M vendor/beta/beta.ts"])
     expect(result.consultedRepositories.map(({ path }) => path)).toEqual([".", "packages/alpha", "vendor/beta"])
+  })
+
+  test("status recursively expands a dirty file inside a nested submodule", () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-nested-status-"))
+    roots.push(fixtureRoot)
+    const fixture = addNestedAlphaSubmodule(createProductFixture(fixtureRoot))
+    writeFileSync(join(fixture.product, "packages/alpha/apps/maddoc/leaf.ts"), "export const leaf = 2\n")
+
+    const result = superStatus({ repo: fixture.product })
+
+    expect(result.records).toEqual([" M packages/alpha/apps/maddoc/leaf.ts"])
+    expect(result.consultedRepositories.map(({ path }) => path)).toEqual([
+      ".",
+      "packages/alpha",
+      "packages/alpha/apps/maddoc",
+      "vendor/beta",
+    ])
+  })
+
+  test("status fails loudly when a nested submodule checkout is missing", () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-nested-missing-"))
+    roots.push(fixtureRoot)
+    const fixture = addNestedAlphaSubmodule(createProductFixture(fixtureRoot))
+    rmSync(join(fixture.product, "packages/alpha/apps/maddoc"), { recursive: true, force: true })
+
+    expect(() => superStatus({ repo: fixture.product })).toThrow("rev-parse --show-toplevel failed")
   })
 
   test("merge-base finds the repository that owns a sha and compares against the ref's pin", () => {

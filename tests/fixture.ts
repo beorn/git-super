@@ -45,6 +45,13 @@ export type ProductFixture = Readonly<{
   productBase: string
 }>
 
+export type NestedProductFixture = ProductFixture &
+  Readonly<{
+    leaf: string
+    leafBase: string
+    productWithNestedBase: string
+  }>
+
 export function createProductFixture(fixture: string): ProductFixture {
   const alpha = join(fixture, "alpha")
   const beta = join(fixture, "beta")
@@ -75,5 +82,38 @@ export function bumpProductSubmodules(fixture: ProductFixture): string {
   git(join(fixture.product, "vendor/beta"), "checkout", "-q", betaHead)
   git(fixture.product, "add", "packages/alpha", "vendor/beta")
   git(fixture.product, "commit", "-q", "-m", "bump product submodules")
+  return git(fixture.product, "rev-parse", "HEAD")
+}
+
+export function addNestedAlphaSubmodule(fixture: ProductFixture): NestedProductFixture {
+  const leaf = join(fixture.alpha, "..", "leaf")
+  const leafBase = createRepository(leaf, "leaf.ts", "export const leaf = 1\n")
+  git(fixture.alpha, "-c", "protocol.file.allow=always", "submodule", "add", "-q", leaf, "apps/maddoc")
+  git(fixture.alpha, "commit", "-q", "-am", "add nested app")
+  const alphaWithNested = git(fixture.alpha, "rev-parse", "HEAD")
+  const alphaCheckout = join(fixture.product, "packages/alpha")
+  git(alphaCheckout, "fetch", "-q", "origin")
+  git(alphaCheckout, "checkout", "-q", alphaWithNested)
+  git(alphaCheckout, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
+  git(fixture.product, "add", "packages/alpha")
+  git(fixture.product, "commit", "-q", "-m", "pin nested app")
+  return {
+    ...fixture,
+    leaf,
+    leafBase,
+    productWithNestedBase: git(fixture.product, "rev-parse", "HEAD"),
+  }
+}
+
+export function bumpNestedAlphaSubmodule(fixture: NestedProductFixture): string {
+  const leafHead = advanceRepository(fixture.leaf, "leaf.ts", "export const leaf = 2\n")
+  const alphaCheckout = join(fixture.product, "packages/alpha")
+  const leafCheckout = join(alphaCheckout, "apps/maddoc")
+  git(leafCheckout, "fetch", "-q", "origin")
+  git(leafCheckout, "checkout", "-q", leafHead)
+  git(alphaCheckout, "add", "apps/maddoc")
+  git(alphaCheckout, "commit", "-q", "-m", "bump nested app")
+  git(fixture.product, "add", "packages/alpha")
+  git(fixture.product, "commit", "-q", "-m", "bump alpha")
   return git(fixture.product, "rev-parse", "HEAD")
 }

@@ -55,7 +55,7 @@ No global installation is required. A clean clone has no dependency on the repos
 
 ```bash
 bun install --frozen-lockfile
-bun test
+bun run test
 bun run typecheck
 ```
 

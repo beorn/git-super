@@ -15,12 +15,12 @@
   ],
   "type": "module",
   "scripts": {
-    "test": "bun test",
+    "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "lint": "oxlint src tests",
     "format": "oxfmt --check .",
     "fix": "oxfmt --write . && oxlint --fix src tests",
-    "check": "bun test && bun run typecheck && bun run lint && bun run format"
+    "check": "bun run test && bun run typecheck && bun run lint && bun run format"
   },
   "dependencies": {
     "@silvery/command": "0.23.2",
@@ -33,7 +33,8 @@
     "@types/react": "19.2.0",
     "oxfmt": "0.38.0",
     "oxlint": "1.71.0",
-    "typescript": "^6.0.3"
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.10"
   },
   "engines": {
     "bun": ">=1.3.0"
