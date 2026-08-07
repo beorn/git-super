@@ -1,6 +1,8 @@
 import { existsSync } from "node:fs"
+import { spawnSync } from "node:child_process"
 import { appendFile } from "node:fs/promises"
 import { isAbsolute, join, relative, resolve, sep } from "node:path"
+import { fileURLToPath } from "node:url"
 import { createExclusive } from "./exclusive.ts"
 import { cleanGitEnvironment } from "./git.ts"
 import { materializeSubmodules } from "./submodules.ts"
@@ -52,6 +54,7 @@ export type WorktreeAdd = Readonly<{ hooks?: WorktreeHookPolicy; lockReason?: st
   (
     | Readonly<{ kind: "branch"; path: string; branch: string }>
     | Readonly<{ kind: "new-branch"; path: string; branch: string; ref: string }>
+    | Readonly<{ kind: "reset-branch"; path: string; branch: string; ref: string }>
     | Readonly<{ kind: "ref"; path: string; ref: string }>
     | Readonly<{ kind: "detached"; path: string; ref: string }>
   )
@@ -59,6 +62,61 @@ export type WorktreeAdd = Readonly<{ hooks?: WorktreeHookPolicy; lockReason?: st
 const GIT_TIMEOUT_MS = 30_000
 /** Worktree removal is correctness-critical and can exceed an interactive timeout under host load. */
 const GIT_CLEANUP_TIMEOUT_MS = 120_000
+
+export type LocalGitWorktreeStoreOptions = Omit<GitWorktreeStoreOptions, "git" | "process">
+
+export type LocalGitWorktreeMutation =
+  | Readonly<{ kind: "add-detached"; repo: string; path: string; ref: string; operation?: string }>
+  | Readonly<{ kind: "remove"; repo: string; path: string; operation?: string }>
+
+export type LocalGitWorktreeMutationResult = Readonly<{ exitCode: number; stdout: string; stderr: string }>
+
+/** Standard local-process adapter; hosts add policy, never another Git mutation runner. */
+export function createLocalGitWorktreeStore(options: LocalGitWorktreeStoreOptions): GitWorktreeStore {
+  return createGitWorktreeStore({
+    ...options,
+    process: {
+      async run(request) {
+        let timedOut = false
+        const child = Bun.spawn([...request.argv], {
+          ...(request.cwd === undefined ? {} : { cwd: request.cwd }),
+          ...(request.env === undefined ? {} : { env: request.env }),
+          ...(request.signal === undefined ? {} : { signal: request.signal }),
+          stdout: "pipe",
+          stderr: "pipe",
+        })
+        const timer =
+          request.timeoutMs === undefined
+            ? undefined
+            : setTimeout(() => {
+                timedOut = true
+                child.kill()
+              }, request.timeoutMs)
+        const [exitCode, stdout, stderr] = await Promise.all([
+          child.exited,
+          new Response(child.stdout).text(),
+          new Response(child.stderr).text(),
+        ])
+        if (timer !== undefined) clearTimeout(timer)
+        return { exitCode, stdout, stderr, timedOut }
+      },
+    },
+  })
+}
+
+/** Synchronous host seam for callers whose public transaction is intentionally synchronous. */
+export function runLocalGitWorktreeMutationSync(request: LocalGitWorktreeMutation): LocalGitWorktreeMutationResult {
+  const child = spawnSync(
+    process.execPath,
+    [fileURLToPath(new URL("./worktree-runner.ts", import.meta.url)), JSON.stringify(request)],
+    { encoding: "utf8", env: cleanGitEnvironment(process.env) },
+  )
+  return {
+    exitCode: child.status ?? 1,
+    stdout: child.stdout ?? "",
+    stderr: child.stderr ?? child.error?.message ?? "git-super worktree runner failed",
+  }
+}
 
 function createGit(
   process: GitWorktreeProcess,
@@ -267,9 +325,11 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
             ? ["worktree", "add", input.path, input.branch]
             : input.kind === "new-branch"
               ? ["worktree", "add", "-b", input.branch, input.path, input.ref]
-              : input.kind === "detached"
-                ? ["worktree", "add", "--detach", input.path, input.ref]
-                : ["worktree", "add", input.path, input.ref]
+              : input.kind === "reset-branch"
+                ? ["worktree", "add", "-B", input.branch, input.path, input.ref]
+                : input.kind === "detached"
+                  ? ["worktree", "add", "--detach", input.path, input.ref]
+                  : ["worktree", "add", input.path, input.ref]
         const insertion = addArgs.indexOf("add") + 1
         addArgs.splice(
           insertion,
@@ -311,7 +371,22 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       await mutate(removeOptions.operation ?? `worktree remove ${path}`, async () => {
         if (removeOptions.unlock === true) await unlockWorktree(git, repo, path)
         await git.run(repo, ["worktree", "remove", "--force", path], false, timeouts.cleanup)
+        if (existsSync(path) || (await inspectWorktree(git, repo, path)).registered) {
+          throw new Error(`git reported success but did not fully remove worktree '${path}'`)
+        }
       })
+    },
+    async prune(
+      pruneOptions: Readonly<{ expire?: string; verbose?: boolean; operation?: string }> = {},
+    ): Promise<void> {
+      await mutate(pruneOptions.operation ?? "worktree prune", () =>
+        git.run(repo, [
+          "worktree",
+          "prune",
+          ...(pruneOptions.expire === undefined ? [] : ["--expire", pruneOptions.expire]),
+          ...(pruneOptions.verbose === true ? ["--verbose"] : []),
+        ]),
+      )
     },
     async inspect(path: string): Promise<WorktreeInspection> {
       return inspectWorktree(git, repo, path)

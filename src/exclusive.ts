@@ -12,7 +12,7 @@ export type ExclusiveOptions = Readonly<{
   pollIntervalMs?: number
 }>
 
-type WriterLock = Readonly<{ release(): void }>
+export type WriterLock = Readonly<{ release(): void }>
 type Flock = { flock(fd: number, operation: number): number }
 
 const LOCK_EX = 2
@@ -33,7 +33,7 @@ export function createExclusive(dir: string, options: ExclusiveOptions = {}): Ex
       if (holder !== undefined && (holder === "" || /\r|\n/u.test(holder))) {
         throw new TypeError("git-super: exclusive holder must be a non-empty single line")
       }
-      const lock = await acquire(dir, options, holder)
+      const lock = await acquireExclusive(dir, options, holder)
       try {
         return await operation()
       } finally {
@@ -43,7 +43,11 @@ export function createExclusive(dir: string, options: ExclusiveOptions = {}): Ex
   }
 }
 
-async function acquire(dir: string, options: ExclusiveOptions, holder?: string): Promise<WriterLock> {
+export async function acquireExclusive(
+  dir: string,
+  options: ExclusiveOptions = {},
+  holder?: string,
+): Promise<WriterLock> {
   await mkdir(dir, { recursive: true })
   const path = join(dir, "writer.lock")
   const timeoutMs = Math.max(0, options.timeoutMs ?? 30_000)
