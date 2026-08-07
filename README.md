@@ -62,8 +62,12 @@ bun run typecheck
 ## Architecture
 
 - `src/diff.ts`, `src/status.ts`, and `src/merge-base.ts` are pure read-plumbing services over an explicit Git process adapter.
+- `src/worktree.ts` is the injected write-plumbing service: add, lock, unlock, inspect, exact removal, recovery, and hook quarantine. Its repository lock deliberately retains the cutover identity `.git/.../yrd-worktree-mutations/writer.lock`, so old and new callers exclude one another.
+- `src/submodules.ts` is the single recursive materializer for Yrd and host adapters. It proves exact gitlinks before borrowing local objects, reports remote fallbacks, supports a top-level path allowlist, and recurses through nested gitlinks.
 - `src/commands.ts` exposes the platform-neutral `CommandNode` tree from the published `@silvery/command` package and every CLI request passes through `resolveInvocation()`.
 - `src/report.tsx` renders the fail-loud repository witness with canonical Silvery components and Sterling semantic tokens.
 - `src/cli.ts` adapts Commander parsing, stdout-compatible data, stable JSON, and the Silvery report around the command tree.
 
 The package depends only on published packages. It contains no delivery daemon, fleet policy, task tracker, or host-repository imports.
+
+Library consumers import `git-super/worktree` for injected worktree mechanics and `git-super/submodules` for recursive materialization. Slot naming, leases, branch shapes, queue admission, and lifecycle remain policy owned by the caller.

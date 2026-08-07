@@ -1,19 +1,12 @@
 import { spawnSync } from "node:child_process"
 
-const REPOSITORY_SCOPED_ENV = [
-  "GIT_DIR",
-  "GIT_WORK_TREE",
-  "GIT_INDEX_FILE",
-  "GIT_COMMON_DIR",
-  "GIT_OBJECT_DIRECTORY",
-  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-  "GIT_PREFIX",
-] as const
-
-function gitEnvironment(): NodeJS.ProcessEnv {
-  const environment = { ...process.env }
-  for (const name of REPOSITORY_SCOPED_ENV) delete environment[name]
-  return environment
+export function cleanGitEnvironment(environment: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return {
+    ...Object.fromEntries(
+      Object.entries(environment).filter(([key, value]) => value !== undefined && !key.startsWith("GIT_")),
+    ),
+    KM_NO_AUTO_SUBMODULE_UPDATE: "1",
+  }
 }
 
 export type GitError = Error &
@@ -40,7 +33,7 @@ export type GitResult = Readonly<{
 export function tryGit(cwd: string, args: readonly string[]): GitResult {
   const result = spawnSync("git", ["-C", cwd, ...args], {
     encoding: "utf8",
-    env: gitEnvironment(),
+    env: cleanGitEnvironment(),
     maxBuffer: 64 * 1024 * 1024,
   })
   if (result.error) throw new Error(`failed to run git in ${cwd}: ${result.error.message}`)
