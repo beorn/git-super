@@ -15,7 +15,7 @@
   ],
   "type": "module",
   "scripts": {
-    "test": "vitest run",
+    "test": "bunx --bun vitest run",
     "typecheck": "tsc --noEmit",
     "lint": "oxlint src tests",
     "format": "oxfmt --check .",
