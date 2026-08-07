@@ -14,7 +14,10 @@ try {
       ...(request.operation === undefined ? {} : { operation: request.operation }),
     })
   } else {
-    await store.remove(request.path, request.operation === undefined ? {} : { operation: request.operation })
+    await store.remove(request.path, {
+      ...(request.operation === undefined ? {} : { operation: request.operation }),
+      ...(request.unlock === true ? { unlock: true } : {}),
+    })
   }
 } catch (error) {
   console.error(error instanceof Error ? error.message : String(error))

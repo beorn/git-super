@@ -9,7 +9,11 @@ import { spawnSync } from "node:child_process"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { describe, expect, it } from "vitest"
-import { createGitWorktreeStore, createLocalGitWorktreeStore } from "../src/worktree.ts"
+import {
+  createGitWorktreeStore,
+  createLocalGitWorktreeStore,
+  runLocalGitWorktreeMutationSync,
+} from "../src/worktree.ts"
 
 function git(repo: string, args: readonly string[]): string {
   const result = spawnSync("git", ["-C", repo, ...args], { encoding: "utf8" })
@@ -77,8 +81,9 @@ describe("createGitWorktreeStore", () => {
       const store = createLocalGitWorktreeStore({ repo })
       await store.add({ kind: "detached", path: linked, ref: "HEAD" })
       expect(existsSync(linked)).toBe(true)
+      await store.lock(linked, "test locked cleanup")
 
-      await store.remove(linked)
+      expect(runLocalGitWorktreeMutationSync({ kind: "remove", repo, path: linked, unlock: true }).exitCode).toBe(0)
       expect(existsSync(linked)).toBe(false)
       expect(git(repo, ["worktree", "list", "--porcelain"])).not.toContain(linked)
     } finally {

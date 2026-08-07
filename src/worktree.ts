@@ -67,7 +67,7 @@ export type LocalGitWorktreeStoreOptions = Omit<GitWorktreeStoreOptions, "git" |
 
 export type LocalGitWorktreeMutation =
   | Readonly<{ kind: "add-detached"; repo: string; path: string; ref: string; operation?: string }>
-  | Readonly<{ kind: "remove"; repo: string; path: string; operation?: string }>
+  | Readonly<{ kind: "remove"; repo: string; path: string; operation?: string; unlock?: boolean }>
 
 export type LocalGitWorktreeMutationResult = Readonly<{ exitCode: number; stdout: string; stderr: string }>
 
