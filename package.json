@@ -15,6 +15,7 @@
   ],
   "type": "module",
   "exports": {
+    "./composition": "./src/composition.ts",
     "./exclusive": "./src/exclusive.ts",
     "./submodules": "./src/submodules.ts",
     "./worktree": "./src/worktree.ts"
