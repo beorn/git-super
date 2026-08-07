@@ -14,6 +14,7 @@ import {
   type SubmoduleGit,
   type SubmoduleGitResult,
 } from "../src/submodules.ts"
+import { cleanGitRepositoryEnvironment } from "../src/git.ts"
 
 const success = (): SubmoduleGitResult => ({ code: 0, stdout: "", stderr: "" })
 const roots: string[] = []
@@ -23,6 +24,17 @@ afterEach(async () => {
 })
 
 describe("materializeSubmodules", () => {
+  it("strips repository pointers without deleting caller Git policy", () => {
+    expect(
+      cleanGitRepositoryEnvironment({
+        GIT_DIR: "/wrong",
+        GIT_CONFIG_COUNT: "1",
+        GIT_CONFIG_KEY_0: "protocol.file.allow",
+      }),
+    ).toMatchObject({ GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "protocol.file.allow" })
+    expect(cleanGitRepositoryEnvironment({ GIT_DIR: "/wrong" })).not.toHaveProperty("GIT_DIR")
+  })
+
   it("falls back loudly when the exact gitlink is absent from the local reference", async () => {
     const worktree = "/candidate"
     const referenceWorktree = "/reference"

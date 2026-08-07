@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process"
 import { existsSync, realpathSync } from "node:fs"
 import { join, resolve } from "node:path"
 import { pathToFileURL } from "node:url"
-import { cleanGitEnvironment } from "./git.ts"
+import { cleanGitRepositoryEnvironment } from "./git.ts"
 
 export const SUBMODULE_ALTERNATE_LOCATION = "superproject"
 export const SUBMODULE_ALTERNATE_ERROR_STRATEGY = "info"
@@ -250,7 +250,7 @@ async function mainWorktree(git: SubmoduleGit, repo: string): Promise<string | u
 export async function materializeSubmodulesFromLocalWorktreeParallel(
   options: HostSubmoduleMaterializationOptions,
 ): Promise<HostSubmoduleMaterializationResult> {
-  const environment = cleanGitEnvironment(options.env ?? process.env)
+  const environment = cleanGitRepositoryEnvironment(options.env ?? process.env)
   const git = hostGit(environment)
   const discovered =
     options.referenceWorktree === undefined ? await mainWorktree(git, options.worktree) : options.referenceWorktree
@@ -282,7 +282,7 @@ export function materializeSubmodulesFromLocalWorktree(
         paths: options.paths,
       }),
     ],
-    { encoding: "utf8", env: cleanGitEnvironment(options.env ?? process.env) },
+    { encoding: "utf8", env: cleanGitRepositoryEnvironment(options.env ?? process.env) },
   )
   if (child.status !== 0) {
     return {
