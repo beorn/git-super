@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process"
 import { existsSync, realpathSync } from "node:fs"
 import { join, resolve } from "node:path"
-import { pathToFileURL } from "node:url"
+import { fileURLToPath, pathToFileURL } from "node:url"
 import { cleanGitRepositoryEnvironment } from "./git.ts"
 
 export const SUBMODULE_ALTERNATE_LOCATION = "superproject"
@@ -275,7 +275,7 @@ export function materializeSubmodulesFromLocalWorktree(
   const child = spawnSync(
     process.execPath,
     [
-      new URL("./submodule-runner.ts", import.meta.url).pathname,
+      fileURLToPath(new URL("./submodule-runner.ts", import.meta.url)),
       JSON.stringify({
         worktree: options.worktree,
         referenceWorktree: options.referenceWorktree,
