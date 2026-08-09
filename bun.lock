@@ -5,6 +5,7 @@
     "": {
       "name": "git-super",
       "dependencies": {
+        "@bearly/flock": "0.1.0",
         "@silvery/command": "0.23.2",
         "@silvery/commander": "0.23.2",
         "react": "19.2.0",
@@ -21,6 +22,8 @@
     },
   },
   "packages": {
+    "@bearly/flock": ["@bearly/flock@0.1.0", "", {}, "sha512-L9qQPH3Df+xKaFfOoYOamyL00CmRltbvilx0XfXzylFw76MRMN4SrhydxrVc4ROsZ5nkVZE0prl3G3zv3ZOH5w=="],
+
     "@chenglou/pretext": ["@chenglou/pretext@0.0.8", "", {}, "sha512-yqm2GMxnPI7VHcHwe84P8ZF0JK/2d2DMKPqMN+s95jQhwDMYYXKVFVJUMEaVWckQStdsjdLav/0Vu+d9YbtGxA=="],
 
     "@jridgewell/sourcemap-codec": ["@jridgewell/sourcemap-codec@1.5.5", "", {}, "sha512-cYQ9310grqxueWbl+WuIUIaiUaDcj7WOq5fVhEljNVgRfOUhY9fy2zTvfoqWsnebh8Sl70VScFbICvJnLKB0Og=="],

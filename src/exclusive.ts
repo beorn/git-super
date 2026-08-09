@@ -1,7 +1,7 @@
-import { closeSync, fsyncSync, ftruncateSync, openSync, readFileSync, writeSync } from "node:fs"
+import { readFileSync } from "node:fs"
 import { mkdir } from "node:fs/promises"
 import { join } from "node:path"
-import { dlopen, FFIType, suffix } from "bun:ffi"
+import { tryAcquireFlock } from "@bearly/flock"
 
 export type Exclusive = Readonly<{
   run<Result>(operation: () => Promise<Result>, options?: Readonly<{ holder?: string }>): Promise<Result>
@@ -13,13 +13,6 @@ export type ExclusiveOptions = Readonly<{
 }>
 
 export type WriterLock = Readonly<{ release(): void }>
-type Flock = { flock(fd: number, operation: number): number }
-
-const LOCK_EX = 2
-const LOCK_NB = 4
-const LOCK_UN = 8
-const held = new Set<string>()
-let libc: Flock | undefined
 
 /**
  * Acquire the repository-scoped writer lock used by both the former Yrd store
@@ -55,69 +48,17 @@ export async function acquireExclusive(
   const deadline = Date.now() + timeoutMs
   const backoff = (): Promise<void> => Bun.sleep(1 + Math.floor(Math.random() * pollMs))
 
-  while (held.has(path)) {
-    if (Date.now() >= deadline) throw busy(path, holder)
-    await backoff()
-  }
-
-  const fd = openSync(path, "a+")
-  let locked = false
-  try {
-    while (!(locked = flock(fd, LOCK_EX | LOCK_NB) === 0)) {
-      if (Date.now() >= deadline) throw busy(path, holder)
-      await backoff()
-    }
-    held.add(path)
+  while (true) {
     const body = JSON.stringify({
       pid: process.pid,
       startedAt: new Date().toISOString(),
       ...(holder === undefined ? {} : { holder }),
     })
-    ftruncateSync(fd, 0)
-    writeSync(fd, body, 0, "utf8")
-    fsyncSync(fd)
-  } catch (error) {
-    if (locked) flock(fd, LOCK_UN)
-    closeSync(fd)
-    throw error
+    const lock = tryAcquireFlock(path, { body })
+    if (lock !== null) return { release: () => lock.release() }
+    if (Date.now() >= deadline) throw busy(path, holder)
+    await backoff()
   }
-
-  let released = false
-  return {
-    release() {
-      if (released) return
-      released = true
-      held.delete(path)
-      flock(fd, LOCK_UN)
-      closeSync(fd)
-    },
-  }
-}
-
-function flock(fd: number, operation: number): number {
-  libc ??= loadFlock()
-  return libc.flock(fd, operation)
-}
-
-export function posixLibcCandidates(platform: NodeJS.Platform): readonly string[] {
-  if (platform === "darwin") return ["libc.dylib"]
-  if (platform === "linux") return ["libc.so.6", "libc.so"]
-  return [`libc.${suffix}`]
-}
-
-function loadFlock(): Flock {
-  const candidates = posixLibcCandidates(process.platform)
-  let cause: unknown
-  for (const path of candidates) {
-    try {
-      return dlopen(path, {
-        flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
-      }).symbols as unknown as Flock
-    } catch (error) {
-      cause = error
-    }
-  }
-  throw new Error(`git-super: failed to load POSIX flock from ${candidates.join(" or ")}`, { cause })
 }
 
 function busy(path: string, contender?: string): Error {
