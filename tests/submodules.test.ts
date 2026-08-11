@@ -4,9 +4,10 @@
  * @consumer Yrd, Bearly, and hh worktree adapters
  */
 import { writeFileSync } from "node:fs"
-import { mkdtemp, rm } from "node:fs/promises"
+import { mkdtemp } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { safeRemove } from "removely"
 import { afterEach, describe, expect, it } from "vitest"
 import {
   materializeSubmodules,
@@ -20,7 +21,7 @@ const success = (): SubmoduleGitResult => ({ code: 0, stdout: "", stderr: "" })
 const roots: string[] = []
 
 afterEach(async () => {
-  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
+  await Promise.all(roots.splice(0).map((root) => safeRemove(root, { within: tmpdir(), allowedRoots: [tmpdir()] })))
 })
 
 describe("materializeSubmodules", () => {
