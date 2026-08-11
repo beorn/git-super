@@ -153,4 +153,22 @@ describe("private Git metadata projection", () => {
       preparePrivateGitMetadataProjection({ storageRoot: `${product}/.private-git`, worktree: product }),
     ).rejects.toThrow("must not overlap")
   })
+
+  it("mounts private metadata directly over an ordinary checkout Git directory", async () => {
+    await using fixture = await tempTree("git-super-projection-directory-")
+    const worktree = createProductFixture(fixture.path).alpha
+    const storageRoot = fixture.resolve("projection")
+    const projection = await preparePrivateGitMetadataProjection({ storageRoot, worktree })
+    const root = projection.repositories[0]
+
+    expect(root).toMatchObject({ gitEntryKind: "directory", relativePath: ".", worktree })
+    expect(root).not.toHaveProperty("gitFile")
+    expect(projection.mounts).toContainEqual({
+      kind: "private-git-directory",
+      source: root?.privateGitDirectory,
+      target: `${worktree}/.git`,
+      readOnly: false,
+    })
+    await expect(retirePrivateGitMetadataProjection({ storageRoot })).resolves.toMatchObject({ kind: "unchanged" })
+  })
 })

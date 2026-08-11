@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto"
 import { existsSync } from "node:fs"
-import { mkdir, readFile, realpath, rename, writeFile } from "node:fs/promises"
+import { lstat, mkdir, readFile, realpath, rename, writeFile } from "node:fs/promises"
 import { basename, dirname, isAbsolute, join, resolve } from "node:path"
 import { isStrictlyInside, safeRemove } from "removely"
 import { runGit, tryGit } from "./git.ts"
@@ -16,13 +16,15 @@ export type PrivateGitProjectionMount = Readonly<{
   readOnly: boolean
 }>
 
-export type PrivateGitProjectedRepository = Readonly<{
+type PrivateGitProjectedRepositoryBase = Readonly<{
   relativePath: string
   worktree: string
   privateGitDirectory: string
-  gitFile: string
   sourceObjectDirectory: string
 }>
+
+export type PrivateGitProjectedRepository = PrivateGitProjectedRepositoryBase &
+  (Readonly<{ gitEntryKind: "file"; gitFile: string }> | Readonly<{ gitEntryKind: "directory" }>)
 
 export type PrivateGitPreservedRef = Readonly<{
   relativePath: string
@@ -206,11 +208,14 @@ async function projectRepository(
   entry: Readonly<{ relativePath: string; worktree: string }>,
 ): Promise<PrivateGitProjectedRepository> {
   const worktree = await realpath(entry.worktree)
+  const gitEntry = await lstat(join(worktree, ".git"))
+  const gitEntryKind = gitEntry.isFile() ? "file" : gitEntry.isDirectory() ? "directory" : undefined
+  if (gitEntryKind === undefined) {
+    throw new Error(`git-super: checkout .git entry must be a file or directory: ${join(worktree, ".git")}`)
+  }
   const identifier = repositoryIdentifier(entry.relativePath)
   const privateGitDirectory = join(storageRoot, "repositories", `${identifier}.git`)
-  const gitFile = join(storageRoot, "overlays", `${identifier}.git`)
   await mkdir(dirname(privateGitDirectory), { recursive: true })
-  await mkdir(dirname(gitFile), { recursive: true })
   runGit(storageRoot, ["init", "--bare", "--quiet", privateGitDirectory])
 
   const sourceObjects = runGit(worktree, ["rev-parse", "--path-format=absolute", "--git-path", "objects"]).trim()
@@ -221,8 +226,20 @@ async function projectRepository(
   configurePrivateRepository(worktree, privateGitDirectory)
   initializePrivateHead(worktree, privateGitDirectory)
   privateRun(worktree, privateGitDirectory, ["read-tree", "HEAD"])
+  if (gitEntryKind === "directory") {
+    return { relativePath: entry.relativePath, worktree, privateGitDirectory, sourceObjectDirectory, gitEntryKind }
+  }
+  const gitFile = join(storageRoot, "overlays", `${identifier}.git`)
+  await mkdir(dirname(gitFile), { recursive: true })
   await writeFile(gitFile, `gitdir: ${privateGitDirectory}\n`)
-  return { relativePath: entry.relativePath, worktree, privateGitDirectory, gitFile, sourceObjectDirectory }
+  return {
+    relativePath: entry.relativePath,
+    worktree,
+    privateGitDirectory,
+    sourceObjectDirectory,
+    gitEntryKind,
+    gitFile,
+  }
 }
 
 function configurePrivateRepository(worktree: string, gitDirectory: string): void {
@@ -390,21 +407,26 @@ function projectionMounts(repositories: readonly PrivateGitProjectedRepository[]
   }
   return [
     ...repositories.map(
-      ({ privateGitDirectory }): PrivateGitProjectionMount => ({
+      (repository): PrivateGitProjectionMount => ({
         kind: "private-git-directory",
-        source: privateGitDirectory,
-        target: privateGitDirectory,
+        source: repository.privateGitDirectory,
+        target:
+          repository.gitEntryKind === "directory" ? join(repository.worktree, ".git") : repository.privateGitDirectory,
         readOnly: false,
       }),
     ),
     ...borrowed.values(),
-    ...repositories.map(
-      ({ gitFile, worktree }): PrivateGitProjectionMount => ({
-        kind: "git-file-overlay",
-        source: gitFile,
-        target: join(worktree, ".git"),
-        readOnly: true,
-      }),
+    ...repositories.flatMap((repository): PrivateGitProjectionMount[] =>
+      repository.gitEntryKind === "file"
+        ? [
+            {
+              kind: "git-file-overlay",
+              source: repository.gitFile,
+              target: join(repository.worktree, ".git"),
+              readOnly: true,
+            },
+          ]
+        : [],
     ),
   ]
 }
@@ -480,13 +502,16 @@ async function loadStoredProjection(storageRoot: string): Promise<StoredProjecti
       !isAbsolute(repository.worktree) ||
       !isAbsolute(repository.sourceObjectDirectory) ||
       !isStrictlyInside(resolve(repository.privateGitDirectory), root) ||
-      !isStrictlyInside(resolve(repository.gitFile), root)
+      (repository.gitEntryKind !== "file" && repository.gitEntryKind !== "directory") ||
+      (repository.gitEntryKind === "file" && !isStrictlyInside(resolve(repository.gitFile), root))
     ) {
       throw new Error(`git-super: projection repository escapes storage root: ${repository.relativePath}`)
     }
-    const expectedGitFile = `gitdir: ${repository.privateGitDirectory}\n`
-    if ((await readFile(repository.gitFile, "utf8")) !== expectedGitFile) {
-      throw new Error(`git-super: projection Git file changed: ${repository.gitFile}`)
+    if (repository.gitEntryKind === "file") {
+      const expectedGitFile = `gitdir: ${repository.privateGitDirectory}\n`
+      if ((await readFile(repository.gitFile, "utf8")) !== expectedGitFile) {
+        throw new Error(`git-super: projection Git file changed: ${repository.gitFile}`)
+      }
     }
   }
   const expectedMounts = projectionMounts(projection.repositories)

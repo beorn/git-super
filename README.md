@@ -59,7 +59,7 @@ const projection = await preparePrivateGitMetadataProjection({
 const volumes = projection.mounts.map(({ source, target, readOnly }) => `${source}:${target}:${readOnly ? "ro" : "rw"}`)
 ```
 
-The mount plan makes each generated Git directory writable, mounts only the host object directory read-only, and overlays each checkout's `.git` file read-only. Hooks and shared config do not cross the boundary. After the writer stops, preserve private refs and unreferenced commits into a unique source-repository namespace, then retire the projection. Retirement also accepts a projection whose refs, unreferenced commits, HEAD, and index are unchanged since preparation; it refuses changed or stale evidence and refuses to label a dirty private index preserved.
+The mount plan makes each generated Git directory writable, directly overlays an ordinary `.git` directory or supplies a read-only Git-file overlay for a linked checkout, and mounts only the host object directory read-only. Hooks and shared config do not cross the boundary. After the writer stops, preserve private refs and unreferenced commits into a unique source-repository namespace, then retire the projection. Retirement also accepts a projection whose refs, unreferenced commits, HEAD, and index are unchanged since preparation; it refuses changed or stale evidence and refuses to label a dirty private index preserved.
 
 ## Try the repository before npm publication
 
