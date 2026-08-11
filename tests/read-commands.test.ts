@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, test } from "vitest"
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { mkdtempSync, realpathSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { safeRemoveSync } from "removely"
 import { resolveInvocation } from "@silvery/command"
 import { commands } from "../src/commands.ts"
 import { runCli } from "../src/cli.ts"
@@ -18,7 +19,9 @@ import {
 const roots: string[] = []
 
 afterEach(() => {
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
+  for (const root of roots.splice(0)) {
+    safeRemoveSync(root, { within: realpathSync(tmpdir()), allowMissing: true })
+  }
 })
 
 function outputSink(): { output: string; write(value: string): void } {
@@ -74,7 +77,10 @@ describe("Phase 1 read commands", () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-nested-missing-"))
     roots.push(fixtureRoot)
     const fixture = addNestedAlphaSubmodule(createProductFixture(fixtureRoot))
-    rmSync(join(fixture.product, "packages/alpha/apps/maddoc"), { recursive: true, force: true })
+    safeRemoveSync(join(fixture.product, "packages/alpha/apps/maddoc"), {
+      within: realpathSync(tmpdir()),
+      allowMissing: true,
+    })
 
     expect(() => superStatus({ repo: fixture.product })).toThrow("rev-parse --show-toplevel failed")
   })

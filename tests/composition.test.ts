@@ -5,9 +5,11 @@
  * @consumer reusable superproject composition callers
  */
 
-import { mkdtemp, rm, writeFile } from "node:fs/promises"
+import { realpathSync } from "node:fs"
+import { mkdtemp, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { safeRemove } from "removely"
 import { afterEach, describe, expect, it } from "vitest"
 import {
   composeSubmoduleCommits,
@@ -20,7 +22,9 @@ const oid = (digit: string) => digit.repeat(40)
 const roots: string[] = []
 
 afterEach(async () => {
-  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
+  await Promise.all(
+    roots.splice(0).map((root) => safeRemove(root, { within: realpathSync(tmpdir()), allowMissing: true })),
+  )
 })
 
 function gitlinkConflict(

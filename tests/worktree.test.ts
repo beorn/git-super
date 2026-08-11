@@ -3,8 +3,9 @@
  * @level l1
  * @consumer Yrd worktree and deployment stores
  */
-import { existsSync } from "node:fs"
-import { mkdtemp, rm, writeFile } from "node:fs/promises"
+import { existsSync, realpathSync } from "node:fs"
+import { mkdtemp, writeFile } from "node:fs/promises"
+import { safeRemove } from "removely"
 import { spawnSync } from "node:child_process"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -62,7 +63,7 @@ describe("createGitWorktreeStore", () => {
         args: ["-c", "core.hooksPath=/dev/null", "worktree", "add", "-B", "wt5", path, "refs/remotes/origin/main"],
       })
     } finally {
-      await rm(repo, { recursive: true, force: true })
+      await safeRemove(repo, { within: realpathSync(tmpdir()), allowMissing: true })
     }
   })
 
@@ -87,7 +88,7 @@ describe("createGitWorktreeStore", () => {
       expect(existsSync(linked)).toBe(false)
       expect(git(repo, ["worktree", "list", "--porcelain"])).not.toContain(linked)
     } finally {
-      await rm(root, { recursive: true, force: true })
+      await safeRemove(root, { within: realpathSync(tmpdir()), allowMissing: true })
     }
   })
 })

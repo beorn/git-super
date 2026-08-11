@@ -5,9 +5,11 @@
  * @consumer Yrd worktree mutation store
  */
 
-import { mkdtemp, readFile, rm } from "node:fs/promises"
+import { realpathSync } from "node:fs"
+import { mkdtemp, readFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { safeRemove } from "removely"
 import { describe, expect, test } from "vitest"
 import { acquireExclusive } from "../src/exclusive.ts"
 
@@ -29,6 +31,6 @@ describe("exclusive writer policy", () => {
 
     const successor = await acquireExclusive(dir, { timeoutMs: 0 }, "successor")
     successor.release()
-    await rm(dir, { recursive: true, force: true })
+    await safeRemove(dir, { within: realpathSync(tmpdir()), allowMissing: true })
   })
 })

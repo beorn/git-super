@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, test } from "vitest"
-import { mkdtempSync, rmSync } from "node:fs"
+import { mkdtempSync, realpathSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { safeRemoveSync } from "removely"
 import { superDiff } from "../src/diff.ts"
 import {
   addNestedAlphaSubmodule,
@@ -15,7 +16,9 @@ import {
 const roots: string[] = []
 
 afterEach(() => {
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
+  for (const root of roots.splice(0)) {
+    safeRemoveSync(root, { within: realpathSync(tmpdir()), allowMissing: true })
+  }
 })
 
 describe("superDiff", () => {
