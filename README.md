@@ -40,6 +40,27 @@ Normal path or porcelain output stays on stdout. A Silvery-rendered consulted-re
 
 Missing checkouts, missing commit objects, added or removed gitlinks without a resolvable commit range, and ambiguous commit ownership all fail loudly. The tool never turns an unresolved repository boundary into an empty success.
 
+## Private metadata projections
+
+`git-super/projection` lets a sandbox write an existing checkout without mounting its linked-worktree common directory. Prepare the projection only after recursive submodules are materialized and the caller holds exclusive writer custody:
+
+```ts
+import {
+  preparePrivateGitMetadataProjection,
+  preservePrivateGitMetadataProjection,
+  retirePrivateGitMetadataProjection,
+} from "git-super/projection"
+
+const projection = await preparePrivateGitMetadataProjection({
+  worktree: "/work/product",
+  storageRoot: "/state/run-42/private-git",
+})
+
+const volumes = projection.mounts.map(({ source, target, readOnly }) => `${source}:${target}:${readOnly ? "ro" : "rw"}`)
+```
+
+The mount plan makes each generated Git directory writable, mounts only the host object directory read-only, and overlays each checkout's `.git` file read-only. Hooks and shared config do not cross the boundary. After the writer stops, preserve private refs and unreferenced commits into a unique source-repository namespace, then retire the projection. Retirement also accepts a projection whose refs, unreferenced commits, HEAD, and index are unchanged since preparation; it refuses changed or stale evidence and refuses to label a dirty private index preserved.
+
 ## Try the repository before npm publication
 
 The package name is reserved but this initial source release is not yet published. Clone it, install its public dependencies, and put its repo-local executable on `PATH` for the current command:
@@ -64,7 +85,7 @@ bun run typecheck
 - `src/diff.ts`, `src/status.ts`, and `src/merge-base.ts` are pure read-plumbing services over an explicit Git process adapter.
 - `src/worktree.ts` is the injected write-plumbing service: add, lock, unlock, inspect, exact removal, recovery, and hook quarantine. Its repository lock deliberately retains the cutover identity `.git/.../yrd-worktree-mutations/writer.lock`, so old and new callers exclude one another.
 - `src/submodules.ts` is the single recursive materializer for Yrd and host adapters. It proves exact gitlinks before borrowing local objects, reports remote fallbacks, supports a top-level path allowlist, and recurses through nested gitlinks.
-- `src/projection.ts` composes an existing checkout and its initialized recursive submodules into private writable Git directories. It borrows only host object directories, emits a backend-neutral mount plan, quarantines hooks and shared config, and refuses retirement until every private ref has preservation evidence.
+- `src/projection.ts` composes an existing checkout and its initialized recursive submodules into private writable Git directories. It borrows only host object directories, emits a backend-neutral mount plan, quarantines hooks and shared config, and refuses retirement until every private ref and unreferenced commit has preservation evidence; a dirty private index must be resolved first.
 - `src/commands.ts` exposes the platform-neutral `CommandNode` tree from the published `@silvery/command` package and every CLI request passes through `resolveInvocation()`.
 - `src/report.tsx` renders the fail-loud repository witness with canonical Silvery components and Sterling semantic tokens.
 - `src/cli.ts` adapts Commander parsing, stdout-compatible data, stable JSON, and the Silvery report around the command tree.

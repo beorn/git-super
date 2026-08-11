@@ -10,7 +10,7 @@ import {
   preparePrivateGitMetadataProjection,
   preservePrivateGitMetadataProjection,
   retirePrivateGitMetadataProjection,
-} from "../src/projection.ts"
+} from "git-super/projection"
 import { tryGit } from "../src/git.ts"
 import { addNestedAlphaSubmodule, createProductFixture, git } from "./fixture.ts"
 
