@@ -75,11 +75,26 @@ describe("private Git metadata projection", () => {
     expect(git(product, "rev-parse", preservedRoot.preservedRef)).toBe(privateSha)
     expect(readFileSync(sharedConfigPath, "utf8")).toBe(sharedConfigBefore)
 
-    await retirePrivateGitMetadataProjection({ storageRoot })
+    await expect(retirePrivateGitMetadataProjection({ storageRoot })).resolves.toMatchObject({ kind: "preserved" })
     expect(existsSync(storageRoot)).toBe(false)
   })
 
-  it("refuses retirement when preservation is absent or stale", async () => {
+  it("retires an unchanged projection without adding preservation refs", async () => {
+    await using fixture = await tempTree("git-super-projection-unchanged-")
+    const product = createProductFixture(fixture.path).product
+    const worktree = fixture.resolve("seat")
+    git(product, "worktree", "add", "-q", "-b", "seat", worktree)
+    git(worktree, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
+    const sharedRefsBefore = git(product, "show-ref")
+    const storageRoot = fixture.resolve("projection")
+    await preparePrivateGitMetadataProjection({ storageRoot, worktree })
+
+    await expect(retirePrivateGitMetadataProjection({ storageRoot })).resolves.toMatchObject({ kind: "unchanged" })
+    expect(git(product, "show-ref")).toBe(sharedRefsBefore)
+    expect(existsSync(storageRoot)).toBe(false)
+  })
+
+  it("preserves reflog-only commits and refuses retirement when preservation is absent or stale", async () => {
     await using fixture = await tempTree("git-super-projection-retire-")
     const product = createProductFixture(fixture.path).product
     const worktree = fixture.resolve("seat")
@@ -90,14 +105,45 @@ describe("private Git metadata projection", () => {
     const root = projection.repositories.find(({ relativePath }) => relativePath === ".")
     if (root === undefined) throw new Error("root projection missing")
 
+    writeFileSync(`${worktree}/reflog-only.txt`, "private then reset\n")
+    privateGit(worktree, root.privateGitDirectory, "add", "reflog-only.txt")
+    privateGit(worktree, root.privateGitDirectory, "commit", "-q", "-m", "reflog-only commit")
+    const reflogOnlySha = privateGit(worktree, root.privateGitDirectory, "rev-parse", "HEAD")
+    privateGit(worktree, root.privateGitDirectory, "reset", "--hard", "HEAD^")
     await expect(retirePrivateGitMetadataProjection({ storageRoot })).rejects.toThrow("preservation")
-    await preservePrivateGitMetadataProjection({ refNamespace: "refs/hab-preserved/seat-5", storageRoot })
+    const preservation = await preservePrivateGitMetadataProjection({
+      refNamespace: "refs/hab-preserved/seat-5",
+      storageRoot,
+    })
+    expect(preservation.refs).toContainEqual(
+      expect.objectContaining({ sourceRef: `unreferenced:${reflogOnlySha}`, sha: reflogOnlySha }),
+    )
+    expect(tryGit(product, ["cat-file", "-e", `${reflogOnlySha}^{commit}`]).exitCode).toBe(0)
 
     writeFileSync(`${worktree}/after-preserve.txt`, "new private commit\n")
     privateGit(worktree, root.privateGitDirectory, "add", "after-preserve.txt")
     privateGit(worktree, root.privateGitDirectory, "commit", "-q", "-m", "after preservation")
     await expect(retirePrivateGitMetadataProjection({ storageRoot })).rejects.toThrow("changed after preservation")
     expect(existsSync(storageRoot)).toBe(true)
+  })
+
+  it("refuses to retire or claim preservation for a dirty private index", async () => {
+    await using fixture = await tempTree("git-super-projection-dirty-")
+    const product = createProductFixture(fixture.path).product
+    const worktree = fixture.resolve("seat")
+    git(product, "worktree", "add", "-q", "-b", "seat", worktree)
+    git(worktree, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
+    const storageRoot = fixture.resolve("projection")
+    const projection = await preparePrivateGitMetadataProjection({ storageRoot, worktree })
+    const root = projection.repositories.find(({ relativePath }) => relativePath === ".")
+    if (root === undefined) throw new Error("root projection missing")
+
+    writeFileSync(`${worktree}/staged.txt`, "staged but not committed\n")
+    privateGit(worktree, root.privateGitDirectory, "add", "staged.txt")
+    await expect(retirePrivateGitMetadataProjection({ storageRoot })).rejects.toThrow("preservation")
+    await expect(
+      preservePrivateGitMetadataProjection({ refNamespace: "refs/hab-preserved/seat-5", storageRoot }),
+    ).rejects.toThrow("dirty private Git state")
   })
 
   it("refuses storage that overlaps the checkout", async () => {

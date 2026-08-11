@@ -61,14 +61,21 @@ export type PreservePrivateGitMetadataProjectionOptions = Readonly<{
 
 export type RetirePrivateGitMetadataProjectionOptions = Readonly<{ storageRoot: string }>
 
+export type PrivateGitProjectionRetirement =
+  | Readonly<{ kind: "unchanged"; retiredAt: string }>
+  | Readonly<{ kind: "preserved"; retiredAt: string; preservation: PrivateGitProjectionPreservation }>
+
 type PrivateRefSnapshot = Readonly<{
   relativePath: string
   refs: readonly Readonly<{ name: string; sha: string }>[]
+  unreferencedCommits: readonly string[]
+  indexHash: string
   head: Readonly<{ kind: "symbolic"; ref: string; sha: string }> | Readonly<{ kind: "detached"; sha: string }>
 }>
 
 type StoredProjection = PrivateGitMetadataProjection &
   Readonly<{
+    initialSnapshot: readonly PrivateRefSnapshot[]
     preservation?: PrivateGitProjectionPreservation & Readonly<{ snapshot: readonly PrivateRefSnapshot[] }>
   }>
 
@@ -105,6 +112,7 @@ export async function preparePrivateGitMetadataProjection(
       worktree,
       repositories: projected,
       mounts: projectionMounts(projected),
+      initialSnapshot: projected.map(snapshotRepository),
     }
     await writeManifest(projection)
     return projection
@@ -124,6 +132,7 @@ export async function preservePrivateGitMetadataProjection(
 ): Promise<PrivateGitProjectionPreservation> {
   const projection = await loadStoredProjection(options.storageRoot)
   const refNamespace = normalizedNamespace(options.refNamespace)
+  for (const repository of projection.repositories) assertCleanPrivateRepository(repository)
   const snapshot = projection.repositories.map(snapshotRepository)
   const planned = preservationPlan(snapshot, refNamespace)
 
@@ -163,22 +172,28 @@ export async function preservePrivateGitMetadataProjection(
   return preservation
 }
 
-/** Retire a projection only when its current private refs exactly match preserved evidence. */
+/** Retire only unchanged metadata or metadata whose refs, commits, and index match preserved evidence. */
 export async function retirePrivateGitMetadataProjection(
   options: RetirePrivateGitMetadataProjectionOptions,
-): Promise<void> {
+): Promise<PrivateGitProjectionRetirement> {
   const projection = await loadStoredProjection(options.storageRoot)
-  if (projection.preservation === undefined) {
-    throw new Error(`git-super: projection retirement requires preservation evidence: ${projection.storageRoot}`)
-  }
   const current = projection.repositories.map(snapshotRepository)
+  if (projection.preservation === undefined) {
+    if (JSON.stringify(current) !== JSON.stringify(projection.initialSnapshot)) {
+      throw new Error(`git-super: projection retirement requires preservation evidence: ${projection.storageRoot}`)
+    }
+    await removeProjection(projection.storageRoot)
+    return { kind: "unchanged", retiredAt: new Date().toISOString() }
+  }
   if (JSON.stringify(current) !== JSON.stringify(projection.preservation.snapshot)) {
     throw new Error(`git-super: private refs changed after preservation; preserve again before retirement`)
   }
-  await safeRemove(projection.storageRoot, {
-    within: dirname(projection.storageRoot),
-    allowedRoots: [dirname(projection.storageRoot)],
-  })
+  await removeProjection(projection.storageRoot)
+  return {
+    kind: "preserved",
+    retiredAt: new Date().toISOString(),
+    preservation: publicPreservation(projection.preservation),
+  }
 }
 
 /** Reopen a durable projection after a caller restart, with its mount plan revalidated. */
@@ -206,7 +221,6 @@ async function projectRepository(
   configurePrivateRepository(worktree, privateGitDirectory)
   initializePrivateHead(worktree, privateGitDirectory)
   privateRun(worktree, privateGitDirectory, ["read-tree", "HEAD"])
-  initializeSubmoduleConfig(worktree, privateGitDirectory)
   await writeFile(gitFile, `gitdir: ${privateGitDirectory}\n`)
   return { relativePath: entry.relativePath, worktree, privateGitDirectory, gitFile, sourceObjectDirectory }
 }
@@ -217,6 +231,7 @@ function configurePrivateRepository(worktree: string, gitDirectory: string): voi
     ["core.worktree", worktree],
     ["core.hooksPath", "/dev/null"],
     ["core.logAllRefUpdates", "true"],
+    ["submodule.recurse", "false"],
   ] as const) {
     privateRun(worktree, gitDirectory, ["config", "--local", key, value])
   }
@@ -267,12 +282,6 @@ function initializePrivateHead(worktree: string, gitDirectory: string): void {
   privateRun(worktree, gitDirectory, ["update-ref", "--no-deref", "HEAD", sha])
 }
 
-function initializeSubmoduleConfig(worktree: string, gitDirectory: string): void {
-  const tracked = privateRun(worktree, gitDirectory, ["ls-tree", "--name-only", "HEAD", "--", ".gitmodules"])
-  if (tracked.trim() === "") return
-  privateRun(worktree, gitDirectory, ["submodule", "init"])
-}
-
 function privateRun(worktree: string, gitDirectory: string, args: readonly string[]): string {
   return runGit(worktree, ["--git-dir", gitDirectory, "--work-tree", worktree, ...args])
 }
@@ -293,6 +302,20 @@ function snapshotRepository(repository: PrivateGitProjectedRepository): PrivateR
     if (separator <= 0) throw new Error(`git-super: malformed private ref row in ${repository.relativePath}: ${line}`)
     return { name: line.slice(0, separator), sha: line.slice(separator + 1) }
   })
+  const unreferencedCommits = lines(
+    privateRun(repository.worktree, repository.privateGitDirectory, [
+      "fsck",
+      "--unreachable",
+      "--no-reflogs",
+      "--no-progress",
+      "--no-full",
+    ]),
+  )
+    .flatMap((line) => /^unreachable commit ([0-9a-f]+)$/u.exec(line)?.[1] ?? [])
+    .toSorted()
+  const indexHash = createHash("sha256")
+    .update(privateRun(repository.worktree, repository.privateGitDirectory, ["ls-files", "--stage", "-z"]))
+    .digest("hex")
   const sha = privateRun(repository.worktree, repository.privateGitDirectory, ["rev-parse", "HEAD"]).trim()
   const symbolic = privateTry(repository.worktree, repository.privateGitDirectory, ["symbolic-ref", "-q", "HEAD"])
   if (symbolic.exitCode !== 0 && symbolic.exitCode !== 1) {
@@ -302,14 +325,30 @@ function snapshotRepository(repository: PrivateGitProjectedRepository): PrivateR
     symbolic.exitCode === 0
       ? ({ kind: "symbolic", ref: symbolic.stdout.trim(), sha } as const)
       : ({ kind: "detached", sha } as const)
-  return { relativePath: repository.relativePath, refs, head }
+  return { relativePath: repository.relativePath, refs, unreferencedCommits, indexHash, head }
+}
+
+function assertCleanPrivateRepository(repository: PrivateGitProjectedRepository): void {
+  const status = privateRun(repository.worktree, repository.privateGitDirectory, [
+    "status",
+    "--porcelain=v1",
+    "-z",
+    "--untracked-files=all",
+  ])
+  if (status !== "") {
+    throw new Error(
+      `git-super: cannot preserve dirty private Git state in ${repository.relativePath}; commit or remove its changes first`,
+    )
+  }
 }
 
 function preservationPlan(snapshot: readonly PrivateRefSnapshot[], refNamespace: string): PrivateGitPreservedRef[] {
   const planned: PrivateGitPreservedRef[] = []
   for (const repository of snapshot) {
     const repositoryKey = repositoryIdentifier(repository.relativePath)
+    const refShas = new Set<string>()
     for (const ref of repository.refs) {
+      refShas.add(ref.sha)
       planned.push({
         relativePath: repository.relativePath,
         sourceRef: ref.name,
@@ -323,6 +362,16 @@ function preservationPlan(snapshot: readonly PrivateRefSnapshot[], refNamespace:
         sourceRef: "HEAD",
         preservedRef: `${refNamespace}/${repositoryKey}/HEAD`,
         sha: repository.head.sha,
+      })
+      refShas.add(repository.head.sha)
+    }
+    for (const sha of repository.unreferencedCommits) {
+      if (refShas.has(sha)) continue
+      planned.push({
+        relativePath: repository.relativePath,
+        sourceRef: `unreferenced:${sha}`,
+        preservedRef: `${refNamespace}/${repositoryKey}/unreferenced/${sha}`,
+        sha,
       })
     }
   }
@@ -423,6 +472,9 @@ async function loadStoredProjection(storageRoot: string): Promise<StoredProjecti
   if (!isAbsolute(projection.worktree) || projection.repositories.length === 0) {
     throw new Error(`git-super: invalid private Git projection roots: ${join(root, MANIFEST)}`)
   }
+  if (!Array.isArray(projection.initialSnapshot)) {
+    throw new Error(`git-super: projection manifest lacks its initial ref snapshot: ${join(root, MANIFEST)}`)
+  }
   for (const repository of projection.repositories) {
     if (
       !isAbsolute(repository.worktree) ||
@@ -445,6 +497,23 @@ async function loadStoredProjection(storageRoot: string): Promise<StoredProjecti
     throw new Error(`git-super: invalid projection preservation evidence: ${join(root, MANIFEST)}`)
   }
   return projection
+}
+
+async function removeProjection(storageRoot: string): Promise<void> {
+  await safeRemove(storageRoot, {
+    within: dirname(storageRoot),
+    allowedRoots: [dirname(storageRoot)],
+  })
+}
+
+function publicPreservation(
+  preservation: PrivateGitProjectionPreservation & Readonly<{ snapshot: readonly PrivateRefSnapshot[] }>,
+): PrivateGitProjectionPreservation {
+  return {
+    preservedAt: preservation.preservedAt,
+    refNamespace: preservation.refNamespace,
+    refs: preservation.refs,
+  }
 }
 
 function lines(value: string): string[] {
