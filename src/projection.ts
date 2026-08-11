@@ -164,6 +164,14 @@ export async function preservePrivateGitMetadataProjection(
       `${ref.sha}:${ref.preservedRef}`,
     ])
   }
+  for (const ref of planned) {
+    const repository = repositoryForPath(projection, ref.relativePath)
+    const preserved = runGit(repository.worktree, ["rev-parse", "--verify", ref.preservedRef]).trim()
+    const object = tryGit(repository.worktree, ["cat-file", "-e", ref.sha])
+    if (preserved !== ref.sha || object.exitCode !== 0) {
+      throw new Error(`git-super: preservation verification failed for ${ref.preservedRef} at ${ref.sha}`)
+    }
+  }
 
   const preservation: PrivateGitProjectionPreservation = {
     preservedAt: new Date().toISOString(),
