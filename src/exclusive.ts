@@ -69,6 +69,13 @@ function busy(path: string, contender?: string): Error {
     if (typeof value.pid === "number") owner = `pid:${value.pid}`
     if (typeof value.holder === "string" && value.holder.trim() !== "") holder = value.holder
   } catch {
+    // silent-fallback-allow: this enriches an error that is ALREADY being
+    // thrown, so the failure is never hidden — only its detail is. The lock
+    // file can legitimately vanish or be half-written between the failed
+    // acquire and this read, and in that race the caller still needs the
+    // useful "lock is busy" error rather than a JSON parse error standing in
+    // for it. Rethrowing would replace a real diagnosis with a worse one, and
+    // logging would add noise to a path that is already reporting a failure.
     // Diagnostic metadata never decides authoritative lock ownership.
   }
   return new Error(
