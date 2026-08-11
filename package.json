@@ -17,6 +17,7 @@
   "exports": {
     "./composition": "./src/composition.ts",
     "./exclusive": "./src/exclusive.ts",
+    "./projection": "./src/projection.ts",
     "./submodules": "./src/submodules.ts",
     "./worktree": "./src/worktree.ts"
   },
@@ -33,6 +34,7 @@
     "@silvery/command": "0.23.2",
     "@silvery/commander": "0.23.2",
     "react": "19.2.0",
+    "removely": "^0.1.0",
     "silvery": "0.23.2"
   },
   "devDependencies": {
