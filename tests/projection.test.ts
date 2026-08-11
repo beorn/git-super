@@ -110,6 +110,7 @@ describe("private Git metadata projection", () => {
     privateGit(worktree, root.privateGitDirectory, "commit", "-q", "-m", "reflog-only commit")
     const reflogOnlySha = privateGit(worktree, root.privateGitDirectory, "rev-parse", "HEAD")
     privateGit(worktree, root.privateGitDirectory, "reset", "--hard", "HEAD^")
+    privateGit(worktree, root.privateGitDirectory, "gc", "--quiet")
     await expect(retirePrivateGitMetadataProjection({ storageRoot })).rejects.toThrow("preservation")
     const preservation = await preservePrivateGitMetadataProjection({
       refNamespace: "refs/hab-preserved/seat-5",
@@ -125,6 +126,25 @@ describe("private Git metadata projection", () => {
     privateGit(worktree, root.privateGitDirectory, "commit", "-q", "-m", "after preservation")
     await expect(retirePrivateGitMetadataProjection({ storageRoot })).rejects.toThrow("changed after preservation")
     expect(existsSync(storageRoot)).toBe(true)
+  })
+
+  it("never classifies dangling objects from the borrowed host store as private work", async () => {
+    await using fixture = await tempTree("git-super-projection-host-dangling-")
+    const product = createProductFixture(fixture.path).product
+    const hostDanglingSha = git(product, "commit-tree", "HEAD^{tree}", "-m", "host-only dangling commit")
+    const worktree = fixture.resolve("seat")
+    git(product, "worktree", "add", "-q", "-b", "seat", worktree)
+    git(worktree, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
+    const storageRoot = fixture.resolve("projection")
+    await preparePrivateGitMetadataProjection({ storageRoot, worktree })
+
+    const preservation = await preservePrivateGitMetadataProjection({
+      refNamespace: "refs/hab-preserved/seat-5",
+      storageRoot,
+    })
+
+    expect(preservation.refs.map(({ sha }) => sha)).not.toContain(hostDanglingSha)
+    await expect(retirePrivateGitMetadataProjection({ storageRoot })).resolves.toMatchObject({ kind: "preserved" })
   })
 
   it("refuses to retire or claim preservation for a dirty private index", async () => {

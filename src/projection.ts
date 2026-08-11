@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto"
-import { existsSync } from "node:fs"
+import { existsSync, readdirSync } from "node:fs"
 import { lstat, mkdir, readFile, realpath, rename, writeFile } from "node:fs/promises"
 import { basename, dirname, isAbsolute, join, resolve } from "node:path"
 import { isStrictlyInside, safeRemove } from "removely"
@@ -274,8 +274,9 @@ function configurePrivateRepository(worktree: string, gitDirectory: string): voi
     copyConfigValues(worktree, gitDirectory, key)
   }
   for (const remote of lines(runGit(worktree, ["remote"]))) {
-    for (const suffix of ["url", "pushurl", "fetch"])
+    for (const suffix of ["url", "pushurl", "fetch"]) {
       copyConfigValues(worktree, gitDirectory, `remote.${remote}.${suffix}`)
+    }
   }
   const symbolic = tryGit(worktree, ["symbolic-ref", "-q", "HEAD"])
   if (symbolic.exitCode === 0) {
@@ -290,8 +291,9 @@ function copyConfigValues(worktree: string, gitDirectory: string, key: string): 
   const result = tryGit(worktree, ["config", "--local", "--get-all", key])
   if (result.exitCode === 1) return
   if (result.exitCode !== 0) throw new Error(`git-super: could not read local config ${key}: ${result.stderr}`)
-  for (const value of lines(result.stdout))
+  for (const value of lines(result.stdout)) {
     privateRun(worktree, gitDirectory, ["config", "--local", "--add", key, value])
+  }
 }
 
 function initializePrivateHead(worktree: string, gitDirectory: string): void {
@@ -327,17 +329,7 @@ function snapshotRepository(repository: PrivateGitProjectedRepository): PrivateR
     if (separator <= 0) throw new Error(`git-super: malformed private ref row in ${repository.relativePath}: ${line}`)
     return { name: line.slice(0, separator), sha: line.slice(separator + 1) }
   })
-  const unreferencedCommits = lines(
-    privateRun(repository.worktree, repository.privateGitDirectory, [
-      "fsck",
-      "--unreachable",
-      "--no-reflogs",
-      "--no-progress",
-      "--no-full",
-    ]),
-  )
-    .flatMap((line) => /^unreachable commit ([0-9a-f]+)$/u.exec(line)?.[1] ?? [])
-    .toSorted()
+  const unreferencedCommits = privateUnreferencedCommits(repository)
   const indexHash = createHash("sha256")
     .update(privateRun(repository.worktree, repository.privateGitDirectory, ["ls-files", "--stage", "-z"]))
     .digest("hex")
@@ -351,6 +343,39 @@ function snapshotRepository(repository: PrivateGitProjectedRepository): PrivateR
       ? ({ kind: "symbolic", ref: symbolic.stdout.trim(), sha } as const)
       : ({ kind: "detached", sha } as const)
   return { relativePath: repository.relativePath, refs, unreferencedCommits, indexHash, head }
+}
+
+function privateUnreferencedCommits(repository: PrivateGitProjectedRepository): string[] {
+  const privateCommits = new Set<string>()
+  const objects = join(repository.privateGitDirectory, "objects")
+  for (const directory of readdirSync(objects, { withFileTypes: true })) {
+    if (!directory.isDirectory() || !/^[0-9a-f]{2}$/u.test(directory.name)) continue
+    for (const object of readdirSync(join(objects, directory.name), { withFileTypes: true })) {
+      if (!object.isFile() || !/^(?:[0-9a-f]{38}|[0-9a-f]{62})$/u.test(object.name)) continue
+      const sha = `${directory.name}${object.name}`
+      if (
+        privateRun(repository.worktree, repository.privateGitDirectory, ["cat-file", "-t", sha]).trim() === "commit"
+      ) {
+        privateCommits.add(sha)
+      }
+    }
+  }
+
+  const packs = join(objects, "pack")
+  if (existsSync(packs)) {
+    for (const index of readdirSync(packs, { withFileTypes: true })) {
+      if (!index.isFile() || !index.name.endsWith(".idx")) continue
+      for (const line of lines(runGit(repository.worktree, ["verify-pack", "-v", join(packs, index.name)]))) {
+        const commit = /^([0-9a-f]{40}|[0-9a-f]{64}) commit\s/u.exec(line)?.[1]
+        if (commit !== undefined) privateCommits.add(commit)
+      }
+    }
+  }
+
+  const reachable = new Set(
+    lines(privateRun(repository.worktree, repository.privateGitDirectory, ["rev-list", "--all", "HEAD"])),
+  )
+  return [...privateCommits].filter((sha) => !reachable.has(sha)).toSorted()
 }
 
 function assertCleanPrivateRepository(repository: PrivateGitProjectedRepository): void {
