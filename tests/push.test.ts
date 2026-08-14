@@ -408,6 +408,27 @@ describe("explicit recursive push mechanics", () => {
     expect(git(remote, "rev-parse", "refs/heads/main")).toBe(source)
   })
 
+  test("preserves native non-fast-forward refusal when no explicit lease is supplied", async () => {
+    const { repository, remote, source: base } = pushFixture("native-non-fast-forward")
+    git(repository, "push", "-q", remote, `${base}:refs/heads/main`)
+    const wanted = advanceRepository(repository, "wanted.txt", "wanted\n")
+    git(repository, "switch", "-q", "-c", "competing", base)
+    const competing = advanceRepository(repository, "competing.txt", "competing\n")
+    git(repository, "push", "-q", remote, `${competing}:refs/heads/main`)
+
+    const result = await pushRefUpdates({
+      root: repository,
+      updates: [update(repository, remote, wanted)],
+    })
+
+    expect(result).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: { code: "push-rejected", phase: "push-refs" },
+    })
+    expect(git(remote, "rev-parse", "refs/heads/main")).toBe(competing)
+  })
+
   test("rechecks the frozen remote value under the mutation lock", async () => {
     const { repository, remote, source: before } = pushFixture("remote-race")
     git(repository, "push", "-q", remote, `${before}:refs/heads/main`)

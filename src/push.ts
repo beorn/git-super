@@ -50,6 +50,7 @@ type PlannedUpdate = Readonly<{
   source: string
   destination: string
   expectedDestination: ExpectedDestination
+  explicitExpectation: boolean
 }>
 
 type PushGroup = Readonly<{
@@ -224,7 +225,12 @@ async function planUpdates(git: GitProcess, input: readonly RefUpdate[]): Promis
       !sameExpected(update.expectedDestination, observed) &&
       !identicalCreateOnlyRetry
     ) {
-      const planned = { ...update, repository, expectedDestination: update.expectedDestination }
+      const planned = {
+        ...update,
+        repository,
+        expectedDestination: update.expectedDestination,
+        explicitExpectation: true,
+      }
       throw Object.assign(new Error("remote destination does not match its explicit expectation"), {
         resultDetail: mismatchDetail(planned, observed, "observe-destination"),
       })
@@ -235,6 +241,7 @@ async function planUpdates(git: GitProcess, input: readonly RefUpdate[]): Promis
       source: update.source,
       destination: update.destination,
       expectedDestination: identicalCreateOnlyRetry ? observed : (update.expectedDestination ?? observed),
+      explicitExpectation: update.expectedDestination !== undefined,
     })
   }
 
@@ -287,7 +294,11 @@ function lease(update: PlannedUpdate): string {
   return `--force-with-lease=${update.destination}:${expected}`
 }
 
-function refResult(update: PlannedUpdate, state: GitResultState, failure?: GitResultDetail): GitSuperRefResult {
+function refResult(
+  update: Pick<PlannedUpdate, "destination" | "source">,
+  state: GitResultState,
+  failure?: GitResultDetail,
+): GitSuperRefResult {
   return {
     source: update.source,
     destination: update.destination,
@@ -369,7 +380,7 @@ async function applyGroup(
     ...(options.verify === false ? ["--no-verify"] : []),
     ...(options.signed === undefined ? [] : [`--signed=${options.signed}`]),
     ...(options.pushOptions ?? []).map((option) => `--push-option=${option}`),
-    ...group.updates.map(lease),
+    ...group.updates.filter((update) => update.explicitExpectation).map(lease),
     group.remote,
     ...group.updates.map((update) => `${update.source}:${update.destination}`),
   ]
@@ -905,13 +916,7 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
               repository: root,
               state: "not-run",
               detail: failure,
-              refs: rootUpdates.map((update) =>
-                refResult(
-                  { ...update, expectedDestination: update.expectedDestination ?? { state: "missing" } },
-                  "not-run",
-                  failure,
-                ),
-              ),
+              refs: rootUpdates.map((update) => refResult(update, "not-run", failure)),
             },
           ],
           failure,
