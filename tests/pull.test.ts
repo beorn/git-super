@@ -582,43 +582,51 @@ describe("git super pull --ff-only", () => {
     expect(readFileSync(join(checkout, "local.txt"), "utf8")).toBe("kept locally\n")
   })
 
-  test("the dry-run tree oracle refuses the same untracked collision as real Git without changing it", async () => {
-    const fixture = mkdtempSync(join(tmpdir(), "git-super-pull-oracle-"))
-    roots.push(fixture)
-    const upstream = join(fixture, "upstream")
-    const planned = join(fixture, "planned")
-    const control = join(fixture, "control")
-    const before = createRepository(upstream, "README.md", "one\n")
-    git(fixture, "clone", "-q", upstream, planned)
-    git(fixture, "clone", "-q", upstream, control)
-    writeFileSync(join(planned, "new.txt"), "local\n")
-    writeFileSync(join(control, "new.txt"), "local\n")
-    const beforeIndex = git(planned, "write-tree")
-    advanceRepository(upstream, "new.txt", "remote\n")
+  test.each(["tracked", "staged", "untracked"] as const)(
+    "the dry-run tree oracle refuses the same %s collision as real Git without changing it",
+    async (kind) => {
+      const fixture = mkdtempSync(join(tmpdir(), `git-super-pull-oracle-${kind}-`))
+      roots.push(fixture)
+      const upstream = join(fixture, "upstream")
+      const planned = join(fixture, "planned")
+      const control = join(fixture, "control")
+      const before = createRepository(upstream, "README.md", "one\n")
+      git(fixture, "clone", "-q", upstream, planned)
+      git(fixture, "clone", "-q", upstream, control)
+      const path = kind === "untracked" ? "new.txt" : "README.md"
+      writeFileSync(join(planned, path), "local\n")
+      writeFileSync(join(control, path), "local\n")
+      if (kind === "staged") {
+        git(planned, "add", path)
+        git(control, "add", path)
+      }
+      const beforeIndex = git(planned, "write-tree")
+      advanceRepository(upstream, path, "remote\n")
 
-    const result = await superPull({
-      repo: planned,
-      repository: "origin",
-      refspecs: ["main"],
-      ffOnly: true,
-      dryRun: true,
-    })
-    git(control, "fetch", "-q", "origin", "main")
-    const actual = await createLocalGitProcess().run({
-      repo: control,
-      args: ["merge", "--ff-only", "--no-edit", "FETCH_HEAD"],
-    })
+      const result = await superPull({
+        repo: planned,
+        repository: "origin",
+        refspecs: ["main"],
+        ffOnly: true,
+        dryRun: true,
+      })
+      git(control, "fetch", "-q", "origin", "main")
+      const actual = await createLocalGitProcess().run({
+        repo: control,
+        args: ["merge", "--ff-only", "--no-edit", "FETCH_HEAD"],
+      })
 
-    expect(result).toMatchObject({
-      state: "failed",
-      partial: false,
-      detail: { phase: "preflight-tree-transition" },
-    })
-    expect(actual.code).not.toBe(0)
-    expect(git(planned, "rev-parse", "HEAD")).toBe(before)
-    expect(git(planned, "write-tree")).toBe(beforeIndex)
-    expect(readFileSync(join(planned, "new.txt"), "utf8")).toBe("local\n")
-  })
+      expect(result).toMatchObject({
+        state: "failed",
+        partial: false,
+        detail: { phase: "preflight-tree-transition" },
+      })
+      expect(actual.code).not.toBe(0)
+      expect(git(planned, "rev-parse", "HEAD")).toBe(before)
+      expect(git(planned, "write-tree")).toBe(beforeIndex)
+      expect(readFileSync(join(planned, path), "utf8")).toBe("local\n")
+    },
+  )
 
   test("the real executable emits stable JSON for success and operational failure", () => {
     const fixture = mkdtempSync(join(tmpdir(), "git-super-pull-bin-"))
