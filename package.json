@@ -17,12 +17,14 @@
   "exports": {
     ".": "./src/index.ts",
     "./composition": "./src/composition.ts",
+    "./commit-graph": "./src/commit-graph.ts",
     "./exclusive": "./src/exclusive.ts",
     "./process": "./src/process.ts",
     "./pull": "./src/pull.ts",
     "./push": "./src/push.ts",
     "./result": "./src/result.ts",
     "./submodules": "./src/submodules.ts",
+    "./submodule-origin": "./src/submodule-origin.ts",
     "./worktree": "./src/worktree.ts"
   },
   "scripts": {

@@ -102,6 +102,7 @@ bun run typecheck
 - `src/diff.ts`, `src/status.ts`, and `src/merge-base.ts` are pure read-plumbing services over an explicit Git process adapter.
 - `src/worktree.ts` is the injected write-plumbing service: add, lock, unlock, inspect, exact removal, recovery, and hook quarantine. Its repository lock deliberately retains the cutover identity `.git/.../yrd-worktree-mutations/writer.lock`, so old and new callers exclude one another.
 - `src/submodules.ts` is the single recursive materializer for Yrd and host adapters. It proves exact gitlinks before borrowing local objects, reports remote fallbacks, supports a top-level path allowlist, and recurses through nested gitlinks.
+- `src/submodule-origin.ts` resolves absolute, URL, scp-like, and relative `.gitmodules` origins without product policy.
 - `src/commit-graph.ts` is the strict, read-only parser for gitlinks recorded in an exact commit. Pull and push share it rather than interpreting `.gitmodules` independently.
 - `src/process.ts` is the public injected Git process capability for graph operations. `src/result.ts` owns their shared repository/ref result vocabulary and aggregation law.
 - `src/pull.ts` owns the fetch/freeze/preflight/recheck/apply fast-forward operation. It imports no scheduler, delivery, or fleet policy.
@@ -112,4 +113,4 @@ bun run typecheck
 
 The package depends only on published packages. It contains no delivery daemon, fleet policy, task tracker, or host-repository imports.
 
-Library consumers may import the root `git-super` operation surface, `git-super/worktree` for injected worktree mechanics, or `git-super/submodules` for recursive materialization. Slot naming, leases, branch shapes, queue admission, retry policy, and lifecycle remain owned by callers.
+Library consumers may import the root `git-super` operation surface, `git-super/commit-graph` for frozen submodule descriptors, `git-super/submodule-origin` for remote resolution, `git-super/worktree` for injected worktree mechanics, or `git-super/submodules` for recursive materialization. Slot naming, leases, branch shapes, queue admission, retry policy, and lifecycle remain owned by callers.
