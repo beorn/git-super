@@ -10,10 +10,12 @@ import { join } from "node:path"
 import { afterEach, describe, expect, it } from "vitest"
 import {
   materializeSubmodules,
+  materializeSubmodulesWithProcess,
   materializeSubmodulesFromLocalWorktree,
   type SubmoduleGit,
   type SubmoduleGitResult,
 } from "../src/submodules.ts"
+import type { GitProcessRequest } from "../src/process.ts"
 import { cleanGitRepositoryEnvironment } from "../src/git.ts"
 
 const success = (): SubmoduleGitResult => ({ code: 0, stdout: "", stderr: "" })
@@ -24,6 +26,23 @@ afterEach(async () => {
 })
 
 describe("materializeSubmodules", () => {
+  it("uses the canonical GitProcess request internally", async () => {
+    const requests: GitProcessRequest[] = []
+    const result = await materializeSubmodulesWithProcess(
+      {
+        async run(request) {
+          requests.push(request)
+          if (request.args[0] === "cat-file") return { code: 1, stdout: "", stderr: "", timedOut: false }
+          return { code: 0, stdout: "", stderr: "", timedOut: false }
+        },
+      },
+      { worktree: "/worktree" },
+    )
+
+    expect(result.code).toBe(0)
+    expect(requests.every((request) => request.repo === "/worktree")).toBe(true)
+  })
+
   it("strips repository pointers without deleting caller Git policy", () => {
     expect(
       cleanGitRepositoryEnvironment({

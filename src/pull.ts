@@ -11,6 +11,7 @@ export type SuperPullOptions = Readonly<{
   refspecs?: readonly string[]
   ffOnly: boolean
   dryRun?: boolean
+  timeoutMs?: number
   git?: GitProcess
   exclusive?: Exclusive
 }>
@@ -31,17 +32,19 @@ type PullRepositoryPlan = Readonly<{
   target: string
 }>
 
+const DEFAULT_GIT_TIMEOUT_MS = 30_000
+
 function detail(code: string, phase: string, message: string, extra: Partial<GitResultDetail> = {}): GitResultDetail {
   return { code, phase, message, ...extra }
 }
 
 async function run(git: GitProcess, repository: string, args: readonly string[], environment?: NodeJS.ProcessEnv) {
-  return git.run({ repository, args, ...(environment === undefined ? {} : { environment }) })
+  return git.run({ repo: repository, args, ...(environment === undefined ? {} : { env: environment }) })
 }
 
 async function required(git: GitProcess, repository: string, args: readonly string[], phase: string): Promise<string> {
   const result = await run(git, repository, args)
-  if (result.exitCode !== 0) throw operationError(repository, phase, args, result)
+  if (result.code !== 0) throw operationError(repository, phase, args, result)
   return result.stdout.trim()
 }
 
@@ -53,7 +56,7 @@ function operationError(
 ): Error & Readonly<{ resultDetail: GitResultDetail }> {
   const message = result.timedOut
     ? `git ${args.join(" ")} timed out in ${repository}`
-    : `git ${args.join(" ")} failed in ${repository} (exit ${result.exitCode})${result.stderr ? `\n${result.stderr}` : ""}`
+    : `git ${args.join(" ")} failed in ${repository} (exit ${result.code})${result.stderr ? `\n${result.stderr}` : ""}`
   return Object.assign(new Error(message), {
     resultDetail: detail(result.timedOut ? "git-timeout" : "git-failed", phase, message, {
       remedy: "Resolve the reported Git condition, then rerun the same git super pull command.",
@@ -108,7 +111,7 @@ async function planPull(git: GitProcess, options: SuperPullOptions): Promise<Pul
     )
   }
   const ancestor = await run(git, root, ["merge-base", "--is-ancestor", current, target])
-  if (ancestor.exitCode !== 0) {
+  if (ancestor.code !== 0) {
     throw Object.assign(new Error(`git super pull --ff-only refused divergent root ${root}`), {
       resultDetail: detail(
         "non-fast-forward",
@@ -188,8 +191,24 @@ async function observeRemoteTarget(
 type SubmoduleEntry = Readonly<{ path: string; target: string }>
 
 async function submoduleEntries(git: GitProcess, repository: string, commit: string): Promise<SubmoduleEntry[]> {
-  const manifest = await run(git, repository, ["cat-file", "-e", `${commit}:.gitmodules`])
-  if (manifest.exitCode !== 0) return []
+  const manifest = await run(git, repository, ["ls-tree", commit, "--", ".gitmodules"])
+  if (manifest.code !== 0) {
+    throw operationError(repository, "read-target-manifest", ["ls-tree", commit, "--", ".gitmodules"], manifest)
+  }
+  if (manifest.stdout.trim() === "") return []
+  if (!/^100[0-9]{3} blob [0-9a-f]+\t\.gitmodules\s*$/mu.test(manifest.stdout)) {
+    throw Object.assign(new Error(`target ${commit} has an invalid .gitmodules entry`), {
+      resultDetail: detail(
+        "invalid-target-manifest",
+        "read-target-manifest",
+        `Target ${commit} has an invalid .gitmodules entry.`,
+        {
+          paths: [".gitmodules"],
+          objectIds: [commit],
+        },
+      ),
+    })
+  }
   const configured = await run(git, repository, [
     "config",
     "--blob",
@@ -197,8 +216,8 @@ async function submoduleEntries(git: GitProcess, repository: string, commit: str
     "--get-regexp",
     "^submodule\\..*\\.path$",
   ])
-  if (configured.exitCode === 1 && configured.stdout.trim() === "" && configured.stderr === "") return []
-  if (configured.exitCode !== 0) {
+  if (configured.code === 1 && configured.stdout.trim() === "" && configured.stderr === "") return []
+  if (configured.code !== 0) {
     throw operationError(
       repository,
       "read-target-submodules",
@@ -235,7 +254,7 @@ async function submoduleEntries(git: GitProcess, repository: string, commit: str
 
 async function ensureCommit(git: GitProcess, repository: string, target: string): Promise<void> {
   const present = await run(git, repository, ["cat-file", "-e", `${target}^{commit}`])
-  if (present.exitCode === 0) return
+  if (present.code === 0) return
   await required(
     git,
     repository,
@@ -253,7 +272,7 @@ async function refuseUnpublishedDetachedHead(
 ): Promise<void> {
   if (recorded === undefined || actual === recorded) return
   const branch = await run(git, repository, ["symbolic-ref", "-q", "HEAD"])
-  if (branch.exitCode === 0) return
+  if (branch.code === 0) return
   const refs = await required(
     git,
     repository,
@@ -291,7 +310,7 @@ async function freezeRepositoryGraph(
       const childPath = path === "." ? entry.path : `${path}/${entry.path}`
       const childRepository = join(repository, entry.path)
       const discovered = await run(git, childRepository, ["rev-parse", "--show-toplevel"])
-      if (discovered.exitCode !== 0) {
+      if (discovered.code !== 0) {
         throw Object.assign(new Error(`submodule ${childPath} is not initialized`), {
           resultDetail: detail(
             "submodule-not-initialized",
@@ -343,8 +362,7 @@ async function proveTreeTransition(
       ["-c", "submodule.recurse=false", "read-tree", "-n", "-m", "-u", current, target],
       { GIT_INDEX_FILE: temporaryIndex },
     )
-    if (transition.exitCode !== 0)
-      throw operationError(repository, "preflight-tree-transition", ["read-tree"], transition)
+    if (transition.code !== 0) throw operationError(repository, "preflight-tree-transition", ["read-tree"], transition)
   } finally {
     rmSync(scratch, { recursive: true, force: true })
   }
@@ -374,7 +392,7 @@ async function refuseIgnoredIncomingCollisions(
     "--",
     ".",
   ])
-  if (changed.exitCode !== 0) {
+  if (changed.code !== 0) {
     throw operationError(repository, "preflight-ignored-paths", ["diff", current, target], changed)
   }
   const incoming = nulPaths(changed.stdout)
@@ -393,7 +411,7 @@ async function refuseIgnoredIncomingCollisions(
       "--",
       ...batch,
     ])
-    if (listed.exitCode !== 0) {
+    if (listed.code !== 0) {
       throw operationError(repository, "preflight-ignored-paths", ["ls-files", "--ignored"], listed)
     }
     for (const path of nulPaths(listed.stdout)) ignored.add(path.replace(/\/+$/u, ""))
@@ -447,7 +465,15 @@ function repositoryResult(
 
 /** Fetch, freeze, preflight, recheck under the shared mutation lock, then fast-forward. */
 export async function superPull(options: SuperPullOptions): Promise<GitSuperResult> {
-  const git = options.git ?? createLocalGitProcess()
+  const timeoutMs = options.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    const failure = detail("invalid-timeout", "validate", "Git command timeout must be a positive finite number.")
+    return gitSuperResult([{ repository: resolve(options.repo), state: "failed", detail: failure, refs: [] }], failure)
+  }
+  const process = options.git ?? createLocalGitProcess()
+  const git: GitProcess = {
+    run: (request) => process.run({ ...request, timeoutMs: request.timeoutMs ?? timeoutMs }),
+  }
   let plan: PullPlan
   try {
     plan = await planPull(git, options)
@@ -526,7 +552,7 @@ export async function superPull(options: SuperPullOptions): Promise<GitSuperResu
               ? ["-c", "submodule.recurse=false", "merge", "--ff-only", "--no-edit", repository.target]
               : ["-c", "submodule.recurse=false", "checkout", "--detach", repository.target]
           const applied = await run(git, repository.repository, args)
-          if (applied.exitCode !== 0) {
+          if (applied.code !== 0) {
             const failure = operationError(
               repository.repository,
               index === 0 ? "apply-root" : "apply-submodule",

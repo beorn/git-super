@@ -5,7 +5,8 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path"
 import { fileURLToPath } from "node:url"
 import { createExclusive } from "./exclusive.ts"
 import { cleanGitEnvironment } from "./git.ts"
-import { materializeSubmodules } from "./submodules.ts"
+import { createLocalGitProcess, type GitProcess } from "./process.ts"
+import { materializeSubmodulesWithProcess } from "./submodules.ts"
 
 export type GitResult = Readonly<{ code: number; stdout: string; stderr: string }>
 export type Git = ReturnType<typeof createGit>
@@ -16,7 +17,10 @@ export type GitWorktreeRunner = Readonly<{
 
 export type GitWorktreeStoreOptions = Readonly<{
   repo: string
+  gitProcess?: GitProcess
+  /** @deprecated Gate D migrates callers to gitProcess. */
   process?: GitWorktreeProcess
+  /** @deprecated Gate D migrates callers to gitProcess. */
   git?: GitWorktreeRunner
   env?: NodeJS.ProcessEnv
   signal?: AbortSignal
@@ -63,7 +67,7 @@ const GIT_TIMEOUT_MS = 30_000
 /** Worktree removal is correctness-critical and can exceed an interactive timeout under host load. */
 const GIT_CLEANUP_TIMEOUT_MS = 120_000
 
-export type LocalGitWorktreeStoreOptions = Omit<GitWorktreeStoreOptions, "git" | "process">
+export type LocalGitWorktreeStoreOptions = Omit<GitWorktreeStoreOptions, "git" | "process" | "gitProcess">
 
 export type LocalGitWorktreeMutation =
   | Readonly<{ kind: "add-detached"; repo: string; path: string; ref: string; operation?: string }>
@@ -75,32 +79,7 @@ export type LocalGitWorktreeMutationResult = Readonly<{ exitCode: number; stdout
 export function createLocalGitWorktreeStore(options: LocalGitWorktreeStoreOptions): GitWorktreeStore {
   return createGitWorktreeStore({
     ...options,
-    process: {
-      async run(request) {
-        let timedOut = false
-        const child = Bun.spawn([...request.argv], {
-          ...(request.cwd === undefined ? {} : { cwd: request.cwd }),
-          ...(request.env === undefined ? {} : { env: request.env }),
-          ...(request.signal === undefined ? {} : { signal: request.signal }),
-          stdout: "pipe",
-          stderr: "pipe",
-        })
-        const timer =
-          request.timeoutMs === undefined
-            ? undefined
-            : setTimeout(() => {
-                timedOut = true
-                child.kill()
-              }, request.timeoutMs)
-        const [exitCode, stdout, stderr] = await Promise.all([
-          child.exited,
-          new Response(child.stdout).text(),
-          new Response(child.stderr).text(),
-        ])
-        if (timer !== undefined) clearTimeout(timer)
-        return { exitCode, stdout, stderr, timedOut }
-      },
-    },
+    gitProcess: createLocalGitProcess(options.env),
   })
 }
 
@@ -159,6 +138,46 @@ function createGit(
   const commit = async (repo: string, ref: string): Promise<string> =>
     (await run(repo, ["rev-parse", "--verify", `${ref}^{commit}`])).stdout.trim()
 
+  return Object.freeze({ run, mutateConfig, commit })
+}
+
+function createGitFromProcess(
+  process: GitProcess,
+  environment: NodeJS.ProcessEnv,
+  operationTimeoutMs: number,
+  signal?: AbortSignal,
+) {
+  const env = cleanGitEnvironment(environment)
+  const run = async (
+    repo: string,
+    args: readonly string[],
+    allowFailure = false,
+    timeoutMs = operationTimeoutMs,
+  ): Promise<GitResult> => {
+    const result = await process.run({ repo, args, env, ...(signal === undefined ? {} : { signal }), timeoutMs })
+    const unsettled = result.failure ?? (result.stalled ? "stalled" : result.timedOut ? "timed out" : result.signal)
+    if (unsettled !== undefined && unsettled !== null) {
+      const message = `git ${args.join(" ")} ${unsettled} in ${repo}`
+      if (!allowFailure) throw new Error(message)
+      return { code: result.code === 0 ? 1 : result.code, stdout: result.stdout, stderr: result.stderr || message }
+    }
+    if (!allowFailure && result.code !== 0) {
+      throw new Error(result.stderr.trim() || result.stdout.trim() || `git ${args.join(" ")} exited ${result.code}`)
+    }
+    return { code: result.code, stdout: result.stdout, stderr: result.stderr }
+  }
+  const mutateConfig = async (repo: string, args: readonly string[]): Promise<GitResult> => {
+    let result: GitResult | undefined
+    for (let attempt = 1; attempt <= 20; attempt += 1) {
+      result = await run(repo, args, true)
+      if (result.code === 0 || !result.stderr.includes("could not lock config file")) return result
+      await Bun.sleep(attempt * 5)
+    }
+    if (result === undefined) throw new Error("git-super: Git config retry did not run")
+    return result
+  }
+  const commit = async (repo: string, ref: string): Promise<string> =>
+    (await run(repo, ["rev-parse", "--verify", `${ref}^{commit}`])).stdout.trim()
   return Object.freeze({ run, mutateConfig, commit })
 }
 
@@ -272,16 +291,19 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
     cleanup: options.timeouts?.cleanup ?? GIT_CLEANUP_TIMEOUT_MS,
     mutationLock: options.timeouts?.mutationLock ?? GIT_TIMEOUT_MS,
   }
-  if (options.git === undefined && options.process === undefined) {
-    throw new Error("yrd: Git worktree capability requires an injected process or Git runner")
+  const capabilities = [options.gitProcess, options.process, options.git].filter((value) => value !== undefined)
+  if (capabilities.length === 0) {
+    throw new Error("git-super: Git worktree capability requires one injected GitProcess")
   }
-  if (options.git !== undefined && options.process !== undefined) {
-    throw new Error("yrd: Git worktree capability accepts either an injected process or Git runner, not both")
+  if (capabilities.length !== 1) {
+    throw new Error("git-super: Git worktree capability accepts exactly one injected Git process capability")
   }
   const git =
-    options.git === undefined
-      ? createGit(options.process as GitWorktreeProcess, options.env ?? process.env, timeouts.operation, options.signal)
-      : adaptGit(options.git)
+    options.gitProcess !== undefined
+      ? createGitFromProcess(options.gitProcess, options.env ?? process.env, timeouts.operation, options.signal)
+      : options.process !== undefined
+        ? createGit(options.process, options.env ?? process.env, timeouts.operation, options.signal)
+        : adaptGit(options.git as GitWorktreeRunner)
   let mutations: Promise<ReturnType<typeof createExclusive>> | undefined
   const mutationLock = (): Promise<ReturnType<typeof createExclusive>> => {
     mutations ??= (async () => {
@@ -343,16 +365,18 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       path: string,
       materializeOptions: Readonly<{ force?: boolean; hooks?: WorktreeHookPolicy }> = {},
     ): Promise<void> {
-      const materializeGit =
-        materializeOptions.hooks === "quarantine"
-          ? {
-              run: (cwd: string, args: readonly string[], allowFailure = false) =>
-                git.run(cwd, withHookPolicy(args, "quarantine"), allowFailure),
-              mutateConfig: (cwd: string, args: readonly string[]) =>
-                git.mutateConfig(cwd, withHookPolicy(args, "quarantine")),
-            }
-          : git
-      const result = await materializeSubmodules(materializeGit, {
+      const materializeProcess: GitProcess = {
+        async run(request) {
+          const result = await git.run(
+            request.repo,
+            withHookPolicy(request.args, materializeOptions.hooks),
+            true,
+            request.timeoutMs,
+          )
+          return { code: result.code, stdout: result.stdout, stderr: result.stderr }
+        },
+      }
+      const result = await materializeSubmodulesWithProcess(materializeProcess, {
         worktree: path,
         referenceWorktree: repo,
         ...(materializeOptions.force === true ? { force: true } : {}),

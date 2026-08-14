@@ -35,28 +35,12 @@ export type SubmoduleCompositionPlan =
   | Readonly<{ status: "planned"; resolutions: readonly SubmoduleResolution[] }>
   | Readonly<{ status: "refused"; conflicts: readonly SubmoduleCompositionConflict[] }>
 
-export type SubmoduleCompositionGitRequest = Readonly<{
-  repo: string
-  args: readonly string[]
-  env: NodeJS.ProcessEnv
-  stdin?: string
-  signal?: AbortSignal
-  timeoutMs: number
-}>
+export type SubmoduleCompositionGitRequest = GitProcessRequest & Readonly<{ env: NodeJS.ProcessEnv; timeoutMs: number }>
 
-export type SubmoduleCompositionGitResult = Readonly<{
-  code: number
-  stdout: string
-  stderr: string
-  failure?: string
-  signal?: string | null
-  timedOut?: boolean
-  stalled?: boolean
-}>
+export type SubmoduleCompositionGitResult = GitProcessResult
 
-export type SubmoduleCompositionGit = Readonly<{
-  run(request: SubmoduleCompositionGitRequest): Promise<SubmoduleCompositionGitResult>
-}>
+/** @deprecated Use GitProcess from git-super/process. */
+export type SubmoduleCompositionGit = GitProcess
 
 export type SubmoduleReviewedBlob = Readonly<{ path: string; oid: string; content: string }>
 
@@ -432,3 +416,4 @@ function hasGitlinkStage(conflict: SubmoduleTreeConflict): boolean {
 function compareText(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0
 }
+import type { GitProcess, GitProcessRequest, GitProcessResult } from "./process.ts"

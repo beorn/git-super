@@ -1,20 +1,22 @@
-import { spawnSync } from "node:child_process"
 import { cleanGitRepositoryEnvironment } from "./git.ts"
 
 export type GitProcessRequest = Readonly<{
-  repository: string
+  repo: string
   args: readonly string[]
-  environment?: NodeJS.ProcessEnv
+  env?: NodeJS.ProcessEnv
   stdin?: string
+  signal?: AbortSignal
   timeoutMs?: number
 }>
 
 export type GitProcessResult = Readonly<{
-  exitCode: number
+  code: number
   stdout: string
   stderr: string
-  timedOut: boolean
-  signal?: NodeJS.Signals
+  failure?: string
+  signal?: string | null
+  timedOut?: boolean
+  stalled?: boolean
 }>
 
 /** The one injectable Git process capability used by graph operations. */
@@ -26,22 +28,38 @@ export function createLocalGitProcess(environment: NodeJS.ProcessEnv = process.e
   const baseEnvironment = cleanGitRepositoryEnvironment(environment)
   return {
     async run(request) {
-      const result = spawnSync("git", ["-C", request.repository, ...request.args], {
-        encoding: "utf8",
-        env: { ...baseEnvironment, ...request.environment },
-        input: request.stdin,
-        maxBuffer: 64 * 1024 * 1024,
-        timeout: request.timeoutMs,
-      })
-      if (result.error !== undefined && (result.error as NodeJS.ErrnoException).code !== "ETIMEDOUT") {
-        throw new Error(`failed to run git in ${request.repository}: ${result.error.message}`)
+      let timedOut = false
+      let child: ReturnType<typeof Bun.spawn>
+      try {
+        child = Bun.spawn(["git", "-C", request.repo, ...request.args], {
+          env: { ...baseEnvironment, ...request.env },
+          stdin: request.stdin === undefined ? "ignore" : new Blob([request.stdin]),
+          ...(request.signal === undefined ? {} : { signal: request.signal }),
+          stdout: "pipe",
+          stderr: "pipe",
+        })
+      } catch (error) {
+        const failure = error instanceof Error ? error.message : String(error)
+        return { code: 1, stdout: "", stderr: failure, failure }
       }
+      const timer =
+        request.timeoutMs === undefined
+          ? undefined
+          : setTimeout(() => {
+              timedOut = true
+              child.kill()
+            }, request.timeoutMs)
+      const [code, stdout, stderr] = await Promise.all([
+        child.exited,
+        new Response(child.stdout as ReadableStream<Uint8Array>).text(),
+        new Response(child.stderr as ReadableStream<Uint8Array>).text(),
+      ])
+      if (timer !== undefined) clearTimeout(timer)
       return {
-        exitCode: result.status ?? 1,
-        stdout: result.stdout ?? "",
-        stderr: result.stderr?.trim() ?? result.error?.message ?? "",
-        timedOut: (result.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT",
-        ...(result.signal === null ? {} : { signal: result.signal }),
+        code,
+        stdout,
+        stderr: stderr.trim(),
+        ...(timedOut ? { timedOut: true } : {}),
       }
     },
   }

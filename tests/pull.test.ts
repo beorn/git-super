@@ -398,6 +398,71 @@ describe("git super pull --ff-only", () => {
     })
   })
 
+  test("does not turn a target-manifest read failure into an empty submodule graph", async () => {
+    const fixture = mkdtempSync(join(tmpdir(), "git-super-pull-manifest-failure-"))
+    roots.push(fixture)
+    const upstream = join(fixture, "upstream")
+    const checkout = join(fixture, "checkout")
+    const before = createRepository(upstream, "README.md", "one\n")
+    git(fixture, "clone", "-q", upstream, checkout)
+    advanceRepository(upstream, "README.md", "two\n")
+    const local = createLocalGitProcess()
+    const failing: GitProcess = {
+      async run(request) {
+        if (request.args[0] === "ls-tree" && request.args.at(-1) === ".gitmodules") {
+          return { code: 77, stdout: "", stderr: "injected target manifest read failure" }
+        }
+        return local.run(request)
+      },
+    }
+
+    const result = await superPull({
+      repo: checkout,
+      repository: "origin",
+      refspecs: ["main"],
+      ffOnly: true,
+      git: failing,
+    })
+
+    expect(git(checkout, "rev-parse", "HEAD")).toBe(before)
+    expect(result).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: { code: "git-failed", phase: "read-target-manifest" },
+    })
+  })
+
+  test("bounds every Git subprocess through the shared process port", async () => {
+    const fixture = mkdtempSync(join(tmpdir(), "git-super-pull-timeout-"))
+    roots.push(fixture)
+    const upstream = join(fixture, "upstream")
+    const checkout = join(fixture, "checkout")
+    createRepository(upstream, "README.md", "one\n")
+    git(fixture, "clone", "-q", upstream, checkout)
+    advanceRepository(upstream, "README.md", "two\n")
+    const local = createLocalGitProcess()
+    const timeouts: Array<number | undefined> = []
+    const recording: GitProcess = {
+      async run(request) {
+        timeouts.push(request.timeoutMs)
+        return local.run(request)
+      },
+    }
+
+    const result = await superPull({
+      repo: checkout,
+      repository: "origin",
+      refspecs: ["main"],
+      ffOnly: true,
+      timeoutMs: 1234,
+      git: recording,
+    })
+
+    expect(result.state).toBe("updated")
+    expect(timeouts.length).toBeGreaterThan(0)
+    expect(new Set(timeouts)).toEqual(new Set([1234]))
+  })
+
   test("reports mutation lock contention without moving HEAD", async () => {
     const fixture = mkdtempSync(join(tmpdir(), "git-super-pull-lock-"))
     roots.push(fixture)
@@ -453,8 +518,8 @@ describe("git super pull --ff-only", () => {
     const failing: GitProcess = {
       async run(request) {
         if (request.args.includes("merge") || request.args.includes("checkout")) writeCommands.push([...request.args])
-        if (request.repository === alphaCheckout && request.args.includes("checkout")) {
-          return { exitCode: 55, stdout: "", stderr: "injected child checkout failure", timedOut: false }
+        if (request.repo === alphaCheckout && request.args.includes("checkout")) {
+          return { code: 55, stdout: "", stderr: "injected child checkout failure", timedOut: false }
         }
         return local.run(request)
       },
@@ -540,7 +605,7 @@ describe("git super pull --ff-only", () => {
     })
     git(control, "fetch", "-q", "origin", "main")
     const actual = await createLocalGitProcess().run({
-      repository: control,
+      repo: control,
       args: ["merge", "--ff-only", "--no-edit", "FETCH_HEAD"],
     })
 
@@ -549,7 +614,7 @@ describe("git super pull --ff-only", () => {
       partial: false,
       detail: { phase: "preflight-tree-transition" },
     })
-    expect(actual.exitCode).not.toBe(0)
+    expect(actual.code).not.toBe(0)
     expect(git(planned, "rev-parse", "HEAD")).toBe(before)
     expect(git(planned, "write-tree")).toBe(beforeIndex)
     expect(readFileSync(join(planned, "new.txt"), "utf8")).toBe("local\n")

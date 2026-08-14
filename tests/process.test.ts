@@ -18,12 +18,12 @@ describe("GitProcess", () => {
     createRepository(fixture, "README.md", "one\n")
 
     const result = await createLocalGitProcess().run({
-      repository: fixture,
+      repo: fixture,
       args: ["-c", "alias.pause=!sleep 1", "pause"],
       timeoutMs: 10,
     })
 
-    expect(result.exitCode).not.toBe(0)
+    expect(result.code).not.toBe(0)
     expect(result.timedOut).toBe(true)
   })
 })

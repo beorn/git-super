@@ -3,6 +3,7 @@ import { existsSync, realpathSync } from "node:fs"
 import { join, resolve } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 import { cleanGitRepositoryEnvironment } from "./git.ts"
+import { createLocalGitProcess, type GitProcess } from "./process.ts"
 
 export const SUBMODULE_ALTERNATE_LOCATION = "superproject"
 export const SUBMODULE_ALTERNATE_ERROR_STRATEGY = "info"
@@ -199,22 +200,36 @@ export async function materializeSubmodules(
   return { ...result, borrowed, remoteFallbacks }
 }
 
-function hostGit(environment: NodeJS.ProcessEnv): SubmoduleGit {
-  return {
-    async run(repo, args) {
-      const child = Bun.spawn(["git", "-C", repo, ...args], {
-        env: environment,
-        stdout: "pipe",
-        stderr: "pipe",
-      })
-      const [stdout, stderr, code] = await Promise.all([
-        new Response(child.stdout).text(),
-        new Response(child.stderr).text(),
-        child.exited,
-      ])
-      return { code, stdout, stderr }
-    },
+function adaptGitProcess(process: GitProcess): SubmoduleGit {
+  const run: SubmoduleGit["run"] = async (repo, args) => {
+    const result = await process.run({ repo, args })
+    return { code: result.code, stdout: result.stdout, stderr: result.stderr }
   }
+  const mutateConfig: NonNullable<SubmoduleGit["mutateConfig"]> = async (repo, args) => {
+    let result = await run(repo, args, true)
+    for (
+      let attempt = 1;
+      result.code !== 0 && result.stderr.includes("could not lock config file") && attempt < 20;
+      attempt += 1
+    ) {
+      await Bun.sleep(attempt * 5)
+      result = await run(repo, args, true)
+    }
+    return result
+  }
+  return { run, mutateConfig }
+}
+
+/** Canonical GitProcess entry; the legacy SubmoduleGit overload is a compatibility boundary for Gate D. */
+export function materializeSubmodulesWithProcess(
+  process: GitProcess,
+  options: SubmoduleMaterializationOptions,
+): Promise<SubmoduleMaterializationResult> {
+  return materializeSubmodules(adaptGitProcess(process), options)
+}
+
+function hostGit(environment: NodeJS.ProcessEnv): SubmoduleGit {
+  return adaptGitProcess(createLocalGitProcess(environment))
 }
 
 function canonical(pathname: string): string {

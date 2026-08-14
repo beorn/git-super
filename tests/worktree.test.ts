@@ -14,6 +14,7 @@ import {
   createLocalGitWorktreeStore,
   runLocalGitWorktreeMutationSync,
 } from "../src/worktree.ts"
+import type { GitProcessRequest } from "../src/process.ts"
 
 function git(repo: string, args: readonly string[]): string {
   const result = spawnSync("git", ["-C", repo, ...args], { encoding: "utf8" })
@@ -22,15 +23,36 @@ function git(repo: string, args: readonly string[]): string {
 }
 
 describe("createGitWorktreeStore", () => {
+  it("uses the canonical GitProcess request internally", async () => {
+    const repo = await mkdtemp(join(tmpdir(), "git-super-process-port-"))
+    const requests: GitProcessRequest[] = []
+    const store = createGitWorktreeStore({
+      repo,
+      gitProcess: {
+        async run(request) {
+          requests.push(request)
+          return { code: 0, stdout: `${join(repo, ".git")}\n`, stderr: "", timedOut: false }
+        },
+      },
+    })
+
+    try {
+      await store.ready()
+      expect(requests[0]).toMatchObject({ repo, args: ["rev-parse", "--path-format=absolute", "--git-common-dir"] })
+    } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
   it("requires exactly one injected Git execution capability", () => {
-    expect(() => createGitWorktreeStore({ repo: "/repo" })).toThrow(/requires an injected process or Git runner/iu)
+    expect(() => createGitWorktreeStore({ repo: "/repo" })).toThrow(/requires one injected GitProcess/iu)
     expect(() =>
       createGitWorktreeStore({
         repo: "/repo",
         process: { run: async () => ({ exitCode: 0, stdout: "", stderr: "", timedOut: false }) },
         git: { run: async () => ({ code: 0, stdout: "", stderr: "" }) },
       }),
-    ).toThrow(/either an injected process or Git runner/iu)
+    ).toThrow(/exactly one injected Git process capability/iu)
   })
 
   it("lets pool policy reset a slot branch at an explicit base", async () => {
