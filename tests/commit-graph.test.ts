@@ -5,7 +5,7 @@ import { afterEach, describe, expect, test } from "vitest"
 
 import { readCommitSubmodules } from "../src/commit-graph.ts"
 import { createLocalGitProcess } from "../src/process.ts"
-import { createProductFixture } from "./fixture.ts"
+import { createProductFixture, git } from "./fixture.ts"
 
 const roots: string[] = []
 
@@ -33,5 +33,21 @@ describe("commit submodule graph", () => {
         url: fixture.beta,
       },
     ])
+  })
+
+  test("refuses a gitlink graph whose manifest was deleted", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-commit-graph-invalid-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    git(fixture.product, "rm", "-q", ".gitmodules")
+    git(fixture.product, "commit", "-q", "-m", "remove manifest")
+    const invalid = git(fixture.product, "rev-parse", "HEAD")
+
+    await expect(readCommitSubmodules(createLocalGitProcess(), fixture.product, invalid)).rejects.toMatchObject({
+      resultDetail: {
+        code: "missing-target-manifest",
+        paths: ["packages/alpha", "vendor/beta"],
+      },
+    })
   })
 })

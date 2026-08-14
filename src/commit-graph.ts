@@ -24,22 +24,53 @@ function operationError(
   })
 }
 
-async function required(git: GitProcess, repository: string, args: readonly string[], phase: string): Promise<string> {
-  const result = await git.run({ repo: repository, args })
-  if (result.code !== 0) throw operationError(repository, phase, args, result)
-  return result.stdout.trim()
-}
-
 /** Read strict submodule metadata and gitlinks from one frozen commit. */
 export async function readCommitSubmodules(
   git: GitProcess,
   repository: string,
   commit: string,
 ): Promise<CommitSubmodule[]> {
+  const treeArgs = ["ls-tree", "-r", "-z", "--full-tree", commit]
+  const tree = await git.run({ repo: repository, args: treeArgs })
+  if (tree.code !== 0) throw operationError(repository, "read-target-tree", treeArgs, tree)
+  const gitlinks = new Map<string, string>()
+  for (const entry of tree.stdout.split("\0").filter((value) => value !== "")) {
+    const separator = entry.indexOf("\t")
+    const match = /^(\d{6}) (\w+) ([0-9a-f]+)$/u.exec(separator < 0 ? "" : entry.slice(0, separator))
+    if (separator < 1 || match?.[1] === undefined || match[2] === undefined || match[3] === undefined) {
+      throw Object.assign(new Error(`target ${commit} has an invalid tree entry`), {
+        resultDetail: detail("invalid-target-tree", "read-target-tree", `Target ${commit} has an invalid tree entry.`, {
+          objectIds: [commit],
+        }),
+      })
+    }
+    if (match[1] !== "160000") continue
+    if (match[2] !== "commit") {
+      throw Object.assign(new Error(`target ${commit} has an invalid gitlink entry`), {
+        resultDetail: detail(
+          "invalid-target-gitlink",
+          "read-target-tree",
+          `Target ${commit} has an invalid gitlink entry.`,
+          { paths: [entry.slice(separator + 1)], objectIds: [commit] },
+        ),
+      })
+    }
+    gitlinks.set(entry.slice(separator + 1), match[3])
+  }
   const manifestArgs = ["ls-tree", commit, "--", ".gitmodules"]
   const manifest = await git.run({ repo: repository, args: manifestArgs })
   if (manifest.code !== 0) throw operationError(repository, "read-target-manifest", manifestArgs, manifest)
-  if (manifest.stdout.trim() === "") return []
+  if (manifest.stdout.trim() === "") {
+    if (gitlinks.size === 0) return []
+    throw Object.assign(new Error(`target ${commit} records gitlinks without .gitmodules`), {
+      resultDetail: detail(
+        "missing-target-manifest",
+        "read-target-manifest",
+        `Target ${commit} records gitlinks without .gitmodules.`,
+        { paths: [...gitlinks.keys()], objectIds: [commit] },
+      ),
+    })
+  }
   if (!/^100[0-9]{3} blob [0-9a-f]+\t\.gitmodules\s*$/mu.test(manifest.stdout)) {
     throw Object.assign(new Error(`target ${commit} has an invalid .gitmodules entry`), {
       resultDetail: detail(
@@ -98,9 +129,8 @@ export async function readCommitSubmodules(
   )) {
     if (configuredEntry.path === undefined) continue
     const path = configuredEntry.path
-    const tree = await required(git, repository, ["ls-tree", commit, "--", path], "read-target-gitlink")
-    const match = /^160000 commit ([0-9a-f]+)\t/u.exec(tree)
-    if (match?.[1] === undefined) {
+    const target = gitlinks.get(path)
+    if (target === undefined) {
       throw Object.assign(new Error(`target ${commit} does not record submodule path ${path}`), {
         resultDetail: detail(
           "missing-target-gitlink",
@@ -113,7 +143,7 @@ export async function readCommitSubmodules(
     const submodule: CommitSubmodule = {
       name,
       path,
-      target: match[1],
+      target,
       ...(configuredEntry.url === undefined ? {} : { url: configuredEntry.url }),
     }
     const previous = configuredPaths.get(path)
@@ -131,6 +161,17 @@ export async function readCommitSubmodules(
       configuredPaths.set(path, submodule)
       entries.push(submodule)
     }
+  }
+  const unconfigured = [...gitlinks.keys()].filter((path) => !configuredPaths.has(path))
+  if (unconfigured.length > 0) {
+    throw Object.assign(new Error(`target ${commit} records gitlinks without submodule metadata`), {
+      resultDetail: detail(
+        "unconfigured-target-gitlink",
+        "read-target-submodules",
+        `Target ${commit} records gitlinks without submodule metadata.`,
+        { paths: unconfigured, objectIds: [commit] },
+      ),
+    })
   }
   return entries
 }
