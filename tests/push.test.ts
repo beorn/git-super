@@ -423,6 +423,40 @@ describe("explicit recursive push mechanics", () => {
     expect(git(remote, "rev-parse", "refs/heads/main")).toBe(source)
   })
 
+  test("an explicit lease cannot bypass the branch fast-forward invariant without a separate authorization", async () => {
+    const { repository, remote, source: base } = pushFixture("leased-non-fast-forward")
+    git(repository, "push", "-q", remote, `${base}:refs/heads/main`)
+    const wanted = advanceRepository(repository, "wanted.txt", "wanted\n")
+    git(repository, "switch", "-q", "-c", "competing", base)
+    const competing = advanceRepository(repository, "competing.txt", "competing\n")
+    git(repository, "push", "-q", remote, `${competing}:refs/heads/main`)
+
+    const refused = await pushRefUpdates({
+      root: repository,
+      updates: [update(repository, remote, wanted, { state: "oid", oid: competing })],
+    })
+
+    expect(refused).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: { code: "non-fast-forward-refused", phase: "verify-fast-forward" },
+    })
+    expect(git(remote, "rev-parse", "refs/heads/main")).toBe(competing)
+
+    const authorized = await pushRefUpdates({
+      root: repository,
+      updates: [
+        {
+          ...update(repository, remote, wanted, { state: "oid", oid: competing }),
+          allowNonFastForward: true,
+        },
+      ],
+    })
+
+    expect(authorized).toMatchObject({ state: "updated", partial: false })
+    expect(git(remote, "rev-parse", "refs/heads/main")).toBe(wanted)
+  })
+
   test("preserves native non-fast-forward refusal when no explicit lease is supplied", async () => {
     const { repository, remote, source: base } = pushFixture("native-non-fast-forward")
     git(repository, "push", "-q", remote, `${base}:refs/heads/main`)
@@ -439,7 +473,7 @@ describe("explicit recursive push mechanics", () => {
     expect(result).toMatchObject({
       state: "failed",
       partial: false,
-      detail: { code: "push-rejected", phase: "push-refs" },
+      detail: { code: "non-fast-forward-refused", phase: "verify-fast-forward" },
     })
     expect(git(remote, "rev-parse", "refs/heads/main")).toBe(competing)
   })

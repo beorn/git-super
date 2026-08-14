@@ -2,6 +2,7 @@ import { isAbsolute, join, resolve } from "node:path"
 
 import { readCommitGitlinks } from "./commit-graph.ts"
 import { createExclusive, type Exclusive } from "./exclusive.ts"
+import { ensureCommitObject } from "./objects.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
 import {
   gitSuperResult,
@@ -61,6 +62,7 @@ type PlannedUpdate = Readonly<{
   destination: string
   expectedDestination: ExpectedDestination
   explicitExpectation: boolean
+  allowNonFastForward: boolean
 }>
 
 type PushGroup = Readonly<{
@@ -240,6 +242,18 @@ async function planUpdates(git: GitProcess, input: readonly RefUpdate[]): Promis
       { repository, remote: update.remote, destination: update.destination },
       "observe-destination",
     )
+    const branchDestination = update.destination.startsWith("refs/heads/")
+    if (branchDestination) {
+      await required(git, repository, ["cat-file", "-e", `${update.source}^{commit}`], "verify-branch-source")
+      if (observed.state === "oid" && update.allowNonFastForward !== true) {
+        await ensureCommitObject({
+          repository,
+          remote: update.remote,
+          commit: observed.oid,
+          git,
+        })
+      }
+    }
     const identicalCreateOnlyRetry = isIdenticalCreateOnly(update.source, update.expectedDestination, observed)
     if (
       update.expectedDestination !== undefined &&
@@ -251,6 +265,7 @@ async function planUpdates(git: GitProcess, input: readonly RefUpdate[]): Promis
         repository,
         expectedDestination: update.expectedDestination,
         explicitExpectation: true,
+        allowNonFastForward: update.allowNonFastForward === true,
       }
       throw Object.assign(new Error("remote destination does not match its explicit expectation"), {
         resultDetail: mismatchDetail(planned, observed, "observe-destination"),
@@ -263,6 +278,7 @@ async function planUpdates(git: GitProcess, input: readonly RefUpdate[]): Promis
       destination: update.destination,
       expectedDestination: identicalCreateOnlyRetry ? observed : (update.expectedDestination ?? observed),
       explicitExpectation: update.expectedDestination !== undefined,
+      allowNonFastForward: update.allowNonFastForward === true,
     })
   }
 
@@ -274,7 +290,13 @@ async function planUpdates(git: GitProcess, input: readonly RefUpdate[]): Promis
       byDestination.set(key, update)
       continue
     }
-    if (prior.source === update.source && sameExpected(prior.expectedDestination, update.expectedDestination)) continue
+    if (
+      prior.source === update.source &&
+      sameExpected(prior.expectedDestination, update.expectedDestination) &&
+      prior.allowNonFastForward === update.allowNonFastForward
+    ) {
+      continue
+    }
     throw Object.assign(new Error(`conflicting updates select ${update.remote} ${update.destination}`), {
       resultDetail: detail(
         "conflicting-destination-updates",
@@ -357,6 +379,39 @@ function pushFailureCode(result: GitProcessResult): string {
   return "push-rejected"
 }
 
+async function verifyFastForwardUpdate(git: GitProcess, update: PlannedUpdate): Promise<GitResultDetail | undefined> {
+  if (
+    update.allowNonFastForward ||
+    !update.destination.startsWith("refs/heads/") ||
+    update.expectedDestination.state === "missing" ||
+    update.expectedDestination.oid === update.source
+  ) {
+    return undefined
+  }
+  const ancestry = await git.run({
+    repo: update.repository,
+    args: ["merge-base", "--is-ancestor", update.expectedDestination.oid, update.source],
+  })
+  if (ancestry.code === 0) return undefined
+  if (ancestry.code !== 1) {
+    throw operationError(
+      update.repository,
+      ["merge-base", "--is-ancestor", update.expectedDestination.oid, update.source],
+      "verify-fast-forward",
+      ancestry,
+    )
+  }
+  return detail(
+    "non-fast-forward-refused",
+    "verify-fast-forward",
+    `Refusing to rewrite ${update.remote} ${update.destination} from ${update.expectedDestination.oid} to ${update.source}.`,
+    {
+      objectIds: [update.expectedDestination.oid, update.source],
+      remedy: "Publish a descendant commit, or make the caller explicitly authorize a non-fast-forward update.",
+    },
+  )
+}
+
 async function applyGroup(
   git: GitProcess,
   group: PushGroup,
@@ -374,6 +429,18 @@ async function applyGroup(
       !isIdenticalCreateOnly(update.source, update.expectedDestination, observed)
     ) {
       const failure = mismatchDetail(update, observed, "recheck-destination")
+      return {
+        repository: group.repository,
+        state: "failed",
+        detail: failure,
+        refs: group.updates.map((entry) => refResult(entry, "failed", failure)),
+      }
+    }
+  }
+
+  for (const update of group.updates) {
+    const failure = await verifyFastForwardUpdate(git, update)
+    if (failure !== undefined) {
       return {
         repository: group.repository,
         state: "failed",

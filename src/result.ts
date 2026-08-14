@@ -8,6 +8,7 @@ export type RefUpdate = Readonly<{
   source: string
   destination: string
   expectedDestination?: ExpectedDestination
+  allowNonFastForward?: boolean
 }>
 
 export type GitResultDetail = Readonly<{
