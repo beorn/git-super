@@ -90,7 +90,6 @@ export async function readCommitSubmodules(
     "^submodule\\..*\\.(path|url)$",
   ]
   const configured = await git.run({ repo: repository, args: configuredArgs })
-  if (configured.code === 1 && configured.stdout.trim() === "" && configured.stderr === "") return []
   if (configured.code !== 0) throw operationError(repository, "read-target-submodules", configuredArgs, configured)
   const configuredByName = new Map<string, { path?: string; url?: string }>()
   for (const entry of configured.stdout.split("\0").filter((value) => value !== "")) {

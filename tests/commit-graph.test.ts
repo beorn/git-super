@@ -4,7 +4,7 @@ import { join } from "node:path"
 import { afterEach, describe, expect, test } from "vitest"
 
 import { changedCommitGitlinks, readCommitSubmodules } from "../src/commit-graph.ts"
-import { createLocalGitProcess } from "../src/process.ts"
+import { createLocalGitProcess, type GitProcess } from "../src/process.ts"
 import { createProductFixture, git } from "./fixture.ts"
 
 const roots: string[] = []
@@ -48,6 +48,27 @@ describe("commit submodule graph", () => {
         code: "missing-target-manifest",
         paths: ["packages/alpha", "vendor/beta"],
       },
+    })
+  })
+
+  test("does not interpret a silent config command failure as an empty submodule graph", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-commit-graph-config-failure-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const local = createLocalGitProcess()
+    let injected = false
+    const silentFailure: GitProcess = {
+      run(request) {
+        if (!injected && request.args.includes("--blob")) {
+          injected = true
+          return Promise.resolve({ code: 1, stdout: "", stderr: "", signal: null, timedOut: false })
+        }
+        return local.run(request)
+      },
+    }
+
+    await expect(readCommitSubmodules(silentFailure, fixture.product, fixture.productBase)).rejects.toMatchObject({
+      resultDetail: { code: "git-failed", phase: "read-target-submodules" },
     })
   })
 

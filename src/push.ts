@@ -200,7 +200,7 @@ function mismatchDetail(update: PlannedUpdate, observed: ExpectedDestination, ph
   )
 }
 
-async function planUpdates(git: GitProcess, input: readonly RefUpdate[]): Promise<PlannedUpdate[]> {
+async function planUpdates(git: GitProcess, input: readonly RefUpdate[], timeoutMs: number): Promise<PlannedUpdate[]> {
   if (input.length === 0) {
     throw Object.assign(new Error("git super push requires at least one ref update"), {
       resultDetail: detail("empty-push", "validate", "No ref updates were selected.", {
@@ -250,6 +250,7 @@ async function planUpdates(git: GitProcess, input: readonly RefUpdate[]): Promis
           repository,
           remote: update.remote,
           commit: observed.oid,
+          timeoutMs,
           git,
         })
       }
@@ -553,7 +554,7 @@ export async function pushRefUpdates(options: PushRefUpdatesOptions): Promise<Gi
   let groups: PushGroup[]
   try {
     const repository = await discoverRepository(git, root, "discover-root")
-    groups = groupUpdates(await planUpdates(git, options.updates), repository)
+    groups = groupUpdates(await planUpdates(git, options.updates, timeoutMs), repository)
     const exclusive = options.exclusive ?? createExclusive(await lockDirectory(git, repository))
     return await exclusive.run(
       async () => {

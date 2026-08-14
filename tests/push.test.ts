@@ -719,6 +719,32 @@ describe("explicit recursive push mechanics", () => {
     })
   })
 
+  test("applies the caller timeout to exact destination commit verification", async () => {
+    const { repository, remote, source: before } = pushFixture("destination-timeout")
+    git(repository, "push", "-q", remote, `${before}:refs/heads/main`)
+    const source = advanceRepository(repository, "README.md", "two\n")
+    const local = createLocalGitProcess()
+    const requests: Array<Readonly<{ args: readonly string[]; timeoutMs?: number }>> = []
+    const traced: GitProcess = {
+      run(request) {
+        requests.push(request)
+        return local.run(request)
+      },
+    }
+
+    const result = await pushRefUpdates({
+      root: repository,
+      updates: [update(repository, remote, source, { state: "oid", oid: before })],
+      timeoutMs: 123_456,
+      git: traced,
+    })
+
+    expect(result.state).toBe("updated")
+    expect(requests.filter(({ args }) => args.includes("cat-file")).map(({ timeoutMs }) => timeoutMs)).toEqual([
+      123_456, 123_456, 123_456,
+    ])
+  })
+
   test("rejects an invalid timeout before inspecting the repository or remotes", async () => {
     let calls = 0
     const unreachable: GitProcess = {
