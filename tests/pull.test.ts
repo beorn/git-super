@@ -134,6 +134,31 @@ describe("git super pull --ff-only", () => {
     expect(before).not.toBe(target)
   })
 
+  test("peels an annotated tag target to its commit without FETCH_HEAD", async () => {
+    const fixture = mkdtempSync(join(tmpdir(), "git-super-pull-annotated-tag-"))
+    roots.push(fixture)
+    const upstream = join(fixture, "upstream")
+    const checkout = join(fixture, "checkout")
+    createRepository(upstream, "README.md", "one\n")
+    git(fixture, "clone", "-q", upstream, checkout)
+    const target = advanceRepository(upstream, "README.md", "two\n")
+    git(upstream, "tag", "-a", "release", "-m", "release", target)
+
+    const result = await superPull({
+      repo: checkout,
+      repository: "origin",
+      refspecs: ["refs/tags/release"],
+      ffOnly: true,
+    })
+
+    expect(result).toMatchObject({
+      state: "updated",
+      partial: false,
+      repositories: [{ refs: [{ source: target, destination: "HEAD", state: "updated" }] }],
+    })
+    expect(git(checkout, "rev-parse", "HEAD")).toBe(target)
+  })
+
   test("freezes and applies every exact gitlink in the target root", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-pull-product-"))
     roots.push(fixtureRoot)
@@ -465,6 +490,41 @@ describe("git super pull --ff-only", () => {
       partial: false,
       detail: { code: "target-changed", phase: "recheck-root-target" },
     })
+  })
+
+  test("does not rely on process-global FETCH_HEAD after fetching the root target", async () => {
+    const fixture = mkdtempSync(join(tmpdir(), "git-super-pull-fetch-head-race-"))
+    roots.push(fixture)
+    const upstream = join(fixture, "upstream")
+    const checkout = join(fixture, "checkout")
+    createRepository(upstream, "README.md", "one\n")
+    git(fixture, "clone", "-q", upstream, checkout)
+    const target = advanceRepository(upstream, "README.md", "two\n")
+    const local = createLocalGitProcess()
+    let disrupted = false
+    const racing: GitProcess = {
+      async run(request) {
+        const result = await local.run(request)
+        // FETCH_HEAD is shared mutable repository state; another fetch may replace or remove it between Git calls.
+        if (!disrupted && request.repo === checkout && request.args[0] === "fetch") {
+          rmSync(join(checkout, ".git", "FETCH_HEAD"), { force: true })
+          disrupted = true
+        }
+        return result
+      },
+    }
+
+    const result = await superPull({
+      repo: checkout,
+      repository: "origin",
+      refspecs: ["main"],
+      ffOnly: true,
+      git: racing,
+    })
+
+    expect(disrupted).toBe(true)
+    expect(result).toMatchObject({ state: "updated", partial: false })
+    expect(git(checkout, "rev-parse", "HEAD")).toBe(target)
   })
 
   test("does not turn a target-manifest read failure into an empty submodule graph", async () => {

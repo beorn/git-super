@@ -87,30 +87,37 @@ async function planPull(git: GitProcess, options: SuperPullOptions): Promise<Pul
       resultDetail: detail("ff-only-required", "validate", "git super pull requires --ff-only"),
     })
   const root = await required(git, options.repo, ["rev-parse", "--show-toplevel"], "discover-root")
-  const { repository, refspecs, remoteRef } = await resolvePullTarget(git, root, options)
-  await required(git, root, ["fetch", "--no-recurse-submodules", repository, ...refspecs], "fetch-root-target")
-  const target = await required(git, root, ["rev-parse", "FETCH_HEAD^{commit}"], "freeze-root-target")
-  const current = await required(git, root, ["rev-parse", "HEAD^{commit}"], "freeze-root-current")
+  const { repository, refspecs, remoteRef, exactTarget } = await resolvePullTarget(git, root, options)
+  await required(
+    git,
+    root,
+    ["fetch", "--no-recurse-submodules", "--no-write-fetch-head", repository, ...refspecs],
+    "fetch-root-target",
+  )
   const observedRemoteTarget =
     remoteRef === undefined
       ? undefined
       : await observeRemoteTarget(git, root, repository, remoteRef, "observe-root-target")
-  if (observedRemoteTarget !== undefined && observedRemoteTarget !== target) {
-    throw Object.assign(
-      new Error(`fetched target ${target} does not match observed ${remoteRef} ${observedRemoteTarget}`),
-      {
-        resultDetail: detail(
-          "target-observation-mismatch",
-          "observe-root-target",
-          `Fetched target does not match ${remoteRef}.`,
-          {
-            objectIds: [target, observedRemoteTarget],
-            remedy: "Rerun git super pull; the requested remote ref changed during fetch.",
-          },
-        ),
-      },
-    )
+  const targetObject = observedRemoteTarget ?? exactTarget
+  if (targetObject === undefined) {
+    throw Object.assign(new Error("git super pull could not resolve the requested root target"), {
+      resultDetail: detail(
+        "unresolved-root-target",
+        "freeze-root-target",
+        "The requested root refspec did not name one remote ref or exact object ID.",
+        { remedy: "Use one unambiguous remote ref or exact commit object ID as the pull target." },
+      ),
+    })
   }
+  await ensureCommitObject({
+    repository: root,
+    remote: repository,
+    commit: targetObject,
+    timeoutMs: options.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS,
+    git,
+  })
+  const target = await required(git, root, ["rev-parse", `${targetObject}^{commit}`], "freeze-root-target")
+  const current = await required(git, root, ["rev-parse", "HEAD^{commit}"], "freeze-root-current")
   const ancestor = await run(git, root, ["merge-base", "--is-ancestor", current, target])
   if (ancestor.code !== 0) {
     throw Object.assign(new Error(`git super pull --ff-only refused divergent root ${root}`), {
@@ -181,7 +188,7 @@ async function resolvePullTarget(
   git: GitProcess,
   root: string,
   options: SuperPullOptions,
-): Promise<Readonly<{ repository: string; refspecs: readonly string[]; remoteRef?: string }>> {
+): Promise<Readonly<{ repository: string; refspecs: readonly string[]; remoteRef?: string; exactTarget?: string }>> {
   const refspecs = options.refspecs ?? []
   if (refspecs.length > 1) {
     throw Object.assign(new Error("git super pull currently requires one root refspec"), {
@@ -205,7 +212,11 @@ async function resolvePullTarget(
   return {
     repository,
     refspecs,
-    ...(source === undefined || source === "" || OBJECT_ID.test(source) ? {} : { remoteRef: source }),
+    ...(source === undefined || source === ""
+      ? {}
+      : OBJECT_ID.test(source)
+        ? { exactTarget: source }
+        : { remoteRef: source }),
   }
 }
 
