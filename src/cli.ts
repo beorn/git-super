@@ -87,7 +87,7 @@ export async function runCli(argv: readonly string[], stdout: OutputSink, stderr
     .description(commands.pull.description ?? commands.pull.title)
     .option("--ff-only", "refuse merge, rebase, stash, force, or conflict resolution")
     .option("--dry-run", "fetch and show the frozen plan without changing a checkout or local branch")
-    .argument("[repository]", "remote repository to fetch", "origin")
+    .argument("[repository]", "remote repository to fetch")
     .argument("[refspecs...]", "root refspecs to fetch")
     .action((repository, refspecs, options, command) => {
       const globals = command.optsWithGlobals() as { repo: string; json?: boolean }

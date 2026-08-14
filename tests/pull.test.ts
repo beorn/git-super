@@ -34,6 +34,75 @@ function outputSink(): { output: string; write(value: string): void } {
 }
 
 describe("git super pull --ff-only", () => {
+  test("uses the configured upstream when repository and refspec are omitted", async () => {
+    const fixture = mkdtempSync(join(tmpdir(), "git-super-pull-upstream-"))
+    roots.push(fixture)
+    const upstream = join(fixture, "upstream")
+    const checkout = join(fixture, "checkout")
+    createRepository(upstream, "README.md", "one\n")
+    git(upstream, "branch", "-m", "trunk")
+    git(fixture, "clone", "-q", upstream, checkout)
+    git(checkout, "remote", "rename", "origin", "source")
+    git(checkout, "branch", "-m", "work")
+    const target = advanceRepository(upstream, "README.md", "two\n")
+    const stdout = outputSink()
+    const stderr = outputSink()
+
+    const exitCode = await runCli(["--repo", checkout, "pull", "--ff-only", "--json"], stdout, stderr)
+
+    expect(exitCode).toBe(0)
+    expect(stderr.output).toBe("")
+    expect(git(checkout, "rev-parse", "HEAD")).toBe(target)
+    expect(JSON.parse(stdout.output)).toMatchObject({ state: "updated", partial: false })
+  })
+
+  test("fails loudly when an omitted refspec has no configured upstream", async () => {
+    const fixture = mkdtempSync(join(tmpdir(), "git-super-pull-no-upstream-"))
+    roots.push(fixture)
+    const upstream = join(fixture, "upstream")
+    const checkout = join(fixture, "checkout")
+    createRepository(upstream, "README.md", "one\n")
+    git(fixture, "clone", "-q", upstream, checkout)
+    git(checkout, "branch", "--unset-upstream")
+    const before = git(checkout, "rev-parse", "HEAD")
+    const stdout = outputSink()
+    const stderr = outputSink()
+
+    const exitCode = await runCli(["--repo", checkout, "pull", "--ff-only", "--json"], stdout, stderr)
+
+    expect(exitCode).toBe(2)
+    expect(stderr.output).toBe("")
+    expect(git(checkout, "rev-parse", "HEAD")).toBe(before)
+    expect(JSON.parse(stdout.output)).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: { code: "configured-upstream-required", phase: "resolve-default-target" },
+    })
+  })
+
+  test("fast-forwards a SHA-256 repository", async () => {
+    const fixture = mkdtempSync(join(tmpdir(), "git-super-pull-sha256-"))
+    roots.push(fixture)
+    const upstream = join(fixture, "upstream")
+    const checkout = join(fixture, "checkout")
+    git(fixture, "init", "-q", "--object-format=sha256", "-b", "main", upstream)
+    writeFileSync(join(upstream, "README.md"), "one\n")
+    git(upstream, "add", "README.md")
+    git(upstream, "commit", "-q", "-m", "add README")
+    git(fixture, "clone", "-q", upstream, checkout)
+    const target = advanceRepository(upstream, "README.md", "two\n")
+    const stdout = outputSink()
+    const stderr = outputSink()
+
+    const exitCode = await runCli(["--repo", checkout, "pull", "--ff-only", "origin", "main", "--json"], stdout, stderr)
+
+    expect(exitCode).toBe(0)
+    expect(stderr.output).toBe("")
+    expect(target).toHaveLength(64)
+    expect(git(checkout, "rev-parse", "HEAD")).toBe(target)
+    expect(JSON.parse(stdout.output)).toMatchObject({ state: "updated", partial: false })
+  })
+
   test("fast-forwards a clean standalone clone with a structured result", async () => {
     const fixture = mkdtempSync(join(tmpdir(), "git-super-pull-"))
     roots.push(fixture)

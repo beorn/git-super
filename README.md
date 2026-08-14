@@ -46,6 +46,8 @@ Missing checkouts, missing commit objects, added or removed gitlinks without a r
 
 `pull --ff-only` fetches and freezes one exact root target, discovers its complete initialized submodule graph without checking it out, fetches only missing recorded child commits, and preflights every working-tree transition before the first write. Apply rechecks the requested remote ref and every repository HEAD under the shared mutation lock, fast-forwards the root, then checks out changed submodules at the exact recorded commits.
 
+With no repository or refspec, pull uses the current branch's configured upstream. With no refspec, an explicitly named repository supplies that same configured upstream branch; a branch without an upstream fails with a remedy instead of guessing `origin/main`.
+
 Unrelated staged, tracked, untracked, and ignored files survive. A path that the incoming graph would overwrite fails before moving the root. Divergence, an unpublished detached child commit, a changing remote target, lock contention, and unavailable recorded objects also fail without merging, rebasing, stashing, forcing, or resolving conflicts. If native Git fails after an earlier repository changed, the result is explicitly partial and every later repository is `not-run`.
 
 Use `--dry-run` to fetch, freeze, and preflight without changing a checkout, index, or local branch. It is evidence about the current plan, not a promise that later hooks, credentials, remote refs, or filesystems will remain unchanged.

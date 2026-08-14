@@ -35,6 +35,7 @@ type PullRepositoryPlan = Readonly<{
 }>
 
 const DEFAULT_GIT_TIMEOUT_MS = 30_000
+const OBJECT_ID = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/u
 
 function detail(code: string, phase: string, message: string, extra: Partial<GitResultDetail> = {}): GitResultDetail {
   return { code, phase, message, ...extra }
@@ -86,12 +87,10 @@ async function planPull(git: GitProcess, options: SuperPullOptions): Promise<Pul
       resultDetail: detail("ff-only-required", "validate", "git super pull requires --ff-only"),
     })
   const root = await required(git, options.repo, ["rev-parse", "--show-toplevel"], "discover-root")
-  const repository = options.repository ?? "origin"
-  const refspecs = options.refspecs ?? []
+  const { repository, refspecs, remoteRef } = await resolvePullTarget(git, root, options)
   await required(git, root, ["fetch", "--no-recurse-submodules", repository, ...refspecs], "fetch-root-target")
   const target = await required(git, root, ["rev-parse", "FETCH_HEAD^{commit}"], "freeze-root-target")
   const current = await required(git, root, ["rev-parse", "HEAD^{commit}"], "freeze-root-current")
-  const remoteRef = await requestedRemoteRef(git, root, refspecs)
   const observedRemoteTarget =
     remoteRef === undefined
       ? undefined
@@ -138,11 +137,52 @@ async function planPull(git: GitProcess, options: SuperPullOptions): Promise<Pul
   }
 }
 
-async function requestedRemoteRef(
+async function configuredUpstream(
   git: GitProcess,
   root: string,
-  refspecs: readonly string[],
-): Promise<string | undefined> {
+): Promise<Readonly<{ repository: string; ref: string }>> {
+  const branch = await run(git, root, ["symbolic-ref", "--quiet", "--short", "HEAD"])
+  if (branch.code !== 0 || branch.stdout.trim() === "") {
+    throw Object.assign(new Error("git super pull requires a configured upstream when no root refspec is given"), {
+      resultDetail: detail(
+        "configured-upstream-required",
+        "resolve-default-target",
+        "The current checkout has no branch whose configured upstream can select the pull target.",
+        { remedy: "Check out a branch with an upstream, or name both the repository and root refspec explicitly." },
+      ),
+    })
+  }
+  const configured = await required(
+    git,
+    root,
+    [
+      "for-each-ref",
+      "--count=1",
+      "--format=%(upstream:remotename)%00%(upstream:remoteref)",
+      `refs/heads/${branch.stdout.trim()}`,
+    ],
+    "resolve-default-target",
+  )
+  const [repository, ref] = configured.split("\0")
+  if (repository === undefined || repository === "" || ref === undefined || ref === "") {
+    throw Object.assign(new Error("git super pull requires a configured upstream when no root refspec is given"), {
+      resultDetail: detail(
+        "configured-upstream-required",
+        "resolve-default-target",
+        `Branch ${branch.stdout.trim()} has no configured upstream.`,
+        { remedy: "Configure the branch upstream, or name both the repository and root refspec explicitly." },
+      ),
+    })
+  }
+  return { repository, ref }
+}
+
+async function resolvePullTarget(
+  git: GitProcess,
+  root: string,
+  options: SuperPullOptions,
+): Promise<Readonly<{ repository: string; refspecs: readonly string[]; remoteRef?: string }>> {
+  const refspecs = options.refspecs ?? []
   if (refspecs.length > 1) {
     throw Object.assign(new Error("git super pull currently requires one root refspec"), {
       resultDetail: detail("multiple-pull-heads", "validate-refspecs", "More than one root refspec was requested.", {
@@ -150,11 +190,23 @@ async function requestedRemoteRef(
       }),
     })
   }
-  const requested =
-    refspecs[0] ?? (await required(git, root, ["symbolic-ref", "--short", "HEAD"], "resolve-default-ref"))
+  if (refspecs.length === 0) {
+    const upstream = await configuredUpstream(git, root)
+    return {
+      repository: options.repository ?? upstream.repository,
+      refspecs: [upstream.ref],
+      remoteRef: upstream.ref,
+    }
+  }
+  const repository = options.repository ?? (await configuredUpstream(git, root)).repository
+  const requested = refspecs[0]
+  if (requested === undefined) throw new Error("git-super: validated pull target contained no refspec")
   const source = requested.replace(/^\+/u, "").split(":", 1)[0]
-  if (source === undefined || source === "" || /^[0-9a-f]{40}$/u.test(source)) return undefined
-  return source
+  return {
+    repository,
+    refspecs,
+    ...(source === undefined || source === "" || OBJECT_ID.test(source) ? {} : { remoteRef: source }),
+  }
 }
 
 async function observeRemoteTarget(
@@ -171,7 +223,7 @@ async function observeRemoteTarget(
         .split(/\r?\n/u)
         .filter((line) => line !== "")
         .map((line) => line.split(/\s/u, 1)[0])
-        .filter((oid): oid is string => oid !== undefined && /^[0-9a-f]{40}$/u.test(oid)),
+        .filter((oid): oid is string => oid !== undefined && OBJECT_ID.test(oid)),
     ),
   ]
   if (objectIds.length !== 1 || objectIds[0] === undefined) {
