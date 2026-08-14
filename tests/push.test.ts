@@ -437,6 +437,25 @@ describe("explicit recursive push mechanics", () => {
     expect(git(remote, "rev-parse", "refs/heads/main")).toBe(other)
   })
 
+  test("accepts an identical create-only publication that wins the recheck race", async () => {
+    const { repository, remote, source } = pushFixture("create-only-race")
+    const racing: Exclusive = {
+      async run(operation) {
+        git(repository, "push", "-q", remote, `${source}:refs/heads/main`)
+        return operation()
+      },
+    }
+
+    const result = await pushRefUpdates({
+      root: repository,
+      updates: [update(repository, remote, source, { state: "missing" })],
+      exclusive: racing,
+    })
+
+    expect(result).toMatchObject({ state: "updated", partial: false })
+    expect(git(remote, "rev-parse", "refs/heads/main")).toBe(source)
+  })
+
   test("reports mutation-lock contention before pushing", async () => {
     const { repository, remote, source } = pushFixture("lock")
     const lockDirectory = join(repository, ".git", "yrd-worktree-mutations")

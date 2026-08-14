@@ -120,6 +120,14 @@ function sameExpected(left: ExpectedDestination, right: ExpectedDestination): bo
   return expectedKey(left) === expectedKey(right)
 }
 
+function isIdenticalCreateOnly(
+  source: string,
+  expected: ExpectedDestination | undefined,
+  observed: ExpectedDestination,
+): boolean {
+  return expected?.state === "missing" && observed.state === "oid" && observed.oid === source
+}
+
 async function observeDestination(
   git: GitProcess,
   update: Pick<PlannedUpdate, "repository" | "remote" | "destination">,
@@ -210,8 +218,7 @@ async function planUpdates(git: GitProcess, input: readonly RefUpdate[]): Promis
       { repository, remote: update.remote, destination: update.destination },
       "observe-destination",
     )
-    const identicalCreateOnlyRetry =
-      update.expectedDestination?.state === "missing" && observed.state === "oid" && observed.oid === update.source
+    const identicalCreateOnlyRetry = isIdenticalCreateOnly(update.source, update.expectedDestination, observed)
     if (
       update.expectedDestination !== undefined &&
       !sameExpected(update.expectedDestination, observed) &&
@@ -328,7 +335,12 @@ async function applyGroup(
   )
   for (const [index, observed] of rechecked.entries()) {
     const update = group.updates[index]
-    if (update !== undefined && observed !== undefined && !sameExpected(update.expectedDestination, observed)) {
+    if (
+      update !== undefined &&
+      observed !== undefined &&
+      !sameExpected(update.expectedDestination, observed) &&
+      !isIdenticalCreateOnly(update.source, update.expectedDestination, observed)
+    ) {
       const failure = mismatchDetail(update, observed, "recheck-destination")
       return {
         repository: group.repository,
