@@ -16,6 +16,7 @@ The answer belongs at the Git invocation layer: callers change `git diff` to `gi
 git super diff --name-only <range>
 git super status --porcelain
 git super merge-base --is-ancestor <sha> <superproject-ref>
+git super pull --ff-only [<repository> [<refspec>...]]
 ```
 
 `diff` accepts `--diff-filter`, `--cached`, and `-z`. `status` includes tracked and untracked changes in checked-out submodules. `merge-base --is-ancestor` discovers which repository owns the first commit and compares it with that repository's pin in the selected superproject ref.
@@ -39,6 +40,16 @@ Normal path or porcelain output stays on stdout. A Silvery-rendered consulted-re
 ```
 
 Missing checkouts, missing commit objects, added or removed gitlinks without a resolvable commit range, and ambiguous commit ownership all fail loudly. The tool never turns an unresolved repository boundary into an empty success.
+
+### Safe fast-forward pull
+
+`pull --ff-only` fetches and freezes one exact root target, discovers its complete initialized submodule graph without checking it out, fetches only missing recorded child commits, and preflights every working-tree transition before the first write. Apply rechecks the requested remote ref and every repository HEAD under the shared mutation lock, fast-forwards the root, then checks out changed submodules at the exact recorded commits.
+
+Unrelated staged, tracked, untracked, and ignored files survive. A path that the incoming graph would overwrite fails before moving the root. Divergence, an unpublished detached child commit, a changing remote target, lock contention, and unavailable recorded objects also fail without merging, rebasing, stashing, forcing, or resolving conflicts. If native Git fails after an earlier repository changed, the result is explicitly partial and every later repository is `not-run`.
+
+Use `--dry-run` to fetch, freeze, and preflight without changing a checkout, index, or local branch. It is evidence about the current plan, not a promise that later hooks, credentials, remote refs, or filesystems will remain unchanged.
+
+`--json` emits one stable `GitSuperResult` on both success and operational failure. Success exits `0`; failed, partial, or unknown results exit nonzero.
 
 ## Try the repository before npm publication
 
@@ -64,10 +75,12 @@ bun run typecheck
 - `src/diff.ts`, `src/status.ts`, and `src/merge-base.ts` are pure read-plumbing services over an explicit Git process adapter.
 - `src/worktree.ts` is the injected write-plumbing service: add, lock, unlock, inspect, exact removal, recovery, and hook quarantine. Its repository lock deliberately retains the cutover identity `.git/.../yrd-worktree-mutations/writer.lock`, so old and new callers exclude one another.
 - `src/submodules.ts` is the single recursive materializer for Yrd and host adapters. It proves exact gitlinks before borrowing local objects, reports remote fallbacks, supports a top-level path allowlist, and recurses through nested gitlinks.
+- `src/process.ts` is the public injected Git process capability for graph operations. `src/result.ts` owns their shared repository/ref result vocabulary and aggregation law.
+- `src/pull.ts` owns the fetch/freeze/preflight/recheck/apply fast-forward operation. It imports no scheduler, delivery, or fleet policy.
 - `src/commands.ts` exposes the platform-neutral `CommandNode` tree from the published `@silvery/command` package and every CLI request passes through `resolveInvocation()`.
 - `src/report.tsx` renders the fail-loud repository witness with canonical Silvery components and Sterling semantic tokens.
 - `src/cli.ts` adapts Commander parsing, stdout-compatible data, stable JSON, and the Silvery report around the command tree.
 
 The package depends only on published packages. It contains no delivery daemon, fleet policy, task tracker, or host-repository imports.
 
-Library consumers import `git-super/worktree` for injected worktree mechanics and `git-super/submodules` for recursive materialization. Slot naming, leases, branch shapes, queue admission, and lifecycle remain policy owned by the caller.
+Library consumers may import the root `git-super` operation surface, `git-super/worktree` for injected worktree mechanics, or `git-super/submodules` for recursive materialization. Slot naming, leases, branch shapes, queue admission, retry policy, and lifecycle remain owned by callers.

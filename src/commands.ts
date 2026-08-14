@@ -7,12 +7,15 @@ import {
 } from "@silvery/command"
 import { superDiff, type SuperDiffOptions, type SuperDiffResult } from "./diff.ts"
 import { superIsAncestor, type SuperIsAncestorOptions, type SuperIsAncestorResult } from "./merge-base.ts"
+import { superPull, type SuperPullOptions } from "./pull.ts"
+import type { GitSuperResult } from "./result.ts"
 import { superStatus, type SuperStatusResult } from "./status.ts"
 
 export type CommandContext = Readonly<{ repo: string }>
 export type DiffParams = Omit<SuperDiffOptions, "repo">
 export type StatusParams = Record<string, never>
 export type MergeBaseParams = Omit<SuperIsAncestorOptions, "repo">
+export type PullParams = Omit<SuperPullOptions, "repo" | "git" | "exclusive">
 
 function params<T>(parse: (value: unknown) => T, missing?: (value: unknown) => string[]): ParseParamSchema<T> {
   return { parse, ...(missing === undefined ? {} : { missing }) }
@@ -71,14 +74,31 @@ const mergeBase = commandNode<CommandContext, MergeBaseParams, SuperIsAncestorRe
   run: (context, input) => superIsAncestor({ repo: context.repo, ...input }),
 })
 
+const pull = commandNode<CommandContext, PullParams, GitSuperResult>({
+  title: "Fast-forward a superproject",
+  description: "Fetch and safely fast-forward a root plus its exact recorded submodule commits.",
+  params: params((value) => {
+    const input = record(value)
+    return {
+      ffOnly: input.ffOnly === true,
+      ...(typeof input.repository === "string" ? { repository: input.repository } : {}),
+      refspecs: stringArray(input.refspecs, "refspecs"),
+      ...(input.dryRun === true ? { dryRun: true } : {}),
+    }
+  }),
+  run: (context, input) => superPull({ repo: context.repo, ...input }),
+})
+
 export type GitSuperCommands = Readonly<{
   diff: CommandNode<CommandContext, DiffParams, SuperDiffResult>
   status: CommandNode<CommandContext, StatusParams, SuperStatusResult>
   "merge-base": CommandNode<CommandContext, MergeBaseParams, SuperIsAncestorResult>
+  pull: CommandNode<CommandContext, PullParams, GitSuperResult>
 }>
 
 export const commands = defineCommandNodes({
   diff,
   status,
   "merge-base": mergeBase,
+  pull,
 }) satisfies CommandNodeTree<CommandContext> as GitSuperCommands

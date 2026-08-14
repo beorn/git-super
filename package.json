@@ -15,8 +15,12 @@
   ],
   "type": "module",
   "exports": {
+    ".": "./src/index.ts",
     "./composition": "./src/composition.ts",
     "./exclusive": "./src/exclusive.ts",
+    "./process": "./src/process.ts",
+    "./pull": "./src/pull.ts",
+    "./result": "./src/result.ts",
     "./submodules": "./src/submodules.ts",
     "./worktree": "./src/worktree.ts"
   },
@@ -44,6 +48,6 @@
     "vitest": "^4.1.10"
   },
   "engines": {
-    "bun": ">=1.3.0"
+    "bun": ">=1.3.13"
   }
 }

@@ -1,8 +1,16 @@
 import { Command as CliCommand, CommanderError } from "@silvery/commander"
 import { resolveInvocation, type CommandNode } from "@silvery/command"
-import { commands, type CommandContext, type DiffParams, type MergeBaseParams, type StatusParams } from "./commands.ts"
+import {
+  commands,
+  type CommandContext,
+  type DiffParams,
+  type MergeBaseParams,
+  type PullParams,
+  type StatusParams,
+} from "./commands.ts"
 import type { ConsultedRepository, SuperDiffResult } from "./diff.ts"
 import type { SuperIsAncestorResult } from "./merge-base.ts"
+import type { GitSuperResult } from "./result.ts"
 import { renderConsultedRepositories } from "./report.tsx"
 import type { SuperStatusResult } from "./status.ts"
 
@@ -16,6 +24,7 @@ type CapturedInvocation =
   | Readonly<{ node: typeof commands.diff; params: DiffParams; json: boolean; nul: boolean }>
   | Readonly<{ node: typeof commands.status; params: StatusParams; json: boolean; nul: boolean }>
   | Readonly<{ node: (typeof commands)["merge-base"]; params: MergeBaseParams; json: boolean; nul: boolean }>
+  | Readonly<{ node: typeof commands.pull; params: PullParams; json: boolean; nul: boolean }>
 
 function stableValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(stableValue)
@@ -45,12 +54,12 @@ function commandResult(
   node: CapturedInvocation["node"],
   context: CommandContext,
   params: CapturedInvocation["params"],
-): Promise<SuperDiffResult | SuperStatusResult | SuperIsAncestorResult> {
+): Promise<SuperDiffResult | SuperStatusResult | SuperIsAncestorResult | GitSuperResult> {
   const invocation = resolveInvocation(
     node as CommandNode<
       CommandContext,
       CapturedInvocation["params"],
-      SuperDiffResult | SuperStatusResult | SuperIsAncestorResult
+      SuperDiffResult | SuperStatusResult | SuperIsAncestorResult | GitSuperResult
     >,
     context,
     params,
@@ -69,6 +78,28 @@ export async function runCli(argv: readonly string[], stdout: OutputSink, stderr
     .configureOutput({
       writeOut: (value) => stdout.write(value),
       writeErr: (value) => stderr.write(value),
+    })
+
+  program
+    .command("pull")
+    .description(commands.pull.description ?? commands.pull.title)
+    .option("--ff-only", "refuse merge, rebase, stash, force, or conflict resolution")
+    .option("--dry-run", "fetch and show the frozen plan without changing a checkout or local branch")
+    .argument("[repository]", "remote repository to fetch", "origin")
+    .argument("[refspecs...]", "root refspecs to fetch")
+    .action((repository, refspecs, options, command) => {
+      const globals = command.optsWithGlobals() as { repo: string; json?: boolean }
+      captured = {
+        node: commands.pull,
+        params: {
+          ...(typeof repository === "string" ? { repository } : {}),
+          refspecs,
+          ffOnly: options.ffOnly === true,
+          ...(options.dryRun === true ? { dryRun: true } : {}),
+        },
+        json: globals.json === true,
+        nul: false,
+      }
     })
 
   program
@@ -128,7 +159,7 @@ export async function runCli(argv: readonly string[], stdout: OutputSink, stderr
   if (captured === undefined) return 0
 
   const globals = program.opts() as { repo: string }
-  let result: SuperDiffResult | SuperStatusResult | SuperIsAncestorResult
+  let result: SuperDiffResult | SuperStatusResult | SuperIsAncestorResult | GitSuperResult
   try {
     result = await commandResult(captured.node, { repo: globals.repo }, captured.params)
   } catch (error) {
@@ -147,9 +178,18 @@ export async function runCli(argv: readonly string[], stdout: OutputSink, stderr
     if (status.records.length > 0)
       stdout.write(`${status.records.join(captured.nul ? "\0" : "\n")}${captured.nul ? "\0" : "\n"}`)
     await writeReport(status.consultedRepositories, stderr)
-  } else {
+  } else if (captured.node === commands["merge-base"]) {
     await writeReport((result as SuperIsAncestorResult).consultedRepositories, stderr)
+  } else {
+    const pull = result as GitSuperResult
+    stdout.write(`${pull.state}\n`)
+    if (pull.detail !== undefined) stderr.write(`${pull.detail.message}\n`)
   }
 
-  return captured.node === commands["merge-base"] && !(result as SuperIsAncestorResult).isAncestor ? 1 : 0
+  if (captured.node === commands["merge-base"] && !(result as SuperIsAncestorResult).isAncestor) return 1
+  if (captured.node === commands.pull) {
+    const pull = result as GitSuperResult
+    return pull.state === "updated" || pull.state === "unchanged" ? 0 : 2
+  }
+  return 0
 }
