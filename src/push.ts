@@ -49,6 +49,7 @@ export type RemoteCommitAvailabilityOptions = Readonly<{
   repository: string
   remote: string
   commit: string
+  refPrefixes?: readonly string[]
   timeoutMs?: number
   git?: GitProcess
 }>
@@ -734,14 +735,26 @@ async function collectCommitRequirements(
   )
 }
 
-async function advertisedCommitTips(git: GitProcess, repository: string, remote: string): Promise<string[]> {
+async function advertisedCommitTips(
+  git: GitProcess,
+  repository: string,
+  remote: string,
+  refPrefixes: readonly string[] = ["refs/"],
+): Promise<string[]> {
   const advertised = await git.run({ repo: repository, args: ["ls-remote", "--refs", remote] })
   if (advertised.code !== 0)
     throw operationError(repository, ["ls-remote", "--refs", remote], "inspect-submodule-remote", advertised)
   const tips: string[] = []
   for (const line of advertised.stdout.split(/\r?\n/u).filter((row) => row !== "")) {
     const [oid, ref] = line.split(/\s+/u, 2)
-    if (oid === undefined || ref === undefined || !OBJECT_ID.test(oid) || !ref.startsWith("refs/")) continue
+    if (
+      oid === undefined ||
+      ref === undefined ||
+      !OBJECT_ID.test(oid) ||
+      !refPrefixes.some((prefix) => ref.startsWith(prefix))
+    ) {
+      continue
+    }
     const present = await git.run({ repo: repository, args: ["cat-file", "-e", `${oid}^{object}`] })
     if (present.code !== 0) {
       await required(
@@ -762,8 +775,9 @@ async function commitAvailableOnRemote(
   repository: string,
   remote: string,
   commit: string,
+  refPrefixes?: readonly string[],
 ): Promise<boolean> {
-  for (const tip of await advertisedCommitTips(git, repository, remote)) {
+  for (const tip of await advertisedCommitTips(git, repository, remote, refPrefixes)) {
     const contains = await git.run({ repo: repository, args: ["merge-base", "--is-ancestor", commit, tip] })
     if (contains.code === 0) return true
     if (contains.code !== 1)
@@ -800,7 +814,7 @@ export async function remoteContainsCommit(options: RemoteCommitAvailabilityOpti
   }
   const repository = await discoverRepository(git, options.repository, "discover-repository")
   await required(git, repository, ["cat-file", "-e", `${options.commit}^{commit}`], "verify-source-commit")
-  return commitAvailableOnRemote(git, repository, options.remote, options.commit)
+  return commitAvailableOnRemote(git, repository, options.remote, options.commit, options.refPrefixes)
 }
 
 async function commitAvailableOnAnyRemote(git: GitProcess, requirement: CommitRequirement): Promise<boolean> {
