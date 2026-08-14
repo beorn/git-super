@@ -17,6 +17,7 @@ git super diff --name-only <range>
 git super status --porcelain
 git super merge-base --is-ancestor <sha> <superproject-ref>
 git super pull --ff-only [<repository> [<refspec>...]]
+git super push [--recurse-submodules=check|on-demand|only|no] [<remote> [<refspec>...]]
 ```
 
 `diff` accepts `--diff-filter`, `--cached`, and `-z`. `status` includes tracked and untracked changes in checked-out submodules. `merge-base --is-ancestor` discovers which repository owns the first commit and compares it with that repository's pin in the selected superproject ref.
@@ -51,6 +52,32 @@ Use `--dry-run` to fetch, freeze, and preflight without changing a checkout, ind
 
 `--json` emits one stable `GitSuperResult` on both success and operational failure. Success exits `0`; failed, partial, or unknown results exit nonzero.
 
+### Push tool-surface audit
+
+| Field                  | Answer                                                                                  |
+| ---------------------- | --------------------------------------------------------------------------------------- |
+| Surface                | `git super push`; `superPush`; `pushRefUpdates`                                         |
+| Kind                   | Vendor CLI and public library                                                           |
+| Read/write             | Remote-ref writes after a read-only frozen plan                                         |
+| Required resources     | Git repository and objects, selected remotes, network transport, credentials, and hooks |
+| Missing-resource class | Invalid user input or unavailable external state                                        |
+| Failure behavior       | Nonzero stable `GitSuperResult` naming the repository, ref, phase, and safe remedy      |
+| Default/empty returns  | No empty success; no selected ref updates is a teaching input error                     |
+| Regression test        | `tests/push.test.ts`                                                                    |
+
+Hooks, credential helpers, and remote helpers remain native Git behavior. A timeout, rejected hook, inaccessible remote, unreadable response, or post-write observation mismatch is never converted into an empty or successful result.
+
+### Recursive push
+
+`push` resolves every selected source to an exact object ID, freezes each destination's advertised old value, and rechecks it under the shared mutation lock. With no refspecs it asks Git for the configured default push selection using a non-writing porcelain dry run, then applies those exact rows. General force refspecs and implicit fetch-racy leases are refused; `--force-with-lease=<full-ref>:<expected>` is explicit, and an empty expected value means create-only.
+
+- `check` requires every recorded child commit to be reachable from at least one configured remote, then pushes root refs.
+- `on-demand` pushes missing nested commits leaf-first and root-last.
+- `only` publishes the nested commits and leaves root refs untouched.
+- `no` pushes only the selected root refs.
+
+`--atomic` is passed separately to each one-repository push. It never makes several repositories atomic: a child may remain published when a later root hook or remote rejects, and the result then reports `partial: true`. Hooks run unless `--no-verify` is explicit; signed-push mode and push options are passed through unchanged.
+
 ## Try the repository before npm publication
 
 The package name is reserved but this initial source release is not yet published. Clone it, install its public dependencies, and put its repo-local executable on `PATH` for the current command:
@@ -75,8 +102,10 @@ bun run typecheck
 - `src/diff.ts`, `src/status.ts`, and `src/merge-base.ts` are pure read-plumbing services over an explicit Git process adapter.
 - `src/worktree.ts` is the injected write-plumbing service: add, lock, unlock, inspect, exact removal, recovery, and hook quarantine. Its repository lock deliberately retains the cutover identity `.git/.../yrd-worktree-mutations/writer.lock`, so old and new callers exclude one another.
 - `src/submodules.ts` is the single recursive materializer for Yrd and host adapters. It proves exact gitlinks before borrowing local objects, reports remote fallbacks, supports a top-level path allowlist, and recurses through nested gitlinks.
+- `src/commit-graph.ts` is the strict, read-only parser for gitlinks recorded in an exact commit. Pull and push share it rather than interpreting `.gitmodules` independently.
 - `src/process.ts` is the public injected Git process capability for graph operations. `src/result.ts` owns their shared repository/ref result vocabulary and aggregation law.
 - `src/pull.ts` owns the fetch/freeze/preflight/recheck/apply fast-forward operation. It imports no scheduler, delivery, or fleet policy.
+- `src/push.ts` plans exact ref updates, proves recursive commit availability, and applies explicit per-ref leases child-first and root-last. It exposes transport mechanics but no submission, promotion, or retry policy.
 - `src/commands.ts` exposes the platform-neutral `CommandNode` tree from the published `@silvery/command` package and every CLI request passes through `resolveInvocation()`.
 - `src/report.tsx` renders the fail-loud repository witness with canonical Silvery components and Sterling semantic tokens.
 - `src/cli.ts` adapts Commander parsing, stdout-compatible data, stable JSON, and the Silvery report around the command tree.

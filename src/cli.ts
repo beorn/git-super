@@ -6,6 +6,7 @@ import {
   type DiffParams,
   type MergeBaseParams,
   type PullParams,
+  type PushParams,
   type StatusParams,
 } from "./commands.ts"
 import type { ConsultedRepository, SuperDiffResult } from "./diff.ts"
@@ -25,6 +26,7 @@ type CapturedInvocation =
   | Readonly<{ node: typeof commands.status; params: StatusParams; json: boolean; nul: boolean }>
   | Readonly<{ node: (typeof commands)["merge-base"]; params: MergeBaseParams; json: boolean; nul: boolean }>
   | Readonly<{ node: typeof commands.pull; params: PullParams; json: boolean; nul: boolean }>
+  | Readonly<{ node: typeof commands.push; params: PushParams; json: boolean; nul: boolean }>
 
 function stableValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(stableValue)
@@ -96,6 +98,52 @@ export async function runCli(argv: readonly string[], stdout: OutputSink, stderr
           refspecs,
           ffOnly: options.ffOnly === true,
           ...(options.dryRun === true ? { dryRun: true } : {}),
+        },
+        json: globals.json === true,
+        nul: false,
+      }
+    })
+
+  program
+    .command("push")
+    .description(commands.push.description ?? commands.push.title)
+    .option(
+      "--recurse-submodules <check|on-demand|only|no>",
+      "check requires commits on at least one submodule remote; on-demand publishes missing submodules before the root; only publishes submodules; no updates only root refs",
+      "check",
+    )
+    .option("--atomic", "request an atomic update only within each one remote repository")
+    .option(
+      "--force-with-lease <ref:expect>",
+      "require one explicit expected old object; repeat for multiple refs (empty expect means create-only)",
+      (value: string, previous: string[]) => [...previous, value],
+      [],
+    )
+    .option("--no-verify", "bypass the ordinary local pre-push hook")
+    .option("--signed <true|false|if-asked>", "pass Git's signed-push mode")
+    .option("-o, --push-option <option...>", "pass push options to the selected remote")
+    .argument("[remote]", "remote name or URL; omit it to use Git's configured push remote")
+    .argument("[refspecs...]", "exact root source:destination refspecs")
+    .action((remote, refspecs, options, command) => {
+      const globals = command.optsWithGlobals() as { repo: string; json?: boolean }
+      const pushOptions = Array.isArray(options.pushOption)
+        ? (options.pushOption as string[])
+        : typeof options.pushOption === "string"
+          ? [options.pushOption]
+          : []
+      captured = {
+        node: commands.push,
+        params: {
+          recurseSubmodules: (options.recurseSubmodules ?? "check") as PushParams["recurseSubmodules"],
+          ...(typeof remote === "string" ? { remote } : {}),
+          refspecs,
+          ...(options.atomic === true ? { atomic: true } : {}),
+          ...(options.verify === false ? { verify: false } : {}),
+          ...(options.signed === undefined ? {} : { signed: options.signed as NonNullable<PushParams["signed"]> }),
+          ...(pushOptions.length === 0 ? {} : { pushOptions }),
+          ...(Array.isArray(options.forceWithLease) && options.forceWithLease.length > 0
+            ? { forceWithLease: options.forceWithLease as string[] }
+            : {}),
         },
         json: globals.json === true,
         nul: false,
@@ -187,9 +235,9 @@ export async function runCli(argv: readonly string[], stdout: OutputSink, stderr
   }
 
   if (captured.node === commands["merge-base"] && !(result as SuperIsAncestorResult).isAncestor) return 1
-  if (captured.node === commands.pull) {
-    const pull = result as GitSuperResult
-    return pull.state === "updated" || pull.state === "unchanged" ? 0 : 2
+  if (captured.node === commands.pull || captured.node === commands.push) {
+    const operation = result as GitSuperResult
+    return operation.state === "updated" || operation.state === "unchanged" ? 0 : 2
   }
   return 0
 }

@@ -20,6 +20,7 @@
     "./exclusive": "./src/exclusive.ts",
     "./process": "./src/process.ts",
     "./pull": "./src/pull.ts",
+    "./push": "./src/push.ts",
     "./result": "./src/result.ts",
     "./submodules": "./src/submodules.ts",
     "./worktree": "./src/worktree.ts"

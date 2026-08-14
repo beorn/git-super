@@ -8,6 +8,7 @@ import {
 import { superDiff, type SuperDiffOptions, type SuperDiffResult } from "./diff.ts"
 import { superIsAncestor, type SuperIsAncestorOptions, type SuperIsAncestorResult } from "./merge-base.ts"
 import { superPull, type SuperPullOptions } from "./pull.ts"
+import { superPush, type SuperPushOptions } from "./push.ts"
 import type { GitSuperResult } from "./result.ts"
 import { superStatus, type SuperStatusResult } from "./status.ts"
 
@@ -16,6 +17,7 @@ export type DiffParams = Omit<SuperDiffOptions, "repo">
 export type StatusParams = Record<string, never>
 export type MergeBaseParams = Omit<SuperIsAncestorOptions, "repo">
 export type PullParams = Omit<SuperPullOptions, "repo" | "git" | "exclusive">
+export type PushParams = Omit<SuperPushOptions, "repo" | "git" | "exclusive">
 
 function params<T>(parse: (value: unknown) => T, missing?: (value: unknown) => string[]): ParseParamSchema<T> {
   return { parse, ...(missing === undefined ? {} : { missing }) }
@@ -89,11 +91,44 @@ const pull = commandNode<CommandContext, PullParams, GitSuperResult>({
   run: (context, input) => superPull({ repo: context.repo, ...input }),
 })
 
+const push = commandNode<CommandContext, PushParams, GitSuperResult>({
+  title: "Push a superproject",
+  description: "Check or publish exact submodule commits before updating root refs.",
+  params: params((value) => {
+    const input = record(value)
+    const recurseSubmodules = input.recurseSubmodules
+    if (
+      recurseSubmodules !== "check" &&
+      recurseSubmodules !== "on-demand" &&
+      recurseSubmodules !== "only" &&
+      recurseSubmodules !== "no"
+    ) {
+      throw new Error("recurseSubmodules must be check, on-demand, only, or no")
+    }
+    const signed = input.signed
+    if (signed !== undefined && signed !== "true" && signed !== "false" && signed !== "if-asked") {
+      throw new Error("signed must be true, false, or if-asked")
+    }
+    return {
+      recurseSubmodules,
+      ...(typeof input.remote === "string" ? { remote: input.remote } : {}),
+      refspecs: stringArray(input.refspecs, "refspecs"),
+      ...(input.atomic === true ? { atomic: true } : {}),
+      ...(input.verify === false ? { verify: false } : {}),
+      pushOptions: stringArray(input.pushOptions, "pushOptions"),
+      forceWithLease: stringArray(input.forceWithLease, "forceWithLease"),
+      ...(signed === undefined ? {} : { signed }),
+    }
+  }),
+  run: (context, input) => superPush({ repo: context.repo, ...input }),
+})
+
 export type GitSuperCommands = Readonly<{
   diff: CommandNode<CommandContext, DiffParams, SuperDiffResult>
   status: CommandNode<CommandContext, StatusParams, SuperStatusResult>
   "merge-base": CommandNode<CommandContext, MergeBaseParams, SuperIsAncestorResult>
   pull: CommandNode<CommandContext, PullParams, GitSuperResult>
+  push: CommandNode<CommandContext, PushParams, GitSuperResult>
 }>
 
 export const commands = defineCommandNodes({
@@ -101,4 +136,5 @@ export const commands = defineCommandNodes({
   status,
   "merge-base": mergeBase,
   pull,
+  push,
 }) satisfies CommandNodeTree<CommandContext> as GitSuperCommands

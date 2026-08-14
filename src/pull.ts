@@ -1,6 +1,7 @@
 import { copyFileSync, mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { isAbsolute, join, resolve } from "node:path"
+import { readCommitGitlinks } from "./commit-graph.ts"
 import { createExclusive, type Exclusive } from "./exclusive.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
 import { gitSuperResult, type GitResultDetail, type GitSuperRepositoryResult, type GitSuperResult } from "./result.ts"
@@ -188,70 +189,6 @@ async function observeRemoteTarget(
   return objectIds[0]
 }
 
-type SubmoduleEntry = Readonly<{ path: string; target: string }>
-
-async function submoduleEntries(git: GitProcess, repository: string, commit: string): Promise<SubmoduleEntry[]> {
-  const manifest = await run(git, repository, ["ls-tree", commit, "--", ".gitmodules"])
-  if (manifest.code !== 0) {
-    throw operationError(repository, "read-target-manifest", ["ls-tree", commit, "--", ".gitmodules"], manifest)
-  }
-  if (manifest.stdout.trim() === "") return []
-  if (!/^100[0-9]{3} blob [0-9a-f]+\t\.gitmodules\s*$/mu.test(manifest.stdout)) {
-    throw Object.assign(new Error(`target ${commit} has an invalid .gitmodules entry`), {
-      resultDetail: detail(
-        "invalid-target-manifest",
-        "read-target-manifest",
-        `Target ${commit} has an invalid .gitmodules entry.`,
-        {
-          paths: [".gitmodules"],
-          objectIds: [commit],
-        },
-      ),
-    })
-  }
-  const configured = await run(git, repository, [
-    "config",
-    "--blob",
-    `${commit}:.gitmodules`,
-    "--get-regexp",
-    "^submodule\\..*\\.path$",
-  ])
-  if (configured.code === 1 && configured.stdout.trim() === "" && configured.stderr === "") return []
-  if (configured.code !== 0) {
-    throw operationError(
-      repository,
-      "read-target-submodules",
-      ["config", "--blob", `${commit}:.gitmodules`],
-      configured,
-    )
-  }
-  const paths = configured.stdout
-    .split(/\r?\n/u)
-    .filter((line) => line !== "")
-    .map((line) => line.slice(line.search(/\s/u) + 1))
-    .sort()
-  const entries: SubmoduleEntry[] = []
-  for (const path of paths) {
-    const tree = await required(git, repository, ["ls-tree", commit, "--", path], "read-target-gitlink")
-    const match = /^160000 commit ([0-9a-f]+)\t/u.exec(tree)
-    if (match?.[1] === undefined) {
-      throw Object.assign(new Error(`target ${commit} does not record submodule path ${path}`), {
-        resultDetail: detail(
-          "missing-target-gitlink",
-          "read-target-gitlink",
-          `Target ${commit} does not record ${path} as a gitlink.`,
-          {
-            paths: [path],
-            objectIds: [commit],
-          },
-        ),
-      })
-    }
-    entries.push({ path, target: match[1] })
-  }
-  return entries
-}
-
 async function ensureCommit(git: GitProcess, repository: string, target: string): Promise<void> {
   const present = await run(git, repository, ["cat-file", "-e", `${target}^{commit}`])
   if (present.code === 0) return
@@ -305,7 +242,7 @@ async function freezeRepositoryGraph(
   const repositories: PullRepositoryPlan[] = []
   const walk = async (repository: string, path: string, from: string, to: string): Promise<void> => {
     repositories.push({ repository, path, current: from, target: to })
-    const entries = await submoduleEntries(git, repository, to)
+    const entries = await readCommitGitlinks(git, repository, to)
     for (const entry of entries) {
       const childPath = path === "." ? entry.path : `${path}/${entry.path}`
       const childRepository = join(repository, entry.path)

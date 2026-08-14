@@ -14,6 +14,8 @@ describe("GitSuperResult aggregation", () => {
     const api = await import("git-super")
 
     expect(api.superPull).toBeTypeOf("function")
+    expect(api.superPush).toBeTypeOf("function")
+    expect(api.pushRefUpdates).toBeTypeOf("function")
     expect(api.createLocalGitProcess).toBeTypeOf("function")
     expect(api.gitSuperResult).toBeTypeOf("function")
   })
