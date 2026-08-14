@@ -543,7 +543,7 @@ describe("explicit recursive push mechanics", () => {
     })
   })
 
-  test("passes atomic, hook, signed-push, and push-option choices to ordinary Git per repository", async () => {
+  test("passes atomic, hook, signed-push, push-option, and receive-pack choices to ordinary Git per repository", async () => {
     const { repository, remote, source } = pushFixture("native-options")
     git(remote, "config", "receive.advertisePushOptions", "true")
     const hook = join(repository, ".git", "hooks", "pre-push")
@@ -565,13 +565,20 @@ describe("explicit recursive push mechanics", () => {
       verify: false,
       signed: "false",
       pushOptions: ["ci.skip=true"],
+      receivePack: "git receive-pack",
       git: recording,
     })
 
     expect(result.state).toBe("updated")
     expect(pushArgs).toHaveLength(1)
     expect(pushArgs[0]).toEqual(
-      expect.arrayContaining(["--atomic", "--no-verify", "--signed=false", "--push-option=ci.skip=true"]),
+      expect.arrayContaining([
+        "--atomic",
+        "--no-verify",
+        "--signed=false",
+        "--push-option=ci.skip=true",
+        "--receive-pack=git receive-pack",
+      ]),
     )
   })
 

@@ -38,6 +38,7 @@ export type PushRefUpdatesOptions = Readonly<{
   atomic?: boolean
   verify?: boolean
   pushOptions?: readonly string[]
+  receivePack?: string
   signed?: PushSignedMode
   timeoutMs?: number
   git?: GitProcess
@@ -339,7 +340,7 @@ function pushFailureCode(result: GitProcessResult): string {
 async function applyGroup(
   git: GitProcess,
   group: PushGroup,
-  options: Pick<PushRefUpdatesOptions, "atomic" | "pushOptions" | "signed" | "verify">,
+  options: Pick<PushRefUpdatesOptions, "atomic" | "pushOptions" | "receivePack" | "signed" | "verify">,
 ): Promise<GitSuperRepositoryResult> {
   const rechecked = await Promise.all(
     group.updates.map((update) => observeDestination(git, update, "recheck-destination")),
@@ -380,6 +381,7 @@ async function applyGroup(
     ...(options.verify === false ? ["--no-verify"] : []),
     ...(options.signed === undefined ? [] : [`--signed=${options.signed}`]),
     ...(options.pushOptions ?? []).map((option) => `--push-option=${option}`),
+    ...(options.receivePack === undefined ? [] : [`--receive-pack=${options.receivePack}`]),
     ...group.updates.filter((update) => update.explicitExpectation).map(lease),
     group.remote,
     ...group.updates.map((update) => `${update.source}:${update.destination}`),
