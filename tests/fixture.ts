@@ -1,5 +1,11 @@
-import { mkdirSync, writeFileSync } from "node:fs"
+import { mkdirSync, realpathSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
 import { join } from "node:path"
+
+/** Git reports physical repository roots; Darwin's tmpdir is commonly a /var alias for /private/var. */
+export function canonicalTmpdir(): string {
+  return realpathSync(tmpdir())
+}
 
 export function git(cwd: string, ...args: string[]): string {
   const result = Bun.spawnSync(["git", "-C", cwd, ...args], {

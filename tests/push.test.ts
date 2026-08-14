@@ -1,5 +1,4 @@
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { afterEach, describe, expect, test } from "vitest"
@@ -8,7 +7,7 @@ import { runCli } from "../src/cli.ts"
 import { acquireExclusive, createExclusive, type Exclusive } from "../src/exclusive.ts"
 import { createLocalGitProcess, type GitProcess } from "../src/process.ts"
 import { pushRefUpdates, remoteContainsCommit, superPush } from "../src/push.ts"
-import { advanceRepository, createRepository, git } from "./fixture.ts"
+import { advanceRepository, canonicalTmpdir as tmpdir, createRepository, git } from "./fixture.ts"
 
 const roots: string[] = []
 const gitSuperBin = fileURLToPath(new URL("../bin/git-super", import.meta.url))

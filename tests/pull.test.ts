@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, test } from "vitest"
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { runCli } from "../src/cli.ts"
@@ -12,6 +11,7 @@ import {
   advanceRepository,
   bumpNestedAlphaSubmodule,
   bumpProductSubmodules,
+  canonicalTmpdir as tmpdir,
   createProductFixture,
   createRepository,
   git,
