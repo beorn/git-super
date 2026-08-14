@@ -367,6 +367,21 @@ describe("explicit recursive push mechanics", () => {
     })
   })
 
+  test("publishes from a bare object store without requiring a working tree", async () => {
+    const fixture = pushFixture("bare-source")
+    const bare = join(fixture.fixture, "staging.git")
+    git(fixture.fixture, "init", "--bare", "-q", bare)
+    git(bare, "fetch", "-q", fixture.repository, fixture.source)
+
+    const result = await pushRefUpdates({
+      root: bare,
+      updates: [update(bare, fixture.remote, fixture.source, { state: "missing" })],
+    })
+
+    expect(result).toMatchObject({ state: "updated", partial: false })
+    expect(git(fixture.remote, "rev-parse", "refs/heads/main")).toBe(fixture.source)
+  })
+
   test("treats an identical create-only retry as unchanged and refuses a different existing object", async () => {
     const identical = pushFixture("create-only-identical")
     git(identical.repository, "push", "-q", identical.remote, `${identical.source}:refs/heads/main`)

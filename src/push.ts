@@ -83,6 +83,17 @@ async function required(git: GitProcess, repository: string, args: readonly stri
   return result.stdout.trim()
 }
 
+async function discoverRepository(git: GitProcess, path: string, phase: string): Promise<string> {
+  const topLevelArgs = ["rev-parse", "--show-toplevel"]
+  const topLevel = await git.run({ repo: path, args: topLevelArgs })
+  if (topLevel.code === 0 && topLevel.stdout.trim() !== "") return resolve(topLevel.stdout.trim())
+  const bare = await git.run({ repo: path, args: ["rev-parse", "--is-bare-repository"] })
+  if (bare.code === 0 && bare.stdout.trim() === "true") {
+    return resolve(await required(git, path, ["rev-parse", "--absolute-git-dir"], phase))
+  }
+  throw operationError(path, topLevelArgs, phase, topLevel)
+}
+
 function operationError(
   repository: string,
   args: readonly string[],
@@ -205,7 +216,7 @@ async function planUpdates(git: GitProcess, input: readonly RefUpdate[]): Promis
         resultDetail: detail("empty-remote", "validate", "Push remote must not be empty."),
       })
     }
-    const repository = await required(git, update.repository, ["rev-parse", "--show-toplevel"], "discover-repository")
+    const repository = await discoverRepository(git, update.repository, "discover-repository")
     await required(git, repository, ["cat-file", "-e", `${update.source}^{object}`], "verify-source-object")
     const validDestination = await git.run({ repo: repository, args: ["check-ref-format", update.destination] })
     if (validDestination.code !== 0) {
@@ -465,7 +476,7 @@ export async function pushRefUpdates(options: PushRefUpdatesOptions): Promise<Gi
   }
   let groups: PushGroup[]
   try {
-    const repository = await required(git, root, ["rev-parse", "--show-toplevel"], "discover-root")
+    const repository = await discoverRepository(git, root, "discover-root")
     groups = groupUpdates(await planUpdates(git, options.updates), repository)
     const exclusive = options.exclusive ?? createExclusive(await lockDirectory(git, repository))
     return await exclusive.run(
@@ -867,7 +878,7 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
   }
   let root: string
   try {
-    root = await required(git, options.repo, ["rev-parse", "--show-toplevel"], "discover-root")
+    root = await discoverRepository(git, options.repo, "discover-root")
     const remote = options.remote ?? (await configuredPushRemote(git, root))
     const refspecs = options.refspecs ?? []
     const selectedUpdates =
