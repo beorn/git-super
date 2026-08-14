@@ -3,6 +3,7 @@ import { tmpdir } from "node:os"
 import { isAbsolute, join, resolve } from "node:path"
 import { readCommitGitlinks } from "./commit-graph.ts"
 import { createExclusive, type Exclusive } from "./exclusive.ts"
+import { ensureCommitObject } from "./objects.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
 import { gitSuperResult, type GitResultDetail, type GitSuperRepositoryResult, type GitSuperResult } from "./result.ts"
 
@@ -189,18 +190,6 @@ async function observeRemoteTarget(
   return objectIds[0]
 }
 
-async function ensureCommit(git: GitProcess, repository: string, target: string): Promise<void> {
-  const present = await run(git, repository, ["cat-file", "-e", `${target}^{commit}`])
-  if (present.code === 0) return
-  await required(
-    git,
-    repository,
-    ["fetch", "--no-tags", "--no-recurse-submodules", "origin", target],
-    "fetch-recorded-submodule-commit",
-  )
-  await required(git, repository, ["cat-file", "-e", `${target}^{commit}`], "verify-recorded-submodule-commit")
-}
-
 async function refuseUnpublishedDetachedHead(
   git: GitProcess,
   repository: string,
@@ -261,7 +250,7 @@ async function freezeRepositoryGraph(
           ),
         })
       }
-      await ensureCommit(git, childRepository, entry.target)
+      await ensureCommitObject({ repository: childRepository, remote: "origin", commit: entry.target, git })
       const actual = await required(git, childRepository, ["rev-parse", "HEAD^{commit}"], "freeze-submodule-current")
       const priorTree = await run(git, repository, ["ls-tree", from, "--", entry.path])
       const recorded = /^160000 commit ([0-9a-f]+)\t/mu.exec(priorTree.stdout)?.[1]

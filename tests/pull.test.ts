@@ -356,7 +356,7 @@ describe("git super pull --ff-only", () => {
     expect(JSON.parse(stdout.output)).toMatchObject({
       state: "failed",
       partial: false,
-      detail: { code: "git-failed", phase: "fetch-recorded-submodule-commit" },
+      detail: { code: "git-failed", phase: "fetch-exact-commit" },
     })
   })
 
