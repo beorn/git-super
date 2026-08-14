@@ -367,6 +367,33 @@ describe("explicit recursive push mechanics", () => {
     })
   })
 
+  test("treats an identical create-only retry as unchanged and refuses a different existing object", async () => {
+    const identical = pushFixture("create-only-identical")
+    git(identical.repository, "push", "-q", identical.remote, `${identical.source}:refs/heads/main`)
+
+    const retried = await pushRefUpdates({
+      root: identical.repository,
+      updates: [update(identical.repository, identical.remote, identical.source, { state: "missing" })],
+    })
+
+    expect(retried).toMatchObject({ state: "unchanged", partial: false })
+
+    const conflict = pushFixture("create-only-conflict")
+    git(conflict.repository, "push", "-q", conflict.remote, `${conflict.source}:refs/heads/main`)
+    const different = advanceRepository(conflict.repository, "README.md", "different\n")
+    const refused = await pushRefUpdates({
+      root: conflict.repository,
+      updates: [update(conflict.repository, conflict.remote, different, { state: "missing" })],
+    })
+
+    expect(refused).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: { code: "destination-changed", phase: "observe-destination" },
+    })
+    expect(git(conflict.remote, "rev-parse", "refs/heads/main")).toBe(conflict.source)
+  })
+
   test("updates only when the explicit expected old object still matches", async () => {
     const { repository, remote, source: before } = pushFixture("lease")
     git(repository, "push", "-q", remote, `${before}:refs/heads/main`)

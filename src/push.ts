@@ -210,7 +210,13 @@ async function planUpdates(git: GitProcess, input: readonly RefUpdate[]): Promis
       { repository, remote: update.remote, destination: update.destination },
       "observe-destination",
     )
-    if (update.expectedDestination !== undefined && !sameExpected(update.expectedDestination, observed)) {
+    const identicalCreateOnlyRetry =
+      update.expectedDestination?.state === "missing" && observed.state === "oid" && observed.oid === update.source
+    if (
+      update.expectedDestination !== undefined &&
+      !sameExpected(update.expectedDestination, observed) &&
+      !identicalCreateOnlyRetry
+    ) {
       const planned = { ...update, repository, expectedDestination: update.expectedDestination }
       throw Object.assign(new Error("remote destination does not match its explicit expectation"), {
         resultDetail: mismatchDetail(planned, observed, "observe-destination"),
@@ -221,7 +227,7 @@ async function planUpdates(git: GitProcess, input: readonly RefUpdate[]): Promis
       remote: update.remote,
       source: update.source,
       destination: update.destination,
-      expectedDestination: update.expectedDestination ?? observed,
+      expectedDestination: identicalCreateOnlyRetry ? observed : (update.expectedDestination ?? observed),
     })
   }
 
