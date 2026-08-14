@@ -184,3 +184,14 @@ export async function readCommitGitlinks(
 ): Promise<CommitGitlink[]> {
   return (await readCommitSubmodules(git, repository, commit)).map(({ path, target }) => ({ path, target }))
 }
+
+/** Return only gitlinks added or advanced by `head`, using exact commit trees. */
+export async function changedCommitGitlinks(
+  git: GitProcess,
+  repository: string,
+  base: string,
+  head: string,
+): Promise<CommitGitlink[]> {
+  const before = new Map((await readCommitGitlinks(git, repository, base)).map((entry) => [entry.path, entry.target]))
+  return (await readCommitGitlinks(git, repository, head)).filter((entry) => before.get(entry.path) !== entry.target)
+}

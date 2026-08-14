@@ -7,7 +7,7 @@ import { afterEach, describe, expect, test } from "vitest"
 import { runCli } from "../src/cli.ts"
 import { acquireExclusive, createExclusive, type Exclusive } from "../src/exclusive.ts"
 import { createLocalGitProcess, type GitProcess } from "../src/process.ts"
-import { pushRefUpdates, superPush } from "../src/push.ts"
+import { pushRefUpdates, remoteContainsCommit, superPush } from "../src/push.ts"
 import { advanceRepository, createRepository, git } from "./fixture.ts"
 
 const roots: string[] = []
@@ -764,6 +764,17 @@ describe("explicit recursive push mechanics", () => {
       ],
     })
     expect(git(remote, "rev-parse", "refs/heads/main")).toBe(source)
+  })
+
+  test("checks exact commit availability on one selected remote", async () => {
+    const { repository, remote, source } = pushFixture("remote-availability")
+    git(repository, "remote", "add", "origin", remote)
+    git(repository, "push", "-q", "origin", `${source}:refs/heads/main`)
+
+    await expect(remoteContainsCommit({ repository, remote: "origin", commit: source })).resolves.toBe(true)
+
+    const unpublished = advanceRepository(repository, "README.md", "two\n")
+    await expect(remoteContainsCommit({ repository, remote: "origin", commit: unpublished })).resolves.toBe(false)
   })
 
   test("reports child success followed by root rejection as partial without rollback", async () => {

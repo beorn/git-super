@@ -45,6 +45,14 @@ export type PushRefUpdatesOptions = Readonly<{
   exclusive?: Exclusive
 }>
 
+export type RemoteCommitAvailabilityOptions = Readonly<{
+  repository: string
+  remote: string
+  commit: string
+  timeoutMs?: number
+  git?: GitProcess
+}>
+
 type PlannedUpdate = Readonly<{
   repository: string
   remote: string
@@ -749,6 +757,52 @@ async function advertisedCommitTips(git: GitProcess, repository: string, remote:
   return [...new Set(tips)]
 }
 
+async function commitAvailableOnRemote(
+  git: GitProcess,
+  repository: string,
+  remote: string,
+  commit: string,
+): Promise<boolean> {
+  for (const tip of await advertisedCommitTips(git, repository, remote)) {
+    const contains = await git.run({ repo: repository, args: ["merge-base", "--is-ancestor", commit, tip] })
+    if (contains.code === 0) return true
+    if (contains.code !== 1)
+      throw operationError(
+        repository,
+        ["merge-base", "--is-ancestor", commit, tip],
+        "check-remote-availability",
+        contains,
+      )
+  }
+  return false
+}
+
+/** Fetch advertised remote tips as needed and test whether one contains an exact local commit. */
+export async function remoteContainsCommit(options: RemoteCommitAvailabilityOptions): Promise<boolean> {
+  const timeoutMs = options.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw Object.assign(new Error("Git command timeout must be a positive finite number."), {
+      resultDetail: detail("invalid-timeout", "validate", "Git command timeout must be a positive finite number."),
+    })
+  }
+  if (!OBJECT_ID.test(options.commit)) {
+    throw Object.assign(new Error(`remote availability requires an exact commit ID: ${options.commit}`), {
+      resultDetail: detail(
+        "non-object-source",
+        "validate",
+        `Remote availability requires an exact commit ID: ${options.commit}.`,
+      ),
+    })
+  }
+  const process = options.git ?? createLocalGitProcess()
+  const git: GitProcess = {
+    run: (request) => process.run({ ...request, timeoutMs: request.timeoutMs ?? timeoutMs }),
+  }
+  const repository = await discoverRepository(git, options.repository, "discover-repository")
+  await required(git, repository, ["cat-file", "-e", `${options.commit}^{commit}`], "verify-source-commit")
+  return commitAvailableOnRemote(git, repository, options.remote, options.commit)
+}
+
 async function commitAvailableOnAnyRemote(git: GitProcess, requirement: CommitRequirement): Promise<boolean> {
   const listed = await required(git, requirement.repository, ["remote"], "list-submodule-remotes")
   const remotes = listed.split(/\r?\n/u).filter((remote) => remote !== "")
@@ -764,19 +818,10 @@ async function commitAvailableOnAnyRemote(git: GitProcess, requirement: CommitRe
   }
   const failures: string[] = []
   for (const remote of remotes) {
-    let tips: string[]
     try {
-      tips = await advertisedCommitTips(git, requirement.repository, remote)
+      if (await commitAvailableOnRemote(git, requirement.repository, remote, requirement.target)) return true
     } catch (error) {
       failures.push(`${remote}: ${error instanceof Error ? error.message : String(error)}`)
-      continue
-    }
-    for (const tip of tips) {
-      const contains = await git.run({
-        repo: requirement.repository,
-        args: ["merge-base", "--is-ancestor", requirement.target, tip],
-      })
-      if (contains.code === 0) return true
     }
   }
   if (failures.length === remotes.length) {

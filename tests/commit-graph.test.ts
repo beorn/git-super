@@ -3,7 +3,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, test } from "vitest"
 
-import { readCommitSubmodules } from "../src/commit-graph.ts"
+import { changedCommitGitlinks, readCommitSubmodules } from "../src/commit-graph.ts"
 import { createLocalGitProcess } from "../src/process.ts"
 import { createProductFixture, git } from "./fixture.ts"
 
@@ -49,5 +49,26 @@ describe("commit submodule graph", () => {
         paths: ["packages/alpha", "vendor/beta"],
       },
     })
+  })
+
+  test("reports only gitlinks added or advanced by the head commit", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-commit-graph-change-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    git(fixture.alpha, "commit", "--allow-empty", "-q", "-m", "advance alpha")
+    git(join(fixture.product, "packages/alpha"), "fetch", "-q", "origin")
+    git(join(fixture.product, "packages/alpha"), "checkout", "-q", git(fixture.alpha, "rev-parse", "HEAD"))
+    git(fixture.product, "add", "packages/alpha")
+    git(fixture.product, "commit", "-q", "-m", "advance alpha pin")
+    const head = git(fixture.product, "rev-parse", "HEAD")
+
+    await expect(
+      changedCommitGitlinks(createLocalGitProcess(), fixture.product, fixture.productBase, head),
+    ).resolves.toEqual([
+      {
+        path: "packages/alpha",
+        target: git(fixture.alpha, "rev-parse", "HEAD"),
+      },
+    ])
   })
 })
