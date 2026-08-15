@@ -1,0 +1,68 @@
+schema_version: 1
+id: gitsuper.raw
+name: git-super — raw git is not the entry point
+version: 0.1.0
+description: >-
+  Forbids raw mutating `git` so every write goes through `git-super`, which
+  understands superproject/submodule topology and can therefore refuse what a
+  regex never can: a reset onto a stale base, a gitlink that rewinds the
+  recorded pin, a commit in the wrong worktree.
+
+  This is an INVERSION, and that is the point. Enumerating dangerous git
+  spellings is an open-ended arms race — every guard that tries it eventually
+  refuses a command that only MENTIONS the danger, or misses a spelling nobody
+  thought of. Enumerating the SAFE read-only verbs is a closed list of about
+  twenty that changes once a decade. One rule plus one allowlist replaces a
+  drawer full of pattern rules.
+
+  Not specific to any one repo: anyone driving git-super wants raw git out of
+  the agent's hands for the same reason.
+
+  ROLLOUT: ship this at "warn" first. `dcg stats` and `dcg history` then report
+  exactly which git verbs your agents actually reach for, in what proportion,
+  so git-super's verb surface gets built from measurements instead of guesses.
+  Promote to deny once that surface covers the traffic.
+keywords:
+  - git
+
+destructive_patterns:
+  - name: raw-git-mutation
+    pattern: (^|[^\w./-])git(\s|$)
+    severity: high
+    description: >-
+      Raw git is not the entry point — run the equivalent `git-super` verb, which
+      knows the superproject and its submodules.
+    explanation: |
+      Plain git sees one repository. In a superproject it will happily commit a
+      gitlink that rewinds a recorded pin, fast-forward a root past submodule
+      commits that were never pushed, or leave a worktree on a branch its owner
+      did not choose — each of which reads as success and costs someone a
+      recovery later.
+
+      git-super wraps the same verbs with that context, so the check happens
+      where the knowledge is rather than in a pattern that can only see text.
+
+      Read-only git is untouched: status, log, diff, show, rev-parse and the
+      rest of the inspection verbs are allowed by the safe pattern below. If a
+      verb you need is missing from git-super, that gap is the bug — report it
+      rather than reaching around the wrapper.
+    executables:
+      - git
+
+safe_patterns:
+  - name: read-only-git
+    pattern: (^|[^\w./-])git\s+(fetch|status|log|diff|show|shortlog|describe|blame|grep|rev-parse|rev-list|merge-base|name-rev|cat-file|ls-files|ls-tree|ls-remote|for-each-ref|check-ignore|check-attr|count-objects|var|version|help|reflog(\s+show)?|remote(\s+(-v|show|get-url))?|config\s+--get|worktree\s+list|submodule\s+status|stash\s+(list|show)|branch(\s+(-a|-r|-v|-vv|--list|--show-current|--points-at|--contains|--merged|--no-merged))?(\s|$)|tag(\s+(-l|--list))?(\s|$))(\s|$)
+    description: >-
+      Inspection verbs — they never mutate an index, a worktree or a gitlink, so
+      the wrapper has nothing to add and the friction would be pure cost. About
+      two thirds of real git invocations land here.
+
+      `fetch` is included deliberately: it writes remote-tracking refs but
+      destroys nothing and creates nothing anyone can lose. Refusing it would
+      block the one command that makes every other decision better informed.
+
+  - name: git-super-itself
+    pattern: (^|[^\w./-])git-super(\s|$)
+    description: >-
+      The wrapper is not the thing being wrapped. Stated explicitly so the rule
+      above can never be read as matching its own remedy.
