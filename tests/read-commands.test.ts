@@ -108,6 +108,54 @@ describe("Phase 1 read commands", () => {
     expect(superStatus({ repo: fixture.product }).records).toEqual(["M  packages/alpha/alpha.ts"])
   })
 
+  test("still answers in the superproject for a commit the superproject's own refs reach", () => {
+    // The other half of the ownership rule, and the regression the fix could
+    // plausibly have caused: tightening "the root has the object" to "the root
+    // REACHES the object" must not stop the root answering for its own history.
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-root-owned-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const productHead = bumpProductSubmodules(fixture)
+
+    const result = superIsAncestor({
+      repo: fixture.product,
+      ancestor: fixture.productBase,
+      descendant: productHead,
+    })
+
+    expect(result.owningRepository).toBe(".")
+    expect(result.comparedTo).toBe(productHead)
+    expect(result.isAncestor).toBe(true)
+  })
+
+  test("does not answer in the superproject when a submodule sha also sits in the root object store", () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-leaked-object-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const productHead = bumpProductSubmodules(fixture)
+
+    // THE PRECONDITION, and the reason this defect hides. A superproject's
+    // object store can hold its submodules' commits — /hh's does — so
+    // `cat-file -e <submodule sha>` succeeds at the ROOT and the resolver
+    // concludes the root owns it. Reproduced by fetching alpha's history into
+    // the product store, because a fixture without it cannot fail for this.
+    git(fixture.product, "-c", "protocol.file.allow=always", "fetch", "-q", "--no-tags", fixture.alpha, "main")
+    expect(git(fixture.product, "cat-file", "-t", `${fixture.alphaBase}^{commit}`)).toBe("commit")
+
+    const result = superIsAncestor({
+      repo: fixture.product,
+      ancestor: fixture.alphaBase,
+      descendant: productHead,
+    })
+
+    // Answering in "." compares an alpha commit against a product commit —
+    // unrelated histories — and returns a confident FALSE. That is the
+    // dangerous direction: it reports landed work as NOT landed, and it is
+    // what manufactured a "km-revert" finding against a clean rescue ref.
+    expect(result.owningRepository).toBe("packages/alpha")
+    expect(result.isAncestor).toBe(true)
+  })
+
   test("merge-base refuses when no consulted repository owns the commit", () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-missing-owner-"))
     roots.push(fixtureRoot)
