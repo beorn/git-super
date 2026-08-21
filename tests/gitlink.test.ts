@@ -4,12 +4,14 @@
  * @consumer @i/10-merge-queue/git-super-one-layer F1 and Yrd composition callers
  */
 
-import { mkdtempSync, rmSync } from "node:fs"
-import { join } from "node:path"
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { isAbsolute, join, resolve } from "node:path"
 import { afterEach, describe, expect, test } from "vitest"
 
 import { runCli } from "../src/cli.ts"
+import { acquireExclusive } from "../src/exclusive.ts"
 import { writeGitlink } from "../src/gitlink.ts"
+import { createLocalGitProcess, type GitProcess } from "../src/process.ts"
 import { advanceRepository, canonicalTmpdir as tmpdir, createProductFixture, git } from "./fixture.ts"
 
 const roots: string[] = []
@@ -170,5 +172,93 @@ describe("policy-free gitlink writes", () => {
     })
     expect(result.detail?.remedy).toMatch(/fetch/iu)
     expect(stage(product.product, "packages/alpha")).toBe(before)
+  })
+
+  test("reports a malformed submodule declaration instead of treating it as a missing checkout", async () => {
+    const product = fixture("malformed-gitmodules")
+    const before = stage(product.product, "packages/alpha")
+    rmSync(join(product.product, "packages/alpha"), { recursive: true, force: true })
+    writeFileSync(join(product.product, ".gitmodules"), '[submodule "broken"\n')
+
+    const result = await writeGitlink({ repo: product.product, path: "packages/alpha", commit: product.alphaBase })
+
+    expect(result).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: {
+        code: "git-failed",
+        phase: "locate-submodule-store",
+        paths: ["packages/alpha"],
+        objectIds: [product.alphaBase],
+      },
+    })
+    expect(stage(product.product, "packages/alpha")).toBe(before)
+  })
+
+  test("uses the common-dir object store when the scratch worktree has no submodule checkout", async () => {
+    const product = fixture("common-store")
+    const next = advanceRepository(product.alpha, "alpha.ts", "export const alpha = 6\n")
+    fetchWithoutCheckout(product.product, "packages/alpha", next)
+    rmSync(join(product.product, "packages/alpha"), { recursive: true, force: true })
+
+    const result = await writeGitlink({ repo: product.product, path: "packages/alpha", commit: next })
+
+    expect(result, JSON.stringify(result)).toMatchObject({ state: "updated", partial: false })
+    expect(stage(product.product, "packages/alpha")).toBe(`160000 ${next} 0\tpackages/alpha`)
+  })
+
+  test("rejects invalid paths and object IDs before invoking Git", async () => {
+    const neverGit: GitProcess = {
+      run: () => Promise.reject(new Error("Git must not run for invalid input")),
+    }
+
+    await expect(
+      writeGitlink({ repo: ".", path: "dep", commit: "not-an-object", git: neverGit }),
+    ).resolves.toMatchObject({ state: "failed", detail: { code: "invalid-commit", phase: "validate-commit" } })
+    await expect(
+      writeGitlink({ repo: ".", path: "../dep", commit: "a".repeat(40), git: neverGit }),
+    ).resolves.toMatchObject({ state: "failed", detail: { code: "invalid-gitlink-path", phase: "validate-gitlink" } })
+  })
+
+  test("reports unknown when the index cannot be observed after Git accepts the write", async () => {
+    const product = fixture("post-write-observation")
+    const next = advanceRepository(product.alpha, "alpha.ts", "export const alpha = 7\n")
+    fetchWithoutCheckout(product.product, "packages/alpha", next)
+    const local = createLocalGitProcess()
+    let indexReads = 0
+    const injected: GitProcess = {
+      async run(request) {
+        const result = await local.run(request)
+        if (request.args[0] === "ls-files" && ++indexReads === 2) {
+          return { ...result, code: 2, stderr: "observation failed" }
+        }
+        return result
+      },
+    }
+
+    const result = await writeGitlink({ repo: product.product, path: "packages/alpha", commit: next, git: injected })
+
+    expect(result).toMatchObject({
+      state: "unknown",
+      partial: false,
+      detail: { code: "post-write-observation-failed", phase: "observe-index" },
+    })
+    expect(stage(product.product, "packages/alpha")).toBe(`160000 ${next} 0\tpackages/alpha`)
+  })
+
+  test("waits for the shared mutation lock before changing the index", async () => {
+    const product = fixture("mutation-lock")
+    const next = advanceRepository(product.alpha, "alpha.ts", "export const alpha = 8\n")
+    fetchWithoutCheckout(product.product, "packages/alpha", next)
+    const common = git(product.product, "rev-parse", "--git-common-dir")
+    const commonDirectory = isAbsolute(common) ? common : resolve(product.product, common)
+    const lock = await acquireExclusive(join(commonDirectory, "yrd-worktree-mutations"))
+
+    const pending = writeGitlink({ repo: product.product, path: "packages/alpha", commit: next })
+    await Bun.sleep(25)
+    expect(stage(product.product, "packages/alpha")).toBe(`160000 ${product.alphaBase} 0\tpackages/alpha`)
+    lock.release()
+
+    await expect(pending).resolves.toMatchObject({ state: "updated", partial: false })
   })
 })

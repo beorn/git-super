@@ -12,11 +12,134 @@ export type WriteGitlinkOptions = Readonly<{
 }>
 
 type IndexEntry = Readonly<{ mode: string; oid: string; stage: number; path: string }>
-type SubmoduleRepository = Readonly<{ repo: string; argsPrefix: readonly string[] }>
+type SubmoduleRepository = Readonly<{ repo: string; env?: NodeJS.ProcessEnv }>
 
 const DEFAULT_GIT_TIMEOUT_MS = 30_000
 const GITLINK_MODE = "160000"
 const OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu
+
+/** Set one existing gitlink's exact index commit without moving the submodule checkout. */
+export async function writeGitlink(options: WriteGitlinkOptions): Promise<GitSuperResult> {
+  const fallbackRepository = resolve(options.repo)
+  if (!OBJECT_ID.test(options.commit)) {
+    const failure = detail(
+      "invalid-commit",
+      "validate-commit",
+      `Gitlink commit ${options.commit} is not an exact 40- or 64-hex object ID.`,
+      {
+        paths: [options.path],
+        objectIds: [options.commit],
+        remedy: "Resolve the desired commit to one exact object ID before retrying.",
+      },
+    )
+    return operationResult(fallbackRepository, "failed", failure)
+  }
+  const pathSegments = options.path.split("/")
+  if (
+    options.path.trim() === "" ||
+    isAbsolute(options.path) ||
+    options.path.includes("\0") ||
+    pathSegments.some((segment) => segment === "." || segment === "..")
+  ) {
+    const failure = detail(
+      "invalid-gitlink-path",
+      "validate-gitlink",
+      `Gitlink path '${options.path}' must be a non-empty root-relative path.`,
+      {
+        paths: [options.path],
+        objectIds: [options.commit],
+        remedy: "Pass the existing submodule's root-relative index path.",
+      },
+    )
+    return operationResult(fallbackRepository, "failed", failure)
+  }
+
+  const process = options.git ?? createLocalGitProcess()
+  const git: GitProcess = {
+    run: (request) => process.run({ ...request, timeoutMs: request.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS }),
+  }
+  let repository: string
+  try {
+    repository = resolve(await required(git, options.repo, ["rev-parse", "--show-toplevel"], "discover-root"))
+  } catch (error) {
+    return operationResult(fallbackRepository, "failed", errorDetail(error, "discover-root"))
+  }
+
+  let wrote = false
+  try {
+    const exclusive = createExclusive(await lockDirectory(git, repository))
+    return await exclusive.run(
+      async () => {
+        const before = await indexEntries(git, repository, options.path)
+        if (before.length === 0 || before.some(({ mode }) => mode !== GITLINK_MODE)) {
+          return notGitlink(repository, options.path, options.commit, before)
+        }
+        const submodule = await submoduleRepository(git, repository, options.path, options.commit)
+        if ("state" in submodule) return submodule
+        const unavailable = await commitExists(git, repository, submodule, options.path, options.commit)
+        if (unavailable !== undefined) return unavailable
+        if (
+          before.length === 1 &&
+          before[0]?.stage === 0 &&
+          before[0]?.oid.toLowerCase() === options.commit.toLowerCase()
+        ) {
+          return operationResult(repository, "unchanged")
+        }
+
+        const args = ["update-index", "--cacheinfo", `${GITLINK_MODE},${options.commit},${options.path}`]
+        const written = await git.run({ repo: repository, args })
+        if (written.code !== 0) {
+          throw operationError(repository, args, "write-gitlink", written, {
+            paths: [options.path],
+            objectIds: [options.commit],
+          })
+        }
+        wrote = true
+
+        let after: IndexEntry[]
+        try {
+          after = await indexEntries(git, repository, options.path)
+        } catch (error) {
+          const observation = errorDetail(error, "observe-index")
+          const failure = detail(
+            "post-write-observation-failed",
+            "observe-index",
+            `Gitlink ${options.path} may have been written to ${options.commit}, but the resulting index entry could not be read: ${observation.message}`,
+            {
+              paths: [options.path],
+              objectIds: [options.commit],
+              remedy: "Inspect `git ls-files --stage` before deciding whether a retry is safe.",
+            },
+          )
+          return operationResult(repository, "unknown", failure)
+        }
+        if (
+          after.length !== 1 ||
+          after[0]?.mode !== GITLINK_MODE ||
+          after[0]?.stage !== 0 ||
+          after[0]?.oid.toLowerCase() !== options.commit.toLowerCase()
+        ) {
+          const failure = detail(
+            "gitlink-observation-mismatch",
+            "observe-index",
+            `Git reported success, but ${options.path} does not resolve to stage-zero gitlink ${options.commit}.`,
+            {
+              paths: [options.path],
+              objectIds: [options.commit, ...after.map(({ oid }) => oid)],
+              remedy: "Inspect `git ls-files --stage` before deciding whether a retry is safe.",
+            },
+          )
+          return operationResult(repository, "unknown", failure)
+        }
+        return operationResult(repository, "updated")
+      },
+      { holder: "git super gitlink write" },
+    )
+  } catch (error) {
+    if (wrote) return postWriteCleanupFailure(repository, options.path, options.commit, error)
+    return operationResult(repository, "failed", errorDetail(error, "write-gitlink"))
+  }
+}
 
 function detail(code: string, phase: string, message: string, extra: Partial<GitResultDetail> = {}): GitResultDetail {
   return { code, phase, message, ...extra }
@@ -38,6 +161,26 @@ function operationResult(
     ],
     failure,
   )
+}
+
+function postWriteCleanupFailure(repository: string, path: string, commit: string, error: unknown): GitSuperResult {
+  const failure = detail(
+    "post-write-lock-release-failed",
+    "release-mutation-lock",
+    `Gitlink ${path} was written to ${commit}, but the mutation lock could not be released: ${error instanceof Error ? error.message : String(error)}`,
+    {
+      paths: [path],
+      objectIds: [commit],
+      remedy:
+        "Treat the index write as applied. Inspect the index and lock owner before retrying; restart the caller if it still holds the lock.",
+    },
+  )
+  return {
+    state: "failed",
+    partial: true,
+    detail: failure,
+    repositories: [{ repository, state: "updated", refs: [] }],
+  }
 }
 
 function operationError(
@@ -134,11 +277,18 @@ async function submoduleRepository(
   const observed = await git.run({ repo: candidate, args })
   const root = observed.stdout.trim()
   if (observed.code === 0 && root !== "" && resolve(root) === resolve(candidate)) {
-    return { repo: resolve(root), argsPrefix: [] }
+    return { repo: resolve(root) }
   }
 
   const configuredArgs = ["config", "--null", "--file", ".gitmodules", "--get-regexp", "^submodule\\..*\\.path$"]
   const configured = await git.run({ repo: repository, args: configuredArgs })
+  if (configured.code !== 0 && configured.code !== 1) {
+    throw operationError(repository, configuredArgs, "locate-submodule-store", configured, {
+      paths: [path],
+      objectIds: [commit],
+      remedy: "Repair the superproject's .gitmodules file, then rerun the same gitlink write.",
+    })
+  }
   const names =
     configured.code === 0
       ? configured.stdout
@@ -156,9 +306,9 @@ async function submoduleRepository(
     const common = await required(git, repository, ["rev-parse", "--git-common-dir"], "locate-submodule-store")
     const commonDirectory = isAbsolute(common) ? common : resolve(repository, common)
     const store = join(commonDirectory, "modules", names[0])
-    const storeArg = `--git-dir=${store}`
-    const verified = await git.run({ repo: repository, args: [storeArg, "rev-parse", "--git-dir"] })
-    if (verified.code === 0) return { repo: repository, argsPrefix: [storeArg] }
+    const env = { GIT_OBJECT_DIRECTORY: join(store, "objects") }
+    const verified = await git.run({ repo: repository, args: ["count-objects", "-v"], env })
+    if (verified.code === 0) return { repo: repository, env }
   }
 
   {
@@ -183,8 +333,12 @@ async function commitExists(
   path: string,
   commit: string,
 ): Promise<GitSuperResult | undefined> {
-  const args = [...submodule.argsPrefix, "cat-file", "-e", `${commit}^{commit}`]
-  const observed = await git.run({ repo: submodule.repo, args })
+  const args = ["cat-file", "-e", `${commit}^{commit}`]
+  const observed = await git.run({
+    repo: submodule.repo,
+    args,
+    ...(submodule.env === undefined ? {} : { env: submodule.env }),
+  })
   if (observed.code === 0) return undefined
   if (
     observed.timedOut === true ||
@@ -214,118 +368,4 @@ async function commitExists(
 async function lockDirectory(git: GitProcess, repository: string): Promise<string> {
   const common = await required(git, repository, ["rev-parse", "--git-common-dir"], "locate-mutation-lock")
   return join(isAbsolute(common) ? common : resolve(repository, common), "yrd-worktree-mutations")
-}
-
-/** Set one existing gitlink's exact index commit without moving the submodule checkout. */
-export async function writeGitlink(options: WriteGitlinkOptions): Promise<GitSuperResult> {
-  const fallbackRepository = resolve(options.repo)
-  if (!OBJECT_ID.test(options.commit)) {
-    const failure = detail(
-      "invalid-commit",
-      "validate-commit",
-      `Gitlink commit ${options.commit} is not an exact 40- or 64-hex object ID.`,
-      {
-        paths: [options.path],
-        objectIds: [options.commit],
-        remedy: "Resolve the desired commit to one exact object ID before retrying.",
-      },
-    )
-    return operationResult(fallbackRepository, "failed", failure)
-  }
-  if (options.path.trim() === "" || isAbsolute(options.path) || options.path.includes("\0")) {
-    const failure = detail(
-      "invalid-gitlink-path",
-      "validate-gitlink",
-      `Gitlink path '${options.path}' must be a non-empty root-relative path.`,
-      {
-        paths: [options.path],
-        objectIds: [options.commit],
-        remedy: "Pass the existing submodule's root-relative index path.",
-      },
-    )
-    return operationResult(fallbackRepository, "failed", failure)
-  }
-
-  const process = options.git ?? createLocalGitProcess()
-  const git: GitProcess = {
-    run: (request) => process.run({ ...request, timeoutMs: request.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS }),
-  }
-  let repository: string
-  try {
-    repository = resolve(await required(git, options.repo, ["rev-parse", "--show-toplevel"], "discover-root"))
-  } catch (error) {
-    return operationResult(fallbackRepository, "failed", errorDetail(error, "discover-root"))
-  }
-
-  try {
-    const exclusive = createExclusive(await lockDirectory(git, repository))
-    return await exclusive.run(
-      async () => {
-        const before = await indexEntries(git, repository, options.path)
-        if (before.length === 0 || before.some(({ mode }) => mode !== GITLINK_MODE)) {
-          return notGitlink(repository, options.path, options.commit, before)
-        }
-        const submodule = await submoduleRepository(git, repository, options.path, options.commit)
-        if ("state" in submodule) return submodule
-        const unavailable = await commitExists(git, repository, submodule, options.path, options.commit)
-        if (unavailable !== undefined) return unavailable
-        if (
-          before.length === 1 &&
-          before[0]?.stage === 0 &&
-          before[0]?.oid.toLowerCase() === options.commit.toLowerCase()
-        ) {
-          return operationResult(repository, "unchanged")
-        }
-
-        const args = ["update-index", "--cacheinfo", `${GITLINK_MODE},${options.commit},${options.path}`]
-        const written = await git.run({ repo: repository, args })
-        if (written.code !== 0) {
-          throw operationError(repository, args, "write-gitlink", written, {
-            paths: [options.path],
-            objectIds: [options.commit],
-          })
-        }
-
-        let after: IndexEntry[]
-        try {
-          after = await indexEntries(git, repository, options.path)
-        } catch (error) {
-          const observation = errorDetail(error, "observe-index")
-          const failure = detail(
-            "post-write-observation-failed",
-            "observe-index",
-            `Gitlink ${options.path} may have been written to ${options.commit}, but the resulting index entry could not be read: ${observation.message}`,
-            {
-              paths: [options.path],
-              objectIds: [options.commit],
-              remedy: "Inspect `git ls-files --stage` before deciding whether a retry is safe.",
-            },
-          )
-          return operationResult(repository, "unknown", failure)
-        }
-        if (
-          after.length !== 1 ||
-          after[0]?.mode !== GITLINK_MODE ||
-          after[0]?.stage !== 0 ||
-          after[0]?.oid.toLowerCase() !== options.commit.toLowerCase()
-        ) {
-          const failure = detail(
-            "gitlink-observation-mismatch",
-            "observe-index",
-            `Git reported success, but ${options.path} does not resolve to stage-zero gitlink ${options.commit}.`,
-            {
-              paths: [options.path],
-              objectIds: [options.commit, ...after.map(({ oid }) => oid)],
-              remedy: "Inspect `git ls-files --stage` before deciding whether a retry is safe.",
-            },
-          )
-          return operationResult(repository, "unknown", failure)
-        }
-        return operationResult(repository, "updated")
-      },
-      { holder: "git super gitlink write" },
-    )
-  } catch (error) {
-    return operationResult(repository, "failed", errorDetail(error, "write-gitlink"))
-  }
 }
