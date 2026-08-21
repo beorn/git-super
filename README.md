@@ -49,7 +49,7 @@ Missing checkouts, missing commit objects, added or removed gitlinks without a r
 
 ### Exact gitlink write
 
-`gitlink write <path> <commit>` updates one existing mode-`160000` index entry to an exact commit without moving the submodule checkout. It is mechanics only: the caller decides which pin should be written. The command serializes through the shared mutation lock and observes the resulting stage-zero entry before reporting success; an unreadable or mismatched post-write observation reports `unknown` and exits nonzero.
+`gitlink write <path> <commit>` updates one existing mode-`160000` index entry to an exact commit without moving the submodule checkout. It is mechanics only: the caller decides which pin should be written. The command serializes through the shared mutation lock and observes the resulting stage-zero entry before reporting success; an unreadable or mismatched post-write observation reports `unknown` and exits nonzero. A lock-release failure after an accepted write reports `failed` and `partial`; if observation also failed, the repository remains `unknown` instead of being overclaimed as updated.
 
 The path must already be a gitlink, and the exact commit object must exist in either its initialized checkout or its configured repository under the superproject's common Git directory. A missing path, repository, or commit fails with a diagnostic naming the repository, path, object ID, and remedy. The operation never adds a path, fetches a commit, checks out a submodule, or chooses whether a pin should advance. `--json` emits the same `GitSuperResult` returned by the `writeGitlink` library export.
 

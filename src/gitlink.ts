@@ -66,6 +66,7 @@ export async function writeGitlink(options: WriteGitlinkOptions): Promise<GitSup
   }
 
   let wrote = false
+  let postWriteResult: GitSuperResult | undefined
   try {
     const exclusive = createExclusive(await lockDirectory(git, repository))
     return await exclusive.run(
@@ -111,7 +112,8 @@ export async function writeGitlink(options: WriteGitlinkOptions): Promise<GitSup
               remedy: "Inspect `git ls-files --stage` before deciding whether a retry is safe.",
             },
           )
-          return operationResult(repository, "unknown", failure)
+          postWriteResult = operationResult(repository, "unknown", failure)
+          return postWriteResult
         }
         if (
           after.length !== 1 ||
@@ -129,14 +131,16 @@ export async function writeGitlink(options: WriteGitlinkOptions): Promise<GitSup
               remedy: "Inspect `git ls-files --stage` before deciding whether a retry is safe.",
             },
           )
-          return operationResult(repository, "unknown", failure)
+          postWriteResult = operationResult(repository, "unknown", failure)
+          return postWriteResult
         }
-        return operationResult(repository, "updated")
+        postWriteResult = operationResult(repository, "updated")
+        return postWriteResult
       },
       { holder: "git super gitlink write" },
     )
   } catch (error) {
-    if (wrote) return postWriteCleanupFailure(repository, options.path, options.commit, error)
+    if (wrote) return postWriteCleanupFailure(repository, options.path, options.commit, error, postWriteResult)
     return operationResult(repository, "failed", errorDetail(error, "write-gitlink"))
   }
 }
@@ -163,23 +167,41 @@ function operationResult(
   )
 }
 
-function postWriteCleanupFailure(repository: string, path: string, commit: string, error: unknown): GitSuperResult {
+function postWriteCleanupFailure(
+  repository: string,
+  path: string,
+  commit: string,
+  error: unknown,
+  postWriteResult: GitSuperResult | undefined,
+): GitSuperResult {
+  const verified = postWriteResult?.state === "updated"
+  const observationDetail = postWriteResult?.repositories[0]?.detail ?? postWriteResult?.detail
   const failure = detail(
-    "post-write-lock-release-failed",
+    verified ? "post-write-lock-release-failed" : "post-write-observation-and-lock-release-failed",
     "release-mutation-lock",
-    `Gitlink ${path} was written to ${commit}, but the mutation lock could not be released: ${error instanceof Error ? error.message : String(error)}`,
+    verified
+      ? `Gitlink ${path} was written to ${commit}, but the mutation lock could not be released: ${error instanceof Error ? error.message : String(error)}`
+      : `Git accepted the write for ${path} at ${commit}, but the resulting index state could not be verified and the mutation lock could not be released: ${error instanceof Error ? error.message : String(error)}`,
     {
       paths: [path],
       objectIds: [commit],
-      remedy:
-        "Treat the index write as applied. Inspect the index and lock owner before retrying; restart the caller if it still holds the lock.",
+      remedy: verified
+        ? "Treat the index write as applied. Inspect the index and lock owner before retrying; restart the caller if it still holds the lock."
+        : "Treat the index state as unknown. Inspect `git ls-files --stage` and the lock owner before retrying; restart the caller if it still holds the lock.",
     },
   )
   return {
     state: "failed",
     partial: true,
     detail: failure,
-    repositories: [{ repository, state: "updated", refs: [] }],
+    repositories: [
+      {
+        repository,
+        state: verified ? "updated" : "unknown",
+        ...(observationDetail === undefined ? {} : { detail: observationDetail }),
+        refs: [],
+      },
+    ],
   }
 }
 
