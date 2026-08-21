@@ -4,7 +4,7 @@
  * @consumer Yrd, Bearly, and hh worktree adapters
  */
 import { writeFileSync } from "node:fs"
-import { mkdtemp, rm } from "node:fs/promises"
+import { mkdir, mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, it } from "vitest"
@@ -125,6 +125,75 @@ describe("materializeSubmodules", () => {
         .map(({ args }) => args.at(-1))
         .toSorted(),
     ).toEqual(paths.toSorted())
+  })
+
+  it("runs remote-fallback updates ONE AT A TIME while local borrows stay parallel", async () => {
+    // 2026-08-21: several seats materializing 16 submodules each, 20-wide,
+    // with every update falling back to the remote, made GitHub refuse SSH
+    // from the host outright (port 22 refused, 443 reset at key exchange) —
+    // every fetch, push, submit and landing stopped for the whole fleet. A
+    // borrow is a local clone and can fan out; a remote fallback is a network
+    // connection and must not.
+    const worktree = "/candidate"
+    // referenceContains checks existsSync(<reference>/<path>) before asking
+    // git, so the borrowable reference stores must exist on disk.
+    const referenceWorktree = await mkdtemp(join(tmpdir(), "git-super-reference-"))
+    roots.push(referenceWorktree)
+    const borrowable = ["vendor/local-a", "vendor/local-b", "vendor/local-c"]
+    const remote = ["vendor/remote-a", "vendor/remote-b", "vendor/remote-c"]
+    const paths = [...borrowable, ...remote]
+    for (const path of borrowable) await mkdir(join(referenceWorktree, path), { recursive: true })
+    let inFlightLocal = 0
+    let inFlightRemote = 0
+    let peakLocal = 0
+    let peakRemote = 0
+    const git: SubmoduleGit = {
+      async run(repo, args) {
+        if (args[0] === "cat-file" && args.at(-1) === "HEAD:.gitmodules") {
+          return repo === worktree ? success() : { ...success(), code: 1 }
+        }
+        if (args[0] === "cat-file" && args[1] === "-e") {
+          // The reference store holds the borrowable pins and lacks the rest.
+          return borrowable.some((path) => repo === `${referenceWorktree}/${path}`)
+            ? success()
+            : { ...success(), code: 1 }
+        }
+        if (args[0] === "config" && args[1] === "--blob") {
+          return {
+            ...success(),
+            stdout: paths.map((path, index) => `submodule.module-${index}.path ${path}`).join("\n"),
+          }
+        }
+        if (args[0] === "ls-tree") {
+          return { ...success(), stdout: `160000 commit ${"a".repeat(40)}\t${args.at(-1)}\n` }
+        }
+        if (args[0] === "config" && args[1] === "--get") {
+          return { ...success(), stdout: "https://example.invalid/module.git\n" }
+        }
+        if (args.includes("update")) {
+          const isBorrow = args.includes("--reference")
+          if (isBorrow) {
+            inFlightLocal += 1
+            peakLocal = Math.max(peakLocal, inFlightLocal)
+          } else {
+            inFlightRemote += 1
+            peakRemote = Math.max(peakRemote, inFlightRemote)
+          }
+          await new Promise((resolve) => setTimeout(resolve, 5))
+          if (isBorrow) inFlightLocal -= 1
+          else inFlightRemote -= 1
+        }
+        return success()
+      },
+    }
+
+    await expect(materializeSubmodules(git, { worktree, referenceWorktree })).resolves.toMatchObject({
+      code: 0,
+      borrowed: 3,
+      remoteFallbacks: 3,
+    })
+    expect(peakLocal).toBe(3)
+    expect(peakRemote).toBe(1)
   })
 
   it("keeps the synchronous host adapter on the same materializer", async () => {

@@ -182,15 +182,31 @@ export async function materializeSubmodules(
       }
       prepared.push({ args, nestedReference: borrowFrom, path })
     }
-    for (let start = 0; start < prepared.length; start += MAX_CONCURRENT_SUBMODULE_UPDATES) {
-      const results = await Promise.all(
-        prepared.slice(start, start + MAX_CONCURRENT_SUBMODULE_UPDATES).map(async ({ args, nestedReference, path }) => {
-          const updated = await git.run(worktree, args, true)
-          return updated.code === 0 ? walk(join(worktree, path), nestedReference) : updated
-        }),
-      )
+    // A borrow clones from a local path and may fan out; a remote fallback
+    // opens a network connection per submodule and must not. On 2026-08-21
+    // several seats materializing 16 submodules each, 20-wide, with every
+    // update falling back, made GitHub refuse SSH from the host outright
+    // (port 22 refused, 443 reset at key exchange) and stopped every fetch,
+    // push, submit and landing fleet-wide. Local first, wide; then remote,
+    // one at a time.
+    const local = prepared.filter(({ nestedReference }) => nestedReference !== undefined)
+    const viaRemote = prepared.filter(({ nestedReference }) => nestedReference === undefined)
+    const update = async ({
+      args,
+      nestedReference,
+      path,
+    }: Readonly<{ args: readonly string[]; nestedReference: string | undefined; path: string }>) => {
+      const updated = await git.run(worktree, args, true)
+      return updated.code === 0 ? walk(join(worktree, path), nestedReference) : updated
+    }
+    for (let start = 0; start < local.length; start += MAX_CONCURRENT_SUBMODULE_UPDATES) {
+      const results = await Promise.all(local.slice(start, start + MAX_CONCURRENT_SUBMODULE_UPDATES).map(update))
       const failed = results.find((result) => result.code !== 0)
       if (failed !== undefined) return failed
+    }
+    for (const entry of viaRemote) {
+      const result = await update(entry)
+      if (result.code !== 0) return result
     }
     return success()
   }
