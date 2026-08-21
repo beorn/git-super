@@ -19,6 +19,7 @@
     "./composition": "./src/composition.ts",
     "./commit-graph": "./src/commit-graph.ts",
     "./exclusive": "./src/exclusive.ts",
+    "./gitlink": "./src/gitlink.ts",
     "./objects": "./src/objects.ts",
     "./process": "./src/process.ts",
     "./pull": "./src/pull.ts",

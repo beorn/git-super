@@ -4,6 +4,7 @@ import {
   commands,
   type CommandContext,
   type DiffParams,
+  type GitlinkWriteParams,
   type MergeBaseParams,
   type PullParams,
   type PushParams,
@@ -27,6 +28,7 @@ type CapturedInvocation =
   | Readonly<{ node: (typeof commands)["merge-base"]; params: MergeBaseParams; json: boolean; nul: boolean }>
   | Readonly<{ node: typeof commands.pull; params: PullParams; json: boolean; nul: boolean }>
   | Readonly<{ node: typeof commands.push; params: PushParams; json: boolean; nul: boolean }>
+  | Readonly<{ node: typeof commands.gitlink.write; params: GitlinkWriteParams; json: boolean; nul: boolean }>
 
 function stableValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(stableValue)
@@ -150,6 +152,22 @@ export async function runCli(argv: readonly string[], stdout: OutputSink, stderr
       }
     })
 
+  const gitlink = program.command("gitlink").description("Inspect or update superproject gitlink entries")
+  gitlink
+    .command("write")
+    .description(commands.gitlink.write.description ?? commands.gitlink.write.title)
+    .argument("<path>", "existing root-relative submodule path")
+    .argument("<commit>", "exact commit object already present in that submodule repository")
+    .action((path, commit, _options, command) => {
+      const globals = command.optsWithGlobals() as { repo: string; json?: boolean }
+      captured = {
+        node: commands.gitlink.write,
+        params: { path, commit },
+        json: globals.json === true,
+        nul: false,
+      }
+    })
+
   program
     .command("diff")
     .description(commands.diff.description ?? commands.diff.title)
@@ -218,13 +236,15 @@ export async function runCli(argv: readonly string[], stdout: OutputSink, stderr
     stdout.write(stableJson(result))
   } else if (captured.node === commands.diff) {
     const diff = result as SuperDiffResult
-    if (diff.paths.length > 0)
+    if (diff.paths.length > 0) {
       stdout.write(`${diff.paths.join(captured.nul ? "\0" : "\n")}${captured.nul ? "\0" : "\n"}`)
+    }
     await writeReport(diff.consultedRepositories, stderr)
   } else if (captured.node === commands.status) {
     const status = result as SuperStatusResult
-    if (status.records.length > 0)
+    if (status.records.length > 0) {
       stdout.write(`${status.records.join(captured.nul ? "\0" : "\n")}${captured.nul ? "\0" : "\n"}`)
+    }
     await writeReport(status.consultedRepositories, stderr)
   } else if (captured.node === commands["merge-base"]) {
     await writeReport((result as SuperIsAncestorResult).consultedRepositories, stderr)
@@ -235,7 +255,7 @@ export async function runCli(argv: readonly string[], stdout: OutputSink, stderr
   }
 
   if (captured.node === commands["merge-base"] && !(result as SuperIsAncestorResult).isAncestor) return 1
-  if (captured.node === commands.pull || captured.node === commands.push) {
+  if (captured.node === commands.pull || captured.node === commands.push || captured.node === commands.gitlink.write) {
     const operation = result as GitSuperResult
     return operation.state === "updated" || operation.state === "unchanged" ? 0 : 2
   }

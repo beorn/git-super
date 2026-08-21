@@ -6,6 +6,7 @@ import {
   type ParseParamSchema,
 } from "@silvery/command"
 import { superDiff, type SuperDiffOptions, type SuperDiffResult } from "./diff.ts"
+import { writeGitlink, type WriteGitlinkOptions } from "./gitlink.ts"
 import { superIsAncestor, type SuperIsAncestorOptions, type SuperIsAncestorResult } from "./merge-base.ts"
 import { superPull, type SuperPullOptions } from "./pull.ts"
 import { superPush, type SuperPushOptions } from "./push.ts"
@@ -18,21 +19,24 @@ export type StatusParams = Record<string, never>
 export type MergeBaseParams = Omit<SuperIsAncestorOptions, "repo">
 export type PullParams = Omit<SuperPullOptions, "repo" | "git" | "exclusive">
 export type PushParams = Omit<SuperPushOptions, "repo" | "git" | "exclusive">
+export type GitlinkWriteParams = Omit<WriteGitlinkOptions, "repo" | "git">
 
 function params<T>(parse: (value: unknown) => T, missing?: (value: unknown) => string[]): ParseParamSchema<T> {
   return { parse, ...(missing === undefined ? {} : { missing }) }
 }
 
 function record(value: unknown): Record<string, unknown> {
-  if (typeof value !== "object" || value === null || Array.isArray(value))
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new Error("expected command parameters")
+  }
   return value as Record<string, unknown>
 }
 
 function stringArray(value: unknown, name: string): string[] {
   if (value === undefined) return []
-  if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string"))
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string")) {
     throw new Error(`${name} must be strings`)
+  }
   return value as string[]
 }
 
@@ -123,12 +127,34 @@ const push = commandNode<CommandContext, PushParams, GitSuperResult>({
   run: (context, input) => superPush({ repo: context.repo, ...input }),
 })
 
+const gitlinkWrite = commandNode<CommandContext, GitlinkWriteParams, GitSuperResult>({
+  title: "Write an exact gitlink pin",
+  description: "Set one existing submodule's index commit without moving its checkout or choosing policy.",
+  params: params(
+    (value) => {
+      const input = record(value)
+      if (typeof input.path !== "string" || typeof input.commit !== "string") {
+        throw new Error("path and commit must be strings")
+      }
+      return { path: input.path, commit: input.commit }
+    },
+    (value) => {
+      const input = typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {}
+      return ["path", "commit"].filter((name) => typeof input[name] !== "string")
+    },
+  ),
+  run: (context, input) => writeGitlink({ repo: context.repo, ...input }),
+})
+
 export type GitSuperCommands = Readonly<{
   diff: CommandNode<CommandContext, DiffParams, SuperDiffResult>
   status: CommandNode<CommandContext, StatusParams, SuperStatusResult>
   "merge-base": CommandNode<CommandContext, MergeBaseParams, SuperIsAncestorResult>
   pull: CommandNode<CommandContext, PullParams, GitSuperResult>
   push: CommandNode<CommandContext, PushParams, GitSuperResult>
+  gitlink: Readonly<{
+    write: CommandNode<CommandContext, GitlinkWriteParams, GitSuperResult>
+  }>
 }>
 
 export const commands = defineCommandNodes({
@@ -137,4 +163,5 @@ export const commands = defineCommandNodes({
   "merge-base": mergeBase,
   pull,
   push,
+  gitlink: { write: gitlinkWrite },
 }) satisfies CommandNodeTree<CommandContext> as GitSuperCommands

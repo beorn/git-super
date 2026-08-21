@@ -20,6 +20,7 @@ Git has display flags for submodule diffs, but no native flag that turns gitlink
 git super diff --name-only <range>
 git super status --porcelain
 git super merge-base --is-ancestor <sha> <superproject-ref>
+git super gitlink write <path> <commit>
 git super pull --ff-only [<repository> [<refspec>...]]
 git super push [--recurse-submodules=check|on-demand|only|no] [<remote> [<refspec>...]]
 ```
@@ -45,6 +46,12 @@ Normal path or porcelain output stays on stdout. A rendered report of the reposi
 ```
 
 Missing checkouts, missing commit objects, added or removed gitlinks without a resolvable commit range, and ambiguous commit ownership all fail loudly. **The tool never turns an unresolved repository boundary into an empty success** — that is the failure it exists to prevent, so it may not commit it itself.
+
+### Exact gitlink write
+
+`gitlink write <path> <commit>` updates one existing mode-`160000` index entry to an exact commit without moving the submodule checkout. It is mechanics only: the caller decides which pin should be written. The command serializes through the shared mutation lock and observes the resulting stage-zero entry before reporting success; an unreadable or mismatched post-write observation reports `unknown` and exits nonzero.
+
+The path must already be a gitlink, and the exact commit object must exist in either its initialized checkout or its configured repository under the superproject's common Git directory. A missing path, repository, or commit fails with a diagnostic naming the repository, path, object ID, and remedy. The operation never adds a path, fetches a commit, checks out a submodule, or chooses whether a pin should advance. `--json` emits the same `GitSuperResult` returned by the `writeGitlink` library export.
 
 ### Safe fast-forward pull
 
@@ -98,6 +105,7 @@ bun run typecheck
 - `src/submodule-origin.ts` resolves absolute, URL, scp-like, and relative `.gitmodules` origins without imposing any product policy.
 - `src/commit-graph.ts` is the strict, read-only parser for gitlinks recorded in an exact commit. Pull and push share it rather than reading `.gitmodules` independently.
 - `src/objects.ts` is the exact-commit presence and fetch primitive shared by graph consumers.
+- `src/gitlink.ts` is the update-only index-pin writer. It validates the existing gitlink and target commit, writes under the shared mutation lock, and never checks out or chooses a target.
 - `src/process.ts` is the public injected Git process capability. `src/result.ts` owns the shared repository/ref result vocabulary and how results aggregate.
 - `src/pull.ts` owns the fetch, freeze, check, recheck, and apply fast-forward operation.
 - `src/push.ts` plans exact ref updates, proves recursive commit availability, and applies explicit per-ref leases child-first and root-last. It exposes transport mechanics and no submission, promotion, or retry policy.
@@ -107,6 +115,6 @@ bun run typecheck
 
 The package depends only on published packages: `@bearly/flock`, `@silvery/command`, `@silvery/commander`, `react`, and `silvery`. It contains no scheduler, no delivery daemon, no task tracker, and no imports from any host repository.
 
-Library consumers may import the root `git-super` surface, or `git-super/commit-graph` for frozen submodule descriptors, `git-super/objects` for exact-object loading, `git-super/submodule-origin` for remote resolution, `git-super/worktree` for injected worktree mechanics, and `git-super/submodules` for recursive materialization.
+Library consumers may import the root `git-super` surface, or `git-super/gitlink` for exact index-pin writes, `git-super/commit-graph` for frozen submodule descriptors, `git-super/objects` for exact-object loading, `git-super/submodule-origin` for remote resolution, `git-super/worktree` for injected worktree mechanics, and `git-super/submodules` for recursive materialization.
 
 **What this package deliberately does not decide:** worktree naming, leases, branch shapes, queue admission, retry policy, and lifecycle. Those are policy, they belong to the caller, and keeping them out is what lets one mechanics layer serve very different tools.
