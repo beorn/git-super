@@ -7,6 +7,7 @@ import { writeFileSync } from "node:fs"
 import { mkdir, mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { createLogger, type ConditionalLogger, type Event } from "loggily"
 import { afterEach, describe, expect, it } from "vitest"
 import {
   materializeSubmodules,
@@ -20,6 +21,39 @@ import { cleanGitRepositoryEnvironment } from "../src/git.ts"
 
 const success = (): SubmoduleGitResult => ({ code: 0, stdout: "", stderr: "" })
 const roots: string[] = []
+
+/**
+ * Log lines only: `spans: false` so the message assertions below stay about
+ * what the code SAID. Span timing is asserted separately through collected
+ * span records, where the shape is data rather than a rendered line.
+ */
+function capturingLogger(messages: string[]): ConditionalLogger {
+  return createLogger("git-super-test", [
+    { level: "trace", spans: false },
+    { write: (text: string) => void messages.push(String(text).replace(/\n$/u, "")), objectMode: false },
+  ])
+}
+
+type SpanEventRow = Readonly<{ name?: string; duration?: number; props?: Record<string, unknown> }>
+
+/**
+ * A logger plus the span events a sink received from it. `named` strips the
+ * logger namespace loggily prefixes onto every span (`git-super-spans:walk`),
+ * so a test names the span the code names and not the wiring around it.
+ */
+function spanEvents(): Readonly<{ log: ConditionalLogger; named: (span: string) => SpanEventRow[] }> {
+  const events: SpanEventRow[] = []
+  const log = createLogger("git-super-spans", [
+    { level: "trace", spans: true },
+    {
+      write: (event: Event) => {
+        if ((event as { kind?: string }).kind === "span") events.push(event as SpanEventRow)
+      },
+      objectMode: true,
+    },
+  ])
+  return { log, named: (span) => events.filter((event) => event.name?.endsWith(`:${span}`) === true) }
+}
 
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
@@ -84,7 +118,7 @@ describe("materializeSubmodules", () => {
     const refused = await materializeSubmodules(git, {
       worktree,
       referenceWorktree,
-      log: (message) => messages.push(message),
+      log: capturingLogger(messages),
     })
     expect(refused.code).toBe(1)
     expect(refused.stderr).toContain("would open their own network connection")
@@ -148,7 +182,7 @@ describe("materializeSubmodules", () => {
         worktree,
         referenceWorktree,
         maxRemoteFallbacks: 1,
-        log: (message) => messages.push(message),
+        log: capturingLogger(messages),
       }),
     ).resolves.toMatchObject({ code: 0, borrowed: 0, remoteFallbacks: 1, warmed: 0 })
     // A warm-up is always attempted first, so the operator sees the repair try
@@ -194,12 +228,82 @@ describe("materializeSubmodules", () => {
     }
 
     await expect(
-      materializeSubmodules(git, { worktree, referenceWorktree, log: (message) => messages.push(message) }),
+      materializeSubmodules(git, { worktree, referenceWorktree, log: capturingLogger(messages) }),
     ).resolves.toMatchObject({ code: 0, borrowed: 1, remoteFallbacks: 0, warmed: 1 })
     // The whole point: one connection repairs the store for every later
     // candidate, instead of one connection per submodule repairing nothing.
     expect(fetched).toBe(1)
     expect(messages).toEqual([expect.stringContaining("warming the reference with one fetch")])
+  })
+
+  it("times each phase and ships the DENOMINATOR beside the counters", async () => {
+    const referenceWorktree = await mkdtemp(join(tmpdir(), "git-super-spans-"))
+    roots.push(referenceWorktree)
+    await mkdir(join(referenceWorktree, "apps/maddoc"), { recursive: true })
+    const worktree = "/candidate"
+    const required = "e".repeat(40)
+
+    const git: SubmoduleGit = {
+      async run(repo, args) {
+        if (args[0] === "cat-file" && args.at(-1) === "HEAD:.gitmodules") {
+          return repo === worktree ? success() : { ...success(), code: 1 }
+        }
+        if (args[0] === "config" && args[1] === "--blob") {
+          return { ...success(), stdout: "submodule.maddoc.path apps/maddoc" }
+        }
+        if (args[0] === "ls-tree") return { ...success(), stdout: `160000 commit ${required}\tapps/maddoc\n` }
+        if (args[0] === "config" && args[1] === "--get-regexp") return { ...success(), code: 1 }
+        if (args[0] === "config" && args[1] === "--get") {
+          return { ...success(), stdout: "https://example.invalid/maddoc.git\n" }
+        }
+        return success()
+      },
+    }
+
+    // Asserted through a sink rather than `startCollecting()`, because a sink
+    // is what an aggregator actually receives. The collector returns proxied
+    // spanData carrying only assigned keys — no name, no props, no laps — so a
+    // test written against it would pass while the emitted event stayed empty.
+    const spans = spanEvents()
+    await expect(materializeSubmodules(git, { worktree, referenceWorktree, log: spans.log })).resolves.toMatchObject({
+      code: 0,
+      borrowed: 1,
+      remoteFallbacks: 0,
+      warmed: 0,
+    })
+
+    // `remoteFallbacks: 0` is unreadable on its own — zero of zero and zero of
+    // sixteen are the same number. The span carries what the counters are
+    // counts OF, which is the difference between an instrument and a number.
+    expect(spans.named("materialize")[0]?.props).toMatchObject({
+      considered: 1,
+      borrowed: 1,
+      warmed: 0,
+      remoteFallbacks: 0,
+      outcome: "ok",
+    })
+
+    // Per-submodule attribution, and local-vs-network on the record rather than
+    // inferred from a total. Without `source` a slow run cannot be told apart
+    // from a networked one, which is exactly what 2026-08-21 needed and lacked.
+    const updates = spans.named("update")
+    expect(updates).toHaveLength(1)
+    expect(updates[0]?.props).toMatchObject({ path: "apps/maddoc", source: "local", outcome: "ok" })
+
+    // Phase deltas, so "where did the time go" is answerable from one record.
+    const walk = spans.named("walk").find((event) => event.props?.["depth"] === 0)
+    expect(Object.keys((walk?.props?.["laps"] ?? {}) as Record<string, unknown>)).toEqual([
+      "enumerate",
+      "resolve",
+      "init",
+      "prepare",
+      "local",
+      "remote",
+    ])
+
+    // The recursion is instrumented too: a nested submodule gets its own walk
+    // at depth 1, so a slow leaf is attributable instead of billed to its root.
+    expect(spans.named("walk").some((event) => event.props?.["depth"] === 1)).toBe(true)
   })
 
   it("refuses a partial-clone reference instead of trusting object presence", async () => {

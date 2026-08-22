@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process"
 import { existsSync, realpathSync } from "node:fs"
 import { join, resolve } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
+import { createLogger, type ConditionalLogger, type LogLevel } from "loggily"
 import { cleanGitRepositoryEnvironment } from "./git.ts"
 import { createLocalGitProcess, type GitProcess } from "./process.ts"
 
@@ -25,7 +26,20 @@ export type SubmoduleMaterializationOptions = Readonly<{
   force?: boolean
   /** Restrict only the top-level pass; nested submodules still recurse. */
   paths?: readonly string[]
-  log?: (message: string) => void
+  /**
+   * Structured logger. Spans here are the only way to learn where
+   * materialization time goes: the whole operation used to report one exit code
+   * and three counters, so a run that spent four minutes fetching sixteen
+   * submodules over the network was indistinguishable from one that borrowed
+   * all sixteen off local disk. `materialize` carries the totals, its laps
+   * split the phases, and `warm`/`update` carry one record per submodule with
+   * `source` naming local versus network.
+   *
+   * Optional throughout: `log?.span?.()` and `log?.debug?.()` are absent under
+   * a plain logger and gated off entirely below the configured level, so an
+   * uninstrumented caller pays nothing.
+   */
+  log?: ConditionalLogger
   /**
    * How many submodules may open their own network connection after a warm-up
    * attempt has already failed. Defaults to 0: with a healthy reference store
@@ -49,6 +63,29 @@ export type HostSubmoduleMaterializationOptions = Omit<SubmoduleMaterializationO
   Readonly<{ env?: NodeJS.ProcessEnv }>
 
 const success = (): SubmoduleGitResult => ({ code: 0, stdout: "", stderr: "" })
+
+/**
+ * A logger that renders to one line-writing sink — for the callers whose output
+ * really is a stream of lines (a console, a captured array, a slot report).
+ *
+ * It exists so those callers do not each hand-roll a loggily pipeline and drift
+ * apart on level and span gating. Spans follow the same env gate yrd applies to
+ * `-vv` (`yrd-cli/src/observability.ts`), so `TRACE=1` turns on per-phase timing
+ * everywhere materialization runs rather than in whichever tool remembered to
+ * wire it. Default `info` keeps an ordinary run to the remote-fallback warning.
+ *
+ * Callers that already HAVE a logger must pass it directly — usually through
+ * `child("submodules")` — and not route it through here; that would flatten the
+ * structure this whole change exists to preserve.
+ */
+export function createSubmoduleLogger(write: (line: string) => void): ConditionalLogger {
+  const level = (process.env["LOG_LEVEL"] as LogLevel | undefined) ?? "info"
+  const spans = process.env["TRACE"] !== undefined || level === "debug" || level === "trace"
+  return createLogger("git-super", [
+    { level, spans },
+    { write: (text: string) => write(String(text).replace(/\n$/u, "")), objectMode: false },
+  ])
+}
 
 export async function configureSubmoduleAlternatePolicy(git: SubmoduleGit, repo: string): Promise<SubmoduleGitResult> {
   for (const [key, value] of [
@@ -152,7 +189,7 @@ export async function materializeSubmodules(
   git: SubmoduleGit,
   options: SubmoduleMaterializationOptions,
 ): Promise<SubmoduleMaterializationResult> {
-  const log = options.log ?? (() => {})
+  const log = options.log
   const referenceRoot =
     options.referenceWorktree !== undefined && resolve(options.referenceWorktree) !== resolve(options.worktree)
       ? options.referenceWorktree
@@ -160,6 +197,16 @@ export async function materializeSubmodules(
   let borrowed = 0
   let remoteFallbacks = 0
   let warmed = 0
+  /**
+   * Every gitlink this run resolved, at every depth — the DENOMINATOR the three
+   * counters above are fractions of, and the number none of them can be read
+   * without. `borrowed + remoteFallbacks` is not it: a submodule with no
+   * reference store increments neither. `warmed` is not disjoint either; it
+   * counts a subset of `borrowed`, the ones that only became borrowable after a
+   * fetch. Reported on the span rather than added to the public result, whose
+   * shape callers already destructure.
+   */
+  let considered = 0
   const maxRemoteFallbacks = options.maxRemoteFallbacks ?? 0
   const misses: Array<Readonly<{ path: string; reference: string | undefined; required: string; why: string }>> = []
 
@@ -167,12 +214,18 @@ export async function materializeSubmodules(
     worktree: string,
     reference: string | undefined,
     selectedPaths?: ReadonlySet<string>,
+    depth = 0,
   ): Promise<SubmoduleGitResult> => {
+    // Laps rather than nested spans: the five phases below are sequential and
+    // always run in the same order, so one record with five deltas reads better
+    // than five span lines per level of recursion.
+    using span = log?.span?.("walk", { worktree, depth })
     const policy = await configureSubmoduleAlternatePolicy(git, worktree)
     if (policy.code !== 0) return policy
 
     const entries = await submodules(git, worktree)
     if (!Array.isArray(entries)) return entries
+    span?.lap("enumerate")
     const resolved: Array<
       Readonly<{
         canBorrow: boolean
@@ -202,9 +255,17 @@ export async function materializeSubmodules(
             why: `reference is a partial clone (${promisor}); object presence there cannot prove the borrow is local`,
           })
         } else {
-          log(`[submodules] ${path}: local store lacks ${required.slice(0, 12)}; warming the reference with one fetch`)
+          // The one network call on the healthy path. Its own span, because
+          // "materialization was slow" and "the reference store was cold" are
+          // different problems with different owners, and only the split tells
+          // you which one you have.
+          using warmSpan = log?.span?.("warm", { path, required, reference: referenceSubmodule })
+          log?.debug?.("warming the reference with one fetch", { path, required })
           const warm = await warmReference(git, referenceSubmodule, required)
           canBorrow = warm.code === 0 && (await referenceContains(git, referenceSubmodule, required))
+          if (warmSpan !== undefined) {
+            Object.assign(warmSpan.spanData, { outcome: canBorrow ? "warmed" : "failed" })
+          }
           if (canBorrow) {
             warmed += 1
           } else {
@@ -221,7 +282,9 @@ export async function materializeSubmodules(
         }
       }
       resolved.push({ canBorrow, name, path, referenceSubmodule, required })
+      considered += 1
     }
+    span?.lap("resolve")
     if (resolved.length > 0) {
       const initArgs = ["submodule", "init", "--", ...resolved.map(({ path }) => path)]
       const initialized =
@@ -230,6 +293,7 @@ export async function materializeSubmodules(
           : await git.mutateConfig(worktree, initArgs)
       if (initialized.code !== 0) return initialized
     }
+    span?.lap("init")
     const prepared: Array<Readonly<{ args: readonly string[]; nestedReference: string | undefined; path: string }>> = []
     for (const { canBorrow, name, path, referenceSubmodule, required } of resolved) {
       const configuredUrl = await git.run(worktree, ["config", "--get", `submodule.${name}.url`], true)
@@ -266,10 +330,11 @@ export async function materializeSubmodules(
         borrowed += 1
       } else if (referenceSubmodule !== undefined) {
         remoteFallbacks += 1
-        log(`[submodules] ${path}: local store lacks ${required.slice(0, 12)}; using the configured remote fallback`)
+        log?.warn?.("local store lacks the pin; using the configured remote fallback", { path, required })
       }
       prepared.push({ args, nestedReference: borrowFrom, path })
     }
+    span?.lap("prepare")
     // A borrow clones from a local path and may fan out; a remote fallback
     // opens a network connection per submodule and must not. On 2026-08-21
     // several seats materializing 16 submodules each, 20-wide, with every
@@ -314,23 +379,52 @@ export async function materializeSubmodules(
       nestedReference,
       path,
     }: Readonly<{ args: readonly string[]; nestedReference: string | undefined; path: string }>) => {
-      const updated = await git.run(worktree, args, true)
-      return updated.code === 0 ? walk(join(worktree, path), nestedReference) : updated
+      const source = nestedReference === undefined ? "remote" : "local"
+      // The span closes over the `git.run` ALONE. Letting it wrap the recursive
+      // walk below would bill every nested submodule to its parent, so the one
+      // submodule at the root of a deep tree would appear to be the slow one
+      // and the actually-slow leaf would never show up in the ranking.
+      const updated = await (async () => {
+        using updateSpan = log?.span?.("update", { path, source })
+        const result = await git.run(worktree, args, true)
+        if (updateSpan !== undefined) {
+          Object.assign(updateSpan.spanData, { outcome: result.code === 0 ? "ok" : "failed" })
+        }
+        return result
+      })()
+      return updated.code === 0 ? walk(join(worktree, path), nestedReference, undefined, depth + 1) : updated
     }
     for (let start = 0; start < local.length; start += MAX_CONCURRENT_SUBMODULE_UPDATES) {
       const results = await Promise.all(local.slice(start, start + MAX_CONCURRENT_SUBMODULE_UPDATES).map(update))
       const failed = results.find((result) => result.code !== 0)
       if (failed !== undefined) return failed
     }
+    span?.lap("local")
     for (const entry of viaRemote) {
       const result = await update(entry)
       if (result.code !== 0) return result
     }
+    span?.lap("remote")
     return success()
   }
 
   const selectedPaths = options.paths === undefined ? undefined : new Set(options.paths)
+  using span = log?.span?.("materialize", { worktree: options.worktree, reference: referenceRoot })
   const result = await walk(options.worktree, referenceRoot, selectedPaths)
+  // ONE record carrying the totals AND what they are totals of. The counters
+  // existed before this and were printed into a log with no reader; a reader
+  // that gets `remoteFallbacks: 16` still cannot tell a broken reference store
+  // from a repository that simply has sixteen submodules. Shipping the
+  // denominator alongside the count is the whole difference.
+  if (span !== undefined) {
+    Object.assign(span.spanData, {
+      considered,
+      borrowed,
+      warmed,
+      remoteFallbacks,
+      outcome: result.code === 0 ? "ok" : "failed",
+    })
+  }
   return { ...result, borrowed, remoteFallbacks, warmed }
 }
 
@@ -449,7 +543,13 @@ export function materializeSubmodulesFromLocalWorktree(
     const payload = JSON.parse(child.stdout ?? "") as HostSubmoduleMaterializationResult & {
       messages?: readonly string[]
     }
-    for (const message of payload.messages ?? []) options.log?.(message)
+    // Structure does not survive the process boundary: the child ran the spans
+    // in its own logger and only its rendered lines come back. Replayed at info
+    // so they are not lost, but a caller wanting per-phase timing must use the
+    // async entry point, which keeps the live logger. Deliberately not an event
+    // serialization bridge — this path has one caller (tools/task-branch.ts)
+    // and it passes no logger at all.
+    for (const message of payload.messages ?? []) options.log?.info?.(message)
     return payload
   } catch (error) {
     return {

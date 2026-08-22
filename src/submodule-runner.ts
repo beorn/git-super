@@ -1,4 +1,5 @@
 import {
+  createSubmoduleLogger,
   materializeSubmodulesFromLocalWorktreeParallel,
   type HostSubmoduleMaterializationOptions,
 } from "./submodules.ts"
@@ -15,11 +16,12 @@ const options = jsonMode
       ...(process.argv[3] === undefined ? {} : { referenceWorktree: process.argv[3] }),
       ...(process.argv.length <= 4 ? {} : { paths: process.argv.slice(4) }),
     }
+// Collected rather than written straight through: JSON mode returns the lines
+// in its payload and human mode prints them, so the sink cannot be stdout here.
 const messages: string[] = []
-const result = await materializeSubmodulesFromLocalWorktreeParallel({
-  ...options,
-  log: (message) => messages.push(message),
-})
+const log = createSubmoduleLogger((line) => void messages.push(line))
+const result = await materializeSubmodulesFromLocalWorktreeParallel({ ...options, log })
+log.end()
 if (jsonMode) {
   process.stdout.write(JSON.stringify({ ...result, messages }))
 } else {
