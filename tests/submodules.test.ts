@@ -127,6 +127,74 @@ describe("materializeSubmodules", () => {
     expect(commands.some(({ repo }) => repo === `${referenceWorktree}/apps/maddoc`)).toBe(false)
   })
 
+  it("batches the local probes but NEVER overlaps two warm-up fetches", async () => {
+    const referenceWorktree = await mkdtemp(join(tmpdir(), "git-super-serial-"))
+    roots.push(referenceWorktree)
+    const paths = ["a/one", "a/two", "a/three", "a/four", "a/five"]
+    for (const path of paths) await mkdir(join(referenceWorktree, path), { recursive: true })
+    const worktree = "/candidate"
+
+    let liveProbes = 0
+    let peakProbes = 0
+    let liveFetches = 0
+    let peakFetches = 0
+    const settle = async (): Promise<void> => {
+      await new Promise((resolve) => setTimeout(resolve, 2))
+    }
+
+    const git: SubmoduleGit = {
+      async run(repo, args) {
+        if (args[0] === "cat-file" && args.at(-1) === "HEAD:.gitmodules") {
+          return repo === worktree ? success() : { ...success(), code: 1 }
+        }
+        if (args[0] === "config" && args[1] === "--blob") {
+          return {
+            ...success(),
+            stdout: paths.map((path, index) => `submodule.s${index}.path ${path}`).join("\n"),
+          }
+        }
+        if (args[0] === "ls-tree") {
+          liveProbes += 1
+          peakProbes = Math.max(peakProbes, liveProbes)
+          await settle()
+          liveProbes -= 1
+          const path = args.at(-1)
+          return { ...success(), stdout: `160000 commit ${"1".repeat(40)}\t${String(path)}\n` }
+        }
+        if (args[0] === "config" && args[1] === "--get-regexp") return { ...success(), code: 1 }
+        if (args[0] === "config" && args[1] === "--get") {
+          return { ...success(), stdout: "https://example.invalid/x.git\n" }
+        }
+        if (args[0] === "fetch") {
+          // THE INVARIANT. A second concurrent fetch here is the 2026-08-21
+          // fan-out, so this counter is the test, not decoration.
+          liveFetches += 1
+          peakFetches = Math.max(peakFetches, liveFetches)
+          await settle()
+          liveFetches -= 1
+          return success()
+        }
+        // Never warm: every gitlink misses, so all five reach the warm-up path.
+        if (args[0] === "cat-file" && args[1] === "-e") return { ...success(), code: 1 }
+        return success()
+      },
+    }
+
+    const refused = await materializeSubmodules(git, { worktree, referenceWorktree })
+
+    // All five missed and could not be repaired, so the fail-loud refuses — that
+    // is incidental here. What matters is HOW the work was scheduled.
+    expect(refused.code).toBe(1)
+
+    // Local probes ran concurrently: five gitlinks, bound of 20, so all five
+    // overlap. A peak of 1 would mean the batching silently did not happen.
+    expect(peakProbes).toBe(paths.length)
+
+    // @chief's acceptance criterion, proven rather than asserted:
+    // LOCAL PROBES BATCH; WARM-UPS STAY SERIALIZED.
+    expect(peakFetches).toBe(1)
+  })
+
   it("SAYS SO when no reference store was supplied, instead of materializing silently", async () => {
     const worktree = "/candidate"
     const messages: string[] = []
@@ -371,7 +439,10 @@ describe("materializeSubmodules", () => {
     // named for it would time the wrong thing and report ~0ms. These five sum to
     // the span's duration.
     const walk = spans.named("walk").find((event) => event.props?.["depth"] === 0)
+    // `probe` is the batched local-read phase; `resolve` is now only the
+    // serialized network phase, which does nothing at all on a healthy store.
     expect(Object.keys((walk?.props?.["laps"] ?? {}) as Record<string, unknown>)).toEqual([
+      "probe",
       "resolve",
       "init",
       "prepare",

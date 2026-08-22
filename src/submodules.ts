@@ -79,6 +79,18 @@ export type HostSubmoduleMaterializationOptions = Omit<SubmoduleMaterializationO
 const success = (): SubmoduleGitResult => ({ code: 0, stdout: "", stderr: "" })
 
 /**
+ * One gitlink after the LOCAL probes have run and before any network call.
+ * `canBorrow` here is provisional: phase B may flip it true after a warm-up.
+ */
+type Probe = Readonly<{
+  canBorrow: boolean
+  name: string
+  path: string
+  referenceSubmodule: string | undefined
+  required: string
+}>
+
+/**
  * A logger that renders to one line-writing sink — for the callers whose output
  * really is a stream of lines (a console, a captured array, a slot report).
  *
@@ -274,23 +286,44 @@ export async function materializeSubmodules(
     // this span's duration, and the excluded policy+enumerate cost is visible as
     // the gap between the `materialize` span and the depth-0 `walk` span.
     using span = log?.span?.("walk", { worktree, depth, gitlinks: entries.length })
-    const resolved: Array<
-      Readonly<{
-        canBorrow: boolean
-        name: string
-        path: string
-        referenceSubmodule: string | undefined
-        required: string
-      }>
-    > = []
-    for (const { name, path } of entries) {
-      if (selectedPaths !== undefined && !selectedPaths.has(path)) continue
-      const required = await requiredGitlink(git, worktree, path)
-      if (required === undefined) {
-        return { code: 1, stdout: "", stderr: `could not resolve gitlink '${path}' in ${worktree}` }
-      }
-      const referenceSubmodule = reference === undefined ? undefined : join(reference, path)
-      let canBorrow = referenceSubmodule !== undefined && (await referenceContains(git, referenceSubmodule, required))
+    const resolved: Array<Probe> = []
+    // PHASE A — LOCAL PROBES, BATCHED. `ls-tree` and `cat-file -e` are read-only
+    // and touch different repositories, so they parallelize at the same bound the
+    // update pass already uses. This was 89ms of a 402ms run done one submodule at
+    // a time, feeding a stage that was already 20-wide.
+    //
+    // NOTHING IN THIS PHASE TOUCHES THE NETWORK. That is the invariant, not an
+    // observation: the moment a network call is added here it fans out N-wide,
+    // which is exactly the shape that made GitHub refuse SSH from this host on
+    // 2026-08-21. Warm-ups live in phase B below and stay serialized.
+    const selected = entries.filter(({ path }) => selectedPaths === undefined || selectedPaths.has(path))
+    const probes: Array<Probe | SubmoduleGitResult> = []
+    for (let start = 0; start < selected.length; start += MAX_CONCURRENT_SUBMODULE_UPDATES) {
+      probes.push(
+        ...(await Promise.all(
+          selected
+            .slice(start, start + MAX_CONCURRENT_SUBMODULE_UPDATES)
+            .map(async ({ name, path }): Promise<Probe | SubmoduleGitResult> => {
+              const required = await requiredGitlink(git, worktree, path)
+              if (required === undefined) {
+                return { code: 1, stdout: "", stderr: `could not resolve gitlink '${path}' in ${worktree}` }
+              }
+              const referenceSubmodule = reference === undefined ? undefined : join(reference, path)
+              const canBorrow =
+                referenceSubmodule !== undefined && (await referenceContains(git, referenceSubmodule, required))
+              return { canBorrow, name, path, referenceSubmodule, required }
+            }),
+        )),
+      )
+    }
+    const unresolved = probes.find((probe): probe is SubmoduleGitResult => "code" in probe)
+    if (unresolved !== undefined) return unresolved
+    span?.lap("probe")
+
+    // PHASE B — THE NETWORK, STRICTLY ONE AT A TIME. Only a miss reaches this
+    // loop, so on a healthy reference store it does nothing at all.
+    for (const { canBorrow: borrowable, name, path, referenceSubmodule, required } of probes as Probe[]) {
+      let canBorrow = borrowable
       if (!canBorrow && referenceSubmodule !== undefined) {
         // One connection into the reference repairs it for every later bay;
         // sixteen connections out of sixteen candidates repair nothing.
@@ -342,14 +375,28 @@ export async function materializeSubmodules(
       if (initialized.code !== 0) return initialized
     }
     span?.lap("init")
+    // `config --get` is another read-only local call, and it was the other
+    // sequential stretch: 29ms of the same 402ms run, one spawn per submodule.
+    // Batched at the same bound, and still no network — the URL is read from
+    // local config, never contacted.
+    const configuredUrls: SubmoduleGitResult[] = []
+    for (let start = 0; start < resolved.length; start += MAX_CONCURRENT_SUBMODULE_UPDATES) {
+      configuredUrls.push(
+        ...(await Promise.all(
+          resolved
+            .slice(start, start + MAX_CONCURRENT_SUBMODULE_UPDATES)
+            .map(({ name }) => git.run(worktree, ["config", "--get", `submodule.${name}.url`], true)),
+        )),
+      )
+    }
     const prepared: Array<Readonly<{ args: readonly string[]; nestedReference: string | undefined; path: string }>> = []
-    for (const { canBorrow, name, path, referenceSubmodule, required } of resolved) {
-      const configuredUrl = await git.run(worktree, ["config", "--get", `submodule.${name}.url`], true)
-      if (configuredUrl.code !== 0 || configuredUrl.stdout.trim() === "") {
+    for (const [index, { canBorrow, name, path, referenceSubmodule, required }] of resolved.entries()) {
+      const configuredUrl = configuredUrls[index]
+      if (configuredUrl === undefined || configuredUrl.code !== 0 || configuredUrl.stdout.trim() === "") {
         return {
-          code: configuredUrl.code === 0 ? 1 : configuredUrl.code,
-          stdout: configuredUrl.stdout,
-          stderr: configuredUrl.stderr || `could not resolve configured URL for submodule '${name}' in ${worktree}`,
+          code: configuredUrl === undefined || configuredUrl.code === 0 ? 1 : configuredUrl.code,
+          stdout: configuredUrl?.stdout ?? "",
+          stderr: configuredUrl?.stderr || `could not resolve configured URL for submodule '${name}' in ${worktree}`,
         }
       }
       const borrowFrom = canBorrow && referenceSubmodule !== undefined ? referenceSubmodule : undefined
