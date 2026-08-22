@@ -127,6 +127,70 @@ describe("materializeSubmodules", () => {
     expect(commands.some(({ repo }) => repo === `${referenceWorktree}/apps/maddoc`)).toBe(false)
   })
 
+  it("SAYS SO when no reference store was supplied, instead of materializing silently", async () => {
+    const worktree = "/candidate"
+    const messages: string[] = []
+    const git: SubmoduleGit = {
+      async run(repo, args) {
+        if (args[0] === "cat-file" && args.at(-1) === "HEAD:.gitmodules") {
+          return repo === worktree ? success() : { ...success(), code: 1 }
+        }
+        if (args[0] === "config" && args[1] === "--blob") {
+          return { ...success(), stdout: "submodule.maddoc.path apps/maddoc" }
+        }
+        if (args[0] === "ls-tree") return { ...success(), stdout: `160000 commit ${"f".repeat(40)}\tapps/maddoc\n` }
+        if (args[0] === "config" && args[1] === "--get") {
+          return { ...success(), stdout: "https://example.invalid/maddoc.git\n" }
+        }
+        return success()
+      },
+    }
+
+    // No referenceWorktree at all. This is a LEGITIMATE plain clone, so it must
+    // succeed — but before this it was also indistinguishable from a caller who
+    // meant to pass one and forgot, which is one of the three causes 2026-08-21
+    // could not separate. The refusal cannot cover it (no reference means no
+    // refusal), so the coverage is this diagnostic plus the `unreferenced`
+    // count. The old `reference ?? "(none supplied)"` string was unreachable and
+    // covered nothing; this is what actually reaches the case.
+    const result = await materializeSubmodules(git, { worktree, log: capturingLogger(messages) })
+
+    expect(result).toMatchObject({ code: 0, considered: 1, borrowed: 0, remoteFallbacks: 0, unreferenced: 1 })
+    expect(result.borrowed + result.remoteFallbacks + result.unreferenced).toBe(result.considered)
+    expect(messages).toEqual([expect.stringContaining("no reference store supplied; materializing from the network")])
+    // The remedy is named, or the warning is just an observation.
+    expect(messages[0]).toContain("referenceWorktree")
+  })
+
+  it("never renders an unreachable '(none supplied)' — the refusal only fires WITH a reference", async () => {
+    const worktree = "/candidate"
+    const referenceWorktree = "/reference"
+    const git: SubmoduleGit = {
+      async run(repo, args) {
+        if (args[0] === "cat-file" && args.at(-1) === "HEAD:.gitmodules") {
+          return repo === worktree ? success() : { ...success(), code: 1 }
+        }
+        if (args[0] === "config" && args[1] === "--blob") {
+          return { ...success(), stdout: "submodule.maddoc.path apps/maddoc" }
+        }
+        if (args[0] === "ls-tree") return { ...success(), stdout: `160000 commit ${"e".repeat(40)}\tapps/maddoc\n` }
+        if (args[0] === "config" && args[1] === "--get") {
+          return { ...success(), stdout: "https://example.invalid/maddoc.git\n" }
+        }
+        return success()
+      },
+    }
+
+    const refused = await materializeSubmodules(git, { worktree, referenceWorktree })
+
+    // Every miss is pushed inside `referenceSubmodule !== undefined`, so the
+    // refusal always has a real path to print. Asserted so nobody reintroduces
+    // a fallback string that can never render and then reports it as coverage.
+    expect(refused.code).toBe(1)
+    expect(refused.stderr).not.toContain("(none supplied)")
+    expect(refused.stderr).toContain(`${referenceWorktree}/apps/maddoc`)
+  })
+
   it("names the missing pin, the reference consulted, and the command that repairs it", async () => {
     const worktree = "/candidate"
     const referenceWorktree = "/reference"
@@ -265,12 +329,24 @@ describe("materializeSubmodules", () => {
     // spanData carrying only assigned keys — no name, no props, no laps — so a
     // test written against it would pass while the emitted event stayed empty.
     const spans = spanEvents()
-    await expect(materializeSubmodules(git, { worktree, referenceWorktree, log: spans.log })).resolves.toMatchObject({
+    const materialized = await materializeSubmodules(git, { worktree, referenceWorktree, log: spans.log })
+    // The RESULT carries the denominator now, not only the span. A caller with
+    // no logger used to get counts and no total.
+    expect(materialized).toMatchObject({
       code: 0,
+      considered: 1,
       borrowed: 1,
       remoteFallbacks: 0,
+      unreferenced: 0,
       warmed: 0,
     })
+    // The partition is exact and total, and `warmed` is deliberately outside it
+    // because it counts a subset of `borrowed`. Asserted as arithmetic rather
+    // than as four literals, so a future counter that breaks the identity fails
+    // here instead of quietly making the total mean nothing.
+    expect(materialized.borrowed + materialized.remoteFallbacks + materialized.unreferenced).toBe(
+      materialized.considered,
+    )
 
     // `remoteFallbacks: 0` is unreadable on its own — zero of zero and zero of
     // sixteen are the same number. The span carries what the counters are

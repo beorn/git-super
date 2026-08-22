@@ -28,8 +28,17 @@ if (jsonMode) {
   for (const message of messages) console.error(message)
   if (result.exitCode !== 0) console.error((result.stderr || result.stdout).trim())
   else {
+    // OF WHAT. This line used to read "materialized with 17 borrowed; 0 warmed;
+    // 0 remote fallback(s)" — three counts and no total, which is precisely the
+    // shape that let sixteen remote fallbacks look like a number instead of a
+    // ratio on 2026-08-21. `unreferenced` appears only when non-zero, because a
+    // plain clone reporting "0 with no reference store" every run is noise, but
+    // a borrow-expecting caller seeing a non-zero one is the whole signal.
+    const { considered, borrowed, warmed, remoteFallbacks, unreferenced } = result
     console.error(
-      `[submodules] materialized with ${result.borrowed} local store(s) borrowed; ${result.warmed} reference store(s) warmed; ${result.remoteFallbacks} remote fallback(s)`,
+      `[submodules] ${borrowed} of ${considered} gitlink(s) borrowed locally; ` +
+        `${warmed} reference store(s) warmed; ${remoteFallbacks} remote fallback(s)` +
+        (unreferenced > 0 ? `; ${unreferenced} with NO reference store supplied` : ""),
     )
   }
 }

@@ -17,8 +17,20 @@ export type SubmoduleGit = Readonly<{
   mutateConfig?(repo: string, args: readonly string[]): Promise<SubmoduleGitResult>
 }>
 
+/**
+ * `considered` is the denominator and is not optional to read: `remoteFallbacks:
+ * 0` means nothing without it, since zero of zero and zero of sixteen are the
+ * same number. `borrowed + remoteFallbacks + unreferenced === considered` is an
+ * exact partition; `warmed` is a SUBSET of `borrowed` and is outside it.
+ */
 export type SubmoduleMaterializationResult = SubmoduleGitResult &
-  Readonly<{ borrowed: number; remoteFallbacks: number; warmed: number }>
+  Readonly<{
+    considered: number
+    borrowed: number
+    remoteFallbacks: number
+    unreferenced: number
+    warmed: number
+  }>
 
 export type SubmoduleMaterializationOptions = Readonly<{
   worktree: string
@@ -54,8 +66,10 @@ export type HostSubmoduleMaterializationResult = Readonly<{
   exitCode: number
   stdout: string
   stderr: string
+  considered: number
   borrowed: number
   remoteFallbacks: number
+  unreferenced: number
   warmed: number
 }>
 
@@ -197,18 +211,31 @@ export async function materializeSubmodules(
   let borrowed = 0
   let remoteFallbacks = 0
   let warmed = 0
+  /** Gitlinks materialized straight from the network because NO reference store
+   * was supplied for them. Legitimate for a plain clone; a silent bug when the
+   * caller meant to pass `referenceWorktree`. Counted so the two are separable. */
+  let unreferenced = 0
   /**
-   * Every gitlink this run resolved, at every depth — the DENOMINATOR the three
-   * counters above are fractions of, and the number none of them can be read
-   * without. `borrowed + remoteFallbacks` is not it: a submodule with no
-   * reference store increments neither. `warmed` is not disjoint either; it
-   * counts a subset of `borrowed`, the ones that only became borrowable after a
-   * fetch. Reported on the span rather than added to the public result, whose
-   * shape callers already destructure.
+   * Every gitlink this run resolved, at every depth — the DENOMINATOR the other
+   * counters are fractions of, and the number none of them can be read without.
+   *
+   * The partition is EXACT and total: `borrowed + remoteFallbacks + unreferenced
+   * === considered`. `warmed` is deliberately NOT part of it — it counts a
+   * subset of `borrowed`, the ones that only became borrowable after a fetch, so
+   * adding it would double-count. An earlier revision shipped `considered` on
+   * the span only; a caller reading the result got counts with no total, which
+   * is the same defect one layer out.
    */
   let considered = 0
   const maxRemoteFallbacks = options.maxRemoteFallbacks ?? 0
-  const misses: Array<Readonly<{ path: string; reference: string | undefined; required: string; why: string }>> = []
+  /**
+   * `reference` is non-optional on purpose: every push site below sits inside
+   * `referenceSubmodule !== undefined`, so a `string | undefined` here invited a
+   * `?? "(none supplied)"` fallback that could never render — and that dead
+   * string was reported as real coverage. The type now proves what the prose
+   * used to assert.
+   */
+  const misses: Array<Readonly<{ path: string; reference: string; required: string; why: string }>> = []
 
   const walk = async (
     worktree: string,
@@ -331,6 +358,15 @@ export async function materializeSubmodules(
       } else if (referenceSubmodule !== undefined) {
         remoteFallbacks += 1
         log?.warn?.("local store lacks the pin; using the configured remote fallback", { path, required })
+      } else {
+        // NO REFERENCE STORE AT ALL — counted, because the alternative is the
+        // hole this whole change exists to close. This submodule goes to the
+        // network and increments neither of the counters above, so before this
+        // it was invisible: a plain clone and a caller who MEANT to pass
+        // referenceWorktree and forgot produced byte-identical output. That is
+        // one of the three causes 2026-08-21 could not tell apart, and it was
+        // the one the fail-loud did not reach.
+        unreferenced += 1
       }
       prepared.push({ args, nestedReference: borrowFrom, path })
     }
@@ -352,11 +388,33 @@ export async function materializeSubmodules(
     // Only when a reference store EXISTS is a fallback a failure. With no
     // reference the caller has no local source and the network is the only
     // option — that is a plain clone doing its job, not the 16-wide fan-out.
+    // THE THIRD CAUSE, and the one this file could not previously express.
+    // With no reference store the refusal below never fires, so a caller who
+    // forgot `referenceWorktree` got a silent network materialization that was
+    // byte-identical to a legitimate plain clone. Not an error — a plain clone
+    // is doing its job — but it must be SAYABLE, so it is said once per level,
+    // with the count and the option that would have changed it. `warn` rather
+    // than `debug` because the expensive direction of error is the quiet one.
+    if (reference === undefined && viaRemote.length > 0) {
+      log?.warn?.("no reference store supplied; materializing from the network", {
+        worktree,
+        depth,
+        fromNetwork: viaRemote.length,
+        ofGitlinks: prepared.length,
+        pass: "referenceWorktree to borrow locally instead",
+      })
+    }
     if (reference !== undefined && viaRemote.length > maxRemoteFallbacks) {
       const detail = misses
+        // `reference` is always defined here — every misses.push sits inside
+        // `referenceSubmodule !== undefined`. It used to render
+        // `reference ?? "(none supplied)"`, which was unreachable, and I
+        // reported that dead string to @chief as the diagnostic covering the
+        // no-reference case. It never covered anything. The real coverage for
+        // that case is the refusal below, which needs no reference to fire.
         .map(
           ({ path, reference, required, why }) =>
-            `  ${path} needs ${required}\n    reference: ${reference ?? "(none supplied)"}\n    why: ${why}`,
+            `  ${path} needs ${required}\n    reference: ${reference}\n    why: ${why}`,
         )
         .join("\n")
       return {
@@ -367,7 +425,6 @@ export async function materializeSubmodules(
           `(limit ${maxRemoteFallbacks}); refusing.\n${detail}\n` +
           `Repair the reference store, then retry:\n` +
           misses
-            .filter(({ reference }) => reference !== undefined)
             .map(({ reference, required }) => `  git -C ${reference} fetch --no-tags origin ${required}`)
             .join("\n") +
           `\nRaise --max-remote-fallbacks only with a reason; one connection per submodule across several ` +
@@ -422,10 +479,11 @@ export async function materializeSubmodules(
       borrowed,
       warmed,
       remoteFallbacks,
+      unreferenced,
       outcome: result.code === 0 ? "ok" : "failed",
     })
   }
-  return { ...result, borrowed, remoteFallbacks, warmed }
+  return { ...result, considered, borrowed, remoteFallbacks, unreferenced, warmed }
 }
 
 function adaptGitProcess(process: GitProcess): SubmoduleGit {
@@ -533,9 +591,13 @@ export function materializeSubmodulesFromLocalWorktree(
       stdout: child.stdout ?? "",
       stderr: child.stderr ?? child.error?.message ?? "git-super submodule runner failed",
       // The run failed before reporting, so these counts are unknown rather
-      // than zero. Read them only alongside a zero exitCode.
+      // than zero. Read them only alongside a zero exitCode. `considered: 0` is
+      // the honest reading of that: nothing was successfully considered, so
+      // every fraction over it is undefined rather than zero.
+      considered: 0,
       borrowed: 0,
       remoteFallbacks: 0,
+      unreferenced: 0,
       warmed: 0,
     }
   }
@@ -557,8 +619,10 @@ export function materializeSubmodulesFromLocalWorktree(
       stdout: child.stdout ?? "",
       stderr: `git-super submodule runner emitted invalid JSON: ${error instanceof Error ? error.message : String(error)}`,
       // Unknown, not zero — see above.
+      considered: 0,
       borrowed: 0,
       remoteFallbacks: 0,
+      unreferenced: 0,
       warmed: 0,
     }
   }
