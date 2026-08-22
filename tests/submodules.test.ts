@@ -78,11 +78,170 @@ describe("materializeSubmodules", () => {
       },
     }
 
+    // Was: resolves code 0 with remoteFallbacks 1. The title said "loudly" and
+    // the assertion said "succeed" — the counter was incremented, printed, and
+    // consumed by nobody. That is the silent error this suite now forbids.
+    const refused = await materializeSubmodules(git, {
+      worktree,
+      referenceWorktree,
+      log: (message) => messages.push(message),
+    })
+    expect(refused.code).toBe(1)
+    expect(refused.stderr).toContain("would open their own network connection")
+    expect(refused.stderr).toContain("apps/maddoc")
+    expect(refused.stderr).toContain("a".repeat(40))
+    expect(commands.some(({ repo }) => repo === `${referenceWorktree}/apps/maddoc`)).toBe(false)
+  })
+
+  it("names the missing pin, the reference consulted, and the command that repairs it", async () => {
+    const worktree = "/candidate"
+    const referenceWorktree = "/reference"
+    const git: SubmoduleGit = {
+      async run(repo, args) {
+        if (args[0] === "cat-file" && args.at(-1) === "HEAD:.gitmodules") {
+          return repo === worktree ? success() : { ...success(), code: 1 }
+        }
+        if (args[0] === "config" && args[1] === "--blob") {
+          return { ...success(), stdout: "submodule.maddoc.path apps/maddoc" }
+        }
+        if (args[0] === "ls-tree") return { ...success(), stdout: `160000 commit ${"b".repeat(40)}\tapps/maddoc\n` }
+        if (args[0] === "config" && args[1] === "--get") {
+          return { ...success(), stdout: "https://example.invalid/maddoc.git\n" }
+        }
+        return success()
+      },
+    }
+
+    const refused = await materializeSubmodules(git, { worktree, referenceWorktree })
+
+    // A bare count is what made this invisible for a night; the refusal has to
+    // carry enough to act on without re-deriving anything.
+    expect(refused.code).toBe(1)
+    expect(refused.stderr).toContain("apps/maddoc")
+    expect(refused.stderr).toContain(`${referenceWorktree}/apps/maddoc`)
+    expect(refused.stderr).toContain(`fetch --no-tags origin ${"b".repeat(40)}`)
+    expect(refused.stderr).toContain("2026-08-21")
+  })
+
+  it("permits fallback only when the caller raises the limit deliberately", async () => {
+    const worktree = "/candidate"
+    const referenceWorktree = "/reference"
+    const messages: string[] = []
+    const git: SubmoduleGit = {
+      async run(repo, args) {
+        if (args[0] === "cat-file" && args.at(-1) === "HEAD:.gitmodules") {
+          return repo === worktree ? success() : { ...success(), code: 1 }
+        }
+        if (args[0] === "config" && args[1] === "--blob") {
+          return { ...success(), stdout: "submodule.maddoc.path apps/maddoc" }
+        }
+        if (args[0] === "ls-tree") return { ...success(), stdout: `160000 commit ${"c".repeat(40)}\tapps/maddoc\n` }
+        if (args[0] === "config" && args[1] === "--get") {
+          return { ...success(), stdout: "https://example.invalid/maddoc.git\n" }
+        }
+        return success()
+      },
+    }
+
+    await expect(
+      materializeSubmodules(git, {
+        worktree,
+        referenceWorktree,
+        maxRemoteFallbacks: 1,
+        log: (message) => messages.push(message),
+      }),
+    ).resolves.toMatchObject({ code: 0, borrowed: 0, remoteFallbacks: 1, warmed: 0 })
+    // A warm-up is always attempted first, so the operator sees the repair try
+    // and its failure — not just the fallback it silently degraded into.
+    expect(messages).toEqual([
+      expect.stringContaining("warming the reference with one fetch"),
+      expect.stringContaining("using the configured remote fallback"),
+    ])
+  })
+
+  it("repairs a cold reference with ONE fetch and then borrows locally", async () => {
+    const referenceWorktree = await mkdtemp(join(tmpdir(), "git-super-warm-"))
+    roots.push(referenceWorktree)
+    await mkdir(join(referenceWorktree, "apps/maddoc"), { recursive: true })
+    const worktree = "/candidate"
+    const required = "d".repeat(40)
+    const messages: string[] = []
+    let fetched = 0
+
+    const git: SubmoduleGit = {
+      async run(repo, args) {
+        if (args[0] === "cat-file" && args.at(-1) === "HEAD:.gitmodules") {
+          return repo === worktree ? success() : { ...success(), code: 1 }
+        }
+        if (args[0] === "config" && args[1] === "--blob") {
+          return { ...success(), stdout: "submodule.maddoc.path apps/maddoc" }
+        }
+        if (args[0] === "ls-tree") return { ...success(), stdout: `160000 commit ${required}\tapps/maddoc\n` }
+        if (args[0] === "config" && args[1] === "--get-regexp") return { ...success(), code: 1 }
+        if (args[0] === "config" && args[1] === "--get") {
+          return { ...success(), stdout: "https://example.invalid/maddoc.git\n" }
+        }
+        if (args[0] === "fetch") {
+          fetched += 1
+          return success()
+        }
+        // Cold until the fetch lands, warm afterwards.
+        if (args[0] === "cat-file" && args[1] === "-e") {
+          return fetched === 0 ? { ...success(), code: 1 } : success()
+        }
+        return success()
+      },
+    }
+
     await expect(
       materializeSubmodules(git, { worktree, referenceWorktree, log: (message) => messages.push(message) }),
-    ).resolves.toMatchObject({ code: 0, borrowed: 0, remoteFallbacks: 1 })
-    expect(messages).toEqual([expect.stringContaining("using the configured remote fallback")])
-    expect(commands.some(({ repo }) => repo === `${referenceWorktree}/apps/maddoc`)).toBe(false)
+    ).resolves.toMatchObject({ code: 0, borrowed: 1, remoteFallbacks: 0, warmed: 1 })
+    // The whole point: one connection repairs the store for every later
+    // candidate, instead of one connection per submodule repairing nothing.
+    expect(fetched).toBe(1)
+    expect(messages).toEqual([expect.stringContaining("warming the reference with one fetch")])
+  })
+
+  it("refuses a partial-clone reference instead of trusting object presence", async () => {
+    const referenceWorktree = await mkdtemp(join(tmpdir(), "git-super-promisor-"))
+    roots.push(referenceWorktree)
+    await mkdir(join(referenceWorktree, "apps/maddoc"), { recursive: true })
+    const worktree = "/candidate"
+    let fetched = 0
+
+    const git: SubmoduleGit = {
+      async run(repo, args) {
+        if (args[0] === "cat-file" && args.at(-1) === "HEAD:.gitmodules") {
+          return repo === worktree ? success() : { ...success(), code: 1 }
+        }
+        if (args[0] === "config" && args[1] === "--blob") {
+          return { ...success(), stdout: "submodule.maddoc.path apps/maddoc" }
+        }
+        if (args[0] === "ls-tree") return { ...success(), stdout: `160000 commit ${"e".repeat(40)}\tapps/maddoc\n` }
+        if (args[0] === "config" && args[1] === "--get-regexp") {
+          return { ...success(), stdout: "remote.origin.promisor true\n" }
+        }
+        if (args[0] === "config" && args[1] === "--get") {
+          return { ...success(), stdout: "https://example.invalid/maddoc.git\n" }
+        }
+        if (args[0] === "fetch") {
+          fetched += 1
+          return success()
+        }
+        if (args[0] === "cat-file" && args[1] === "-e") return { ...success(), code: 1 }
+        return success()
+      },
+    }
+
+    const refused = await materializeSubmodules(git, { worktree, referenceWorktree })
+
+    // On a promisor remote `cat-file -e` passes while trees and blobs are still
+    // fetched lazily, so presence stops meaning warmth and the counter goes
+    // blind. Refuse rather than report a borrow we cannot honour.
+    expect(refused.code).toBe(1)
+    expect(refused.stderr).toContain("partial clone")
+    expect(refused.stderr).toContain("remote.origin.promisor")
+    expect(fetched).toBe(0)
   })
 
   it("initializes sibling paths in one config mutation before parallel updates", async () => {
@@ -187,7 +346,12 @@ describe("materializeSubmodules", () => {
       },
     }
 
-    await expect(materializeSubmodules(git, { worktree, referenceWorktree })).resolves.toMatchObject({
+    // This test is about ORDERING — local wide, remote one at a time — so it
+    // raises the limit to reach the code under test. The default would refuse
+    // three unrepairable fallbacks before any of them ran.
+    await expect(
+      materializeSubmodules(git, { worktree, referenceWorktree, maxRemoteFallbacks: 3 }),
+    ).resolves.toMatchObject({
       code: 0,
       borrowed: 3,
       remoteFallbacks: 3,

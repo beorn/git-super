@@ -27,7 +27,7 @@ if (jsonMode) {
   if (result.exitCode !== 0) console.error((result.stderr || result.stdout).trim())
   else {
     console.error(
-      `[submodules] materialized with ${result.borrowed} local store(s) borrowed; ${result.remoteFallbacks} remote fallback(s)`,
+      `[submodules] materialized with ${result.borrowed} local store(s) borrowed; ${result.warmed} reference store(s) warmed; ${result.remoteFallbacks} remote fallback(s)`,
     )
   }
 }

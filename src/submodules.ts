@@ -17,7 +17,7 @@ export type SubmoduleGit = Readonly<{
 }>
 
 export type SubmoduleMaterializationResult = SubmoduleGitResult &
-  Readonly<{ borrowed: number; remoteFallbacks: number }>
+  Readonly<{ borrowed: number; remoteFallbacks: number; warmed: number }>
 
 export type SubmoduleMaterializationOptions = Readonly<{
   worktree: string
@@ -26,6 +26,14 @@ export type SubmoduleMaterializationOptions = Readonly<{
   /** Restrict only the top-level pass; nested submodules still recurse. */
   paths?: readonly string[]
   log?: (message: string) => void
+  /**
+   * How many submodules may open their own network connection after a warm-up
+   * attempt has already failed. Defaults to 0: with a healthy reference store
+   * every gitlink borrows locally, so an unrepairable fallback is an incident
+   * and not a tolerance. On 2026-08-21 sixteen of them per bay, several bays at
+   * once, made GitHub refuse SSH from the host and stopped the whole fleet.
+   */
+  maxRemoteFallbacks?: number
 }>
 
 export type HostSubmoduleMaterializationResult = Readonly<{
@@ -34,6 +42,7 @@ export type HostSubmoduleMaterializationResult = Readonly<{
   stderr: string
   borrowed: number
   remoteFallbacks: number
+  warmed: number
 }>
 
 export type HostSubmoduleMaterializationOptions = Omit<SubmoduleMaterializationOptions, "force"> &
@@ -88,6 +97,44 @@ async function referenceContains(git: SubmoduleGit, reference: string, sha: stri
 }
 
 /**
+ * `cat-file -e <sha>^{commit}` proves the commit object is present. It does NOT
+ * prove the commit's closure is local: in a partial clone the check passes and
+ * the borrow then lazily fetches trees and blobs from the promisor remote, so
+ * the network work reappears one layer down and `remoteFallbacks` never counts
+ * it. Refuse to treat presence as warmth when a promisor is configured, rather
+ * than reporting a borrow we cannot honour.
+ */
+async function promisorRemote(git: SubmoduleGit, repo: string): Promise<string | undefined> {
+  if (!existsSync(repo)) return undefined
+  const configured = await git.run(
+    repo,
+    ["config", "--get-regexp", "^(extensions\\.partialclone|remote\\..*\\.(promisor|partialclonefilter))$"],
+    true,
+  )
+  if (configured.code !== 0) return undefined
+  const first = configured.stdout.split(/\r?\n/u).find((row) => row.trim() !== "")
+  return first === undefined ? undefined : first.trim()
+}
+
+/**
+ * Repair one cold reference store with a single connection, so the borrow can
+ * proceed locally. Without this a miss costs one network connection PER
+ * SUBMODULE and leaves every later bay just as cold; with it, one fetch warms
+ * the store for the whole fleet. Same operation `ensureCommitObject` already
+ * performs for the superproject, aimed at the reference instead.
+ */
+async function warmReference(git: SubmoduleGit, reference: string, sha: string): Promise<SubmoduleGitResult> {
+  if (!existsSync(reference)) {
+    return { code: 1, stdout: "", stderr: `reference store ${reference} does not exist` }
+  }
+  return git.run(
+    reference,
+    ["fetch", "--no-tags", "--no-recurse-submodules", "--no-write-fetch-head", "origin", sha],
+    true,
+  )
+}
+
+/**
  * Materialize isolated submodule checkouts while borrowing object history from
  * the matching checkout in the source repository. Git's documented
  * superproject alternate policy remains the fail-soft fallback for reference-
@@ -104,6 +151,9 @@ export async function materializeSubmodules(
       : undefined
   let borrowed = 0
   let remoteFallbacks = 0
+  let warmed = 0
+  const maxRemoteFallbacks = options.maxRemoteFallbacks ?? 0
+  const misses: Array<Readonly<{ path: string; reference: string | undefined; required: string; why: string }>> = []
 
   const walk = async (
     worktree: string,
@@ -131,7 +181,37 @@ export async function materializeSubmodules(
         return { code: 1, stdout: "", stderr: `could not resolve gitlink '${path}' in ${worktree}` }
       }
       const referenceSubmodule = reference === undefined ? undefined : join(reference, path)
-      const canBorrow = referenceSubmodule !== undefined && (await referenceContains(git, referenceSubmodule, required))
+      let canBorrow = referenceSubmodule !== undefined && (await referenceContains(git, referenceSubmodule, required))
+      if (!canBorrow && referenceSubmodule !== undefined) {
+        // One connection into the reference repairs it for every later bay;
+        // sixteen connections out of sixteen candidates repair nothing.
+        const promisor = await promisorRemote(git, referenceSubmodule)
+        if (promisor !== undefined) {
+          misses.push({
+            path,
+            reference: referenceSubmodule,
+            required,
+            why: `reference is a partial clone (${promisor}); object presence there cannot prove the borrow is local`,
+          })
+        } else {
+          log(`[submodules] ${path}: local store lacks ${required.slice(0, 12)}; warming the reference with one fetch`)
+          const warm = await warmReference(git, referenceSubmodule, required)
+          canBorrow = warm.code === 0 && (await referenceContains(git, referenceSubmodule, required))
+          if (canBorrow) {
+            warmed += 1
+          } else {
+            misses.push({
+              path,
+              reference: referenceSubmodule,
+              required,
+              why:
+                warm.code === 0
+                  ? "warm-up fetch succeeded but the reference still lacks the commit"
+                  : `warm-up fetch failed: ${warm.stderr.trim() || `exit ${warm.code}`}`,
+            })
+          }
+        }
+      }
       resolved.push({ canBorrow, name, path, referenceSubmodule, required })
     }
     if (resolved.length > 0) {
@@ -191,6 +271,36 @@ export async function materializeSubmodules(
     // one at a time.
     const local = prepared.filter(({ nestedReference }) => nestedReference !== undefined)
     const viaRemote = prepared.filter(({ nestedReference }) => nestedReference === undefined)
+    // NO SILENT ERRORS. Until now this counter was incremented, printed, and
+    // read by nobody: the exact signal that would have caught 2026-08-21 went
+    // into a log with no consumer, and the fleet spent a night inferring a
+    // quantity it was already measuring. Refuse, and say which pin is missing
+    // and what would repair it — a bare count is what made this invisible.
+    // Only when a reference store EXISTS is a fallback a failure. With no
+    // reference the caller has no local source and the network is the only
+    // option — that is a plain clone doing its job, not the 16-wide fan-out.
+    if (reference !== undefined && viaRemote.length > maxRemoteFallbacks) {
+      const detail = misses
+        .map(
+          ({ path, reference, required, why }) =>
+            `  ${path} needs ${required}\n    reference: ${reference ?? "(none supplied)"}\n    why: ${why}`,
+        )
+        .join("\n")
+      return {
+        code: 1,
+        stdout: "",
+        stderr:
+          `git-super: ${viaRemote.length} submodule(s) would open their own network connection after warm-up ` +
+          `(limit ${maxRemoteFallbacks}); refusing.\n${detail}\n` +
+          `Repair the reference store, then retry:\n` +
+          misses
+            .filter(({ reference }) => reference !== undefined)
+            .map(({ reference, required }) => `  git -C ${reference} fetch --no-tags origin ${required}`)
+            .join("\n") +
+          `\nRaise --max-remote-fallbacks only with a reason; one connection per submodule across several ` +
+          `candidates is what made GitHub refuse SSH from this host on 2026-08-21.\n`,
+      }
+    }
     const update = async ({
       args,
       nestedReference,
@@ -213,7 +323,7 @@ export async function materializeSubmodules(
 
   const selectedPaths = options.paths === undefined ? undefined : new Set(options.paths)
   const result = await walk(options.worktree, referenceRoot, selectedPaths)
-  return { ...result, borrowed, remoteFallbacks }
+  return { ...result, borrowed, remoteFallbacks, warmed }
 }
 
 function adaptGitProcess(process: GitProcess): SubmoduleGit {
@@ -320,8 +430,11 @@ export function materializeSubmodulesFromLocalWorktree(
       exitCode: child.status ?? 1,
       stdout: child.stdout ?? "",
       stderr: child.stderr ?? child.error?.message ?? "git-super submodule runner failed",
+      // The run failed before reporting, so these counts are unknown rather
+      // than zero. Read them only alongside a zero exitCode.
       borrowed: 0,
       remoteFallbacks: 0,
+      warmed: 0,
     }
   }
   try {
@@ -335,8 +448,10 @@ export function materializeSubmodulesFromLocalWorktree(
       exitCode: 1,
       stdout: child.stdout ?? "",
       stderr: `git-super submodule runner emitted invalid JSON: ${error instanceof Error ? error.message : String(error)}`,
+      // Unknown, not zero — see above.
       borrowed: 0,
       remoteFallbacks: 0,
+      warmed: 0,
     }
   }
 }
