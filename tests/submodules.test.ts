@@ -367,19 +367,29 @@ describe("materializeSubmodules", () => {
     expect(updates[0]?.props).toMatchObject({ path: "apps/maddoc", source: "local", outcome: "ok" })
 
     // Phase deltas, so "where did the time go" is answerable from one record.
+    // No `enumerate` lap: the span opens after the .gitmodules read, so a lap
+    // named for it would time the wrong thing and report ~0ms. These five sum to
+    // the span's duration.
     const walk = spans.named("walk").find((event) => event.props?.["depth"] === 0)
     expect(Object.keys((walk?.props?.["laps"] ?? {}) as Record<string, unknown>)).toEqual([
-      "enumerate",
       "resolve",
       "init",
       "prepare",
       "local",
       "remote",
     ])
+    expect(walk?.props?.["gitlinks"]).toBe(1)
 
-    // The recursion is instrumented too: a nested submodule gets its own walk
-    // at depth 1, so a slow leaf is attributable instead of billed to its root.
-    expect(spans.named("walk").some((event) => event.props?.["depth"] === 1)).toBe(true)
+    // A LEAF EMITS NO WALK SPAN. apps/maddoc has no submodules of its own, so its
+    // level has nothing to time and a span for it would be five zero laps. On a
+    // real 17-gitlink run that was 17 of 18 spans — noise burying the one record
+    // that carries the totals.
+    expect(spans.named("walk").some((event) => event.props?.["depth"] === 1)).toBe(false)
+
+    // Per-submodule attribution does not depend on those leaf spans; it comes
+    // from the `update` span asserted above, which names path and source. That is
+    // why dropping them costs no attribution.
+    expect(updates[0]?.props?.["path"]).toBe("apps/maddoc")
   })
 
   it("refuses a partial-clone reference instead of trusting object presence", async () => {

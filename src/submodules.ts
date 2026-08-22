@@ -243,16 +243,37 @@ export async function materializeSubmodules(
     selectedPaths?: ReadonlySet<string>,
     depth = 0,
   ): Promise<SubmoduleGitResult> => {
-    // Laps rather than nested spans: the five phases below are sequential and
-    // always run in the same order, so one record with five deltas reads better
-    // than five span lines per level of recursion.
-    using span = log?.span?.("walk", { worktree, depth })
     const policy = await configureSubmoduleAlternatePolicy(git, worktree)
     if (policy.code !== 0) return policy
 
     const entries = await submodules(git, worktree)
     if (!Array.isArray(entries)) return entries
-    span?.lap("enumerate")
+    // A LEVEL WITH NO SUBMODULES HAS NOTHING TO TIME, and emitting a span for it
+    // buries the ones that carry signal. Measured 2026-08-22 on a full 17-gitlink
+    // run: 17 of 18 `walk` spans were leaves, every lap zero except `enumerate`.
+    // Everything below is a no-op by construction when `entries` is empty — the
+    // resolve loop does not run, `resolved` and `prepared` stay empty, the
+    // refusal cannot fire at 0 > 0, and both update loops are empty — so this
+    // early return is behaviourally identical to falling through.
+    //
+    // The enumeration cost is NOT lost, only re-attributed: a leaf's enumerate
+    // happens inside its parent's `local` lap and is counted there. Depth 0
+    // always has submodules, so the one enumerate measurement worth reading
+    // (24ms of 402ms on the measured run) still lands on the depth-0 span.
+    if (entries.length === 0) return success()
+    // Laps rather than nested spans: the phases below are sequential and always
+    // run in the same order, so one record with five deltas reads better than
+    // five span lines per level of recursion. `gitlinks` is on the span so a
+    // reader sees the width this level worked at, not only its duration.
+    //
+    // THERE IS NO `enumerate` LAP ANY MORE, deliberately. The span now starts
+    // AFTER the policy write and the `.gitmodules` read, so a lap named for that
+    // work would measure the microseconds since the span opened and report ~0ms
+    // for something that measured 24ms of a 402ms run. A lap that names one thing
+    // and times another is worse than an absent one. The laps below now sum to
+    // this span's duration, and the excluded policy+enumerate cost is visible as
+    // the gap between the `materialize` span and the depth-0 `walk` span.
+    using span = log?.span?.("walk", { worktree, depth, gitlinks: entries.length })
     const resolved: Array<
       Readonly<{
         canBorrow: boolean
