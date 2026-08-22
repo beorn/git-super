@@ -122,6 +122,14 @@ async function promisorRemote(git: SubmoduleGit, repo: string): Promise<string |
  * SUBMODULE and leaves every later bay just as cold; with it, one fetch warms
  * the store for the whole fleet. Same operation `ensureCommitObject` already
  * performs for the superproject, aimed at the reference instead.
+ *
+ * KNOWN NARROWING: this fetches from the REFERENCE's `origin`, while the old
+ * fallback used the CANDIDATE's configured submodule URL. Where those differ
+ * and only the candidate's URL carries the commit, a materialization that used
+ * to succeed now refuses. That is deliberate — a candidate reaching a remote
+ * its reference cannot is the fan-out shape this exists to stop — but it is a
+ * behaviour change, so the refusal prints both the commit and the reference it
+ * consulted rather than leaving the caller to guess which remote was short.
  */
 async function warmReference(git: SubmoduleGit, reference: string, sha: string): Promise<SubmoduleGitResult> {
   if (!existsSync(reference)) {
