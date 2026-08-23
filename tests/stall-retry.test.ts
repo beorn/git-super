@@ -11,7 +11,7 @@
  * which is why the queue landed nothing for hours and why no queue-specific bug
  * was ever needed to explain it. These tests pin the policy that fixes it.
  */
-import { describe, expect, test } from "vitest"
+import { afterEach, describe, expect, test, vi } from "vitest"
 import type { GitProcess, GitProcessRequest, GitProcessResult } from "../src/process.ts"
 import { isRetryableRead, withStallRetry } from "../src/process.ts"
 
@@ -36,26 +36,41 @@ const REAL_FAILURE: GitProcessResult = { code: 128, stdout: "", stderr: "fatal: 
 
 const req = (args: readonly string[]): GitProcessRequest => ({ repo: "/tmp/repo", args, timeoutMs: 1000 })
 
+afterEach(() => {
+  vi.restoreAllMocks()
+})
+
 describe("withStallRetry", () => {
   test("retries a stalled ls-remote and returns the eventual success", async () => {
+    const announced = vi.spyOn(console, "error").mockImplementation(() => {})
     const inner = scripted([STALL, OK])
     const result = await withStallRetry(inner).run(req(["ls-remote", "--refs", "origin", "main"]))
     expect(result.code).toBe(0)
     expect(inner.calls).toHaveLength(2)
+    expect(announced).toHaveBeenCalledOnce()
+    expect(announced).toHaveBeenCalledWith(expect.stringContaining("retry 2/3"))
   })
 
   test("retries a stalled fetch — it only advances remote-tracking refs", async () => {
+    const announced = vi.spyOn(console, "error").mockImplementation(() => {})
     const inner = scripted([STALL, STALL, OK])
     const result = await withStallRetry(inner).run(req(["fetch", "origin"]))
     expect(result.code).toBe(0)
     expect(inner.calls).toHaveLength(3)
+    expect(announced).toHaveBeenCalledTimes(2)
+    expect(announced).toHaveBeenNthCalledWith(1, expect.stringContaining("retry 2/3"))
+    expect(announced).toHaveBeenNthCalledWith(2, expect.stringContaining("retry 3/3"))
   })
 
   test("gives up after the attempt cap and reports the stall rather than hiding it", async () => {
+    const announced = vi.spyOn(console, "error").mockImplementation(() => {})
     const inner = scripted([STALL])
     const result = await withStallRetry(inner).run(req(["ls-remote", "origin"]))
     expect(result.timedOut).toBe(true)
     expect(inner.calls).toHaveLength(3)
+    expect(announced).toHaveBeenCalledTimes(2)
+    expect(announced).toHaveBeenNthCalledWith(1, expect.stringContaining("retry 2/3"))
+    expect(announced).toHaveBeenNthCalledWith(2, expect.stringContaining("retry 3/3"))
   })
 
   // The dangerous direction. A stalled mutation may ALREADY have reached the
