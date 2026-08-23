@@ -60,6 +60,32 @@ afterEach(async () => {
 })
 
 describe("materializeSubmodules", () => {
+  it("uses target .gitmodules metadata instead of local submodule config", async () => {
+    const commands: Array<readonly string[]> = []
+    const git: SubmoduleGit = {
+      async run(repo, args) {
+        commands.push(args)
+        if (args[0] === "cat-file" && args.at(-1) === "HEAD:.gitmodules") return success()
+        if (args[0] === "config" && args[1] === "--blob") {
+          return {
+            ...success(),
+            stdout:
+              "submodule.live.path\nvendor/live\0submodule.live.url\nhttps://target.invalid/live.git\0",
+          }
+        }
+        if (args[0] === "ls-tree") return { ...success(), stdout: `160000 commit ${"a".repeat(40)}\tvendor/live\n` }
+        if (args[0] === "config" && args[1] === "--get") {
+          return { code: 1, stdout: "", stderr: "local submodule config must not be consulted" }
+        }
+        if (args[0] === "config" && args[1] === "--get-regexp") return { ...success(), code: 1 }
+        return success()
+      },
+    }
+
+    await expect(materializeSubmodules(git, { worktree: "/candidate" })).resolves.toMatchObject({ code: 0 })
+    expect(commands).not.toContainEqual(["config", "--get", "submodule.live.url"])
+  })
+
   it("uses the canonical GitProcess request internally", async () => {
     const requests: GitProcessRequest[] = []
     const result = await materializeSubmodulesWithProcess(
