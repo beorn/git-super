@@ -3,8 +3,9 @@
  * @level l1
  * @consumer Yrd, Bearly, and hh worktree adapters
  */
-import { writeFileSync } from "node:fs"
+import { readFileSync, writeFileSync } from "node:fs"
 import { mkdir, mkdtemp, rm } from "node:fs/promises"
+import { spawnSync } from "node:child_process"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { createLogger, type ConditionalLogger, type Event } from "loggily"
@@ -16,11 +17,29 @@ import {
   type SubmoduleGit,
   type SubmoduleGitResult,
 } from "../src/submodules.ts"
-import type { GitProcessRequest } from "../src/process.ts"
+import { createLocalGitProcess, type GitProcessRequest } from "../src/process.ts"
 import { cleanGitRepositoryEnvironment } from "../src/git.ts"
 
 const success = (): SubmoduleGitResult => ({ code: 0, stdout: "", stderr: "" })
 const roots: string[] = []
+
+function git(repo: string, args: readonly string[]): string {
+  const result = spawnSync("git", ["-C", repo, ...args], { encoding: "utf8" })
+  if (result.status !== 0) throw new Error(result.stderr || `git ${args.join(" ")} failed`)
+  return result.stdout
+}
+
+function withPrimaryWorktree(git: SubmoduleGit, primary: string): SubmoduleGit {
+  return {
+    ...git,
+    async run(repo, args, allowFailure) {
+      if (repo === primary && args[0] === "worktree" && args[1] === "list") {
+        return { ...success(), stdout: `worktree ${primary}\n\n` }
+      }
+      return git.run(repo, args, allowFailure)
+    },
+  }
+}
 
 /**
  * Log lines only: `spans: false` so the message assertions below stay about
@@ -90,7 +109,8 @@ describe("materializeSubmodules", () => {
 
   it("falls back loudly when the exact gitlink is absent from the local reference", async () => {
     const worktree = "/candidate"
-    const referenceWorktree = "/reference"
+    const referenceWorktree = await mkdtemp(join(tmpdir(), "git-super-missing-reference-"))
+    roots.push(referenceWorktree)
     const messages: string[] = []
     const commands: Array<Readonly<{ repo: string; args: readonly string[] }>> = []
     const git: SubmoduleGit = {
@@ -115,7 +135,7 @@ describe("materializeSubmodules", () => {
     // Was: resolves code 0 with remoteFallbacks 1. The title said "loudly" and
     // the assertion said "succeed" — the counter was incremented, printed, and
     // consumed by nobody. That is the silent error this suite now forbids.
-    const refused = await materializeSubmodules(git, {
+    const refused = await materializeSubmodules(withPrimaryWorktree(git, referenceWorktree), {
       worktree,
       referenceWorktree,
       log: capturingLogger(messages),
@@ -180,7 +200,10 @@ describe("materializeSubmodules", () => {
       },
     }
 
-    const refused = await materializeSubmodules(git, { worktree, referenceWorktree })
+    const refused = await materializeSubmodules(withPrimaryWorktree(git, referenceWorktree), {
+      worktree,
+      referenceWorktree,
+    })
 
     // All five missed and could not be repaired, so the fail-loud refuses — that
     // is incidental here. What matters is HOW the work was scheduled.
@@ -232,7 +255,8 @@ describe("materializeSubmodules", () => {
 
   it("never renders an unreachable '(none supplied)' — the refusal only fires WITH a reference", async () => {
     const worktree = "/candidate"
-    const referenceWorktree = "/reference"
+    const referenceWorktree = await mkdtemp(join(tmpdir(), "git-super-refusal-reference-"))
+    roots.push(referenceWorktree)
     const git: SubmoduleGit = {
       async run(repo, args) {
         if (args[0] === "cat-file" && args.at(-1) === "HEAD:.gitmodules") {
@@ -249,7 +273,10 @@ describe("materializeSubmodules", () => {
       },
     }
 
-    const refused = await materializeSubmodules(git, { worktree, referenceWorktree })
+    const refused = await materializeSubmodules(withPrimaryWorktree(git, referenceWorktree), {
+      worktree,
+      referenceWorktree,
+    })
 
     // Every miss is pushed inside `referenceSubmodule !== undefined`, so the
     // refusal always has a real path to print. Asserted so nobody reintroduces
@@ -261,7 +288,8 @@ describe("materializeSubmodules", () => {
 
   it("names the missing pin, the reference consulted, and the command that repairs it", async () => {
     const worktree = "/candidate"
-    const referenceWorktree = "/reference"
+    const referenceWorktree = await mkdtemp(join(tmpdir(), "git-super-remedy-reference-"))
+    roots.push(referenceWorktree)
     const git: SubmoduleGit = {
       async run(repo, args) {
         if (args[0] === "cat-file" && args.at(-1) === "HEAD:.gitmodules") {
@@ -278,7 +306,10 @@ describe("materializeSubmodules", () => {
       },
     }
 
-    const refused = await materializeSubmodules(git, { worktree, referenceWorktree })
+    const refused = await materializeSubmodules(withPrimaryWorktree(git, referenceWorktree), {
+      worktree,
+      referenceWorktree,
+    })
 
     // A bare count is what made this invisible for a night; the refusal has to
     // carry enough to act on without re-deriving anything.
@@ -291,7 +322,8 @@ describe("materializeSubmodules", () => {
 
   it("permits fallback only when the caller raises the limit deliberately", async () => {
     const worktree = "/candidate"
-    const referenceWorktree = "/reference"
+    const referenceWorktree = await mkdtemp(join(tmpdir(), "git-super-fallback-reference-"))
+    roots.push(referenceWorktree)
     const messages: string[] = []
     const git: SubmoduleGit = {
       async run(repo, args) {
@@ -310,7 +342,7 @@ describe("materializeSubmodules", () => {
     }
 
     await expect(
-      materializeSubmodules(git, {
+      materializeSubmodules(withPrimaryWorktree(git, referenceWorktree), {
         worktree,
         referenceWorktree,
         maxRemoteFallbacks: 1,
@@ -360,7 +392,11 @@ describe("materializeSubmodules", () => {
     }
 
     await expect(
-      materializeSubmodules(git, { worktree, referenceWorktree, log: capturingLogger(messages) }),
+      materializeSubmodules(withPrimaryWorktree(git, referenceWorktree), {
+        worktree,
+        referenceWorktree,
+        log: capturingLogger(messages),
+      }),
     ).resolves.toMatchObject({ code: 0, borrowed: 1, remoteFallbacks: 0, warmed: 1 })
     // The whole point: one connection repairs the store for every later
     // candidate, instead of one connection per submodule repairing nothing.
@@ -397,7 +433,11 @@ describe("materializeSubmodules", () => {
     // spanData carrying only assigned keys — no name, no props, no laps — so a
     // test written against it would pass while the emitted event stayed empty.
     const spans = spanEvents()
-    const materialized = await materializeSubmodules(git, { worktree, referenceWorktree, log: spans.log })
+    const materialized = await materializeSubmodules(withPrimaryWorktree(git, referenceWorktree), {
+      worktree,
+      referenceWorktree,
+      log: spans.log,
+    })
     // The RESULT carries the denominator now, not only the span. A caller with
     // no logger used to get counts and no total.
     expect(materialized).toMatchObject({
@@ -494,7 +534,10 @@ describe("materializeSubmodules", () => {
       },
     }
 
-    const refused = await materializeSubmodules(git, { worktree, referenceWorktree })
+    const refused = await materializeSubmodules(withPrimaryWorktree(git, referenceWorktree), {
+      worktree,
+      referenceWorktree,
+    })
 
     // On a promisor remote `cat-file -e` passes while trees and blobs are still
     // fetched lazily, so presence stops meaning warmth and the counter goes
@@ -611,7 +654,11 @@ describe("materializeSubmodules", () => {
     // raises the limit to reach the code under test. The default would refuse
     // three unrepairable fallbacks before any of them ran.
     await expect(
-      materializeSubmodules(git, { worktree, referenceWorktree, maxRemoteFallbacks: 3 }),
+      materializeSubmodules(withPrimaryWorktree(git, referenceWorktree), {
+        worktree,
+        referenceWorktree,
+        maxRemoteFallbacks: 3,
+      }),
     ).resolves.toMatchObject({
       code: 0,
       borrowed: 3,
@@ -636,5 +683,81 @@ describe("materializeSubmodules", () => {
       borrowed: 0,
       remoteFallbacks: 0,
     })
+  })
+
+  it("borrows from the primary submodule store when given a linked reference worktree", async () => {
+    const root = await mkdtemp(join(tmpdir(), "git-super-primary-reference-"))
+    roots.push(root)
+    const dependency = join(root, "dependency")
+    const owner = join(root, "owner")
+    const linked = join(root, "linked")
+    const candidate = join(root, "candidate")
+
+    git(root, ["init", "-q", "-b", "main", dependency])
+    git(dependency, ["config", "user.name", "Git Super Test"])
+    git(dependency, ["config", "user.email", "git-super@example.invalid"])
+    writeFileSync(join(dependency, "dependency.txt"), "dependency\n")
+    git(dependency, ["add", "dependency.txt"])
+    git(dependency, ["commit", "-qm", "dependency"])
+
+    git(root, ["init", "-q", "-b", "main", owner])
+    git(owner, ["config", "user.name", "Git Super Test"])
+    git(owner, ["config", "user.email", "git-super@example.invalid"])
+    git(owner, ["config", "protocol.file.allow", "always"])
+    writeFileSync(join(owner, "README.md"), "owner\n")
+    git(owner, ["add", "README.md"])
+    git(owner, ["commit", "-qm", "owner"])
+    git(owner, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", dependency, "vendor/dependency"])
+    git(owner, ["commit", "-qam", "add dependency"])
+
+    git(owner, ["worktree", "add", "-q", "--detach", linked, "HEAD"])
+    git(linked, ["-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive"])
+    git(owner, ["worktree", "add", "-q", "--detach", candidate, "HEAD"])
+
+    const previousGitAllowProtocol = process.env.GIT_ALLOW_PROTOCOL
+    process.env.GIT_ALLOW_PROTOCOL = "file"
+    let materialized: Awaited<ReturnType<typeof materializeSubmodulesWithProcess>>
+    try {
+      materialized = await materializeSubmodulesWithProcess(createLocalGitProcess(), {
+        worktree: candidate,
+        referenceWorktree: linked,
+      })
+    } finally {
+      if (previousGitAllowProtocol === undefined) delete process.env.GIT_ALLOW_PROTOCOL
+      else process.env.GIT_ALLOW_PROTOCOL = previousGitAllowProtocol
+    }
+    expect(materialized, materialized.stderr).toMatchObject({ code: 0, borrowed: 1, remoteFallbacks: 0 })
+
+    const candidateDependency = join(candidate, "vendor/dependency")
+    const alternatesFile = git(candidateDependency, [
+      "rev-parse",
+      "--path-format=absolute",
+      "--git-path",
+      "objects/info/alternates",
+    ]).trim()
+    const primaryGitDir = git(join(owner, "vendor/dependency"), [
+      "rev-parse",
+      "--path-format=absolute",
+      "--git-dir",
+    ]).trim()
+    expect(readFileSync(alternatesFile, "utf8").trim()).toBe(join(primaryGitDir, "objects"))
+
+    git(owner, ["worktree", "remove", "--force", linked])
+    expect(git(candidateDependency, ["cat-file", "-e", "HEAD^{commit}"])).toBe("")
+  })
+
+  it("refuses an explicit reference whose primary worktree cannot be proven", async () => {
+    const result = await materializeSubmodules(
+      {
+        async run(_repo, args) {
+          return args[0] === "worktree" ? { code: 128, stdout: "", stderr: "fatal: not a git repository" } : success()
+        },
+      },
+      { worktree: "/candidate", referenceWorktree: "/linked-reference" },
+    )
+
+    expect(result).toMatchObject({ code: 128, considered: 0, borrowed: 0, remoteFallbacks: 0 })
+    expect(result.stderr).toContain("cannot prove the primary worktree")
+    expect(result.stderr).toContain("potentially disposable linked worktree")
   })
 })

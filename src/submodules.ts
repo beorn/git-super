@@ -216,10 +216,18 @@ export async function materializeSubmodules(
   options: SubmoduleMaterializationOptions,
 ): Promise<SubmoduleMaterializationResult> {
   const log = options.log
-  const referenceRoot =
+  const requestedReference =
     options.referenceWorktree !== undefined && resolve(options.referenceWorktree) !== resolve(options.worktree)
       ? options.referenceWorktree
       : undefined
+  let referenceRoot: string | undefined
+  if (requestedReference !== undefined) {
+    const primary = await primaryWorktree(git, requestedReference)
+    if (typeof primary !== "string") {
+      return { ...primary, considered: 0, borrowed: 0, remoteFallbacks: 0, unreferenced: 0, warmed: 0 }
+    }
+    if (canonical(primary) !== canonical(options.worktree)) referenceRoot = primary
+  }
   let borrowed = 0
   let remoteFallbacks = 0
   let warmed = 0
@@ -608,11 +616,28 @@ function parseWorktrees(output: string): Array<Readonly<{ path: string; branch?:
   return entries
 }
 
-async function mainWorktree(git: SubmoduleGit, repo: string): Promise<string | undefined> {
+async function primaryWorktree(git: SubmoduleGit, repo: string): Promise<string | SubmoduleGitResult> {
   const listed = await git.run(repo, ["worktree", "list", "--porcelain"], true)
-  if (listed.code !== 0) return undefined
-  const entries = parseWorktrees(listed.stdout)
-  return entries.find((entry) => entry.branch === "refs/heads/main")?.path ?? entries[0]?.path
+  if (listed.code !== 0) {
+    return {
+      code: listed.code,
+      stdout: listed.stdout,
+      stderr:
+        `git-super: cannot prove the primary worktree for reference '${repo}'; refusing to create ` +
+        `submodule alternates from a potentially disposable linked worktree.\n${listed.stderr}`,
+    }
+  }
+  const primary = parseWorktrees(listed.stdout)[0]?.path
+  if (primary === undefined || !existsSync(primary)) {
+    return {
+      code: 1,
+      stdout: listed.stdout,
+      stderr:
+        `git-super: cannot prove the primary worktree for reference '${repo}'; ` +
+        `git worktree list did not return an existing primary path.`,
+    }
+  }
+  return canonical(primary)
 }
 
 /** Host adapter for callers that need git-super to supply the Git process. */
@@ -622,7 +647,18 @@ export async function materializeSubmodulesFromLocalWorktreeParallel(
   const environment = cleanGitRepositoryEnvironment(options.env ?? process.env)
   const git = hostGit(environment)
   const discovered =
-    options.referenceWorktree === undefined ? await mainWorktree(git, options.worktree) : options.referenceWorktree
+    options.referenceWorktree === undefined ? await primaryWorktree(git, options.worktree) : options.referenceWorktree
+  if (typeof discovered !== "string") {
+    return {
+      ...discovered,
+      exitCode: discovered.code,
+      considered: 0,
+      borrowed: 0,
+      remoteFallbacks: 0,
+      unreferenced: 0,
+      warmed: 0,
+    }
+  }
   const referenceWorktree =
     discovered !== undefined && canonical(discovered) !== canonical(options.worktree) ? discovered : undefined
   const result = await materializeSubmodules(git, {
