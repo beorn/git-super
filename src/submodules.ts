@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process"
 import { existsSync, realpathSync } from "node:fs"
-import { join, resolve } from "node:path"
+import { appendFile, mkdir, readFile } from "node:fs/promises"
+import { isAbsolute, join, resolve } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 import { createLogger, type ConditionalLogger, type LogLevel } from "loggily"
 import { cleanGitRepositoryEnvironment } from "./git.ts"
@@ -206,10 +207,102 @@ async function warmReference(git: SubmoduleGit, reference: string, sha: string):
 }
 
 /**
+ * Guarantee the durable module store line in a materialized submodule's
+ * `objects/info/alternates`.
+ *
+ * A borrow-cloned store holds almost no objects of its own; every read runs
+ * through this file. When its only line points into another linked worktree's
+ * `worktrees/<wt>/modules` store, recycling that worktree kills the store —
+ * measured 2026-08-25 across the fleet estate: 610 stores chained to another
+ * worktree, 62 already unreadable. The durable line makes deletion of the
+ * borrow survivable, and because this runs after EVERY update — warm no-ops
+ * included — it also heals stores emitted before the anchor existed.
+ *
+ * Never rewrites or reorders existing lines: a borrow stays as the optional,
+ * additive first line. Skips only a store that already IS the durable one.
+ * A durable store that does not exist yet is announced and still anchored —
+ * a dangling alternates line is harmless to git, and it becomes load-bearing
+ * the moment the primary checkout materializes that submodule.
+ */
+async function anchorDurableAlternates(
+  git: SubmoduleGit,
+  checkout: string,
+  durableGitDir: string,
+  log?: ConditionalLogger,
+): Promise<SubmoduleGitResult> {
+  const objects = await git.run(checkout, ["rev-parse", "--path-format=absolute", "--git-path", "objects"], true)
+  const ownObjects = objects.stdout.trim()
+  if (objects.code !== 0 || ownObjects === "") {
+    return {
+      code: objects.code === 0 ? 1 : objects.code,
+      stdout: objects.stdout,
+      stderr:
+        `git-super: cannot resolve the object store for materialized submodule '${checkout}'; ` +
+        `refusing to leave it without a durable alternates anchor.\n${objects.stderr}`,
+    }
+  }
+  const durableObjects = join(durableGitDir, "objects")
+  if (canonical(ownObjects) === canonical(durableObjects)) return success()
+  const alternatesFile = join(ownObjects, "info", "alternates")
+  let content = ""
+  try {
+    content = await readFile(alternatesFile, "utf8")
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      return {
+        code: 1,
+        stdout: "",
+        stderr: `git-super: cannot read '${alternatesFile}' to anchor the durable module store: ${String(error)}`,
+      }
+    }
+  }
+  const target = canonical(durableObjects)
+  const anchored = content.split(/\r?\n/u).some((line) => {
+    const entry = line.trim()
+    if (entry === "" || entry.startsWith("#")) return false
+    return canonical(isAbsolute(entry) ? entry : resolve(ownObjects, entry)) === target
+  })
+  if (anchored) return success()
+  if (!existsSync(durableObjects)) {
+    log?.warn?.("durable module store does not exist yet; anchoring its line for when it does", {
+      checkout,
+      durableObjects,
+    })
+  }
+  try {
+    await mkdir(join(ownObjects, "info"), { recursive: true })
+    await appendFile(alternatesFile, `${content === "" || content.endsWith("\n") ? "" : "\n"}${target}\n`, "utf8")
+  } catch (error) {
+    return {
+      code: 1,
+      stdout: "",
+      stderr: `git-super: cannot append the durable module store line to '${alternatesFile}': ${String(error)}`,
+    }
+  }
+  log?.debug?.("anchored the durable module store line", { checkout, durable: target })
+  return success()
+}
+
+/**
  * Materialize isolated submodule checkouts while borrowing object history from
  * the matching checkout in the source repository. Git's documented
  * superproject alternate policy remains the fail-soft fallback for reference-
  * cloned roots; explicit per-path references close the linked-worktree gap.
+ *
+ * TWO guarantees anchor every store this function touches to the durable
+ * module store (`<superproject common dir>/modules/<name>/objects`), because
+ * either alone leaves a hole that killed 62 stores on 2026-08-25:
+ *
+ * 1. Borrows are REDIRECTED to the primary worktree (`primaryWorktree` above),
+ *    so a fresh clone's alternates line lands on the durable store instead of
+ *    a disposable linked worktree's `worktrees/<wt>/modules` store.
+ * 2. After EVERY successful update — fresh clone or warm no-op — the durable
+ *    line is appended to the store's `objects/info/alternates` unless already
+ *    present (`anchorDurableAlternates` below). Redirection alone cannot do
+ *    this: a warm `submodule update` never rewrites alternates, so a store
+ *    that was emitted before the redirect existed would stay chained to its
+ *    disposable borrow forever. Any pre-existing borrow line is kept — it is
+ *    a performance borrow, additive and optional, never the store of record.
  */
 export async function materializeSubmodules(
   git: SubmoduleGit,
@@ -257,9 +350,35 @@ export async function materializeSubmodules(
    */
   const misses: Array<Readonly<{ path: string; reference: string; required: string; why: string }>> = []
 
+  /**
+   * The git dir under which this superproject's submodules have their durable
+   * stores (`<here>/modules/<name>`). Resolved LAZILY — only a successful
+   * update needs it — and cached, because it is one `rev-parse` per whole run.
+   * For a linked worktree the common dir crosses to the primary repository,
+   * which is exactly what makes the anchored line survive worktree recycling.
+   */
+  let durableRoot: Promise<string | SubmoduleGitResult> | undefined
+  const resolveDurableRoot = (): Promise<string | SubmoduleGitResult> =>
+    (durableRoot ??= (async () => {
+      const common = await git.run(options.worktree, ["rev-parse", "--path-format=absolute", "--git-common-dir"], true)
+      const dir = common.stdout.trim()
+      if (common.code !== 0 || dir === "") {
+        return {
+          code: common.code === 0 ? 1 : common.code,
+          stdout: common.stdout,
+          stderr:
+            `git-super: cannot resolve the common git dir for '${options.worktree}'; refusing to materialize ` +
+            `a submodule store without a durable alternates anchor — an un-anchored store dies with whichever ` +
+            `worktree it borrowed from.\n${common.stderr}`,
+        }
+      }
+      return dir
+    })())
+
   const walk = async (
     worktree: string,
     reference: string | undefined,
+    durableLevel: () => Promise<string | SubmoduleGitResult>,
     selectedPaths?: ReadonlySet<string>,
     depth = 0,
   ): Promise<SubmoduleGitResult> => {
@@ -397,7 +516,9 @@ export async function materializeSubmodules(
         )),
       )
     }
-    const prepared: Array<Readonly<{ args: readonly string[]; nestedReference: string | undefined; path: string }>> = []
+    const prepared: Array<
+      Readonly<{ args: readonly string[]; name: string; nestedReference: string | undefined; path: string }>
+    > = []
     for (const [index, { canBorrow, name, path, referenceSubmodule, required }] of resolved.entries()) {
       const configuredUrl = configuredUrls[index]
       if (configuredUrl === undefined || configuredUrl.code !== 0 || configuredUrl.stdout.trim() === "") {
@@ -444,7 +565,7 @@ export async function materializeSubmodules(
         // the one the fail-loud did not reach.
         unreferenced += 1
       }
-      prepared.push({ args, nestedReference: borrowFrom, path })
+      prepared.push({ args, name, nestedReference: borrowFrom, path })
     }
     span?.lap("prepare")
     // A borrow clones from a local path and may fan out; a remote fallback
@@ -509,9 +630,10 @@ export async function materializeSubmodules(
     }
     const update = async ({
       args,
+      name,
       nestedReference,
       path,
-    }: Readonly<{ args: readonly string[]; nestedReference: string | undefined; path: string }>) => {
+    }: Readonly<{ args: readonly string[]; name: string; nestedReference: string | undefined; path: string }>) => {
       const source = nestedReference === undefined ? "remote" : "local"
       // The span closes over the `git.run` ALONE. Letting it wrap the recursive
       // walk below would bill every nested submodule to its parent, so the one
@@ -525,7 +647,13 @@ export async function materializeSubmodules(
         }
         return result
       })()
-      return updated.code === 0 ? walk(join(worktree, path), nestedReference, undefined, depth + 1) : updated
+      if (updated.code !== 0) return updated
+      const level = await durableLevel()
+      if (typeof level !== "string") return level
+      const durableGitDir = join(level, "modules", name)
+      const anchored = await anchorDurableAlternates(git, join(worktree, path), durableGitDir, log)
+      if (anchored.code !== 0) return anchored
+      return walk(join(worktree, path), nestedReference, async () => durableGitDir, undefined, depth + 1)
     }
     for (let start = 0; start < local.length; start += MAX_CONCURRENT_SUBMODULE_UPDATES) {
       const results = await Promise.all(local.slice(start, start + MAX_CONCURRENT_SUBMODULE_UPDATES).map(update))
@@ -543,7 +671,7 @@ export async function materializeSubmodules(
 
   const selectedPaths = options.paths === undefined ? undefined : new Set(options.paths)
   using span = log?.span?.("materialize", { worktree: options.worktree, reference: referenceRoot })
-  const result = await walk(options.worktree, referenceRoot, selectedPaths)
+  const result = await walk(options.worktree, referenceRoot, resolveDurableRoot, selectedPaths)
   // ONE record carrying the totals AND what they are totals of. The counters
   // existed before this and were printed into a log with no reader; a reader
   // that gets `remoteFallbacks: 16` still cannot tell a broken reference store

@@ -3,7 +3,7 @@
  * @level l1
  * @consumer Yrd, Bearly, and hh worktree adapters
  */
-import { readFileSync, writeFileSync } from "node:fs"
+import { existsSync, readFileSync, writeFileSync } from "node:fs"
 import { mkdir, mkdtemp, rm } from "node:fs/promises"
 import { spawnSync } from "node:child_process"
 import { tmpdir } from "node:os"
@@ -35,6 +35,34 @@ function withPrimaryWorktree(git: SubmoduleGit, primary: string): SubmoduleGit {
     async run(repo, args, allowFailure) {
       if (repo === primary && args[0] === "worktree" && args[1] === "list") {
         return { ...success(), stdout: `worktree ${primary}\n\n` }
+      }
+      return git.run(repo, args, allowFailure)
+    },
+  }
+}
+
+/**
+ * Answer the anchor's two `rev-parse` reads so a mocked submodule store already
+ * LIVES at its durable home (`<root>/modules/<name>/objects`) — the anchor then
+ * has nothing to append, exactly like materializing the primary checkout
+ * itself. `modules` maps submodule path → submodule name.
+ */
+function withDurableStores(
+  git: SubmoduleGit,
+  worktree: string,
+  root: string,
+  modules: Record<string, string>,
+): SubmoduleGit {
+  return {
+    ...git,
+    async run(repo, args, allowFailure) {
+      if (args[0] === "rev-parse" && args.includes("--git-common-dir") && repo === worktree) {
+        return { ...success(), stdout: `${root}\n` }
+      }
+      if (args[0] === "rev-parse" && args.includes("--git-path")) {
+        const path = Object.keys(modules).find((candidate) => repo === join(worktree, candidate))
+        const name = path === undefined ? undefined : modules[path]
+        if (name !== undefined) return { ...success(), stdout: `${join(root, "modules", name, "objects")}\n` }
       }
       return git.run(repo, args, allowFailure)
     },
@@ -244,7 +272,13 @@ describe("materializeSubmodules", () => {
     // refusal), so the coverage is this diagnostic plus the `unreferenced`
     // count. The old `reference ?? "(none supplied)"` string was unreachable and
     // covered nothing; this is what actually reaches the case.
-    const result = await materializeSubmodules(git, { worktree, log: capturingLogger(messages) })
+    const result = await materializeSubmodules(
+      withDurableStores(git, worktree, "/durable", { "apps/maddoc": "maddoc" }),
+      {
+        worktree,
+        log: capturingLogger(messages),
+      },
+    )
 
     expect(result).toMatchObject({ code: 0, considered: 1, borrowed: 0, remoteFallbacks: 0, unreferenced: 1 })
     expect(result.borrowed + result.remoteFallbacks + result.unreferenced).toBe(result.considered)
@@ -342,12 +376,17 @@ describe("materializeSubmodules", () => {
     }
 
     await expect(
-      materializeSubmodules(withPrimaryWorktree(git, referenceWorktree), {
-        worktree,
-        referenceWorktree,
-        maxRemoteFallbacks: 1,
-        log: capturingLogger(messages),
-      }),
+      materializeSubmodules(
+        withDurableStores(withPrimaryWorktree(git, referenceWorktree), worktree, "/durable", {
+          "apps/maddoc": "maddoc",
+        }),
+        {
+          worktree,
+          referenceWorktree,
+          maxRemoteFallbacks: 1,
+          log: capturingLogger(messages),
+        },
+      ),
     ).resolves.toMatchObject({ code: 0, borrowed: 0, remoteFallbacks: 1, warmed: 0 })
     // A warm-up is always attempted first, so the operator sees the repair try
     // and its failure — not just the fallback it silently degraded into.
@@ -392,11 +431,16 @@ describe("materializeSubmodules", () => {
     }
 
     await expect(
-      materializeSubmodules(withPrimaryWorktree(git, referenceWorktree), {
-        worktree,
-        referenceWorktree,
-        log: capturingLogger(messages),
-      }),
+      materializeSubmodules(
+        withDurableStores(withPrimaryWorktree(git, referenceWorktree), worktree, "/durable", {
+          "apps/maddoc": "maddoc",
+        }),
+        {
+          worktree,
+          referenceWorktree,
+          log: capturingLogger(messages),
+        },
+      ),
     ).resolves.toMatchObject({ code: 0, borrowed: 1, remoteFallbacks: 0, warmed: 1 })
     // The whole point: one connection repairs the store for every later
     // candidate, instead of one connection per submodule repairing nothing.
@@ -433,11 +477,16 @@ describe("materializeSubmodules", () => {
     // spanData carrying only assigned keys — no name, no props, no laps — so a
     // test written against it would pass while the emitted event stayed empty.
     const spans = spanEvents()
-    const materialized = await materializeSubmodules(withPrimaryWorktree(git, referenceWorktree), {
-      worktree,
-      referenceWorktree,
-      log: spans.log,
-    })
+    const materialized = await materializeSubmodules(
+      withDurableStores(withPrimaryWorktree(git, referenceWorktree), worktree, "/durable", {
+        "apps/maddoc": "maddoc",
+      }),
+      {
+        worktree,
+        referenceWorktree,
+        log: spans.log,
+      },
+    )
     // The RESULT carries the denominator now, not only the span. A caller with
     // no logger used to get counts and no total.
     expect(materialized).toMatchObject({
@@ -578,7 +627,16 @@ describe("materializeSubmodules", () => {
       },
     }
 
-    await expect(materializeSubmodules(git, { worktree })).resolves.toMatchObject({ code: 0 })
+    await expect(
+      materializeSubmodules(
+        withDurableStores(git, worktree, "/durable", {
+          "vendor/one": "module-0",
+          "vendor/two": "module-1",
+          "vendor/three": "module-2",
+        }),
+        { worktree },
+      ),
+    ).resolves.toMatchObject({ code: 0 })
     expect(commands.filter(({ args }) => args[0] === "submodule" && args[1] === "init")).toEqual([
       { args: ["submodule", "init", "--", ...paths], mutation: true },
     ])
@@ -654,11 +712,21 @@ describe("materializeSubmodules", () => {
     // raises the limit to reach the code under test. The default would refuse
     // three unrepairable fallbacks before any of them ran.
     await expect(
-      materializeSubmodules(withPrimaryWorktree(git, referenceWorktree), {
-        worktree,
-        referenceWorktree,
-        maxRemoteFallbacks: 3,
-      }),
+      materializeSubmodules(
+        withDurableStores(withPrimaryWorktree(git, referenceWorktree), worktree, "/durable", {
+          "vendor/local-a": "module-0",
+          "vendor/local-b": "module-1",
+          "vendor/local-c": "module-2",
+          "vendor/remote-a": "module-3",
+          "vendor/remote-b": "module-4",
+          "vendor/remote-c": "module-5",
+        }),
+        {
+          worktree,
+          referenceWorktree,
+          maxRemoteFallbacks: 3,
+        },
+      ),
     ).resolves.toMatchObject({
       code: 0,
       borrowed: 3,
@@ -759,5 +827,203 @@ describe("materializeSubmodules", () => {
     expect(result).toMatchObject({ code: 128, considered: 0, borrowed: 0, remoteFallbacks: 0 })
     expect(result.stderr).toContain("cannot prove the primary worktree")
     expect(result.stderr).toContain("potentially disposable linked worktree")
+  })
+
+  it("re-anchors a warm store whose alternates only name a disposable linked worktree", async () => {
+    // THE 2026-08-25 DEFECT SHAPE: a candidate's submodule store whose ONLY
+    // alternates line points into another linked worktree's module store
+    // (`<common>/worktrees/<wt>/modules/<path>/objects`). Recycling that
+    // worktree deleted the store and killed every object read — 62 stores on
+    // the measured estate. A warm `submodule update` never rewrites alternates,
+    // so redirecting NEW borrows to the primary cannot heal an existing store;
+    // only the anchor pass can, and this test is the proof it does.
+    const root = await mkdtemp(join(tmpdir(), "git-super-reanchor-"))
+    roots.push(root)
+    const dependency = join(root, "dependency")
+    const owner = join(root, "owner")
+    const linked = join(root, "linked")
+    const candidate = join(root, "candidate")
+
+    git(root, ["init", "-q", "-b", "main", dependency])
+    git(dependency, ["config", "user.name", "Git Super Test"])
+    git(dependency, ["config", "user.email", "git-super@example.invalid"])
+    writeFileSync(join(dependency, "dependency.txt"), "dependency\n")
+    git(dependency, ["add", "dependency.txt"])
+    git(dependency, ["commit", "-qm", "dependency"])
+
+    git(root, ["init", "-q", "-b", "main", owner])
+    git(owner, ["config", "user.name", "Git Super Test"])
+    git(owner, ["config", "user.email", "git-super@example.invalid"])
+    git(owner, ["config", "protocol.file.allow", "always"])
+    writeFileSync(join(owner, "README.md"), "owner\n")
+    git(owner, ["add", "README.md"])
+    git(owner, ["commit", "-qm", "owner"])
+    git(owner, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", dependency, "vendor/dependency"])
+    git(owner, ["commit", "-qam", "add dependency"])
+
+    git(owner, ["worktree", "add", "-q", "--detach", linked, "HEAD"])
+    git(linked, ["-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive"])
+    git(owner, ["worktree", "add", "-q", "--detach", candidate, "HEAD"])
+
+    const previousGitAllowProtocol = process.env.GIT_ALLOW_PROTOCOL
+    process.env.GIT_ALLOW_PROTOCOL = "file"
+    try {
+      const materialized = await materializeSubmodulesWithProcess(createLocalGitProcess(), {
+        worktree: candidate,
+        referenceWorktree: linked,
+      })
+      expect(materialized, materialized.stderr).toMatchObject({ code: 0 })
+
+      const candidateDependency = join(candidate, "vendor/dependency")
+      const alternatesFile = git(candidateDependency, [
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        "objects/info/alternates",
+      ]).trim()
+      const linkedStoreObjects = git(join(linked, "vendor/dependency"), [
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        "objects",
+      ]).trim()
+      const primaryStoreObjects = git(join(owner, "vendor/dependency"), [
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        "objects",
+      ]).trim()
+
+      // Fabricate the legacy emission: the linked worktree's store as the ONLY
+      // line. This is byte-for-byte what the pre-anchor materializer wrote when
+      // its reference was a linked worktree.
+      writeFileSync(alternatesFile, `${linkedStoreObjects}\n`)
+
+      const rematerialized = await materializeSubmodulesWithProcess(createLocalGitProcess(), {
+        worktree: candidate,
+        referenceWorktree: linked,
+      })
+      expect(rematerialized, rematerialized.stderr).toMatchObject({ code: 0 })
+
+      const lines = readFileSync(alternatesFile, "utf8")
+        .split("\n")
+        .filter((line) => line.trim() !== "")
+      // The borrow stays as the optional, additive FIRST line — it is a
+      // performance borrow, never the store of record.
+      expect(lines[0]).toBe(linkedStoreObjects)
+      // The durable module store line is MANDATORY in every emission.
+      expect(lines).toContain(primaryStoreObjects)
+
+      // The store must survive the borrow target's deletion — the exact way
+      // the 62 died.
+      git(owner, ["worktree", "remove", "--force", linked])
+      expect(git(candidateDependency, ["cat-file", "-e", "HEAD^{commit}"])).toBe("")
+    } finally {
+      if (previousGitAllowProtocol === undefined) delete process.env.GIT_ALLOW_PROTOCOL
+      else process.env.GIT_ALLOW_PROTOCOL = previousGitAllowProtocol
+    }
+  })
+
+  it("anchors nested submodule stores under the durable modules chain", async () => {
+    // Depth is where a wrong durable path would hide: the nested store's home
+    // is `<common>/modules/<parent>/modules/<child>`, keyed by NAME at every
+    // level. Every emitted line must also EXIST — a fabricated chain that
+    // appends a plausible-but-wrong path fails here, not in production.
+    const root = await mkdtemp(join(tmpdir(), "git-super-nested-anchor-"))
+    roots.push(root)
+    const inner = join(root, "inner")
+    const dependency = join(root, "dependency")
+    const owner = join(root, "owner")
+    const candidate = join(root, "candidate")
+
+    git(root, ["init", "-q", "-b", "main", inner])
+    git(inner, ["config", "user.name", "Git Super Test"])
+    git(inner, ["config", "user.email", "git-super@example.invalid"])
+    writeFileSync(join(inner, "inner.txt"), "inner\n")
+    git(inner, ["add", "inner.txt"])
+    git(inner, ["commit", "-qm", "inner"])
+
+    git(root, ["init", "-q", "-b", "main", dependency])
+    git(dependency, ["config", "user.name", "Git Super Test"])
+    git(dependency, ["config", "user.email", "git-super@example.invalid"])
+    writeFileSync(join(dependency, "dependency.txt"), "dependency\n")
+    git(dependency, ["add", "dependency.txt"])
+    git(dependency, ["commit", "-qm", "dependency"])
+    git(dependency, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", inner, "nested/inner"])
+    git(dependency, ["commit", "-qam", "add inner"])
+
+    git(root, ["init", "-q", "-b", "main", owner])
+    git(owner, ["config", "user.name", "Git Super Test"])
+    git(owner, ["config", "user.email", "git-super@example.invalid"])
+    git(owner, ["config", "protocol.file.allow", "always"])
+    writeFileSync(join(owner, "README.md"), "owner\n")
+    git(owner, ["add", "README.md"])
+    git(owner, ["commit", "-qm", "owner"])
+    git(owner, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", dependency, "vendor/dependency"])
+    git(owner, ["commit", "-qam", "add dependency"])
+    git(owner, ["-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive"])
+
+    git(owner, ["worktree", "add", "-q", "--detach", candidate, "HEAD"])
+
+    const previousGitAllowProtocol = process.env.GIT_ALLOW_PROTOCOL
+    process.env.GIT_ALLOW_PROTOCOL = "file"
+    try {
+      const materialized = await materializeSubmodulesWithProcess(createLocalGitProcess(), {
+        worktree: candidate,
+        referenceWorktree: owner,
+      })
+      expect(materialized, materialized.stderr).toMatchObject({ code: 0, considered: 2 })
+    } finally {
+      if (previousGitAllowProtocol === undefined) delete process.env.GIT_ALLOW_PROTOCOL
+      else process.env.GIT_ALLOW_PROTOCOL = previousGitAllowProtocol
+    }
+
+    const nestedCheckout = join(candidate, "vendor/dependency", "nested/inner")
+    const alternatesFile = git(nestedCheckout, [
+      "rev-parse",
+      "--path-format=absolute",
+      "--git-path",
+      "objects/info/alternates",
+    ]).trim()
+    const durableNested = git(join(owner, "vendor/dependency", "nested/inner"), [
+      "rev-parse",
+      "--path-format=absolute",
+      "--git-path",
+      "objects",
+    ]).trim()
+    const lines = readFileSync(alternatesFile, "utf8")
+      .split("\n")
+      .filter((line) => line.trim() !== "")
+    expect(lines).toContain(durableNested)
+    for (const line of lines) expect(existsSync(line), `alternates line does not exist: ${line}`).toBe(true)
+  })
+
+  it("fails loud when the durable modules root cannot be resolved", async () => {
+    // A store the anchor cannot prove durable must refuse, never materialize
+    // silently un-anchored — an un-anchored store is the 62-store outage class.
+    const worktree = "/candidate"
+    const git: SubmoduleGit = {
+      async run(repo, args) {
+        if (args[0] === "rev-parse" && args.includes("--git-common-dir")) {
+          return { code: 128, stdout: "", stderr: "fatal: this operation must be run in a work tree" }
+        }
+        if (args[0] === "cat-file" && args.at(-1) === "HEAD:.gitmodules") {
+          return repo === worktree ? success() : { ...success(), code: 1 }
+        }
+        if (args[0] === "config" && args[1] === "--blob") {
+          return { ...success(), stdout: "submodule.maddoc.path apps/maddoc" }
+        }
+        if (args[0] === "ls-tree") return { ...success(), stdout: `160000 commit ${"f".repeat(40)}\tapps/maddoc\n` }
+        if (args[0] === "config" && args[1] === "--get") {
+          return { ...success(), stdout: "https://example.invalid/maddoc.git\n" }
+        }
+        return success()
+      },
+    }
+
+    const result = await materializeSubmodules(git, { worktree })
+
+    expect(result.code).not.toBe(0)
+    expect(result.stderr).toContain("durable")
   })
 })
