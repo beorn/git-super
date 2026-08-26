@@ -354,6 +354,156 @@ describe("materializeSubmodules", () => {
     expect(refused.stderr).toContain("2026-08-21")
   })
 
+  /**
+   * A candidate tree that predates a submodule REMOVAL. The reference's own HEAD
+   * dropped the gitlink, so the store it names was never merely cold — it is
+   * gone by design, and "repair the reference store, then retry" is advice that
+   * cannot be followed. Found 2026-08-24 on hh's `hh-web` detachment: every
+   * branch older than the removal refused with a fetch command pointing at a
+   * directory that does not exist, and the queue kept telling owners to submit
+   * or recut those branches, both of which fail at exactly this call.
+   */
+  const detachedReferenceGit = (
+    worktree: string,
+    referenceWorktree: string,
+    commands: Array<Readonly<{ repo: string; args: readonly string[] }>>,
+    options: Readonly<{ referenceTreeReadable?: boolean }> = {},
+  ): SubmoduleGit => ({
+    async run(repo, args) {
+      commands.push({ repo, args })
+      if (args[0] === "cat-file" && args.at(-1) === "HEAD:.gitmodules") {
+        return repo === worktree ? success() : { ...success(), code: 1 }
+      }
+      if (args[0] === "config" && args[1] === "--blob") {
+        return { ...success(), stdout: "submodule.hh-web.path hh-web" }
+      }
+      if (args[0] === "ls-tree") {
+        // THE WHOLE DISCRIMINATOR. The candidate still carries the gitlink; the
+        // reference does not. Two different repos, two different answers — the
+        // pair is what separates "cold store" from "removed submodule".
+        if (repo === referenceWorktree) {
+          return options.referenceTreeReadable === false ? { ...success(), code: 128 } : success()
+        }
+        return { ...success(), stdout: `160000 commit ${"9".repeat(40)}\thh-web\n` }
+      }
+      if (args[0] === "log") {
+        return { ...success(), stdout: "d9558f2038 chore(repo)!: detach hh-web and remove CI credential arm\n" }
+      }
+      // The pin is absent from the reference store, and the store is not a
+      // partial clone — so without the pre-flight this reaches the warm-up.
+      if (args[0] === "cat-file" && args[1] === "-e") return { ...success(), code: 1 }
+      if (args[0] === "config" && args[1] === "--get-regexp") return { ...success(), code: 1 }
+      if (args[0] === "config" && args[1] === "--get") {
+        return { ...success(), stdout: "https://example.invalid/hh-web.git\n" }
+      }
+      return success()
+    },
+  })
+
+  it("names the removing commit and asks for a re-author when the reference dropped the submodule", async () => {
+    const worktree = "/candidate"
+    const referenceWorktree = await mkdtemp(join(tmpdir(), "git-super-detached-reference-"))
+    roots.push(referenceWorktree)
+    // The store DIRECTORY exists, so a warm-up would really run a fetch here.
+    // Without that the "no fetch attempted" assertion below would pass for the
+    // wrong reason — `warmReference` short-circuits on a missing directory.
+    await mkdir(join(referenceWorktree, "hh-web"), { recursive: true })
+    const commands: Array<Readonly<{ repo: string; args: readonly string[] }>> = []
+
+    const refused = await materializeSubmodules(
+      withPrimaryWorktree(detachedReferenceGit(worktree, referenceWorktree, commands), referenceWorktree),
+      { worktree, referenceWorktree },
+    )
+
+    expect(refused.code).toBe(1)
+    // The real cause, and the commit that caused it — derived from the
+    // reference's own history, never hardcoded.
+    expect(refused.stderr).toContain("d9558f2038")
+    expect(refused.stderr).toContain("detach hh-web")
+    expect(refused.stderr).toMatch(/re-author/iu)
+    // The advice that cannot be followed must be ABSENT, not merely accompanied:
+    // a caller who reads it provisions a store the repository deliberately
+    // dropped, which is satisfying a guard by editing the world.
+    expect(refused.stderr).not.toContain("Repair the reference store")
+    expect(refused.stderr).not.toContain(`fetch --no-tags origin ${"9".repeat(40)}`)
+    // PRE-FLIGHT, not post-mortem: the refusal lands before the network call.
+    expect(commands.some(({ args }) => args[0] === "fetch")).toBe(false)
+  })
+
+  it("does not call an unreadable reference a removal — that is a different state", async () => {
+    const worktree = "/candidate"
+    const referenceWorktree = await mkdtemp(join(tmpdir(), "git-super-unreadable-reference-"))
+    roots.push(referenceWorktree)
+    await mkdir(join(referenceWorktree, "hh-web"), { recursive: true })
+    const commands: Array<Readonly<{ repo: string; args: readonly string[] }>> = []
+
+    const refused = await materializeSubmodules(
+      withPrimaryWorktree(
+        detachedReferenceGit(worktree, referenceWorktree, commands, { referenceTreeReadable: false }),
+        referenceWorktree,
+      ),
+      { worktree, referenceWorktree },
+    )
+
+    // An `ls-tree` that FAILED says nothing about whether the submodule was
+    // removed. Claiming a permanent repo fact from a failed read would send a
+    // recoverable cold store down the re-author path, which is unrecoverable
+    // advice. So this one keeps the old, correct remedy.
+    expect(refused.code).toBe(1)
+    expect(refused.stderr).toContain("Repair the reference store")
+    expect(refused.stderr).not.toMatch(/re-author/iu)
+    expect(commands.some(({ args }) => args[0] === "fetch")).toBe(true)
+  })
+
+  it("prints the fetch remedy for the cold store only, never for the removed one", async () => {
+    const worktree = "/candidate"
+    const referenceWorktree = await mkdtemp(join(tmpdir(), "git-super-mixed-reference-"))
+    roots.push(referenceWorktree)
+    for (const path of ["hh-web", "ag"]) await mkdir(join(referenceWorktree, path), { recursive: true })
+    const removed = "9".repeat(40)
+    const cold = "a".repeat(40)
+    const git: SubmoduleGit = {
+      async run(repo, args) {
+        if (args[0] === "cat-file" && args.at(-1) === "HEAD:.gitmodules") {
+          return repo === worktree ? success() : { ...success(), code: 1 }
+        }
+        if (args[0] === "config" && args[1] === "--blob") {
+          return { ...success(), stdout: "submodule.hh-web.path hh-web\nsubmodule.ag.path ag" }
+        }
+        if (args[0] === "ls-tree") {
+          const path = args.at(-1)
+          // The reference dropped `hh-web` and still carries `ag`. One tree, two
+          // classes — the mix a real superproject actually presents.
+          if (repo === referenceWorktree) {
+            return path === "hh-web" ? success() : { ...success(), stdout: `160000 commit ${cold}\tag\n` }
+          }
+          return { ...success(), stdout: `160000 commit ${path === "hh-web" ? removed : cold}\t${String(path)}\n` }
+        }
+        if (args[0] === "log") return { ...success(), stdout: "d9558f2038 chore(repo)!: detach hh-web\n" }
+        if (args[0] === "cat-file" && args[1] === "-e") return { ...success(), code: 1 }
+        if (args[0] === "config" && args[1] === "--get-regexp") return { ...success(), code: 1 }
+        if (args[0] === "config" && args[1] === "--get") {
+          return { ...success(), stdout: "https://example.invalid/x.git\n" }
+        }
+        return success()
+      },
+    }
+
+    const refused = await materializeSubmodules(withPrimaryWorktree(git, referenceWorktree), {
+      worktree,
+      referenceWorktree,
+    })
+
+    expect(refused.code).toBe(1)
+    // Both remedies present, each attached to the miss it can actually fix.
+    expect(refused.stderr).toMatch(/re-author/iu)
+    expect(refused.stderr).toContain("Repair the reference store")
+    expect(refused.stderr).toContain(`fetch --no-tags origin ${cold}`)
+    // The regression this test exists for: the removed submodule's sha must
+    // never appear in a fetch command, however the two blocks are assembled.
+    expect(refused.stderr).not.toContain(`fetch --no-tags origin ${removed}`)
+  })
+
   it("permits fallback only when the caller raises the limit deliberately", async () => {
     const worktree = "/candidate"
     const referenceWorktree = await mkdtemp(join(tmpdir(), "git-super-fallback-reference-"))

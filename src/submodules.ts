@@ -85,6 +85,13 @@ const success = (): SubmoduleGitResult => ({ code: 0, stdout: "", stderr: "" })
  */
 type Probe = Readonly<{
   canBorrow: boolean
+  /**
+   * Set only on a miss whose path the reference's HEAD no longer carries.
+   * Resolved in phase A because it is a local read and phase B must not attempt
+   * a warm-up for it — a fetch aimed at a removed submodule is the network call
+   * this whole classification exists to skip.
+   */
+  detached: Detachment | undefined
   name: string
   path: string
   referenceSubmodule: string | undefined
@@ -149,10 +156,54 @@ async function submodules(git: SubmoduleGit, repo: string): Promise<Submodule[] 
     .filter((submodule): submodule is Submodule => submodule !== undefined)
 }
 
+const GITLINK_ROW = /^160000 commit ([0-9a-f]+)\t/mu
+
 async function requiredGitlink(git: SubmoduleGit, repo: string, path: string): Promise<string | undefined> {
   const tree = await git.run(repo, ["ls-tree", "HEAD", "--", path], true)
   if (tree.code !== 0) return undefined
-  return /^160000 commit ([0-9a-f]+)\t/mu.exec(tree.stdout)?.[1]
+  return GITLINK_ROW.exec(tree.stdout)?.[1]
+}
+
+/**
+ * A gitlink the REFERENCE no longer carries at all: its HEAD tree has no entry
+ * at this path, so the store the candidate needs was not left cold — it was
+ * removed, deliberately, by the commit named here.
+ */
+type Detachment = Readonly<{ removedBy: string | undefined }>
+
+/**
+ * Decide whether a miss is a cold store or a removed submodule, BEFORE any
+ * network call. The two look identical at the point of failure and have
+ * opposite remedies: a cold store is repaired with one fetch, while a removed
+ * one can only be re-authored — no fetch will ever produce a store the
+ * repository dropped, and provisioning one reconstitutes layout the repo
+ * deliberately shed.
+ *
+ * Found 2026-08-24 on hh's `hh-web` detachment (`d9558f2038`). Every branch
+ * whose tree predates it still carries `hh-web` as a gitlink, so materializing
+ * one demanded an object unreachable by design — and the refusal named the
+ * missing reference store, inviting exactly the provisioning it must not get.
+ * Branch owners were told to submit or recut; both fail at this call.
+ *
+ * THE FAILED READ IS NOT EVIDENCE. An `ls-tree` that errored says nothing about
+ * whether the submodule was removed, and calling an unreadable reference a
+ * removal would send a recoverable cold store down the unrecoverable path. Only
+ * a SUCCESSFUL read with no gitlink row proves the removal, and only then is the
+ * removing commit looked up.
+ */
+async function detachedFromReference(
+  git: SubmoduleGit,
+  reference: string,
+  path: string,
+): Promise<Detachment | undefined> {
+  const tree = await git.run(reference, ["ls-tree", "HEAD", "--", path], true)
+  if (tree.code !== 0 || GITLINK_ROW.test(tree.stdout)) return undefined
+  // Derived, never hardcoded: the same probe names whichever commit detached
+  // whichever submodule, so a future layout change is covered on the day it
+  // lands rather than the day someone edits this file.
+  const removal = await git.run(reference, ["log", "-1", "--format=%h %s", "--diff-filter=D", "HEAD", "--", path], true)
+  const removedBy = removal.code === 0 ? removal.stdout.trim() : ""
+  return { removedBy: removedBy === "" ? undefined : removedBy }
 }
 
 async function referenceContains(git: SubmoduleGit, reference: string, sha: string): Promise<boolean> {
@@ -348,7 +399,9 @@ export async function materializeSubmodules(
    * string was reported as real coverage. The type now proves what the prose
    * used to assert.
    */
-  const misses: Array<Readonly<{ path: string; reference: string; required: string; why: string }>> = []
+  const misses: Array<
+    Readonly<{ detached: Detachment | undefined; path: string; reference: string; required: string; why: string }>
+  > = []
 
   /**
    * The git dir under which this superproject's submodules have their durable
@@ -438,7 +491,9 @@ export async function materializeSubmodules(
               const referenceSubmodule = reference === undefined ? undefined : join(reference, path)
               const canBorrow =
                 referenceSubmodule !== undefined && (await referenceContains(git, referenceSubmodule, required))
-              return { canBorrow, name, path, referenceSubmodule, required }
+              const detached =
+                canBorrow || reference === undefined ? undefined : await detachedFromReference(git, reference, path)
+              return { canBorrow, detached, name, path, referenceSubmodule, required }
             }),
         )),
       )
@@ -449,14 +504,29 @@ export async function materializeSubmodules(
 
     // PHASE B — THE NETWORK, STRICTLY ONE AT A TIME. Only a miss reaches this
     // loop, so on a healthy reference store it does nothing at all.
-    for (const { canBorrow: borrowable, name, path, referenceSubmodule, required } of probes as Probe[]) {
+    for (const { canBorrow: borrowable, detached, name, path, referenceSubmodule, required } of probes as Probe[]) {
       let canBorrow = borrowable
       if (!canBorrow && referenceSubmodule !== undefined) {
         // One connection into the reference repairs it for every later bay;
         // sixteen connections out of sixteen candidates repair nothing.
-        const promisor = await promisorRemote(git, referenceSubmodule)
-        if (promisor !== undefined) {
+        const promisor = detached !== undefined ? undefined : await promisorRemote(git, referenceSubmodule)
+        if (detached !== undefined) {
+          // NO WARM-UP. The reference dropped this submodule, so the fetch below
+          // would ask a store that does not exist for an object nothing will
+          // ever put there. Skipping it is the pre-flight: the refusal lands
+          // before the network rather than after a failure that reads retryable.
           misses.push({
+            detached,
+            path,
+            reference: referenceSubmodule,
+            required,
+            why:
+              `the reference no longer carries this submodule` +
+              (detached.removedBy === undefined ? "" : `; removed by ${detached.removedBy}`),
+          })
+        } else if (promisor !== undefined) {
+          misses.push({
+            detached: undefined,
             path,
             reference: referenceSubmodule,
             required,
@@ -478,6 +548,7 @@ export async function materializeSubmodules(
             warmed += 1
           } else {
             misses.push({
+              detached: undefined,
               path,
               reference: referenceSubmodule,
               required,
@@ -489,7 +560,7 @@ export async function materializeSubmodules(
           }
         }
       }
-      resolved.push({ canBorrow, name, path, referenceSubmodule, required })
+      resolved.push({ canBorrow, detached, name, path, referenceSubmodule, required })
       considered += 1
     }
     span?.lap("resolve")
@@ -614,18 +685,42 @@ export async function materializeSubmodules(
             `  ${path} needs ${required}\n    reference: ${reference}\n    why: ${why}`,
         )
         .join("\n")
+      // TWO CLASSES, TWO REMEDIES, AND ONLY THE APPLICABLE ONE PRINTS. A cold
+      // store is repaired by a fetch; a removed submodule is not repairable at
+      // all, and printing the fetch beside it is what sent branch owners to
+      // provision a store the repository had deliberately dropped.
+      const removed = misses.filter(({ detached }) => detached !== undefined)
+      const repairable = misses.filter(({ detached }) => detached === undefined)
+      const detachmentRemedy =
+        removed.length === 0
+          ? ""
+          : `\nThis tree PREDATES a submodule removal, so no fetch can repair it:\n` +
+            removed
+              .map(
+                ({ detached, path }) =>
+                  `  ${path} was removed from ${reference}` +
+                  (detached?.removedBy === undefined ? "" : ` by ${detached.removedBy}`),
+              )
+              .join("\n") +
+            `\nDo NOT provision a reference store for it — that reconstitutes layout the repository dropped.\n` +
+            `A rebase does not help either; it still materializes this tree.\n` +
+            `Re-author the change onto a branch cut from current ${reference} HEAD, and close the original ` +
+            `as superseded once the replacement is on the landing branch by content.\n`
+      const repairRemedy =
+        repairable.length === 0
+          ? ""
+          : `Repair the reference store, then retry:\n` +
+            repairable
+              .map(({ reference, required }) => `  git -C ${reference} fetch --no-tags origin ${required}`)
+              .join("\n") +
+            `\nRaise --max-remote-fallbacks only with a reason; one connection per submodule across several ` +
+            `candidates is what made GitHub refuse SSH from this host on 2026-08-21.\n`
       return {
         code: 1,
         stdout: "",
         stderr:
           `git-super: ${viaRemote.length} submodule(s) would open their own network connection after warm-up ` +
-          `(limit ${maxRemoteFallbacks}); refusing.\n${detail}\n` +
-          `Repair the reference store, then retry:\n` +
-          misses
-            .map(({ reference, required }) => `  git -C ${reference} fetch --no-tags origin ${required}`)
-            .join("\n") +
-          `\nRaise --max-remote-fallbacks only with a reason; one connection per submodule across several ` +
-          `candidates is what made GitHub refuse SSH from this host on 2026-08-21.\n`,
+          `(limit ${maxRemoteFallbacks}); refusing.\n${detail}\n${detachmentRemedy}${repairRemedy}`,
       }
     }
     const update = async ({
