@@ -30,35 +30,6 @@
     "./submodule-origin": "./src/submodule-origin.ts",
     "./worktree": "./src/worktree.ts"
   },
-  "scripts": {
-    "test": "bunx --bun vitest run",
-    "typecheck": "tsc --noEmit",
-    "lint": "oxlint src tests",
-    "format": "oxfmt --check .",
-    "fix": "oxfmt --write . && oxlint --fix src tests",
-    "check": "bun run test && bun run typecheck && bun run lint && bun run format",
-    "build": "tsdown"
-  },
-  "dependencies": {
-    "@bearly/flock": "0.1.0",
-    "@silvery/command": "0.23.2",
-    "@silvery/commander": "0.23.2",
-    "loggily": "^0.10.2",
-    "react": "19.2.0",
-    "silvery": "0.23.2"
-  },
-  "devDependencies": {
-    "@types/bun": "^1.3.14",
-    "@types/react": "19.2.0",
-    "oxfmt": "0.38.0",
-    "oxlint": "1.71.0",
-    "typescript": "^6.0.3",
-    "vitest": "^4.1.10",
-    "tsdown": "^0.15.7"
-  },
-  "engines": {
-    "bun": ">=1.3.13"
-  },
   "publishConfig": {
     "access": "public",
     "exports": {
@@ -116,7 +87,35 @@
       }
     }
   },
+  "scripts": {
+    "test": "bunx --bun vitest run",
+    "typecheck": "tsc --noEmit",
+    "lint": "oxlint src tests",
+    "format": "oxfmt --check .",
+    "fix": "oxfmt --write . && oxlint --fix src tests",
+    "check": "bun run test && bun run typecheck && bun run lint && bun run format",
+    "build": "tsdown"
+  },
+  "dependencies": {
+    "@bearly/flock": "0.1.0",
+    "@silvery/command": "0.23.2",
+    "@silvery/commander": "0.23.2",
+    "loggily": "^0.10.2",
+    "react": "19.2.0",
+    "silvery": "0.23.2"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14",
+    "@types/react": "19.2.0",
+    "oxfmt": "0.38.0",
+    "oxlint": "1.71.0",
+    "tsdown": "^0.15.7",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.10"
+  },
   "tsdown": {
+    "clean": true,
+    "dts": true,
     "entry": [
       "src/index.ts",
       "src/composition.ts",
@@ -132,8 +131,9 @@
       "src/submodule-origin.ts",
       "src/worktree.ts"
     ],
-    "format": "esm",
-    "dts": true,
-    "clean": true
+    "format": "esm"
+  },
+  "engines": {
+    "bun": ">=1.3.13"
   }
 }
