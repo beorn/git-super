@@ -37,11 +37,6 @@ export type SubmoduleCompositionPlan =
 
 export type SubmoduleCompositionGitRequest = GitProcessRequest & Readonly<{ env: NodeJS.ProcessEnv; timeoutMs: number }>
 
-export type SubmoduleCompositionGitResult = GitProcessResult
-
-/** @deprecated Use GitProcess from git-super/process. */
-export type SubmoduleCompositionGit = GitProcess
-
 export type SubmoduleReviewedBlob = Readonly<{ path: string; oid: string; content: string }>
 
 export type SubmoduleExecutedResolution =
@@ -62,7 +57,7 @@ export type SubmoduleCompositionExecution =
 
 export type SubmoduleCompositionExecutionOptions = Readonly<{
   inject: Readonly<{
-    git: SubmoduleCompositionGit
+    git: GitProcess
     storeForOrigin(origin: string): string
   }>
   commit: Readonly<{
@@ -143,7 +138,7 @@ export async function composeSubmoduleCommits(
 }
 
 type GitContext = Readonly<{
-  git: SubmoduleCompositionGit
+  git: GitProcess
   env: NodeJS.ProcessEnv
   signal?: AbortSignal
   timeoutMs: number
@@ -240,7 +235,7 @@ async function runGit(
   repo: string,
   args: readonly string[],
   options: Readonly<{ stdin?: string; env?: NodeJS.ProcessEnv }> = {},
-): Promise<SubmoduleCompositionGitResult> {
+): Promise<GitProcessResult> {
   return context.git.run({
     repo,
     args,
@@ -263,7 +258,7 @@ async function requiredGit(
   return options.trim === false ? result.stdout : result.stdout.trim()
 }
 
-function settled(result: SubmoduleCompositionGitResult): boolean {
+function settled(result: GitProcessResult): boolean {
   return (
     result.failure === undefined &&
     result.timedOut !== true &&
@@ -272,7 +267,7 @@ function settled(result: SubmoduleCompositionGitResult): boolean {
   )
 }
 
-function gitDetail(result: SubmoduleCompositionGitResult): string {
+function gitDetail(result: GitProcessResult): string {
   const output = result.stderr.trim() || result.stdout.trim() || `git exited ${result.code}`
   if (result.failure !== undefined) return `${result.failure}: ${output}`
   if (result.stalled) return `git stalled: ${output}`

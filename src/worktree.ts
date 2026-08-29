@@ -5,7 +5,7 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path"
 import { fileURLToPath } from "node:url"
 import { createExclusive } from "./exclusive.ts"
 import { cleanGitEnvironment } from "./git.ts"
-import { createLocalGitProcess, type GitProcess } from "./process.ts"
+import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
 import { materializeSubmodulesWithProcess } from "./submodules.ts"
 
 export type GitResult = Readonly<{ code: number; stdout: string; stderr: string }>
@@ -83,13 +83,37 @@ export function runLocalGitWorktreeMutationSync(request: LocalGitWorktreeMutatio
   }
 }
 
-function createGit(
+/**
+ * The one Git VIEW: ergonomics over the one transport, and the only place
+ * allowed to hold them. Exported so no caller has to hand-roll a rival — six
+ * independently-declared git surfaces is how this codebase learned that a
+ * private convenience wrapper is just a transport with a smaller blast radius.
+ */
+export function createGit(
   process: GitProcess,
   environment: NodeJS.ProcessEnv,
   operationTimeoutMs: number,
   signal?: AbortSignal,
 ) {
   const env = cleanGitEnvironment(environment)
+  /**
+   * Why the call did not SETTLE, or undefined when git actually answered.
+   *
+   * "git exited non-zero" is an answer. "git never finished" is not, and the
+   * two must never collapse into one another — that collapse is what turns a
+   * stalled repository into a clean-looking result.
+   *
+   * A timeout NAMES ITS BOUND, and a generic transport `failure` string must
+   * not mask it: "timed out" without the limit that produced it sends the
+   * reader hunting for a hang that was in fact a configured ceiling, and seven
+   * suites across four packages assert the `timed out after <n>ms` shape.
+   */
+  const unsettledReason = (result: GitProcessResult, timeoutMs: number): string | undefined => {
+    if (result.stalled === true) return "stalled"
+    if (result.timedOut === true) return `timed out after ${String(timeoutMs)}ms`
+    return result.failure ?? result.signal ?? undefined
+  }
+
   const run = async (
     repo: string,
     args: readonly string[],
@@ -97,18 +121,8 @@ function createGit(
     timeoutMs = operationTimeoutMs,
   ): Promise<GitResult> => {
     const result = await process.run({ repo, args, env, ...(signal === undefined ? {} : { signal }), timeoutMs })
-    // A timeout NAMES ITS BOUND, and a generic transport `failure` string must
-    // not mask it. "timed out" without the limit that produced it sends the
-    // reader hunting for a hang that was in fact a configured ceiling, and
-    // seven suites across four packages assert the `timed out after <n>ms`
-    // shape — this path was the one that dropped it.
-    const unsettled =
-      result.stalled === true
-        ? "stalled"
-        : result.timedOut === true
-          ? `timed out after ${String(timeoutMs)}ms`
-          : (result.failure ?? result.signal)
-    if (unsettled !== undefined && unsettled !== null) {
+    const unsettled = unsettledReason(result, timeoutMs)
+    if (unsettled !== undefined) {
       const message = `git ${args.join(" ")} ${unsettled} in ${repo}`
       if (!allowFailure) throw new Error(message)
       return { code: result.code === 0 ? 1 : result.code, stdout: result.stdout, stderr: result.stderr || message }
@@ -129,8 +143,42 @@ function createGit(
     return result
   }
   const commit = async (repo: string, ref: string): Promise<string> =>
-    (await run(repo, ["rev-parse", "--verify", `${ref}^{commit}`])).stdout.trim()
-  return Object.freeze({ run, mutateConfig, commit })
+    text(repo, ["rev-parse", "--verify", `${ref}^{commit}`])
+
+  /**
+   * Read a VALUE out of git: trimmed stdout, throwing when git says no.
+   *
+   * The trim belongs to the CALL, not to a whole Git surface. Hoisting it to
+   * the surface is what produced two "identical" `{code, stdout, stderr}`
+   * transports that silently disagreed — one of them feeding a sha straight
+   * into `reset --hard`, where a trailing newline breaks the reset. Ask for
+   * `text` when you want a sha or a config value; ask for `run` when you want
+   * a payload (a diff, a porcelain status) that must survive verbatim.
+   */
+  const text = async (repo: string, args: readonly string[], timeoutMs?: number): Promise<string> =>
+    (await run(repo, args, false, timeoutMs)).stdout.trim()
+
+  /**
+   * Same, but a non-zero exit yields undefined instead of throwing — for the
+   * questions where "cannot answer" is a real answer rather than a fault (an
+   * unreadable submodule object, a ref that is simply absent).
+   */
+  const optionalText = async (
+    repo: string,
+    args: readonly string[],
+    timeoutMs = operationTimeoutMs,
+  ): Promise<string | undefined> => {
+    const result = await process.run({ repo, args, env, ...(signal === undefined ? {} : { signal }), timeoutMs })
+    // A TIMEOUT IS NOT AN ANSWER, so it stays fatal here. Mapping every
+    // non-zero outcome to undefined would conflate "no such ref" with "the
+    // repository is unreachable" and with "git never finished asking",
+    // quietly downgrading a stalled repository into a clean-looking sweep.
+    const unsettled = unsettledReason(result, timeoutMs)
+    if (unsettled !== undefined) throw new Error(`git ${args.join(" ")} ${unsettled} in ${repo}`)
+    return result.code === 0 ? result.stdout.trim() : undefined
+  }
+
+  return Object.freeze({ run, mutateConfig, commit, text, optionalText })
 }
 
 async function localConfig(git: Git, repo: string, key: string): Promise<string | undefined> {
