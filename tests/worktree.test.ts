@@ -13,6 +13,7 @@ import {
   createGitWorktreeStore,
   createLocalGitWorktreeStore,
   runLocalGitWorktreeMutationSync,
+  type GitWorktreeStoreOptions,
 } from "../src/worktree.ts"
 import type { GitProcessRequest } from "../src/process.ts"
 
@@ -44,15 +45,14 @@ describe("createGitWorktreeStore", () => {
     }
   })
 
-  it("requires exactly one injected Git execution capability", () => {
-    expect(() => createGitWorktreeStore({ repo: "/repo" })).toThrow(/requires one injected GitProcess/iu)
-    expect(() =>
-      createGitWorktreeStore({
-        repo: "/repo",
-        process: { run: async () => ({ exitCode: 0, stdout: "", stderr: "", timedOut: false }) },
-        git: { run: async () => ({ code: 0, stdout: "", stderr: "" }) },
-      }),
-    ).toThrow(/exactly one injected Git process capability/iu)
+  it("refuses to build without the one injected Git capability", () => {
+    // A JavaScript caller can still omit it, so this run-time refusal stays.
+    // What is GONE is the companion assertion that TWO capabilities are
+    // rejected: the options type now carries exactly one capability field, so
+    // "two were supplied" is unrepresentable rather than merely detected.
+    expect(() => createGitWorktreeStore({ repo: "/repo" } as unknown as GitWorktreeStoreOptions)).toThrow(
+      /requires one injected GitProcess/iu,
+    )
   })
 
   it("lets pool policy reset a slot branch at an explicit base", async () => {
@@ -60,10 +60,10 @@ describe("createGitWorktreeStore", () => {
     const calls: Array<{ repo: string; args: readonly string[] }> = []
     const store = createGitWorktreeStore({
       repo,
-      git: {
-        run: async (cwd, args) => {
-          calls.push({ repo: cwd, args })
-          if (args[0] === "rev-parse") return { code: 0, stdout: `${join(repo, ".git")}\n`, stderr: "" }
+      gitProcess: {
+        run: async (request) => {
+          calls.push({ repo: request.repo, args: request.args })
+          if (request.args[0] === "rev-parse") return { code: 0, stdout: `${join(repo, ".git")}\n`, stderr: "" }
           return { code: 0, stdout: "", stderr: "" }
         },
       },
