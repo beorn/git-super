@@ -9,6 +9,7 @@ import { spawnSync } from "node:child_process"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { describe, expect, it } from "vitest"
+import { acquireExclusive } from "../src/exclusive.ts"
 import {
   createGitWorktreeStore,
   createLocalGitWorktreeStore,
@@ -32,6 +33,9 @@ describe("createGitWorktreeStore", () => {
       gitProcess: {
         async run(request) {
           requests.push(request)
+          if (request.args.includes("extensions.worktreeConfig")) {
+            return { code: 1, stdout: "", stderr: "", timedOut: false }
+          }
           return { code: 0, stdout: `${join(repo, ".git")}\n`, stderr: "", timedOut: false }
         },
       },
@@ -39,8 +43,44 @@ describe("createGitWorktreeStore", () => {
 
     try {
       await store.ready()
-      expect(requests[0]).toMatchObject({ repo, args: ["rev-parse", "--path-format=absolute", "--git-common-dir"] })
+      expect(requests.map(({ repo: requestRepo, args }) => ({ repo: requestRepo, args }))).toEqual([
+        { repo, args: ["config", "--local", "--get", "--type=bool", "extensions.worktreeConfig"] },
+        { repo, args: ["rev-parse", "--path-format=absolute", "--git-common-dir"] },
+      ])
     } finally {
+      await rm(repo, { recursive: true, force: true })
+    }
+  })
+
+  it("checks the heal guards before locking and still takes the lock when repair is required", async () => {
+    const repo = await mkdtemp(join(tmpdir(), "git-super-config-heal-lock-"))
+    const commonDir = join(repo, ".git")
+    const lockDirectory = join(commonDir, "yrd-worktree-mutations")
+    const requests: GitProcessRequest[] = []
+    const held = await acquireExclusive(lockDirectory, { timeoutMs: 0 }, "outer mutation")
+    const store = createGitWorktreeStore({
+      repo,
+      timeouts: { mutationLock: 0 },
+      gitProcess: {
+        async run(request) {
+          requests.push(request)
+          if (request.args.includes("extensions.worktreeConfig") || request.args.includes("core.bare")) {
+            return { code: 0, stdout: "true\n", stderr: "", timedOut: false }
+          }
+          return { code: 0, stdout: `${commonDir}\n`, stderr: "", timedOut: false }
+        },
+      },
+    })
+
+    try {
+      await expect(store.ready()).rejects.toThrow(/holder=outer mutation.*operation=worktree configuration repair/iu)
+      expect(requests.map(({ args }) => args)).toEqual([
+        ["config", "--local", "--get", "--type=bool", "extensions.worktreeConfig"],
+        ["config", "--local", "--get", "--type=bool", "core.bare"],
+        ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+      ])
+    } finally {
+      held.release()
       await rm(repo, { recursive: true, force: true })
     }
   })

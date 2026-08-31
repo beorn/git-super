@@ -11,6 +11,7 @@ import { advanceRepository, canonicalTmpdir as tmpdir, createRepository, git } f
 
 const roots: string[] = []
 const gitSuperBin = fileURLToPath(new URL("../bin/git-super", import.meta.url))
+const gitWorktreeModule = new URL("../src/worktree.ts", import.meta.url).href
 
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
@@ -545,6 +546,30 @@ describe("explicit recursive push mechanics", () => {
     } finally {
       held.release()
     }
+  })
+
+  test("lets a receiver hook initialize the same repository when worktree config healing is a no-op", async () => {
+    const { repository, remote, source } = pushFixture("receiver-worktree-ready")
+    git(repository, "config", "extensions.worktreeConfig", "true")
+    const hook = join(remote, "hooks", "pre-receive")
+    writeFileSync(
+      hook,
+      [
+        "#!/usr/bin/env bun",
+        `import { createLocalGitWorktreeStore } from ${JSON.stringify(gitWorktreeModule)}`,
+        `await createLocalGitWorktreeStore({ repo: ${JSON.stringify(repository)}, timeouts: { mutationLock: 25 } }).ready()`,
+        "",
+      ].join("\n"),
+    )
+    chmodSync(hook, 0o755)
+
+    const result = await pushRefUpdates({
+      root: repository,
+      updates: [update(repository, remote, source, { state: "missing" })],
+    })
+
+    expect(result, JSON.stringify(result, null, 2)).toMatchObject({ state: "updated", partial: false })
+    expect(git(remote, "rev-parse", "refs/heads/main")).toBe(source)
   })
 
   test("deduplicates identical rows and rejects conflicting destinations before any write", async () => {

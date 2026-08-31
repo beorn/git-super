@@ -241,8 +241,13 @@ async function prepareWorktreeConfig(git: Git, repo: string, required: boolean):
 }
 
 async function healPoisonedWorktreeConfig(git: Git, repo: string): Promise<void> {
-  if ((await localBool(git, repo, "extensions.worktreeConfig")) !== true) return
+  if (!(await poisonedWorktreeConfigNeedsHealing(git, repo))) return
   await relocateSharedBare(git, repo)
+}
+
+async function poisonedWorktreeConfigNeedsHealing(git: Git, repo: string): Promise<boolean> {
+  if ((await localBool(git, repo, "extensions.worktreeConfig")) !== true) return false
+  return (await localBool(git, repo, "core.bare")) === true
 }
 
 async function ignoreInRepositoryRoot(git: Git, repo: string, root: string): Promise<void> {
@@ -278,12 +283,15 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
   let mutations: Promise<ReturnType<typeof createExclusive>> | undefined
   const mutationLock = (): Promise<ReturnType<typeof createExclusive>> => {
     mutations ??= (async () => {
+      const needsConfigHealing = await poisonedWorktreeConfigNeedsHealing(git, repo)
       const commonDir = (await git.run(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"])).stdout.trim()
       if (commonDir === "") throw new Error("git rev-parse returned an empty common directory")
       const lock = createExclusive(join(commonDir, "yrd-worktree-mutations"), {
         timeoutMs: timeouts.mutationLock,
       })
-      await lock.run(() => healPoisonedWorktreeConfig(git, repo), { holder: "worktree configuration repair" })
+      if (needsConfigHealing) {
+        await lock.run(() => healPoisonedWorktreeConfig(git, repo), { holder: "worktree configuration repair" })
+      }
       return lock
     })()
     return mutations
