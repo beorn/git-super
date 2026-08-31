@@ -14,6 +14,7 @@ import {
   materializeSubmodules,
   materializeSubmodulesWithProcess,
   materializeSubmodulesFromLocalWorktree,
+  materializeSubmodulesFromLocalWorktreeParallel,
   type SubmoduleGit,
   type SubmoduleGitResult,
 } from "../src/submodules.ts"
@@ -107,6 +108,47 @@ afterEach(async () => {
 })
 
 describe("materializeSubmodules", () => {
+  it("creates a worktree after deleting a gitlink and reports its stale local config once", async () => {
+    const fixtureRoot = await mkdtemp(join(tmpdir(), "git-super-stale-config-"))
+    roots.push(fixtureRoot)
+    const dependency = join(fixtureRoot, "dependency")
+    const owner = join(fixtureRoot, "owner")
+    const candidate = join(fixtureRoot, "candidate")
+    await mkdir(dependency)
+    await mkdir(owner)
+    for (const repository of [dependency, owner]) {
+      git(repository, ["init", "-q"])
+      git(repository, ["config", "user.email", "git-super@example.invalid"])
+      git(repository, ["config", "user.name", "Git Super Test"])
+      writeFileSync(join(repository, "README.md"), `${repository}\n`)
+      git(repository, ["add", "README.md"])
+      git(repository, ["commit", "-q", "-m", "initial"])
+    }
+    git(owner, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", dependency, "hh-web"])
+    git(owner, ["commit", "-q", "-am", "add hh-web"])
+    git(owner, ["rm", "-q", "-f", "hh-web"])
+    git(owner, ["commit", "-q", "-am", "delete hh-web"])
+
+    // Reproduce the estate residue: the target tree no longer declares the
+    // gitlink, while multiple keys keep one stale local subsection alive.
+    git(owner, ["config", "--local", "submodule.hh-web.url", dependency])
+    git(owner, ["config", "--local", "submodule.hh-web.active", "true"])
+    git(owner, ["worktree", "add", "-q", "--detach", candidate, "HEAD"])
+    const messages: string[] = []
+
+    const result = await materializeSubmodulesFromLocalWorktreeParallel({
+      worktree: candidate,
+      referenceWorktree: owner,
+      log: capturingLogger(messages),
+    })
+
+    expect(result).toMatchObject({ exitCode: 0, considered: 0 })
+    expect(git(candidate, ["rev-parse", "HEAD"])).toBe(git(owner, ["rev-parse", "HEAD"]))
+    const cleanup = messages.filter((message) => message.includes("--remove-section"))
+    expect(cleanup).toHaveLength(1)
+    expect(cleanup[0]).toContain(`git -C '${candidate}' config --local --remove-section 'submodule.hh-web'`)
+  })
+
   it("uses the canonical GitProcess request internally", async () => {
     const requests: GitProcessRequest[] = []
     const result = await materializeSubmodulesWithProcess(

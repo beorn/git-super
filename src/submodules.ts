@@ -156,6 +156,48 @@ async function submodules(git: SubmoduleGit, repo: string): Promise<Submodule[] 
     .filter((submodule): submodule is Submodule => submodule !== undefined)
 }
 
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", `'\\''`)}'`
+}
+
+/**
+ * Report local config that the target tree deliberately does not declare.
+ *
+ * This is a diagnostic comparison, never an enumeration source: only the
+ * entries parsed from `HEAD:.gitmodules` above reach init/update. A removed
+ * gitlink can therefore leave any number of keys in one local subsection
+ * without resurrecting the path or blocking worktree creation. The subsection
+ * is reported once with the exact optional cleanup command.
+ */
+async function reportStaleLocalSubmoduleConfig(
+  git: SubmoduleGit,
+  repo: string,
+  declared: readonly Submodule[],
+  log?: ConditionalLogger,
+): Promise<SubmoduleGitResult> {
+  const configured = await git.run(
+    repo,
+    ["config", "--local", "--name-only", "--get-regexp", "^submodule\\..*\\."],
+    true,
+  )
+  if (configured.code === 1 && configured.stdout === "" && configured.stderr === "") return success()
+  if (configured.code !== 0) return configured
+  const declaredNames = new Set(declared.map(({ name }) => name))
+  const staleNames = new Set<string>()
+  for (const key of configured.stdout.split(/\r?\n/u)) {
+    const name = /^submodule\.(.+)\.[^.]+$/u.exec(key)?.[1]
+    if (name !== undefined && !declaredNames.has(name)) staleNames.add(name)
+  }
+  for (const name of [...staleNames].sort()) {
+    const section = `submodule.${name}`
+    const cleanup = `git -C ${shellQuote(repo)} config --local --remove-section ${shellQuote(section)}`
+    log?.warn?.(`target tree ignores stale local submodule config; optional cleanup: ${cleanup}`, {
+      section,
+    })
+  }
+  return success()
+}
+
 const GITLINK_ROW = /^160000 commit ([0-9a-f]+)\t/mu
 
 async function requiredGitlink(git: SubmoduleGit, repo: string, path: string): Promise<string | undefined> {
@@ -440,6 +482,10 @@ export async function materializeSubmodules(
 
     const entries = await submodules(git, worktree)
     if (!Array.isArray(entries)) return entries
+    if (depth === 0) {
+      const staleConfig = await reportStaleLocalSubmoduleConfig(git, worktree, entries, log)
+      if (staleConfig.code !== 0) return staleConfig
+    }
     // A LEVEL WITH NO SUBMODULES HAS NOTHING TO TIME, and emitting a span for it
     // buries the ones that carry signal. Measured 2026-08-22 on a full 17-gitlink
     // run: 17 of 18 `walk` spans were leaves, every lap zero except `enumerate`.
