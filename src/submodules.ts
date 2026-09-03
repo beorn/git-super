@@ -935,6 +935,11 @@ export async function materializeSubmodulesFromLocalWorktreeParallel(
     ...(referenceWorktree === undefined ? {} : { referenceWorktree }),
     ...(options.paths === undefined ? {} : { paths: options.paths }),
     ...(options.log === undefined ? {} : { log: options.log }),
+    // Forwarded, not defaulted. This adapter accepted `maxRemoteFallbacks` in
+    // its type and dropped it on the floor, so a caller that raised the bound
+    // got the zero default and a refusal it had explicitly opted out of — the
+    // option was documented, type-checked, and inert.
+    ...(options.maxRemoteFallbacks === undefined ? {} : { maxRemoteFallbacks: options.maxRemoteFallbacks }),
   })
   return { ...result, exitCode: result.code }
 }

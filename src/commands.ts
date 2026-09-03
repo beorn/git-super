@@ -12,6 +12,7 @@ import { superPull, type SuperPullOptions } from "./pull.ts"
 import { superPush, type SuperPushOptions } from "./push.ts"
 import type { GitSuperResult } from "./result.ts"
 import { superStatus, type SuperStatusResult } from "./status.ts"
+import { superWorktreeAdd, type SuperWorktreeAddOptions } from "./worktree-add.ts"
 
 export type CommandContext = Readonly<{ repo: string }>
 export type DiffParams = Omit<SuperDiffOptions, "repo">
@@ -20,6 +21,7 @@ export type MergeBaseParams = Omit<SuperIsAncestorOptions, "repo">
 export type PullParams = Omit<SuperPullOptions, "repo" | "git" | "exclusive">
 export type PushParams = Omit<SuperPushOptions, "repo" | "git" | "exclusive">
 export type GitlinkWriteParams = Omit<WriteGitlinkOptions, "repo" | "git">
+export type WorktreeAddParams = Omit<SuperWorktreeAddOptions, "repo" | "env" | "log">
 
 function params<T>(parse: (value: unknown) => T, missing?: (value: unknown) => string[]): ParseParamSchema<T> {
   return { parse, ...(missing === undefined ? {} : { missing }) }
@@ -146,6 +148,32 @@ const gitlinkWrite = commandNode<CommandContext, GitlinkWriteParams, GitSuperRes
   run: (context, input) => writeGitlink({ repo: context.repo, ...input }),
 })
 
+const worktreeAdd = commandNode<CommandContext, WorktreeAddParams, GitSuperResult>({
+  title: "Add a worktree with its submodules",
+  description: "Create a detached worktree and materialize every gitlink the selected commit records.",
+  params: params(
+    (value) => {
+      const input = record(value)
+      if (typeof input.path !== "string" || typeof input.commit !== "string") {
+        throw new Error("path and commit must be strings")
+      }
+      if (input.reference !== undefined && typeof input.reference !== "string") {
+        throw new Error("reference must be a string")
+      }
+      return {
+        path: input.path,
+        commit: input.commit,
+        ...(input.reference === undefined ? {} : { reference: input.reference }),
+      }
+    },
+    (value) => {
+      const input = typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {}
+      return ["path", "commit"].filter((name) => typeof input[name] !== "string")
+    },
+  ),
+  run: (context, input) => superWorktreeAdd({ repo: context.repo, ...input }),
+})
+
 export type GitSuperCommands = Readonly<{
   diff: CommandNode<CommandContext, DiffParams, SuperDiffResult>
   status: CommandNode<CommandContext, StatusParams, SuperStatusResult>
@@ -154,6 +182,9 @@ export type GitSuperCommands = Readonly<{
   push: CommandNode<CommandContext, PushParams, GitSuperResult>
   gitlink: Readonly<{
     write: CommandNode<CommandContext, GitlinkWriteParams, GitSuperResult>
+  }>
+  worktree: Readonly<{
+    add: CommandNode<CommandContext, WorktreeAddParams, GitSuperResult>
   }>
 }>
 
@@ -164,4 +195,5 @@ export const commands = defineCommandNodes({
   pull,
   push,
   gitlink: { write: gitlinkWrite },
+  worktree: { add: worktreeAdd },
 }) satisfies CommandNodeTree<CommandContext> as GitSuperCommands

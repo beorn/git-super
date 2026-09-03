@@ -23,6 +23,7 @@ git super merge-base --is-ancestor <sha> <superproject-ref>
 git super gitlink write <path> <commit>
 git super pull --ff-only [<repository> [<refspec>...]]
 git super push [--recurse-submodules=check|on-demand|only|no] [<remote> [<refspec>...]]
+git super worktree add <path> <commit> [--reference <path>]
 ```
 
 `diff` accepts `--diff-filter`, `--cached`, and `-z`. `status` includes tracked and untracked changes in checked-out submodules. `merge-base --is-ancestor` discovers which repository owns the first commit and compares it with that repository's pin in the selected superproject ref.
@@ -78,6 +79,26 @@ Unrelated staged, tracked, untracked, and ignored files survive. A path the inco
 
 Hooks, credential helpers, and remote helpers stay native Git behavior. A timeout, a rejected hook, an unreachable remote, an unreadable response, or a post-write check that disagrees is never turned into an empty or successful result. Selecting no refs at all is an input error with an explanation, not a silent success. Push is covered by `tests/push.test.ts`.
 
+### Worktree with submodules
+
+`worktree add <path> <commit>` creates a detached worktree and materializes every gitlink at the pins that commit records. It is one program for the whole operation, because `git worktree add` alone leaves every submodule an empty directory and the recursive checkout that fills them is where callers reimplement borrowing, fallback limits, and rollback slightly differently each time.
+
+Gitlinks borrow their objects from `--reference` when it is given and from the repository the command stands in otherwise. A pin the reference's stores lack is fetched from the submodule's own remote rather than refused: this is the one caller for which an unbounded fallback is correct, since a commit whose submodules the reference has never seen is exactly what it exists to check out.
+
+**Either the worktree stands complete or it does not stand.** Any failure after `git worktree add` already succeeded removes the worktree again and exits nonzero with the reason, so a half-materialized tree is never left behind. When the removal itself fails the result is `unknown` rather than `failed`, names the surviving path, and gives the exact command that clears it — that is a different situation from a clean rollback and must not read like one.
+
+A commit that records no `.gitmodules` is not an error. The command is then exactly `git worktree add`, and the report line says so.
+
+The report line goes to stderr and names the path, the resolved commit, the ref that was asked for when it differs, and the split:
+
+```
+worktree add /work/candidate at 0123456789abcdef0123456789abcdef01234567 (main): 3 gitlinks (2 borrowed, 1 fetched, 0 absent)
+```
+
+`borrowed + fetched + absent` always equals the number of gitlinks considered. **Borrowed** were already present in the reference's stores; **fetched** had to come over the network, whether into the reference or straight from the submodule's remote; **absent** had no reference store offered for them at all. Counting a pin that only became borrowable after a fetch as borrowed would report `0 fetched` for a run that went to the network for every single pin, so it does not.
+
+`--json` emits one stable `GitSuperResult` carrying the path, the requested and resolved commits, and those counts. Success exits `0` and every failure exits nonzero; `git super worktree` with an unknown subcommand exits `2` with usage.
+
 ## Try it
 
 The package name is reserved; this first source release is not yet on npm. Clone it, install its public dependencies, and put its executable on `PATH` for one command:
@@ -108,6 +129,8 @@ bun run typecheck
 - `src/gitlink.ts` is the update-only index-pin writer. It validates the existing gitlink and target commit, writes under the shared mutation lock, and never checks out or chooses a target.
 - `src/process.ts` is the public injected Git process capability. `src/result.ts` owns the shared repository/ref result vocabulary and how results aggregate.
 - `src/pull.ts` owns the fetch, freeze, check, recheck, and apply fast-forward operation.
+- `src/worktree-add.ts` composes the two write services: one detached `git worktree add` plus one recursive
+  materialization, joined by the rollback that keeps them a single outcome.
 - `src/push.ts` plans exact ref updates, proves recursive commit availability, and applies explicit per-ref leases child-first and root-last. It exposes transport mechanics and no submission, promotion, or retry policy.
 - `src/commands.ts` exposes a platform-neutral command tree from the published `@silvery/command` package; every CLI request passes through `resolveInvocation()`.
 - `src/report.tsx` renders the fail-loud repository witness.

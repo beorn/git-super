@@ -9,6 +9,7 @@ import {
   type PullParams,
   type PushParams,
   type StatusParams,
+  type WorktreeAddParams,
 } from "./commands.ts"
 import type { ConsultedRepository, SuperDiffResult } from "./diff.ts"
 import type { SuperIsAncestorResult } from "./merge-base.ts"
@@ -29,6 +30,7 @@ type CapturedInvocation =
   | Readonly<{ node: typeof commands.pull; params: PullParams; json: boolean; nul: boolean }>
   | Readonly<{ node: typeof commands.push; params: PushParams; json: boolean; nul: boolean }>
   | Readonly<{ node: typeof commands.gitlink.write; params: GitlinkWriteParams; json: boolean; nul: boolean }>
+  | Readonly<{ node: typeof commands.worktree.add; params: WorktreeAddParams; json: boolean; nul: boolean }>
 
 function stableValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(stableValue)
@@ -74,6 +76,7 @@ function commandResult(
 
 export async function runCli(argv: readonly string[], stdout: OutputSink, stderr: OutputSink): Promise<number> {
   let captured: CapturedInvocation | undefined
+  let usage: string | undefined
   const program = new CliCommand("git super")
     .description("Git commands that treat superprojects and submodule interiors as one product")
     .option("--repo <path>", "repository to inspect", ".")
@@ -168,6 +171,44 @@ export async function runCli(argv: readonly string[], stdout: OutputSink, stderr
       }
     })
 
+  const worktree = program
+    .command("worktree")
+    .description("Create worktrees that carry a superproject's submodules")
+    // An action handler on the PARENT, so an unknown subcommand reaches this
+    // handler instead of Commander's own `unknown command` exit. A bare
+    // `worktree` and a misspelled subcommand are the same mistake, and they now
+    // get one usage line and one exit code rather than Commander's 1 beside
+    // git-super's 2. The excess operand is allowed only so it can be NAMED in
+    // the refusal; declaring it as an argument instead would advertise a
+    // parameter this command does not have.
+    .allowExcessArguments()
+    .action((_options, command) => {
+      const subcommand = command.args[0]
+      usage =
+        (subcommand === undefined
+          ? "git-super: worktree needs a subcommand\n"
+          : `git-super: unknown worktree subcommand '${subcommand}'\n`) + command.helpInformation()
+    })
+  worktree
+    .command("add")
+    .description(commands.worktree.add.description ?? commands.worktree.add.title)
+    .option("--reference <path>", "repository whose object stores the gitlinks borrow from")
+    .argument("<path>", "path the new detached worktree is created at")
+    .argument("<commit>", "commit the worktree and every recorded gitlink are placed at")
+    .action((path, commit, options, command) => {
+      const globals = command.optsWithGlobals() as { repo: string; json?: boolean }
+      captured = {
+        node: commands.worktree.add,
+        params: {
+          path,
+          commit,
+          ...(typeof options.reference === "string" ? { reference: options.reference } : {}),
+        },
+        json: globals.json === true,
+        nul: false,
+      }
+    })
+
   program
     .command("diff")
     .description(commands.diff.description ?? commands.diff.title)
@@ -222,6 +263,10 @@ export async function runCli(argv: readonly string[], stdout: OutputSink, stderr
     if (error instanceof CommanderError) return error.exitCode
     throw error
   }
+  if (usage !== undefined) {
+    stderr.write(usage.endsWith("\n") ? usage : `${usage}\n`)
+    return 2
+  }
   if (captured === undefined) return 0
 
   const globals = program.opts() as { repo: string }
@@ -255,7 +300,12 @@ export async function runCli(argv: readonly string[], stdout: OutputSink, stderr
   }
 
   if (captured.node === commands["merge-base"] && !(result as SuperIsAncestorResult).isAncestor) return 1
-  if (captured.node === commands.pull || captured.node === commands.push || captured.node === commands.gitlink.write) {
+  if (
+    captured.node === commands.pull ||
+    captured.node === commands.push ||
+    captured.node === commands.gitlink.write ||
+    captured.node === commands.worktree.add
+  ) {
     const operation = result as GitSuperResult
     return operation.state === "updated" || operation.state === "unchanged" ? 0 : 2
   }
