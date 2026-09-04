@@ -3,7 +3,7 @@
  * @level l1
  * @consumer Yrd settled candidate preparation and landing
  */
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, it } from "vitest"
@@ -181,6 +181,92 @@ describe("git super merge", () => {
       `packages/alpha@${newestAlpha}`,
       `vendor/beta@${newestBeta}`,
     ])
+  })
+
+  it("writes one complete settled merge while queue-owned verification bypasses every repository hook", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-one-settled-commit-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const newestAlpha = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
+    const newestBeta = advanceRepository(fixture.beta, "beta.ts", "export const beta = 2\n")
+    const candidate = candidateWithRootChange(fixture, "candidate-one-settled-commit")
+    const hookLog = join(fixtureRoot, "observed-hooks.log")
+    for (const hook of ["pre-merge-commit", "pre-commit", "commit-msg"]) {
+      const path = join(fixture.product, ".git", "hooks", hook)
+      writeFileSync(path, `#!/bin/sh\nprintf '%s\\n' '${hook}' >> '${hookLog}'\nexit 1\n`)
+      chmodSync(path, 0o755)
+    }
+    const local = createLocalGitProcess()
+    const commands: string[][] = []
+
+    const result = await superMerge({
+      repo: fixture.product,
+      commit: candidate,
+      message: "merge once\n\nChange: task/once@1234567",
+      noVerify: true,
+      git: {
+        run: async (request) => {
+          commands.push([...request.args])
+          return local.run(request)
+        },
+      },
+    })
+
+    expect(result).toMatchObject({ state: "updated", partial: false })
+    expect(existsSync(hookLog)).toBe(false)
+    expect(commands.filter(([command]) => command === "merge")).toEqual([
+      expect.arrayContaining(["merge", "--no-ff", "--no-commit", "--no-verify", candidate]),
+    ])
+    expect(commands.filter(([command]) => command === "commit")).toEqual([
+      expect.arrayContaining(["commit", "--no-verify", "-F", "-"]),
+    ])
+    expect(commands.flat()).not.toContain("--amend")
+    const merged = git(fixture.product, "rev-parse", "HEAD")
+    expect(result.commit).toBe(merged)
+    expect(git(fixture.product, "rev-list", "--parents", "-n", "1", merged).split(" ")).toHaveLength(3)
+    expect(git(fixture.product, "show", "-s", "--format=%B", merged)).toContain(
+      `Settled: packages/alpha@${newestAlpha}`,
+    )
+    expect(git(fixture.product, "show", "-s", "--format=%B", merged)).toContain(
+      `Settled: vendor/beta@${newestBeta}`,
+    )
+  })
+
+  it("refuses an uncomposable Settled report before writing a merge", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-settlement-refusal-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
+    const candidate = candidateWithRootChange(fixture, "candidate-settlement-refusal")
+    const headBefore = git(fixture.product, "rev-parse", "HEAD")
+    const statusBefore = git(fixture.product, "status", "--porcelain=v1")
+    const local = createLocalGitProcess()
+
+    const result = await superMerge({
+      repo: fixture.product,
+      commit: candidate,
+      message: "merge whose report cannot be composed",
+      noVerify: true,
+      git: {
+        run: (request) =>
+          request.args[0] === "interpret-trailers"
+            ? Promise.resolve({ code: 1, stdout: "", stderr: "injected trailer composition refusal" })
+            : local.run(request),
+      },
+    })
+
+    expect(result).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: {
+        code: "settlement-message-failed",
+        phase: "compose-settlement-report",
+        message: expect.stringContaining("injected trailer composition refusal"),
+      },
+    })
+    expect(result.commit).toBeUndefined()
+    expect(git(fixture.product, "rev-parse", "HEAD")).toBe(headBefore)
+    expect(git(fixture.product, "status", "--porcelain=v1")).toBe(statusBefore)
   })
 
   it("checks out every raised component so the settled worktree matches HEAD", async () => {
