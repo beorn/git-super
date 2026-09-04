@@ -150,6 +150,88 @@ describe("git super merge", () => {
     expect(git(raised.product, "show", "-s", "--format=%B", "HEAD")).toContain(`Settled: packages/alpha@${newestAlpha}`)
   })
 
+  it("preserves the queue record trailer block when it adds Settled trailers", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-trailers-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const newestAlpha = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
+    const newestBeta = advanceRepository(fixture.beta, "beta.ts", "export const beta = 2\n")
+    const candidate = candidateWithRootChange(fixture, "candidate-trailers")
+    const stdout = outputSink()
+    const stderr = outputSink()
+
+    expect(
+      await runCli(
+        [
+          "--repo",
+          fixture.product,
+          "merge",
+          candidate,
+          "-m",
+          "merge with queue record\n\nChange: task/example@1234567\nMerged-By: yrd queue main",
+        ],
+        stdout,
+        stderr,
+      ),
+    ).toBe(0)
+
+    expect(git(fixture.product, "log", "-1", "--format=%(trailers:key=Change,valueonly)")).toBe("task/example@1234567")
+    expect(git(fixture.product, "log", "-1", "--format=%(trailers:key=Merged-By,valueonly)")).toBe("yrd queue main")
+    expect(git(fixture.product, "log", "-1", "--format=%(trailers:key=Settled,valueonly)").split("\n")).toEqual([
+      `packages/alpha@${newestAlpha}`,
+      `vendor/beta@${newestBeta}`,
+    ])
+  })
+
+  it("checks out every raised component so the settled worktree matches HEAD", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-checkouts-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const newestAlpha = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
+    const candidate = candidateWithRootChange(fixture, "candidate-checkouts")
+    const stdout = outputSink()
+    const stderr = outputSink()
+
+    expect(await runCli(["--repo", fixture.product, "merge", candidate], stdout, stderr)).toBe(0)
+
+    expect(git(join(fixture.product, "packages/alpha"), "rev-parse", "HEAD")).toBe(newestAlpha)
+    expect(git(fixture.product, "status", "--porcelain=v1")).toBe("")
+  })
+
+  it("returns a named partial with the recovery command when a raised checkout cannot settle", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-checkout-failure-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const component = join(fixture.product, "packages/alpha")
+    const newestAlpha = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
+    const candidate = candidateWithRootChange(fixture, "candidate-checkout-failure")
+    const local = createLocalGitProcess()
+
+    const result = await superMerge({
+      repo: fixture.product,
+      commit: candidate,
+      git: {
+        run: (request) =>
+          request.repo === component && request.args[0] === "checkout"
+            ? Promise.resolve({ code: 1, stdout: "", stderr: "injected checkout failure" })
+            : local.run(request),
+      },
+    })
+
+    expect(result).toMatchObject({
+      state: "failed",
+      partial: true,
+      detail: {
+        code: "component-checkout-failed",
+        phase: "settle-component-checkout",
+        paths: ["packages/alpha"],
+        next: `git -C ${fixture.product} submodule update --init -- packages/alpha`,
+      },
+      gitlinks: [{ path: "packages/alpha", from: fixture.alphaBase, to: newestAlpha, state: "raised" }],
+    })
+    expect(result.commit).toBe(git(fixture.product, "rev-parse", "HEAD"))
+  })
+
   it("returns a merge commit with no gitlink rows when every pin is already newest", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-newest-"))
     roots.push(fixtureRoot)

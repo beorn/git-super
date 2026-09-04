@@ -244,12 +244,32 @@ async function mergeUnderLock(
         ? `Settled: ${plan.path}@${plan.to}`
         : `Settled: ${plan.path}@${plan.from} left-off-main component-main@${plan.to}`,
     )
+    const trailerArgs = ["interpret-trailers", ...trailers.flatMap((trailer) => ["--trailer", trailer])]
+    const trailerResult = await run(git, root, trailerArgs, timeoutMs, messageResult.stdout)
+    if (trailerResult.code !== 0) {
+      return partial(
+        root,
+        mergeCommit,
+        completed,
+        resultDetailFromGit(
+          "merge-trailers-failed",
+          "compose-settlement-report",
+          root,
+          trailerArgs,
+          trailerResult,
+          `Merge ${mergeCommit} was written and its gitlinks were updated, but its existing trailer block could not be extended with the Settled report.`,
+          `git -C ${root} show -s --format=%B HEAD`,
+          "Preserve the partial merge and repair its existing trailer block before retrying.",
+          "the caller",
+        ),
+      )
+    }
     const amended = await run(
       git,
       root,
       ["commit", "--amend", ...(options.noVerify === true ? ["--no-verify"] : []), "-F", "-"],
       timeoutMs,
-      `${messageResult.stdout.trimEnd()}\n\n${trailers.join("\n")}\n`,
+      trailerResult.stdout,
     )
     if (amended.code !== 0) {
       return partial(
@@ -289,6 +309,30 @@ async function mergeUnderLock(
       )
     }
     mergeCommit = observedSettled.stdout.trim()
+  }
+
+  for (const raise of raises) {
+    const args = ["checkout", "--detach", raise.to]
+    const checkedOut = await run(git, join(root, raise.path), args, timeoutMs)
+    if (checkedOut.code !== 0) {
+      return partial(
+        root,
+        mergeCommit,
+        completed,
+        resultDetailFromGit(
+          "component-checkout-failed",
+          "settle-component-checkout",
+          join(root, raise.path),
+          args,
+          checkedOut,
+          `Settled merge ${mergeCommit} records ${raise.path} at ${raise.to}, but that component checkout could not be detached at the same commit.`,
+          `git -C ${join(root, raise.path)} rev-parse HEAD`,
+          `git -C ${root} submodule update --init -- ${raise.path}`,
+          "the caller",
+          { paths: [raise.path], objectIds: [raise.to] },
+        ),
+      )
+    }
   }
 
   return {
