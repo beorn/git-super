@@ -7,6 +7,7 @@ import {
 } from "@silvery/command"
 import { superDiff, type SuperDiffOptions, type SuperDiffResult } from "./diff.ts"
 import { writeGitlink, type WriteGitlinkOptions } from "./gitlink.ts"
+import { superMerge, type SuperMergeOptions, type SuperMergeResult } from "./merge.ts"
 import { superIsAncestor, type SuperIsAncestorOptions, type SuperIsAncestorResult } from "./merge-base.ts"
 import { superPull, type SuperPullOptions } from "./pull.ts"
 import { superPush, type SuperPushOptions } from "./push.ts"
@@ -18,6 +19,7 @@ export type CommandContext = Readonly<{ repo: string }>
 export type DiffParams = Omit<SuperDiffOptions, "repo">
 export type StatusParams = Record<string, never>
 export type MergeBaseParams = Omit<SuperIsAncestorOptions, "repo">
+export type MergeParams = Omit<SuperMergeOptions, "repo" | "git" | "exclusive">
 export type PullParams = Omit<SuperPullOptions, "repo" | "git" | "exclusive">
 export type PushParams = Omit<SuperPushOptions, "repo" | "git" | "exclusive">
 export type GitlinkWriteParams = Omit<WriteGitlinkOptions, "repo" | "git">
@@ -80,6 +82,30 @@ const mergeBase = commandNode<CommandContext, MergeBaseParams, SuperIsAncestorRe
     },
   ),
   run: (context, input) => superIsAncestor({ repo: context.repo, ...input }),
+})
+
+const merge = commandNode<CommandContext, MergeParams, SuperMergeResult>({
+  title: "Merge and settle a superproject",
+  description: "Merge one commit and raise its gitlinks to freshly fetched component main commits.",
+  params: params(
+    (value) => {
+      const input = record(value)
+      if (typeof input.commit !== "string") throw new Error("commit must be a string")
+      if (input.message !== undefined && typeof input.message !== "string") {
+        throw new Error("message must be a string")
+      }
+      return {
+        commit: input.commit,
+        ...(input.message === undefined ? {} : { message: input.message }),
+        ...(input.noVerify === true ? { noVerify: true } : {}),
+      }
+    },
+    (value) => {
+      const input = typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {}
+      return typeof input.commit === "string" ? [] : ["commit"]
+    },
+  ),
+  run: (context, input) => superMerge({ repo: context.repo, ...input }),
 })
 
 const pull = commandNode<CommandContext, PullParams, GitSuperResult>({
@@ -178,6 +204,7 @@ export type GitSuperCommands = Readonly<{
   diff: CommandNode<CommandContext, DiffParams, SuperDiffResult>
   status: CommandNode<CommandContext, StatusParams, SuperStatusResult>
   "merge-base": CommandNode<CommandContext, MergeBaseParams, SuperIsAncestorResult>
+  merge: CommandNode<CommandContext, MergeParams, SuperMergeResult>
   pull: CommandNode<CommandContext, PullParams, GitSuperResult>
   push: CommandNode<CommandContext, PushParams, GitSuperResult>
   gitlink: Readonly<{
@@ -192,6 +219,7 @@ export const commands = defineCommandNodes({
   diff,
   status,
   "merge-base": mergeBase,
+  merge,
   pull,
   push,
   gitlink: { write: gitlinkWrite },

@@ -6,6 +6,7 @@ import {
   type DiffParams,
   type GitlinkWriteParams,
   type MergeBaseParams,
+  type MergeParams,
   type PullParams,
   type PushParams,
   type StatusParams,
@@ -13,6 +14,7 @@ import {
 } from "./commands.ts"
 import type { ConsultedRepository, SuperDiffResult } from "./diff.ts"
 import type { SuperIsAncestorResult } from "./merge-base.ts"
+import type { SuperMergeResult } from "./merge.ts"
 import type { GitSuperResult } from "./result.ts"
 import { renderConsultedRepositories } from "./report.tsx"
 import type { SuperStatusResult } from "./status.ts"
@@ -27,6 +29,7 @@ type CapturedInvocation =
   | Readonly<{ node: typeof commands.diff; params: DiffParams; json: boolean; nul: boolean }>
   | Readonly<{ node: typeof commands.status; params: StatusParams; json: boolean; nul: boolean }>
   | Readonly<{ node: (typeof commands)["merge-base"]; params: MergeBaseParams; json: boolean; nul: boolean }>
+  | Readonly<{ node: typeof commands.merge; params: MergeParams; json: boolean; nul: boolean }>
   | Readonly<{ node: typeof commands.pull; params: PullParams; json: boolean; nul: boolean }>
   | Readonly<{ node: typeof commands.push; params: PushParams; json: boolean; nul: boolean }>
   | Readonly<{ node: typeof commands.gitlink.write; params: GitlinkWriteParams; json: boolean; nul: boolean }>
@@ -60,12 +63,12 @@ function commandResult(
   node: CapturedInvocation["node"],
   context: CommandContext,
   params: CapturedInvocation["params"],
-): Promise<SuperDiffResult | SuperStatusResult | SuperIsAncestorResult | GitSuperResult> {
+): Promise<SuperDiffResult | SuperStatusResult | SuperIsAncestorResult | SuperMergeResult | GitSuperResult> {
   const invocation = resolveInvocation(
     node as CommandNode<
       CommandContext,
       CapturedInvocation["params"],
-      SuperDiffResult | SuperStatusResult | SuperIsAncestorResult | GitSuperResult
+      SuperDiffResult | SuperStatusResult | SuperIsAncestorResult | SuperMergeResult | GitSuperResult
     >,
     context,
     params,
@@ -85,6 +88,26 @@ export async function runCli(argv: readonly string[], stdout: OutputSink, stderr
     .configureOutput({
       writeOut: (value) => stdout.write(value),
       writeErr: (value) => stderr.write(value),
+    })
+
+  program
+    .command("merge")
+    .description(commands.merge.description ?? commands.merge.title)
+    .option("-m, --message <message>", "merge commit message")
+    .option("--no-verify", "bypass ordinary merge and commit hooks")
+    .argument("<commit>", "commit to merge into the current branch")
+    .action((commit, options, command) => {
+      const globals = command.optsWithGlobals() as { repo: string; json?: boolean }
+      captured = {
+        node: commands.merge,
+        params: {
+          commit,
+          ...(typeof options.message === "string" ? { message: options.message } : {}),
+          ...(options.verify === false ? { noVerify: true } : {}),
+        },
+        json: globals.json === true,
+        nul: false,
+      }
     })
 
   program
@@ -270,7 +293,7 @@ export async function runCli(argv: readonly string[], stdout: OutputSink, stderr
   if (captured === undefined) return 0
 
   const globals = program.opts() as { repo: string }
-  let result: SuperDiffResult | SuperStatusResult | SuperIsAncestorResult | GitSuperResult
+  let result: SuperDiffResult | SuperStatusResult | SuperIsAncestorResult | SuperMergeResult | GitSuperResult
   try {
     result = await commandResult(captured.node, { repo: globals.repo }, captured.params)
   } catch (error) {
@@ -293,6 +316,19 @@ export async function runCli(argv: readonly string[], stdout: OutputSink, stderr
     await writeReport(status.consultedRepositories, stderr)
   } else if (captured.node === commands["merge-base"]) {
     await writeReport((result as SuperIsAncestorResult).consultedRepositories, stderr)
+  } else if (captured.node === commands.merge) {
+    const merge = result as SuperMergeResult
+    if (merge.commit !== undefined) stdout.write(`${merge.commit}\n`)
+    for (const gitlink of merge.gitlinks) {
+      stderr.write(
+        gitlink.state === "raised"
+          ? `${gitlink.path} ${gitlink.from.slice(0, 7)} -> ${gitlink.to.slice(0, 7)} (component main)\n`
+          : gitlink.state === "left-off-main"
+            ? `left-off-main ${gitlink.path} ${gitlink.from} (component main ${gitlink.to})\n`
+            : `not-run ${gitlink.path} ${gitlink.from} -> ${gitlink.to} (component main)\n`,
+      )
+    }
+    if (merge.detail !== undefined) stderr.write(`${merge.detail.message}\n`)
   } else {
     const pull = result as GitSuperResult
     stdout.write(`${pull.state}\n`)
@@ -300,6 +336,11 @@ export async function runCli(argv: readonly string[], stdout: OutputSink, stderr
   }
 
   if (captured.node === commands["merge-base"] && !(result as SuperIsAncestorResult).isAncestor) return 1
+  if (captured.node === commands.merge) {
+    const merge = result as SuperMergeResult
+    if (merge.state === "updated" || merge.state === "unchanged") return 0
+    return merge.partial ? 2 : 1
+  }
   if (
     captured.node === commands.pull ||
     captured.node === commands.push ||

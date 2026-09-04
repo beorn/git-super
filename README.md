@@ -20,6 +20,7 @@ Git has display flags for submodule diffs, but no native flag that turns gitlink
 git super diff --name-only <range>
 git super status --porcelain
 git super merge-base --is-ancestor <sha> <superproject-ref>
+git super merge <commit> [-m <message>] [--no-verify]
 git super gitlink write <path> <commit>
 git super pull --ff-only [<repository> [<refspec>...]]
 git super push [--recurse-submodules=check|on-demand|only|no] [<remote> [<refspec>...]]
@@ -47,6 +48,14 @@ Normal path or porcelain output stays on stdout. A rendered report of the reposi
 ```
 
 Missing checkouts, missing commit objects, added or removed gitlinks without a resolvable commit range, and ambiguous commit ownership all fail loudly. **The tool never turns an unresolved repository boundary into an empty success** — that is the failure it exists to prevent, so it may not commit it itself.
+
+### Merge and settle gitlinks
+
+`merge <commit>` computes the prospective merge tree before writing. A gitlink value authored by that merge must be carried by its component's freshly fetched `origin/main`; otherwise the command exits `1` with `gitlink-off-main` and leaves HEAD, the index, and the worktree unchanged. A pre-existing off-main pin is not attributed to the incoming change, so it is left untouched and reported as `left-off-main` with both object IDs.
+
+After the no-ff merge, every merged-index pin proven ancestral to and behind component main is raised to that fetched main commit. Each raise is printed on stderr as `<path> <old7> -> <new7> (component main)`, and every raise or retained off-main anomaly is recorded as a `Settled:` trailer on the merge commit. Equal pins remain unchanged; divergent pins are never overwritten.
+
+Human output puts the resulting merge commit on stdout and settlement evidence on stderr. `--json` emits one byte-clean `SuperMergeResult` with the same commit and gitlink rows. A failure before the merge exits `1` and writes nothing; a failure after Git created the merge exits `2` with `partial: true`, the merge commit, completed rows, and every `not-run` row. A repository with no submodules or nothing to raise still returns the real merge commit plus an empty gitlink-row set.
 
 ### Exact gitlink write
 
@@ -127,6 +136,7 @@ bun run typecheck
 - `src/commit-graph.ts` is the strict, read-only parser for gitlinks recorded in an exact commit. Pull and push share it rather than reading `.gitmodules` independently.
 - `src/objects.ts` is the exact-commit presence and fetch primitive shared by graph consumers.
 - `src/gitlink.ts` is the update-only index-pin writer. It validates the existing gitlink and target commit, writes under the shared mutation lock, and never checks out or chooses a target.
+- `src/merge.ts` preflights one no-ff merge, fetches component main refs, refuses incoming off-main pins, and settles proven-behind pins while preserving partial-write evidence.
 - `src/process.ts` is the public injected Git process capability. `src/result.ts` owns the shared repository/ref result vocabulary and how results aggregate.
 - `src/pull.ts` owns the fetch, freeze, check, recheck, and apply fast-forward operation.
 - `src/worktree-add.ts` composes the two write services: one detached `git worktree add` plus one recursive

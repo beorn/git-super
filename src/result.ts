@@ -15,6 +15,10 @@ export type GitResultDetail = Readonly<{
   code: string
   phase: string
   message: string
+  subject?: string
+  evidence?: string
+  next?: string
+  owner?: string
   paths?: readonly string[]
   objectIds?: readonly string[]
   remedy?: string
