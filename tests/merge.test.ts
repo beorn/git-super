@@ -3,7 +3,7 @@
  * @level l1
  * @consumer Yrd settled candidate preparation and landing
  */
-import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, it } from "vitest"
@@ -183,19 +183,13 @@ describe("git super merge", () => {
     ])
   })
 
-  it("writes one complete settled merge while queue-owned verification bypasses every repository hook", async () => {
+  it("writes the complete Settled report in one merge commit", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-one-settled-commit-"))
     roots.push(fixtureRoot)
     const fixture = createProductFixture(fixtureRoot)
     const newestAlpha = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
     const newestBeta = advanceRepository(fixture.beta, "beta.ts", "export const beta = 2\n")
     const candidate = candidateWithRootChange(fixture, "candidate-one-settled-commit")
-    const hookLog = join(fixtureRoot, "observed-hooks.log")
-    for (const hook of ["pre-merge-commit", "pre-commit", "commit-msg"]) {
-      const path = join(fixture.product, ".git", "hooks", hook)
-      writeFileSync(path, `#!/bin/sh\nprintf '%s\\n' '${hook}' >> '${hookLog}'\nexit 1\n`)
-      chmodSync(path, 0o755)
-    }
     const local = createLocalGitProcess()
     const commands: string[][] = []
 
@@ -203,7 +197,6 @@ describe("git super merge", () => {
       repo: fixture.product,
       commit: candidate,
       message: "merge once\n\nChange: task/once@1234567",
-      noVerify: true,
       git: {
         run: async (request) => {
           commands.push([...request.args])
@@ -213,12 +206,11 @@ describe("git super merge", () => {
     })
 
     expect(result).toMatchObject({ state: "updated", partial: false })
-    expect(existsSync(hookLog)).toBe(false)
     expect(commands.filter(([command]) => command === "merge")).toEqual([
-      expect.arrayContaining(["merge", "--no-ff", "--no-commit", "--no-verify", candidate]),
+      expect.arrayContaining(["merge", "--no-ff", "--no-commit", candidate]),
     ])
     expect(commands.filter(([command]) => command === "commit")).toEqual([
-      expect.arrayContaining(["commit", "--no-verify", "-F", "-"]),
+      expect.arrayContaining(["commit", "-F", "-"]),
     ])
     expect(commands.flat()).not.toContain("--amend")
     const merged = git(fixture.product, "rev-parse", "HEAD")
