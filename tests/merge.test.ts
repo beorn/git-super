@@ -282,6 +282,29 @@ describe("git super merge", () => {
     expect(git(fixture.product, "status", "--porcelain=v1")).toBe("")
   })
 
+  it("checks out an on-main gitlink moved by the candidate so the settled worktree matches HEAD", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-candidate-gitlink-checkout-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const component = join(fixture.product, "packages/alpha")
+    const newestAlpha = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
+    git(fixture.product, "switch", "-q", "-c", "candidate-gitlink")
+    git(component, "fetch", "-q", "origin")
+    git(component, "checkout", "-q", newestAlpha)
+    git(fixture.product, "add", "packages/alpha")
+    git(fixture.product, "commit", "-q", "-m", "advance alpha to component main")
+    const candidate = git(fixture.product, "rev-parse", "HEAD")
+    git(fixture.product, "switch", "-q", "main")
+    git(component, "checkout", "-q", fixture.alphaBase)
+
+    const result = await superMerge({ repo: fixture.product, commit: candidate, noVerify: true })
+
+    expect(result).toMatchObject({ state: "updated", partial: false })
+    expect(git(fixture.product, "ls-tree", "HEAD", "packages/alpha")).toContain(newestAlpha)
+    expect(git(component, "rev-parse", "HEAD")).toBe(newestAlpha)
+    expect(git(fixture.product, "status", "--porcelain=v1")).toBe("")
+  })
+
   it("returns a named partial with the recovery command when a raised checkout cannot settle", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-checkout-failure-"))
     roots.push(fixtureRoot)

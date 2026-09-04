@@ -35,6 +35,11 @@ type GitlinkPlan = Readonly<{
   changedByMerge: boolean
 }>
 
+type GitlinkPlans = Readonly<{
+  settlements: readonly GitlinkPlan[]
+  checkouts: readonly Readonly<{ path: string; to: string }>[]
+}>
+
 const DEFAULT_GIT_TIMEOUT_MS = 30_000
 const OBJECT_ID = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/u
 
@@ -131,12 +136,13 @@ async function mergeUnderLock(
   const prospective = await prospectiveTree(git, root, head, target, timeoutMs)
   if ("failure" in prospective) return failed(root, [], prospective.failure)
 
-  let plans: readonly GitlinkPlan[]
+  let planned: GitlinkPlans
   try {
-    plans = await planGitlinks(git, root, head, prospective.tree, timeoutMs)
+    planned = await planGitlinks(git, root, head, prospective.tree, timeoutMs)
   } catch (error) {
     return failed(root, [], resultError(error, "inspect-gitlinks"))
   }
+  const plans = planned.settlements
   const refusal = plans.find((plan) => plan.state === "left-off-main" && plan.changedByMerge)
   if (refusal !== undefined) {
     return failed(
@@ -262,9 +268,9 @@ async function mergeUnderLock(
   }
   const mergeCommit = observedSettled.stdout.trim()
 
-  for (const raise of raises) {
-    const args = ["checkout", "--detach", raise.to]
-    const checkedOut = await run(git, join(root, raise.path), args, timeoutMs)
+  for (const checkout of planned.checkouts) {
+    const args = ["checkout", "--detach", checkout.to]
+    const checkedOut = await run(git, join(root, checkout.path), args, timeoutMs)
     if (checkedOut.code !== 0) {
       return partial(
         root,
@@ -273,14 +279,14 @@ async function mergeUnderLock(
         resultDetailFromGit(
           "component-checkout-failed",
           "settle-component-checkout",
-          join(root, raise.path),
+          join(root, checkout.path),
           args,
           checkedOut,
-          `Settled merge ${mergeCommit} records ${raise.path} at ${raise.to}, but that component checkout could not be detached at the same commit.`,
-          `git -C ${join(root, raise.path)} rev-parse HEAD`,
-          `git -C ${root} submodule update --init -- ${raise.path}`,
+          `Settled merge ${mergeCommit} records ${checkout.path} at ${checkout.to}, but that component checkout could not be detached at the same commit.`,
+          `git -C ${join(root, checkout.path)} rev-parse HEAD`,
+          `git -C ${root} submodule update --init -- ${checkout.path}`,
           "the caller",
-          { paths: [raise.path], objectIds: [raise.to] },
+          { paths: [checkout.path], objectIds: [checkout.to] },
         ),
       )
     }
@@ -340,33 +346,39 @@ async function planGitlinks(
   head: string,
   tree: string,
   timeoutMs: number,
-): Promise<readonly GitlinkPlan[]> {
+): Promise<GitlinkPlans> {
   const before = new Map((await readCommitSubmodules(git, root, head)).map((entry) => [entry.path, entry.target]))
   const merged = await readCommitSubmodules(git, root, tree)
   const plans: GitlinkPlan[] = []
+  const checkouts = new Map<string, string>()
   for (const entry of merged) {
     const component = join(root, entry.path)
     const main = await fetchComponentMain(git, component, entry.path, entry.target, timeoutMs)
-    if (entry.target === main) continue
+    const changedByMerge = before.get(entry.path) !== entry.target
+    if (entry.target === main) {
+      if (changedByMerge) checkouts.set(entry.path, entry.target)
+      continue
+    }
     const ancestry = await run(git, component, ["merge-base", "--is-ancestor", entry.target, main], timeoutMs)
     if (ancestry.code === 0) {
+      checkouts.set(entry.path, main)
       plans.push({
         path: entry.path,
         from: entry.target,
         to: main,
         state: "raised",
-        changedByMerge: before.get(entry.path) !== entry.target,
+        changedByMerge,
       })
       continue
     }
-    const changed = before.get(entry.path) !== entry.target
     if (ancestry.code === 1) {
+      if (changedByMerge) checkouts.set(entry.path, entry.target)
       plans.push({
         path: entry.path,
         from: entry.target,
         to: main,
         state: "left-off-main",
-        changedByMerge: changed,
+        changedByMerge,
       })
       continue
     }
@@ -377,7 +389,7 @@ async function planGitlinks(
       ancestry,
     )
   }
-  return plans
+  return { settlements: plans, checkouts: [...checkouts].map(([path, to]) => ({ path, to })) }
 }
 
 async function mergeApplicationFailure(
