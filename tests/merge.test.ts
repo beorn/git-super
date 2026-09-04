@@ -3,7 +3,7 @@
  * @level l1
  * @consumer Yrd settled candidate preparation and landing
  */
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, it } from "vitest"
@@ -274,6 +274,140 @@ describe("git super merge", () => {
     expect(git(fixture.product, "status", "--porcelain=v1")).toBe("")
   })
 
+  it("accepts a clean component already at the staged pin without checking it out again", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-pre-settled-checkout-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const component = join(fixture.product, "packages/alpha")
+    const newestAlpha = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
+    const candidate = candidateWithRootChange(fixture, "candidate-pre-settled-checkout")
+    git(component, "fetch", "-q", "origin")
+    git(component, "checkout", "-q", "--detach", newestAlpha)
+    const local = createLocalGitProcess()
+    const componentCheckouts: string[][] = []
+
+    const result = await superMerge({
+      repo: fixture.product,
+      commit: candidate,
+      git: {
+        run: async (request) => {
+          if (request.repo === component && request.args[0] === "checkout") {
+            componentCheckouts.push([...request.args])
+          }
+          return local.run(request)
+        },
+      },
+    })
+
+    expect(result).toMatchObject({
+      state: "updated",
+      partial: false,
+      checkouts: [
+        {
+          path: "packages/alpha",
+          recorded: fixture.alphaBase,
+          index: newestAlpha,
+          preCheckout: newestAlpha,
+          checkout: newestAlpha,
+          state: "settled",
+        },
+      ],
+    })
+    expect(componentCheckouts).toEqual([])
+    expect(git(fixture.product, "ls-tree", "HEAD", "packages/alpha")).toContain(newestAlpha)
+    expect(git(component, "rev-parse", "HEAD")).toBe(newestAlpha)
+    expect(git(fixture.product, "status", "--porcelain=v1")).toBe("")
+  })
+
+  it("refuses content changes inside a component already at the staged pin", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-dirty-pre-settled-checkout-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const component = join(fixture.product, "packages/alpha")
+    const newestAlpha = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
+    const candidate = candidateWithRootChange(fixture, "candidate-dirty-pre-settled-checkout")
+    git(component, "fetch", "-q", "origin")
+    git(component, "checkout", "-q", "--detach", newestAlpha)
+    writeFileSync(join(component, "alpha.ts"), "export const alpha = 'uncommitted'\n")
+    const headBefore = git(fixture.product, "rev-parse", "HEAD")
+    const indexBefore = git(fixture.product, "write-tree")
+    const mergeHead = join(fixture.product, ".git", "MERGE_HEAD")
+    const local = createLocalGitProcess()
+    const rootStatus = await local.run({
+      repo: fixture.product,
+      args: ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    })
+
+    expect(rootStatus).toMatchObject({ code: 0, stdout: " M packages/alpha\0" })
+    expect(existsSync(mergeHead)).toBe(false)
+    const result = await superMerge({ repo: fixture.product, commit: candidate })
+
+    expect(result).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: { code: "dirty-worktree" },
+      checkouts: [
+        {
+          path: "packages/alpha",
+          recorded: fixture.alphaBase,
+          index: newestAlpha,
+          preCheckout: newestAlpha,
+          checkout: newestAlpha,
+          state: "settled",
+        },
+      ],
+    })
+    expect(git(fixture.product, "rev-parse", "HEAD")).toBe(headBefore)
+    expect(git(fixture.product, "write-tree")).toBe(indexBefore)
+    expect(existsSync(mergeHead)).toBe(false)
+    expect(git(component, "rev-parse", "HEAD")).toBe(newestAlpha)
+    expect(git(component, "diff", "--", "alpha.ts")).toContain("uncommitted")
+  })
+
+  it("refuses unrelated component checkout drift before touching HEAD, index, or MERGE_HEAD", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-checkout-drift-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const component = join(fixture.product, "packages/alpha")
+    const newestAlpha = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
+    const candidate = candidateWithRootChange(fixture, "candidate-checkout-drift")
+    writeFileSync(join(component, "drift.ts"), "export const drift = true\n")
+    git(component, "add", "drift.ts")
+    git(component, "commit", "-q", "-m", "unrelated local checkout drift")
+    const unrelated = git(component, "rev-parse", "HEAD")
+    const headBefore = git(fixture.product, "rev-parse", "HEAD")
+    const indexBefore = git(fixture.product, "write-tree")
+    const mergeHead = join(fixture.product, ".git", "MERGE_HEAD")
+    const stdout = outputSink()
+    const stderr = outputSink()
+    expect(existsSync(mergeHead)).toBe(false)
+
+    const code = await runCli(["--repo", fixture.product, "--json", "merge", candidate], stdout, stderr)
+    const result = JSON.parse(stdout.output)
+
+    expect(code).toBe(1)
+    expect(stderr.output).toBe("")
+    expect(result).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: { code: "component-checkout-drift" },
+      checkouts: [
+        {
+          path: "packages/alpha",
+          recorded: fixture.alphaBase,
+          index: newestAlpha,
+          preCheckout: unrelated,
+          checkout: unrelated,
+          state: "not-run",
+        },
+      ],
+    })
+    expect(git(fixture.product, "rev-parse", "HEAD")).toBe(headBefore)
+    expect(git(fixture.product, "write-tree")).toBe(indexBefore)
+    expect(existsSync(mergeHead)).toBe(false)
+    expect(git(component, "rev-parse", "HEAD")).toBe(unrelated)
+  })
+
   it("checks out staged gitlink pins before the concluding commit hook", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-hook-coherence-"))
     roots.push(fixtureRoot)
@@ -307,7 +441,7 @@ describe("git super merge", () => {
     expect(git(fixture.product, "status", "--porcelain=v1")).toBe("")
   })
 
-  it("restores exact pre-checkout pins when the concluding commit is rejected", async () => {
+  it("restores every settled checkout to its root-recorded pin when the concluding commit is rejected", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-commit-rollback-"))
     roots.push(fixtureRoot)
     const fixture = createProductFixture(fixtureRoot)
@@ -316,6 +450,8 @@ describe("git super merge", () => {
     const newestAlpha = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
     const newestBeta = advanceRepository(fixture.beta, "beta.ts", "export const beta = 2\n")
     const candidate = candidateWithRootChange(fixture, "candidate-commit-rollback")
+    git(component, "fetch", "-q", "origin")
+    git(component, "checkout", "-q", "--detach", newestAlpha)
     const headBefore = git(fixture.product, "rev-parse", "HEAD")
     const hook = join(fixture.product, ".git", "hooks", "pre-commit")
     writeFileSync(hook, "#!/bin/sh\necho commit-policy-refused >&2\nexit 23\n")
@@ -335,7 +471,7 @@ describe("git super merge", () => {
           path: "packages/alpha",
           recorded: fixture.alphaBase,
           index: newestAlpha,
-          preCheckout: fixture.alphaBase,
+          preCheckout: newestAlpha,
           checkout: fixture.alphaBase,
           state: "restored",
         },
@@ -357,6 +493,53 @@ describe("git super merge", () => {
     expect(git(fixture.product, "rev-parse", "MERGE_HEAD")).toBe(candidate)
     expect(git(fixture.product, "ls-files", "--stage", "--", "packages/alpha")).toContain(newestAlpha)
     expect(git(fixture.product, "ls-files", "--stage", "--", "vendor/beta")).toContain(newestBeta)
+  })
+
+  it("preserves the observed merge when commit writes HEAD but reports failure", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-commit-reported-failure-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const component = join(fixture.product, "packages/alpha")
+    const newestAlpha = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
+    const candidate = candidateWithRootChange(fixture, "candidate-commit-reported-failure")
+    const headBefore = git(fixture.product, "rev-parse", "HEAD")
+    const local = createLocalGitProcess()
+
+    const result = await superMerge({
+      repo: fixture.product,
+      commit: candidate,
+      git: {
+        run: async (request) => {
+          const observed = await local.run(request)
+          return request.repo === fixture.product && request.args[0] === "commit" && observed.code === 0
+            ? { ...observed, code: 23, stderr: "injected failure after commit wrote HEAD" }
+            : observed
+        },
+      },
+    })
+
+    const merged = git(fixture.product, "rev-parse", "HEAD")
+    expect(result).toMatchObject({
+      state: "failed",
+      partial: true,
+      commit: merged,
+      detail: {
+        code: "settled-merge-commit-reported-failed",
+        objectIds: [headBefore, merged],
+      },
+      checkouts: [
+        {
+          path: "packages/alpha",
+          recorded: fixture.alphaBase,
+          index: newestAlpha,
+          preCheckout: fixture.alphaBase,
+          checkout: newestAlpha,
+          state: "settled",
+        },
+      ],
+    })
+    expect(git(fixture.product, "rev-list", "--parents", "-n", "1", merged).split(" ")).toHaveLength(3)
+    expect(git(component, "rev-parse", "HEAD")).toBe(newestAlpha)
   })
 
   it("renders recorded, staged-index, checkout, and pre-checkout pins for a partial merge", async () => {
@@ -502,6 +685,65 @@ describe("git super merge", () => {
     })
     expect(result.commit).toBeUndefined()
     expect(git(fixture.product, "rev-parse", "HEAD")).toBe(headBefore)
+    expect(git(component, "rev-parse", "HEAD")).toBe(fixture.alphaBase)
+  })
+
+  it("restores a checkout when its staged-pin settlement cannot be observed", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-settlement-observation-failure-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const component = join(fixture.product, "packages/alpha")
+    const newestAlpha = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
+    const candidate = candidateWithRootChange(fixture, "candidate-settlement-observation-failure")
+    const headBefore = git(fixture.product, "rev-parse", "HEAD")
+    const local = createLocalGitProcess()
+    let settling = false
+
+    const result = await superMerge({
+      repo: fixture.product,
+      commit: candidate,
+      git: {
+        run: async (request) => {
+          const observed = await local.run(request)
+          if (
+            request.repo === component &&
+            request.args[0] === "checkout" &&
+            request.args.at(-1) === newestAlpha &&
+            observed.code === 0
+          ) {
+            settling = true
+            return observed
+          }
+          if (settling && request.repo === component && request.args.join(" ") === "rev-parse HEAD^{commit}") {
+            settling = false
+            return { code: 0, stdout: `${fixture.betaBase}\n`, stderr: "" }
+          }
+          return observed
+        },
+      },
+    })
+
+    expect(result).toMatchObject({
+      state: "failed",
+      partial: true,
+      detail: {
+        code: "component-checkout-failed",
+        message: expect.stringContaining("checkout observation mismatch"),
+      },
+      checkouts: [
+        {
+          path: "packages/alpha",
+          recorded: fixture.alphaBase,
+          index: newestAlpha,
+          preCheckout: fixture.alphaBase,
+          checkout: fixture.alphaBase,
+          state: "restored",
+        },
+      ],
+    })
+    expect(git(fixture.product, "rev-parse", "HEAD")).toBe(headBefore)
+    expect(git(fixture.product, "rev-parse", "MERGE_HEAD")).toBe(candidate)
+    expect(git(fixture.product, "ls-files", "--stage", "--", "packages/alpha")).toContain(newestAlpha)
     expect(git(component, "rev-parse", "HEAD")).toBe(fixture.alphaBase)
   })
 
