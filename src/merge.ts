@@ -154,38 +154,41 @@ async function mergeUnderLock(
   }
   const visiblePlans = plans.map(({ changedByMerge: _changedByMerge, ...plan }) => plan)
 
-  const mergeArgs = [
-    "merge",
-    "--no-ff",
-    "--no-edit",
-    ...(options.noVerify === true ? ["--no-verify"] : []),
-    ...(options.message === undefined ? [] : ["-m", options.message]),
-    target,
-  ]
+  const trailers = visiblePlans.map((plan) =>
+    plan.state === "raised"
+      ? `Settled: ${plan.path}@${plan.to}`
+      : `Settled: ${plan.path}@${plan.from} left-off-main component-main@${plan.to}`,
+  )
+  const requestedMessage = options.message ?? `Merge ${target.slice(0, 12)} into ${head.slice(0, 12)}`
+  let settledMessage = requestedMessage
+  if (trailers.length > 0) {
+    const trailerArgs = ["interpret-trailers", ...trailers.flatMap((trailer) => ["--trailer", trailer])]
+    const trailerResult = await run(git, root, trailerArgs, timeoutMs, requestedMessage)
+    if (trailerResult.code !== 0) {
+      return failed(
+        root,
+        [],
+        resultDetailFromGit(
+          "settlement-message-failed",
+          "compose-settlement-report",
+          root,
+          trailerArgs,
+          trailerResult,
+          `The Settled report for merge ${target} could not be composed before any commit was written.`,
+          `git -C ${root} interpret-trailers`,
+          "Repair the merge message or trailer input, then rerun the same git super merge command.",
+          "the caller",
+        ),
+      )
+    }
+    settledMessage = trailerResult.stdout
+  }
+
+  const mergeArgs = ["merge", "--no-ff", "--no-commit", ...(options.noVerify === true ? ["--no-verify"] : []), target]
   const merged = await run(git, root, mergeArgs, timeoutMs)
   if (merged.code !== 0) {
     return mergeApplicationFailure(git, root, head, target, mergeArgs, merged, timeoutMs)
   }
-  const observedMerge = await run(git, root, ["rev-parse", "HEAD^{commit}"], timeoutMs)
-  if (observedMerge.code !== 0) {
-    return partial(
-      root,
-      undefined,
-      plansAfterUnobservedMerge(visiblePlans),
-      resultDetailFromGit(
-        "post-merge-observation-failed",
-        "observe-merge",
-        root,
-        ["rev-parse", "HEAD^{commit}"],
-        observedMerge,
-        `Git reported that merge ${target} completed, but the resulting HEAD could not be read.`,
-        `git -C ${root} status --short`,
-        "Inspect and preserve the checkout before deciding whether a retry is safe.",
-        "the caller",
-      ),
-    )
-  }
-  let mergeCommit = observedMerge.stdout.trim()
   const completed: SuperMergeGitlinkResult[] = visiblePlans
     .filter((plan) => plan.state === "left-off-main")
     .map((plan) => ({ ...plan }))
@@ -199,7 +202,7 @@ async function mergeUnderLock(
       const notRun = raises.slice(index).map((plan) => ({ ...plan, state: "not-run" as const }))
       return partial(
         root,
-        mergeCommit,
+        undefined,
         [...completed, ...notRun],
         resultDetailFromGit(
           "gitlink-raise-failed",
@@ -207,9 +210,9 @@ async function mergeUnderLock(
           root,
           args,
           written,
-          `Merge ${mergeCommit} was written, but ${raise.path} was not raised from ${raise.from} to ${raise.to}.`,
+          `The prospective merge of ${target} was applied, but ${raise.path} was not raised from ${raise.from} to ${raise.to}.`,
           `git -C ${root} status --short`,
-          "Inspect the named index state and preserve the partial merge before retrying.",
+          "Inspect and preserve the uncommitted merge before deciding whether a retry is safe.",
           "the caller",
           { paths: [raise.path], objectIds: [raise.from, raise.to] },
         ),
@@ -218,98 +221,46 @@ async function mergeUnderLock(
     completed.push({ ...raise })
   }
 
-  if (visiblePlans.length > 0) {
-    const messageArgs = ["show", "-s", "--format=%B", "HEAD"]
-    const messageResult = await run(git, root, messageArgs, timeoutMs)
-    if (messageResult.code !== 0) {
-      return partial(
-        root,
-        mergeCommit,
-        completed,
-        resultDetailFromGit(
-          "merge-message-unreadable",
-          "read-merge-message",
-          root,
-          messageArgs,
-          messageResult,
-          `Merge ${mergeCommit} was written and its gitlinks were updated, but its message could not be read for the Settled report.`,
-          `git -C ${root} show -s --format=%B HEAD`,
-          "Preserve the partial merge and inspect its commit message before retrying.",
-          "the caller",
-        ),
-      )
-    }
-    const trailers = visiblePlans.map((plan) =>
-      plan.state === "raised"
-        ? `Settled: ${plan.path}@${plan.to}`
-        : `Settled: ${plan.path}@${plan.from} left-off-main component-main@${plan.to}`,
-    )
-    const trailerArgs = ["interpret-trailers", ...trailers.flatMap((trailer) => ["--trailer", trailer])]
-    const trailerResult = await run(git, root, trailerArgs, timeoutMs, messageResult.stdout)
-    if (trailerResult.code !== 0) {
-      return partial(
-        root,
-        mergeCommit,
-        completed,
-        resultDetailFromGit(
-          "merge-trailers-failed",
-          "compose-settlement-report",
-          root,
-          trailerArgs,
-          trailerResult,
-          `Merge ${mergeCommit} was written and its gitlinks were updated, but its existing trailer block could not be extended with the Settled report.`,
-          `git -C ${root} show -s --format=%B HEAD`,
-          "Preserve the partial merge and repair its existing trailer block before retrying.",
-          "the caller",
-        ),
-      )
-    }
-    const amended = await run(
-      git,
+  const commitArgs = ["commit", ...(options.noVerify === true ? ["--no-verify"] : []), "-F", "-"]
+  const committed = await run(git, root, commitArgs, timeoutMs, settledMessage)
+  if (committed.code !== 0) {
+    return partial(
       root,
-      ["commit", "--amend", ...(options.noVerify === true ? ["--no-verify"] : []), "-F", "-"],
-      timeoutMs,
-      trailerResult.stdout,
+      undefined,
+      completed,
+      resultDetailFromGit(
+        "settled-merge-commit-failed",
+        "write-settled-merge",
+        root,
+        commitArgs,
+        committed,
+        `The prospective merge of ${target} and its Settled report were prepared, but the concluding commit was not written.`,
+        `git -C ${root} status --short`,
+        "Preserve the uncommitted merge and inspect the named Git failure before retrying.",
+        "the caller",
+      ),
     )
-    if (amended.code !== 0) {
-      return partial(
-        root,
-        mergeCommit,
-        completed,
-        resultDetailFromGit(
-          "merge-amend-failed",
-          "record-settlement",
-          root,
-          ["commit", "--amend", "-F", "-"],
-          amended,
-          `Merge ${mergeCommit} was written and its gitlinks were updated, but the Settled report was not committed.`,
-          `git -C ${root} status --short`,
-          "Preserve the partial merge and commit the staged gitlinks with the named Settled trailers.",
-          "the caller",
-        ),
-      )
-    }
-    const observedSettled = await run(git, root, ["rev-parse", "HEAD^{commit}"], timeoutMs)
-    if (observedSettled.code !== 0) {
-      return partial(
-        root,
-        undefined,
-        completed,
-        resultDetailFromGit(
-          "post-amend-observation-failed",
-          "observe-settled-merge",
-          root,
-          ["rev-parse", "HEAD^{commit}"],
-          observedSettled,
-          `Git reported that settlement for merge ${mergeCommit} was committed, but the resulting HEAD could not be read.`,
-          `git -C ${root} status --short`,
-          "Inspect and preserve the checkout before deciding whether a retry is safe.",
-          "the caller",
-        ),
-      )
-    }
-    mergeCommit = observedSettled.stdout.trim()
   }
+  const observedSettled = await run(git, root, ["rev-parse", "HEAD^{commit}"], timeoutMs)
+  if (observedSettled.code !== 0) {
+    return partial(
+      root,
+      undefined,
+      completed,
+      resultDetailFromGit(
+        "post-commit-observation-failed",
+        "observe-settled-merge",
+        root,
+        ["rev-parse", "HEAD^{commit}"],
+        observedSettled,
+        `Git reported that the settled merge of ${target} was committed, but the resulting HEAD could not be read.`,
+        `git -C ${root} status --short`,
+        "Inspect and preserve the checkout before deciding whether a retry is safe.",
+        "the caller",
+      ),
+    )
+  }
+  const mergeCommit = observedSettled.stdout.trim()
 
   for (const raise of raises) {
     const args = ["checkout", "--detach", raise.to]
@@ -501,10 +452,6 @@ function componentMainError(
   )
 }
 
-function plansAfterUnobservedMerge(plans: readonly SuperMergeGitlinkResult[]): SuperMergeGitlinkResult[] {
-  return plans.map((plan) => (plan.state === "raised" ? { ...plan, state: "not-run" } : plan))
-}
-
 function obviousDetail(
   code: string,
   subject: string,
@@ -541,7 +488,7 @@ function resultDetailFromGit(
   const gitMessage = result.timedOut
     ? `git ${args.join(" ")} timed out in ${repository}`
     : `git ${args.join(" ")} failed in ${repository} (exit ${result.code})${result.stderr ? `: ${result.stderr}` : ""}`
-  return obviousDetail(
+  const detail = obviousDetail(
     code,
     subject ?? gitMessage,
     evidence ?? `git -C ${repository} ${args.join(" ")}`,
@@ -549,6 +496,7 @@ function resultDetailFromGit(
     owner ?? "the caller",
     { ...extra, phase },
   )
+  return subject === undefined ? detail : { ...detail, message: `${detail.message}; git: ${gitMessage}` }
 }
 
 function operationError(

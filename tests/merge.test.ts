@@ -227,9 +227,7 @@ describe("git super merge", () => {
     expect(git(fixture.product, "show", "-s", "--format=%B", merged)).toContain(
       `Settled: packages/alpha@${newestAlpha}`,
     )
-    expect(git(fixture.product, "show", "-s", "--format=%B", merged)).toContain(
-      `Settled: vendor/beta@${newestBeta}`,
-    )
+    expect(git(fixture.product, "show", "-s", "--format=%B", merged)).toContain(`Settled: vendor/beta@${newestBeta}`)
   })
 
   it("refuses an uncomposable Settled report before writing a merge", async () => {
@@ -481,13 +479,14 @@ describe("git super merge", () => {
     })
   })
 
-  it("returns a named partial with completed and not-run raises after the merge commit", async () => {
+  it("returns a named partial with completed and not-run raises in the uncommitted merge", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-partial-"))
     roots.push(fixtureRoot)
     const fixture = createProductFixture(fixtureRoot)
     advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
     advanceRepository(fixture.beta, "beta.ts", "export const beta = 2\n")
     const candidate = candidateWithRootChange(fixture, "candidate-partial")
+    const headBefore = git(fixture.product, "rev-parse", "HEAD")
     const local = createLocalGitProcess()
     let writes = 0
 
@@ -515,8 +514,9 @@ describe("git super merge", () => {
         { path: "vendor/beta", state: "not-run" },
       ],
     })
-    expect(result.commit).toBe(git(fixture.product, "rev-parse", "HEAD"))
-    expect(git(fixture.product, "rev-list", "--parents", "-n", "1", "HEAD").split(" ")).toHaveLength(3)
+    expect(result.commit).toBeUndefined()
+    expect(git(fixture.product, "rev-parse", "HEAD")).toBe(headBefore)
+    expect(git(fixture.product, "rev-list", "--parents", "-n", "1", "HEAD").split(" ")).toHaveLength(1)
     expect(git(fixture.product, "status", "--porcelain=v1")).toContain("packages/alpha")
   })
 
@@ -553,7 +553,7 @@ describe("git super merge", () => {
     expect(result).toMatchObject({
       state: "failed",
       partial: true,
-      detail: { code: "post-merge-observation-failed", phase: "observe-merge" },
+      detail: { code: "post-commit-observation-failed", phase: "observe-settled-merge" },
       gitlinks: [],
     })
     expect(result.commit).toBeUndefined()
