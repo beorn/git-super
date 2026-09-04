@@ -86,7 +86,7 @@ const mergeBase = commandNode<CommandContext, MergeBaseParams, SuperIsAncestorRe
 
 const merge = commandNode<CommandContext, MergeParams, SuperMergeResult>({
   title: "Merge and settle a superproject",
-  description: "Merge one commit and raise its gitlinks to freshly fetched component main commits.",
+  description: "Merge one commit, stage component-main gitlinks, settle their checkouts, then commit once.",
   params: params(
     (value) => {
       const input = record(value)

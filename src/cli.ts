@@ -94,7 +94,7 @@ export async function runCli(argv: readonly string[], stdout: OutputSink, stderr
     .command("merge")
     .description(commands.merge.description ?? commands.merge.title)
     .option("-m, --message <message>", "merge commit message")
-    .option("--no-verify", "bypass ordinary merge and commit hooks")
+    .option("--no-verify", "emergency only: bypass ordinary merge and commit hooks")
     .argument("<commit>", "commit to merge into the current branch")
     .action((commit, options, command) => {
       const globals = command.optsWithGlobals() as { repo: string; json?: boolean }
@@ -327,6 +327,13 @@ export async function runCli(argv: readonly string[], stdout: OutputSink, stderr
             ? `left-off-main ${gitlink.path} ${gitlink.from} (component main ${gitlink.to})\n`
             : `not-run ${gitlink.path} ${gitlink.from} -> ${gitlink.to} (component main)\n`,
       )
+    }
+    if (merge.partial) {
+      for (const checkout of merge.checkouts ?? []) {
+        stderr.write(
+          `checkout-state ${checkout.path} recorded=${checkout.recorded} staged-index=${checkout.index} checkout=${checkout.checkout ?? "unreadable"} pre-checkout=${checkout.preCheckout} state=${checkout.state}\n`,
+        )
+      }
     }
     if (merge.detail !== undefined) stderr.write(`${merge.detail.message}\n`)
   } else {

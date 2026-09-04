@@ -11,10 +11,21 @@ export type SuperMergeGitlinkResult = Readonly<{
   state: "raised" | "left-off-main" | "not-run"
 }>
 
+export type SuperMergeCheckoutResult = Readonly<{
+  path: string
+  recorded: string
+  index: string
+  preCheckout: string
+  checkout?: string
+  state: "settled" | "restored" | "restore-failed" | "not-run"
+}>
+
 export type SuperMergeResult = GitSuperResult &
   Readonly<{
     commit?: string
     gitlinks: readonly SuperMergeGitlinkResult[]
+    /** Additive recovery evidence for component checkouts touched by a merge. */
+    checkouts?: readonly SuperMergeCheckoutResult[]
   }>
 
 export type SuperMergeOptions = Readonly<{
@@ -37,7 +48,21 @@ type GitlinkPlan = Readonly<{
 
 type GitlinkPlans = Readonly<{
   settlements: readonly GitlinkPlan[]
-  checkouts: readonly Readonly<{ path: string; to: string }>[]
+  checkouts: readonly GitlinkCheckoutPlan[]
+}>
+
+type GitlinkCheckoutPlan = Readonly<{
+  path: string
+  recorded: string
+  index: string
+}>
+
+type PreparedCheckout = GitlinkCheckoutPlan & Readonly<{ preCheckout: string }>
+
+type CheckoutFailure = Readonly<{
+  plan: PreparedCheckout
+  args: readonly string[]
+  result: GitProcessResult
 }>
 
 const DEFAULT_GIT_TIMEOUT_MS = 30_000
@@ -190,6 +215,11 @@ async function mergeUnderLock(
     settledMessage = trailerResult.stdout
   }
 
+  const prepared = await prepareComponentCheckouts(git, root, planned.checkouts, timeoutMs)
+  if ("failure" in prepared) return failed(root, [], prepared.failure)
+  const preparedCheckouts = prepared.checkouts
+  const notRunCheckouts = checkoutResults(preparedCheckouts, "not-run")
+
   const mergeArgs = ["merge", "--no-ff", "--no-commit", ...(options.noVerify === true ? ["--no-verify"] : []), target]
   const merged = await run(git, root, mergeArgs, timeoutMs)
   if (merged.code !== 0) {
@@ -222,29 +252,127 @@ async function mergeUnderLock(
           "the caller",
           { paths: [raise.path], objectIds: [raise.from, raise.to] },
         ),
+        notRunCheckouts,
       )
     }
     completed.push({ ...raise })
   }
 
-  const commitArgs = ["commit", ...(options.noVerify === true ? ["--no-verify"] : []), "-F", "-"]
-  const committed = await run(git, root, commitArgs, timeoutMs, settledMessage)
-  if (committed.code !== 0) {
+  const settledCheckouts = await settleComponentCheckouts(git, root, preparedCheckouts, timeoutMs)
+  if (settledCheckouts.failure !== undefined) {
+    const restored = await restoreComponentCheckouts(
+      git,
+      root,
+      preparedCheckouts,
+      settledCheckouts.rows,
+      settledCheckouts.attempted,
+      timeoutMs,
+    )
+    const failure = restored.failure
+    const evidence = formatCheckoutEvidence(restored.rows)
     return partial(
       root,
       undefined,
       completed,
-      resultDetailFromGit(
-        "settled-merge-commit-failed",
-        "write-settled-merge",
+      failure === undefined
+        ? resultDetailFromGit(
+            "component-checkout-failed",
+            "settle-component-checkout",
+            join(root, settledCheckouts.failure.plan.path),
+            settledCheckouts.failure.args,
+            settledCheckouts.failure.result,
+            `The prospective merge remains uncommitted because ${settledCheckouts.failure.plan.path} could not be checked out at staged index pin ${settledCheckouts.failure.plan.index}; every attempted component checkout was restored.`,
+            evidence,
+            "Inspect the preserved root merge and the named checkout failure before deciding whether a retry is safe.",
+            "the caller",
+            {
+              paths: [settledCheckouts.failure.plan.path],
+              objectIds: [settledCheckouts.failure.plan.recorded, settledCheckouts.failure.plan.index],
+            },
+          )
+        : rollbackFailureDetail(
+            root,
+            "component checkout preparation",
+            settledCheckouts.failure,
+            failure,
+            restored.rows,
+          ),
+      restored.rows,
+    )
+  }
+
+  const commitArgs = ["commit", ...(options.noVerify === true ? ["--no-verify"] : []), "-F", "-"]
+  const committed = await run(git, root, commitArgs, timeoutMs, settledMessage)
+  if (committed.code !== 0) {
+    const observedHead = await run(git, root, ["rev-parse", "HEAD^{commit}"], timeoutMs)
+    if (observedHead.code !== 0) {
+      return partial(
         root,
-        commitArgs,
-        committed,
-        `The prospective merge of ${target} and its Settled report were prepared, but the concluding commit was not written.`,
-        `git -C ${root} status --short`,
-        "Preserve the uncommitted merge and inspect the named Git failure before retrying.",
-        "the caller",
-      ),
+        undefined,
+        completed,
+        resultDetailFromGit(
+          "settled-merge-commit-state-unknown",
+          "observe-rejected-settled-merge",
+          root,
+          ["rev-parse", "HEAD^{commit}"],
+          observedHead,
+          `Git reported that the settled merge commit failed, and HEAD could not be read, so component checkouts were not rolled back.`,
+          formatCheckoutEvidence(settledCheckouts.rows),
+          "Preserve the root and component checkouts until the commit outcome is known.",
+          "the caller",
+        ),
+        settledCheckouts.rows,
+      )
+    }
+    const observedCommit = observedHead.stdout.trim()
+    if (observedCommit !== head) {
+      return partial(
+        root,
+        observedCommit,
+        completed,
+        resultDetailFromGit(
+          "settled-merge-commit-reported-failed",
+          "write-settled-merge",
+          root,
+          commitArgs,
+          committed,
+          `Git reported that the settled merge commit failed, but HEAD moved from ${head} to ${observedCommit}; component checkouts remain at the staged pins.`,
+          formatCheckoutEvidence(settledCheckouts.rows),
+          "Preserve the observed commit and inspect the named Git failure before any retry.",
+          "the caller",
+          { objectIds: [head, observedCommit] },
+        ),
+        settledCheckouts.rows,
+      )
+    }
+
+    const restored = await restoreComponentCheckouts(
+      git,
+      root,
+      preparedCheckouts,
+      settledCheckouts.rows,
+      preparedCheckouts.length,
+      timeoutMs,
+    )
+    const evidence = formatCheckoutEvidence(restored.rows)
+    return partial(
+      root,
+      undefined,
+      completed,
+      restored.failure === undefined
+        ? resultDetailFromGit(
+            "settled-merge-commit-failed",
+            "write-settled-merge",
+            root,
+            commitArgs,
+            committed,
+            `The prospective merge of ${target} and its Settled report remain staged, the concluding commit was not written, and every component checkout was restored to its recorded pin.`,
+            evidence,
+            "Inspect the preserved root merge and named Git failure; move each component to its staged index pin before retrying the commit.",
+            "the caller",
+          )
+        : rollbackFailureDetail(root, "the rejected settled merge commit", undefined, restored.failure, restored.rows),
+      restored.rows,
     )
   }
   const observedSettled = await run(git, root, ["rev-parse", "HEAD^{commit}"], timeoutMs)
@@ -264,41 +392,205 @@ async function mergeUnderLock(
         "Inspect and preserve the checkout before deciding whether a retry is safe.",
         "the caller",
       ),
+      settledCheckouts.rows,
     )
   }
   const mergeCommit = observedSettled.stdout.trim()
-
-  for (const checkout of planned.checkouts) {
-    const args = ["checkout", "--detach", checkout.to]
-    const checkedOut = await run(git, join(root, checkout.path), args, timeoutMs)
-    if (checkedOut.code !== 0) {
-      return partial(
-        root,
-        mergeCommit,
-        completed,
-        resultDetailFromGit(
-          "component-checkout-failed",
-          "settle-component-checkout",
-          join(root, checkout.path),
-          args,
-          checkedOut,
-          `Settled merge ${mergeCommit} records ${checkout.path} at ${checkout.to}, but that component checkout could not be detached at the same commit.`,
-          `git -C ${join(root, checkout.path)} rev-parse HEAD`,
-          `git -C ${root} submodule update --init -- ${checkout.path}`,
-          "the caller",
-          { paths: [checkout.path], objectIds: [checkout.to] },
-        ),
-      )
-    }
-  }
 
   return {
     state: "updated",
     partial: false,
     commit: mergeCommit,
     gitlinks: completed,
+    ...(settledCheckouts.rows.length === 0 ? {} : { checkouts: settledCheckouts.rows }),
     repositories: [{ repository: root, state: "updated", refs: [] }],
   }
+}
+
+async function prepareComponentCheckouts(
+  git: GitProcess,
+  root: string,
+  plans: readonly GitlinkCheckoutPlan[],
+  timeoutMs: number,
+): Promise<Readonly<{ checkouts: readonly PreparedCheckout[] }> | Readonly<{ failure: GitResultDetail }>> {
+  const checkouts: PreparedCheckout[] = []
+  for (const plan of plans) {
+    const component = join(root, plan.path)
+    const args = ["rev-parse", "HEAD^{commit}"]
+    const observed = await run(git, component, args, timeoutMs)
+    if (observed.code !== 0) {
+      return {
+        failure: resultDetailFromGit(
+          "component-checkout-unreadable",
+          "prepare-component-checkout",
+          component,
+          args,
+          observed,
+          `The pre-merge checkout pin for ${plan.path} could not be read, so no merge was started.`,
+          `git -C ${component} rev-parse HEAD^{commit}`,
+          `Restore an initialized checkout for ${plan.path} at recorded pin ${plan.recorded}, then rerun the merge.`,
+          "the caller",
+          { paths: [plan.path], objectIds: [plan.recorded, plan.index] },
+        ),
+      }
+    }
+    const preCheckout = observed.stdout.trim()
+    if (!OBJECT_ID.test(preCheckout) || preCheckout !== plan.recorded) {
+      const row: SuperMergeCheckoutResult = {
+        ...plan,
+        preCheckout,
+        checkout: preCheckout,
+        state: "not-run",
+      }
+      return {
+        failure: obviousDetail(
+          "component-checkout-drift",
+          `Before the merge, ${plan.path} records ${plan.recorded} but its checkout is ${preCheckout}; no merge was started.`,
+          formatCheckoutEvidence([row]),
+          `Restore ${plan.path} to recorded pin ${plan.recorded}, then rerun the merge.`,
+          "the caller",
+          { paths: [plan.path], objectIds: [plan.recorded, plan.index, preCheckout] },
+        ),
+      }
+    }
+    checkouts.push({ ...plan, preCheckout })
+  }
+  return { checkouts }
+}
+
+function checkoutResults(
+  plans: readonly PreparedCheckout[],
+  state: SuperMergeCheckoutResult["state"],
+): SuperMergeCheckoutResult[] {
+  return plans.map((plan) => ({ ...plan, checkout: plan.preCheckout, state }))
+}
+
+async function settleComponentCheckouts(
+  git: GitProcess,
+  root: string,
+  plans: readonly PreparedCheckout[],
+  timeoutMs: number,
+): Promise<
+  Readonly<{
+    rows: readonly SuperMergeCheckoutResult[]
+    attempted: number
+    failure?: CheckoutFailure
+  }>
+> {
+  const rows = checkoutResults(plans, "not-run")
+  for (let index = 0; index < plans.length; index += 1) {
+    const plan = plans[index]
+    if (plan === undefined) continue
+    const component = join(root, plan.path)
+    const args = ["checkout", "--detach", plan.index]
+    const checkedOut = await run(git, component, args, timeoutMs)
+    if (checkedOut.code !== 0) {
+      return { rows, attempted: index + 1, failure: { plan, args, result: checkedOut } }
+    }
+    const observeArgs = ["rev-parse", "HEAD^{commit}"]
+    const observed = await run(git, component, observeArgs, timeoutMs)
+    const checkout = observed.stdout.trim()
+    if (observed.code !== 0 || checkout !== plan.index) {
+      const result =
+        observed.code !== 0
+          ? observed
+          : {
+              code: 1,
+              stdout: observed.stdout,
+              stderr: `checkout observation mismatch: expected ${plan.index}, observed ${checkout}`,
+            }
+      rows[index] = { ...plan, ...(checkout === "" ? {} : { checkout }), state: "restore-failed" }
+      return { rows, attempted: index + 1, failure: { plan, args: observeArgs, result } }
+    }
+    rows[index] = { ...plan, checkout, state: "settled" }
+  }
+  return { rows, attempted: plans.length }
+}
+
+async function restoreComponentCheckouts(
+  git: GitProcess,
+  root: string,
+  plans: readonly PreparedCheckout[],
+  currentRows: readonly SuperMergeCheckoutResult[],
+  attempted: number,
+  timeoutMs: number,
+): Promise<Readonly<{ rows: readonly SuperMergeCheckoutResult[]; failure?: CheckoutFailure }>> {
+  const rows = [...currentRows]
+  let failure: CheckoutFailure | undefined
+  for (let index = Math.min(attempted, plans.length) - 1; index >= 0; index -= 1) {
+    const plan = plans[index]
+    if (plan === undefined) continue
+    const component = join(root, plan.path)
+    const args = ["checkout", "--detach", plan.recorded]
+    const restored = await run(git, component, args, timeoutMs)
+    const observed = await run(git, component, ["rev-parse", "HEAD^{commit}"], timeoutMs)
+    const checkout = observed.code === 0 ? observed.stdout.trim() : undefined
+    if (restored.code !== 0 || checkout !== plan.recorded) {
+      const result =
+        restored.code !== 0
+          ? restored
+          : observed.code !== 0
+            ? observed
+            : {
+                code: 1,
+                stdout: observed.stdout,
+                stderr: `rollback observation mismatch: expected ${plan.recorded}, observed ${checkout ?? "unreadable"}`,
+              }
+      rows[index] = { ...plan, ...(checkout === undefined ? {} : { checkout }), state: "restore-failed" }
+      failure ??= { plan, args, result }
+      continue
+    }
+    rows[index] = { ...plan, checkout, state: "restored" }
+  }
+  return { rows, ...(failure === undefined ? {} : { failure }) }
+}
+
+function formatCheckoutEvidence(rows: readonly SuperMergeCheckoutResult[]): string {
+  if (rows.length === 0) return "component-checkouts: none"
+  return rows
+    .map(
+      (row) =>
+        `${row.path}: recorded=${row.recorded} index=${row.index} checkout=${row.checkout ?? "unreadable"} pre-checkout=${row.preCheckout} state=${row.state}`,
+    )
+    .join(" | ")
+}
+
+function rollbackFailureDetail(
+  root: string,
+  cause: string,
+  checkoutFailure: CheckoutFailure | undefined,
+  rollbackFailure: CheckoutFailure,
+  rows: readonly SuperMergeCheckoutResult[],
+): GitResultDetail {
+  const path = rollbackFailure.plan.path
+  const causeText =
+    checkoutFailure === undefined
+      ? cause
+      : `${cause} failed for ${checkoutFailure.plan.path} before ${path} rollback was attempted`
+  return resultDetailFromGit(
+    "component-checkout-rollback-failed",
+    "restore-component-checkout",
+    join(root, path),
+    rollbackFailure.args,
+    rollbackFailure.result,
+    `The root merge remains preserved after ${causeText}, but ${path} could not be restored exactly to recorded pin ${rollbackFailure.plan.recorded}.`,
+    formatCheckoutEvidence(rows),
+    "Do not retry the commit; preserve the root and components, restore every restore-failed row to its pre-checkout pin, then prove recorded, index, and checkout pins again.",
+    "the caller",
+    {
+      paths: rows.filter((row) => row.state === "restore-failed").map((row) => row.path),
+      objectIds: [
+        ...new Set(
+          rows.flatMap((row) => [
+            row.recorded,
+            row.index,
+            row.preCheckout,
+            ...(row.checkout === undefined ? [] : [row.checkout]),
+          ]),
+        ),
+      ],
+    },
+  )
 }
 
 async function prospectiveTree(
@@ -350,18 +642,20 @@ async function planGitlinks(
   const before = new Map((await readCommitSubmodules(git, root, head)).map((entry) => [entry.path, entry.target]))
   const merged = await readCommitSubmodules(git, root, tree)
   const plans: GitlinkPlan[] = []
-  const checkouts = new Map<string, string>()
+  const checkouts = new Map<string, GitlinkCheckoutPlan>()
   for (const entry of merged) {
     const component = join(root, entry.path)
     const main = await fetchComponentMain(git, component, entry.path, entry.target, timeoutMs)
-    const changedByMerge = before.get(entry.path) !== entry.target
+    const recordedBefore = before.get(entry.path)
+    const recorded = recordedBefore ?? entry.target
+    const changedByMerge = recordedBefore !== entry.target
     if (entry.target === main) {
-      if (changedByMerge) checkouts.set(entry.path, entry.target)
+      if (changedByMerge) checkouts.set(entry.path, { path: entry.path, recorded, index: entry.target })
       continue
     }
     const ancestry = await run(git, component, ["merge-base", "--is-ancestor", entry.target, main], timeoutMs)
     if (ancestry.code === 0) {
-      checkouts.set(entry.path, main)
+      checkouts.set(entry.path, { path: entry.path, recorded, index: main })
       plans.push({
         path: entry.path,
         from: entry.target,
@@ -372,7 +666,7 @@ async function planGitlinks(
       continue
     }
     if (ancestry.code === 1) {
-      if (changedByMerge) checkouts.set(entry.path, entry.target)
+      if (changedByMerge) checkouts.set(entry.path, { path: entry.path, recorded, index: entry.target })
       plans.push({
         path: entry.path,
         from: entry.target,
@@ -389,7 +683,7 @@ async function planGitlinks(
       ancestry,
     )
   }
-  return { settlements: plans, checkouts: [...checkouts].map(([path, to]) => ({ path, to })) }
+  return { settlements: plans, checkouts: [...checkouts.values()] }
 }
 
 async function mergeApplicationFailure(
@@ -546,12 +840,18 @@ function resultError(error: unknown, phase: string): GitResultDetail {
   )
 }
 
-function failed(root: string, gitlinks: readonly SuperMergeGitlinkResult[], detail: GitResultDetail): SuperMergeResult {
+function failed(
+  root: string,
+  gitlinks: readonly SuperMergeGitlinkResult[],
+  detail: GitResultDetail,
+  checkouts: readonly SuperMergeCheckoutResult[] = [],
+): SuperMergeResult {
   return {
     state: "failed",
     partial: false,
     detail,
     gitlinks,
+    ...(checkouts.length === 0 ? {} : { checkouts }),
     repositories: [{ repository: root, state: "failed", detail, refs: [] }],
   }
 }
@@ -561,6 +861,7 @@ function partial(
   commit: string | undefined,
   gitlinks: readonly SuperMergeGitlinkResult[],
   detail: GitResultDetail,
+  checkouts: readonly SuperMergeCheckoutResult[] = [],
 ): SuperMergeResult {
   const repository: GitSuperRepositoryResult = { repository: root, state: "updated", detail, refs: [] }
   return {
@@ -569,6 +870,7 @@ function partial(
     detail,
     ...(commit === undefined ? {} : { commit }),
     gitlinks,
+    ...(checkouts.length === 0 ? {} : { checkouts }),
     repositories: [repository],
   }
 }
