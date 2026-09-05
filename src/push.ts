@@ -144,12 +144,8 @@ function sameExpected(left: ExpectedDestination, right: ExpectedDestination): bo
   return expectedKey(left) === expectedKey(right)
 }
 
-function isIdenticalCreateOnly(
-  source: string,
-  expected: ExpectedDestination | undefined,
-  observed: ExpectedDestination,
-): boolean {
-  return expected?.state === "missing" && observed.state === "oid" && observed.oid === source
+function isIdenticalSuccess(source: string, observed: ExpectedDestination): boolean {
+  return observed.state === "oid" && observed.oid === source
 }
 
 async function observeDestination(
@@ -255,11 +251,11 @@ async function planUpdates(git: GitProcess, input: readonly RefUpdate[], timeout
         })
       }
     }
-    const identicalCreateOnlyRetry = isIdenticalCreateOnly(update.source, update.expectedDestination, observed)
+    const identicalSuccess = isIdenticalSuccess(update.source, observed)
     if (
       update.expectedDestination !== undefined &&
       !sameExpected(update.expectedDestination, observed) &&
-      !identicalCreateOnlyRetry
+      !identicalSuccess
     ) {
       const planned = {
         ...update,
@@ -277,7 +273,7 @@ async function planUpdates(git: GitProcess, input: readonly RefUpdate[], timeout
       remote: update.remote,
       source: update.source,
       destination: update.destination,
-      expectedDestination: identicalCreateOnlyRetry ? observed : (update.expectedDestination ?? observed),
+      expectedDestination: identicalSuccess ? observed : (update.expectedDestination ?? observed),
       explicitExpectation: update.expectedDestination !== undefined,
       allowNonFastForward: update.allowNonFastForward === true,
     })
@@ -427,7 +423,7 @@ async function applyGroup(
       update !== undefined &&
       observed !== undefined &&
       !sameExpected(update.expectedDestination, observed) &&
-      !isIdenticalCreateOnly(update.source, update.expectedDestination, observed)
+      !isIdenticalSuccess(update.source, observed)
     ) {
       const failure = mismatchDetail(update, observed, "recheck-destination")
       return {
