@@ -215,6 +215,7 @@ async function planUpdates(git: GitProcess, input: readonly RefUpdate[], timeout
     })
   }
   const normalized: PlannedUpdate[] = []
+  const mismatches = new Map<PlannedUpdate, GitResultDetail>()
   for (const update of input) {
     if (!OBJECT_ID.test(update.source)) {
       throw Object.assign(new Error(`push source must be an exact object ID: ${update.source}`), {
@@ -262,23 +263,7 @@ async function planUpdates(git: GitProcess, input: readonly RefUpdate[], timeout
       }
     }
     const identicalSuccess = isIdenticalSuccess(update.source, observed)
-    if (
-      update.expectedDestination !== undefined &&
-      !sameExpected(update.expectedDestination, observed) &&
-      !identicalSuccess
-    ) {
-      const planned = {
-        ...update,
-        repository,
-        expectedDestination: update.expectedDestination,
-        explicitExpectation: true,
-        allowNonFastForward: update.allowNonFastForward === true,
-      }
-      throw Object.assign(new Error("remote destination does not match its explicit expectation"), {
-        resultDetail: mismatchDetail(planned, observed, "observe-destination"),
-      })
-    }
-    normalized.push({
+    const planned = {
       repository,
       remote: update.remote,
       source: update.source,
@@ -286,7 +271,15 @@ async function planUpdates(git: GitProcess, input: readonly RefUpdate[], timeout
       expectedDestination: identicalSuccess ? observed : (update.expectedDestination ?? observed),
       explicitExpectation: update.expectedDestination !== undefined,
       allowNonFastForward: update.allowNonFastForward === true,
-    })
+    }
+    normalized.push(planned)
+    if (
+      update.expectedDestination !== undefined &&
+      !sameExpected(update.expectedDestination, observed) &&
+      !identicalSuccess
+    ) {
+      mismatches.set(planned, mismatchDetail(planned, observed, "observe-destination"))
+    }
   }
 
   const byDestination = new Map<string, PlannedUpdate>()
@@ -316,7 +309,17 @@ async function planUpdates(git: GitProcess, input: readonly RefUpdate[], timeout
       ),
     })
   }
-  return [...byDestination.values()]
+  const planned = [...byDestination.values()]
+  if (mismatches.size > 0) {
+    const failure = mismatches.values().next().value
+    if (failure === undefined) throw new Error("preflight mismatch lost its failure detail")
+    throw Object.assign(new Error("remote destination does not match its explicit expectation"), {
+      resultDetail: failure,
+      plannedUpdates: planned,
+      preflightMismatches: mismatches,
+    })
+  }
+  return planned
 }
 
 function groupUpdates(updates: readonly PlannedUpdate[], root: string): PushGroup[] {
@@ -364,6 +367,31 @@ function notRunGroup(group: PushGroup, failure: GitResultDetail): GitSuperReposi
     detail: failure,
     refs: group.updates.map((update) => refResult(update, "not-run", failure)),
   }
+}
+
+function preflightFailureResult(
+  root: string,
+  updates: readonly PlannedUpdate[],
+  mismatches: ReadonlyMap<PlannedUpdate, GitResultDetail>,
+): GitSuperResult {
+  const first = mismatches.values().next().value
+  if (first === undefined) throw new Error("preflight failure result requires at least one mismatch")
+  return gitSuperResult(
+    groupUpdates(updates, root).map((group) => {
+      const failure = group.updates.map((update) => mismatches.get(update)).find((detail) => detail !== undefined)
+      if (failure === undefined) return notRunGroup(group, first)
+      return {
+        repository: group.repository,
+        state: "failed",
+        detail: failure,
+        refs: group.updates.map((update) => {
+          const mismatch = mismatches.get(update)
+          return mismatch === undefined ? refResult(update, "not-run", first) : refResult(update, "failed", mismatch)
+        }),
+      }
+    }),
+    first,
+  )
 }
 
 function repositoryState(refs: readonly GitSuperRefResult[]): GitResultState {
@@ -548,7 +576,7 @@ async function applyGroup(
 /** Apply exact remote ref updates child-first and root-last using explicit leases. */
 export async function pushRefUpdates(options: PushRefUpdatesOptions): Promise<GitSuperResult> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS
-  const root = resolve(options.root)
+  let root = resolve(options.root)
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
     const failure = detail("invalid-timeout", "validate", "Git command timeout must be a positive finite number.")
     return failedResult(root, failure)
@@ -557,11 +585,10 @@ export async function pushRefUpdates(options: PushRefUpdatesOptions): Promise<Gi
   const git: GitProcess = {
     run: (request) => process.run({ ...request, timeoutMs: request.timeoutMs ?? timeoutMs }),
   }
-  let groups: PushGroup[]
   try {
-    const repository = await discoverRepository(git, root, "discover-root")
-    groups = groupUpdates(await planUpdates(git, options.updates, timeoutMs), repository)
-    const exclusive = options.exclusive ?? createExclusive(await lockDirectory(git, repository))
+    root = await discoverRepository(git, root, "discover-root")
+    const groups = groupUpdates(await planUpdates(git, options.updates, timeoutMs), root)
+    const exclusive = options.exclusive ?? createExclusive(await lockDirectory(git, root))
     return await exclusive.run(
       async () => {
         const results: GitSuperRepositoryResult[] = []
@@ -580,6 +607,13 @@ export async function pushRefUpdates(options: PushRefUpdatesOptions): Promise<Gi
       { holder: "git super push" },
     )
   } catch (error) {
+    if (typeof error === "object" && error !== null && "plannedUpdates" in error && "preflightMismatches" in error) {
+      const preflight = error as {
+        plannedUpdates: readonly PlannedUpdate[]
+        preflightMismatches: ReadonlyMap<PlannedUpdate, GitResultDetail>
+      }
+      return preflightFailureResult(root, preflight.plannedUpdates, preflight.preflightMismatches)
+    }
     const failure = resultError(error, "push")
     return failedResult(root, failure)
   }

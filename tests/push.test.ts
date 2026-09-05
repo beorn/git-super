@@ -360,13 +360,60 @@ describe("explicit recursive push mechanics", () => {
     expect(git(remote, "for-each-ref", "--format=%(refname)", "refs/heads/main")).toBe("")
   })
 
-  test("refuses a moved plan lease without updating the root", async () => {
+  // 24166 K2: a stale frozen child lease must report every frozen ref before
+  // any write. The former assertion accepted the preflight's empty ref list.
+  test("refuses a moved plan lease with failed and untouched plan rows", async () => {
     const fixture = recursivePushFixture("moved-plan-lease")
+    const earlierRemote = join(fixture.fixture, "earlier.git")
+    const earlierSeed = join(fixture.fixture, "earlier-seed")
+    git(fixture.fixture, "init", "--bare", "-q", "-b", "main", earlierRemote)
+    const earlierBefore = createRepository(earlierSeed, "earlier.txt", "one\n")
+    git(earlierSeed, "remote", "add", "origin", earlierRemote)
+    git(earlierSeed, "push", "-q", "-u", "origin", "main")
+    git(fixture.root, "-c", "protocol.file.allow=always", "submodule", "add", "-q", earlierRemote, "earlier")
+    git(fixture.root, "commit", "-q", "-am", "add earlier child")
+    const earlier = join(fixture.root, "earlier")
+    const earlierSource = advanceRepository(earlier, "earlier.txt", "two\n")
+    git(fixture.root, "add", "earlier")
+    git(fixture.root, "commit", "-q", "-m", "record earlier child")
+    const rootSource = git(fixture.root, "rev-parse", "HEAD")
     git(fixture.child, "checkout", "-q", "-b", "other", fixture.childBefore)
     const other = advanceRepository(fixture.child, "other.txt", "other\n")
     git(fixture.child, "push", "-q", fixture.childRemote, `${other}:refs/heads/main`)
     git(fixture.child, "checkout", "-q", "main")
-    const planPath = writePlan(fixture.fixture, "moved.json", recursivePushPlan(fixture))
+    const plan = {
+      updates: [
+        {
+          repository: "earlier",
+          remote: earlierRemote,
+          source: earlierSource,
+          destination: "refs/heads/main",
+          expectedDestination: { state: "oid", oid: earlierBefore },
+        },
+        {
+          repository: "child",
+          remote: fixture.childRemote,
+          source: fixture.childSource,
+          destination: "refs/heads/main",
+          expectedDestination: { state: "oid", oid: fixture.childBefore },
+        },
+        {
+          repository: ".",
+          remote: fixture.rootRemote,
+          source: rootSource,
+          destination: "refs/heads/main",
+          expectedDestination: { state: "oid", oid: fixture.rootBefore },
+        },
+        {
+          repository: ".",
+          remote: fixture.rootRemote,
+          source: rootSource,
+          destination: "refs/yrd/main/task/k2",
+          expectedDestination: { state: "missing" },
+        },
+      ],
+    }
+    const planPath = writePlan(fixture.fixture, "moved.json", plan)
     const stdout = outputSink()
     const stderr = outputSink()
 
@@ -377,8 +424,23 @@ describe("explicit recursive push mechanics", () => {
       partial: false,
       detail: { code: "destination-changed" },
     })
+    const result = JSON.parse(stdout.output) as {
+      repositories: { repository: string; refs: { destination: string; state: string }[] }[]
+    }
+    expect(
+      result.repositories.flatMap((repository) =>
+        repository.refs.map((row) => [repository.repository, row.destination, row.state]),
+      ),
+    ).toEqual([
+      [earlier, "refs/heads/main", "not-run"],
+      [fixture.child, "refs/heads/main", "failed"],
+      [fixture.root, "refs/heads/main", "not-run"],
+      [fixture.root, "refs/yrd/main/task/k2", "not-run"],
+    ])
+    expect(git(earlierRemote, "rev-parse", "refs/heads/main")).toBe(earlierBefore)
     expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(other)
     expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(fixture.rootBefore)
+    expect(git(fixture.rootRemote, "for-each-ref", "--format=%(refname)")).toBe("refs/heads/main")
   })
 
   test("reports a rejected plan group and leaves the root not-run", async () => {
