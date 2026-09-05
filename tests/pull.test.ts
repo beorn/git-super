@@ -392,6 +392,60 @@ describe("git super pull --ff-only", () => {
     expect((JSON.parse(stdout.output) as { repositories: unknown[] }).repositories).toHaveLength(4)
   })
 
+  test("accepts a detached commit contained in the incoming pin despite stale local refs", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-pull-stale-refs-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const checkout = join(fixtureRoot, "checkout")
+    git(
+      fixtureRoot,
+      "-c",
+      "protocol.file.allow=always",
+      "clone",
+      "-q",
+      "--recurse-submodules",
+      fixture.product,
+      checkout,
+    )
+    const alphaCheckout = join(checkout, "packages/alpha")
+    const intermediate = advanceRepository(fixture.alpha, "intermediate.ts", "export const intermediate = true\n")
+    git(alphaCheckout, "fetch", "--no-tags", "origin", intermediate)
+    git(alphaCheckout, "checkout", "--detach", intermediate)
+    const target = bumpProductSubmodules(fixture)
+    const alphaTarget = git(fixture.alpha, "rev-parse", "HEAD")
+    expect(git(alphaCheckout, "for-each-ref", "--format=%(refname)", "--contains", intermediate)).toBe("")
+    expect(git(alphaCheckout, "rev-parse", "origin/main")).toBe(fixture.alphaBase)
+    const local = createLocalGitProcess()
+    let ancestryFailureInjected = false
+    const failed = await superPull({
+      repo: checkout,
+      repository: "origin",
+      refspecs: ["main"],
+      ffOnly: true,
+      git: {
+        run(request) {
+          if (request.repo === alphaCheckout && request.args[0] === "merge-base") {
+            ancestryFailureInjected = true
+            return Promise.resolve({ code: 128, stdout: "", stderr: "cannot read commit graph", timedOut: false })
+          }
+          return local.run(request)
+        },
+      },
+    })
+    expect(ancestryFailureInjected).toBe(true)
+    expect(failed).toMatchObject({ state: "failed", detail: { code: "git-failed", phase: "prove-submodule-ancestry" } })
+    expect(git(checkout, "rev-parse", "HEAD")).toBe(fixture.productBase)
+    expect(git(alphaCheckout, "rev-parse", "HEAD")).toBe(intermediate)
+    const stdout = outputSink()
+    const stderr = outputSink()
+
+    expect(await runCli(["--repo", checkout, "pull", "--ff-only", "origin", "main", "--json"], stdout, stderr)).toBe(0)
+    expect(stderr.output).toBe("")
+    expect(git(checkout, "rev-parse", "HEAD")).toBe(target)
+    expect(git(alphaCheckout, "rev-parse", "HEAD")).toBe(alphaTarget)
+    expect(git(alphaCheckout, "merge-base", "--is-ancestor", intermediate, "HEAD")).toBe("")
+  })
+
   test("protects an unpublished detached submodule commit before moving the root", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-pull-detached-"))
     roots.push(fixtureRoot)
@@ -420,7 +474,11 @@ describe("git super pull --ff-only", () => {
     expect(JSON.parse(stdout.output)).toMatchObject({
       state: "failed",
       partial: false,
-      detail: { code: "unpublished-detached-submodule", phase: "protect-submodule-head" },
+      detail: {
+        code: "unpublished-detached-submodule",
+        phase: "protect-submodule-head",
+        remedy: `In ${alphaCheckout}, run: git branch preserve/detached-${unpublished} ${unpublished}. Then rerun git super pull.`,
+      },
     })
   })
 

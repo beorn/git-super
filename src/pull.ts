@@ -82,10 +82,11 @@ function resultError(error: unknown, phase: string): GitResultDetail {
 }
 
 async function planPull(git: GitProcess, options: SuperPullOptions): Promise<PullPlan> {
-  if (!options.ffOnly)
+  if (!options.ffOnly) {
     throw Object.assign(new Error("git super pull requires --ff-only"), {
       resultDetail: detail("ff-only-required", "validate", "git super pull requires --ff-only"),
     })
+  }
   const root = await required(git, options.repo, ["rev-parse", "--show-toplevel"], "discover-root")
   const { repository, refspecs, remoteRef, exactTarget } = await resolvePullTarget(git, root, options)
   await required(
@@ -258,10 +259,17 @@ async function refuseUnpublishedDetachedHead(
   repository: string,
   recorded: string | undefined,
   actual: string,
+  target: string,
 ): Promise<void> {
   if (recorded === undefined || actual === recorded) return
   const branch = await run(git, repository, ["symbolic-ref", "-q", "HEAD"])
   if (branch.code === 0) return
+  const args = ["merge-base", "--is-ancestor", actual, target]
+  const ancestor = await run(git, repository, args)
+  if (ancestor.code === 0) return
+  if (ancestor.code !== 1 || ancestor.timedOut) {
+    throw operationError(repository, "prove-submodule-ancestry", args, ancestor)
+  }
   const refs = await required(
     git,
     repository,
@@ -275,10 +283,10 @@ async function refuseUnpublishedDetachedHead(
       resultDetail: detail(
         "unpublished-detached-submodule",
         "protect-submodule-head",
-        `Detached HEAD ${actual} differs from recorded commit ${recorded ?? "missing"} and is not reachable from a durable ref.`,
+        `Detached HEAD ${actual} differs from recorded commit ${recorded ?? "missing"} and is contained in neither incoming commit ${target} nor any local durable ref.`,
         {
-          objectIds: [actual, ...(recorded === undefined ? [] : [recorded])],
-          remedy: "Create a branch or tag for the detached commit, then rerun git super pull.",
+          objectIds: [actual, recorded, target],
+          remedy: `In ${repository}, run: git branch preserve/detached-${actual} ${actual}. Then rerun git super pull.`,
         },
       ),
     },
@@ -317,7 +325,7 @@ async function freezeRepositoryGraph(
       const actual = await required(git, childRepository, ["rev-parse", "HEAD^{commit}"], "freeze-submodule-current")
       const priorTree = await run(git, repository, ["ls-tree", from, "--", entry.path])
       const recorded = /^160000 commit ([0-9a-f]+)\t/mu.exec(priorTree.stdout)?.[1]
-      await refuseUnpublishedDetachedHead(git, childRepository, recorded, actual)
+      await refuseUnpublishedDetachedHead(git, childRepository, recorded, actual, entry.target)
       await walk(childRepository, childPath, actual, entry.target)
     }
   }
