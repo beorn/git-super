@@ -60,12 +60,22 @@ export type NestedProductFixture = ProductFixture &
     productWithNestedBase: string
   }>
 
-export function createProductFixture(fixture: string): ProductFixture {
+export function createProductFixture(fixture: string, seedOlderComponentCommit = false): ProductFixture {
   const alpha = join(fixture, "alpha")
   const beta = join(fixture, "beta")
   const product = join(fixture, "product")
-  const alphaBase = createRepository(alpha, "alpha.ts", "export const alpha = 1\n")
-  const betaBase = createRepository(beta, "beta.ts", "export const beta = 1\n")
+  const alphaBase = seedOlderComponentCommit
+    ? (() => {
+        createRepository(alpha, "alpha.ts", "export const alpha = 0\n")
+        return advanceRepository(alpha, "alpha.ts", "export const alpha = 1\n")
+      })()
+    : createRepository(alpha, "alpha.ts", "export const alpha = 1\n")
+  const betaBase = seedOlderComponentCommit
+    ? (() => {
+        createRepository(beta, "beta.ts", "export const beta = 0\n")
+        return advanceRepository(beta, "beta.ts", "export const beta = 1\n")
+      })()
+    : createRepository(beta, "beta.ts", "export const beta = 1\n")
   mkdirSync(product, { recursive: true })
   git(product, "init", "-q", "-b", "main")
   git(product, "-c", "protocol.file.allow=always", "submodule", "add", "-q", alpha, "packages/alpha")

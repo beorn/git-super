@@ -34,18 +34,48 @@ function outputSink(): { output: string; write(value: string): void } {
   }
 }
 
-function candidateWithRootChange(fixture: ProductFixture, name: string): string {
+function candidateWithRootChange(
+  fixture: ProductFixture,
+  name: string,
+  authoredGitlinks: readonly ("packages/alpha" | "vendor/beta")[] = [],
+): string {
   git(fixture.product, "switch", "-q", "-c", name)
+  for (const path of authoredGitlinks) {
+    const component = join(fixture.product, path)
+    git(component, "checkout", "-q", "--detach", git(component, "rev-parse", "HEAD^"))
+    git(fixture.product, "add", path)
+  }
   writeFileSync(join(fixture.product, `${name}.txt`), `${name}\n`)
   git(fixture.product, "add", `${name}.txt`)
   git(fixture.product, "commit", "-q", "-m", `add ${name}`)
   const candidate = git(fixture.product, "rev-parse", "HEAD")
   git(fixture.product, "switch", "-q", "main")
+  for (const path of authoredGitlinks) {
+    const component = join(fixture.product, path)
+    git(component, "checkout", "-q", "--detach", git(fixture.product, "rev-parse", `HEAD:${path}`))
+  }
   return candidate
 }
 
 describe("git super merge", () => {
-  it("keeps authored-ahead pins, reports untouched off-main pins, and raises behind pins", async () => {
+  // M8.5: settlement is only the authored pin changes. Earlier coverage
+  // deliberately raised an untouched behind pin, the superseded M7.5 policy.
+  it("leaves untouched behind pins at the target without a settlement row", async () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-merge-untouched-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const candidate = candidateWithRootChange(fixture, "root-only")
+    const newest = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 'newest'\n")
+    expect(newest).not.toBe(fixture.alphaBase)
+
+    const result = await superMerge({ repo: fixture.product, commit: candidate })
+
+    expect(result).toMatchObject({ state: "updated", partial: false, gitlinks: [] })
+    expect(git(fixture.product, "ls-tree", "HEAD", "packages/alpha")).toContain(fixture.alphaBase)
+    expect(git(join(fixture.product, "packages/alpha"), "rev-parse", "HEAD")).toBe(fixture.alphaBase)
+  })
+
+  it("keeps authored-ahead pins, refuses authored off-main pins, and raises authored behind pins", async () => {
     const refusedRoot = mkdtempSync(join(tmpdir(), "git-super-merge-refused-"))
     roots.push(refusedRoot)
     const refused = createProductFixture(refusedRoot)
@@ -94,37 +124,41 @@ describe("git super merge", () => {
     roots.push(leftRoot)
     const left = createProductFixture(leftRoot)
     const leftAlpha = join(left.product, "packages/alpha")
+    git(left.product, "switch", "-q", "-c", "candidate-left")
     writeFileSync(join(leftAlpha, "alpha.ts"), "export const alpha = 'already ahead'\n")
     git(leftAlpha, "add", "alpha.ts")
     git(leftAlpha, "commit", "-q", "-m", "advance alpha already at head")
     const leftOffMain = git(leftAlpha, "rev-parse", "HEAD")
-    git(left.product, "add", "packages/alpha")
-    git(left.product, "commit", "-q", "-m", "pin existing off-main alpha")
-    const leftCandidate = candidateWithRootChange(left, "candidate-left")
+    const leftMain = advanceRepository(left.alpha, "alpha.ts", "export const alpha = 'component main'\n")
+    writeFileSync(join(left.product, "candidate-left.txt"), "candidate-left\n")
+    git(left.product, "add", "packages/alpha", "candidate-left.txt")
+    git(left.product, "commit", "-q", "-m", "author existing off-main alpha")
+    const leftCandidate = git(left.product, "rev-parse", "HEAD")
+    git(left.product, "switch", "-q", "main")
+    git(leftAlpha, "switch", "-q", "--detach", left.alphaBase)
     const leftStdout = outputSink()
     const leftStderr = outputSink()
 
     expect(
       await runCli(
-        ["--repo", left.product, "merge", leftCandidate, "-m", "merge untouched off-main"],
+        ["--repo", left.product, "merge", leftCandidate, "-m", "merge authored off-main"],
         leftStdout,
         leftStderr,
       ),
-    ).toBe(0)
-    expect(leftStderr.output).toContain("left-off-main")
+    ).toBe(1)
+    expect(leftStdout.output).toBe("")
+    expect(leftStderr.output).toContain("component-main-moved")
     expect(leftStderr.output).toContain("packages/alpha")
     expect(leftStderr.output).toContain(leftOffMain)
-    expect(leftStderr.output).toContain(left.alphaBase)
-    expect(git(left.product, "ls-tree", "HEAD", "packages/alpha")).toContain(leftOffMain)
-    expect(git(left.product, "show", "-s", "--format=%B", "HEAD")).toContain(
-      `Settled: packages/alpha@${leftOffMain} left-off-main component-main@${left.alphaBase}`,
-    )
+    expect(leftStderr.output).toContain(leftMain)
+    expect(git(left.product, "ls-tree", "HEAD", "packages/alpha")).toContain(left.alphaBase)
 
     const raisedRoot = mkdtempSync(join(tmpdir(), "git-super-merge-raised-"))
     roots.push(raisedRoot)
-    const raised = createProductFixture(raisedRoot)
+    const raised = createProductFixture(raisedRoot, true)
     const newestAlpha = advanceRepository(raised.alpha, "alpha.ts", "export const alpha = 2\n")
-    const raisedCandidate = candidateWithRootChange(raised, "candidate-raised")
+    const authoredAlpha = git(join(raised.product, "packages/alpha"), "rev-parse", "HEAD^")
+    const raisedCandidate = candidateWithRootChange(raised, "candidate-raised", ["packages/alpha"])
     const raisedStdout = outputSink()
     const raisedStderr = outputSink()
 
@@ -136,7 +170,7 @@ describe("git super merge", () => {
       ),
     ).toBe(0)
     expect(raisedStderr.output).toContain(
-      `packages/alpha ${raised.alphaBase.slice(0, 7)} -> ${newestAlpha.slice(0, 7)} (component main)`,
+      `packages/alpha ${authoredAlpha.slice(0, 7)} -> ${newestAlpha.slice(0, 7)} (component main)`,
     )
     expect(git(raised.product, "ls-tree", "HEAD", "packages/alpha")).toContain(newestAlpha)
     expect(git(raised.product, "show", "-s", "--format=%B", "HEAD")).toContain(`Settled: packages/alpha@${newestAlpha}`)
@@ -406,10 +440,10 @@ describe("git super merge", () => {
   it("preserves the queue record trailer block when it adds Settled trailers", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-trailers-"))
     roots.push(fixtureRoot)
-    const fixture = createProductFixture(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot, true)
     const newestAlpha = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
     const newestBeta = advanceRepository(fixture.beta, "beta.ts", "export const beta = 2\n")
-    const candidate = candidateWithRootChange(fixture, "candidate-trailers")
+    const candidate = candidateWithRootChange(fixture, "candidate-trailers", ["packages/alpha", "vendor/beta"])
     const stdout = outputSink()
     const stderr = outputSink()
 
@@ -439,10 +473,13 @@ describe("git super merge", () => {
   it("writes the complete Settled report in one merge commit", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-one-settled-commit-"))
     roots.push(fixtureRoot)
-    const fixture = createProductFixture(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot, true)
     const newestAlpha = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
     const newestBeta = advanceRepository(fixture.beta, "beta.ts", "export const beta = 2\n")
-    const candidate = candidateWithRootChange(fixture, "candidate-one-settled-commit")
+    const candidate = candidateWithRootChange(fixture, "candidate-one-settled-commit", [
+      "packages/alpha",
+      "vendor/beta",
+    ])
     const local = createLocalGitProcess()
     const commands: string[][] = []
 
@@ -478,9 +515,9 @@ describe("git super merge", () => {
   it("refuses an uncomposable Settled report before writing a merge", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-settlement-refusal-"))
     roots.push(fixtureRoot)
-    const fixture = createProductFixture(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot, true)
     advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
-    const candidate = candidateWithRootChange(fixture, "candidate-settlement-refusal")
+    const candidate = candidateWithRootChange(fixture, "candidate-settlement-refusal", ["packages/alpha"])
     const headBefore = git(fixture.product, "rev-parse", "HEAD")
     const statusBefore = git(fixture.product, "status", "--porcelain=v1")
     const local = createLocalGitProcess()
@@ -515,9 +552,9 @@ describe("git super merge", () => {
   it("checks out every raised component so the settled worktree matches HEAD", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-checkouts-"))
     roots.push(fixtureRoot)
-    const fixture = createProductFixture(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot, true)
     const newestAlpha = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
-    const candidate = candidateWithRootChange(fixture, "candidate-checkouts")
+    const candidate = candidateWithRootChange(fixture, "candidate-checkouts", ["packages/alpha"])
     const stdout = outputSink()
     const stderr = outputSink()
 
@@ -530,10 +567,10 @@ describe("git super merge", () => {
   it("accepts a clean component already at the staged pin without checking it out again", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-pre-settled-checkout-"))
     roots.push(fixtureRoot)
-    const fixture = createProductFixture(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot, true)
     const component = join(fixture.product, "packages/alpha")
     const newestAlpha = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
-    const candidate = candidateWithRootChange(fixture, "candidate-pre-settled-checkout")
+    const candidate = candidateWithRootChange(fixture, "candidate-pre-settled-checkout", ["packages/alpha"])
     git(component, "fetch", "-q", "origin")
     git(component, "checkout", "-q", "--detach", newestAlpha)
     const local = createLocalGitProcess()
@@ -575,10 +612,10 @@ describe("git super merge", () => {
   it("refuses content changes inside a component already at the staged pin", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-dirty-pre-settled-checkout-"))
     roots.push(fixtureRoot)
-    const fixture = createProductFixture(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot, true)
     const component = join(fixture.product, "packages/alpha")
     const newestAlpha = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
-    const candidate = candidateWithRootChange(fixture, "candidate-dirty-pre-settled-checkout")
+    const candidate = candidateWithRootChange(fixture, "candidate-dirty-pre-settled-checkout", ["packages/alpha"])
     git(component, "fetch", "-q", "origin")
     git(component, "checkout", "-q", "--detach", newestAlpha)
     writeFileSync(join(component, "alpha.ts"), "export const alpha = 'uncommitted'\n")
@@ -620,10 +657,10 @@ describe("git super merge", () => {
   it("refuses unrelated component checkout drift before touching HEAD, index, or MERGE_HEAD", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-checkout-drift-"))
     roots.push(fixtureRoot)
-    const fixture = createProductFixture(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot, true)
     const component = join(fixture.product, "packages/alpha")
     const newestAlpha = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
-    const candidate = candidateWithRootChange(fixture, "candidate-checkout-drift")
+    const candidate = candidateWithRootChange(fixture, "candidate-checkout-drift", ["packages/alpha"])
     writeFileSync(join(component, "drift.ts"), "export const drift = true\n")
     git(component, "add", "drift.ts")
     git(component, "commit", "-q", "-m", "unrelated local checkout drift")
@@ -664,9 +701,9 @@ describe("git super merge", () => {
   it("checks out staged gitlink pins before the concluding commit hook", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-hook-coherence-"))
     roots.push(fixtureRoot)
-    const fixture = createProductFixture(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot, true)
     const newestAlpha = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
-    const candidate = candidateWithRootChange(fixture, "candidate-hook-coherence")
+    const candidate = candidateWithRootChange(fixture, "candidate-hook-coherence", ["packages/alpha"])
     const hook = join(fixture.product, ".git", "hooks", "pre-commit")
     writeFileSync(
       hook,
@@ -697,12 +734,12 @@ describe("git super merge", () => {
   it("restores every settled checkout to its root-recorded pin when the concluding commit is rejected", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-commit-rollback-"))
     roots.push(fixtureRoot)
-    const fixture = createProductFixture(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot, true)
     const component = join(fixture.product, "packages/alpha")
     const betaComponent = join(fixture.product, "vendor/beta")
     const newestAlpha = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
     const newestBeta = advanceRepository(fixture.beta, "beta.ts", "export const beta = 2\n")
-    const candidate = candidateWithRootChange(fixture, "candidate-commit-rollback")
+    const candidate = candidateWithRootChange(fixture, "candidate-commit-rollback", ["packages/alpha", "vendor/beta"])
     git(component, "fetch", "-q", "origin")
     git(component, "checkout", "-q", "--detach", newestAlpha)
     const headBefore = git(fixture.product, "rev-parse", "HEAD")
@@ -751,10 +788,10 @@ describe("git super merge", () => {
   it("preserves the observed merge when commit writes HEAD but reports failure", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-commit-reported-failure-"))
     roots.push(fixtureRoot)
-    const fixture = createProductFixture(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot, true)
     const component = join(fixture.product, "packages/alpha")
     const newestAlpha = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
-    const candidate = candidateWithRootChange(fixture, "candidate-commit-reported-failure")
+    const candidate = candidateWithRootChange(fixture, "candidate-commit-reported-failure", ["packages/alpha"])
     const headBefore = git(fixture.product, "rev-parse", "HEAD")
     const local = createLocalGitProcess()
     const probe = injectionProbe()
@@ -803,9 +840,9 @@ describe("git super merge", () => {
   it("renders recorded, staged-index, checkout, and pre-checkout pins for a partial merge", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-partial-render-"))
     roots.push(fixtureRoot)
-    const fixture = createProductFixture(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot, true)
     const newestAlpha = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
-    const candidate = candidateWithRootChange(fixture, "candidate-partial-render")
+    const candidate = candidateWithRootChange(fixture, "candidate-partial-render", ["packages/alpha"])
     const hook = join(fixture.product, ".git", "hooks", "pre-commit")
     writeFileSync(hook, "#!/bin/sh\necho render-policy-refused >&2\nexit 23\n")
     chmodSync(hook, 0o755)
@@ -823,10 +860,10 @@ describe("git super merge", () => {
   it("names recorded, staged-index, checkout, and pre-checkout pins when rollback cannot be proved", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-rollback-failure-"))
     roots.push(fixtureRoot)
-    const fixture = createProductFixture(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot, true)
     const component = join(fixture.product, "packages/alpha")
     const newestAlpha = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
-    const candidate = candidateWithRootChange(fixture, "candidate-rollback-failure")
+    const candidate = candidateWithRootChange(fixture, "candidate-rollback-failure", ["packages/alpha"])
     const local = createLocalGitProcess()
     const probe = injectionProbe()
     let commitRejected = false
@@ -907,10 +944,11 @@ describe("git super merge", () => {
   it("returns a named partial with the recovery command when a raised checkout cannot settle", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-checkout-failure-"))
     roots.push(fixtureRoot)
-    const fixture = createProductFixture(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot, true)
     const component = join(fixture.product, "packages/alpha")
     const newestAlpha = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
-    const candidate = candidateWithRootChange(fixture, "candidate-checkout-failure")
+    const authoredAlpha = git(component, "rev-parse", "HEAD^")
+    const candidate = candidateWithRootChange(fixture, "candidate-checkout-failure", ["packages/alpha"])
     const headBefore = git(fixture.product, "rev-parse", "HEAD")
     const local = createLocalGitProcess()
     const probe = injectionProbe()
@@ -940,7 +978,7 @@ describe("git super merge", () => {
         paths: ["packages/alpha"],
         next: expect.stringContaining("Inspect the preserved root merge"),
       },
-      gitlinks: [{ path: "packages/alpha", from: fixture.alphaBase, to: newestAlpha, state: "raised" }],
+      gitlinks: [{ path: "packages/alpha", from: authoredAlpha, to: newestAlpha, state: "raised" }],
       checkouts: [
         {
           path: "packages/alpha",
@@ -960,10 +998,10 @@ describe("git super merge", () => {
   it("restores a checkout when its staged-pin settlement cannot be observed", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-settlement-observation-failure-"))
     roots.push(fixtureRoot)
-    const fixture = createProductFixture(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot, true)
     const component = join(fixture.product, "packages/alpha")
     const newestAlpha = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
-    const candidate = candidateWithRootChange(fixture, "candidate-settlement-observation-failure")
+    const candidate = candidateWithRootChange(fixture, "candidate-settlement-observation-failure", ["packages/alpha"])
     const headBefore = git(fixture.product, "rev-parse", "HEAD")
     const local = createLocalGitProcess()
     const probe = injectionProbe()
@@ -1219,8 +1257,8 @@ describe("git super merge", () => {
   it("refuses an unreadable component main before merging and names the resource", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-unreadable-main-"))
     roots.push(fixtureRoot)
-    const fixture = createProductFixture(fixtureRoot)
-    const candidate = candidateWithRootChange(fixture, "candidate-unreadable")
+    const fixture = createProductFixture(fixtureRoot, true)
+    const candidate = candidateWithRootChange(fixture, "candidate-unreadable", ["packages/alpha"])
     const component = join(fixture.product, "packages/alpha")
     git(component, "remote", "set-url", "origin", join(fixtureRoot, "missing-alpha-origin"))
     const headBefore = git(fixture.product, "rev-parse", "HEAD")
@@ -1281,9 +1319,10 @@ describe("git super merge", () => {
   it("emits one byte-clean JSON result carrying the commit and raise rows", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-json-"))
     roots.push(fixtureRoot)
-    const fixture = createProductFixture(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot, true)
     const newestAlpha = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
-    const candidate = candidateWithRootChange(fixture, "candidate-json")
+    const authoredAlpha = git(join(fixture.product, "packages/alpha"), "rev-parse", "HEAD^")
+    const candidate = candidateWithRootChange(fixture, "candidate-json", ["packages/alpha"])
     const stdout = outputSink()
     const stderr = outputSink()
 
@@ -1297,7 +1336,7 @@ describe("git super merge", () => {
       gitlinks: [
         {
           path: "packages/alpha",
-          from: fixture.alphaBase,
+          from: authoredAlpha,
           to: newestAlpha,
           state: "raised",
         },
@@ -1310,10 +1349,10 @@ describe("git super merge", () => {
   it("returns a named partial with completed and not-run raises in the uncommitted merge", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-partial-"))
     roots.push(fixtureRoot)
-    const fixture = createProductFixture(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot, true)
     advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
     advanceRepository(fixture.beta, "beta.ts", "export const beta = 2\n")
-    const candidate = candidateWithRootChange(fixture, "candidate-partial")
+    const candidate = candidateWithRootChange(fixture, "candidate-partial", ["packages/alpha", "vendor/beta"])
     const headBefore = git(fixture.product, "rev-parse", "HEAD")
     const local = createLocalGitProcess()
     let writes = 0
@@ -1351,18 +1390,21 @@ describe("git super merge", () => {
   it("keeps a completed as-written row when a later raise is not run", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-as-written-partial-"))
     roots.push(fixtureRoot)
-    const fixture = createProductFixture(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot, true)
     const component = join(fixture.product, "packages/alpha")
     git(fixture.product, "switch", "-q", "-c", "candidate-as-written-partial")
     writeFileSync(join(component, "alpha.ts"), "export const alpha = 'external partial'\n")
     git(component, "add", "alpha.ts")
     git(component, "commit", "-q", "-m", "author external alpha pin")
     const authored = git(component, "rev-parse", "HEAD")
-    git(fixture.product, "add", "packages/alpha")
-    git(fixture.product, "commit", "-q", "-m", "pin external alpha")
+    const beta = join(fixture.product, "vendor/beta")
+    git(beta, "checkout", "-q", "--detach", "HEAD^")
+    git(fixture.product, "add", "packages/alpha", "vendor/beta")
+    git(fixture.product, "commit", "-q", "-m", "pin external alpha and authored behind beta")
     const candidate = git(fixture.product, "rev-parse", "HEAD")
     git(fixture.product, "switch", "-q", "main")
     git(component, "switch", "-q", "--detach", fixture.alphaBase)
+    git(beta, "switch", "-q", "--detach", fixture.betaBase)
     advanceRepository(fixture.beta, "beta.ts", "export const beta = 2\n")
     const headBefore = git(fixture.product, "rev-parse", "HEAD")
     const local = createLocalGitProcess()

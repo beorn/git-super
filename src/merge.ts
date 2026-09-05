@@ -753,9 +753,9 @@ async function planGitlinks(
     const recordedBefore = before.get(entry.path)
     const recorded = recordedBefore ?? entry.target
     const changedByMerge = recordedBefore !== entry.target
-    if (changedByMerge) await requireComponentPin(git, component, entry.path, entry.target, timeoutMs)
+    if (!changedByMerge) continue
+    await requireComponentPin(git, component, entry.path, entry.target, timeoutMs)
     if (pinAsWritten.has(entry.path)) {
-      if (!changedByMerge) continue
       checkouts.set(entry.path, { path: entry.path, recorded, index: entry.target })
       try {
         const main = await fetchComponentMain(git, component, entry.path, entry.target, timeoutMs)
@@ -783,7 +783,7 @@ async function planGitlinks(
     }
     const main = await fetchComponentMain(git, component, entry.path, entry.target, timeoutMs)
     if (entry.target === main) {
-      if (changedByMerge) checkouts.set(entry.path, { path: entry.path, recorded, index: entry.target })
+      checkouts.set(entry.path, { path: entry.path, recorded, index: entry.target })
       continue
     }
     const ancestry = await run(git, component, ["merge-base", "--is-ancestor", entry.target, main], timeoutMs)
@@ -799,29 +799,27 @@ async function planGitlinks(
       continue
     }
     if (ancestry.code === 1) {
-      if (changedByMerge) {
-        const descends = await run(git, component, ["merge-base", "--is-ancestor", main, entry.target], timeoutMs)
-        if (descends.code === 0) {
-          checkouts.set(entry.path, { path: entry.path, recorded, index: entry.target })
-          plans.push({
-            path: entry.path,
-            from: entry.target,
-            to: main,
-            state: "kept-ahead",
-            changedByMerge,
-          })
-          continue
-        }
-        if (descends.code !== 1) {
-          throw operationError(
-            component,
-            "prove-gitlink-descends-from-main",
-            ["merge-base", "--is-ancestor", main, entry.target],
-            descends,
-          )
-        }
+      const descends = await run(git, component, ["merge-base", "--is-ancestor", main, entry.target], timeoutMs)
+      if (descends.code === 0) {
+        checkouts.set(entry.path, { path: entry.path, recorded, index: entry.target })
+        plans.push({
+          path: entry.path,
+          from: entry.target,
+          to: main,
+          state: "kept-ahead",
+          changedByMerge,
+        })
+        continue
       }
-      if (changedByMerge) checkouts.set(entry.path, { path: entry.path, recorded, index: entry.target })
+      if (descends.code !== 1) {
+        throw operationError(
+          component,
+          "prove-gitlink-descends-from-main",
+          ["merge-base", "--is-ancestor", main, entry.target],
+          descends,
+        )
+      }
+      checkouts.set(entry.path, { path: entry.path, recorded, index: entry.target })
       plans.push({
         path: entry.path,
         from: entry.target,
