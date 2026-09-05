@@ -1,4 +1,6 @@
-import { cleanGitRepositoryEnvironment } from "./git.ts"
+import { cleanGitEnvironment, cleanGitRepositoryEnvironment } from "./git.ts"
+
+export { cleanGitEnvironment } from "./git.ts"
 
 export type GitProcessRequest = Readonly<{
   repo: string
@@ -82,7 +84,76 @@ export type GitProcess = Readonly<{
   run(request: GitProcessRequest): Promise<GitProcessResult>
 }>
 
+/** The supervised runner capability Git needs; its owner retains process lifetime and teardown. */
+export type SupervisedProcess = Readonly<{
+  run(
+    request: Readonly<{
+      argv: readonly string[]
+      cwd: string
+      env: NodeJS.ProcessEnv
+      stdin?: string
+      signal?: AbortSignal
+      timeoutMs?: number
+    }>,
+  ): Promise<
+    Readonly<{
+      exitCode: number
+      stdout: string
+      stderr: string
+      signal: string | null
+      timedOut: boolean
+      stalled?: boolean
+      verdict?: string
+      sweepFailure?: string
+    }>
+  >
+}>
+
+export type GitProcessDefaults = Readonly<{
+  env?: NodeJS.ProcessEnv
+  signal?: AbortSignal
+  timeoutMs?: number
+}>
+
+/** Fleet runners adapt their supervised process; CLI and development callers use createLocalGitProcess. */
+export function adaptProcessGit(process: SupervisedProcess, defaults: GitProcessDefaults = {}): GitProcess {
+  return {
+    async run(request) {
+      const env = {
+        ...cleanGitEnvironment(defaults.env ?? globalThis.process.env),
+        ...request.env,
+        GIT_TERMINAL_PROMPT: "0",
+        LC_ALL: "C",
+        TZ: "UTC",
+      }
+      const result = await process.run({
+        argv: ["git", "-C", request.repo, ...request.args],
+        cwd: request.repo,
+        env,
+        ...(request.stdin === undefined ? {} : { stdin: request.stdin }),
+        ...((request.signal ?? defaults.signal) === undefined ? {} : { signal: request.signal ?? defaults.signal }),
+        ...((request.timeoutMs ?? defaults.timeoutMs) === undefined
+          ? {}
+          : { timeoutMs: request.timeoutMs ?? defaults.timeoutMs }),
+      })
+      return {
+        code: result.exitCode,
+        stdout: result.stdout,
+        stderr: result.stderr,
+        signal: result.signal,
+        timedOut: result.timedOut,
+        ...(result.stalled === undefined ? {} : { stalled: result.stalled }),
+        ...((result.verdict !== undefined && result.verdict !== "EXITED") || result.sweepFailure !== undefined
+          ? { failure: result.sweepFailure ?? `process verdict ${result.verdict}` }
+          : {}),
+      }
+    },
+  }
+}
+
 export function createLocalGitProcess(environment: NodeJS.ProcessEnv = process.env): GitProcess {
+  // Local callers own Git policy (for example GIT_ALLOW_PROTOCOL and GIT_CONFIG_*),
+  // so only inherited repository pointers are removed; the supervised port uses the full scrubber.
   const baseEnvironment = cleanGitRepositoryEnvironment(environment)
 
   const runOnce = async (request: GitProcessRequest): Promise<GitProcessResult> => {
