@@ -8,7 +8,7 @@ export type SuperMergeGitlinkResult = Readonly<{
   path: string
   from: string
   to: string
-  state: "raised" | "left-off-main" | "not-run"
+  state: "raised" | "kept-ahead" | "left-off-main" | "not-run"
 }>
 
 export type SuperMergeCheckoutResult = Readonly<{
@@ -42,7 +42,7 @@ type GitlinkPlan = Readonly<{
   path: string
   from: string
   to: string
-  state: "raised" | "left-off-main"
+  state: "raised" | "kept-ahead" | "left-off-main"
   changedByMerge: boolean
 }>
 
@@ -158,11 +158,11 @@ async function mergeUnderLock(
       root,
       [],
       obviousDetail(
-        "gitlink-off-main",
-        `Merge ${target} would change ${refusal.path} to ${refusal.from}, which fetched component main ${refusal.to} does not contain.`,
-        `git -C ${join(root, refusal.path)} merge-base --is-ancestor ${refusal.from} ${refusal.to}`,
-        `Push ${refusal.from} to ${refusal.path} main, then rerun the same git super merge command.`,
-        "the component writer",
+        "component-main-moved",
+        `Merge ${target} would change ${refusal.path} to authored pin ${refusal.from}, which has diverged from fetched component main ${refusal.to}.`,
+        `git -C ${join(root, refusal.path)} merge-base --is-ancestor ${refusal.from} ${refusal.to}; git -C ${join(root, refusal.path)} merge-base --is-ancestor ${refusal.to} ${refusal.from}`,
+        `Rebase the change's ${refusal.path} history onto component main ${refusal.to}, then rerun the same git super merge command.`,
+        "the change author",
         { paths: [refusal.path], objectIds: [refusal.from, refusal.to] },
       ),
     )
@@ -172,7 +172,9 @@ async function mergeUnderLock(
   const trailers = visiblePlans.map((plan) =>
     plan.state === "raised"
       ? `Settled: ${plan.path}@${plan.to}`
-      : `Settled: ${plan.path}@${plan.from} left-off-main component-main@${plan.to}`,
+      : plan.state === "kept-ahead"
+        ? `Settled: ${plan.path}@${plan.from} kept-ahead component-main@${plan.to}`
+        : `Settled: ${plan.path}@${plan.from} left-off-main component-main@${plan.to}`,
   )
   const requestedMessage = options.message ?? `Merge ${target.slice(0, 12)} into ${head.slice(0, 12)}`
   let settledMessage = requestedMessage
@@ -231,7 +233,7 @@ async function mergeUnderLock(
     return mergeApplicationFailure(git, root, head, target, mergeArgs, merged, timeoutMs)
   }
   const completed: SuperMergeGitlinkResult[] = visiblePlans
-    .filter((plan) => plan.state === "left-off-main")
+    .filter((plan) => plan.state !== "raised")
     .map((plan) => ({ ...plan }))
   const raises = visiblePlans.filter((plan) => plan.state === "raised")
   for (let index = 0; index < raises.length; index += 1) {
@@ -743,6 +745,28 @@ async function planGitlinks(
       continue
     }
     if (ancestry.code === 1) {
+      if (changedByMerge) {
+        const descends = await run(git, component, ["merge-base", "--is-ancestor", main, entry.target], timeoutMs)
+        if (descends.code === 0) {
+          checkouts.set(entry.path, { path: entry.path, recorded, index: entry.target })
+          plans.push({
+            path: entry.path,
+            from: entry.target,
+            to: main,
+            state: "kept-ahead",
+            changedByMerge,
+          })
+          continue
+        }
+        if (descends.code !== 1) {
+          throw operationError(
+            component,
+            "prove-gitlink-descends-from-main",
+            ["merge-base", "--is-ancestor", main, entry.target],
+            descends,
+          )
+        }
+      }
       if (changedByMerge) checkouts.set(entry.path, { path: entry.path, recorded, index: entry.target })
       plans.push({
         path: entry.path,
