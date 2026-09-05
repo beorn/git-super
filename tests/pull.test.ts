@@ -416,26 +416,34 @@ describe("git super pull --ff-only", () => {
     expect(git(alphaCheckout, "for-each-ref", "--format=%(refname)", "--contains", intermediate)).toBe("")
     expect(git(alphaCheckout, "rev-parse", "origin/main")).toBe(fixture.alphaBase)
     const local = createLocalGitProcess()
-    let ancestryFailureInjected = false
-    const failed = await superPull({
-      repo: checkout,
-      repository: "origin",
-      refspecs: ["main"],
-      ffOnly: true,
-      git: {
-        run(request) {
-          if (request.repo === alphaCheckout && request.args[0] === "merge-base") {
-            ancestryFailureInjected = true
-            return Promise.resolve({ code: 128, stdout: "", stderr: "cannot read commit graph", timedOut: false })
-          }
-          return local.run(request)
+    for (const injectedFailure of [
+      { code: 128, stdout: "", stderr: "cannot read commit graph" },
+      { code: 1, stdout: "", stderr: "cannot start git", failure: "cannot start git" },
+    ]) {
+      let ancestryFailureInjected = false
+      const failed = await superPull({
+        repo: checkout,
+        repository: "origin",
+        refspecs: ["main"],
+        ffOnly: true,
+        git: {
+          run(request) {
+            if (request.repo === alphaCheckout && request.args[0] === "merge-base") {
+              ancestryFailureInjected = true
+              return Promise.resolve(injectedFailure)
+            }
+            return local.run(request)
+          },
         },
-      },
-    })
-    expect(ancestryFailureInjected).toBe(true)
-    expect(failed).toMatchObject({ state: "failed", detail: { code: "git-failed", phase: "prove-submodule-ancestry" } })
-    expect(git(checkout, "rev-parse", "HEAD")).toBe(fixture.productBase)
-    expect(git(alphaCheckout, "rev-parse", "HEAD")).toBe(intermediate)
+      })
+      expect(ancestryFailureInjected).toBe(true)
+      expect(failed).toMatchObject({
+        state: "failed",
+        detail: { code: "git-failed", phase: "prove-submodule-ancestry" },
+      })
+      expect(git(checkout, "rev-parse", "HEAD")).toBe(fixture.productBase)
+      expect(git(alphaCheckout, "rev-parse", "HEAD")).toBe(intermediate)
+    }
     const stdout = outputSink()
     const stderr = outputSink()
 

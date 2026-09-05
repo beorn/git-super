@@ -266,10 +266,15 @@ async function refuseUnpublishedDetachedHead(
   if (branch.code === 0) return
   const args = ["merge-base", "--is-ancestor", actual, target]
   const ancestor = await run(git, repository, args)
-  if (ancestor.code === 0) return
-  if (ancestor.code !== 1 || ancestor.timedOut) {
+  if (
+    ancestor.failure !== undefined ||
+    ancestor.timedOut ||
+    ancestor.stalled ||
+    (ancestor.code !== 0 && ancestor.code !== 1)
+  ) {
     throw operationError(repository, "prove-submodule-ancestry", args, ancestor)
   }
+  if (ancestor.code === 0) return
   const refs = await required(
     git,
     repository,
