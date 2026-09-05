@@ -6,7 +6,7 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs"
 import { mkdir, mkdtemp, rm } from "node:fs/promises"
 import { spawnSync } from "node:child_process"
-import { tmpdir } from "node:os"
+import { canonicalTmpdir as tmpdir } from "./fixture.ts"
 import { join } from "node:path"
 import { createLogger, type ConditionalLogger, type Event } from "loggily"
 import { afterEach, describe, expect, it } from "vitest"
@@ -458,6 +458,15 @@ describe("materializeSubmodules", () => {
     )
 
     expect(refused.code).toBe(1)
+    // The discriminator must have been consulted at the reference path git
+    // reports. `materializeSubmodules` canonicalizes the reference, so a mock
+    // keyed on an alias (Darwin's /var for /private/var) answers the candidate's
+    // tree for both repos and turns this removal into a cold store — which is
+    // how macos-15 read a re-author case as "repair the reference store".
+    expect(
+      commands.filter(({ args }) => args[0] === "ls-tree").map(({ repo }) => repo),
+      "ls-tree was never asked about the reference",
+    ).toContain(referenceWorktree)
     // The real cause, and the commit that caused it — derived from the
     // reference's own history, never hardcoded.
     expect(refused.stderr).toContain("d9558f2038")
@@ -504,6 +513,7 @@ describe("materializeSubmodules", () => {
     for (const path of ["hh-web", "ag"]) await mkdir(join(referenceWorktree, path), { recursive: true })
     const removed = "9".repeat(40)
     const cold = "a".repeat(40)
+    const treeReads: string[] = []
     const git: SubmoduleGit = {
       async run(repo, args) {
         if (args[0] === "cat-file" && args.at(-1) === "HEAD:.gitmodules") {
@@ -513,6 +523,7 @@ describe("materializeSubmodules", () => {
           return { ...success(), stdout: "submodule.hh-web.path hh-web\nsubmodule.ag.path ag" }
         }
         if (args[0] === "ls-tree") {
+          treeReads.push(repo)
           const path = args.at(-1)
           // The reference dropped `hh-web` and still carries `ag`. One tree, two
           // classes — the mix a real superproject actually presents.
@@ -537,6 +548,9 @@ describe("materializeSubmodules", () => {
     })
 
     expect(refused.code).toBe(1)
+    // The reference must have been read at the path git reports, or the mock
+    // classifies both misses as cold and the re-author remedy never renders.
+    expect(treeReads, "ls-tree was never asked about the reference").toContain(referenceWorktree)
     // Both remedies present, each attached to the miss it can actually fix.
     expect(refused.stderr).toMatch(/re-author/iu)
     expect(refused.stderr).toContain("Repair the reference store")
@@ -860,12 +874,14 @@ describe("materializeSubmodules", () => {
     let inFlightRemote = 0
     let peakLocal = 0
     let peakRemote = 0
+    const storeProbes: string[] = []
     const git: SubmoduleGit = {
       async run(repo, args) {
         if (args[0] === "cat-file" && args.at(-1) === "HEAD:.gitmodules") {
           return repo === worktree ? success() : { ...success(), code: 1 }
         }
         if (args[0] === "cat-file" && args[1] === "-e") {
+          storeProbes.push(repo)
           // The reference store holds the borrowable pins and lacks the rest.
           return borrowable.some((path) => repo === `${referenceWorktree}/${path}`)
             ? success()
@@ -924,6 +940,12 @@ describe("materializeSubmodules", () => {
       borrowed: 3,
       remoteFallbacks: 3,
     })
+    // Every borrowable store was probed at the path git reports; a probe at an
+    // alias of it misses, and all six updates go to the network — the exact
+    // fan-out this test forbids, reported as `borrowed: 0`.
+    expect(storeProbes, "no borrowable reference store was ever probed").toEqual(
+      expect.arrayContaining(borrowable.map((path) => `${referenceWorktree}/${path}`)),
+    )
     expect(peakLocal).toBe(3)
     expect(peakRemote).toBe(1)
   })

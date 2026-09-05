@@ -4,13 +4,20 @@
  * @consumer Yrd settled candidate preparation and landing
  */
 import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, it } from "vitest"
 import { runCli } from "../src/cli.ts"
 import { superMerge } from "../src/merge.ts"
 import { createLocalGitProcess } from "../src/process.ts"
-import { advanceRepository, createProductFixture, createRepository, git, type ProductFixture } from "./fixture.ts"
+import {
+  advanceRepository,
+  canonicalTmpdir as tmpdir,
+  createProductFixture,
+  createRepository,
+  git,
+  injectionProbe,
+  type ProductFixture,
+} from "./fixture.ts"
 
 const roots: string[] = []
 
@@ -504,20 +511,25 @@ describe("git super merge", () => {
     const candidate = candidateWithRootChange(fixture, "candidate-commit-reported-failure")
     const headBefore = git(fixture.product, "rev-parse", "HEAD")
     const local = createLocalGitProcess()
+    const probe = injectionProbe()
 
     const result = await superMerge({
       repo: fixture.product,
       commit: candidate,
       git: {
         run: async (request) => {
+          probe.observe(request)
           const observed = await local.run(request)
-          return request.repo === fixture.product && request.args[0] === "commit" && observed.code === 0
-            ? { ...observed, code: 23, stderr: "injected failure after commit wrote HEAD" }
-            : observed
+          if (request.repo === fixture.product && request.args[0] === "commit" && observed.code === 0) {
+            probe.fire("commit reported failure after writing HEAD")
+            return { ...observed, code: 23, stderr: "injected failure after commit wrote HEAD" }
+          }
+          return observed
         },
       },
     })
 
+    probe.expectFired("commit reported failure after writing HEAD")
     const merged = git(fixture.product, "rev-parse", "HEAD")
     expect(result).toMatchObject({
       state: "failed",
@@ -570,6 +582,7 @@ describe("git super merge", () => {
     const newestAlpha = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
     const candidate = candidateWithRootChange(fixture, "candidate-rollback-failure")
     const local = createLocalGitProcess()
+    const probe = injectionProbe()
     let commitRejected = false
 
     const result = await superMerge({
@@ -577,8 +590,10 @@ describe("git super merge", () => {
       commit: candidate,
       git: {
         run: async (request) => {
+          probe.observe(request)
           if (request.repo === fixture.product && request.args[0] === "commit") {
             commitRejected = true
+            probe.fire("commit refusal")
             return { code: 23, stdout: "", stderr: "injected commit refusal" }
           }
           if (
@@ -587,6 +602,7 @@ describe("git super merge", () => {
             request.args[0] === "checkout" &&
             request.args.at(-1) === fixture.alphaBase
           ) {
+            probe.fire("rollback refusal")
             return { code: 24, stdout: "", stderr: "injected rollback refusal" }
           }
           return local.run(request)
@@ -594,6 +610,7 @@ describe("git super merge", () => {
       },
     })
 
+    probe.expectFired("commit refusal", "rollback refusal")
     expect(result).toMatchObject({
       state: "failed",
       partial: true,
@@ -650,18 +667,24 @@ describe("git super merge", () => {
     const candidate = candidateWithRootChange(fixture, "candidate-checkout-failure")
     const headBefore = git(fixture.product, "rev-parse", "HEAD")
     const local = createLocalGitProcess()
+    const probe = injectionProbe()
 
     const result = await superMerge({
       repo: fixture.product,
       commit: candidate,
       git: {
-        run: (request) =>
-          request.repo === component && request.args[0] === "checkout" && request.args.at(-1) === newestAlpha
-            ? Promise.resolve({ code: 1, stdout: "", stderr: "injected checkout failure" })
-            : local.run(request),
+        run: (request) => {
+          probe.observe(request)
+          if (request.repo === component && request.args[0] === "checkout" && request.args.at(-1) === newestAlpha) {
+            probe.fire("checkout failure")
+            return Promise.resolve({ code: 1, stdout: "", stderr: "injected checkout failure" })
+          }
+          return local.run(request)
+        },
       },
     })
 
+    probe.expectFired("checkout failure")
     expect(result).toMatchObject({
       state: "failed",
       partial: true,
@@ -697,6 +720,7 @@ describe("git super merge", () => {
     const candidate = candidateWithRootChange(fixture, "candidate-settlement-observation-failure")
     const headBefore = git(fixture.product, "rev-parse", "HEAD")
     const local = createLocalGitProcess()
+    const probe = injectionProbe()
     let settling = false
 
     const result = await superMerge({
@@ -704,6 +728,7 @@ describe("git super merge", () => {
       commit: candidate,
       git: {
         run: async (request) => {
+          probe.observe(request)
           const observed = await local.run(request)
           if (
             request.repo === component &&
@@ -716,6 +741,7 @@ describe("git super merge", () => {
           }
           if (settling && request.repo === component && request.args.join(" ") === "rev-parse HEAD^{commit}") {
             settling = false
+            probe.fire("checkout observation mismatch")
             return { code: 0, stdout: `${fixture.betaBase}\n`, stderr: "" }
           }
           return observed
@@ -723,6 +749,7 @@ describe("git super merge", () => {
       },
     })
 
+    probe.expectFired("checkout observation mismatch")
     expect(result).toMatchObject({
       state: "failed",
       partial: true,
@@ -860,18 +887,24 @@ describe("git super merge", () => {
     git(fixture.product, "switch", "-q", "main")
     const headBefore = git(fixture.product, "rev-parse", "HEAD")
     const local = createLocalGitProcess()
+    const probe = injectionProbe()
 
     const result = await superMerge({
       repo: fixture.product,
       commit: candidate,
       git: {
-        run: (request) =>
-          request.repo === component && request.args[0] === "merge-base"
-            ? Promise.resolve({ code: 128, stdout: "", stderr: "injected ancestry failure" })
-            : local.run(request),
+        run: (request) => {
+          probe.observe(request)
+          if (request.repo === component && request.args[0] === "merge-base") {
+            probe.fire("ancestry probe failure")
+            return Promise.resolve({ code: 128, stdout: "", stderr: "injected ancestry failure" })
+          }
+          return local.run(request)
+        },
       },
     })
 
+    probe.expectFired("ancestry probe failure")
     expect(result).toMatchObject({
       state: "failed",
       partial: false,

@@ -1,6 +1,8 @@
 import { mkdirSync, realpathSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { expect } from "vitest"
+import type { GitProcessRequest } from "../src/process.ts"
 
 /** Git reports physical repository roots; Darwin's tmpdir is commonly a /var alias for /private/var. */
 export function canonicalTmpdir(): string {
@@ -122,4 +124,46 @@ export function bumpNestedAlphaSubmodule(fixture: NestedProductFixture): string 
   git(fixture.product, "add", "packages/alpha")
   git(fixture.product, "commit", "-q", "-m", "bump alpha")
   return git(fixture.product, "rev-parse", "HEAD")
+}
+
+export type InjectionProbe = Readonly<{
+  /** Record every request the wrapper saw, matched or not. */
+  observe(request: GitProcessRequest): void
+  /** Record that the named injection replaced git's answer. */
+  fire(injection: string): void
+  /** Fail by name, listing the repositories git was asked about, when an injection never matched. */
+  expectFired(...injections: readonly string[]): void
+}>
+
+/**
+ * Proof that a failure injection actually fired.
+ *
+ * An injection keyed on `request.repo` compares against the PHYSICAL path git
+ * reports (`rev-parse --show-toplevel`), never the path the test typed. On
+ * Darwin `os.tmpdir()` is `/var/folders/…`, an alias of `/private/var/…`, so a
+ * fixture rooted there never matched: five failure-path merge tests took the
+ * success branch on macos-15 from 2026-08-31 and failed on `state`, two
+ * assertions away from the cause. `canonicalTmpdir` removes the alias; this
+ * probe makes a missed injection fail by its own name, saying which
+ * repositories git was asked about, instead of proving the happy path.
+ */
+export function injectionProbe(): InjectionProbe {
+  const repositories = new Set<string>()
+  const fired = new Map<string, number>()
+  return {
+    observe(request) {
+      repositories.add(request.repo)
+    },
+    fire(injection) {
+      fired.set(injection, (fired.get(injection) ?? 0) + 1)
+    },
+    expectFired(...injections) {
+      for (const injection of injections) {
+        expect(
+          fired.get(injection) ?? 0,
+          `injection "${injection}" never fired; git was asked about: ${[...repositories].sort().join(", ") || "nothing"}`,
+        ).toBeGreaterThan(0)
+      }
+    },
+  }
 }
