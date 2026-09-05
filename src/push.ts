@@ -79,7 +79,13 @@ type CommitRequirement = Readonly<{
   target: string
 }>
 
-type PortablePlanUpdate = Readonly<Omit<RefUpdate, "repository" | "allowNonFastForward"> & { repository: string }>
+type PortablePlanUpdate = Readonly<{
+  repository: string
+  remote: string
+  source: string
+  destination: string
+  expectedDestination: ExpectedDestination
+}>
 
 const DEFAULT_GIT_TIMEOUT_MS = 30_000
 const OBJECT_ID = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/u
