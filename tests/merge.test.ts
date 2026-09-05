@@ -851,6 +851,26 @@ describe("git super merge", () => {
     expect(stderr.output).toContain("shared.txt")
     const detailed = await superMerge({ repo: repository, commit: candidate })
     expect(detailed.detail?.paths).toEqual(["shared.txt"])
+    const local = createLocalGitProcess()
+    const probe = injectionProbe()
+    const mergeTreeStderr = "verbatim merge-tree conflict hint"
+    const detailedWithStderr = await superMerge({
+      repo: repository,
+      commit: candidate,
+      git: {
+        run: async (request) => {
+          const result = await local.run(request)
+          probe.observe(request)
+          if (request.args.includes("merge-tree")) {
+            probe.fire("merge-tree stderr")
+            return { ...result, stderr: mergeTreeStderr }
+          }
+          return result
+        },
+      },
+    })
+    probe.expectFired("merge-tree stderr")
+    expect(detailedWithStderr.detail?.message).toContain(mergeTreeStderr)
     expect(git(repository, "rev-parse", "HEAD")).toBe(headBefore)
     expect(git(repository, "status", "--porcelain=v1")).toBe(statusBefore)
   })

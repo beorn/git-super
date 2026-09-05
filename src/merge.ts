@@ -683,8 +683,12 @@ async function prospectiveTree(
         ? "; Git reported no conflicted paths"
         : ` at ${paths.map((path) => JSON.stringify(path)).join(", ")}`
     return {
-      failure: obviousDetail(
+      failure: resultDetailFromGit(
         "merge-conflict",
+        "preflight-merge",
+        root,
+        args,
+        result,
         `Merge ${target} conflicts with current HEAD ${head}${location}; no commit was written.`,
         `git -C ${root} ${args.join(" ")}`,
         "Resolve the named conflict on the submitted branch, then rerun the same git super merge command.",
