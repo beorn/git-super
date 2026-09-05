@@ -53,6 +53,8 @@ const diff = commandNode<CommandContext, DiffParams, SuperDiffResult>({
       refs: stringArray(input.refs, "refs"),
       ...(input.cached === true ? { cached: true } : {}),
       ...(typeof input.diffFilter === "string" ? { diffFilter: input.diffFilter } : {}),
+      ...(input.stat === true ? { stat: true } : {}),
+      ...(input.patch === true ? { patch: true } : {}),
     }
   }),
   run: (context, input) => superDiff({ repo: context.repo, ...input }),

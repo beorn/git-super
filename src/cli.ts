@@ -239,6 +239,8 @@ export async function runCli(argv: readonly string[], stdout: OutputSink, stderr
     .option("-z, --null", "terminate paths with NUL instead of newline")
     .option("--cached", "compare the index instead of the working tree")
     .option("--diff-filter <letters>", "select paths by Git diff status")
+    .option("--stat", "show per-repository diffstat, including each moved gitlink's own component diff")
+    .option("-p, --patch", "show per-repository patch, including each moved gitlink's own component diff")
     .argument("[refs...]", "Git revision range or refs")
     .action((refs, options, command) => {
       const globals = command.optsWithGlobals() as { repo: string; json?: boolean }
@@ -248,6 +250,8 @@ export async function runCli(argv: readonly string[], stdout: OutputSink, stderr
           refs,
           ...(options.cached ? { cached: true } : {}),
           ...(options.diffFilter === undefined ? {} : { diffFilter: options.diffFilter }),
+          ...(options.stat === true ? { stat: true } : {}),
+          ...(options.patch === true ? { patch: true } : {}),
         },
         json: globals.json === true,
         nul: options.null === true,
@@ -306,6 +310,23 @@ export async function runCli(argv: readonly string[], stdout: OutputSink, stderr
     const diff = result as SuperDiffResult
     if (diff.paths.length > 0) {
       stdout.write(`${diff.paths.join(captured.nul ? "\0" : "\n")}${captured.nul ? "\0" : "\n"}`)
+    }
+    for (const stat of diff.stats ?? []) {
+      stdout.write(`\n== ${stat.repository} ==\n`)
+      for (const file of stat.files) {
+        stdout.write(` ${file.path} | ${file.binary ? "Bin" : `+${file.added} -${file.deleted}`}\n`)
+      }
+      stdout.write(
+        ` ${stat.totals.files} file${stat.totals.files === 1 ? "" : "s"} changed, ` +
+          `${stat.totals.added} insertion${stat.totals.added === 1 ? "" : "s"}(+), ` +
+          `${stat.totals.deleted} deletion${stat.totals.deleted === 1 ? "" : "s"}(-)\n`,
+      )
+      for (const move of stat.pointerMoves) {
+        stdout.write(` ${move.path}: pointer ${move.from.slice(0, 7)} -> ${move.to.slice(0, 7)}\n`)
+      }
+    }
+    for (const patch of diff.patches ?? []) {
+      stdout.write(`\n== ${patch.repository} ==\n${patch.patch}`)
     }
     await writeReport(diff.consultedRepositories, stderr)
   } else if (captured.node === commands.status) {

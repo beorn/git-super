@@ -18,6 +18,7 @@ Git has display flags for submodule diffs, but no native flag that turns gitlink
 
 ```bash
 git super diff --name-only <range>
+git super diff --stat|--patch <range>
 git super status --porcelain
 git super merge-base --is-ancestor <sha> <superproject-ref>
 git super merge <commit> [-m <message>] [--no-verify]

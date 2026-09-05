@@ -15,12 +15,54 @@ export type SuperDiffOptions = Readonly<{
   refs?: readonly string[]
   cached?: boolean
   diffFilter?: string
+  stat?: boolean
+  patch?: boolean
+}>
+
+export type DiffFileStat = Readonly<{
+  /** Relative to the OWNING repository (`repository` below), not the superproject root. */
+  path: string
+  /** `null` (never a fake `0`) for a binary file — a real zero-line text change cannot be told apart from "no count available" otherwise. */
+  added: number | null
+  deleted: number | null
+  binary: boolean
+}>
+
+export type DiffTotals = Readonly<{
+  files: number
+  added: number
+  deleted: number
+}>
+
+/** A gitlink pointer bump inside one repository's OWN diff — excluded from that repository's `files`/`totals` (never counted as product lines) and reported here instead. */
+export type PointerMove = Readonly<{
+  path: string
+  from: string
+  to: string
+}>
+
+export type RepositoryDiffStat = Readonly<{
+  repository: string
+  /** Always present for a moved-gitlink entry (its exact pins). Best-effort for root: parsed from `options.refs` when it is one `a..b`/`a...b` string or exactly two ref args; omitted when root's refs don't resolve to a clean two-endpoint pair (e.g. `--cached`, a working-tree diff, 3+ ref args) rather than reporting a guess. */
+  range?: Readonly<{ from: string; to: string }>
+  files: readonly DiffFileStat[]
+  totals: DiffTotals
+  pointerMoves: readonly PointerMove[]
+}>
+
+export type RepositoryDiffPatch = Readonly<{
+  repository: string
+  range?: Readonly<{ from: string; to: string }>
+  /** Verbatim `git diff -p` text, in that repository's OWN paths — not rewritten to superproject-relative. */
+  patch: string
 }>
 
 export type SuperDiffResult = Readonly<{
   paths: readonly string[]
   deletedPaths: readonly string[]
   consultedRepositories: readonly ConsultedRepository[]
+  stats?: readonly RepositoryDiffStat[]
+  patches?: readonly RepositoryDiffPatch[]
 }>
 
 type RawDiffRow = Readonly<{
@@ -157,6 +199,116 @@ function uniqueRepositories(repositories: readonly ConsultedRepository[]): Consu
   })
 }
 
+/** Best-effort {from,to} for root's own refs: one "a..b"/"a...b" string, or exactly two ref args. Omitted otherwise (--cached, worktree diff, 3+ args) rather than guessing. */
+function rootRange(options: SuperDiffOptions): Readonly<{ from: string; to: string }> | undefined {
+  const refs = options.refs ?? []
+  if (refs.length === 2) {
+    const [from, to] = refs
+    if (from !== undefined && to !== undefined) return { from, to }
+  }
+  if (refs.length === 1 && refs[0] !== undefined) {
+    const match = /^(.+?)\.{2,3}(.+)$/u.exec(refs[0])
+    if (match?.[1] !== undefined && match[2] !== undefined) return { from: match[1], to: match[2] }
+  }
+  return undefined
+}
+
+function entryRange(
+  entry: ConsultedRepository,
+  options: SuperDiffOptions,
+): Readonly<{ from: string; to: string }> | undefined {
+  if (entry.from !== undefined && entry.to !== undefined) return { from: entry.from, to: entry.to }
+  return rootRange(options)
+}
+
+/** Diff args comparing one repository's exact pin move, or (for root) the original options. */
+function rangeArgsFor(entry: ConsultedRepository, options: SuperDiffOptions): string[] {
+  if (entry.from !== undefined && entry.to !== undefined) {
+    return [
+      "--no-renames",
+      ...(options.diffFilter === undefined ? [] : [`--diff-filter=${options.diffFilter}`]),
+      `${entry.from}..${entry.to}`,
+    ]
+  }
+  return commonDiffArgs(options)
+}
+
+/** True when no OTHER consulted repository sits between `entryPath` and `candidatePath` in the nesting tree. */
+function isDirectChild(entryPath: string, candidatePath: string, all: readonly ConsultedRepository[]): boolean {
+  const prefix = entryPath === "." ? "" : `${entryPath}/`
+  if (candidatePath === entryPath || !candidatePath.startsWith(prefix)) return false
+  return !all.some(
+    (other) =>
+      other.path !== entryPath &&
+      other.path !== candidatePath &&
+      other.path.startsWith(prefix) &&
+      candidatePath.startsWith(`${other.path}/`),
+  )
+}
+
+/** This repository's OWN direct gitlink children that moved — excluded from ITS `files`/`totals`, reported separately so gitlink SHA churn is never counted as product lines. */
+function pointerMovesFor(entry: ConsultedRepository, all: readonly ConsultedRepository[]): PointerMove[] {
+  const prefix = entry.path === "." ? "" : `${entry.path}/`
+  return all
+    .filter((candidate): candidate is ConsultedRepository & { from: string; to: string } => {
+      return (
+        candidate.from !== undefined && candidate.to !== undefined && isDirectChild(entry.path, candidate.path, all)
+      )
+    })
+    .map((candidate) => ({ path: candidate.path.slice(prefix.length), from: candidate.from, to: candidate.to }))
+}
+
+function parseNumstat(
+  raw: string,
+): readonly Readonly<{ path: string; added: number | null; deleted: number | null; binary: boolean }>[] {
+  return nulFields(raw).map((record) => {
+    const match = /^(-|\d+)\t(-|\d+)\t([\s\S]*)$/u.exec(record)
+    if (!match || match[1] === undefined || match[2] === undefined || match[3] === undefined) {
+      throw new Error(`git super: malformed numstat row ${JSON.stringify(record)}`)
+    }
+    const [, added, deleted, path] = match
+    const binary = added === "-" || deleted === "-"
+    return { path, added: binary ? null : Number(added), deleted: binary ? null : Number(deleted), binary }
+  })
+}
+
+function computeRepositoryStat(
+  entry: ConsultedRepository,
+  options: SuperDiffOptions,
+  all: readonly ConsultedRepository[],
+): RepositoryDiffStat {
+  const pointerMoves = pointerMovesFor(entry, all)
+  const excluded = new Set(pointerMoves.map((move) => move.path))
+  const raw = runGit(entry.root, ["diff", "--numstat", "-z", ...rangeArgsFor(entry, options)])
+  const files = parseNumstat(raw).filter((file) => !excluded.has(file.path))
+  const totals = files.reduce<{ files: number; added: number; deleted: number }>(
+    (accumulator, file) => ({
+      files: accumulator.files + 1,
+      added: accumulator.added + (file.added ?? 0),
+      deleted: accumulator.deleted + (file.deleted ?? 0),
+    }),
+    { files: 0, added: 0, deleted: 0 },
+  )
+  const range = entryRange(entry, options)
+  return {
+    repository: entry.path,
+    ...(range === undefined ? {} : { range }),
+    files,
+    totals,
+    pointerMoves,
+  }
+}
+
+function computeRepositoryPatch(entry: ConsultedRepository, options: SuperDiffOptions): RepositoryDiffPatch {
+  const patch = runGit(entry.root, ["diff", "-p", ...rangeArgsFor(entry, options)])
+  const range = entryRange(entry, options)
+  return {
+    repository: entry.path,
+    ...(range === undefined ? {} : { range }),
+    patch,
+  }
+}
+
 export function superDiff(options: SuperDiffOptions): SuperDiffResult {
   const root = repositoryRoot(options.repo)
   const consulted = { path: ".", root } as const
@@ -176,10 +328,17 @@ export function superDiff(options: SuperDiffOptions): SuperDiffResult {
     diffFilter: "D",
     consulted,
   })
+  const consultedRepositories = uniqueRepositories([...changed.consultedRepositories, ...deleted.consultedRepositories])
 
   return {
     paths: [...new Set(changed.entries.map(({ path }) => path))].sort(),
     deletedPaths: [...new Set(deleted.entries.map(({ path }) => path))].sort(),
-    consultedRepositories: uniqueRepositories([...changed.consultedRepositories, ...deleted.consultedRepositories]),
+    consultedRepositories,
+    ...(options.stat === true
+      ? { stats: consultedRepositories.map((entry) => computeRepositoryStat(entry, options, consultedRepositories)) }
+      : {}),
+    ...(options.patch === true
+      ? { patches: consultedRepositories.map((entry) => computeRepositoryPatch(entry, options)) }
+      : {}),
   }
 }
