@@ -91,6 +91,20 @@ Unrelated staged, tracked, untracked, and ignored files survive. A path the inco
 
 Hooks, credential helpers, and remote helpers stay native Git behavior. A timeout, a rejected hook, an unreachable remote, an unreadable response, or a post-write check that disagrees is never turned into an empty or successful result. Selecting no refs at all is an input error with an explanation, not a silent success. Push is covered by `tests/push.test.ts`.
 
+### Landing across repositories
+
+Gerrit's cross-repository topics and Aviator's ChangeSets each group several repositories' changes into one submission gesture, but neither documents an atomic guarantee once repositories start merging independently. Gerrit: a same-repository topic submits atomically, while a multi-repository topic can fail into a partial submission ([cross-repository-changes](https://gerrit-review.googlesource.com/Documentation/cross-repository-changes.html)); Gerrit documents compensating revert commits, reviewed and submitted normally, but it does not guarantee automatic rollback of a partial multi-repository submission. Aviator: a ChangeSet is validated as a whole and fails before merging if any check fails, but partial-merge behavior once some repositories in a set have already merged isn't documented ([ChangeSets](https://docs.aviator.co/mergequeue/concepts/changesets)). git-super does not claim an automatic cross-repository rollback guarantee either; see [Yrd's own README](https://github.com/beorn/yrd#readme) for submission policy, which this section does not repeat.
+
+**Present today.** `git super merge` already classifies an incoming gitlink pin against the component's freshly fetched main and refuses outright (`gitlink-off-main`) rather than land a pin main doesn't contain (`src/merge.ts`). `git super push --recurse-submodules=on-demand` already applies remote ref updates child-first, root-last (`src/push.ts:542,1095`). The two are not wired together yet: advancing a component's own main today still takes a separate `git super push`, not an automatic consequence of a root merge.
+
+**The M8.5 target (not yet shipped).** A future landing settles a change's pins one of three ways, worked here as K1/K2/K3 — labels scoped to this example, not a naming standard:
+
+- **K1 — the pin descends from main.** Component main (A) is an ancestor of the authored pin (P); landing fast-forwards main from A to P, pushing the author's commits there before the root's gitlink moves.
+- **K2 — main already contains the pin.** The authored pin (P) is an ancestor of a newer main (A); nothing is pushed, and the merged root takes A, the component's current main, as its pin.
+- **K3 — diverged.** Neither is an ancestor of the other; landing fails "component main moved," and the author rebases before resubmitting.
+
+Landing also adds a journal, so a run killed between the component push and the root push recovers on restart with no hand step, and a required per-component `landing: product|external` key: `external` components keep their own release identity and are never raised or pushed by this flow. None of this — the fast-forward action, the journal, or the `landing:` key — exists as working code or config yet; do not configure against it.
+
 ### Worktree with submodules
 
 `worktree add <path> <commit>` creates a detached worktree and materializes every gitlink at the pins that commit records. It is one program for the whole operation, because `git worktree add` alone leaves every submodule an empty directory and the recursive checkout that fills them is where callers reimplement borrowing, fallback limits, and rollback slightly differently each time.
