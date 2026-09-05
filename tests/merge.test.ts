@@ -45,7 +45,7 @@ function candidateWithRootChange(fixture: ProductFixture, name: string): string 
 }
 
 describe("git super merge", () => {
-  it("refuses moved off-main pins, reports untouched off-main pins, and raises behind pins", async () => {
+  it("keeps authored-ahead pins, reports untouched off-main pins, and raises behind pins", async () => {
     const refusedRoot = mkdtempSync(join(tmpdir(), "git-super-merge-refused-"))
     roots.push(refusedRoot)
     const refused = createProductFixture(refusedRoot)
@@ -60,50 +60,32 @@ describe("git super merge", () => {
     const refusedCandidate = git(refused.product, "rev-parse", "HEAD")
     git(refused.product, "switch", "-q", "main")
     git(refusedAlpha, "switch", "-q", "--detach", refused.alphaBase)
-    const refusedHeadBefore = git(refused.product, "rev-parse", "HEAD")
-    const refusedStatusBefore = git(refused.product, "status", "--porcelain=v1")
-    const refusedStdout = outputSink()
-    const refusedStderr = outputSink()
+    const kept = await superMerge({ repo: refused.product, commit: refusedCandidate, message: "merge candidate" })
 
-    const refusedCode = await runCli(
-      ["--repo", refused.product, "merge", refusedCandidate, "-m", "merge candidate"],
-      refusedStdout,
-      refusedStderr,
-    )
-
-    expect(refusedCode).toBe(1)
-    expect(refusedStdout.output).toBe("")
-    expect(refusedStderr.output).toContain("gitlink-off-main")
-    expect(refusedStderr.output).toContain("packages/alpha")
-    expect(refusedStderr.output).toContain(unpublished)
-    expect(refusedStderr.output).toContain(refused.alphaBase)
-    expect(refusedStderr.output).toContain("evidence:")
-    expect(refusedStderr.output).toContain("next:")
-    expect(refusedStderr.output).toContain("owner: the component writer")
-    expect(git(refused.product, "rev-parse", "HEAD")).toBe(refusedHeadBefore)
-    expect(git(refused.product, "status", "--porcelain=v1")).toBe(refusedStatusBefore)
-
-    const refusedJsonStdout = outputSink()
-    const refusedJsonStderr = outputSink()
-    expect(
-      await runCli(
-        ["--repo", refused.product, "--json", "merge", refusedCandidate, "-m", "merge candidate"],
-        refusedJsonStdout,
-        refusedJsonStderr,
-      ),
-    ).toBe(1)
-    expect(refusedJsonStderr.output).toBe("")
-    expect(JSON.parse(refusedJsonStdout.output)).toMatchObject({
-      state: "failed",
+    expect(kept).toMatchObject({
+      state: "updated",
       partial: false,
-      detail: {
-        code: "gitlink-off-main",
-        subject: expect.stringContaining("packages/alpha"),
-        evidence: expect.stringContaining("merge-base --is-ancestor"),
-        next: expect.stringContaining("Push"),
-        owner: "the component writer",
-      },
+      gitlinks: [
+        {
+          path: "packages/alpha",
+          from: unpublished,
+          to: refused.alphaBase,
+          state: "kept-ahead",
+        },
+      ],
+      checkouts: [
+        {
+          path: "packages/alpha",
+          recorded: refused.alphaBase,
+          index: unpublished,
+          checkout: unpublished,
+          state: "settled",
+        },
+      ],
     })
+    expect(git(refused.product, "ls-tree", "HEAD", "packages/alpha")).toContain(unpublished)
+    expect(git(refusedAlpha, "rev-parse", "HEAD")).toBe(unpublished)
+    expect(git(refused.product, "status", "--porcelain=v1")).toBe("")
 
     const leftRoot = mkdtempSync(join(tmpdir(), "git-super-merge-left-off-main-"))
     roots.push(leftRoot)
@@ -155,6 +137,44 @@ describe("git super merge", () => {
     )
     expect(git(raised.product, "ls-tree", "HEAD", "packages/alpha")).toContain(newestAlpha)
     expect(git(raised.product, "show", "-s", "--format=%B", "HEAD")).toContain(`Settled: packages/alpha@${newestAlpha}`)
+  })
+
+  it("refuses a changed gitlink that diverged from component main before writing", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-component-main-moved-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const component = join(fixture.product, "packages/alpha")
+    git(fixture.product, "switch", "-q", "-c", "candidate-diverged")
+    writeFileSync(join(component, "alpha.ts"), "export const alpha = 'authored'\n")
+    git(component, "add", "alpha.ts")
+    git(component, "commit", "-q", "-m", "author alpha pin")
+    const authored = git(component, "rev-parse", "HEAD")
+    git(fixture.product, "add", "packages/alpha")
+    git(fixture.product, "commit", "-q", "-m", "pin authored alpha")
+    const candidate = git(fixture.product, "rev-parse", "HEAD")
+    git(fixture.product, "switch", "-q", "main")
+    git(component, "switch", "-q", "--detach", fixture.alphaBase)
+    const movedMain = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 'moved main'\n")
+    const headBefore = git(fixture.product, "rev-parse", "HEAD")
+    const indexBefore = git(fixture.product, "write-tree")
+    const statusBefore = git(fixture.product, "status", "--porcelain=v1")
+    const checkoutBefore = git(component, "rev-parse", "HEAD")
+
+    const result = await superMerge({ repo: fixture.product, commit: candidate })
+
+    expect(result).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: {
+        code: "component-main-moved",
+        subject: expect.stringContaining("packages/alpha"),
+        objectIds: expect.arrayContaining([authored, movedMain]),
+      },
+    })
+    expect(git(fixture.product, "rev-parse", "HEAD")).toBe(headBefore)
+    expect(git(fixture.product, "write-tree")).toBe(indexBefore)
+    expect(git(fixture.product, "status", "--porcelain=v1")).toBe(statusBefore)
+    expect(git(component, "rev-parse", "HEAD")).toBe(checkoutBefore)
   })
 
   it("preserves the queue record trailer block when it adds Settled trailers", async () => {

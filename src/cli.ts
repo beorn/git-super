@@ -323,9 +323,11 @@ export async function runCli(argv: readonly string[], stdout: OutputSink, stderr
       stderr.write(
         gitlink.state === "raised"
           ? `${gitlink.path} ${gitlink.from.slice(0, 7)} -> ${gitlink.to.slice(0, 7)} (component main)\n`
-          : gitlink.state === "left-off-main"
-            ? `left-off-main ${gitlink.path} ${gitlink.from} (component main ${gitlink.to})\n`
-            : `not-run ${gitlink.path} ${gitlink.from} -> ${gitlink.to} (component main)\n`,
+          : gitlink.state === "kept-ahead"
+            ? `${gitlink.path} kept at ${gitlink.from.slice(0, 7)} (ahead of component main ${gitlink.to.slice(0, 7)})\n`
+            : gitlink.state === "left-off-main"
+              ? `left-off-main ${gitlink.path} ${gitlink.from} (component main ${gitlink.to})\n`
+              : `not-run ${gitlink.path} ${gitlink.from} -> ${gitlink.to} (component main)\n`,
       )
     }
     if (merge.partial) {
