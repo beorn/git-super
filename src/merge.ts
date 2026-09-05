@@ -213,7 +213,19 @@ async function mergeUnderLock(
   )
   if (statusFailure !== undefined) return failed(root, [], statusFailure, preparedRows)
 
-  const mergeArgs = ["merge", "--no-ff", "--no-commit", ...(options.noVerify === true ? ["--no-verify"] : []), target]
+  // Interim for alternate-backed worktree modules: Git 2.55 can treat a split
+  // commit-graph read failure as a submodule conflict. Keep this on both the
+  // preflight and application paths until the minimal reproduction below no
+  // longer diverges with core.commitGraph enabled.
+  const mergeArgs = [
+    "-c",
+    "core.commitGraph=false",
+    "merge",
+    "--no-ff",
+    "--no-commit",
+    ...(options.noVerify === true ? ["--no-verify"] : []),
+    target,
+  ]
   const merged = await run(git, root, mergeArgs, timeoutMs)
   if (merged.code !== 0) {
     return mergeApplicationFailure(git, root, head, target, mergeArgs, merged, timeoutMs)
@@ -634,10 +646,37 @@ async function prospectiveTree(
   target: string,
   timeoutMs: number,
 ): Promise<Readonly<{ tree: string }> | Readonly<{ failure: GitResultDetail }>> {
-  const args = ["merge-tree", "--write-tree", "--name-only", "-z", "--no-messages", head, target]
+  const args = [
+    "-c",
+    "core.commitGraph=false",
+    "merge-tree",
+    "--write-tree",
+    "--name-only",
+    "-z",
+    "--no-messages",
+    head,
+    target,
+  ]
   const result = await run(git, root, args, timeoutMs)
   const [tree, ...paths] = nulRecords(result.stdout)
   if (result.code === 0 && tree !== undefined && OBJECT_ID.test(tree)) return { tree }
+  const unreadable = /(?:^|\n)error: Could not read ([0-9a-f]{40,64})(?:\r?$|\s)/imu.exec(result.stderr)?.[1]
+  if (unreadable !== undefined) {
+    return {
+      failure: resultDetailFromGit(
+        "component-history-unreadable",
+        "preflight-merge",
+        root,
+        args,
+        result,
+        `The prospective merge of ${target} into ${head} could not read component history object ${unreadable}; no commit was written.`,
+        `git -C ${root} ${args.join(" ")}`,
+        "Repair the named object or its commit graph, then rerun the same git super merge command.",
+        "the caller",
+        { objectIds: [head, target, unreadable] },
+      ),
+    }
+  }
   if (result.code === 1) {
     const location =
       paths.length === 0

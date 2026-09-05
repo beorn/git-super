@@ -213,7 +213,7 @@ describe("git super merge", () => {
     })
 
     expect(result).toMatchObject({ state: "updated", partial: false })
-    expect(commands.filter(([command]) => command === "merge")).toEqual([
+    expect(commands.filter((command) => command.includes("merge"))).toEqual([
       expect.arrayContaining(["merge", "--no-ff", "--no-commit", candidate]),
     ])
     expect(commands.filter(([command]) => command === "commit")).toEqual([
@@ -855,6 +855,101 @@ describe("git super merge", () => {
     expect(git(repository, "status", "--porcelain=v1")).toBe(statusBefore)
   })
 
+  it("disables commit graphs when alternate-backed worktree history makes a clean gitlink merge unreadable", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-stale-commit-graph-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const targetAlpha = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
+    const productAlpha = join(fixture.product, "packages/alpha")
+    git(productAlpha, "fetch", "-q", "origin")
+    git(fixture.product, "switch", "-q", "-c", "candidate-graph-target")
+    git(productAlpha, "checkout", "-q", targetAlpha)
+    git(fixture.product, "add", "packages/alpha")
+    git(fixture.product, "commit", "-q", "-m", "advance alpha on target")
+    const target = git(fixture.product, "rev-parse", "HEAD")
+    git(fixture.product, "switch", "-q", "main")
+    git(productAlpha, "checkout", "-q", fixture.alphaBase)
+
+    const worktree = join(fixtureRoot, "worktree")
+    const addedStdout = outputSink()
+    const addedStderr = outputSink()
+    expect(
+      await runCli(["--repo", fixture.product, "worktree", "add", worktree, "HEAD"], addedStdout, addedStderr),
+    ).toBe(0)
+    const worktreeAlpha = join(worktree, "packages/alpha")
+    git(worktree, "switch", "-q", "-c", "newer-than-graph")
+    git(worktreeAlpha, "checkout", "-q", targetAlpha)
+    git(worktreeAlpha, "commit-graph", "write", "--reachable", "--split")
+    writeFileSync(join(worktreeAlpha, "alpha.ts"), "export const alpha = 3\n")
+    git(worktreeAlpha, "add", "alpha.ts")
+    git(worktreeAlpha, "commit", "-q", "-m", "first alpha commit after graph")
+    writeFileSync(join(worktreeAlpha, "alpha.ts"), "export const alpha = 4\n")
+    git(worktreeAlpha, "commit", "-q", "-am", "second alpha commit after graph")
+    const newerAlpha = git(worktreeAlpha, "rev-parse", "HEAD")
+    git(worktree, "add", "packages/alpha")
+    git(worktree, "commit", "-q", "-m", "pin alpha newer than graph")
+    const head = git(worktree, "rev-parse", "HEAD")
+    const local = createLocalGitProcess()
+
+    const graphOn = await local.run({
+      repo: worktree,
+      args: ["-c", "core.commitGraph=true", "merge-tree", "--write-tree", "--name-only", head, target],
+    })
+    const graphOff = await local.run({
+      repo: worktree,
+      args: ["-c", "core.commitGraph=false", "merge-tree", "--write-tree", "--name-only", head, target],
+    })
+
+    expect(graphOn.code).toBe(1)
+    expect(graphOn.stderr).toContain("Could not read")
+    expect(`${graphOn.stdout}\n${graphOn.stderr}`).toContain("CONFLICT (submodule): Merge conflict in packages/alpha")
+    expect(graphOff.code).toBe(0)
+    expect(graphOff.stderr).toBe("")
+
+    const result = await superMerge({ repo: worktree, commit: target })
+
+    expect(result.state).toBe("updated")
+    expect(result.partial).toBe(false)
+    expect(git(worktree, "ls-tree", "HEAD", "packages/alpha")).toContain(newerAlpha)
+  })
+
+  it("reports an unreadable merge-tree object with its stderr and sha instead of a merge conflict", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-unreadable-history-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const candidate = candidateWithRootChange(fixture, "candidate-unreadable-history")
+    const local = createLocalGitProcess()
+    const probe = injectionProbe()
+    const unreadable = "a".repeat(40)
+
+    const result = await superMerge({
+      repo: fixture.product,
+      commit: candidate,
+      git: {
+        run: (request) => {
+          probe.observe(request)
+          if (request.repo === fixture.product && request.args.includes("merge-tree")) {
+            probe.fire("unreadable merge-tree object")
+            return Promise.resolve({
+              code: 1,
+              stdout: "",
+              stderr: `error: Could not read ${unreadable}`,
+            })
+          }
+          return local.run(request)
+        },
+      },
+    })
+
+    probe.expectFired("unreadable merge-tree object")
+    expect(result.state).toBe("failed")
+    expect(result.partial).toBe(false)
+    expect(result.detail?.code).toBe("component-history-unreadable")
+    expect(result.detail?.message).toContain(`error: Could not read ${unreadable}`)
+    expect(result.detail?.objectIds).toContain(unreadable)
+    expect(result.detail?.message).not.toContain("merge-conflict")
+  })
+
   it("refuses an unreadable component main before merging and names the resource", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-unreadable-main-"))
     roots.push(fixtureRoot)
@@ -1008,7 +1103,7 @@ describe("git super merge", () => {
       git: {
         run: async (request) => {
           const observed = await local.run(request)
-          if (request.args[0] === "merge" && observed.code === 0) merged = true
+          if (request.args.includes("merge") && observed.code === 0) merged = true
           if (merged && request.args.join(" ") === "rev-parse HEAD^{commit}") {
             return { code: 1, stdout: "", stderr: "injected observation failure" }
           }
