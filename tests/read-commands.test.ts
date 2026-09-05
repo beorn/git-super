@@ -170,6 +170,38 @@ describe("Phase 1 read commands", () => {
     ).toThrow("no consulted repository owns commit")
   })
 
+  test("merge-base resolves a ref name in the named repository, not in a nested submodule that carries the same name", () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-ref-name-ancestor-"))
+    roots.push(fixtureRoot)
+    const fixture = addNestedAlphaSubmodule(createProductFixture(fixtureRoot))
+    const alphaCheckout = join(fixture.product, "packages/alpha")
+    const alphaHead = git(alphaCheckout, "rev-parse", "HEAD")
+
+    // THE PRECONDITION: the named repository and its nested submodule BOTH
+    // resolve `origin/main`, to unrelated commits. A ref name is not an
+    // object id; searching the name across the consulted repositories found
+    // an owner in each and refused as ambiguous, so a comparison against a
+    // ref name failed in every repository with a nested submodule.
+    expect(git(alphaCheckout, "rev-parse", "--verify", "origin/main")).toBe(alphaHead)
+    expect(git(join(alphaCheckout, "apps/maddoc"), "rev-parse", "--verify", "origin/main")).toBe(fixture.leafBase)
+
+    const result = superIsAncestor({ repo: alphaCheckout, ancestor: "origin/main", descendant: alphaHead })
+
+    expect(result.owningRepository).toBe(".")
+    expect(result.comparedTo).toBe(alphaHead)
+    expect(result.isAncestor).toBe(true)
+  })
+
+  test("merge-base refuses, by name, a ref the named repository does not resolve", () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-ref-name-missing-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+
+    expect(() =>
+      superIsAncestor({ repo: fixture.product, ancestor: "origin/no-such-branch", descendant: fixture.productBase }),
+    ).toThrow("origin/no-such-branch is not an object id and does not resolve in")
+  })
+
   test("dispatches through the Silvery command tree and preserves JSON and NUL output parity", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-cli-"))
     roots.push(fixtureRoot)
