@@ -86,7 +86,8 @@ const mergeBase = commandNode<CommandContext, MergeBaseParams, SuperIsAncestorRe
 
 const merge = commandNode<CommandContext, MergeParams, SuperMergeResult>({
   title: "Merge and settle a superproject",
-  description: "Merge one commit, stage component-main gitlinks, settle their checkouts, then commit once.",
+  description:
+    "Merge one commit, reconcile direct gitlinks with component main, settle their checkouts, then commit once.",
   params: params(
     (value) => {
       const input = record(value)
@@ -97,6 +98,7 @@ const merge = commandNode<CommandContext, MergeParams, SuperMergeResult>({
       return {
         commit: input.commit,
         ...(input.message === undefined ? {} : { message: input.message }),
+        pinAsWritten: stringArray(input.pinAsWritten, "pinAsWritten"),
         ...(input.noVerify === true ? { noVerify: true } : {}),
       }
     },
