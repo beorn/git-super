@@ -207,26 +207,16 @@ describe("git super merge", () => {
     const divergedStderr = outputSink()
     expect(
       await runCli(
-        ["--repo", diverged.product, "--json", "merge", divergedCandidate, "--pin-as-written", "packages/alpha"],
+        ["--repo", diverged.product, "merge", divergedCandidate, "--pin-as-written", "packages/alpha"],
         divergedStdout,
         divergedStderr,
       ),
     ).toBe(0)
-    const keptDiverged = JSON.parse(divergedStdout.output)
 
-    expect(divergedStderr.output).toBe("")
-    expect(keptDiverged).toMatchObject({
-      state: "updated",
-      partial: false,
-      gitlinks: [
-        {
-          path: "packages/alpha",
-          from: divergedPin,
-          to: movedMain,
-          state: "as-written",
-        },
-      ],
-    })
+    expect(divergedStdout.output).toBe(`${git(diverged.product, "rev-parse", "HEAD")}\n`)
+    expect(divergedStderr.output).toContain(
+      `packages/alpha kept as written at ${divergedPin.slice(0, 7)} (component main ${movedMain.slice(0, 7)})`,
+    )
     expect(git(diverged.product, "ls-tree", "HEAD", "packages/alpha")).toContain(divergedPin)
     expect(git(divergedComponent, "rev-parse", "HEAD")).toBe(divergedPin)
     expect(git(diverged.product, "show", "-s", "--format=%B", "HEAD")).toContain(
@@ -249,12 +239,18 @@ describe("git super merge", () => {
     git(unreachableComponent, "switch", "-q", "--detach", unreachable.alphaBase)
     git(unreachableComponent, "remote", "set-url", "origin", join(unreachableRoot, "absent.git"))
 
-    const keptUnreachable = await superMerge({
-      repo: unreachable.product,
-      commit: unreachableCandidate,
-      pinAsWritten: ["packages/alpha"],
-    })
+    const unreachableStdout = outputSink()
+    const unreachableStderr = outputSink()
+    expect(
+      await runCli(
+        ["--repo", unreachable.product, "--json", "merge", unreachableCandidate, "--pin-as-written", "packages/alpha"],
+        unreachableStdout,
+        unreachableStderr,
+      ),
+    ).toBe(0)
+    const keptUnreachable = JSON.parse(unreachableStdout.output)
 
+    expect(unreachableStderr.output).toBe("")
     expect(keptUnreachable).toMatchObject({
       state: "updated",
       partial: false,
@@ -357,6 +353,51 @@ describe("git super merge", () => {
         paths: ["packages/alpha"],
         objectIds: [authored],
       },
+    })
+    expect(git(fixture.product, "rev-parse", "HEAD")).toBe(headBefore)
+    expect(git(fixture.product, "write-tree")).toBe(indexBefore)
+  })
+
+  it("fails before writing when as-written component-main inspection throws unexpectedly", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-as-written-unexpected-fetch-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const component = join(fixture.product, "packages/alpha")
+    git(fixture.product, "switch", "-q", "-c", "candidate-as-written-unexpected-fetch")
+    writeFileSync(join(component, "alpha.ts"), "export const alpha = 'unexpected fetch'\n")
+    git(component, "add", "alpha.ts")
+    git(component, "commit", "-q", "-m", "author as-written alpha pin")
+    git(fixture.product, "add", "packages/alpha")
+    git(fixture.product, "commit", "-q", "-m", "pin as-written alpha")
+    const candidate = git(fixture.product, "rev-parse", "HEAD")
+    git(fixture.product, "switch", "-q", "main")
+    git(component, "switch", "-q", "--detach", fixture.alphaBase)
+    const headBefore = git(fixture.product, "rev-parse", "HEAD")
+    const indexBefore = git(fixture.product, "write-tree")
+    const local = createLocalGitProcess()
+    const probe = injectionProbe()
+
+    const result = await superMerge({
+      repo: fixture.product,
+      commit: candidate,
+      pinAsWritten: ["packages/alpha"],
+      git: {
+        run: (request) => {
+          probe.observe(request)
+          if (request.repo === component && request.args[0] === "fetch") {
+            probe.fire("unexpected component-main inspection throw")
+            throw new Error("injected adapter crash")
+          }
+          return local.run(request)
+        },
+      },
+    })
+
+    probe.expectFired("unexpected component-main inspection throw")
+    expect(result).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: { code: "unexpected-error", phase: "inspect-gitlinks" },
     })
     expect(git(fixture.product, "rev-parse", "HEAD")).toBe(headBefore)
     expect(git(fixture.product, "write-tree")).toBe(indexBefore)

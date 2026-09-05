@@ -769,12 +769,14 @@ async function planGitlinks(
           })
         }
       } catch (error) {
+        const detail = resultError(error, "read-component-main")
+        if (detail.code !== "component-main-unreadable") throw error
         plans.push({
           path: entry.path,
           from: entry.target,
           state: "as-written",
           changedByMerge,
-          detail: resultError(error, "read-component-main"),
+          detail,
         })
       }
       continue
