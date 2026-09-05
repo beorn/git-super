@@ -128,8 +128,12 @@ const push = commandNode<CommandContext, PushParams, GitSuperResult>({
   description: "Check or publish exact submodule commits before updating root refs.",
   params: params((value) => {
     const input = record(value)
-    const recurseSubmodules = input.recurseSubmodules
+    const plan = input.plan
+    if (plan !== undefined && typeof plan !== "string") throw new Error("plan must be a string")
+    const recurseSubmodules =
+      input.recurseSubmodules === undefined && plan === undefined ? "check" : input.recurseSubmodules
     if (
+      recurseSubmodules !== undefined &&
       recurseSubmodules !== "check" &&
       recurseSubmodules !== "on-demand" &&
       recurseSubmodules !== "only" &&
@@ -142,7 +146,8 @@ const push = commandNode<CommandContext, PushParams, GitSuperResult>({
       throw new Error("signed must be true, false, or if-asked")
     }
     return {
-      recurseSubmodules,
+      ...(typeof plan === "string" ? { plan } : {}),
+      ...(recurseSubmodules === undefined ? {} : { recurseSubmodules }),
       ...(typeof input.remote === "string" ? { remote: input.remote } : {}),
       refspecs: stringArray(input.refspecs, "refspecs"),
       ...(input.atomic === true ? { atomic: true } : {}),

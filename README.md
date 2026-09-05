@@ -86,7 +86,27 @@ Unrelated staged, tracked, untracked, and ignored files survive. A path the inco
 - `only` publishes the nested commits and leaves root refs untouched.
 - `no` pushes only the selected root refs.
 
+`--plan <path|->` skips refspec and submodule-policy planning and applies one frozen JSON document:
+
+```json
+{
+  "updates": [
+    {
+      "repository": "child",
+      "remote": "origin",
+      "source": "<full-oid>",
+      "destination": "main",
+      "expectedDestination": { "state": "oid", "oid": "<full-oid>" }
+    }
+  ]
+}
+```
+
+`repository` is `.` for the root or one exact root-relative direct gitlink path recorded by root `HEAD`. Sources and `oid` expectations are full object IDs; a bare destination such as `main` becomes `refs/heads/main`, and a missing destination uses `{"state":"missing"}`. Positional remotes/refspecs, `--recurse-submodules`, and `--force-with-lease` conflict with `--plan`; transport flags still apply to every repository group.
+
 `--atomic` is passed separately to each single-repository push. **It never makes several repositories atomic.** A child may stay published when a later root hook or remote rejects; the result then reports `partial: true`. Hooks run unless `--no-verify` is explicit. Signed-push mode and push options pass through unchanged.
+
+Rerunning the same frozen plan is idempotent: a destination already equal to its source is `unchanged`, even when its original expectation names the pre-push object. A different destination is `destination-changed`, and every later repository is `not-run`; Git Super never rolls an earlier successful group back.
 
 Hooks, credential helpers, and remote helpers stay native Git behavior. A timeout, a rejected hook, an unreachable remote, an unreadable response, or a post-write check that disagrees is never turned into an empty or successful result. Selecting no refs at all is an input error with an explanation, not a silent success. Push is covered by `tests/push.test.ts`.
 

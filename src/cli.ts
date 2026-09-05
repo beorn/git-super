@@ -138,8 +138,8 @@ export async function runCli(argv: readonly string[], stdout: OutputSink, stderr
     .option(
       "--recurse-submodules <check|on-demand|only|no>",
       "check requires commits on at least one submodule remote; on-demand publishes missing submodules before the root; only publishes submodules; no updates only root refs",
-      "check",
     )
+    .option("--plan <path|->", "read exact root-relative multi-repository ref updates from one JSON document")
     .option("--atomic", "request an atomic update only within each one remote repository")
     .option(
       "--force-with-lease <ref:expect>",
@@ -162,7 +162,10 @@ export async function runCli(argv: readonly string[], stdout: OutputSink, stderr
       captured = {
         node: commands.push,
         params: {
-          recurseSubmodules: (options.recurseSubmodules ?? "check") as PushParams["recurseSubmodules"],
+          ...(typeof options.plan === "string" ? { plan: options.plan } : {}),
+          ...(options.recurseSubmodules === undefined
+            ? {}
+            : { recurseSubmodules: options.recurseSubmodules as NonNullable<PushParams["recurseSubmodules"]> }),
           ...(typeof remote === "string" ? { remote } : {}),
           refspecs,
           ...(options.atomic === true ? { atomic: true } : {}),
