@@ -452,7 +452,7 @@ async function validateWorktreeStatus(
 ): Promise<GitResultDetail | undefined> {
   const alreadySettled = plans.filter((plan) => plan.preCheckout === plan.index)
   const allowedRootRecords = new Set(alreadySettled.map((plan) => ` M ${plan.path}`))
-  const unexpectedRootRecords = statusRecords(status).filter((record) => !allowedRootRecords.has(record))
+  const unexpectedRootRecords = nulRecords(status).filter((record) => !allowedRootRecords.has(record))
   if (unexpectedRootRecords.length > 0) return dirtyWorktreeDetail(root, commit, unexpectedRootRecords)
 
   for (const plan of alreadySettled) {
@@ -462,7 +462,7 @@ async function validateWorktreeStatus(
     if (componentStatus.code !== 0) {
       return resultDetailFromGit("git-failed", "verify-clean", component, args, componentStatus)
     }
-    const componentRecords = statusRecords(componentStatus.stdout)
+    const componentRecords = nulRecords(componentStatus.stdout)
     if (componentRecords.length > 0) {
       return dirtyWorktreeDetail(
         root,
@@ -474,8 +474,8 @@ async function validateWorktreeStatus(
   return undefined
 }
 
-function statusRecords(status: string): string[] {
-  return status.split("\0").filter(Boolean)
+function nulRecords(output: string): string[] {
+  return output.split("\0").filter(Boolean)
 }
 
 function dirtyWorktreeDetail(root: string, commit: string, paths: readonly string[]): GitResultDetail {
@@ -634,19 +634,23 @@ async function prospectiveTree(
   target: string,
   timeoutMs: number,
 ): Promise<Readonly<{ tree: string }> | Readonly<{ failure: GitResultDetail }>> {
-  const args = ["merge-tree", "--write-tree", "--messages", head, target]
+  const args = ["merge-tree", "--write-tree", "--name-only", "-z", "--no-messages", head, target]
   const result = await run(git, root, args, timeoutMs)
-  const tree = result.stdout.split(/\r?\n/u)[0]?.trim()
+  const [tree, ...paths] = nulRecords(result.stdout)
   if (result.code === 0 && tree !== undefined && OBJECT_ID.test(tree)) return { tree }
   if (result.code === 1) {
+    const location =
+      paths.length === 0
+        ? "; Git reported no conflicted paths"
+        : ` at ${paths.map((path) => JSON.stringify(path)).join(", ")}`
     return {
       failure: obviousDetail(
         "merge-conflict",
-        `Merge ${target} conflicts with current HEAD ${head}; no commit was written.`,
-        `git -C ${root} merge-tree --write-tree ${head} ${target}`,
+        `Merge ${target} conflicts with current HEAD ${head}${location}; no commit was written.`,
+        `git -C ${root} ${args.join(" ")}`,
         "Resolve the named conflict on the submitted branch, then rerun the same git super merge command.",
         "the caller",
-        { objectIds: [head, target] },
+        { paths, objectIds: [head, target] },
       ),
     }
   }
@@ -658,7 +662,7 @@ async function prospectiveTree(
       args,
       result,
       `The prospective merge of ${target} into ${head} could not be computed; no commit was written.`,
-      `git -C ${root} merge-tree --write-tree ${head} ${target}`,
+      `git -C ${root} ${args.join(" ")}`,
       "Resolve the reported Git condition, then rerun the same git super merge command.",
       "the caller",
       { objectIds: [head, target] },
