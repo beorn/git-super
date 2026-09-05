@@ -94,6 +94,12 @@ export async function runCli(argv: readonly string[], stdout: OutputSink, stderr
     .command("merge")
     .description(commands.merge.description ?? commands.merge.title)
     .option("-m, --message <message>", "merge commit message")
+    .option(
+      "--pin-as-written <path>",
+      "keep one direct gitlink at the prospective merge pin; repeat for multiple paths",
+      (value: string, previous: string[]) => [...previous, value],
+      [],
+    )
     .option("--no-verify", "emergency only: bypass ordinary merge and commit hooks")
     .argument("<commit>", "commit to merge into the current branch")
     .action((commit, options, command) => {
@@ -103,6 +109,7 @@ export async function runCli(argv: readonly string[], stdout: OutputSink, stderr
         params: {
           commit,
           ...(typeof options.message === "string" ? { message: options.message } : {}),
+          pinAsWritten: options.pinAsWritten as string[],
           ...(options.verify === false ? { noVerify: true } : {}),
         },
         json: globals.json === true,
@@ -325,10 +332,15 @@ export async function runCli(argv: readonly string[], stdout: OutputSink, stderr
           ? `${gitlink.path} ${gitlink.from.slice(0, 7)} -> ${gitlink.to.slice(0, 7)} (component main)\n`
           : gitlink.state === "kept-ahead"
             ? `${gitlink.path} kept at ${gitlink.from.slice(0, 7)} (ahead of component main ${gitlink.to.slice(0, 7)})\n`
-            : gitlink.state === "left-off-main"
-              ? `left-off-main ${gitlink.path} ${gitlink.from} (component main ${gitlink.to})\n`
-              : `not-run ${gitlink.path} ${gitlink.from} -> ${gitlink.to} (component main)\n`,
+            : gitlink.state === "as-written"
+              ? `${gitlink.path} kept as written at ${gitlink.from.slice(0, 7)}${gitlink.to === undefined ? " (component main unavailable)" : ` (component main ${gitlink.to.slice(0, 7)})`}\n`
+              : gitlink.state === "left-off-main"
+                ? `left-off-main ${gitlink.path} ${gitlink.from} (component main ${gitlink.to})\n`
+                : `not-run ${gitlink.path} ${gitlink.from} -> ${gitlink.to} (component main)\n`,
       )
+    }
+    for (const gitlink of merge.gitlinks) {
+      if (gitlink.state === "as-written" && gitlink.detail !== undefined) stderr.write(`${gitlink.detail.message}\n`)
     }
     if (merge.partial) {
       for (const checkout of merge.checkouts ?? []) {

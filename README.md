@@ -20,7 +20,7 @@ Git has display flags for submodule diffs, but no native flag that turns gitlink
 git super diff --name-only <range>
 git super status --porcelain
 git super merge-base --is-ancestor <sha> <superproject-ref>
-git super merge <commit> [-m <message>] [--no-verify]
+git super merge <commit> [-m <message>] [--pin-as-written <path>...] [--no-verify]
 git super gitlink write <path> <commit>
 git super pull --ff-only [<repository> [<refspec>...]]
 git super push [--recurse-submodules=check|on-demand|only|no] [<remote> [<refspec>...]]
@@ -51,9 +51,11 @@ Missing checkouts, missing commit objects, added or removed gitlinks without a r
 
 ### Merge and settle gitlinks
 
-`merge <commit>` computes the prospective merge tree before writing. A gitlink value authored by that merge must be carried by its component's freshly fetched `origin/main`; otherwise the command exits `1` with `gitlink-off-main` and leaves HEAD, the index, and the worktree unchanged. A pre-existing off-main pin is not attributed to the incoming change, so it is left untouched and reported as `left-off-main` with both object IDs.
+`merge <commit>` computes the prospective merge tree before writing and compares every direct gitlink with its component's freshly fetched `origin/main`. An equal pin produces no row. A pin behind main is raised to main. An authored pin ahead of main is retained and reported as `kept-ahead`. An authored pin that has diverged from main fails before any write with `component-main-moved`. A pre-existing off-main pin is not attributed to the incoming change, so it is left untouched and reported as `left-off-main` with both object IDs.
 
-Git first applies the no-ff merge without committing it, then raises every merged-index pin proven ancestral to and behind component main. Before the concluding commit and its hooks run, each affected component checkout is detached at its staged index pin. Hooks therefore observe one coherent product: the root index pin and the component checkout agree. Each raise is printed on stderr as `<path> <old7> -> <new7> (component main)`, and every raise or retained off-main anomaly is added to the merge commit's existing trailer block as a `Settled:` trailer. Equal pins remain unchanged; divergent pins are never overwritten.
+Git first completes those topology checks, applies the no-ff merge without committing it, then raises every merged-index pin proven behind component main. Before the concluding commit and its hooks run, each affected component checkout is detached at its staged index pin. Hooks therefore observe one coherent product: the root index pin and the component checkout agree. Each raise or retained pin is printed on stderr, and every non-equal settlement is added to the merge commit's existing trailer block as a `Settled:` trailer. Divergent pins are never overwritten.
+
+`--pin-as-written <path>` is repeatable and applies only to exact direct gitlink paths in the prospective tree. A listed gitlink changed by the merge is retained mechanically at its authored pin and reported as `as-written`; the caller owns the policy decision for selecting it. Git Super still records fetched component main when available, but a failed component-main fetch is diagnostic detail on the row rather than a refusal. The authored commit object itself must already be readable in the component repository; Git Super does not fetch it by SHA. Unknown or non-gitlink paths and unreadable authored pins fail before any write. Listing an unchanged direct gitlink is accepted and produces no settlement row.
 
 Human output puts the resulting merge commit on stdout and settlement evidence on stderr. `--json` emits one byte-clean `SuperMergeResult` with the same commit and gitlink rows. Its additive `checkouts` rows record, for every checkout the operation touches, the pin in root `HEAD` (`recorded`), the staged gitlink (`index`), the exact pre-operation checkout (`preCheckout`), the observed checkout, and whether it is `settled`, `settle-failed`, `restored`, `restore-failed`, or `not-run`.
 
@@ -138,7 +140,7 @@ bun run typecheck
 - `src/commit-graph.ts` is the strict, read-only parser for gitlinks recorded in an exact commit. Pull and push share it rather than reading `.gitmodules` independently.
 - `src/objects.ts` is the exact-commit presence and fetch primitive shared by graph consumers.
 - `src/gitlink.ts` is the update-only index-pin writer. It validates the existing gitlink and target commit, writes under the shared mutation lock, and never checks out or chooses a target.
-- `src/merge.ts` preflights one no-ff merge, fetches component main refs, refuses incoming off-main pins, and settles proven-behind pins while preserving partial-write evidence.
+- `src/merge.ts` preflights one no-ff merge, reconciles direct gitlinks by ancestry, supports caller-selected as-written pins without owning their policy, and preserves partial-write evidence.
 - `src/process.ts` is the public injected Git process capability. `src/result.ts` owns the shared repository/ref result vocabulary and how results aggregate.
 - `src/pull.ts` owns the fetch, freeze, check, recheck, and apply fast-forward operation.
 - `src/worktree-add.ts` composes the two write services: one detached `git worktree add` plus one recursive

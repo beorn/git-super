@@ -4,12 +4,12 @@ import { createExclusive, type Exclusive } from "./exclusive.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
 import type { GitResultDetail, GitSuperRepositoryResult, GitSuperResult } from "./result.ts"
 
-export type SuperMergeGitlinkResult = Readonly<{
-  path: string
-  from: string
-  to: string
-  state: "raised" | "kept-ahead" | "left-off-main" | "not-run"
-}>
+export type SuperMergeGitlinkResult = Readonly<
+  { path: string; from: string } & (
+    | Readonly<{ to: string; state: "raised" | "kept-ahead" | "left-off-main" | "not-run" }>
+    | Readonly<{ to?: string; state: "as-written"; detail?: GitResultDetail }>
+  )
+>
 
 export type SuperMergeCheckoutResult = Readonly<{
   path: string
@@ -32,19 +32,19 @@ export type SuperMergeOptions = Readonly<{
   repo: string
   commit: string
   message?: string
+  pinAsWritten?: readonly string[]
   noVerify?: boolean
   timeoutMs?: number
   git?: GitProcess
   exclusive?: Exclusive
 }>
 
-type GitlinkPlan = Readonly<{
-  path: string
-  from: string
-  to: string
-  state: "raised" | "kept-ahead" | "left-off-main"
-  changedByMerge: boolean
-}>
+type GitlinkPlan = Readonly<
+  { path: string; from: string; changedByMerge: boolean } & (
+    | Readonly<{ to: string; state: "raised" | "kept-ahead" | "left-off-main" }>
+    | Readonly<{ to?: string; state: "as-written"; detail?: GitResultDetail }>
+  )
+>
 
 type GitlinkPlans = Readonly<{
   settlements: readonly GitlinkPlan[]
@@ -147,12 +147,15 @@ async function mergeUnderLock(
 
   let planned: GitlinkPlans
   try {
-    planned = await planGitlinks(git, root, head, prospective.tree, timeoutMs)
+    planned = await planGitlinks(git, root, head, prospective.tree, options.pinAsWritten ?? [], timeoutMs)
   } catch (error) {
     return failed(root, [], resultError(error, "inspect-gitlinks"))
   }
   const plans = planned.settlements
-  const refusal = plans.find((plan) => plan.state === "left-off-main" && plan.changedByMerge)
+  const refusal = plans.find(
+    (plan): plan is GitlinkPlan & { to: string; state: "left-off-main" } =>
+      plan.state === "left-off-main" && plan.changedByMerge,
+  )
   if (refusal !== undefined) {
     return failed(
       root,
@@ -167,14 +170,16 @@ async function mergeUnderLock(
       ),
     )
   }
-  const visiblePlans = plans.map(({ changedByMerge: _changedByMerge, ...plan }) => plan)
+  const visiblePlans: SuperMergeGitlinkResult[] = plans.map(({ changedByMerge: _changedByMerge, ...plan }) => plan)
 
   const trailers = visiblePlans.map((plan) =>
     plan.state === "raised"
       ? `Settled: ${plan.path}@${plan.to}`
       : plan.state === "kept-ahead"
         ? `Settled: ${plan.path}@${plan.from} kept-ahead component-main@${plan.to}`
-        : `Settled: ${plan.path}@${plan.from} left-off-main component-main@${plan.to}`,
+        : plan.state === "as-written"
+          ? `Settled: ${plan.path}@${plan.from} as-written${plan.to === undefined ? "" : ` component-main@${plan.to}`}`
+          : `Settled: ${plan.path}@${plan.from} left-off-main component-main@${plan.to}`,
   )
   const requestedMessage = options.message ?? `Merge ${target.slice(0, 12)} into ${head.slice(0, 12)}`
   let settledMessage = requestedMessage
@@ -232,10 +237,12 @@ async function mergeUnderLock(
   if (merged.code !== 0) {
     return mergeApplicationFailure(git, root, head, target, mergeArgs, merged, timeoutMs)
   }
-  const completed: SuperMergeGitlinkResult[] = visiblePlans
-    .filter((plan) => plan.state !== "raised")
+  const completed = visiblePlans
+    .filter((plan): plan is Exclude<SuperMergeGitlinkResult, { state: "raised" }> => plan.state !== "raised")
     .map((plan) => ({ ...plan }))
-  const raises = visiblePlans.filter((plan) => plan.state === "raised")
+  const raises = visiblePlans.filter(
+    (plan): plan is SuperMergeGitlinkResult & { to: string; state: "raised" } => plan.state === "raised",
+  )
   for (let index = 0; index < raises.length; index += 1) {
     const raise = raises[index]
     if (raise === undefined) continue
@@ -720,18 +727,59 @@ async function planGitlinks(
   root: string,
   head: string,
   tree: string,
+  pinAsWrittenPaths: readonly string[],
   timeoutMs: number,
 ): Promise<GitlinkPlans> {
   const before = new Map((await readCommitSubmodules(git, root, head)).map((entry) => [entry.path, entry.target]))
   const merged = await readCommitSubmodules(git, root, tree)
+  const mergedPaths = new Set(merged.map((entry) => entry.path))
+  const pinAsWritten = new Set(pinAsWrittenPaths)
+  const invalidPath = [...pinAsWritten].find((path) => !mergedPaths.has(path))
+  if (invalidPath !== undefined) {
+    const detail = obviousDetail(
+      "invalid-gitlink-path",
+      `Pin-as-written path ${invalidPath} is not a direct gitlink in the prospective merge tree.`,
+      `git -C ${root} ls-tree ${tree} -- ${invalidPath}`,
+      "Name an exact direct gitlink path from the prospective merge tree.",
+      "the caller",
+      { phase: "validate-pin-as-written", paths: [invalidPath], objectIds: [tree] },
+    )
+    throw Object.assign(new Error(detail.message), { resultDetail: detail })
+  }
   const plans: GitlinkPlan[] = []
   const checkouts = new Map<string, GitlinkCheckoutPlan>()
   for (const entry of merged) {
     const component = join(root, entry.path)
-    const main = await fetchComponentMain(git, component, entry.path, entry.target, timeoutMs)
     const recordedBefore = before.get(entry.path)
     const recorded = recordedBefore ?? entry.target
     const changedByMerge = recordedBefore !== entry.target
+    if (changedByMerge) await requireComponentPin(git, component, entry.path, entry.target, timeoutMs)
+    if (pinAsWritten.has(entry.path)) {
+      if (!changedByMerge) continue
+      checkouts.set(entry.path, { path: entry.path, recorded, index: entry.target })
+      try {
+        const main = await fetchComponentMain(git, component, entry.path, entry.target, timeoutMs)
+        if (entry.target !== main) {
+          plans.push({
+            path: entry.path,
+            from: entry.target,
+            to: main,
+            state: "as-written",
+            changedByMerge,
+          })
+        }
+      } catch (error) {
+        plans.push({
+          path: entry.path,
+          from: entry.target,
+          state: "as-written",
+          changedByMerge,
+          detail: resultError(error, "read-component-main"),
+        })
+      }
+      continue
+    }
+    const main = await fetchComponentMain(git, component, entry.path, entry.target, timeoutMs)
     if (entry.target === main) {
       if (changedByMerge) checkouts.set(entry.path, { path: entry.path, recorded, index: entry.target })
       continue
@@ -789,6 +837,32 @@ async function planGitlinks(
     )
   }
   return { settlements: plans, checkouts: [...checkouts.values()] }
+}
+
+async function requireComponentPin(
+  git: GitProcess,
+  component: string,
+  path: string,
+  pin: string,
+  timeoutMs: number,
+): Promise<void> {
+  const args = ["cat-file", "-e", `${pin}^{commit}`]
+  const result = await run(git, component, args, timeoutMs)
+  if (result.code === 0) return
+  throw operationError(
+    component,
+    "read-component-pin",
+    args,
+    result,
+    obviousDetail(
+      "component-pin-unreadable",
+      `Authored gitlink pin ${pin} for ${path} is not a readable commit in its component repository.`,
+      `git -C ${component} ${args.join(" ")}`,
+      `Publish and materialize ${pin} in ${path}, then rerun the same git super merge command.`,
+      "the change author",
+      { phase: "read-component-pin", paths: [path], objectIds: [pin] },
+    ),
+  )
 }
 
 async function mergeApplicationFailure(
