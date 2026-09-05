@@ -114,6 +114,33 @@ function nestedRecursivePushFixture(name: string) {
   return { ...fixture, rootSource, childSource, leaf, leafRemote, leafBefore, leafSource }
 }
 
+function recursivePushPlan(fixture: ReturnType<typeof recursivePushFixture>) {
+  return {
+    updates: [
+      {
+        repository: ".",
+        remote: fixture.rootRemote,
+        source: fixture.rootSource,
+        destination: "main",
+        expectedDestination: { state: "oid", oid: fixture.rootBefore },
+      },
+      {
+        repository: "child",
+        remote: fixture.childRemote,
+        source: fixture.childSource,
+        destination: "refs/heads/main",
+        expectedDestination: { state: "oid", oid: fixture.childBefore },
+      },
+    ],
+  }
+}
+
+function writePlan(directory: string, name: string, value: unknown): string {
+  const path = join(directory, name)
+  writeFileSync(path, typeof value === "string" ? value : JSON.stringify(value))
+  return path
+}
+
 describe("explicit recursive push mechanics", () => {
   test("documents every recursive mode and pushes an explicit root ref through the real CLI", async () => {
     const { repository, remote, source } = pushFixture("cli")
@@ -123,6 +150,7 @@ describe("explicit recursive push mechanics", () => {
 
     expect(await runCli(["push", "--help"], help, helpErrors)).toBe(0)
     expect(help.output).toContain("check|on-demand|only|no")
+    expect(help.output).toContain("--plan <path|->")
     expect(help.output).toContain("at least one submodule remote")
     expect(help.output).toContain("submodules before the root")
     expect(helpErrors.output).toBe("")
@@ -139,6 +167,225 @@ describe("explicit recursive push mechanics", () => {
     expect(stderr.output).toBe("")
     expect(JSON.parse(stdout.output)).toMatchObject({ state: "updated", partial: false })
     expect(git(remote, "rev-parse", "refs/heads/main")).toBe(source)
+  })
+
+  test("pushes a frozen multi-repository plan from a file and replays it from stdin", () => {
+    const fixture = recursivePushFixture("cli-plan")
+    const plan = recursivePushPlan(fixture)
+    const planPath = writePlan(fixture.fixture, "push-plan.json", plan)
+    const pushed = Bun.spawnSync([
+      process.execPath,
+      gitSuperBin,
+      "--repo",
+      fixture.root,
+      "push",
+      "--plan",
+      planPath,
+      "--json",
+    ])
+
+    expect(pushed.exitCode, pushed.stderr.toString()).toBe(0)
+    expect(pushed.stderr.toString()).toBe("")
+    expect(JSON.parse(pushed.stdout.toString())).toMatchObject({
+      state: "updated",
+      partial: false,
+      repositories: [
+        { repository: fixture.child, state: "updated" },
+        { repository: fixture.root, state: "updated" },
+      ],
+    })
+
+    const replayed = Bun.spawnSync(
+      [process.execPath, gitSuperBin, "--repo", fixture.root, "push", "--plan", "-", "--json"],
+      { stdin: new Blob([JSON.stringify(plan)]) },
+    )
+
+    expect(replayed.exitCode, replayed.stderr.toString()).toBe(0)
+    expect(replayed.stderr.toString()).toBe("")
+    expect(JSON.parse(replayed.stdout.toString())).toMatchObject({
+      state: "unchanged",
+      partial: false,
+      repositories: [
+        { repository: fixture.child, state: "unchanged" },
+        { repository: fixture.root, state: "unchanged" },
+      ],
+    })
+  })
+
+  test("rejects conflicting plan inputs before inspecting Git or the plan path", async () => {
+    const conflicts = [
+      ["--recurse-submodules=no"],
+      ["--force-with-lease", "refs/heads/main:"],
+      ["origin"],
+      ["origin", "HEAD:refs/heads/main"],
+    ]
+
+    for (const conflict of conflicts) {
+      const stdout = outputSink()
+      const stderr = outputSink()
+      expect(
+        await runCli(
+          ["--repo", "/not-inspected", "push", "--plan", "/not-read", ...conflict, "--json"],
+          stdout,
+          stderr,
+        ),
+      ).toBe(2)
+      expect(stderr.output).toBe("")
+      expect(JSON.parse(stdout.output)).toMatchObject({
+        state: "failed",
+        partial: false,
+        detail: { code: "conflicting-inputs", phase: "validate" },
+      })
+    }
+  })
+
+  test("rejects malformed plan documents and rows with a named invalid-plan diagnostic", async () => {
+    const { fixture, repository, remote, source } = pushFixture("invalid-plan")
+    const cases = [
+      { name: "document", contents: "{not-json", field: "document" },
+      {
+        name: "row",
+        contents: {
+          updates: [{ repository: ".", remote, source, destination: "main" }],
+        },
+        field: "expectedDestination",
+      },
+    ]
+
+    for (const testCase of cases) {
+      const stdout = outputSink()
+      const stderr = outputSink()
+      const planPath = writePlan(fixture, `${testCase.name}.json`, testCase.contents)
+      expect(await runCli(["--repo", repository, "push", "--plan", planPath, "--json"], stdout, stderr)).toBe(2)
+      expect(stderr.output).toBe("")
+      expect(JSON.parse(stdout.output)).toMatchObject({
+        state: "failed",
+        partial: false,
+        detail: { code: "invalid-plan", phase: "validate", message: expect.stringContaining(testCase.field) },
+      })
+    }
+  })
+
+  test("fails loudly for an unreadable plan and an empty update list", async () => {
+    const { fixture, repository, remote } = pushFixture("plan-resources")
+    const absent = join(fixture, "absent.json")
+    const empty = writePlan(fixture, "empty.json", { updates: [] })
+    const cases = [
+      { path: absent, code: "invalid-plan" },
+      { path: empty, code: "empty-push" },
+    ]
+
+    for (const testCase of cases) {
+      const stdout = outputSink()
+      const stderr = outputSink()
+      expect(await runCli(["--repo", repository, "push", "--plan", testCase.path, "--json"], stdout, stderr)).toBe(2)
+      expect(stderr.output).toBe("")
+      expect(JSON.parse(stdout.output)).toMatchObject({
+        state: "failed",
+        partial: false,
+        detail: { code: testCase.code },
+      })
+    }
+    expect(git(remote, "for-each-ref", "--format=%(refname)", "refs/heads/main")).toBe("")
+  })
+
+  test("rejects conflicting destination rows without writing either source", async () => {
+    const { fixture, repository, remote, source } = pushFixture("plan-destination-conflict")
+    const other = advanceRepository(repository, "other.txt", "other\n")
+    const row = {
+      repository: ".",
+      remote,
+      destination: "main",
+      expectedDestination: { state: "missing" },
+    }
+    const planPath = writePlan(fixture, "conflict.json", {
+      updates: [
+        { ...row, source },
+        { ...row, source: other },
+      ],
+    })
+    const stdout = outputSink()
+    const stderr = outputSink()
+
+    expect(await runCli(["--repo", repository, "push", "--plan", planPath, "--json"], stdout, stderr)).toBe(2)
+    expect(stderr.output).toBe("")
+    expect(JSON.parse(stdout.output)).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: { code: "conflicting-destination-updates" },
+    })
+    expect(git(remote, "for-each-ref", "--format=%(refname)", "refs/heads/main")).toBe("")
+  })
+
+  test("rejects a plan repository that is not the root or one direct HEAD gitlink", async () => {
+    const { fixture, repository, remote, source } = pushFixture("unknown-plan-repository")
+    const planPath = writePlan(fixture, "unknown.json", {
+      updates: [
+        {
+          repository: "not-a-gitlink",
+          remote,
+          source,
+          destination: "main",
+          expectedDestination: { state: "missing" },
+        },
+      ],
+    })
+    const stdout = outputSink()
+    const stderr = outputSink()
+
+    expect(await runCli(["--repo", repository, "push", "--plan", planPath, "--json"], stdout, stderr)).toBe(2)
+    expect(stderr.output).toBe("")
+    expect(JSON.parse(stdout.output)).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: { code: "unknown-repository", phase: "validate" },
+    })
+    expect(git(remote, "for-each-ref", "--format=%(refname)", "refs/heads/main")).toBe("")
+  })
+
+  test("refuses a moved plan lease without updating the root", async () => {
+    const fixture = recursivePushFixture("moved-plan-lease")
+    git(fixture.child, "checkout", "-q", "-b", "other", fixture.childBefore)
+    const other = advanceRepository(fixture.child, "other.txt", "other\n")
+    git(fixture.child, "push", "-q", fixture.childRemote, `${other}:refs/heads/main`)
+    git(fixture.child, "checkout", "-q", "main")
+    const planPath = writePlan(fixture.fixture, "moved.json", recursivePushPlan(fixture))
+    const stdout = outputSink()
+    const stderr = outputSink()
+
+    expect(await runCli(["--repo", fixture.root, "push", "--plan", planPath, "--json"], stdout, stderr)).toBe(2)
+    expect(stderr.output).toBe("")
+    expect(JSON.parse(stdout.output)).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: { code: "destination-changed" },
+    })
+    expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(other)
+    expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(fixture.rootBefore)
+  })
+
+  test("reports a rejected plan group and leaves the root not-run", async () => {
+    const fixture = recursivePushFixture("plan-not-run")
+    const childGitDirectory = git(fixture.child, "rev-parse", "--absolute-git-dir")
+    const hook = join(childGitDirectory, "hooks", "pre-push")
+    writeFileSync(hook, "#!/bin/sh\necho child-refused >&2\nexit 29\n")
+    chmodSync(hook, 0o755)
+    const planPath = writePlan(fixture.fixture, "not-run.json", recursivePushPlan(fixture))
+    const stdout = outputSink()
+    const stderr = outputSink()
+
+    expect(await runCli(["--repo", fixture.root, "push", "--plan", planPath, "--json"], stdout, stderr)).toBe(2)
+    expect(stderr.output).toBe("")
+    expect(JSON.parse(stdout.output)).toMatchObject({
+      state: "failed",
+      partial: false,
+      repositories: [
+        { repository: fixture.child, state: "failed", detail: { code: "push-rejected" } },
+        { repository: fixture.root, state: "not-run", refs: [{ state: "not-run" }] },
+      ],
+    })
+    expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(fixture.childBefore)
+    expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(fixture.rootBefore)
   })
 
   test("uses Git's configured default push selection when no refspec is supplied", async () => {

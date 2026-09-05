@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs"
 import { isAbsolute, join, resolve } from "node:path"
 
 import { readCommitGitlinks } from "./commit-graph.ts"
@@ -20,9 +21,10 @@ export type PushRecurseMode = "check" | "no" | "on-demand" | "only"
 
 export type SuperPushOptions = Readonly<{
   repo: string
+  plan?: string
   remote?: string
   refspecs?: readonly string[]
-  recurseSubmodules: PushRecurseMode
+  recurseSubmodules?: PushRecurseMode
   atomic?: boolean
   verify?: boolean
   pushOptions?: readonly string[]
@@ -76,6 +78,8 @@ type CommitRequirement = Readonly<{
   path: string
   target: string
 }>
+
+type PortablePlanUpdate = Readonly<Omit<RefUpdate, "repository" | "allowNonFastForward"> & { repository: string }>
 
 const DEFAULT_GIT_TIMEOUT_MS = 30_000
 const OBJECT_ID = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/u
@@ -580,6 +584,120 @@ function pushInputFailure(repository: string, code: string, message: string, rem
   return failedResult(resolve(repository), failure)
 }
 
+function invalidPlan(message: string, remedy = "Fix the named plan field and rerun the same command."): never {
+  throw Object.assign(new Error(message), {
+    resultDetail: detail("invalid-plan", "validate", message, { remedy }),
+  })
+}
+
+function planRecord(value: unknown, subject: string): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    invalidPlan(`${subject} must be a JSON object.`)
+  }
+  return value as Record<string, unknown>
+}
+
+function rejectUnknownPlanFields(record: Record<string, unknown>, allowed: readonly string[], subject: string): void {
+  const unknown = Object.keys(record).find((field) => !allowed.includes(field))
+  if (unknown !== undefined) invalidPlan(`${subject} field ${unknown} is not supported.`)
+}
+
+function planString(record: Record<string, unknown>, field: string, row: number): string {
+  const value = record[field]
+  if (typeof value !== "string" || value.trim() === "") {
+    invalidPlan(`Plan row ${row} field ${field} must be a non-empty string.`)
+  }
+  return value
+}
+
+function planExpectedDestination(value: unknown, row: number): ExpectedDestination {
+  const expected = planRecord(value, `Plan row ${row} field expectedDestination`)
+  const state = expected.state
+  if (state === "missing") {
+    rejectUnknownPlanFields(expected, ["state"], `Plan row ${row} field expectedDestination`)
+    return { state }
+  }
+  if (state === "oid") {
+    rejectUnknownPlanFields(expected, ["state", "oid"], `Plan row ${row} field expectedDestination`)
+    if (typeof expected.oid !== "string" || !OBJECT_ID.test(expected.oid)) {
+      invalidPlan(`Plan row ${row} field expectedDestination.oid must be an exact object ID.`)
+    }
+    return { state, oid: expected.oid }
+  }
+  invalidPlan(`Plan row ${row} field expectedDestination.state must be missing or oid.`)
+}
+
+function parsePushPlan(contents: string, source: string): PortablePlanUpdate[] {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(contents)
+  } catch (error) {
+    invalidPlan(`Plan document ${source} is not valid JSON: ${error instanceof Error ? error.message : String(error)}`)
+  }
+  const document = planRecord(parsed, "Plan document")
+  rejectUnknownPlanFields(document, ["updates"], "Plan document")
+  if (!Array.isArray(document.updates)) invalidPlan("Plan document field updates must be an array.")
+  return document.updates.map((value, row) => {
+    const update = planRecord(value, `Plan row ${row}`)
+    rejectUnknownPlanFields(
+      update,
+      ["repository", "remote", "source", "destination", "expectedDestination"],
+      `Plan row ${row}`,
+    )
+    const repository = planString(update, "repository", row)
+    if (isAbsolute(repository)) invalidPlan(`Plan row ${row} field repository must be root-relative.`)
+    const sourceObject = planString(update, "source", row)
+    if (!OBJECT_ID.test(sourceObject)) invalidPlan(`Plan row ${row} field source must be an exact object ID.`)
+    return {
+      repository,
+      remote: planString(update, "remote", row),
+      source: sourceObject,
+      destination: normalizeDestination(planString(update, "destination", row)),
+      expectedDestination: planExpectedDestination(update.expectedDestination, row),
+    }
+  })
+}
+
+function readPushPlan(path: string): PortablePlanUpdate[] {
+  if (path.trim() === "") invalidPlan("Plan path must not be empty.")
+  try {
+    return parsePushPlan(readFileSync(path === "-" ? 0 : path, "utf8"), path === "-" ? "stdin" : path)
+  } catch (error) {
+    if (typeof error === "object" && error !== null && "resultDetail" in error) throw error
+    invalidPlan(
+      `Plan document ${path} could not be read: ${error instanceof Error ? error.message : String(error)}`,
+      "Provide one readable plan file, or use --plan - and send one JSON document on stdin.",
+    )
+  }
+}
+
+async function resolvePlanRepositories(
+  git: GitProcess,
+  root: string,
+  updates: readonly PortablePlanUpdate[],
+): Promise<RefUpdate[]> {
+  const gitlinks = await readCommitGitlinks(git, root, "HEAD")
+  const repositories = new Map<string, string>([[".", root]])
+  for (const gitlink of gitlinks) repositories.set(gitlink.path, resolve(root, gitlink.path))
+  return updates.map((update, row) => {
+    const repository = repositories.get(update.repository)
+    if (repository === undefined) {
+      throw Object.assign(new Error(`plan row ${row} names unknown repository ${update.repository}`), {
+        resultDetail: detail(
+          "unknown-repository",
+          "validate",
+          `Plan row ${row} repository ${update.repository} is neither . nor a direct gitlink recorded by root HEAD.`,
+          {
+            paths: [update.repository],
+            remedy: "Use . for the root or one exact root-relative direct gitlink path from root HEAD.",
+          },
+        ),
+      })
+    }
+    return { ...update, repository }
+  })
+}
+
 function normalizeDestination(destination: string): string {
   return destination.startsWith("refs/") ? destination : `refs/heads/${destination}`
 }
@@ -976,13 +1094,30 @@ function prependRepositories(
   return gitSuperResult([...repositories, ...result.repositories], result.detail)
 }
 
-/** Plan ordinary CLI refspecs into exact rows, then execute the selected recursive mode. */
+/** Apply one frozen multi-repository plan, or plan ordinary CLI refspecs into the selected recursive mode. */
 export async function superPush(options: SuperPushOptions): Promise<GitSuperResult> {
-  if (!(["check", "no", "on-demand", "only"] as const).includes(options.recurseSubmodules)) {
+  if (options.plan !== undefined) {
+    const conflicts = [
+      ...(options.remote === undefined ? [] : ["positional remote"]),
+      ...(options.refspecs === undefined || options.refspecs.length === 0 ? [] : ["positional refspecs"]),
+      ...(options.recurseSubmodules === undefined ? [] : ["--recurse-submodules"]),
+      ...(options.forceWithLease === undefined || options.forceWithLease.length === 0 ? [] : ["--force-with-lease"]),
+    ]
+    if (conflicts.length > 0) {
+      return pushInputFailure(
+        options.repo,
+        "conflicting-inputs",
+        `Push plan conflicts with ${conflicts.join(", ")}.`,
+        "Use --plan by itself; only transport flags --atomic, --signed, --no-verify, and --push-option may accompany it.",
+      )
+    }
+  }
+  const recurseSubmodules = options.recurseSubmodules ?? "check"
+  if (!(["check", "no", "on-demand", "only"] as const).includes(recurseSubmodules)) {
     return pushInputFailure(
       options.repo,
       "invalid-recurse-mode",
-      `Unknown recurse-submodules mode ${options.recurseSubmodules}.`,
+      `Unknown recurse-submodules mode ${recurseSubmodules}.`,
       "Choose check, on-demand, only, or no.",
     )
   }
@@ -1001,7 +1136,22 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
   }
   let root: string
   try {
+    const planned = options.plan === undefined ? undefined : readPushPlan(options.plan)
     root = await discoverRepository(git, options.repo, "discover-root")
+    if (planned !== undefined) {
+      const updates = await resolvePlanRepositories(git, root, planned)
+      return pushRefUpdates({
+        root,
+        updates,
+        ...(options.atomic === undefined ? {} : { atomic: options.atomic }),
+        ...(options.verify === undefined ? {} : { verify: options.verify }),
+        ...(options.pushOptions === undefined ? {} : { pushOptions: options.pushOptions }),
+        ...(options.signed === undefined ? {} : { signed: options.signed }),
+        timeoutMs,
+        git,
+        ...(options.exclusive === undefined ? {} : { exclusive: options.exclusive }),
+      })
+    }
     const remote = options.remote ?? (await configuredPushRemote(git, root))
     const refspecs = options.refspecs ?? []
     const selectedUpdates =
@@ -1009,7 +1159,7 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
         ? await configuredPushUpdates(git, root, remote, options)
         : await Promise.all(refspecs.map((refspec) => refspecUpdate(git, root, remote, refspec)))
     const rootUpdates = applyExplicitLeases(selectedUpdates, options.forceWithLease ?? [])
-    if (options.recurseSubmodules === "no") {
+    if (recurseSubmodules === "no") {
       return pushRefUpdates({
         root,
         updates: rootUpdates,
@@ -1027,7 +1177,7 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
       root,
       rootUpdates.map((update) => update.source),
     )
-    if (options.recurseSubmodules === "check") {
+    if (recurseSubmodules === "check") {
       const available: GitSuperRepositoryResult[] = []
       for (const requirement of requirements) {
         if (await commitAvailableOnAnyRemote(git, requirement)) {
@@ -1073,7 +1223,7 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
     }
     const childUpdates: RefUpdate[] = []
     for (const requirement of requirements) childUpdates.push(await childUpdate(git, requirement))
-    if (childUpdates.length === 0 && options.recurseSubmodules === "only") {
+    if (childUpdates.length === 0 && recurseSubmodules === "only") {
       return gitSuperResult([
         {
           repository: root,
@@ -1088,7 +1238,7 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
     }
     return pushRefUpdates({
       root,
-      updates: [...childUpdates, ...(options.recurseSubmodules === "on-demand" ? rootUpdates : [])],
+      updates: [...childUpdates, ...(recurseSubmodules === "on-demand" ? rootUpdates : [])],
       ...(options.atomic === undefined ? {} : { atomic: options.atomic }),
       ...(options.verify === undefined ? {} : { verify: options.verify }),
       ...(options.pushOptions === undefined ? {} : { pushOptions: options.pushOptions }),
