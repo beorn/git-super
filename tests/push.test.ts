@@ -6,7 +6,7 @@ import { afterEach, describe, expect, test } from "vitest"
 import { runCli } from "../src/cli.ts"
 import { acquireExclusive, createExclusive, type Exclusive } from "../src/exclusive.ts"
 import { createLocalGitProcess, type GitProcess } from "../src/process.ts"
-import { pushRefUpdates, remoteContainsCommit, superPush } from "../src/push.ts"
+import { parsePushPlan, pushRefUpdates, remoteContainsCommit, superPush } from "../src/push.ts"
 import { advanceRepository, canonicalTmpdir as tmpdir, createRepository, git } from "./fixture.ts"
 
 const roots: string[] = []
@@ -142,6 +142,23 @@ function writePlan(directory: string, name: string, value: unknown): string {
 }
 
 describe("explicit recursive push mechanics", () => {
+  // 24166: recovery must reuse the CLI's exact plan grammar without reading a plan file.
+  test("parses frozen recovery intent through the public push plan reader", () => {
+    const row = {
+      repository: "component",
+      remote: "origin",
+      source: "1".repeat(40),
+      destination: "main",
+      expectedDestination: { state: "oid", oid: "2".repeat(40) },
+    }
+    expect(parsePushPlan(JSON.stringify({ updates: [row] }), "checked record")).toEqual([
+      { ...row, destination: "refs/heads/main" },
+    ])
+    expect(() =>
+      parsePushPlan(JSON.stringify({ updates: [{ ...row, expectedDestination: undefined }] }), "checked record"),
+    ).toThrow("expectedDestination")
+  })
+
   test("documents every recursive mode and pushes an explicit root ref through the real CLI", async () => {
     const { repository, remote, source } = pushFixture("cli")
     git(repository, "remote", "add", "origin", remote)

@@ -633,7 +633,8 @@ function planExpectedDestination(value: unknown, row: number): ExpectedDestinati
   invalidPlan(`Plan row ${row} field expectedDestination.state must be missing or oid.`)
 }
 
-function parsePushPlan(contents: string, source: string): PortablePlanUpdate[] {
+/** Parse a frozen exact-ref plan without filesystem or Git access; source names its diagnostic origin. */
+export function parsePushPlan(contents: string, source: string): PortablePlanUpdate[] {
   let parsed: unknown
   try {
     parsed = JSON.parse(contents)
