@@ -43,7 +43,7 @@ export type PointerMove = Readonly<{
 
 export type RepositoryDiffStat = Readonly<{
   repository: string
-  /** Always present for a moved-gitlink entry (its exact pins). Best-effort for root: parsed from `options.refs` when it is one `a..b`/`a...b` string or exactly two ref args; omitted when root's refs don't resolve to a clean two-endpoint pair (e.g. `--cached`, a working-tree diff, 3+ ref args) rather than reporting a guess. */
+  /** The endpoints these `files`/`totals` were MEASURED over, never the expression as typed. A moved-gitlink entry always carries its exact pins. Root carries the pair Git compared: `a..b` and two ref args as given, `a...b` as `{merge-base(a,b), b}`; omitted when root's refs are not a clean two-endpoint pair (`--cached`, a working-tree diff, 3+ ref args) rather than reporting a guess. */
   range?: Readonly<{ from: string; to: string }>
   files: readonly DiffFileStat[]
   totals: DiffTotals
@@ -199,17 +199,32 @@ function uniqueRepositories(repositories: readonly ConsultedRepository[]): Consu
   })
 }
 
-/** Best-effort {from,to} for root's own refs: one "a..b"/"a...b" string, or exactly two ref args. Omitted otherwise (--cached, worktree diff, 3+ args) rather than guessing. */
-function rootRange(options: SuperDiffOptions): Readonly<{ from: string; to: string }> | undefined {
+/**
+ * The endpoints Git ACTUALLY measured for root's own refs — never the expression as typed.
+ *
+ * `a..b` and two ref args measure exactly `a` to `b`, so those are reported as given.
+ * `a...b` does NOT: Git measures `merge-base(a,b)..b`, so the left endpoint is resolved
+ * here with `git merge-base`. Reporting `{a, b}` for a symmetric request claimed every
+ * left-only commit as a deletion that no diff in the run had measured.
+ *
+ * Omitted (never guessed) when the refs are not a clean two-endpoint pair: `--cached`,
+ * a working-tree diff, 3+ ref args.
+ */
+function rootRange(root: string, options: SuperDiffOptions): Readonly<{ from: string; to: string }> | undefined {
   const refs = options.refs ?? []
   if (refs.length === 2) {
     const [from, to] = refs
     if (from !== undefined && to !== undefined) return { from, to }
   }
-  if (refs.length === 1 && refs[0] !== undefined) {
-    const match = /^(.+?)\.{2,3}(.+)$/u.exec(refs[0])
-    if (match?.[1] !== undefined && match[2] !== undefined) return { from: match[1], to: match[2] }
+  const single = refs.length === 1 ? refs[0] : undefined
+  if (single === undefined) return undefined
+  const symmetric = /^(.+?)\.{3}(.+)$/u.exec(single)
+  if (symmetric?.[1] !== undefined && symmetric[2] !== undefined) {
+    const [, left, right] = symmetric
+    return { from: runGit(root, ["merge-base", left, right]).trim(), to: right }
   }
+  const twoDot = /^(.+?)\.{2}(.+)$/u.exec(single)
+  if (twoDot?.[1] !== undefined && twoDot[2] !== undefined) return { from: twoDot[1], to: twoDot[2] }
   return undefined
 }
 
@@ -218,7 +233,7 @@ function entryRange(
   options: SuperDiffOptions,
 ): Readonly<{ from: string; to: string }> | undefined {
   if (entry.from !== undefined && entry.to !== undefined) return { from: entry.from, to: entry.to }
-  return rootRange(options)
+  return rootRange(entry.root, options)
 }
 
 /** Diff args comparing one repository's exact pin move, or (for root) the original options. */
