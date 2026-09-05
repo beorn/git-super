@@ -861,29 +861,43 @@ describe("explicit recursive push mechanics", () => {
     await expect(remoteContainsCommit({ repository, remote: "origin", commit: unpublished })).resolves.toBe(false)
   })
 
-  test("reports child success followed by root rejection as partial without rollback", async () => {
-    const root = pushFixture("partial-root")
-    const child = pushFixture("partial-child")
-    const hookDirectory = join(root.repository, ".git", "hooks")
+  test("replays an ordinary leased plan after child success and root rejection", async () => {
+    const fixture = recursivePushFixture("partial-root-replay")
+    const hookDirectory = join(fixture.root, ".git", "hooks")
     mkdirSync(hookDirectory, { recursive: true })
     const hook = join(hookDirectory, "pre-push")
     writeFileSync(hook, "#!/bin/sh\necho root-refused >&2\nexit 19\n")
     chmodSync(hook, 0o755)
 
-    const result = await pushRefUpdates({
-      root: root.repository,
-      updates: [
-        update(root.repository, root.remote, root.source, { state: "missing" }),
-        update(child.repository, child.remote, child.source, { state: "missing" }),
-      ],
+    const updates = [
+      update(fixture.root, fixture.rootRemote, fixture.rootSource, { state: "oid", oid: fixture.rootBefore }),
+      update(fixture.child, fixture.childRemote, fixture.childSource, { state: "oid", oid: fixture.childBefore }),
+    ]
+    const interrupted = await pushRefUpdates({
+      root: fixture.root,
+      updates,
     })
 
-    expect(result).toMatchObject({ state: "failed", partial: true })
-    expect(result.repositories.map(({ repository, state }) => ({ repository, state }))).toEqual([
-      { repository: child.repository, state: "updated" },
-      { repository: root.repository, state: "failed" },
+    expect(interrupted).toMatchObject({ state: "failed", partial: true })
+    expect(interrupted.repositories.map(({ repository, state }) => ({ repository, state }))).toEqual([
+      { repository: fixture.child, state: "updated" },
+      { repository: fixture.root, state: "failed" },
     ])
-    expect(git(child.remote, "rev-parse", "refs/heads/main")).toBe(child.source)
-    expect(git(root.remote, "for-each-ref", "--format=%(refname)", "refs/heads/main")).toBe("")
+    expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(fixture.childSource)
+    expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(fixture.rootBefore)
+
+    writeFileSync(hook, "#!/bin/sh\nexit 0\n")
+    const replayed = await pushRefUpdates({
+      root: fixture.root,
+      updates,
+    })
+
+    expect(replayed).toMatchObject({ state: "updated", partial: false })
+    expect(replayed.repositories.map(({ repository, state }) => ({ repository, state }))).toEqual([
+      { repository: fixture.child, state: "unchanged" },
+      { repository: fixture.root, state: "updated" },
+    ])
+    expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(fixture.childSource)
+    expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(fixture.rootSource)
   })
 })
