@@ -52,11 +52,38 @@ function treeGitlinks(root: string, ref: string): TreeGitlink[] {
     .sort((left, right) => left.path.localeCompare(right.path))
 }
 
+const OBJECT_ID_RE = /^[0-9a-f]{4,40}$/u
+
+/**
+ * A ref name names the repository it was given to.
+ *
+ * Only an object id has an owner to discover. A name such as `origin/main`
+ * resolves in EVERY repository that has such a ref — the named one and each
+ * nested submodule alike — so searching the name across the consulted
+ * repositories finds an owner in each and refuses the comparison as
+ * ambiguous, in any repository that carries a nested submodule. The name is
+ * resolved here, in the named repository, and the object id it names goes
+ * through the same owner search as any other id.
+ */
+function resolveAncestor(root: string, ancestor: string): string {
+  if (OBJECT_ID_RE.test(ancestor)) return ancestor
+  const resolved = tryGit(root, ["rev-parse", "--verify", "--end-of-options", `${ancestor}^{commit}`])
+  if (resolved.exitCode !== 0) {
+    throw new Error(
+      `git super: ${ancestor} is not an object id and does not resolve in ${root}` +
+        " — a ref name names the repository it is given to; pass --repo <path> for another repository's ref, or an object id",
+    )
+  }
+  return resolved.stdout.trim()
+}
+
 export function superIsAncestor(options: SuperIsAncestorOptions): SuperIsAncestorResult {
   const root = repositoryRoot(options.repo)
   const consultedRepositories: ConsultedRepository[] = [{ path: ".", root }]
 
   runGit(root, ["rev-parse", "--verify", `${options.descendant}^{commit}`])
+  const ancestor = resolveAncestor(root, options.ancestor)
+  const label = ancestor === options.ancestor ? ancestor : `${options.ancestor} (${ancestor})`
   const owners: Array<{ path: string; root: string; target: string }> = []
   // The superproject is a CANDIDATE owner, never an automatic one. Returning
   // here on object presence alone is the defect this replaces: a submodule sha
@@ -64,14 +91,14 @@ export function superIsAncestor(options: SuperIsAncestorOptions): SuperIsAncesto
   // against the superproject tip, and returned a confident `false` — reporting
   // landed work as not landed. That manufactured a "km-revert" finding against
   // a rescue ref whose pin had only ever moved forward.
-  const presentAtRoot = objectExists(root, options.ancestor)
-  if (presentAtRoot && reachableFromAnyRef(root, options.ancestor)) {
+  const presentAtRoot = objectExists(root, ancestor)
+  if (presentAtRoot && reachableFromAnyRef(root, ancestor)) {
     owners.push({ path: ".", root, target: options.descendant })
   }
   for (const gitlink of treeGitlinks(root, options.descendant)) {
     const nestedRoot = repositoryRoot(join(root, gitlink.path))
     consultedRepositories.push({ path: gitlink.path, root: nestedRoot, to: gitlink.pin })
-    if (!objectExists(nestedRoot, options.ancestor)) continue
+    if (!objectExists(nestedRoot, ancestor)) continue
     owners.push({ path: gitlink.path, root: nestedRoot, target: gitlink.pin })
   }
   if (owners.length === 0) {
@@ -82,19 +109,19 @@ export function superIsAncestor(options: SuperIsAncestorOptions): SuperIsAncesto
       ? " — the object IS in the superproject's store but no ref reaches it, so the superproject does not own it either;" +
         " run the comparison inside the repository the commit belongs to (git -C <submodule>)"
       : ""
-    throw new Error(`git super: no consulted repository owns commit ${options.ancestor}${orphaned}`)
+    throw new Error(`git super: no consulted repository owns commit ${label}${orphaned}`)
   }
   if (owners.length > 1) {
     // Named, never silently preferred. Picking one here is how the wrong
     // object store wins an argument it should not have been in.
     throw new Error(
-      `git super: commit ${options.ancestor} is ambiguous across ${owners.map(({ path }) => path).join(", ")}` +
+      `git super: commit ${label} is ambiguous across ${owners.map(({ path }) => path).join(", ")}` +
         " — compare it inside the repository you mean (git -C <path> merge-base --is-ancestor)",
     )
   }
   const owner = owners[0]!
   return {
-    isAncestor: isAncestor(owner.root, options.ancestor, owner.target),
+    isAncestor: isAncestor(owner.root, ancestor, owner.target),
     owningRepository: owner.path,
     comparedTo: owner.target,
     consultedRepositories,
