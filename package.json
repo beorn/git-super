@@ -89,10 +89,10 @@
   },
   "scripts": {
     "test": "bunx --bun vitest run",
-    "typecheck": "tsc --noEmit",
-    "lint": "oxlint src tests",
+    "typecheck": "bun scripts/typecheck.ts",
+    "lint": "oxlint src tests scripts",
     "format": "oxfmt --check .",
-    "fix": "oxfmt --write . && oxlint --fix src tests",
+    "fix": "oxfmt --write . && oxlint --fix src tests scripts",
     "check": "bun run test && bun run typecheck && bun run lint && bun run format",
     "build": "tsdown"
   },
