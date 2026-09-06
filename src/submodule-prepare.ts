@@ -118,6 +118,11 @@ function failureDetail(error: unknown, phase: string): GitResultDetail {
     const value = (error as DetailedError).resultDetail
     if (value !== undefined) return value
   }
+  if (error instanceof Error && error.message.includes("worktree mutation lock is busy")) {
+    return detail("mutation-lock-busy", "acquire-mutation-lock", error.message, {
+      remedy: "Wait for the named lock holder to finish, then rerun git super submodule prepare.",
+    })
+  }
   return detail("submodule-prepare-failed", phase, error instanceof Error ? error.message : String(error), {
     remedy: "Resolve the named repository or component store condition, then rerun the same prepare command.",
   })

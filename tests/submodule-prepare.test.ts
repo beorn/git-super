@@ -10,6 +10,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, expect, test } from "vitest"
 import { runCli } from "../src/cli.ts"
+import { acquireExclusive, createExclusive } from "../src/exclusive.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "../src/process.ts"
 import { superSubmodulePrepare, type SuperSubmodulePrepareResult } from "../src/submodule-prepare.ts"
 import { createProductFixture, git } from "./fixture.ts"
@@ -206,6 +207,45 @@ test("serializes concurrent cold preparation through the shared common-dir lock"
   expect([one.state, two.state].sort()).toEqual(["unchanged", "updated"])
   expect(one.components).toEqual(two.components)
   expect(oneErr.output + twoErr.output).toBe("")
+})
+
+// Concurrent cold success does not exercise a writer that outlasts the wait.
+test("reports the busy writer and retry remedy without preparing component stores", async () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-prepare-busy-"))
+  roots.push(fixtureRoot)
+  const fixture = createProductFixture(fixtureRoot)
+  git(fixture.product, "remote", "add", "origin", fixture.product)
+  const common = git(fixture.product, "rev-parse", "--path-format=absolute", "--git-common-dir")
+  const stores = [join(common, "modules", "packages", "alpha"), join(common, "modules", "vendor", "beta")]
+  for (const store of stores) rmSync(store, { recursive: true, force: true })
+  const refs = git(fixture.product, "for-each-ref", "--format=%(refname) %(objectname)")
+  const index = git(fixture.product, "diff", "--cached", "--raw")
+  const lockDirectory = join(common, "yrd-worktree-mutations")
+  const held = await acquireExclusive(lockDirectory, { timeoutMs: 0 }, "git super push --plan")
+  try {
+    const result = await superSubmodulePrepare({
+      repo: fixture.product,
+      commit: fixture.productBase,
+      remote: "origin",
+      exclusive: createExclusive(lockDirectory, { timeoutMs: 0 }),
+    })
+
+    expect(result).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: {
+        code: "mutation-lock-busy",
+        phase: "acquire-mutation-lock",
+        message: expect.stringContaining("holder=git super push --plan"),
+        remedy: "Wait for the named lock holder to finish, then rerun git super submodule prepare.",
+      },
+    })
+    expect(stores.map((store) => existsSync(store))).toEqual([false, false])
+    expect(git(fixture.product, "for-each-ref", "--format=%(refname) %(objectname)")).toBe(refs)
+    expect(git(fixture.product, "diff", "--cached", "--raw")).toBe(index)
+  } finally {
+    held.release()
+  }
 })
 
 test("uses the primary common directory for a linked root", async () => {
