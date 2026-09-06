@@ -11,7 +11,7 @@ import { join } from "node:path"
 import { afterEach, expect, test } from "vitest"
 import { runCli } from "../src/cli.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "../src/process.ts"
-import { superSubmodulePrepare } from "../src/submodule-prepare.ts"
+import { superSubmodulePrepare, type SuperSubmodulePrepareResult } from "../src/submodule-prepare.ts"
 import { createProductFixture, git } from "./fixture.ts"
 
 const roots: string[] = []
@@ -201,8 +201,10 @@ test("serializes concurrent cold preparation through the shared common-dir lock"
   ])
 
   expect(exits).toEqual([0, 0])
-  expect([JSON.parse(oneOut.output).state, JSON.parse(twoOut.output).state].sort()).toEqual(["unchanged", "updated"])
-  expect(JSON.parse(oneOut.output).components).toEqual(JSON.parse(twoOut.output).components)
+  const one = JSON.parse(oneOut.output) as SuperSubmodulePrepareResult
+  const two = JSON.parse(twoOut.output) as SuperSubmodulePrepareResult
+  expect([one.state, two.state].sort()).toEqual(["unchanged", "updated"])
+  expect(one.components).toEqual(two.components)
   expect(oneErr.output + twoErr.output).toBe("")
 })
 
@@ -215,8 +217,9 @@ test("uses the primary common directory for a linked root", async () => {
   git(fixture.product, "worktree", "add", "--detach", linked, fixture.productBase)
   try {
     const common = git(fixture.product, "rev-parse", "--path-format=absolute", "--git-common-dir")
-    for (const path of ["packages/alpha", "vendor/beta"])
-      {rmSync(join(common, "modules", path), { recursive: true, force: true })}
+    for (const path of ["packages/alpha", "vendor/beta"]) {
+      rmSync(join(common, "modules", path), { recursive: true, force: true })
+    }
     const output = outputSink()
     const errors = outputSink()
 
@@ -228,7 +231,8 @@ test("uses the primary common directory for a linked root", async () => {
       ),
     ).toBe(0)
     expect(errors.output).toBe("")
-    expect(JSON.parse(output.output).components.map((component: { gitdir: string }) => component.gitdir)).toEqual([
+    const result = JSON.parse(output.output) as SuperSubmodulePrepareResult
+    expect(result.components.map((component) => component.gitdir)).toEqual([
       join(common, "modules", "packages", "alpha"),
       join(common, "modules", "vendor", "beta"),
     ])
@@ -449,8 +453,9 @@ test("uses an explicit root URL without consulting root configuration or a netwo
   roots.push(fixtureRoot)
   const fixture = createProductFixture(fixtureRoot)
   const common = git(fixture.product, "rev-parse", "--path-format=absolute", "--git-common-dir")
-  for (const path of ["packages/alpha", "vendor/beta"])
-    {rmSync(join(common, "modules", path), { recursive: true, force: true })}
+  for (const path of ["packages/alpha", "vendor/beta"]) {
+    rmSync(join(common, "modules", path), { recursive: true, force: true })
+  }
   const calls: Array<Readonly<{ repo: string; args: readonly string[]; env?: NodeJS.ProcessEnv }>> = []
   const local = createLocalGitProcess()
   const tracing: GitProcess = {
