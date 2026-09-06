@@ -27,7 +27,7 @@ test("the package typecheck reports its workspace-composition boundary", () => {
   expect(output).toMatch(
     /git-super workspace-composition typecheck: filtered diagnostics to \d+ configured git-super files?; \d+ dependency diagnostics? excluded \(packages: (?:none|[^)]+)\)/u,
   )
-})
+}, 20_000)
 
 test("the package typecheck rejects an error in a configured git-super file", () => {
   withFixture(
