@@ -10,6 +10,7 @@ import {
   type PullParams,
   type PushParams,
   type StatusParams,
+  type SubmodulePrepareParams,
   type WorktreeAddParams,
 } from "./commands.ts"
 import type { ConsultedRepository, SuperDiffResult } from "./diff.ts"
@@ -18,6 +19,7 @@ import type { SuperMergeResult } from "./merge.ts"
 import type { GitSuperResult } from "./result.ts"
 import { renderConsultedRepositories } from "./report.tsx"
 import type { SuperStatusResult } from "./status.ts"
+import type { SuperSubmodulePrepareResult } from "./submodule-prepare.ts"
 
 export type OutputSink = Readonly<{
   write(value: string): unknown
@@ -33,6 +35,7 @@ type CapturedInvocation =
   | Readonly<{ node: typeof commands.pull; params: PullParams; json: boolean; nul: boolean }>
   | Readonly<{ node: typeof commands.push; params: PushParams; json: boolean; nul: boolean }>
   | Readonly<{ node: typeof commands.gitlink.write; params: GitlinkWriteParams; json: boolean; nul: boolean }>
+  | Readonly<{ node: typeof commands.submodule.prepare; params: SubmodulePrepareParams; json: boolean; nul: boolean }>
   | Readonly<{ node: typeof commands.worktree.add; params: WorktreeAddParams; json: boolean; nul: boolean }>
 
 function stableValue(value: unknown): unknown {
@@ -63,12 +66,24 @@ function commandResult(
   node: CapturedInvocation["node"],
   context: CommandContext,
   params: CapturedInvocation["params"],
-): Promise<SuperDiffResult | SuperStatusResult | SuperIsAncestorResult | SuperMergeResult | GitSuperResult> {
+): Promise<
+  | SuperDiffResult
+  | SuperStatusResult
+  | SuperIsAncestorResult
+  | SuperMergeResult
+  | SuperSubmodulePrepareResult
+  | GitSuperResult
+> {
   const invocation = resolveInvocation(
     node as CommandNode<
       CommandContext,
       CapturedInvocation["params"],
-      SuperDiffResult | SuperStatusResult | SuperIsAncestorResult | SuperMergeResult | GitSuperResult
+      | SuperDiffResult
+      | SuperStatusResult
+      | SuperIsAncestorResult
+      | SuperMergeResult
+      | SuperSubmodulePrepareResult
+      | GitSuperResult
     >,
     context,
     params,
@@ -194,6 +209,26 @@ export async function runCli(argv: readonly string[], stdout: OutputSink, stderr
       }
     })
 
+  const submodule = program.command("submodule").description("Inspect or prepare durable direct-component stores")
+  submodule
+    .command("prepare")
+    .description(commands.submodule.prepare.description ?? commands.submodule.prepare.title)
+    .requiredOption(
+      "--remote <name-or-url>",
+      "explicit root remote name or URL used to resolve frozen relative component URLs",
+    )
+    .argument("<commit>", "exact root commit whose direct gitlinks are prepared")
+    .action((commit, options, command) => {
+      const globals = command.optsWithGlobals() as { repo: string; json?: boolean }
+      const remote = (options as { remote: string }).remote
+      captured = {
+        node: commands.submodule.prepare,
+        params: { commit, remote },
+        json: globals.json === true,
+        nul: false,
+      }
+    })
+
   const worktree = program
     .command("worktree")
     .description("Create worktrees that carry a superproject's submodules")
@@ -293,7 +328,13 @@ export async function runCli(argv: readonly string[], stdout: OutputSink, stderr
   if (captured === undefined) return 0
 
   const globals = program.opts() as { repo: string }
-  let result: SuperDiffResult | SuperStatusResult | SuperIsAncestorResult | SuperMergeResult | GitSuperResult
+  let result:
+    | SuperDiffResult
+    | SuperStatusResult
+    | SuperIsAncestorResult
+    | SuperMergeResult
+    | SuperSubmodulePrepareResult
+    | GitSuperResult
   try {
     result = await commandResult(captured.node, { repo: globals.repo }, captured.params)
   } catch (error) {
@@ -352,6 +393,7 @@ export async function runCli(argv: readonly string[], stdout: OutputSink, stderr
     captured.node === commands.pull ||
     captured.node === commands.push ||
     captured.node === commands.gitlink.write ||
+    captured.node === commands.submodule.prepare ||
     captured.node === commands.worktree.add
   ) {
     const operation = result as GitSuperResult

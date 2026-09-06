@@ -14,14 +14,19 @@ function operationError(
   args: readonly string[],
   result: GitProcessResult,
 ): Error & Readonly<{ resultDetail: GitResultDetail }> {
+  const cause = result.failure ?? result.stderr
   const message = result.timedOut
-    ? `git ${args.join(" ")} timed out in ${repository}`
-    : `git ${args.join(" ")} failed in ${repository} (exit ${result.code})${result.stderr ? `\n${result.stderr}` : ""}`
+    ? `git ${args.join(" ")} timed out in ${repository}${cause ? `\n${cause}` : ""}`
+    : `git ${args.join(" ")} failed in ${repository} (exit ${result.code})${cause ? `\n${cause}` : ""}`
   return Object.assign(new Error(message), {
     resultDetail: detail(result.timedOut ? "git-timeout" : "git-failed", phase, message, {
       remedy: "Resolve the named commit-tree read failure, then rerun the same graph operation.",
     }),
   })
+}
+
+function gitProcessFailed(result: GitProcessResult): boolean {
+  return result.code !== 0 || result.timedOut === true || result.failure !== undefined
 }
 
 /** Read strict submodule metadata and gitlinks from one frozen commit. */
@@ -32,7 +37,7 @@ export async function readCommitSubmodules(
 ): Promise<CommitSubmodule[]> {
   const treeArgs = ["ls-tree", "-r", "-z", "--full-tree", commit]
   const tree = await git.run({ repo: repository, args: treeArgs })
-  if (tree.code !== 0) throw operationError(repository, "read-target-tree", treeArgs, tree)
+  if (gitProcessFailed(tree)) throw operationError(repository, "read-target-tree", treeArgs, tree)
   const gitlinks = new Map<string, string>()
   for (const entry of tree.stdout.split("\0").filter((value) => value !== "")) {
     const separator = entry.indexOf("\t")
@@ -59,7 +64,7 @@ export async function readCommitSubmodules(
   }
   const manifestArgs = ["ls-tree", commit, "--", ".gitmodules"]
   const manifest = await git.run({ repo: repository, args: manifestArgs })
-  if (manifest.code !== 0) throw operationError(repository, "read-target-manifest", manifestArgs, manifest)
+  if (gitProcessFailed(manifest)) throw operationError(repository, "read-target-manifest", manifestArgs, manifest)
   if (manifest.stdout.trim() === "") {
     if (gitlinks.size === 0) return []
     throw Object.assign(new Error(`target ${commit} records gitlinks without .gitmodules`), {
@@ -90,7 +95,8 @@ export async function readCommitSubmodules(
     "^submodule\\..*\\.(path|url)$",
   ]
   const configured = await git.run({ repo: repository, args: configuredArgs })
-  if (configured.code !== 0) throw operationError(repository, "read-target-submodules", configuredArgs, configured)
+  if (gitProcessFailed(configured))
+    {throw operationError(repository, "read-target-submodules", configuredArgs, configured)}
   const configuredByName = new Map<string, { path?: string; url?: string }>()
   for (const entry of configured.stdout.split("\0").filter((value) => value !== "")) {
     const separator = entry.indexOf("\n")

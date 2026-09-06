@@ -22,6 +22,7 @@ git super status --porcelain
 git super merge-base --is-ancestor <sha> <superproject-ref>
 git super merge <commit> [-m <message>] [--no-verify]
 git super gitlink write <path> <commit>
+git super submodule prepare <exact-root-commit> --remote <root-remote-name-or-url> --json
 git super pull --ff-only [<repository> [<refspec>...]]
 git super push [--recurse-submodules=check|on-demand|only|no] [<remote> [<refspec>...]]
 git super worktree add <path> <commit> [--reference <path>]
@@ -64,6 +65,14 @@ A failure before the root merge exits `1` and writes nothing. A failure after Gi
 `gitlink write <path> <commit>` updates one existing mode-`160000` index entry to an exact commit without moving the submodule checkout. It is mechanics only: the caller decides which pin should be written. The command serializes through the shared mutation lock and observes the resulting stage-zero entry before reporting success; an unreadable or mismatched post-write observation reports `unknown` and exits nonzero. A lock-release failure after an accepted write reports `failed` and `partial`; if observation also failed, the repository remains `unknown` instead of being overclaimed as updated.
 
 The path must already be a gitlink, and the exact commit object must exist in either its initialized checkout or its configured repository under the superproject's common Git directory. A missing path, repository, or commit fails with a diagnostic naming the repository, path, object ID, and remedy. The operation never adds a path, fetches a commit, checks out a submodule, or chooses whether a pin should advance. `--json` emits the same `GitSuperResult` returned by the `writeGitlink` library export.
+
+### Prepare persistent component stores
+
+`submodule prepare <exact-root-commit> --remote <root-remote-name-or-url> --json` reads direct gitlinks and `.gitmodules` only from the named root commit. Both inputs are required: it never chooses checkout `HEAD` or treats a stored component origin as authority. The selected root remote resolves relative frozen URLs; JSON returns the normal `GitSuperResult` envelope plus `components`, each with `name`, `path`, `gitlink`, resolved `url`, and absolute `gitdir`.
+
+First use needs a readable root and exact commit, a configured remote name or explicit URL, and a writable root common Git directory. Under the shared mutation lock it creates one checkout-free repository at that common directory's existing `modules/<name>` location, configures it non-bare with an initial frozen URL origin, and validates it again. It performs no clone, fetch, checkout, root ref, or index write. Warm calls preserve existing store configuration and origin while returning the frozen descriptor URL. A valid root with no direct gitlinks succeeds with `components: []`.
+
+An unresolved root, malformed frozen descriptor, unsafe store location, or partial/invalid existing store returns a nonzero structured detail; it is never an empty result or implicit reinitialization. Cold local stores are reported as `updated`, warm stores as `unchanged`, and a later failure keeps already prepared rows as partial evidence rather than deleting them. The returned stores are compatible with a later ordinary `git submodule update`; observation code remains responsible for any network read and exact-object fetch.
 
 ### Safe fast-forward pull
 

@@ -11,6 +11,7 @@ import {
   addNestedAlphaSubmodule,
   advanceRepository,
   bumpProductSubmodules,
+  createRepository,
   createProductFixture,
   git,
 } from "./fixture.ts"
@@ -210,5 +211,83 @@ describe("Phase 1 read commands", () => {
     const cached = await commands.diff.run({ repo: fixture.product }, { refs: [], cached: true, diffFilter: "A" })
 
     expect(cached.paths).toEqual(["root.ts"])
+  })
+
+  test("requires an exact commit and explicit remote for JSON component preparation", async () => {
+    // The prepare command has no HEAD or stored-origin fallback. Existing CLI
+    // coverage exercises read output but not this persistent-store boundary.
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-prepare-cli-"))
+    roots.push(fixtureRoot)
+    const repository = join(fixtureRoot, "plain-root")
+    const commit = createRepository(repository, "root.ts", "export const root = true\n")
+    git(repository, "remote", "add", "origin", repository)
+
+    const missingRemoteOut = outputSink()
+    const missingRemoteErr = outputSink()
+    expect(
+      await runCli(
+        ["--repo", repository, "submodule", "prepare", commit, "--json"],
+        missingRemoteOut,
+        missingRemoteErr,
+      ),
+    ).toBe(1)
+    expect(missingRemoteOut.output).toBe("")
+    expect(missingRemoteErr.output).toContain("required option '--remote <name-or-url>' not specified")
+
+    const missingCommitOut = outputSink()
+    const missingCommitErr = outputSink()
+    expect(
+      await runCli(
+        ["--repo", repository, "submodule", "prepare", "--remote", "origin", "--json"],
+        missingCommitOut,
+        missingCommitErr,
+      ),
+    ).toBe(1)
+    expect(missingCommitOut.output).toBe("")
+    expect(missingCommitErr.output).toContain("missing required argument 'commit'")
+
+    const output = outputSink()
+    const errors = outputSink()
+    expect(
+      await runCli(
+        ["--repo", repository, "submodule", "prepare", commit, "--remote", "origin", "--json"],
+        output,
+        errors,
+      ),
+    ).toBe(0)
+    expect(errors.output).toBe("")
+    expect(JSON.parse(output.output)).toMatchObject({ state: "unchanged", partial: false, components: [] })
+  })
+
+  test.each([
+    ["tree", "HEAD^{tree}"],
+    ["blob", "HEAD:root.ts"],
+  ])("refuses a %s object instead of treating it as an empty frozen root", async (_kind, expression) => {
+    // An object ID alone is not authority to prepare an empty graph: `ls-tree`
+    // accepts trees. Existing valid-empty coverage therefore missed this
+    // non-commit success path.
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-prepare-noncommit-"))
+    roots.push(fixtureRoot)
+    const repository = join(fixtureRoot, "plain-root")
+    createRepository(repository, "root.ts", "export const root = true\n")
+    git(repository, "remote", "add", "origin", repository)
+    const object = git(repository, "rev-parse", expression)
+    const output = outputSink()
+    const errors = outputSink()
+
+    expect(
+      await runCli(
+        ["--repo", repository, "submodule", "prepare", object, "--remote", "origin", "--json"],
+        output,
+        errors,
+      ),
+    ).toBe(2)
+    expect(errors.output).toBe("")
+    expect(JSON.parse(output.output)).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: { code: "invalid-root-commit", phase: "validate-root-commit" },
+      components: [],
+    })
   })
 })

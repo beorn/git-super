@@ -13,6 +13,11 @@ import { superPull, type SuperPullOptions } from "./pull.ts"
 import { superPush, type SuperPushOptions } from "./push.ts"
 import type { GitSuperResult } from "./result.ts"
 import { superStatus, type SuperStatusResult } from "./status.ts"
+import {
+  superSubmodulePrepare,
+  type SuperSubmodulePrepareOptions,
+  type SuperSubmodulePrepareResult,
+} from "./submodule-prepare.ts"
 import { superWorktreeAdd, type SuperWorktreeAddOptions } from "./worktree-add.ts"
 
 export type CommandContext = Readonly<{ repo: string }>
@@ -23,6 +28,7 @@ export type MergeParams = Omit<SuperMergeOptions, "repo" | "git" | "exclusive">
 export type PullParams = Omit<SuperPullOptions, "repo" | "git" | "exclusive">
 export type PushParams = Omit<SuperPushOptions, "repo" | "git" | "exclusive">
 export type GitlinkWriteParams = Omit<WriteGitlinkOptions, "repo" | "git">
+export type SubmodulePrepareParams = Omit<SuperSubmodulePrepareOptions, "repo" | "git" | "exclusive">
 export type WorktreeAddParams = Omit<SuperWorktreeAddOptions, "repo" | "env" | "log">
 
 function params<T>(parse: (value: unknown) => T, missing?: (value: unknown) => string[]): ParseParamSchema<T> {
@@ -174,6 +180,25 @@ const gitlinkWrite = commandNode<CommandContext, GitlinkWriteParams, GitSuperRes
   run: (context, input) => writeGitlink({ repo: context.repo, ...input }),
 })
 
+const submodulePrepare = commandNode<CommandContext, SubmodulePrepareParams, SuperSubmodulePrepareResult>({
+  title: "Prepare persistent component stores",
+  description: "Bind direct gitlinks from one exact root commit to durable checkout-free Git directories.",
+  params: params(
+    (value) => {
+      const input = record(value)
+      if (typeof input.commit !== "string" || typeof input.remote !== "string") {
+        throw new Error("commit and remote must be strings")
+      }
+      return { commit: input.commit, remote: input.remote }
+    },
+    (value) => {
+      const input = typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {}
+      return ["commit", "remote"].filter((name) => typeof input[name] !== "string")
+    },
+  ),
+  run: (context, input) => superSubmodulePrepare({ repo: context.repo, ...input }),
+})
+
 const worktreeAdd = commandNode<CommandContext, WorktreeAddParams, GitSuperResult>({
   title: "Add a worktree with its submodules",
   description: "Create a detached worktree and materialize every gitlink the selected commit records.",
@@ -210,6 +235,9 @@ export type GitSuperCommands = Readonly<{
   gitlink: Readonly<{
     write: CommandNode<CommandContext, GitlinkWriteParams, GitSuperResult>
   }>
+  submodule: Readonly<{
+    prepare: CommandNode<CommandContext, SubmodulePrepareParams, SuperSubmodulePrepareResult>
+  }>
   worktree: Readonly<{
     add: CommandNode<CommandContext, WorktreeAddParams, GitSuperResult>
   }>
@@ -223,5 +251,6 @@ export const commands = defineCommandNodes({
   pull,
   push,
   gitlink: { write: gitlinkWrite },
+  submodule: { prepare: submodulePrepare },
   worktree: { add: worktreeAdd },
 }) satisfies CommandNodeTree<CommandContext> as GitSuperCommands
