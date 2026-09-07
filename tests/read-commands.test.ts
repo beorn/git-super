@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "vitest"
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { resolveInvocation } from "@silvery/command"
+import { flattenCommandNodes, resolveInvocation } from "@silvery/command"
 import { commands } from "../src/commands.ts"
 import { runCli } from "../src/cli.ts"
 import { superIsAncestor } from "../src/merge-base.ts"
@@ -32,13 +32,23 @@ function outputSink(): { output: string; write(value: string): void } {
 }
 
 describe("Phase 1 read commands", () => {
-  test("routes help to stdout without contaminating stderr", async () => {
-    const stdout = outputSink()
-    const stderr = outputSink()
+  test.each(["-h", "--help"])("advertises every registered command in %s help on stdout", async (flag) => {
+    // A Usage-only assertion misses commands that still run but disappear
+    // from help. Derive expected entries from the owning command tree.
+    for (const { path } of flattenCommandNodes(commands)) {
+      for (const [depth, name] of path.entries()) {
+        const stdout = outputSink()
+        const stderr = outputSink()
 
-    expect(await runCli(["-h"], stdout, stderr)).toBe(0)
-    expect(stdout.output).toContain("Usage: git super [options] [command]")
-    expect(stderr.output).toBe("")
+        expect(await runCli([...path.slice(0, depth), flag], stdout, stderr)).toBe(0)
+        if (depth === 0) expect(stdout.output).toContain("Usage: git super [options] [command]")
+        expect(stdout.output).toContain("\nCommands:\n")
+        const commandSection = stdout.output.split("\nCommands:\n")[1]!
+        const advertised = [...commandSection.matchAll(/^  (\S+)/gm)].map((match) => match[1])
+        expect(advertised, `${path.slice(0, depth).join(" ")} ${flag}`).toContain(name)
+        expect(stderr.output).toBe("")
+      }
+    }
   })
 
   test("status prefixes tracked and untracked changes inside every checked-out submodule", () => {
