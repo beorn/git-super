@@ -6,6 +6,7 @@ import { runCli } from "../src/cli.ts"
 import { acquireExclusive, createExclusive } from "../src/exclusive.ts"
 import { adaptProcessGit, createLocalGitProcess, type GitProcess } from "../src/process.ts"
 import { superPull } from "../src/pull.ts"
+import type { GitSuperResult } from "../src/result.ts"
 import {
   addNestedAlphaSubmodule,
   advanceRepository,
@@ -124,7 +125,7 @@ describe("git super pull --ff-only", () => {
       partial: false,
       repositories: [
         {
-          refs: [{ destination: "HEAD", source: target, state: "updated" }],
+          refs: [{ destination: "HEAD", observed: before, source: target, state: "updated" }],
           repository: checkout,
           state: "updated",
         },
@@ -177,6 +178,11 @@ describe("git super pull --ff-only", () => {
     const target = bumpProductSubmodules(fixture)
     const alphaTarget = git(fixture.product, "rev-parse", `${target}:packages/alpha`)
     const betaTarget = git(fixture.product, "rev-parse", `${target}:vendor/beta`)
+    // The heads the report must name as OBSERVED: what this checkout was at
+    // before the pull, not what it ends up at (24243).
+    const priorRoot = git(checkout, "rev-parse", "HEAD")
+    const priorAlpha = git(join(checkout, "packages/alpha"), "rev-parse", "HEAD")
+    const priorBeta = git(join(checkout, "vendor/beta"), "rev-parse", "HEAD")
     const stdout = outputSink()
     const stderr = outputSink()
 
@@ -193,16 +199,20 @@ describe("git super pull --ff-only", () => {
     }
     expect(result.state).toBe("updated")
     expect(result.repositories).toEqual([
-      { repository: checkout, state: "updated", refs: [{ destination: "HEAD", source: target, state: "updated" }] },
+      {
+        repository: checkout,
+        state: "updated",
+        refs: [{ destination: "HEAD", observed: priorRoot, source: target, state: "updated" }],
+      },
       {
         repository: join(checkout, "packages/alpha"),
         state: "updated",
-        refs: [{ destination: "HEAD", source: alphaTarget, state: "updated" }],
+        refs: [{ destination: "HEAD", observed: priorAlpha, source: alphaTarget, state: "updated" }],
       },
       {
         repository: join(checkout, "vendor/beta"),
         state: "updated",
-        refs: [{ destination: "HEAD", source: betaTarget, state: "updated" }],
+        refs: [{ destination: "HEAD", observed: priorBeta, source: betaTarget, state: "updated" }],
       },
     ])
   })
@@ -269,7 +279,9 @@ describe("git super pull --ff-only", () => {
       expect(result.state).toBe("unchanged")
       expect(result.partial).toBe(false)
       expect(result.repositories.map((repository) => repository.state)).toEqual(["unchanged", "unchanged", "unchanged"])
-      expect(result.repositories[0]?.refs).toEqual([{ destination: "HEAD", source: head, state: "unchanged" }])
+      expect(result.repositories[0]?.refs).toEqual([
+        { destination: "HEAD", observed: head, source: head, state: "unchanged" },
+      ])
       expect(result.detail).toMatchObject({ code: "already-up-to-date", objectIds: [head, fixture.productBase] })
       expect(result.detail?.message).toContain("kept the current root tree and its recorded submodule pins")
       expect(git(checkout, "rev-parse", "HEAD")).toBe(head)
@@ -1119,5 +1131,102 @@ describe("git super pull --ff-only", () => {
     expect(await runCli(["--repo", checkout, "pull", "--ff-only", "origin", "main", "--json"], stdout, stderr)).toBe(0)
     expect(stderr.output).toBe("")
     expect(readFileSync(marker, "utf8")).toBe("invoked")
+  })
+})
+
+/**
+ * @failure `state=unchanged` answers "your head equals the target" while being
+ *          read as "there was nothing to do, so you are where you were". Those
+ *          coincide right up until something else moved the checkout — which is
+ *          precisely when someone is reading the report to find out.
+ * @level   l1 — real repositories on disk, through the same CLI the reporter ran
+ * @bead    @i/10-yrd/24243-unchanged-is-ambiguous
+ */
+describe("the pull report names the head it decided against", () => {
+  // The specimen, replayed in the reporter's own shape rather than a shape I
+  // invented: a checkout is fast-forwarded by SOMETHING ELSE, and only then does
+  // its owner run the dry-run. The old report said `unchanged` with the target
+  // as `source` and nothing else — indistinguishable, from the owner's side,
+  // from a dry-run that had moved them itself. That misreading cost two agents
+  // and a chief two hours and produced a bead against an innocent tool.
+  test("a dry-run after someone else moved the checkout reports the head it actually saw", async () => {
+    const fixture = mkdtempSync(join(tmpdir(), "git-super-pull-observed-moved-"))
+    roots.push(fixture)
+    const upstream = join(fixture, "upstream")
+    const checkout = join(fixture, "checkout")
+    const before = createRepository(upstream, "README.md", "one\n")
+    git(fixture, "clone", "-q", upstream, checkout)
+    const after = advanceRepository(upstream, "README.md", "two\n")
+
+    // Somebody else's sweep: the checkout is already at the target before its
+    // owner ever asks.
+    git(checkout, "fetch", "-q", "origin", "main")
+    git(checkout, "merge", "-q", "--ff-only", after)
+    expect(git(checkout, "rev-parse", "HEAD")).toBe(after)
+    expect(after).not.toBe(before)
+
+    const stdout = outputSink()
+    const stderr = outputSink()
+    expect(
+      await runCli(["--repo", checkout, "pull", "--ff-only", "--dry-run", "origin", "main", "--json"], stdout, stderr),
+    ).toBe(0)
+
+    // Typed at the parse: the component's own vitest does not typecheck, but the
+    // ROOT compiler does, and an untyped JSON.parse is an unknown there.
+    const report = JSON.parse(stdout.output) as GitSuperResult
+    expect(report).toMatchObject({ state: "unchanged" })
+    const ref = report.repositories[0]!.refs[0]!
+    // The whole fix: the owner can now see WHICH head produced `unchanged`, so
+    // comparing it against the head they recorded shows the move instead of
+    // hiding it.
+    expect(ref.observed).toBe(after)
+    expect(ref.observed).not.toBe(before)
+    expect(ref.source).toBe(after)
+  })
+
+  // Both states must render differently, per the bead's acceptance — otherwise
+  // the field is decoration. Behind: observed is the PRE-pull head and differs
+  // from the target. Already there: observed equals it.
+  test("behind and already-at-target render differently, not just as different words", async () => {
+    const fixture = mkdtempSync(join(tmpdir(), "git-super-pull-observed-behind-"))
+    roots.push(fixture)
+    const upstream = join(fixture, "upstream")
+    const checkout = join(fixture, "checkout")
+    const before = createRepository(upstream, "README.md", "one\n")
+    git(fixture, "clone", "-q", upstream, checkout)
+    const after = advanceRepository(upstream, "README.md", "two\n")
+
+    const behind = await superPull({
+      repo: checkout,
+      repository: "origin",
+      refspecs: ["main"],
+      ffOnly: true,
+      dryRun: true,
+    })
+    const behindRef = behind.repositories[0]!.refs[0]!
+    expect(behindRef.state).toBe("updated")
+    expect(behindRef.observed).toBe(before)
+    expect(behindRef.source).toBe(after)
+    // A dry-run must not be readable as a completed move. It is not the word
+    // that carries that now — it is that observed still names the OLD head.
+    expect(git(checkout, "rev-parse", "HEAD")).toBe(before)
+
+    const applied = await superPull({ repo: checkout, repository: "origin", refspecs: ["main"], ffOnly: true })
+    expect(applied.repositories[0]!.refs[0]!.observed).toBe(before)
+
+    const settled = await superPull({
+      repo: checkout,
+      repository: "origin",
+      refspecs: ["main"],
+      ffOnly: true,
+      dryRun: true,
+    })
+    const settledRef = settled.repositories[0]!.refs[0]!
+    expect(settledRef.state).toBe("unchanged")
+    expect(settledRef.observed).toBe(after)
+    expect(settledRef.observed).toBe(settledRef.source)
+    // The two reports differ in the field a reader can act on, not only in the
+    // state word they were already misreading.
+    expect(settledRef.observed).not.toBe(behindRef.observed)
   })
 })
