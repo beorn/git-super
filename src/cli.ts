@@ -19,6 +19,7 @@ import type { GitSuperResult } from "./result.ts"
 import type { SuperStatusResult } from "./status.ts"
 import type { SuperSubmodulePrepareResult } from "./submodule-prepare.ts"
 import { delegateNativeGit, readNativeGit, type ProcessOutputSink } from "./process.ts"
+import { openInvocationProtocol, type InvocationProtocol } from "./protocol.ts"
 
 export type OutputSink = ProcessOutputSink &
   Readonly<{
@@ -263,14 +264,48 @@ export async function runCli(
   stderr: OutputSink,
   replaceProcess = false,
 ): Promise<number> {
+  if (!argv[0]?.startsWith("--protocol-fd")) return runInvocation(argv, stdout, stderr, replaceProcess)
+  let protocol: InvocationProtocol | undefined
+  let code = 1
+  try {
+    if (argv[0] !== "--protocol-fd=3") throw new Error("git-super: the control option must be --protocol-fd=3")
+    protocol = await openInvocationProtocol()
+    code = await runInvocation(argv.slice(1), stdout, stderr, replaceProcess, protocol)
+  } catch (error) {
+    stderr.write(`${error instanceof Error ? error.message : String(error)}\n`)
+  } finally {
+    try {
+      await protocol?.close()
+    } catch (error) {
+      stderr.write(`${error instanceof Error ? error.message : String(error)}\n`)
+      code = 1
+    }
+  }
+  return code
+}
+
+async function runInvocation(
+  argv: readonly string[],
+  stdout: OutputSink,
+  stderr: OutputSink,
+  replaceProcess: boolean,
+  protocol?: InvocationProtocol,
+): Promise<number> {
+  let delegated = false
   try {
     const enriched = await enrichedInvocation(argv)
     // execve on the executable path leaves native Git owning the PID, byte
     // streams and cancellation. In-process callers retain their process owner.
-    if (enriched === undefined) return await delegateNativeGit(argv, stdout, stderr, replaceProcess)
+    if (enriched === undefined) {
+      delegated = true
+      await protocol?.close()
+      return await delegateNativeGit(argv, stdout, stderr, replaceProcess)
+    }
     argv = enriched
   } catch (error) {
-    stderr.write(`${error instanceof Error ? error.message : String(error)}\n`)
+    const message = error instanceof Error ? error.message : String(error)
+    stderr.write(`${message}\n`)
+    if (!delegated) await protocol?.refuse("unjudged", message)
     return 1
   }
   const [{ Command: CliCommand, CommanderError }, { commands }] = await Promise.all([
@@ -522,26 +557,67 @@ export async function runCli(
   try {
     result = await commandResult(captured.node, { repo: globals.repo }, captured.params)
   } catch (error) {
-    stderr.write(`${error instanceof Error ? error.message : String(error)}\n`)
+    const message = error instanceof Error ? error.message : String(error)
+    stderr.write(`${message}\n`)
+    await protocol?.refuse("unjudged", message)
     return 2
   }
+  await writeResult(captured, result, stdout, stderr, commands)
+
+  if (captured.node === commands["merge-base"] && !(result as SuperIsAncestorResult).isAncestor) return 1
+  if (captured.node === commands.merge) {
+    const merge = result as SuperMergeResult
+    if (merge.state === "updated" || merge.state === "unchanged") return 0
+    await protocol?.refuse(
+      "unjudged",
+      merge.detail?.message ?? `Merge in ${globals.repo} ended ${merge.state}; its outcome requires reconciliation.`,
+    )
+    return merge.partial ? 2 : 1
+  }
+  if (
+    captured.node === commands.pull ||
+    captured.node === commands.push ||
+    captured.node === commands.gitlink.write ||
+    captured.node === commands.submodule.prepare ||
+    captured.node === commands.worktree.add
+  ) {
+    const operation = result as GitSuperResult
+    if (operation.state !== "updated" && operation.state !== "unchanged") {
+      await protocol?.refuse(
+        "unjudged",
+        operation.detail?.message ??
+          `Operation in ${globals.repo} ended ${operation.state}; its outcome requires reconciliation.`,
+      )
+    }
+    return operation.state === "updated" || operation.state === "unchanged" ? 0 : 2
+  }
+  return 0
+}
+
+async function writeResult(
+  captured: CapturedInvocation,
+  result: Awaited<ReturnType<typeof commandResult>>,
+  stdout: OutputSink,
+  stderr: OutputSink,
+  nodes: typeof commands,
+): Promise<void> {
   if (captured.json) {
     stdout.write(stableJson(result))
-  } else if (captured.node === commands.diff) {
+  } else if (captured.node === nodes.diff) {
     const diff = result as SuperDiffResult
     if (diff.paths.length > 0) {
       stdout.write(`${diff.paths.join(captured.nul ? "\0" : "\n")}${captured.nul ? "\0" : "\n"}`)
     }
     await writeReport(diff.consultedRepositories, stderr)
-  } else if (captured.node === commands.status) {
+  } else if (captured.node === nodes.status) {
     const status = result as SuperStatusResult
     if (status.records.length > 0) {
       stdout.write(`${status.records.join(captured.nul ? "\0" : "\n")}${captured.nul ? "\0" : "\n"}`)
     }
     await writeReport(status.consultedRepositories, stderr)
-  } else if (captured.node === commands["merge-base"]) {
+  } else if (captured.node === nodes["merge-base"]) {
     await writeReport((result as SuperIsAncestorResult).consultedRepositories, stderr)
-  } else if (captured.node === commands.merge) {
+  } else if (captured.node === nodes.merge) {
     const merge = result as SuperMergeResult
     if (merge.commit !== undefined) stdout.write(`${merge.commit}\n`)
     for (const gitlink of merge.gitlinks) {
@@ -566,22 +642,4 @@ export async function runCli(
     stdout.write(`${pull.state}\n`)
     if (pull.detail !== undefined) stderr.write(`${pull.detail.message}\n`)
   }
-
-  if (captured.node === commands["merge-base"] && !(result as SuperIsAncestorResult).isAncestor) return 1
-  if (captured.node === commands.merge) {
-    const merge = result as SuperMergeResult
-    if (merge.state === "updated" || merge.state === "unchanged") return 0
-    return merge.partial ? 2 : 1
-  }
-  if (
-    captured.node === commands.pull ||
-    captured.node === commands.push ||
-    captured.node === commands.gitlink.write ||
-    captured.node === commands.submodule.prepare ||
-    captured.node === commands.worktree.add
-  ) {
-    const operation = result as GitSuperResult
-    return operation.state === "updated" || operation.state === "unchanged" ? 0 : 2
-  }
-  return 0
 }
