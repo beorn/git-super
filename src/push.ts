@@ -633,20 +633,29 @@ async function refspecUpdate(git: GitProcess, root: string, remote: string, refs
 }
 
 async function configuredPushRemote(git: GitProcess, root: string): Promise<string> {
-  const pushDefault = await git.run({ repo: root, args: ["config", "--get", "remote.pushDefault"] })
-  if (pushDefault.code === 0 && pushDefault.stdout.trim() !== "") return pushDefault.stdout.trim()
-  const branch = await git.run({ repo: root, args: ["symbolic-ref", "--quiet", "--short", "HEAD"] })
-  if (branch.code === 0 && branch.stdout.trim() !== "") {
-    for (const suffix of ["pushRemote", "remote"] as const) {
-      const configured = await git.run({
-        repo: root,
-        args: ["config", "--get", `branch.${branch.stdout.trim()}.${suffix}`],
-      })
-      if (configured.code === 0 && configured.stdout.trim() !== "") return configured.stdout.trim()
+  const branchArgs = ["symbolic-ref", "--quiet", "--short", "HEAD"]
+  const branch = await git.run({ repo: root, args: branchArgs })
+  if (branch.code !== 0 && !(branch.code === 1 && branch.stdout === "" && branch.stderr === "")) {
+    throw operationError(root, branchArgs, "resolve-push-remote", branch)
+  }
+  const branchName = branch.stdout.trim()
+  const keys = [
+    ...(branchName === "" ? [] : [`branch.${branchName}.pushRemote`]),
+    "remote.pushDefault",
+    ...(branchName === "" ? [] : [`branch.${branchName}.remote`]),
+  ]
+  for (const key of keys) {
+    const args = ["config", "--get", key]
+    const configured = await git.run({ repo: root, args })
+    if (configured.code === 0) return configured.stdout.trim()
+    if (!(configured.code === 1 && configured.stdout === "" && configured.stderr === "")) {
+      throw operationError(root, args, "resolve-push-remote", configured)
     }
   }
-  const origin = await git.run({ repo: root, args: ["remote", "get-url", "--push", "origin"] })
+  const originArgs = ["remote", "get-url", "--push", "origin"]
+  const origin = await git.run({ repo: root, args: originArgs })
   if (origin.code === 0) return "origin"
+  if (origin.code !== 2) throw operationError(root, originArgs, "resolve-push-remote", origin)
   throw Object.assign(new Error("Git has no configured push remote"), {
     resultDetail: detail("missing-push-remote", "resolve-push-remote", "Git has no configured push remote.", {
       remedy: "Supply a remote explicitly or configure remote.pushDefault / branch.<name>.remote.",
@@ -669,7 +678,15 @@ async function configuredPushUpdates(
   remote: string,
   options: Pick<SuperPushOptions, "atomic" | "pushOptions" | "signed" | "verify">,
 ): Promise<RefUpdate[]> {
-  const args = ["push", "--porcelain", "--dry-run", "--recurse-submodules=no", ...nativePushOptions(options), remote]
+  // The preview resolves refspecs; only the actual push runs the caller's hook.
+  const args = [
+    "push",
+    "--porcelain",
+    "--dry-run",
+    "--recurse-submodules=no",
+    ...nativePushOptions({ ...options, verify: false }),
+    remote,
+  ]
   const planned = await git.run({ repo: root, args })
   if (planned.code !== 0) throw operationError(root, args, "resolve-default-refspecs", planned)
   const updates: RefUpdate[] = []
@@ -810,8 +827,9 @@ async function advertisedCommitTips(
   refPrefixes: readonly string[] = ["refs/"],
 ): Promise<string[]> {
   const advertised = await git.run({ repo: repository, args: ["ls-remote", "--refs", remote] })
-  if (advertised.code !== 0)
+  if (advertised.code !== 0) {
     throw operationError(repository, ["ls-remote", "--refs", remote], "inspect-submodule-remote", advertised)
+  }
   const tips: string[] = []
   for (const line of advertised.stdout.split(/\r?\n/u).filter((row) => row !== "")) {
     const [oid, ref] = line.split(/\s+/u, 2)
@@ -848,13 +866,14 @@ async function commitAvailableOnRemote(
   for (const tip of await advertisedCommitTips(git, repository, remote, refPrefixes)) {
     const contains = await git.run({ repo: repository, args: ["merge-base", "--is-ancestor", commit, tip] })
     if (contains.code === 0) return true
-    if (contains.code !== 1)
+    if (contains.code !== 1) {
       throw operationError(
         repository,
         ["merge-base", "--is-ancestor", commit, tip],
         "check-remote-availability",
         contains,
       )
+    }
   }
   return false
 }
@@ -1014,7 +1033,7 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
         : await Promise.all(refspecs.map((refspec) => refspecUpdate(git, root, remote, refspec)))
     const rootUpdates = applyExplicitLeases(selectedUpdates, options.forceWithLease ?? [])
     if (options.recurseSubmodules === "no") {
-      return pushRefUpdates({
+      return await pushRefUpdates({
         root,
         updates: rootUpdates,
         ...(options.atomic === undefined ? {} : { atomic: options.atomic }),
@@ -1090,7 +1109,7 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
         },
       ])
     }
-    return pushRefUpdates({
+    return await pushRefUpdates({
       root,
       updates: [...childUpdates, ...(options.recurseSubmodules === "on-demand" ? rootUpdates : [])],
       ...(options.atomic === undefined ? {} : { atomic: options.atomic }),

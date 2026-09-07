@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { afterEach, describe, expect, test } from "vitest"
@@ -141,22 +141,92 @@ describe("explicit recursive push mechanics", () => {
     expect(git(remote, "rev-parse", "refs/heads/main")).toBe(source)
   })
 
-  test("uses Git's configured default push selection when no refspec is supplied", async () => {
-    const { repository, remote, source } = pushFixture("cli-default")
+  test.each([
+    ["branch override", true, true, "origin"],
+    ["push default", false, true, "alternate"],
+    ["branch remote", false, false, "origin"],
+  ] as const)(
+    "uses configured %s and runs the push hook once",
+    async (_name, branchOverride, pushDefault, selected) => {
+      const { fixture, repository, remote, source: before } = pushFixture("cli-default")
+      const alternate = join(fixture, "alternate.git")
+      git(fixture, "init", "--bare", "-q", alternate)
+      git(repository, "remote", "add", "origin", remote)
+      git(repository, "remote", "add", "alternate", alternate)
+      git(repository, "push", "-q", "origin", "main")
+      git(repository, "push", "-q", "alternate", "main")
+      git(repository, "config", "branch.main.remote", "origin")
+      git(repository, "config", "branch.main.merge", "refs/heads/main")
+      if (pushDefault) git(repository, "config", "remote.pushDefault", "alternate")
+      if (branchOverride) git(repository, "config", "branch.main.pushRemote", "origin")
+      const source = advanceRepository(repository, "README.md", "two\n")
+      const hook = join(repository, ".git", "hooks", "pre-push")
+      writeFileSync(`${hook}.calls`, "")
+      writeFileSync(hook, '#!/bin/sh\nprintf "called\\n" >> "$0.calls"\n')
+      chmodSync(hook, 0o755)
+      const stdout = outputSink()
+      const stderr = outputSink()
+
+      expect(await runCli(["--repo", repository, "push", "--recurse-submodules=no", "--json"], stdout, stderr)).toBe(0)
+
+      expect(stderr.output).toBe("")
+      expect(JSON.parse(stdout.output)).toMatchObject({
+        state: "updated",
+        repositories: [{ refs: [{ source, destination: "refs/heads/main", state: "updated" }] }],
+      })
+      expect({
+        origin: git(remote, "rev-parse", "refs/heads/main"),
+        alternate: git(alternate, "rev-parse", "refs/heads/main"),
+        hooks: readFileSync(`${hook}.calls`, "utf8"),
+      }).toEqual({
+        origin: selected === "origin" ? source : before,
+        alternate: selected === "alternate" ? source : before,
+        hooks: "called\n",
+      })
+
+      const next = advanceRepository(repository, "README.md", "three\n")
+      expect(
+        await runCli(
+          ["--repo", repository, "push", "--recurse-submodules=no", "--no-verify", "--json"],
+          outputSink(),
+          outputSink(),
+        ),
+      ).toBe(0)
+      expect(git(selected === "origin" ? remote : alternate, "rev-parse", "refs/heads/main")).toBe(next)
+      expect(readFileSync(`${hook}.calls`, "utf8")).toBe("called\n")
+    },
+  )
+
+  test("preserves a configured remote read failure before any push", async () => {
+    const { repository, remote } = pushFixture("config-failure")
     git(repository, "remote", "add", "origin", remote)
     git(repository, "config", "branch.main.remote", "origin")
     git(repository, "config", "branch.main.merge", "refs/heads/main")
-    const stdout = outputSink()
-    const stderr = outputSink()
+    const local = createLocalGitProcess()
+    let failures = 0
+    const failing: GitProcess = {
+      run(request) {
+        if (request.args[0] === "config" && request.args[2] === "remote.pushDefault") {
+          failures += 1
+          return Promise.resolve({ code: 128, stdout: "", stderr: "cannot read push configuration" })
+        }
+        return local.run(request)
+      },
+    }
 
-    expect(await runCli(["--repo", repository, "push", "--recurse-submodules=no", "--json"], stdout, stderr)).toBe(0)
+    const result = await superPush({ repo: repository, recurseSubmodules: "no", git: failing })
 
-    expect(stderr.output).toBe("")
-    expect(JSON.parse(stdout.output)).toMatchObject({
-      state: "updated",
-      repositories: [{ refs: [{ source, destination: "refs/heads/main", state: "updated" }] }],
+    expect(failures).toBe(1)
+    expect(result).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: {
+        code: "git-failed",
+        phase: "resolve-push-remote",
+        message: expect.stringContaining("cannot read push configuration"),
+      },
     })
-    expect(git(remote, "rev-parse", "refs/heads/main")).toBe(source)
+    expect(git(remote, "for-each-ref", "--format=%(refname)", "refs/heads/main")).toBe("")
   })
 
   test("fails loudly when neither the CLI nor Git configuration names a push remote", async () => {
