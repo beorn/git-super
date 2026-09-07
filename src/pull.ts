@@ -469,6 +469,10 @@ function repositoryResult(
         source: repository.target,
         destination: "HEAD",
         state,
+        // The head this decision was actually made against. `state` is derived
+        // from comparing it to `source`, so reporting the verdict without the
+        // input it was computed from is what made `unchanged` unfalsifiable.
+        observed: repository.current,
         ...(failure === undefined ? {} : { detail: failure }),
       },
     ],
