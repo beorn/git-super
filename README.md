@@ -78,6 +78,8 @@ An unresolved root, malformed frozen descriptor, unsafe store location, or parti
 
 `pull --ff-only` fetches and freezes one exact root target. It then works out the full graph of initialized submodules without checking anything out, fetches only the recorded child commits it is missing, and tests every working-tree change before the first write. Applying the change rechecks the remote ref and every repository HEAD under a shared lock, fast-forwards the root, then checks out changed submodules at their exact recorded commits.
 
+If the root already contains the target, pull keeps the current root tree and its component pins and reports why it is already up to date.
+
 With no repository or refspec, pull uses the current branch's configured upstream. With no refspec, a named repository supplies that same upstream branch. A branch with no upstream fails and says so, rather than guessing `origin/main`.
 
 Unrelated staged, tracked, untracked, and ignored files survive. A path the incoming graph would overwrite fails before the root moves. Divergence, an unpublished detached child commit, a remote target that changes mid-operation, lock contention, and unavailable objects all fail without merging, rebasing, stashing, forcing, or resolving conflicts. If native Git fails after an earlier repository already changed, the result says `partial` and every later repository is `not-run`.

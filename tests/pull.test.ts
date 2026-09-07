@@ -221,6 +221,104 @@ describe("git super pull --ff-only", () => {
     expect(stderr.output).toBe("")
     expect(git(checkout, "rev-parse", "HEAD")).toBe(head)
     expect(JSON.parse(stdout.output)).toMatchObject({ state: "unchanged", partial: false })
+    // Equality must return before applying, not ask Git to merge the same SHA.
+    expect(
+      await superPull({
+        repo: checkout,
+        repository: "origin",
+        refspecs: ["main"],
+        ffOnly: true,
+        exclusive: {
+          async run() {
+            throw new Error("equal root entered the apply phase")
+          },
+        },
+      }),
+    ).toMatchObject({ state: "unchanged", partial: false })
+  })
+
+  test("preserves an ahead root and its newer component pins in dry-run and actual pull", async () => {
+    // A feature branch already contains the remote target. The equal-root and
+    // forward-pull cases do not catch rejecting it or restoring the older pins.
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-pull-ahead-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const checkout = join(fixtureRoot, "checkout")
+    git(
+      fixtureRoot,
+      "-c",
+      "protocol.file.allow=always",
+      "clone",
+      "-q",
+      "--recurse-submodules",
+      fixture.product,
+      checkout,
+    )
+    const alpha = join(checkout, "packages/alpha")
+    const ahead = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
+    git(alpha, "fetch", "-q", "origin")
+    git(alpha, "checkout", "-q", ahead)
+    git(checkout, "add", "packages/alpha")
+    git(checkout, "commit", "-q", "-m", "pin newer alpha on feature branch")
+    const head = git(checkout, "rev-parse", "HEAD")
+    const index = git(checkout, "write-tree")
+
+    for (const dryRun of [true, false]) {
+      const result = await superPull({ repo: checkout, repository: "origin", refspecs: ["main"], ffOnly: true, dryRun })
+
+      expect(result.state).toBe("unchanged")
+      expect(result.partial).toBe(false)
+      expect(result.repositories.map((repository) => repository.state)).toEqual(["unchanged", "unchanged", "unchanged"])
+      expect(result.repositories[0]?.refs).toEqual([{ destination: "HEAD", source: head, state: "unchanged" }])
+      expect(result.detail).toMatchObject({ code: "already-up-to-date", objectIds: [head, fixture.productBase] })
+      expect(result.detail?.message).toContain("kept the current root tree and its recorded component pins")
+      expect(git(checkout, "rev-parse", "HEAD")).toBe(head)
+      expect(git(checkout, "write-tree")).toBe(index)
+      expect(git(checkout, "status", "--short")).toBe("")
+      expect(git(alpha, "rev-parse", "HEAD")).toBe(ahead)
+      expect(git(checkout, "rev-parse", "HEAD:packages/alpha")).toBe(ahead)
+    }
+  })
+
+  test.each(["forward", "reverse"])("preserves a Git failure in the %s ancestry proof", async (direction) => {
+    // A failed ancestry command is unknown, not proof of divergence or of an
+    // already-contained target. Exercise both reads on an ahead checkout.
+    const fixture = mkdtempSync(join(tmpdir(), "git-super-pull-ancestry-error-"))
+    roots.push(fixture)
+    const upstream = join(fixture, "upstream")
+    const checkout = join(fixture, "checkout")
+    const target = createRepository(upstream, "README.md", "one\n")
+    git(fixture, "clone", "-q", upstream, checkout)
+    const head = advanceRepository(checkout, "local.txt", "local\n")
+    const process = createLocalGitProcess()
+    const stderr = "fatal: ancestry object is unavailable\noriginal Git evidence\n"
+    let injected = 0
+    const result = await superPull({
+      repo: checkout,
+      repository: "origin",
+      refspecs: ["main"],
+      ffOnly: true,
+      dryRun: true,
+      git: {
+        run(request) {
+          if (request.args[0] === "merge-base" && request.args[2] === (direction === "forward" ? head : target)) {
+            injected++
+            return Promise.resolve({ code: 128, stdout: "", stderr })
+          }
+          return process.run(request)
+        },
+      },
+    })
+
+    expect(injected).toBe(1)
+    expect(result).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: { code: "git-failed", phase: "prove-root-ancestry" },
+    })
+    expect(result.detail?.message).toContain(stderr)
+    expect(result.detail?.message).not.toContain("not an ancestor")
+    expect(git(checkout, "rev-parse", "HEAD")).toBe(head)
   })
 
   test("preserves an unrelated tracked root edit", async () => {

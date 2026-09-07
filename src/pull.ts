@@ -24,6 +24,7 @@ type PullPlan = Readonly<{
   refspecs: readonly string[]
   remoteRef?: string
   observedRemoteTarget?: string
+  detail?: GitResultDetail
   repositories: readonly PullRepositoryPlan[]
 }>
 
@@ -82,10 +83,11 @@ function resultError(error: unknown, phase: string): GitResultDetail {
 }
 
 async function planPull(git: GitProcess, options: SuperPullOptions): Promise<PullPlan> {
-  if (!options.ffOnly)
+  if (!options.ffOnly) {
     throw Object.assign(new Error("git super pull requires --ff-only"), {
       resultDetail: detail("ff-only-required", "validate", "git super pull requires --ff-only"),
     })
+  }
   const root = await required(git, options.repo, ["rev-parse", "--show-toplevel"], "discover-root")
   const { repository, refspecs, remoteRef, exactTarget } = await resolvePullTarget(git, root, options)
   await required(
@@ -116,21 +118,41 @@ async function planPull(git: GitProcess, options: SuperPullOptions): Promise<Pul
     timeoutMs: options.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS,
     git,
   })
-  const target = await required(git, root, ["rev-parse", `${targetObject}^{commit}`], "freeze-root-target")
+  let target = await required(git, root, ["rev-parse", `${targetObject}^{commit}`], "freeze-root-target")
   const current = await required(git, root, ["rev-parse", "HEAD^{commit}"], "freeze-root-current")
-  const ancestor = await run(git, root, ["merge-base", "--is-ancestor", current, target])
-  if (ancestor.code !== 0) {
-    throw Object.assign(new Error(`git super pull --ff-only refused divergent root ${root}`), {
-      resultDetail: detail(
-        "non-fast-forward",
+  const forwardArgs = ["merge-base", "--is-ancestor", current, target]
+  const ancestor = await run(git, root, forwardArgs)
+  if (ancestor.code !== 0 && ancestor.code !== 1) {
+    throw operationError(root, "prove-root-ancestry", forwardArgs, ancestor)
+  }
+  let rootDetail: GitResultDetail | undefined
+  if (ancestor.code === 1) {
+    const reverseArgs = ["merge-base", "--is-ancestor", target, current]
+    const contained = await run(git, root, reverseArgs)
+    if (contained.code !== 0 && contained.code !== 1) {
+      throw operationError(root, "prove-root-ancestry", reverseArgs, contained)
+    }
+    if (contained.code === 0) {
+      rootDetail = detail(
+        "already-up-to-date",
         "prove-root-ancestry",
-        `Current ${current} is not an ancestor of ${target}.`,
-        {
-          objectIds: [current, target],
-          remedy: "Reconcile the local branch explicitly; git super pull never merges, rebases, stashes, or forces.",
-        },
-      ),
-    })
+        `Target ${target} is an ancestor of current ${current}; kept the current root tree and its recorded component pins.`,
+        { objectIds: [current, target] },
+      )
+      target = current
+    } else {
+      throw Object.assign(new Error(`git super pull --ff-only refused divergent root ${root}`), {
+        resultDetail: detail(
+          "non-fast-forward",
+          "prove-root-ancestry",
+          `Current ${current} is not an ancestor of ${target}.`,
+          {
+            objectIds: [current, target],
+            remedy: "Reconcile the local branch explicitly; git super pull never merges, rebases, stashes, or forces.",
+          },
+        ),
+      })
+    }
   }
   const repositories = await freezeRepositoryGraph(git, root, current, target)
   await proveRepositoryTransitions(git, repositories)
@@ -140,6 +162,7 @@ async function planPull(git: GitProcess, options: SuperPullOptions): Promise<Pul
     refspecs,
     ...(remoteRef === undefined ? {} : { remoteRef }),
     ...(observedRemoteTarget === undefined ? {} : { observedRemoteTarget }),
+    ...(rootDetail === undefined ? {} : { detail: rootDetail }),
     repositories,
   }
 }
@@ -476,6 +499,7 @@ export async function superPull(options: SuperPullOptions): Promise<GitSuperResu
       plan.repositories.map((repository) =>
         repositoryResult(repository, repository.current === repository.target ? "unchanged" : "updated"),
       ),
+      plan.detail,
     )
   }
   const exclusive = options.exclusive ?? createExclusive(await lockDirectory(git, plan.root))
@@ -556,7 +580,7 @@ export async function superPull(options: SuperPullOptions): Promise<GitSuperResu
           }
           results.push(repositoryResult(repository, "updated"))
         }
-        return gitSuperResult(results)
+        return gitSuperResult(results, plan.detail)
       },
       { holder: "git super pull --ff-only" },
     )
