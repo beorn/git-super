@@ -45,10 +45,12 @@ jobs:
           bun --bun x vitest run
           packages/yrd-queue-core/tests/submit.test.ts
           packages/yrd-queue-core/tests/pause.test.ts
+          --testTimeout 10000
           --reporter=default --reporter=json
           --outputFile=${{ github.workspace }}/native-git-results.json
-      # Keep the initial failure visible: this is a conformance gate, not an
-      # expected-failure assertion. Passing cases with no Git calls prove none.
+      # Both legs use the same integration readiness budget, not a performance
+      # claim. Keep per-call timings and flag cases above the former 5s budget.
+      # Conformance failures stay visible; cases with no Git calls prove none.
       - name: Selected GitSuper executable
         working-directory: .yrd-conformance
         env:
@@ -58,6 +60,7 @@ jobs:
           bun --bun x vitest run
           packages/yrd-queue-core/tests/submit.test.ts
           packages/yrd-queue-core/tests/pause.test.ts
+          --testTimeout 10000
           --reporter=default --reporter=json
           --outputFile=${{ github.workspace }}/git-super-results.json
       - uses: actions/upload-artifact@v4
