@@ -121,6 +121,8 @@ worktree add /work/candidate at 0123456789abcdef0123456789abcdef01234567 (main):
 
 ## Try it
 
+Requires Bun 1.3.14 or newer. Native Git delegation uses `process.execve` to preserve the process ID, streams, and signals.
+
 The package name is reserved; this first source release is not yet on npm. Clone it, install its public dependencies, and put its executable on `PATH` for one command:
 
 ```bash

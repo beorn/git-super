@@ -48,7 +48,9 @@ export async function delegateNativeGit(
   replaceProcess: boolean,
 ): Promise<number> {
   if (replaceProcess) {
-    if (process.execve === undefined) throw new Error("git-super: native delegation requires process.execve")
+    if (process.execve === undefined) {
+      throw new Error(`git-super: Bun ${Bun.version} lacks process.execve; use Bun >=1.3.14 for native Git delegation`)
+    }
     const executable = nativeGitExecutable()
     process.execve(executable, [executable, ...args], process.env)
   }
