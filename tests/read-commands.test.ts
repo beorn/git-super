@@ -11,6 +11,7 @@ import {
   addNestedAlphaSubmodule,
   advanceRepository,
   bumpProductSubmodules,
+  canonicalTmpdir,
   createRepository,
   createProductFixture,
   git,
@@ -32,6 +33,67 @@ function outputSink(): { output: string; write(value: string): void } {
 }
 
 describe("Phase 1 read commands", () => {
+  // Gate A: existing extension calls use --repo/--json and formatted results.
+  // Native callers need unchanged syntax even for names already registered here.
+  test("plain repository calls, including registered names, match native Git bytes", async () => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-native-collisions-"))
+    roots.push(root)
+    createRepository(root, "README.md", "one\n")
+    writeFileSync(join(root, "--json"), "one\n")
+    git(root, "add", "--", "--json")
+    git(root, "commit", "-q", "-m", "add option-shaped filename")
+    writeFileSync(join(root, "--json"), "two\n")
+    for (const args of [
+      ["rev-parse", "HEAD"],
+      ["merge-base", "HEAD", "HEAD"],
+      ["status", "--porcelain=v1", "-z"],
+      ["diff", "--", "--json"],
+      ["push", "--quiet", "missing-remote", "HEAD"],
+    ]) {
+      const argv = ["-C", root, "-c", "color.ui=false", ...args]
+      const expected = Bun.spawnSync(["git", ...argv], { stdout: "pipe", stderr: "pipe" })
+      const stdout = outputSink()
+      const stderr = outputSink()
+      expect(await runCli(argv, stdout, stderr), args.join(" ")).toBe(expected.exitCode)
+      expect(stdout.output).toBe(expected.stdout.toString())
+      expect(stderr.output).toBe(expected.stderr.toString())
+    }
+  })
+
+  // Gate A: no indexed gitlink does not establish that a push's source is plain.
+  // The frozen Yrd conformance cases contain no such source/context mismatch.
+  test.each(["worktree", "bare", "unborn"])(
+    "refuses a gitlink-bearing push argument from a plain %s context before any push",
+    async (kind) => {
+      const root = mkdtempSync(join(canonicalTmpdir(), "git-super-argument-topology-"))
+      roots.push(root)
+      const fixture = createProductFixture(root)
+      const empty = Bun.spawnSync(["git", "-C", fixture.product, "mktree"], {
+        stdin: Buffer.alloc(0),
+        stdout: "pipe",
+        stderr: "pipe",
+      })
+      expect(empty.exitCode).toBe(0)
+      const plain = git(fixture.product, "commit-tree", empty.stdout.toString().trim(), "-m", "plain")
+      git(fixture.product, "branch", "plain", plain)
+      const query = join(root, "query")
+      git(root, "clone", "-q", kind === "bare" ? "--bare" : "--no-checkout", fixture.product, query)
+      if (kind === "worktree") git(query, "checkout", "-q", "plain")
+      else git(query, "symbolic-ref", "HEAD", kind === "bare" ? "refs/heads/plain" : "refs/heads/unborn")
+      const destination = join(root, "destination.git")
+      git(root, "init", "-q", "--bare", destination)
+      const argument = `${fixture.productBase}:refs/heads/main`
+      const stdout = outputSink()
+      const stderr = outputSink()
+
+      expect(await runCli(["-C", query, "push", destination, argument], stdout, stderr)).not.toBe(0)
+      expect(stderr.output).toContain(argument)
+      expect(stderr.output).toContain("gitlinks")
+      expect(stderr.output).toContain(`--repo ${query}`)
+      expect(git(destination, "for-each-ref", "--format=%(refname)")).toBe("")
+    },
+  )
+
   test.each(["-h", "--help"])("advertises every registered command in %s help on stdout", async (flag) => {
     // A Usage-only assertion misses commands that still run but disappear
     // from help. Derive expected entries from the owning command tree.

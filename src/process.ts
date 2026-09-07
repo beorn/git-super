@@ -1,6 +1,65 @@
 import { cleanGitEnvironment, cleanGitRepositoryEnvironment } from "./git.ts"
+import { realpathSync } from "node:fs"
+import { Blob } from "node:buffer"
+import { fileURLToPath } from "node:url"
 
 export { cleanGitEnvironment } from "./git.ts"
+
+export type ProcessOutputSink = Readonly<{ write(value: string | Uint8Array): unknown }>
+
+/** Resolve the native executable separately; selecting this binary must not recurse. */
+export function nativeGitExecutable(): string {
+  const executable = Bun.which("git")
+  if (executable === null) throw new Error("git-super: native Git executable 'git' was not found on PATH")
+  if (realpathSync(executable) === realpathSync(fileURLToPath(new URL("../bin/git-super", import.meta.url)))) {
+    throw new Error(`git-super: native Git resolves to git-super itself: ${executable}`)
+  }
+  return executable
+}
+
+/** Raw transport shared by local graph policy and native CLI delegation. */
+function spawnGit(
+  args: readonly string[],
+  options: {
+    env: NodeJS.ProcessEnv
+    stdin: "inherit" | "ignore" | Blob
+    signal?: AbortSignal
+  },
+) {
+  return Bun.spawn([nativeGitExecutable(), ...args], { ...options, stdout: "pipe", stderr: "pipe" })
+}
+
+/** Native command output for dispatch observations. No scrub, retry or text trimming. */
+export async function readNativeGit(args: readonly string[]): Promise<GitProcessResult> {
+  const child = spawnGit(args, { env: process.env, stdin: "ignore" })
+  const [code, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ])
+  return { code, stdout, stderr }
+}
+
+/** The executable replaces itself so native Git owns stdin, bytes, signals and lifetime. */
+export async function delegateNativeGit(
+  args: readonly string[],
+  stdout: ProcessOutputSink,
+  stderr: ProcessOutputSink,
+  replaceProcess: boolean,
+): Promise<number> {
+  if (replaceProcess) {
+    if (process.execve === undefined) throw new Error("git-super: native delegation requires process.execve")
+    const executable = nativeGitExecutable()
+    process.execve(executable, [executable, ...args], process.env)
+  }
+  // In-process CLI consumers retain their process and supply the output sinks.
+  const child = spawnGit(args, { env: process.env, stdin: "inherit" })
+  const forward = async (stream: ReadableStream<Uint8Array>, sink: ProcessOutputSink) => {
+    for await (const bytes of stream) sink.write(Buffer.from(bytes))
+  }
+  const [code] = await Promise.all([child.exited, forward(child.stdout, stdout), forward(child.stderr, stderr)])
+  return code
+}
 
 export type GitProcessRequest = Readonly<{
   repo: string
@@ -71,7 +130,9 @@ export function withStallRetry(inner: GitProcess): GitProcess {
           `git-super: ${request.args[0] ?? "git"} stalled after ${String(request.timeoutMs)}ms in ${request.repo}; ` +
             `retry ${String(attempt)}/${String(STALL_ATTEMPTS)}`,
         )
-        await new Promise((resolve) => setTimeout(resolve, STALL_BACKOFF_MS))
+        await new Promise((resolve) => {
+          setTimeout(resolve, STALL_BACKOFF_MS)
+        })
         result = await inner.run(request)
       }
       return result
@@ -161,12 +222,10 @@ export function createLocalGitProcess(environment: NodeJS.ProcessEnv = process.e
       let timedOut = false
       let child: ReturnType<typeof Bun.spawn>
       try {
-        child = Bun.spawn(["git", "-C", request.repo, ...request.args], {
+        child = spawnGit(["-C", request.repo, ...request.args], {
           env: { ...baseEnvironment, ...request.env },
           stdin: request.stdin === undefined ? "ignore" : new Blob([request.stdin]),
           ...(request.signal === undefined ? {} : { signal: request.signal }),
-          stdout: "pipe",
-          stderr: "pipe",
         })
       } catch (error) {
         const failure = error instanceof Error ? error.message : String(error)

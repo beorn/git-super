@@ -240,7 +240,7 @@ describe("git super worktree add", () => {
     const stdout = outputSink()
     const stderr = outputSink()
 
-    expect(await runCli(["worktree", "remove"], stdout, stderr)).toBe(2)
+    expect(await runCli(["--repo", ".", "worktree", "remove"], stdout, stderr)).toBe(2)
     expect(stderr.output).toContain("unknown worktree subcommand 'remove'")
     expect(stderr.output).toContain("Usage: git super worktree")
     expect(stdout.output).toBe("")

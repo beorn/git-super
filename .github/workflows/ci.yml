@@ -19,3 +19,54 @@ jobs:
           bun-version: 1.3.13
       - run: bun install --frozen-lockfile
       - run: bun run check
+
+  yrd-conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.13
+      - run: bun install --frozen-lockfile
+      # Consume the existing Yrd cases at an immutable test-only revision.
+      # Their fixture writes and ref assertions always use native Git.
+      - uses: actions/checkout@v4
+        with:
+          repository: beorn/yrd
+          ref: 9c688d28edcb3fe142faa8639d065059c3ed5c43
+          path: .yrd-conformance
+      - run: bun install --frozen-lockfile
+        working-directory: .yrd-conformance
+      - name: Native Git control
+        working-directory: .yrd-conformance
+        env:
+          YRD_TEST_GIT_TRACE: ${{ github.workspace }}/native-git-trace.jsonl
+        run: >-
+          bun --bun x vitest run
+          packages/yrd-queue-core/tests/submit.test.ts
+          packages/yrd-queue-core/tests/pause.test.ts
+          --reporter=default --reporter=json
+          --outputFile=${{ github.workspace }}/native-git-results.json
+      # Keep the initial failure visible: this is a conformance gate, not an
+      # expected-failure assertion. Passing cases with no Git calls prove none.
+      - name: Selected GitSuper executable
+        working-directory: .yrd-conformance
+        env:
+          YRD_TEST_GIT_EXECUTABLE: ${{ github.workspace }}/bin/git-super
+          YRD_TEST_GIT_TRACE: ${{ github.workspace }}/git-super-trace.jsonl
+        run: >-
+          bun --bun x vitest run
+          packages/yrd-queue-core/tests/submit.test.ts
+          packages/yrd-queue-core/tests/pause.test.ts
+          --reporter=default --reporter=json
+          --outputFile=${{ github.workspace }}/git-super-results.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: yrd-conformance-${{ github.sha }}
+          path: |
+            native-git-trace.jsonl
+            native-git-results.json
+            git-super-trace.jsonl
+            git-super-results.json
+          if-no-files-found: error

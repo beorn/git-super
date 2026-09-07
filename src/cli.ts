@@ -1,7 +1,6 @@
-import { Command as CliCommand, CommanderError } from "@silvery/commander"
-import { resolveInvocation, type CommandNode } from "@silvery/command"
+import type { CommandNode } from "@silvery/command"
 import {
-  commands,
+  type commands,
   type CommandContext,
   type DiffParams,
   type GitlinkWriteParams,
@@ -17,15 +16,15 @@ import type { ConsultedRepository, SuperDiffResult } from "./diff.ts"
 import type { SuperIsAncestorResult } from "./merge-base.ts"
 import type { SuperMergeResult } from "./merge.ts"
 import type { GitSuperResult } from "./result.ts"
-import { renderConsultedRepositories } from "./report.tsx"
 import type { SuperStatusResult } from "./status.ts"
 import type { SuperSubmodulePrepareResult } from "./submodule-prepare.ts"
+import { delegateNativeGit, readNativeGit, type ProcessOutputSink } from "./process.ts"
 
-export type OutputSink = Readonly<{
-  write(value: string): unknown
-  isTTY?: boolean
-  columns?: number
-}>
+export type OutputSink = ProcessOutputSink &
+  Readonly<{
+    isTTY?: boolean
+    columns?: number
+  }>
 
 type CapturedInvocation =
   | Readonly<{ node: typeof commands.diff; params: DiffParams; json: boolean; nul: boolean }>
@@ -55,6 +54,7 @@ function stableJson(value: unknown): string {
 }
 
 async function writeReport(repositories: readonly ConsultedRepository[], stderr: OutputSink): Promise<void> {
+  const { renderConsultedRepositories } = await import("./report.tsx")
   const report = await renderConsultedRepositories(repositories, {
     plain: !stderr.isTTY,
     width: stderr.columns ?? 100,
@@ -62,7 +62,7 @@ async function writeReport(repositories: readonly ConsultedRepository[], stderr:
   stderr.write(`${report}\n`)
 }
 
-function commandResult(
+async function commandResult(
   node: CapturedInvocation["node"],
   context: CommandContext,
   params: CapturedInvocation["params"],
@@ -74,6 +74,7 @@ function commandResult(
   | SuperSubmodulePrepareResult
   | GitSuperResult
 > {
+  const { resolveInvocation } = await import("@silvery/command")
   const invocation = resolveInvocation(
     node as CommandNode<
       CommandContext,
@@ -92,7 +93,190 @@ function commandResult(
   return Promise.resolve(node.run(context, invocation.params as never))
 }
 
-export async function runCli(argv: readonly string[], stdout: OutputSink, stderr: OutputSink): Promise<number> {
+// Only these existing operations interpret superproject topology. Ordinary Git
+// commands are delegated by default; there is no registry of native commands.
+const ENRICHED_COMMANDS = new Set(["diff", "status", "merge-base", "merge", "pull", "push", "worktree"])
+
+function inputObjects(command: string, args: readonly string[]): readonly { argument: string; object: string }[] {
+  if (command === "status") return []
+  if (command === "pull") throw new Error("implicit pull does not identify its incoming objects")
+  const operands: string[] = []
+  let options = true
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]
+    if (arg === undefined) break
+    if (options && arg === "--") {
+      if (command === "diff") break // The remaining words are paths, not revisions.
+      options = false
+    } else if (options && arg.startsWith("-")) {
+      if (["-m", "--message", "-b", "-B"].includes(arg)) index += 1
+      else if (
+        ![
+          "--quiet",
+          "-q",
+          "--atomic",
+          "--no-verify",
+          "--is-ancestor",
+          "--cached",
+          "--staged",
+          "--name-only",
+          "--name-status",
+          "--stat",
+          "-z",
+          "--no-ff",
+          "--ff-only",
+          "--no-edit",
+          "--detach",
+          "--dry-run",
+          "-n",
+        ].includes(arg) &&
+        !arg.startsWith("--force-with-lease=") &&
+        !arg.startsWith("--message=")
+      ) {
+        throw new Error(`implicit ${command} cannot determine input objects for option '${arg}'`)
+      }
+    } else operands.push(arg)
+  }
+  if (command === "push") {
+    const refspecs = operands.slice(1) // The first operand is Git's remote, never an object.
+    if (refspecs.length === 0) throw new Error("implicit push requires explicit source refspecs")
+    return refspecs.map((argument) => {
+      const object = argument.replace(/^\+/u, "").split(":")[0] ?? ""
+      if (object === "" || object.includes("*")) {
+        throw new Error(`implicit push cannot determine objects for '${argument}'`)
+      }
+      return { argument, object }
+    })
+  }
+  if (command === "worktree") return [{ argument: operands[2] ?? "HEAD", object: operands[2] ?? "HEAD" }]
+  return operands.flatMap((argument) =>
+    argument.split(/\.{2,3}/u).map((object) => ({ argument, object: object || "HEAD" })),
+  )
+}
+
+async function enrichedInvocation(argv: readonly string[]): Promise<readonly string[] | undefined> {
+  // Explicit extension calls retain their existing parser and result contract.
+  if (argv.length === 0 || argv[0] === "--repo" || argv[0]?.startsWith("--repo=") || argv[0] === "--json") return argv
+  if (
+    argv[0] === "-h" ||
+    argv[0] === "--help" ||
+    argv[0] === "gitlink" ||
+    (argv[0] === "submodule" && ["prepare", "-h", "--help"].includes(argv[1] ?? ""))
+  ) {
+    return argv
+  }
+  if (argv[0] === "--version" || argv[0] === "-v") return undefined
+  if (ENRICHED_COMMANDS.has(argv[0] ?? "") && (argv[1] === "-h" || argv[1] === "--help")) return argv
+
+  let commandIndex = 0
+  while (argv[commandIndex]?.startsWith("-")) {
+    const option = argv[commandIndex]
+    if (option === undefined) break
+    if (["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env"].includes(option)) {
+      if (argv[commandIndex + 1] === undefined) return undefined // Native Git diagnoses the missing operand.
+      commandIndex += 2
+    } else if (
+      /^(?:--(?:git-dir|work-tree|namespace|config-env)=|-C.|-c.)/u.test(option) ||
+      [
+        "--no-pager",
+        "--paginate",
+        "--no-optional-locks",
+        "--literal-pathspecs",
+        "--no-literal-pathspecs",
+        "--glob-pathspecs",
+        "--noglob-pathspecs",
+        "--icase-pathspecs",
+        "--no-replace-objects",
+      ].includes(option)
+    ) {
+      commandIndex += 1
+    } else {
+      throw new Error(`git-super: cannot select an operation with unsupported global option '${option}'`)
+    }
+  }
+  const command = argv[commandIndex]
+  if (command === undefined || !ENRICHED_COMMANDS.has(command)) return undefined
+  if (command === "worktree" && argv[commandIndex + 1] !== "add") return undefined
+  const globals = argv.slice(0, commandIndex)
+  const bare = await readNativeGit([...globals, "rev-parse", "--is-bare-repository"])
+  if (bare.code !== 0 || !["true\n", "false\n"].includes(bare.stdout)) {
+    throw new Error(`git-super: cannot determine repository topology for ${argv.join(" ")}\n${bare.stderr}`)
+  }
+  const root = await readNativeGit([
+    ...globals,
+    "rev-parse",
+    bare.stdout === "true\n" ? "--absolute-git-dir" : "--show-toplevel",
+  ])
+  if (root.code !== 0) throw new Error(`git-super: cannot locate repository for ${argv.join(" ")}\n${root.stderr}`)
+  const repo = root.stdout.trim()
+  const refuse = (reason: string) =>
+    new Error(
+      `git-super: ${command}: ${reason}. Use the explicit git-super --repo ${repo} interface; implicit superproject operation contracts are not yet supported.`,
+    )
+  let objects: readonly { argument: string; object: string }[]
+  try {
+    objects = inputObjects(command, argv.slice(commandIndex + 1))
+  } catch (error) {
+    throw refuse(error instanceof Error ? error.message : String(error))
+  }
+  const tree = await readNativeGit([...globals, "ls-files", "--stage", "-z"])
+  // failure to measure topology is not evidence of a plain repository
+  if (tree.code !== 0) {
+    throw refuse(`cannot read the index for ${argv.join(" ")}\n${tree.stderr}`)
+  }
+  const { readCommitSubmodules } = await import("./commit-graph.ts")
+  // Reuse the existing strict tree reader. These reads only identify ambiguity;
+  // they do not choose composition or recovery semantics for the operation.
+  const git = { run: (request: { args: readonly string[] }) => readNativeGit([...globals, ...request.args]) }
+  for (const { argument, object } of [...objects, { argument: "HEAD", object: "HEAD" }]) {
+    const resolved = await readNativeGit([
+      ...globals,
+      "rev-parse",
+      "--verify",
+      "--quiet",
+      "--end-of-options",
+      `${object}^{tree}`,
+    ])
+    // Git's quiet verification returns 1 for an absent/non-tree object, including
+    // an unborn HEAD. The actual command retains responsibility for that error.
+    if (resolved.code === 1 && resolved.stderr === "") continue
+    if (resolved.code !== 0) throw refuse(`cannot inspect argument '${argument}'\n${resolved.stderr}`)
+    let hasGitlinks: boolean
+    try {
+      hasGitlinks = (await readCommitSubmodules(git, repo, resolved.stdout.trim())).length > 0
+    } catch (error) {
+      throw refuse(`cannot classify argument '${argument}': ${error instanceof Error ? error.message : String(error)}`)
+    }
+    if (hasGitlinks) {
+      throw refuse(
+        `argument '${argument}' carries gitlinks against this ${bare.stdout === "true\n" ? "bare" : "worktree"} context`,
+      )
+    }
+  }
+  if (tree.stdout.split("\0").some((entry) => entry.startsWith("160000 "))) throw refuse("the index carries gitlinks")
+  return undefined
+}
+
+export async function runCli(
+  argv: readonly string[],
+  stdout: OutputSink,
+  stderr: OutputSink,
+  replaceProcess = false,
+): Promise<number> {
+  try {
+    const enriched = await enrichedInvocation(argv)
+    // execve on the executable path leaves native Git owning the PID, byte
+    // streams and cancellation. In-process callers retain their process owner.
+    if (enriched === undefined) return await delegateNativeGit(argv, stdout, stderr, replaceProcess)
+    argv = enriched
+  } catch (error) {
+    stderr.write(`${error instanceof Error ? error.message : String(error)}\n`)
+    return 1
+  }
+  const [{ Command: CliCommand, CommanderError }, { commands }] = await Promise.all([
+    import("@silvery/commander"),
+    import("./commands.ts"),
+  ])
   let captured: CapturedInvocation | undefined
   let usage: string | undefined
   const program = new CliCommand("git super")
