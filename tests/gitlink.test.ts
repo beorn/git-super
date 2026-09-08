@@ -55,10 +55,31 @@ describe("policy-free gitlink writes", () => {
 
     const written = await writeGitlink({ repo: product.product, path: "packages/alpha", commit: next })
 
+    // RE-PINNED, not loosened, and the difference is the point. This asserted
+    // `refs: []` — that the write touched no references — which was never true:
+    // it moved a recorded pointer. `@dev/11` ruled the writer must SAY which
+    // pointer and what it held before (@i/10-yrd/24243), so the empty array is
+    // now the wrong answer rather than the incomplete one. The replacement says
+    // strictly MORE than the line it replaces: destination, source, state, and
+    // the oid the decision was made against. A loosened assertion admits your
+    // change; this one narrows what the test will accept.
     expect(written).toMatchObject({
       state: "updated",
       partial: false,
-      repositories: [{ repository: product.product, state: "updated", refs: [] }],
+      repositories: [
+        {
+          repository: product.product,
+          state: "updated",
+          refs: [
+            {
+              source: next,
+              destination: "packages/alpha",
+              state: "updated",
+              observed: product.alphaBase,
+            },
+          ],
+        },
+      ],
     })
     expect(stage(product.product, "packages/alpha")).toBe(`160000 ${next} 0\tpackages/alpha`)
     expect(git(join(product.product, "packages/alpha"), "rev-parse", "HEAD")).toBe(checkoutBefore)
@@ -260,5 +281,45 @@ describe("policy-free gitlink writes", () => {
     lock.release()
 
     await expect(pending).resolves.toMatchObject({ state: "updated", partial: false })
+  })
+})
+
+/**
+ * @failure `state=unchanged` on a gitlink write answers "the index already held
+ *          this commit" while being read as "there was nothing to do, so the
+ *          pin is where you left it". Those coincide until something else moved
+ *          the index — precisely when someone reads the report to find out.
+ *          Pull carried this defect, then push; the gitlink writer is the third
+ *          surface, and it reported `refs: []` so there was nowhere to say it.
+ * @level   l1 — real repositories on disk, through the production writer
+ * @bead    @i/10-yrd/24243-unchanged-is-ambiguous
+ */
+describe("the gitlink report names the index oid it decided against", () => {
+  test("updated carries the PRIOR oid, unchanged carries the one it compared, and the two differ", async () => {
+    const product = fixture("observed-head")
+    const next = advanceRepository(product.alpha, "alpha.ts", "export const alpha = 5\n")
+    fetchWithoutCheckout(product.product, "packages/alpha", next)
+
+    // 1. A REAL WRITE. `observed` must be the oid the index held BEFORE, not the
+    //    one just written — otherwise a reader comparing the report against a
+    //    recorded precondition gets the same false confirmation the bead was
+    //    filed for, one write later.
+    const written = await writeGitlink({ repo: product.product, path: "packages/alpha", commit: next })
+    expect(written).toMatchObject({ state: "updated" })
+    expect(written.repositories[0]?.refs, "refs: [] said this touched nothing while it moved a pin").toEqual([
+      { source: next, destination: "packages/alpha", state: "updated", observed: product.alphaBase },
+    ])
+
+    // 2. THE AMBIGUOUS CASE, immediately after: the index already holds it, so
+    //    `unchanged` means already-at-target and must name what made it so.
+    const again = await writeGitlink({ repo: product.product, path: "packages/alpha", commit: next })
+    expect(again.repositories[0]?.refs).toEqual([
+      { source: next, destination: "packages/alpha", state: "unchanged", observed: next },
+    ])
+
+    // 3. THE 24243 ACCEPTANCE ITSELF: the two states render DIFFERENTLY. Before
+    //    this change both reported one word and an empty refs array, so a reader
+    //    could not tell "I moved it" from "it was already there".
+    expect(written.repositories[0]?.refs).not.toEqual(again.repositories[0]?.refs)
   })
 })

@@ -84,7 +84,14 @@ export async function writeGitlink(options: WriteGitlinkOptions): Promise<GitSup
           before[0]?.stage === 0 &&
           before[0]?.oid.toLowerCase() === options.commit.toLowerCase()
         ) {
-          return operationResult(repository, "unchanged")
+          // The ambiguous word, now falsifiable: `unchanged` here means the
+          // index ALREADY held this commit, and the report names the oid it
+          // compared rather than leaving a reader to assume nothing moved.
+          return operationResult(repository, "unchanged", undefined, {
+            path: options.path,
+            commit: options.commit,
+            observed: before[0].oid,
+          })
         }
 
         const args = ["update-index", "--cacheinfo", `${GITLINK_MODE},${options.commit},${options.path}`]
@@ -112,7 +119,11 @@ export async function writeGitlink(options: WriteGitlinkOptions): Promise<GitSup
               remedy: "Inspect `git ls-files --stage` before deciding whether a retry is safe.",
             },
           )
-          postWriteResult = operationResult(repository, "unknown", failure)
+          postWriteResult = operationResult(repository, "unknown", failure, {
+            path: options.path,
+            commit: options.commit,
+            ...(before[0] === undefined ? {} : { observed: before[0].oid }),
+          })
           return postWriteResult
         }
         if (
@@ -131,10 +142,18 @@ export async function writeGitlink(options: WriteGitlinkOptions): Promise<GitSup
               remedy: "Inspect `git ls-files --stage` before deciding whether a retry is safe.",
             },
           )
-          postWriteResult = operationResult(repository, "unknown", failure)
+          postWriteResult = operationResult(repository, "unknown", failure, {
+            path: options.path,
+            commit: options.commit,
+            ...(before[0] === undefined ? {} : { observed: before[0].oid }),
+          })
           return postWriteResult
         }
-        postWriteResult = operationResult(repository, "updated")
+        postWriteResult = operationResult(repository, "updated", undefined, {
+          path: options.path,
+          commit: options.commit,
+          ...(before[0] === undefined ? {} : { observed: before[0].oid }),
+        })
         return postWriteResult
       },
       { holder: "git super gitlink write" },
@@ -149,10 +168,20 @@ function detail(code: string, phase: string, message: string, extra: Partial<Git
   return { code, phase, message, ...extra }
 }
 
+/**
+ * The write target, when this operation actually reached one.
+ *
+ * `observed` is the oid the index held for `path` BEFORE the write — the head
+ * this decision was made against (@i/10-yrd/24243). Absent on the paths that
+ * never got far enough to look.
+ */
+type GitlinkTarget = Readonly<{ path: string; commit: string; observed?: string }>
+
 function operationResult(
   repository: string,
   state: "updated" | "unchanged" | "failed" | "unknown",
   failure?: GitResultDetail,
+  target?: GitlinkTarget,
 ): GitSuperResult {
   return gitSuperResult(
     [
@@ -160,7 +189,38 @@ function operationResult(
         repository,
         state,
         ...(failure === undefined ? {} : { detail: failure }),
-        refs: [],
+        // A SYNTHESIZED REF RESULT, and the reasoning is `@dev/11`'s, recorded
+        // here because the next reader meets this line before they meet the
+        // thread.
+        //
+        // `observed` is a PER-DESTINATION fact: it answers "what was at the
+        // place I wrote, before I wrote". Hanging it off the REPOSITORY result
+        // instead would be one slot for N answers — `push.ts` maps a group's
+        // updates into a refs array at nine sites — so it would be ambiguous by
+        // construction the moment an operation touches two destinations. That is
+        // the field at the wrong CARDINALITY, and it would reintroduce the very
+        // "which one is this about" ambiguity the field exists to remove.
+        //
+        // `refs: []` also claimed this operation touched no references while it
+        // plainly changed a recorded pointer. One synthesized entry is more
+        // honest than the empty array, not less.
+        //
+        // THE COST, accepted deliberately rather than hidden: a gitlink path is
+        // not a ref, so this widens `refs` from "reference" to "write target".
+        // If that ever grates, THE FIX IS RENAMING THE FIELD — not moving the
+        // fact to a level where it cannot be read. A slightly loose name beats a
+        // precisely wrong location.
+        refs:
+          target === undefined
+            ? []
+            : [
+                {
+                  source: target.commit,
+                  destination: target.path,
+                  state,
+                  ...(target.observed === undefined ? {} : { observed: target.observed }),
+                },
+              ],
       },
     ],
     failure,
