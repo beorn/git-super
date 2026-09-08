@@ -42,15 +42,27 @@ async function cleanSnapshot(
   inspect: (repository: string, path: string) => Promise<WorktreeInspection>,
 ): Promise<readonly Readonly<{ path: string; head: string }>[]> {
   const status = superStatus({ repo: path })
-  if (status.records.length > 0)
-    {throw new Error(`worktree ${path} is dirty: ${status.records.join("; ")}; preserve its changes before removal`)}
+  if (status.records.length > 0) {
+    throw new Error(`worktree ${path} is dirty: ${status.records.join("; ")}; preserve its changes before removal`)
+  }
   const snapshot: { path: string; head: string }[] = []
   for (const entry of status.consultedRepositories) {
-    const state = await inspect(entry.root, entry.root)
-    if (!state.registered)
-      {throw new Error(`worktree ${entry.root} is absent from its Git registration; inspect git worktree list`)}
-    if (state.locked !== undefined)
-      {throw new Error(`worktree ${entry.root} is locked: ${state.locked}; resolve its holder before removal`)}
+    let state = await inspect(entry.root, entry.root)
+    if (!state.registered) {
+      // Git lists a primary clone with a separate gitdir at the gitdir path,
+      // even though rev-parse --show-toplevel reports its actual checkout.
+      const directory = realpathSync(await git.text(entry.root, ["rev-parse", "--absolute-git-dir"]))
+      const common = realpathSync(
+        await git.text(entry.root, ["rev-parse", "--path-format=absolute", "--git-common-dir"]),
+      )
+      if (directory === common) state = await inspect(entry.root, common)
+    }
+    if (!state.registered) {
+      throw new Error(`worktree ${entry.root} is absent from its Git registration; inspect git worktree list`)
+    }
+    if (state.locked !== undefined) {
+      throw new Error(`worktree ${entry.root} is locked: ${state.locked}; resolve its holder before removal`)
+    }
     const dirty = await git.text(entry.root, [
       "status",
       "--porcelain=v1",
@@ -72,8 +84,9 @@ function manifest(root: string): Readonly<Record<string, string>> {
     const path = join(entry.parentPath, entry.name)
     if (entry.name.endsWith(".lock")) throw new Error(`Git lock ${path} prevents worktree removal; resolve its holder`)
     if (entry.isDirectory()) continue
-    if (!entry.isFile())
-      {throw new Error(`Git store ${path} is not a regular file; preserve and resolve it before removal`)}
+    if (!entry.isFile()) {
+      throw new Error(`Git store ${path} is not a regular file; preserve and resolve it before removal`)
+    }
     hashes[relative(root, path)] = createHash("sha256").update(readFileSync(path)).digest("hex")
   }
   return Object.fromEntries(Object.entries(hashes).sort(([a], [b]) => a.localeCompare(b)))
@@ -89,14 +102,17 @@ export async function retainWorktreeModules(
 ): Promise<WorktreeRemovalProof> {
   const path = realpathSync(requested)
   const registered = await inspect(repo, path)
-  if (!registered.registered)
-    {throw new Error(`worktree ${path} is not registered in ${repo}; inspect git worktree list`)}
-  if (registered.locked !== undefined)
-    {throw new Error(`worktree ${path} is locked: ${registered.locked}; resolve its holder before removal`)}
+  if (!registered.registered) {
+    throw new Error(`worktree ${path} is not registered in ${repo}; inspect git worktree list`)
+  }
+  if (registered.locked !== undefined) {
+    throw new Error(`worktree ${path} is locked: ${registered.locked}; resolve its holder before removal`)
+  }
   const gitDir = realpathSync(await git.text(path, ["rev-parse", "--absolute-git-dir"]))
   const common = realpathSync(await git.text(path, ["rev-parse", "--path-format=absolute", "--git-common-dir"]))
-  if (gitDir === common)
-    {throw new Error(`worktree ${path} is the primary worktree; only a linked worktree can be removed`)}
+  if (gitDir === common) {
+    throw new Error(`worktree ${path} is the primary worktree; only a linked worktree can be removed`)
+  }
   const before = await cleanSnapshot(git, path, inspect)
   const modules = join(gitDir, "modules")
   // Check metadata locks before copying. The modules subtree includes every store,
@@ -144,8 +160,9 @@ export async function retainWorktreeModules(
     }
   }
   const after = await cleanSnapshot(git, path, inspect)
-  if (JSON.stringify(after) !== JSON.stringify(before))
-    {throw new Error(`worktree ${path} changed during retention; preserved, retry after its writer stops`)}
+  if (JSON.stringify(after) !== JSON.stringify(before)) {
+    throw new Error(`worktree ${path} changed during retention; preserved, retry after its writer stops`)
+  }
   const proof: WorktreeRemovalProof = {
     path,
     head: await git.commit(path, "HEAD"),
