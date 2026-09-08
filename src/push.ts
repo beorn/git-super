@@ -906,18 +906,36 @@ async function frozenChildUpdates(
   root: string,
   remote: string,
   rootUpdates: readonly RefUpdate[],
-  requirements: readonly CommitRequirement[],
-): Promise<RefUpdate[] | undefined> {
+): Promise<{
+  updates: RefUpdate[] | undefined
+  retention: RefUpdate[]
+  publications: RefUpdate[]
+}> {
   const updates: RefUpdate[] = []
+  const retention: RefUpdate[] = []
+  const publications: RefUpdate[] = []
+  const direct = new Set(rootUpdates.map((update) => update.source))
+  const advertised = await advertisedCommitTips(git, root, remote)
+  const reachable = await required(
+    git,
+    root,
+    ["rev-list", "--min-parents=2", ...direct, "--not", ...advertised],
+    "find-new-frozen-merges",
+  )
   let found = false
-  for (const source of new Set(rootUpdates.map((update) => update.source))) {
+  for (const source of new Set([...direct, ...reachable.split(/\r?\n/u).filter(Boolean)])) {
     const message = await required(
       git,
       root,
       ["show", "-s", "--format=%(trailers:only,unfold)", source],
       "read-frozen-push-intent",
     )
-    const values = message.split(/\r?\n/u).filter((line) => line.startsWith(`${PUSH_INTENT_TRAILER}:`))
+    const values = message
+      .split(/\r?\n/u)
+      .filter(
+        (line) =>
+          line.slice(0, PUSH_INTENT_TRAILER.length + 1).toLowerCase() === `${PUSH_INTENT_TRAILER.toLowerCase()}:`,
+      )
     if (values.length === 0) continue
     if (values.length !== 1) throw new Error(`Merge ${source} carries duplicate ${PUSH_INTENT_TRAILER} trailers`)
     const value = values[0]
@@ -929,18 +947,35 @@ async function frozenChildUpdates(
     }
     const parents = (await required(git, root, ["show", "-s", "--format=%P", source], "bind-frozen-merge")).split(" ")
     if (parents.length !== 2) throw new Error(`Frozen push intent must belong to an actual two-parent merge: ${source}`)
-    found = true
-    const selected = rootUpdates.length === 1 ? requirements : await collectCommitRequirements(git, root, [source])
+    if (direct.has(source)) found = true
+    const selected = await collectCommitRequirements(git, root, [source])
     for (const row of intent.children) {
       const requirement = selected.find((entry) => entry.path === row.path && entry.target === row.pin)
       if (requirement === undefined) {
         throw new Error(`Frozen child ${row.path}@${row.pin} is not selected by merge ${source}`)
       }
+      if (sameHostedOwner(intent.rootRemote, row.remote)) {
+        for (const pin of new Set([row.pin, ...(row.publication === undefined ? [] : [row.publication.source])])) {
+          retention.push({
+            repository: requirement.repository,
+            remote: row.remote,
+            source: pin,
+            destination: `refs/git-super/pins/${pin}`,
+            expectedDestination: { state: "missing" },
+          })
+        }
+      } else if (!direct.has(source)) {
+        throw new Error(
+          `Cannot retain merge ${source}: external child ${row.path}@${row.pin} has no authorized immutable source prerequisite; no external refs were written`,
+        )
+      }
       if (row.publication === undefined) continue
       const args = ["merge-base", "--is-ancestor", row.pin, row.publication.source]
       const contains = await git.run({ repo: requirement.repository, args })
       if (contains.code !== 0) throw operationError(requirement.repository, args, "bind-frozen-publication", contains)
-      updates.push({ repository: requirement.repository, remote: row.remote, ...row.publication })
+      const update = { repository: requirement.repository, remote: row.remote, ...row.publication }
+      publications.push(update)
+      if (direct.has(source)) updates.push(update)
     }
     for (const requirement of selected) {
       if (!intent.children.some((row) => row.path === requirement.path && row.pin === requirement.target)) {
@@ -948,7 +983,20 @@ async function frozenChildUpdates(
       }
     }
   }
-  return found ? updates : undefined
+  return { updates: found ? updates : undefined, retention, publications }
+}
+
+async function verifyRetainedSource(git: GitProcess, update: RefUpdate): Promise<void> {
+  await required(
+    git,
+    update.repository,
+    ["fetch", "--no-tags", "--no-recurse-submodules", "--no-write-fetch-head", update.remote, update.destination],
+    "verify-retained-source-fetch",
+  )
+  const observed = await observeDestination(git, update, "verify-retained-source-ref")
+  if (!isIdenticalSuccess(update.source, observed)) {
+    throw new Error(`Retained source ${update.remote} ${update.destination} no longer names ${update.source}`)
+  }
 }
 
 async function collectCommitRequirements(
@@ -1199,6 +1247,7 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
     run: (request) => process.run({ ...request, timeoutMs: request.timeoutMs ?? timeoutMs }),
   }
   let root: string
+  const retained: GitSuperRepositoryResult[] = []
   try {
     root = await discoverRepository(git, options.repo, "discover-root")
     const remote = options.remote ?? (await configuredPushRemote(git, root))
@@ -1270,12 +1319,39 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
       })
       return prependRepositories(pushed, available)
     }
-    const frozen = await frozenChildUpdates(git, root, remote, rootUpdates, requirements)
-    const childUpdates: RefUpdate[] = frozen ?? []
-    if (frozen === undefined) {
+    const frozen = await frozenChildUpdates(git, root, remote, rootUpdates)
+    const childUpdates: RefUpdate[] = frozen.updates ?? []
+    if (frozen.updates === undefined) {
       for (const requirement of requirements) childUpdates.push(await childUpdate(git, requirement, timeoutMs))
     }
+    if (frozen.retention.length > 0) {
+      // Validate every frozen destination and root lease before the first retention write.
+      await planUpdates(git, [...frozen.retention, ...frozen.publications, ...childUpdates, ...rootUpdates], timeoutMs)
+      const result = await pushRefUpdates({
+        root,
+        updates: frozen.retention,
+        timeoutMs,
+        git,
+        ...(options.exclusive === undefined ? {} : { exclusive: options.exclusive }),
+      })
+      retained.push(...result.repositories)
+      if (result.state === "failed" || result.state === "unknown") {
+        return gitSuperResult(
+          [
+            ...retained,
+            {
+              repository: root,
+              state: "not-run",
+              refs: rootUpdates.map((update) => refResult(update, "not-run", result.detail)),
+            },
+          ],
+          result.detail,
+        )
+      }
+      for (const update of frozen.retention) await verifyRetainedSource(git, update)
+    }
     if (childUpdates.length === 0 && options.recurseSubmodules === "only") {
+      if (retained.length > 0) return gitSuperResult(retained)
       return gitSuperResult([
         {
           repository: root,
@@ -1288,7 +1364,7 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
         },
       ])
     }
-    return await pushRefUpdates({
+    const pushed = await pushRefUpdates({
       root,
       updates: [...childUpdates, ...(options.recurseSubmodules === "on-demand" ? rootUpdates : [])],
       ...(options.atomic === undefined ? {} : { atomic: options.atomic }),
@@ -1299,8 +1375,9 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
       git,
       ...(options.exclusive === undefined ? {} : { exclusive: options.exclusive }),
     })
+    return prependRepositories(pushed, retained)
   } catch (error) {
     const failure = resultError(error, "plan-push")
-    return failedResult(resolve(options.repo), failure)
+    return prependRepositories(failedResult(resolve(options.repo), failure), retained)
   }
 }

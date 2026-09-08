@@ -1103,6 +1103,8 @@ describe("explicit recursive push mechanics", () => {
   /**
    * M8.5 frozen recovery must reuse captured destinations after child config changes.
    * Ordinary recursive push tests resolve current config and cannot prove this seam.
+   * Empty-tree records must retain reachable merge sources without advancing mains;
+   * published history must not replay frozen destinations on a later record push.
    */
   test("pushes a frozen merge to its original child destination and resumes an identical result", async () => {
     const fixture = recursivePushFixture("frozen-destination")
@@ -1150,11 +1152,70 @@ describe("explicit recursive push mechanics", () => {
       recurseSubmodules: "on-demand" as const,
     }
 
+    const emptyTree = git(fixture.root, "hash-object", "-w", "-t", "tree", "--stdin")
+    const record = git(fixture.root, "commit-tree", emptyTree, "-p", merge, "-m", "retain checked merge")
+    const recordRef = "refs/checks/frozen"
+    const pinRef = `refs/git-super/pins/${fixture.childSource}`
+    const recordOptions = { ...options, refspecs: [`${record}:${recordRef}`] }
+    git(fixture.childRemote, "update-ref", pinRef, fixture.childBefore)
+    expect(await superPush(recordOptions)).toMatchObject({ state: "failed", partial: false })
+    expect(git(fixture.rootRemote, "for-each-ref", "--format=%(refname)", recordRef)).toBe("")
+    expect(git(fixture.childRemote, "rev-parse", pinRef)).toBe(fixture.childBefore)
+    git(fixture.childRemote, "update-ref", "-d", pinRef, fixture.childBefore)
+
+    const process = createLocalGitProcess()
+    const calls: string[][] = []
+    let rejectFetch = true
+    const injected: GitProcess = {
+      run: async (request) => {
+        calls.push([...request.args])
+        if (rejectFetch && request.args[0] === "fetch" && request.args.includes(pinRef)) {
+          return { code: 73, stdout: "", stderr: "retained source fetch refused" }
+        }
+        return process.run(request)
+      },
+    }
+    expect(await superPush({ ...recordOptions, git: injected })).toMatchObject({
+      state: "failed",
+      partial: true,
+      detail: {
+        phase: "verify-retained-source-fetch",
+        message: expect.stringContaining("retained source fetch refused"),
+      },
+    })
+    expect(git(fixture.childRemote, "rev-parse", pinRef)).toBe(fixture.childSource)
+    expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(fixture.childBefore)
+    expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(fixture.rootBefore)
+    expect(git(fixture.rootRemote, "for-each-ref", "--format=%(refname)", recordRef)).toBe("")
+    rejectFetch = false
+    expect(await superPush({ ...recordOptions, git: injected })).toMatchObject({ state: "updated", partial: false })
+    expect(git(fixture.rootRemote, "rev-parse", recordRef)).toBe(record)
+    expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(fixture.childBefore)
+    expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(fixture.rootBefore)
+    const retentionPush = calls.findIndex(
+      (args) => args[0] === "push" && args.includes(`${fixture.childSource}:${pinRef}`),
+    )
+    const retentionFetch = calls.findIndex((args) => args[0] === "fetch" && args.includes(pinRef))
+    const recordPush = calls.findIndex((args) => args[0] === "push" && args.includes(`${record}:${recordRef}`))
+    expect(retentionPush).toBeGreaterThanOrEqual(0)
+    expect(retentionFetch).toBeGreaterThan(retentionPush)
+    expect(recordPush).toBeGreaterThan(retentionFetch)
+
     expect(await superPush(options)).toMatchObject({ state: "updated", partial: false })
     expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(fixture.childSource)
     expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(merge)
     expect(git(fixture.childRemote, "for-each-ref", "--format=%(refname)", "refs/heads/changed-after-checks")).toBe("")
     expect(await superPush(options)).toMatchObject({ state: "unchanged", partial: false })
+
+    const third = advanceRepository(fixture.child, "child.txt", "later independent main\n")
+    git(fixture.child, "push", "-q", childUrl, `${third}:refs/heads/main`)
+    const laterRecord = git(fixture.root, "commit-tree", emptyTree, "-p", record, "-m", "later record")
+    expect(await superPush({ ...recordOptions, refspecs: [`${laterRecord}:${recordRef}`] })).toMatchObject({
+      state: "updated",
+      partial: false,
+    })
+    expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(third)
+    expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(merge)
   })
 
   /** M8.5: malformed or externally targeted saved intent must refuse before any ref write. */
