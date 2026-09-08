@@ -28,6 +28,7 @@ git super submodule prepare <exact-root-commit> --remote <root-remote-name-or-ur
 git super pull --ff-only [<repository> [<refspec>...]]
 git super push [--recurse-submodules=check|on-demand|only|no] [<remote> [<refspec>...]]
 git super worktree add <path> <commit> [--reference <path>]
+git super --json worktree remove <path> --retain <directory>
 ```
 
 `diff` accepts `--diff-filter`, `--cached`, and `-z`. `status` includes tracked and untracked changes in checked-out submodules. `merge-base --is-ancestor` discovers which repository owns the first commit and compares it with that repository's pin in the selected superproject ref.
@@ -124,6 +125,8 @@ The planned integration adds journaled recovery: a run killed between component 
 Gitlinks borrow their objects from `--reference` when it is given and from the repository the command stands in otherwise. A pin the reference's stores lack is fetched from the submodule's own remote rather than refused: this is the one caller for which an unbounded fallback is correct, since a commit whose submodules the reference has never seen is exactly what it exists to check out.
 
 **Either the worktree stands complete or it does not stand.** Any failure after `git worktree add` already succeeded removes the worktree again and exits nonzero with the reason, so a half-materialized tree is never left behind. When the removal itself fails the result is `unknown` rather than `failed`, names the surviving path, and gives the exact command that clears it — that is a different situation from a clean rollback and must not read like one.
+
+`git super --json worktree remove <path> --retain <directory>` removes one registered, clean, unlocked linked worktree. It checks the root and every populated submodule through the existing recursive status operation. Before Git removes anything, it copies the complete per-worktree module stores (including objects, refs, and reflogs) outside both deletion paths, compares them with `diff -r`, and writes a SHA256 manifest of every file. The proof is printed on stderr before one native `git worktree remove --force`; the force only bypasses Git's blanket refusal of populated submodules after the stronger checks have passed. Dirty, locked, unreadable, or unretained work refuses. The JSON result names the proof. Choose a durable retention directory; copies are never deleted automatically and must be kept at least until the proof's `retainUntil` date and any longer retention your repository requires.
 
 A commit that records no `.gitmodules` is not an error. The command is then exactly `git worktree add`, and the report line says so.
 

@@ -19,8 +19,9 @@ import {
   type SuperSubmodulePrepareResult,
 } from "./submodule-prepare.ts"
 import { superWorktreeAdd, type SuperWorktreeAddOptions } from "./worktree-add.ts"
+import { superWorktreeRemove, type SuperWorktreeRemoveOptions } from "./worktree-remove.ts"
 
-export type CommandContext = Readonly<{ repo: string }>
+export type CommandContext = Readonly<{ repo: string; report?: (message: string) => void }>
 export type DiffParams = Omit<SuperDiffOptions, "repo">
 export type StatusParams = Record<string, never>
 export type MergeBaseParams = Omit<SuperIsAncestorOptions, "repo">
@@ -29,6 +30,7 @@ export type PullParams = Omit<SuperPullOptions, "repo" | "git" | "exclusive">
 export type PushParams = Omit<SuperPushOptions, "repo" | "git" | "exclusive">
 export type GitlinkWriteParams = Omit<WriteGitlinkOptions, "repo" | "git">
 export type SubmodulePrepareParams = Omit<SuperSubmodulePrepareOptions, "repo" | "git" | "exclusive">
+export type WorktreeRemoveParams = Omit<SuperWorktreeRemoveOptions, "repo" | "report">
 export type WorktreeAddParams = Omit<SuperWorktreeAddOptions, "repo" | "env" | "log">
 
 function params<T>(parse: (value: unknown) => T, missing?: (value: unknown) => string[]): ParseParamSchema<T> {
@@ -227,6 +229,19 @@ const worktreeAdd = commandNode<CommandContext, WorktreeAddParams, GitSuperResul
   run: (context, input) => superWorktreeAdd({ repo: context.repo, ...input }),
 })
 
+const worktreeRemove = commandNode<CommandContext, WorktreeRemoveParams, GitSuperResult>({
+  title: "Remove a clean worktree with retained submodule stores",
+  description: "Prove all repositories clean and unlocked, retain and verify Git stores, then remove once.",
+  params: params((value) => {
+    const input = record(value)
+    if (typeof input.path !== "string" || typeof input.retain !== "string" || input.retain.trim() === "") {
+      throw new Error("worktree remove requires a path and --retain <external directory>")
+    }
+    return { path: input.path, retain: input.retain }
+  }),
+  run: (context, input) => superWorktreeRemove({ repo: context.repo, ...input, report: context.report }),
+})
+
 export type GitSuperCommands = Readonly<{
   diff: CommandNode<CommandContext, DiffParams, SuperDiffResult>
   status: CommandNode<CommandContext, StatusParams, SuperStatusResult>
@@ -242,6 +257,7 @@ export type GitSuperCommands = Readonly<{
   }>
   worktree: Readonly<{
     add: CommandNode<CommandContext, WorktreeAddParams, GitSuperResult>
+    remove: CommandNode<CommandContext, WorktreeRemoveParams, GitSuperResult>
   }>
 }>
 
@@ -254,5 +270,5 @@ export const commands = defineCommandNodes({
   push,
   gitlink: { write: gitlinkWrite },
   submodule: { prepare: submodulePrepare },
-  worktree: { add: worktreeAdd },
+  worktree: { add: worktreeAdd, remove: worktreeRemove },
 }) satisfies CommandNodeTree<CommandContext> as GitSuperCommands

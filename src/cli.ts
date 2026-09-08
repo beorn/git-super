@@ -11,6 +11,7 @@ import {
   type StatusParams,
   type SubmodulePrepareParams,
   type WorktreeAddParams,
+  type WorktreeRemoveParams,
 } from "./commands.ts"
 import type { ConsultedRepository, SuperDiffResult } from "./diff.ts"
 import type { SuperIsAncestorResult } from "./merge-base.ts"
@@ -36,6 +37,7 @@ type CapturedInvocation =
   | Readonly<{ node: typeof commands.gitlink.write; params: GitlinkWriteParams; json: boolean; nul: boolean }>
   | Readonly<{ node: typeof commands.submodule.prepare; params: SubmodulePrepareParams; json: boolean; nul: boolean }>
   | Readonly<{ node: typeof commands.worktree.add; params: WorktreeAddParams; json: boolean; nul: boolean }>
+  | Readonly<{ node: typeof commands.worktree.remove; params: WorktreeRemoveParams; json: boolean; nul: boolean }>
 
 function stableValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(stableValue)
@@ -451,6 +453,21 @@ export async function runCli(
       }
     })
 
+  worktree
+    .command("remove")
+    .description(commands.worktree.remove.description ?? commands.worktree.remove.title)
+    .requiredOption("--retain <directory>", "durable directory outside the worktree and its Git directory")
+    .argument("<path>", "registered clean worktree to remove")
+    .action((path, options, command) => {
+      const globals = command.optsWithGlobals() as { repo: string; json?: boolean }
+      captured = {
+        node: commands.worktree.remove,
+        params: { path, retain: String(options.retain) },
+        json: globals.json === true,
+        nul: false,
+      }
+    })
+
   program
     .command("diff")
     .description(commands.diff.description ?? commands.diff.title)
@@ -524,7 +541,7 @@ export async function runCli(
     | SuperSubmodulePrepareResult
     | GitSuperResult
   try {
-    result = await commandResult(captured.node, { repo: globals.repo }, captured.params)
+    result = await commandResult(captured.node, { repo: globals.repo, report: (message) => stderr.write(message) }, captured.params)
   } catch (error) {
     stderr.write(`${error instanceof Error ? error.message : String(error)}\n`)
     return 2
@@ -599,7 +616,8 @@ export async function runCli(
     captured.node === commands.push ||
     captured.node === commands.gitlink.write ||
     captured.node === commands.submodule.prepare ||
-    captured.node === commands.worktree.add
+    captured.node === commands.worktree.add ||
+    captured.node === commands.worktree.remove
   ) {
     const operation = result as GitSuperResult
     return operation.state === "updated" || operation.state === "unchanged" ? 0 : 2

@@ -3,7 +3,7 @@
  * @level l1
  * @consumer Yrd worktree provisioning
  */
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs"
 import { spawnSync } from "node:child_process"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -111,6 +111,85 @@ function referenceStoreHas(fixture: SuperFixture, pin: string): boolean {
 }
 
 describe("git super worktree add", () => {
+  it("retains complete module stores before removing a clean unlocked populated worktree", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-worktree-remove-"))
+    roots.push(fixtureRoot)
+    const fixture = createSuperproject(fixtureRoot)
+    const worktree = join(fixtureRoot, "candidate")
+    const retained = join(fixtureRoot, "retained")
+    const out = outputSink()
+    const err = outputSink()
+    expect(await runCli(["--repo", fixture.product, "worktree", "add", worktree, "HEAD"], out, err)).toBe(0)
+    const child = join(worktree, "vendor/dep")
+    // This object is in no remote or author store. A clean detached HEAD alone
+    // cannot prove that removing the child Git directory loses no work.
+    git(child, ["checkout", "-q", "-b", "spare"])
+    writeFileSync(join(child, "dep.ts"), "export const dep = 42\n")
+    git(child, ["add", "dep.ts"])
+    git(child, ["commit", "-q", "-m", "private spare object"])
+    const spare = git(child, ["rev-parse", "HEAD"])
+    git(child, ["checkout", "-q", "--detach", fixture.pin])
+    const source = git(child, ["rev-parse", "--absolute-git-dir"])
+    const beforeLog = readFileSync(join(source, "logs/HEAD"), "utf8")
+
+    for (const dirty of [join(worktree, "untracked.txt"), join(child, "untracked.txt")]) {
+      writeFileSync(dirty, "preserve me")
+      const failure = outputSink()
+      expect(await runCli(["--repo", fixture.product, "--json", "worktree", "remove", worktree, "--retain", retained], failure, outputSink())).toBe(2)
+      expect(failure.output).toContain("dirty")
+      expect(existsSync(worktree)).toBe(true)
+      unlinkSync(dirty)
+    }
+    git(fixture.product, ["worktree", "lock", "--reason", "held by test", worktree])
+    const locked = outputSink()
+    expect(await runCli(["--repo", fixture.product, "--json", "worktree", "remove", worktree, "--retain", retained], locked, outputSink())).toBe(2)
+    expect(locked.output).toContain("held by test")
+    git(fixture.product, ["worktree", "unlock", worktree])
+
+    for (const unsafe of [join(worktree, "backup"), join(source, "backup")]) {
+      const failure = outputSink()
+      expect(await runCli(["--repo", fixture.product, "--json", "worktree", "remove", worktree, "--retain", unsafe], failure, outputSink())).toBe(2)
+      expect(failure.output).toContain("inside worktree removal paths")
+      expect(existsSync(worktree)).toBe(true)
+    }
+    const output = outputSink()
+    let proofBeforeRemoval = false
+    const diagnostic = {
+      write(value: string) {
+        if (value.startsWith("worktree removal proof ")) proofBeforeRemoval = existsSync(worktree)
+      },
+    }
+    expect(await runCli(["--repo", fixture.product, "--json", "worktree", "remove", worktree, "--retain", retained], output, diagnostic)).toBe(0)
+    const result = JSON.parse(output.output) as { state: string; proof: { retained: string; manifest: string } }
+    expect(result.state).toBe("updated")
+    expect(proofBeforeRemoval).toBe(true)
+    expect(existsSync(worktree)).toBe(false)
+    expect(existsSync(source)).toBe(false)
+    expect(git(fixture.product, ["worktree", "list", "--porcelain"])).not.toContain(worktree)
+    const store = join(result.proof.retained, "vendor/dep")
+    expect(readFileSync(join(store, "logs/HEAD"), "utf8")).toBe(beforeLog)
+    expect(readFileSync(result.proof.manifest, "utf8")).toContain("vendor/dep/refs/heads/spare")
+    const rescued = join(fixtureRoot, "rescued.git")
+    git(fixtureRoot, ["clone", "--quiet", "--bare", "--no-hardlinks", store, rescued])
+    expect(git(rescued, ["rev-parse", "refs/heads/spare"])).toBe(spare)
+    expect(git(rescued, ["show", `${spare}:dep.ts`])).toBe("export const dep = 42")
+  }, 30_000)
+
+  it("refuses removal when the retention destination cannot be written", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-worktree-retain-fail-"))
+    roots.push(fixtureRoot)
+    const fixture = createSuperproject(fixtureRoot)
+    const worktree = join(fixtureRoot, "candidate")
+    const blocker = join(fixtureRoot, "not-a-directory")
+    writeFileSync(blocker, "blocked")
+    expect(await runCli(["--repo", fixture.product, "worktree", "add", worktree, "HEAD"], outputSink(), outputSink())).toBe(0)
+    const out = outputSink()
+    expect(await runCli(["--repo", fixture.product, "--json", "worktree", "remove", worktree, "--retain", blocker], out, outputSink())).toBe(2)
+    expect(out.output).toContain(blocker)
+    expect(existsSync(worktree)).toBe(true)
+    expect(git(fixture.product, ["worktree", "list", "--porcelain"])).toContain(worktree)
+  })
+
   it("materializes a submodule at the pin the reference already holds", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-worktree-add-"))
     roots.push(fixtureRoot)
