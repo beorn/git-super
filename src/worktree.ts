@@ -377,8 +377,9 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
     ): Promise<void> {
       await mutate(removeOptions.operation ?? `worktree remove ${path}`, async () => {
         if (removeOptions.retention !== undefined) {
-          if (removeOptions.unlock === true)
-            {throw new Error(`retained worktree removal cannot unlock ${path}; resolve its holder first`)}
+          if (removeOptions.unlock === true) {
+            throw new Error(`retained worktree removal cannot unlock ${path}; resolve its holder first`)
+          }
           await retainWorktreeModules(git, repo, path, removeOptions.retention, (repository, target) =>
             inspectWorktree(git, repository, target),
           )
