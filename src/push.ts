@@ -3,7 +3,14 @@ import { isAbsolute, join, resolve } from "node:path"
 import { readCommitSubmodules, resolveSubmoduleBranch, type CommitSubmodule } from "./commit-graph.ts"
 import { createExclusive, type Exclusive } from "./exclusive.ts"
 import { ensureCommitObject } from "./objects.ts"
-import { decodePushIntent, PUSH_INTENT_TRAILER, sameHostedRepository } from "./push-intent.ts"
+import {
+  decodePushIntent,
+  encodePushIntent,
+  PUSH_INTENT_TRAILER,
+  sameHostedOwner,
+  sameHostedRepository,
+  type FrozenPushIntent,
+} from "./push-intent.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
 import {
   gitSuperResult,
@@ -831,6 +838,64 @@ async function logicalPushUrl(git: GitProcess, repository: string, remote: strin
   throw new Error(`Frozen push remote ${remote} has no declared URL in ${repository}`)
 }
 
+/** Freeze the existing recursive planner's inputs before the merge is committed or checked. */
+export async function capturePushIntent(
+  git: GitProcess,
+  root: string,
+  head: string,
+  tree: string,
+  rootPins: ReadonlyMap<string, string>,
+  timeoutMs: number,
+): Promise<string | undefined> {
+  const requirements = await collectCommitRequirements(git, root, [tree], rootPins)
+  if (requirements.length === 0) return undefined
+  const rootRemote = await logicalPushUrl(git, root, await configuredPushRemote(git, root))
+  const before = new Map(
+    (await collectCommitRequirements(git, root, [head])).map((entry) => [entry.path, entry.target]),
+  )
+  const children: FrozenPushIntent["children"][number][] = []
+  for (const requirement of requirements) {
+    const declared = requirement.entry.url
+    const pin = { path: requirement.path, remote: declared, pin: requirement.target }
+    // An external declaration can never be converted into write authority by local config.
+    if (!sameHostedOwner(rootRemote, declared)) {
+      children.push(pin)
+      continue
+    }
+    const update = await childUpdate(git, requirement, timeoutMs)
+    const remote = await logicalPushUrl(git, requirement.repository, update.remote)
+    if (!sameHostedOwner(rootRemote, remote)) {
+      children.push({ ...pin, remote })
+      continue
+    }
+    if (update.expectedDestination === undefined) throw new Error(`No observed destination for ${requirement.path}`)
+    if (update.expectedDestination.state === "oid") {
+      const args = ["merge-base", "--is-ancestor", update.expectedDestination.oid, update.source]
+      const ancestry = await git.run({ repo: requirement.repository, args })
+      if (ancestry.code === 1 && before.get(requirement.path) === requirement.target) {
+        children.push({ ...pin, remote })
+        continue
+      }
+      if (ancestry.code !== 0) throw operationError(requirement.repository, args, "freeze-child-fast-forward", ancestry)
+    }
+    children.push({
+      ...pin,
+      remote,
+      publication: {
+        destination: update.destination,
+        source: update.source,
+        expectedDestination: update.expectedDestination,
+      },
+    })
+  }
+  return encodePushIntent({ version: 1, rootRemote, children })
+}
+
+/** Read logical root identity before transport rewrites, using the ordinary push selection. */
+export async function rootPushIdentity(git: GitProcess, root: string): Promise<string> {
+  return logicalPushUrl(git, root, await configuredPushRemote(git, root))
+}
+
 async function frozenChildUpdates(
   git: GitProcess,
   root: string,
@@ -861,21 +926,19 @@ async function frozenChildUpdates(
     if (parents.length !== 2) throw new Error(`Frozen push intent must belong to an actual two-parent merge: ${source}`)
     found = true
     const selected = rootUpdates.length === 1 ? requirements : await collectCommitRequirements(git, root, [source])
-    for (const row of intent.updates) {
-      const requirement = selected.find((entry) => entry.path === row.path && entry.target === row.source)
+    for (const row of intent.children) {
+      const requirement = selected.find((entry) => entry.path === row.path && entry.target === row.pin)
       if (requirement === undefined) {
-        throw new Error(`Frozen child ${row.path}@${row.source} is not selected by merge ${source}`)
+        throw new Error(`Frozen child ${row.path}@${row.pin} is not selected by merge ${source}`)
       }
-      updates.push({
-        repository: requirement.repository,
-        remote: row.remote,
-        destination: row.destination,
-        source: row.source,
-        expectedDestination: row.expectedDestination,
-      })
+      if (row.publication === undefined) continue
+      const args = ["merge-base", "--is-ancestor", row.pin, row.publication.source]
+      const contains = await git.run({ repo: requirement.repository, args })
+      if (contains.code !== 0) throw operationError(requirement.repository, args, "bind-frozen-publication", contains)
+      updates.push({ repository: requirement.repository, remote: row.remote, ...row.publication })
     }
     for (const requirement of selected) {
-      if (!intent.updates.some((row) => row.path === requirement.path && row.source === requirement.target)) {
+      if (!intent.children.some((row) => row.path === requirement.path && row.pin === requirement.target)) {
         throw new Error(`Frozen merge ${source} has no child disposition for ${requirement.path}@${requirement.target}`)
       }
     }
@@ -887,6 +950,7 @@ async function collectCommitRequirements(
   git: GitProcess,
   root: string,
   commits: readonly string[],
+  rootPins?: ReadonlyMap<string, string>,
 ): Promise<CommitRequirement[]> {
   const completed = new Set<string>()
   const visiting = new Set<string>()
@@ -904,7 +968,9 @@ async function collectCommitRequirements(
       })
     }
     visiting.add(key)
-    for (const entry of await readCommitSubmodules(git, repository, commit)) {
+    for (const recorded of await readCommitSubmodules(git, repository, commit)) {
+      const target = path === "." ? rootPins?.get(recorded.path) : undefined
+      const entry = target === undefined ? recorded : { ...recorded, target }
       const childPath = path === "." ? entry.path : `${path}/${entry.path}`
       const child = join(repository, entry.path)
       const discovered = await required(git, child, ["rev-parse", "--show-toplevel"], "discover-submodule")

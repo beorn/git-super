@@ -1,5 +1,7 @@
 import { isAbsolute, join, resolve } from "node:path"
 import { readCommitSubmodules, resolveSubmoduleBranch, type CommitSubmodule } from "./commit-graph.ts"
+import { capturePushIntent, rootPushIdentity } from "./push.ts"
+import { PUSH_INTENT_TRAILER, sameHostedOwner } from "./push-intent.ts"
 import { createExclusive, type Exclusive } from "./exclusive.ts"
 import { parseIndexEntries, type IndexEntry } from "./index-entries.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
@@ -9,7 +11,7 @@ export type SuperMergeGitlinkResult = Readonly<{
   path: string
   from: string
   to: string
-  state: "raised" | "left-off-main" | "not-run"
+  state: "raised" | "kept-ahead" | "as-written" | "left-off-main" | "not-run"
 }>
 
 export type SuperMergeCheckoutResult = Readonly<{
@@ -43,7 +45,7 @@ type GitlinkPlan = Readonly<{
   path: string
   from: string
   to: string
-  state: "raised" | "left-off-main"
+  state: "raised" | "kept-ahead" | "as-written" | "left-off-main"
   changedByMerge: boolean
 }>
 
@@ -162,7 +164,7 @@ async function mergeUnderLock(
         "gitlink-off-main",
         `Merge ${target} would change ${refusal.path} to ${refusal.from}, which fetched component main ${refusal.to} does not contain.`,
         `git -C ${join(root, refusal.path)} merge-base --is-ancestor ${refusal.from} ${refusal.to}`,
-        `Push ${refusal.from} to ${refusal.path} main, then rerun the same git super merge command.`,
+        `Rebase ${refusal.path} onto its configured component branch, then rerun the same git super merge command.`,
         "the component writer",
         { paths: [refusal.path], objectIds: [refusal.from, refusal.to] },
       ),
@@ -170,12 +172,36 @@ async function mergeUnderLock(
   }
   const visiblePlans = plans.map(({ changedByMerge: _changedByMerge, ...plan }) => plan)
 
+  const requestedMessage = options.message ?? `Merge ${target.slice(0, 12)} into ${head.slice(0, 12)}`
   const trailers = visiblePlans.map((plan) =>
     plan.state === "raised"
       ? `Settled: ${plan.path}@${plan.to}`
-      : `Settled: ${plan.path}@${plan.from} left-off-main component-main@${plan.to}`,
+      : `Settled: ${plan.path}@${plan.from} ${plan.state} component-main@${plan.to}`,
   )
-  const requestedMessage = options.message ?? `Merge ${target.slice(0, 12)} into ${head.slice(0, 12)}`
+  try {
+    const parsed = await run(git, root, ["interpret-trailers", "--parse"], timeoutMs, requestedMessage)
+    if (parsed.code !== 0) throw operationError(root, "parse-merge-trailers", ["interpret-trailers", "--parse"], parsed)
+    if (
+      parsed.stdout
+        .split(/\r?\n/u)
+        .some((line) => line.toLowerCase().startsWith(`${PUSH_INTENT_TRAILER.toLowerCase()}:`))
+    ) {
+      throw new Error(
+        `${PUSH_INTENT_TRAILER} is produced from the selected merge tree; remove the caller-supplied trailer`,
+      )
+    }
+    const frozen = await capturePushIntent(
+      git,
+      root,
+      head,
+      prospective.tree,
+      new Map(visiblePlans.filter((plan) => plan.state === "raised").map((plan) => [plan.path, plan.to])),
+      timeoutMs,
+    )
+    if (frozen !== undefined) trailers.push(`${PUSH_INTENT_TRAILER}: ${frozen}`)
+  } catch (error) {
+    return failed(root, [], resultError(error, "freeze-merge-push"))
+  }
   let settledMessage = requestedMessage
   if (trailers.length > 0) {
     const trailerArgs = ["interpret-trailers", ...trailers.flatMap((trailer) => ["--trailer", trailer])]
@@ -232,7 +258,7 @@ async function mergeUnderLock(
     return mergeApplicationFailure(git, root, head, target, mergeArgs, merged, timeoutMs)
   }
   const completed: SuperMergeGitlinkResult[] = visiblePlans
-    .filter((plan) => plan.state === "left-off-main")
+    .filter((plan) => plan.state !== "raised")
     .map((plan) => ({ ...plan }))
   const raises = visiblePlans.filter((plan) => plan.state === "raised")
   for (let index = 0; index < raises.length; index += 1) {
@@ -753,14 +779,20 @@ async function planGitlinks(
 ): Promise<GitlinkPlans> {
   const before = new Map((await readCommitSubmodules(git, root, head)).map((entry) => [entry.path, entry.target]))
   const merged = await readCommitSubmodules(git, root, tree)
+  const rootRemote = merged.length === 0 ? undefined : await rootPushIdentity(git, root)
   const plans: GitlinkPlan[] = []
   const checkouts = new Map<string, GitlinkCheckoutPlan>()
   for (const entry of merged) {
     const component = join(root, entry.path)
-    const main = await fetchComponentMain(git, root, component, entry, timeoutMs)
     const recordedBefore = before.get(entry.path)
     const recorded = recordedBefore ?? entry.target
     const changedByMerge = recordedBefore !== entry.target
+    if (rootRemote !== undefined && !sameHostedOwner(rootRemote, entry.url)) {
+      if (changedByMerge) checkouts.set(entry.path, { path: entry.path, recorded, index: entry.target })
+      plans.push({ path: entry.path, from: entry.target, to: entry.target, state: "as-written", changedByMerge })
+      continue
+    }
+    const main = await fetchComponentMain(git, root, component, entry, timeoutMs)
     if (entry.target === main) {
       if (changedByMerge) checkouts.set(entry.path, { path: entry.path, recorded, index: entry.target })
       continue
@@ -778,12 +810,16 @@ async function planGitlinks(
       continue
     }
     if (ancestry.code === 1) {
+      const reverseArgs = ["merge-base", "--is-ancestor", main, entry.target]
+      const reverse = await run(git, component, reverseArgs, timeoutMs)
+      if (reverse.code !== 0 && reverse.code !== 1)
+        {throw operationError(component, "prove-gitlink-ahead", reverseArgs, reverse)}
       if (changedByMerge) checkouts.set(entry.path, { path: entry.path, recorded, index: entry.target })
       plans.push({
         path: entry.path,
         from: entry.target,
         to: main,
-        state: "left-off-main",
+        state: reverse.code === 0 ? "kept-ahead" : "left-off-main",
         changedByMerge,
       })
       continue

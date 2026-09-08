@@ -1117,13 +1117,16 @@ describe("explicit recursive push mechanics", () => {
     const encoded = encodePushIntent({
       version: 1,
       rootRemote: rootUrl,
-      updates: [
+      children: [
         {
           path: "child",
           remote: childUrl,
-          destination: "refs/heads/main",
-          source: fixture.childSource,
-          expectedDestination: { state: "oid", oid: fixture.childBefore },
+          pin: fixture.childSource,
+          publication: {
+            destination: "refs/heads/main",
+            source: fixture.childSource,
+            expectedDestination: { state: "oid", oid: fixture.childBefore },
+          },
         },
       ],
     })
@@ -1165,16 +1168,19 @@ describe("explicit recursive push mechanics", () => {
       let json = JSON.stringify({
         version: 1,
         rootRemote: rootUrl,
-        updates: [
+        children: [
           {
             path: "child",
             remote:
               condition === "external-remote"
                 ? "https://git-super.test/external/child.git"
                 : "https://git-super.test/owned/child.git",
-            destination: "refs/heads/main",
-            source: fixture.childSource,
-            expectedDestination: { state: "oid", oid: fixture.childBefore },
+            pin: fixture.childSource,
+            publication: {
+              destination: "refs/heads/main",
+              source: fixture.childSource,
+              expectedDestination: { state: "oid", oid: fixture.childBefore },
+            },
           },
         ],
       })

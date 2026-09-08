@@ -6,12 +6,15 @@ export const PUSH_INTENT_TRAILER = "Git-Super-Push"
 export type FrozenPushIntent = Readonly<{
   version: 1
   rootRemote: string
-  updates: readonly Readonly<{
+  children: readonly Readonly<{
     path: string
     remote: string
-    destination: string
-    source: string
-    expectedDestination: ExpectedDestination
+    pin: string
+    publication?: Readonly<{
+      destination: string
+      source: string
+      expectedDestination: ExpectedDestination
+    }>
   }>[]
 }>
 
@@ -68,6 +71,12 @@ export function hostedRemoteIdentity(
   return { host, namespace: parts.slice(0, -1).join("/"), repository: path }
 }
 
+export function sameHostedOwner(left: string, right: string): boolean {
+  const a = hostedRemoteIdentity(left)
+  const b = hostedRemoteIdentity(right)
+  return a.host === b.host && a.namespace === b.namespace
+}
+
 export function sameHostedRepository(left: string, right: string): boolean {
   const a = hostedRemoteIdentity(left)
   const b = hostedRemoteIdentity(right)
@@ -88,22 +97,22 @@ export function decodePushIntent(encoded: string): FrozenPushIntent {
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) invalid("payload must be an object")
   const value = parsed as Record<string, unknown>
-  if (value.version !== 1 || typeof value.rootRemote !== "string" || !Array.isArray(value.updates)) {
-    invalid("version 1 requires rootRemote and updates")
+  if (value.version !== 1 || typeof value.rootRemote !== "string" || !Array.isArray(value.children)) {
+    invalid("version 1 requires rootRemote and children")
   }
   const rootRemote = value.rootRemote
   const owner = hostedRemoteIdentity(rootRemote)
   const paths = new Set<string>()
-  const updates = value.updates.map((item: unknown) => {
+  const children = value.children.map((item: unknown) => {
     if (typeof item !== "object" || item === null || Array.isArray(item)) invalid("child update must be an object")
     const row = item as Record<string, unknown>
     if (
       typeof row.path !== "string" ||
       typeof row.remote !== "string" ||
-      typeof row.destination !== "string" ||
-      typeof row.source !== "string"
+      typeof row.pin !== "string" ||
+      !OID.test(row.pin)
     ) {
-      invalid("child update requires path, remote, destination and source strings")
+      invalid("child requires path, remote and a full pin OID")
     }
     if (
       row.path.includes("\0") ||
@@ -118,13 +127,24 @@ export function decodePushIntent(encoded: string): FrozenPushIntent {
     }
     paths.add(row.path)
     const child = hostedRemoteIdentity(row.remote)
+    if (row.publication === undefined) return { path: row.path, remote: row.remote, pin: row.pin }
     if (owner.host !== child.host || owner.namespace !== child.namespace) {
       invalid(`external remote ${row.remote} cannot receive a frozen child update for ${rootRemote}`)
     }
-    if (!row.destination.startsWith("refs/heads/") || !OID.test(row.source)) {
+    if (typeof row.publication !== "object" || row.publication === null || Array.isArray(row.publication)) {
+      invalid(`invalid publication for ${row.path}`)
+    }
+    const publication = row.publication as Record<string, unknown>
+    if (
+      typeof publication.destination !== "string" ||
+      !publication.destination.startsWith("refs/heads/") ||
+      typeof publication.source !== "string" ||
+      !OID.test(publication.source) ||
+      publication.source.length !== row.pin.length
+    ) {
       invalid(`invalid destination or source for ${row.path}`)
     }
-    const expected = row.expectedDestination
+    const expected = publication.expectedDestination
     if (typeof expected !== "object" || expected === null || Array.isArray(expected)) {
       invalid(`expected destination missing for ${row.path}`)
     }
@@ -135,13 +155,18 @@ export function decodePushIntent(encoded: string): FrozenPushIntent {
       old.state === "oid" &&
       typeof old.oid === "string" &&
       OID.test(old.oid) &&
-      old.oid.length === row.source.length
+      old.oid.length === row.pin.length
     ) {
       expectedDestination = { state: "oid", oid: old.oid }
     } else invalid(`invalid expected destination for ${row.path}`)
-    return { path: row.path, remote: row.remote, destination: row.destination, source: row.source, expectedDestination }
+    return {
+      path: row.path,
+      remote: row.remote,
+      pin: row.pin,
+      publication: { destination: publication.destination, source: publication.source, expectedDestination },
+    }
   })
-  const intent: FrozenPushIntent = { version: 1, rootRemote, updates }
+  const intent: FrozenPushIntent = { version: 1, rootRemote, children }
   if (JSON.stringify(intent) !== json) invalid("payload has duplicate, unknown or noncanonical fields")
   return intent
 }
