@@ -215,7 +215,12 @@ export async function resolveSubmoduleBranch(
   const key = `submodule.${entry.name}.branch`
   const configArgs = ["config", "--get", key]
   const configured = await git.run({ repo: superproject, args: configArgs })
-  const absent = configured.code === 1 && !configured.timedOut && configured.failure === undefined && configured.stdout === "" && configured.stderr === ""
+  const absent =
+    configured.code === 1 &&
+    !configured.timedOut &&
+    configured.failure === undefined &&
+    configured.stdout === "" &&
+    configured.stderr === ""
   if (gitProcessFailed(configured) && !absent) throw operationError(superproject, phase, configArgs, configured)
   let branch = absent ? entry.branch : configured.stdout.trimEnd()
   const refuse = (code: string, message: string): never => {
@@ -233,7 +238,8 @@ export async function resolveSubmoduleBranch(
       refuse("detached-superproject-branch", `${key}=. cannot resolve a branch from detached HEAD in ${superproject}.`)
     }
     if (gitProcessFailed(head)) throw operationError(superproject, phase, args, head)
-    if (!head.stdout.trim().startsWith("refs/heads/")) refuse("invalid-superproject-branch", `${superproject} HEAD does not name a local branch.`)
+    if (!head.stdout.trim().startsWith("refs/heads/"))
+      {refuse("invalid-superproject-branch", `${superproject} HEAD does not name a local branch.`)}
     branch = head.stdout.trim().slice("refs/heads/".length)
   }
   if (branch === undefined) {
@@ -244,8 +250,13 @@ export async function resolveSubmoduleBranch(
       const match = /^ref: refs\/heads\/(.+)\s+HEAD$/u.exec(line)
       return match?.[1] === undefined ? [] : [match[1]]
     })
-    if (heads.length !== 1) refuse("submodule-remote-head-unresolved", `No unique symbolic branch was advertised by ${component} remote ${remote} HEAD; ${key} is unset in Git config and the captured .gitmodules.`)
-    branch = heads[0]!
+    const advertisedBranch = heads[0]
+    if (heads.length !== 1 || advertisedBranch === undefined)
+      {refuse(
+        "submodule-remote-head-unresolved",
+        `No unique symbolic branch was advertised by ${component} remote ${remote} HEAD; ${key} is unset in Git config and the captured .gitmodules.`,
+      )}
+    branch = advertisedBranch
   }
   const args = ["check-ref-format", `refs/heads/${branch}`]
   const valid = await git.run({ repo: component, args })

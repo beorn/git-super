@@ -807,7 +807,13 @@ async function fetchComponentMain(
   entry: CommitSubmodule,
   timeoutMs: number,
 ): Promise<string> {
-  const branch = await resolveSubmoduleBranch({ run: (request) => git.run({ ...request, timeoutMs }) }, superproject, component, entry, "origin")
+  const branch = await resolveSubmoduleBranch(
+    { run: (request) => git.run({ ...request, timeoutMs }) },
+    superproject,
+    component,
+    entry,
+    "origin",
+  )
   const { path, target: pin } = entry
   const fetchArgs = ["fetch", "--no-tags", "origin", `+refs/heads/${branch}:refs/remotes/origin/${branch}`]
   const fetched = await run(git, component, fetchArgs, timeoutMs)

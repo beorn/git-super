@@ -377,7 +377,14 @@ describe("explicit recursive push mechanics", () => {
       if (selection === "remote-head") {
         git(fixture.childRemote, "symbolic-ref", "HEAD", `refs/heads/${branch}`)
       } else {
-        git(fixture.root, "config", "--file", ".gitmodules", "submodule.child.branch", selection === "dot" ? "." : selection === "override" ? "wrong" : branch)
+        git(
+          fixture.root,
+          "config",
+          "--file",
+          ".gitmodules",
+          "submodule.child.branch",
+          selection === "dot" ? "." : selection === "override" ? "wrong" : branch,
+        )
         git(fixture.root, "add", ".gitmodules")
         git(fixture.root, "commit", "-q", "-m", "declare forwarding branch")
       }
@@ -389,13 +396,21 @@ describe("explicit recursive push mechanics", () => {
       git(fixture.child, "switch", "-q", "--detach", extra)
       git(fixture.root, "config", "--file", ".gitmodules", "submodule.child.branch", "uncommitted")
 
-      const result = await superPush({ repo: fixture.root, remote: "origin", refspecs: [`${rootSource}:refs/heads/main`], recurseSubmodules: "on-demand" })
+      const result = await superPush({
+        repo: fixture.root,
+        remote: "origin",
+        refspecs: [`${rootSource}:refs/heads/main`],
+        recurseSubmodules: "on-demand",
+      })
 
       expect(result).toMatchObject({ state: "updated", partial: false })
       expect(git(fixture.childRemote, "rev-parse", `refs/heads/${branch}`)).toBe(fixture.childSource)
       expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(fixture.childBefore)
       expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(rootSource)
-      expect(result.repositories[0]?.refs[0]).toMatchObject({ source: fixture.childSource, destination: `refs/heads/${branch}` })
+      expect(result.repositories[0]?.refs[0]).toMatchObject({
+        source: fixture.childSource,
+        destination: `refs/heads/${branch}`,
+      })
     },
   )
 
@@ -412,8 +427,19 @@ describe("explicit recursive push mechanics", () => {
     } else {
       git(fixture.childRemote, "symbolic-ref", "HEAD", "refs/heads/missing")
     }
-    const result = await superPush({ repo: fixture.root, remote: "origin", refspecs: ["HEAD:refs/heads/main"], recurseSubmodules: "on-demand" })
-    expect(result).toMatchObject({ state: "failed", partial: false, detail: { code: selection === "detached-dot" ? "detached-superproject-branch" : "submodule-remote-head-unresolved" } })
+    const result = await superPush({
+      repo: fixture.root,
+      remote: "origin",
+      refspecs: ["HEAD:refs/heads/main"],
+      recurseSubmodules: "on-demand",
+    })
+    expect(result).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: {
+        code: selection === "detached-dot" ? "detached-superproject-branch" : "submodule-remote-head-unresolved",
+      },
+    })
     expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(fixture.childBefore)
     expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(fixture.rootBefore)
   })

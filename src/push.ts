@@ -808,7 +808,13 @@ async function collectCommitRequirements(
       const discovered = await required(git, child, ["rev-parse", "--show-toplevel"], "discover-submodule")
       await required(git, discovered, ["cat-file", "-e", `${entry.target}^{commit}`], "verify-submodule-commit")
       await walk(discovered, childPath, entry.target)
-      requirements.push({ superproject: repository, entry, repository: discovered, path: childPath, target: entry.target })
+      requirements.push({
+        superproject: repository,
+        entry,
+        repository: discovered,
+        path: childPath,
+        target: entry.target,
+      })
     }
     visiting.delete(key)
     completed.add(key)
@@ -817,7 +823,11 @@ async function collectCommitRequirements(
   return requirements.filter(
     (requirement, index, all) =>
       all.findIndex(
-        (candidate) => candidate.repository === requirement.repository && candidate.target === requirement.target && candidate.entry.name === requirement.entry.name && candidate.entry.branch === requirement.entry.branch,
+        (candidate) =>
+          candidate.repository === requirement.repository &&
+          candidate.target === requirement.target &&
+          candidate.entry.name === requirement.entry.name &&
+          candidate.entry.branch === requirement.entry.branch,
       ) === index,
   )
 }
@@ -946,7 +956,13 @@ async function commitAvailableOnAnyRemote(git: GitProcess, requirement: CommitRe
 
 async function childUpdate(git: GitProcess, requirement: CommitRequirement): Promise<RefUpdate> {
   const remote = await configuredPushRemote(git, requirement.repository)
-  const branch = await resolveSubmoduleBranch(git, requirement.superproject, requirement.repository, requirement.entry, remote)
+  const branch = await resolveSubmoduleBranch(
+    git,
+    requirement.superproject,
+    requirement.repository,
+    requirement.entry,
+    remote,
+  )
   return { repository: requirement.repository, remote, source: requirement.target, destination: `refs/heads/${branch}` }
 }
 

@@ -59,7 +59,10 @@ describe("git super merge", () => {
     git(fixture.product, "config", "submodule.packages/alpha.branch", "stable")
     const candidate = candidateWithRootChange(fixture, "candidate-stable")
     const result = await superMerge({ repo: fixture.product, commit: candidate })
-    expect(result).toMatchObject({ state: "updated", gitlinks: [expect.objectContaining({ path: "packages/alpha", to: stable, state: "raised" })] })
+    expect(result).toMatchObject({
+      state: "updated",
+      gitlinks: [expect.objectContaining({ path: "packages/alpha", to: stable, state: "raised" })],
+    })
     expect(git(fixture.product, "rev-parse", "HEAD:packages/alpha")).toBe(stable)
     expect(git(fixture.alpha, "rev-parse", "main")).toBe(fixture.alphaBase)
   })
@@ -995,6 +998,7 @@ describe("git super merge", () => {
     const fixture = createProductFixture(fixtureRoot)
     const candidate = candidateWithRootChange(fixture, "candidate-unreadable")
     const component = join(fixture.product, "packages/alpha")
+    git(fixture.product, "config", "submodule.packages/alpha.branch", "main")
     git(component, "remote", "set-url", "origin", join(fixtureRoot, "missing-alpha-origin"))
     const headBefore = git(fixture.product, "rev-parse", "HEAD")
     const stdout = outputSink()
