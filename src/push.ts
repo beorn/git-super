@@ -12,6 +12,7 @@ import {
   type FrozenPushIntent,
 } from "./push-intent.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
+import { superSubmodulePrepare, type PreparedSubmodule } from "./submodule-prepare.ts"
 import {
   gitSuperResult,
   type ExpectedDestination,
@@ -110,6 +111,10 @@ async function discoverRepository(git: GitProcess, path: string, phase: string):
   if (topLevel.code === 0 && topLevel.stdout.trim() !== "") return resolve(topLevel.stdout.trim())
   const bare = await git.run({ repo: path, args: ["rev-parse", "--is-bare-repository"] })
   if (bare.code === 0 && bare.stdout.trim() === "true") {
+    return resolve(await required(git, path, ["rev-parse", "--absolute-git-dir"], phase))
+  }
+  const inside = await git.run({ repo: path, args: ["rev-parse", "--is-inside-git-dir"] })
+  if (inside.code === 0 && inside.stdout.trim() === "true") {
     return resolve(await required(git, path, ["rev-parse", "--absolute-git-dir"], phase))
   }
   throw operationError(path, topLevelArgs, phase, topLevel)
@@ -948,7 +953,7 @@ async function frozenChildUpdates(
     const parents = (await required(git, root, ["show", "-s", "--format=%P", source], "bind-frozen-merge")).split(" ")
     if (parents.length !== 2) throw new Error(`Frozen push intent must belong to an actual two-parent merge: ${source}`)
     if (direct.has(source)) found = true
-    const selected = await collectCommitRequirements(git, root, [source])
+    const selected = await collectCommitRequirements(git, root, [source], undefined, intent)
     for (const row of intent.children) {
       const requirement = selected.find((entry) => entry.path === row.path && entry.target === row.pin)
       if (requirement === undefined) {
@@ -999,11 +1004,36 @@ async function verifyRetainedSource(git: GitProcess, update: RefUpdate): Promise
   }
 }
 
+async function prepareFrozenChildren(
+  git: GitProcess,
+  repository: string,
+  path: string,
+  commit: string,
+  frozen: FrozenPushIntent,
+): Promise<ReadonlyMap<string, PreparedSubmodule>> {
+  const remote =
+    path === "." ? frozen.rootRemote : frozen.children.find((row) => row.path === path && row.pin === commit)?.remote
+  if (remote === undefined) throw new Error(`Frozen merge has no repository identity for ${path}@${commit}`)
+  const prepared = await superSubmodulePrepare({ repo: repository, commit, remote, git })
+  if (prepared.state === "failed" || prepared.state === "unknown") {
+    const failure =
+      prepared.detail ??
+      detail(
+        "prepare-frozen-children-failed",
+        "recover-frozen-sources",
+        `Cannot prepare frozen children in ${repository}`,
+      )
+    throw Object.assign(new Error(failure.message), { resultDetail: failure })
+  }
+  return new Map(prepared.components.map((entry) => [entry.path, entry]))
+}
+
 async function collectCommitRequirements(
   git: GitProcess,
   root: string,
   commits: readonly string[],
   rootPins?: ReadonlyMap<string, string>,
+  frozen?: FrozenPushIntent,
 ): Promise<CommitRequirement[]> {
   const completed = new Set<string>()
   const visiting = new Set<string>()
@@ -1021,12 +1051,41 @@ async function collectCommitRequirements(
       })
     }
     visiting.add(key)
+    const stores = frozen === undefined ? undefined : await prepareFrozenChildren(git, repository, path, commit, frozen)
     for (const recorded of await readCommitSubmodules(git, repository, commit)) {
       const target = path === "." ? rootPins?.get(recorded.path) : undefined
       const entry = target === undefined ? recorded : { ...recorded, target }
       const childPath = path === "." ? entry.path : `${path}/${entry.path}`
-      const child = join(repository, entry.path)
-      const discovered = await required(git, child, ["rev-parse", "--show-toplevel"], "discover-submodule")
+      const store = stores?.get(entry.path)
+      if (stores !== undefined && store === undefined) {
+        throw new Error(`No prepared store for frozen child ${childPath}`)
+      }
+      const child = store?.gitdir ?? join(repository, entry.path)
+      const discovered = await discoverRepository(git, child, "discover-submodule")
+      if (frozen !== undefined) {
+        const row = frozen.children.find((candidate) => candidate.path === childPath && candidate.pin === entry.target)
+        if (row === undefined) throw new Error(`Frozen merge has no child disposition for ${childPath}@${entry.target}`)
+        for (const source of new Set([row.pin, ...(row.publication === undefined ? [] : [row.publication.source])])) {
+          const args = ["cat-file", "-e", `${source}^{commit}`]
+          const present = await git.run({ repo: discovered, args })
+          if (present.code === 0) continue
+          if (present.timedOut === true || present.failure !== undefined) {
+            throw operationError(discovered, args, "recover-frozen-source", present)
+          }
+          if (!sameHostedOwner(frozen.rootRemote, row.remote)) {
+            throw new Error(
+              `External child ${childPath}@${source} is unavailable locally and has no authorized cold recovery prerequisite`,
+            )
+          }
+          await verifyRetainedSource(git, {
+            repository: discovered,
+            remote: row.remote,
+            source,
+            destination: `refs/git-super/pins/${source}`,
+          })
+          await required(git, discovered, args, "verify-recovered-source")
+        }
+      }
       await required(git, discovered, ["cat-file", "-e", `${entry.target}^{commit}`], "verify-submodule-commit")
       await walk(discovered, childPath, entry.target)
       requirements.push({
@@ -1270,12 +1329,12 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
         ...(options.exclusive === undefined ? {} : { exclusive: options.exclusive }),
       })
     }
-    const requirements = await collectCommitRequirements(
-      git,
-      root,
-      rootUpdates.map((update) => update.source),
-    )
     if (options.recurseSubmodules === "check") {
+      const requirements = await collectCommitRequirements(
+        git,
+        root,
+        rootUpdates.map((update) => update.source),
+      )
       const available: GitSuperRepositoryResult[] = []
       for (const requirement of requirements) {
         if (await commitAvailableOnAnyRemote(git, requirement)) {
@@ -1322,6 +1381,11 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
     const frozen = await frozenChildUpdates(git, root, remote, rootUpdates)
     const childUpdates: RefUpdate[] = frozen.updates ?? []
     if (frozen.updates === undefined) {
+      const requirements = await collectCommitRequirements(
+        git,
+        root,
+        rootUpdates.map((update) => update.source),
+      )
       for (const requirement of requirements) childUpdates.push(await childUpdate(git, requirement, timeoutMs))
     }
     if (frozen.retention.length > 0) {

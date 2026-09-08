@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { afterEach, describe, expect, test } from "vitest"
@@ -1105,6 +1105,8 @@ describe("explicit recursive push mechanics", () => {
    * Ordinary recursive push tests resolve current config and cannot prove this seam.
    * Empty-tree records must retain reachable merge sources without advancing mains;
    * published history must not replay frozen destinations on a later record push.
+   * Recovery must fetch retained child sources with the author checkout gone and
+   * preserve the checked merge without materializing a replacement worktree.
    */
   test("pushes a frozen merge to its original child destination and resumes an identical result", async () => {
     const fixture = recursivePushFixture("frozen-destination")
@@ -1201,16 +1203,52 @@ describe("explicit recursive push mechanics", () => {
     expect(retentionFetch).toBeGreaterThan(retentionPush)
     expect(recordPush).toBeGreaterThan(retentionFetch)
 
-    expect(await superPush(options)).toMatchObject({ state: "updated", partial: false })
+    const cold = join(fixture.fixture, "cold")
+    git(fixture.fixture, "clone", "-q", "--no-checkout", "--no-local", fixture.rootRemote, cold)
+    git(cold, "fetch", "-q", "origin", `${recordRef}:${recordRef}`)
+    git(cold, "remote", "set-url", "origin", rootUrl)
+    git(cold, "config", "submodule.child.branch", "changed-after-restart")
+    expect(existsSync(join(cold, ".git", "objects", "info", "alternates"))).toBe(false)
+    expect(existsSync(join(cold, ".git", "modules", "child"))).toBe(false)
+    rmSync(fixture.root, { recursive: true, force: true })
+    expect(existsSync(fixture.root)).toBe(false)
+    const coldProcess = createLocalGitProcess({
+      ...globalThis.process.env,
+      GIT_CONFIG_COUNT: "2",
+      GIT_CONFIG_KEY_0: `url.${fixture.rootRemote}.insteadOf`,
+      GIT_CONFIG_VALUE_0: rootUrl,
+      GIT_CONFIG_KEY_1: `url.${fixture.childRemote}.insteadOf`,
+      GIT_CONFIG_VALUE_1: childUrl,
+    })
+    const recoveryCalls: string[][] = []
+    const recoveryGit: GitProcess = {
+      run: (request) => {
+        recoveryCalls.push([...request.args])
+        return coldProcess.run(request)
+      },
+    }
+    const recoveryOptions = { ...options, repo: cold, git: recoveryGit }
+    expect(await superPush(recoveryOptions)).toMatchObject({ state: "updated", partial: false })
+    expect(recoveryCalls.some((args) => args[0] === "fetch" && args.includes(pinRef))).toBe(true)
+    expect(recoveryCalls.some((args) => ["merge", "commit-tree", "worktree"].includes(args[0] ?? ""))).toBe(false)
+    expect(existsSync(join(cold, "child"))).toBe(false)
     expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(fixture.childSource)
     expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(merge)
     expect(git(fixture.childRemote, "for-each-ref", "--format=%(refname)", "refs/heads/changed-after-checks")).toBe("")
-    expect(await superPush(options)).toMatchObject({ state: "unchanged", partial: false })
+    expect(await superPush(recoveryOptions)).toMatchObject({ state: "unchanged", partial: false })
 
-    const third = advanceRepository(fixture.child, "child.txt", "later independent main\n")
-    git(fixture.child, "push", "-q", childUrl, `${third}:refs/heads/main`)
-    const laterRecord = git(fixture.root, "commit-tree", emptyTree, "-p", record, "-m", "later record")
-    expect(await superPush({ ...recordOptions, refspecs: [`${laterRecord}:${recordRef}`] })).toMatchObject({
+    const third = git(
+      fixture.childRemote,
+      "commit-tree",
+      `${fixture.childSource}^{tree}`,
+      "-p",
+      fixture.childSource,
+      "-m",
+      "later independent main",
+    )
+    git(fixture.childRemote, "update-ref", "refs/heads/main", third, fixture.childSource)
+    const laterRecord = git(cold, "commit-tree", emptyTree, "-p", record, "-m", "later record")
+    expect(await superPush({ ...recoveryOptions, refspecs: [`${laterRecord}:${recordRef}`] })).toMatchObject({
       state: "updated",
       partial: false,
     })
