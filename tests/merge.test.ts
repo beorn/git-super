@@ -67,7 +67,7 @@ describe("git super merge", () => {
     expect(git(fixture.alpha, "rev-parse", "main")).toBe(fixture.alphaBase)
   })
 
-  it("refuses moved off-main pins, reports untouched off-main pins, and raises behind pins", async () => {
+  it("refuses moved off-main pins before changing the checkout", async () => {
     const refusedRoot = mkdtempSync(join(tmpdir(), "git-super-merge-refused-"))
     roots.push(refusedRoot)
     const refused = createProductFixture(refusedRoot)
@@ -126,7 +126,9 @@ describe("git super merge", () => {
         owner: "the component writer",
       },
     })
+  })
 
+  it("reports untouched off-main pins without changing them", async () => {
     const leftRoot = mkdtempSync(join(tmpdir(), "git-super-merge-left-off-main-"))
     roots.push(leftRoot)
     const left = createProductFixture(leftRoot)
@@ -156,7 +158,9 @@ describe("git super merge", () => {
     expect(git(left.product, "show", "-s", "--format=%B", "HEAD")).toContain(
       `Settled: packages/alpha@${leftOffMain} left-off-main component-main@${left.alphaBase}`,
     )
+  })
 
+  it("raises behind pins to the component destination", async () => {
     const raisedRoot = mkdtempSync(join(tmpdir(), "git-super-merge-raised-"))
     roots.push(raisedRoot)
     const raised = createProductFixture(raisedRoot)
