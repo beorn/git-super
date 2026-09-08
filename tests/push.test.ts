@@ -1107,6 +1107,8 @@ describe("explicit recursive push mechanics", () => {
    * published history must not replay frozen destinations on a later record push.
    * Recovery must fetch retained child sources with the author checkout gone and
    * preserve the checked merge without materializing a replacement worktree.
+   * This native-Git workflow includes conflict, fetch failure, retry and cold clone;
+   * macOS CI exceeded the default 5s budget, so this one workflow is bounded at 30s.
    */
   test("pushes a frozen merge to its original child destination and resumes an identical result", async () => {
     const fixture = recursivePushFixture("frozen-destination")
@@ -1254,7 +1256,7 @@ describe("explicit recursive push mechanics", () => {
     })
     expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(third)
     expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(merge)
-  })
+  }, 30_000)
 
   /** M8.5: malformed or externally targeted saved intent must refuse before any ref write. */
   test.each(["duplicate-field", "external-remote", "invalid-base64"] as const)(
