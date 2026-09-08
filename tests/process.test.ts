@@ -1,11 +1,11 @@
 import { afterEach, describe, expect, test, vi } from "vitest"
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync, writeSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { createLocalGitProcess } from "../src/process.ts"
 import * as processPort from "git-super/process"
 import type { SupervisedProcess } from "git-super/process"
-import { canonicalTmpdir, createRepository } from "./fixture.ts"
+import { advanceRepository, canonicalTmpdir, createRepository, git } from "./fixture.ts"
 
 const roots: string[] = []
 
@@ -16,41 +16,276 @@ afterEach(() => {
 describe("GitProcess", () => {
   // Gate A: graph-process tests intentionally scrub Git variables and decode text.
   // They cannot prove a selected executable preserves the caller's raw request.
-  test("delegated CLI preserves argv, cwd, environment, empty/binary stdin, streams and exit", async () => {
-    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-native-bytes-"))
-    roots.push(root)
-    writeFileSync(
-      join(root, "git"),
-      `#!${process.execPath}
+  test.each([false, true])(
+    "delegated CLI preserves native bytes and closes its control endpoint (protocol=%s)",
+    async (protocol) => {
+      const root = mkdtempSync(join(canonicalTmpdir(), "git-super-native-bytes-"))
+      roots.push(root)
+      writeFileSync(
+        join(root, "git"),
+        `#!${process.execPath}
+import { writeSync } from 'node:fs'
+// Bun can reuse numeric fd3 internally after exec. It must not be the control endpoint.
+try { writeSync(3, 'native inherited control\\n') }
+catch (error) { if (!['EBADF', 'EINVAL'].includes(error.code)) throw error }
 const input = await new Response(Bun.stdin.stream()).arrayBuffer()
 process.stdout.write(JSON.stringify({args: process.argv.slice(2), cwd: process.cwd(), config: process.env.GIT_CONFIG_COUNT, dir: process.env.GIT_DIR}) + "\\n")
 process.stdout.write(Buffer.from(input))
 process.stderr.write(Buffer.from([32, 255, 0, 13, 10, 32]))
 process.exitCode = 19
 `,
-      { mode: 0o755 },
-    )
-    const args = ["opaque", "", "two words", "--", "--json"]
-    const env = { ...process.env, PATH: `${root}:${process.env.PATH}`, GIT_CONFIG_COUNT: "0", GIT_DIR: "keep-this" }
-    for (const input of [Buffer.alloc(0), Buffer.from([0, 255, 195, 10, 32])]) {
-      const child = Bun.spawn([process.execPath, join(import.meta.dirname, "../bin/git-super"), ...args], {
-        cwd: root,
-        env,
-        stdin: new Blob([input]),
+        { mode: 0o755 },
+      )
+      const args = ["opaque", "", "two words", "--", "--json"]
+      const env = { ...process.env, PATH: `${root}:${process.env.PATH}`, GIT_CONFIG_COUNT: "0", GIT_DIR: "keep-this" }
+      for (const input of [Buffer.alloc(0), Buffer.from([0, 255, 195, 10, 32])]) {
+        const child = Bun.spawn(
+          [
+            process.execPath,
+            join(import.meta.dirname, "../bin/git-super"),
+            ...(protocol ? ["--protocol-fd=3"] : []),
+            ...args,
+          ],
+          {
+            cwd: root,
+            env,
+            stdio: protocol ? [new Blob([input]), "pipe", "pipe", "pipe"] : [new Blob([input]), "pipe", "pipe"],
+          },
+        )
+        const fd = child.stdio[3]
+        const control =
+          protocol && typeof fd === "number"
+            ? new Response(Bun.file(fd).stream()).bytes().then(
+                (bytes) => ({ bytes: Buffer.from(bytes).toString() }),
+                (error) => ({ error: String(error) }),
+              )
+            : undefined
+        if (protocol) {
+          if (typeof fd !== "number") throw new Error("Test did not open the requested control descriptor")
+          writeSync(fd, JSON.stringify({ version: 1, token: "native-fd-token" }) + "\n")
+        }
+        const [code, stdout, stderr, controlBytes] = await Promise.all([
+          child.exited,
+          new Response(child.stdout).bytes(),
+          new Response(child.stderr).bytes(),
+          control,
+        ])
+        expect(code, Buffer.from(stderr).toString()).toBe(19)
+        expect(Buffer.from(stdout)).toEqual(
+          Buffer.concat([
+            Buffer.from(JSON.stringify({ args, cwd: root, config: "0", dir: "keep-this" }) + "\n"),
+            input,
+          ]),
+        )
+        expect(Buffer.from(stderr)).toEqual(Buffer.from([32, 255, 0, 13, 10, 32]))
+        expect(controlBytes).toEqual(
+          protocol
+            ? { bytes: JSON.stringify({ version: 1, token: "native-fd-token", ready: true }) + "\n" }
+            : undefined,
+        )
+      }
+    },
+  )
+
+  test("an explicitly requested missing control endpoint fails before native execution", () => {
+    const result = Bun.spawnSync(
+      [process.execPath, join(import.meta.dirname, "../bin/git-super"), "--protocol-fd=3", "--version"],
+      {
+        stdin: "ignore",
         stdout: "pipe",
         stderr: "pipe",
-      })
-      const [code, stdout, stderr] = await Promise.all([
-        child.exited,
-        new Response(child.stdout).bytes(),
-        new Response(child.stderr).bytes(),
-      ])
-      expect(code, Buffer.from(stderr).toString()).toBe(19)
-      expect(Buffer.from(stdout)).toEqual(
-        Buffer.concat([Buffer.from(JSON.stringify({ args, cwd: root, config: "0", dir: "keep-this" }) + "\n"), input]),
-      )
-      expect(Buffer.from(stderr)).toEqual(Buffer.from([32, 255, 0, 13, 10, 32]))
+        timeout: 2000,
+      },
+    )
+    expect(result.exitCode).toBe(1)
+    expect(result.stdout.toString()).toBe("")
+    expect(result.stderr.toString()).toContain("control descriptor 3")
+    expect(result.stderr.toString()).toContain("readable duplex")
+  })
+
+  // Sixth-item contract: closing before native delegation must also preserve a
+  // launch error. Byte-preservation cases use a present executable and miss it.
+  test("native launch failure after readiness retains its error without a false producer refusal", async () => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-control-native-failure-"))
+    roots.push(root)
+    const child = Bun.spawn(
+      [process.execPath, join(import.meta.dirname, "../bin/git-super"), "--protocol-fd=3", "opaque"],
+      {
+        cwd: root,
+        env: { ...process.env, PATH: root },
+        stdio: ["ignore", "pipe", "pipe", "pipe"],
+      },
+    )
+    const fd = child.stdio[3]
+    if (typeof fd !== "number") throw new Error("Test did not open the requested control descriptor")
+    const control = new Response(Bun.file(fd).stream()).text()
+    writeSync(fd, JSON.stringify({ version: 1, token: "launch-failure" }) + "\n")
+    const [code, stdout, stderr, frames] = await Promise.all([
+      child.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      control,
+    ])
+    expect({ code, stdout, frames }).toEqual({
+      code: 1,
+      stdout: "",
+      frames: JSON.stringify({ version: 1, token: "launch-failure", ready: true }) + "\n",
+    })
+    expect(stderr).toBe("git-super: native Git executable 'git' was not found on PATH\n")
+  })
+
+  // Sixth-item greeting validation must precede execution and report its
+  // expected endpoint. Native byte tests only exercise a valid greeting.
+  test.each([
+    ["invalid UTF-8", Buffer.from([255, 10])],
+    ["invalid JSON", Buffer.from("{\n")],
+    ["unknown version", Buffer.from('{"version":2,"token":"test"}\n')],
+    ["oversized greeting", Buffer.from(JSON.stringify({ version: 1, token: "x".repeat(64 * 1024) }) + "\n")],
+  ])("invalid control greeting (%s) fails before command execution", async (_label, greeting) => {
+    const child = Bun.spawn(
+      [process.execPath, join(import.meta.dirname, "../bin/git-super"), "--protocol-fd=3", "--version"],
+      {
+        stdio: ["ignore", "pipe", "pipe", "pipe"],
+      },
+    )
+    const fd = child.stdio[3]
+    if (typeof fd !== "number") throw new Error("Test did not open the requested control descriptor")
+    const control = new Response(Bun.file(fd).stream()).text()
+    writeSync(fd, greeting)
+    const [code, stdout, stderr, frames] = await Promise.all([
+      child.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      control,
+    ])
+    expect({ code, stdout, frames }).toEqual({ code: 1, stdout: "", frames: "" })
+    expect(stderr).toContain("git-super: control descriptor 3")
+  })
+
+  test("a second greeting after readiness is a visible protocol defect", async () => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-control-duplicate-"))
+    roots.push(root)
+    const child = Bun.spawn(
+      [
+        process.execPath,
+        join(import.meta.dirname, "../bin/git-super"),
+        "--protocol-fd=3",
+        "--repo",
+        join(root, "absent"),
+        "status",
+        "--json",
+      ],
+      {
+        stdio: ["ignore", "pipe", "pipe", "pipe"],
+      },
+    )
+    const fd = child.stdio[3]
+    if (typeof fd !== "number") throw new Error("Test did not open the requested control descriptor")
+    const reader = Bun.file(fd).stream().getReader()
+    const greeting = JSON.stringify({ version: 1, token: "duplicate" }) + "\n"
+    writeSync(fd, greeting)
+    let frames = ""
+    while (!frames.includes("\n")) {
+      const next = await reader.read()
+      if (next.done) throw new Error("Producer closed before readiness")
+      frames += Buffer.from(next.value).toString()
     }
+    expect(JSON.parse(frames)).toEqual({ version: 1, token: "duplicate", ready: true })
+    writeSync(fd, greeting)
+    while (true) {
+      const next = await reader.read()
+      if (next.done) break
+      frames += Buffer.from(next.value).toString()
+    }
+    reader.releaseLock()
+    const [code, stdout, stderr] = await Promise.all([
+      child.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+    ])
+    expect({ code, stdout }).toEqual({ code: 1, stdout: "" })
+    expect(stderr).toContain("unexpected input after the greeting")
+    expect(frames).toBe(JSON.stringify({ version: 1, token: "duplicate", ready: true }) + "\n")
+  })
+
+  // Native exec closure cannot prove the enriched producer keeps its endpoint
+  // while excluding Git and hooks; this real hook refuses after composition.
+  test("enriched execution retains its refusal endpoint while its Git hook cannot write to it", async () => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-control-hook-"))
+    roots.push(root)
+    const base = createRepository(root, "base.txt", "base\n")
+    git(root, "switch", "-q", "-c", "candidate")
+    const candidate = advanceRepository(root, "candidate.txt", "candidate\n")
+    git(root, "switch", "-q", "main")
+    const marker = join(root, ".git", "hook-control-evidence")
+    writeFileSync(
+      join(root, ".git", "hooks", "pre-commit"),
+      `#!${process.execPath}
+import { writeSync, writeFileSync } from 'node:fs'
+let outcome = 'inherited'
+try { writeSync(3, 'hook forged control\\n') }
+catch (error) {
+  if (!['EBADF', 'EINVAL'].includes(error.code)) throw error
+  outcome = 'excluded'
+}
+writeFileSync(${JSON.stringify(marker)}, outcome)
+process.stderr.write('hook-policy-refused\\n')
+process.exitCode = 23
+`,
+      { mode: 0o755 },
+    )
+    const child = Bun.spawn(
+      [
+        process.execPath,
+        join(import.meta.dirname, "../bin/git-super"),
+        "--protocol-fd=3",
+        "--repo",
+        root,
+        "merge",
+        candidate,
+      ],
+      {
+        stdio: ["ignore", "pipe", "pipe", "pipe"],
+        env: {
+          ...process.env,
+          GIT_AUTHOR_NAME: "Git Super Test",
+          GIT_AUTHOR_EMAIL: "git-super@example.test",
+          GIT_COMMITTER_NAME: "Git Super Test",
+          GIT_COMMITTER_EMAIL: "git-super@example.test",
+        },
+      },
+    )
+    const fd = child.stdio[3]
+    if (typeof fd !== "number") throw new Error("Test did not open the requested control descriptor")
+    const control = new Response(Bun.file(fd).stream()).text()
+    writeSync(fd, JSON.stringify({ version: 1, token: "hook-refusal" }) + "\n")
+    const [code, stdout, stderr, frames] = await Promise.all([
+      child.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      control,
+    ])
+    expect(code, stderr).toBeGreaterThan(0)
+    expect({ stdout, head: git(root, "rev-parse", "HEAD"), hook: readFileSync(marker, "utf8") }).toEqual({
+      stdout: "",
+      head: base,
+      hook: "excluded",
+    })
+    expect(stderr).toContain("hook-policy-refused")
+    expect(
+      frames
+        .trimEnd()
+        .split("\n")
+        .map((frame) => JSON.parse(frame)),
+    ).toEqual([
+      { version: 1, token: "hook-refusal", ready: true },
+      {
+        version: 1,
+        token: "hook-refusal",
+        refusal: "unjudged",
+        message: expect.stringContaining("hook-policy-refused"),
+      },
+    ])
   })
 
   test("delegation retains the native PID and cancellation, and refuses executable recursion", async () => {
