@@ -794,7 +794,7 @@ export async function materializeSubmodules(
       const durableGitDir = join(level, "modules", name)
       const anchored = await anchorDurableAlternates(git, join(worktree, path), durableGitDir, log)
       if (anchored.code !== 0) return anchored
-      return walk(join(worktree, path), nestedReference, async () => durableGitDir, undefined, depth + 1)
+      return walk(join(worktree, path), nestedReference, () => Promise.resolve(durableGitDir), undefined, depth + 1)
     }
     for (let start = 0; start < local.length; start += MAX_CONCURRENT_SUBMODULE_UPDATES) {
       const results = await Promise.all(local.slice(start, start + MAX_CONCURRENT_SUBMODULE_UPDATES).map(update))
@@ -959,6 +959,9 @@ export function materializeSubmodulesFromLocalWorktree(
         worktree: options.worktree,
         referenceWorktree: options.referenceWorktree,
         paths: options.paths,
+        // JSON has no Infinity; preserve an explicitly unlimited fetch budget.
+        maxRemoteFallbacks:
+          options.maxRemoteFallbacks === Infinity ? Number.MAX_SAFE_INTEGER : options.maxRemoteFallbacks,
       }),
     ],
     { encoding: "utf8", env: cleanGitRepositoryEnvironment(options.env ?? process.env) },
