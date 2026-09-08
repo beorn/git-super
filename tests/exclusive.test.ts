@@ -34,6 +34,11 @@ describe("exclusive writer policy", () => {
     await rm(dir, { recursive: true, force: true })
   })
 
+  /**
+   * @failure A legacy or unreadable holder timestamp becomes a fabricated age in a timeout refusal.
+   * @level l1
+   * @consumer Yrd worktree mutation store
+   */
   test.each([undefined, "invalid", "9999-01-01T00:00:00.000Z"])(
     "reports unknown age when holder metadata has no usable start time: %j",
     async (startedAt) => {
