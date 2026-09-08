@@ -339,7 +339,12 @@ function lease(update: PlannedUpdate): string {
 }
 
 function refResult(
-  update: Pick<PlannedUpdate, "destination" | "source">,
+  // `expectedDestination` is OPTIONAL here and that is the contract, not a
+    // convenience: the root "not-run" path passes a plain RefUpdate, which may
+    // carry none. The field's own docblock says absent means the operation did
+    // not look — so a caller that never looked emits nothing, and a reader is
+    // never told a head was observed when it was not.
+  update: Pick<PlannedUpdate, "destination" | "source"> & Partial<Pick<PlannedUpdate, "expectedDestination">>,
   state: GitResultState,
   failure?: GitResultDetail,
 ): GitSuperRefResult {
@@ -347,6 +352,21 @@ function refResult(
     source: update.source,
     destination: update.destination,
     state,
+    // The destination head this decision was made against, reported beside the
+    // verdict derived from it (@i/10-yrd/24243). Derived HERE rather than at
+    // the two `unchanged` sites on purpose: the field's contract is "present
+    // wherever the operation actually LOOKED", and push looks at
+    // `expectedDestination` for every planned update — it is what the
+    // force-with-lease is built from. Emitting it only on `unchanged` rows
+    // would make its ABSENCE on an `updated` row read as "did not look", which
+    // is a second ambiguity in the field that exists to remove one.
+    //
+    // PRE-WRITE, deliberately. `expectedDestination` is the head observed when
+    // the push was planned. The post-push observation at the remote is a
+    // DIFFERENT fact and must not be reported here, or a reader comparing this
+    // against a recorded precondition gets the same false confirmation 24243
+    // was filed for, one write later.
+    ...(update.expectedDestination?.state === "oid" ? { observed: update.expectedDestination.oid } : {}),
     ...(failure === undefined ? {} : { detail: failure }),
   }
 }

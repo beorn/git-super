@@ -957,3 +957,55 @@ describe("explicit recursive push mechanics", () => {
     expect(git(root.remote, "for-each-ref", "--format=%(refname)", "refs/heads/main")).toBe("")
   })
 })
+
+/**
+ * @failure `state=unchanged` answers "the destination already equals what you
+ *          are pushing" while being read as "there was nothing to do". Those
+ *          coincide until something else moved the destination — exactly when
+ *          someone reads the report to find out. Pull carried the same defect
+ *          and the same cure; push is the second surface.
+ * @level   l1 — real repositories on disk, through the production push path
+ * @bead    @i/10-yrd/24243-unchanged-is-ambiguous
+ */
+describe("the push report names the destination head it decided against", () => {
+  test("absent when nothing was observed, the compared head on unchanged, the PRIOR head on updated", async () => {
+    const { repository, remote, source } = pushFixture("observed-head")
+    git(repository, "remote", "add", "origin", remote)
+
+    // 1. The destination does not exist yet, so the push looked at NOTHING.
+    //    The field must be ABSENT, never an empty string: its contract is that
+    //    absence means the operation did not look.
+    const created = await pushRefUpdates({
+      root: repository,
+      updates: [update(repository, remote, source, { state: "missing" })],
+    })
+    expect(created).toMatchObject({ state: "updated" })
+    expect(created.repositories[0]?.refs[0], "nothing was observed, so nothing may be reported").not.toHaveProperty(
+      "observed",
+    )
+
+    // 2. THE AMBIGUOUS CASE. Same head again, destination already at it —
+    //    `unchanged` here means already-at-target, and the report must carry
+    //    the head that made it so.
+    const again = await pushRefUpdates({
+      root: repository,
+      updates: [update(repository, remote, source, { state: "oid", oid: source })],
+    })
+    expect(again.repositories[0]?.refs[0]).toMatchObject({ state: "unchanged", observed: source })
+
+    // 3. A real advance. Two things are proven here at once: the two states
+    //    RENDER DIFFERENTLY (the 24243 acceptance), and `observed` is the
+    //    PRE-WRITE head — `source`, not the `next` the remote now holds. If it
+    //    ever reports the post-push head, a reader comparing this report
+    //    against a recorded precondition gets the same false confirmation the
+    //    bead was filed for, one write later.
+    const next = advanceRepository(repository, "README.md", "two\n")
+    const moved = await pushRefUpdates({
+      root: repository,
+      updates: [update(repository, remote, next, { state: "oid", oid: source })],
+    })
+    expect(moved.repositories[0]?.refs[0]).toMatchObject({ state: "updated", observed: source })
+    expect(moved.repositories[0]?.refs[0]?.observed, "the post-push head is a different fact").not.toBe(next)
+    expect(git(remote, "rev-parse", "refs/heads/main")).toBe(next)
+  })
+})
