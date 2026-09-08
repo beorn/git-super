@@ -238,8 +238,9 @@ export async function resolveSubmoduleBranch(
       refuse("detached-superproject-branch", `${key}=. cannot resolve a branch from detached HEAD in ${superproject}.`)
     }
     if (gitProcessFailed(head)) throw operationError(superproject, phase, args, head)
-    if (!head.stdout.trim().startsWith("refs/heads/"))
-      {refuse("invalid-superproject-branch", `${superproject} HEAD does not name a local branch.`)}
+    if (!head.stdout.trim().startsWith("refs/heads/")) {
+      refuse("invalid-superproject-branch", `${superproject} HEAD does not name a local branch.`)
+    }
     branch = head.stdout.trim().slice("refs/heads/".length)
   }
   if (branch === undefined) {
@@ -251,11 +252,12 @@ export async function resolveSubmoduleBranch(
       return match?.[1] === undefined ? [] : [match[1]]
     })
     const advertisedBranch = heads[0]
-    if (heads.length !== 1 || advertisedBranch === undefined)
-      {refuse(
+    if (heads.length !== 1 || advertisedBranch === undefined) {
+      return refuse(
         "submodule-remote-head-unresolved",
         `No unique symbolic branch was advertised by ${component} remote ${remote} HEAD; ${key} is unset in Git config and the captured .gitmodules.`,
-      )}
+      )
+    }
     branch = advertisedBranch
   }
   const args = ["check-ref-format", `refs/heads/${branch}`]
