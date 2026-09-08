@@ -18,6 +18,8 @@ Git has display flags for submodule diffs, but no native flag that turns gitlink
 
 ```bash
 git super diff --name-only <range>
+git super diff --stat <range>
+git super diff --patch <range>
 git super status --porcelain
 git super merge-base --is-ancestor <sha> <superproject-ref>
 git super merge <commit> [-m <message>] [--no-verify]
@@ -100,6 +102,20 @@ Unrelated staged, tracked, untracked, and ignored files survive. A path the inco
 `--atomic` is passed separately to each single-repository push. **It never makes several repositories atomic.** A child may stay published when a later root hook or remote rejects; the result then reports `partial: true`. Hooks run unless `--no-verify` is explicit. Signed-push mode and push options pass through unchanged.
 
 Hooks, credential helpers, and remote helpers stay native Git behavior. A timeout, a rejected hook, an unreachable remote, an unreadable response, or a post-write check that disagrees is never turned into an empty or successful result. Selecting no refs at all is an input error with an explanation, not a silent success. Push is covered by `tests/push.test.ts`.
+
+### Landing across repositories
+
+Gerrit's cross-repository topics and Aviator's ChangeSets each group several repositories' changes into one submission gesture, but neither documents an atomic guarantee once repositories start merging independently. Gerrit: a same-repository topic submits atomically, while a multi-repository topic can fail into a partial submission ([cross-repository-changes](https://gerrit-review.googlesource.com/Documentation/cross-repository-changes.html)); Gerrit documents compensating revert commits, reviewed and submitted normally, but it does not guarantee automatic rollback of a partial multi-repository submission. Aviator: a ChangeSet is validated as a whole and fails before merging if any check fails, but partial-merge behavior once some repositories in a set have already merged isn't documented ([ChangeSets](https://docs.aviator.co/mergequeue/concepts/changesets)). git-super does not claim an automatic cross-repository rollback guarantee either; see [Yrd's own README](https://github.com/beorn/yrd#readme) for submission policy, which this section does not repeat.
+
+**Present today.** `git super merge` already classifies an incoming gitlink pin against the component's freshly fetched main and refuses outright (`gitlink-off-main`) rather than land a pin main doesn't contain (`src/merge.ts`). `git super push --recurse-submodules=on-demand` already applies remote ref updates child-first, root-last (`src/push.ts:542,1095`). The two are not wired together yet: advancing a component's own main today still takes a separate `git super push`, not an automatic consequence of a root merge.
+
+**Planned queue integration.** For a component whose main the product queue owns, a future landing compares the authored pin with current main. K1/K2/K3 label the three cases where they differ; equal pins need no change:
+
+- **K1 — the pin descends from main.** Component main (A) is an ancestor of the authored pin (P); landing fast-forwards main from A to P, pushing the author's commits there before the root's gitlink moves.
+- **K2 — main already contains the pin.** The authored pin (P) is an ancestor of a newer main (A); nothing is pushed, and the merged root takes A, the component's current main, as its pin.
+- **K3 — diverged.** Neither is an ancestor of the other; landing fails "component main moved" before any write, and the author rebases before resubmitting.
+
+The planned integration adds journaled recovery: a run killed between component and root pushes resumes the recorded work on restart. The queue's component declaration determines which queue advances each main. Components with their own process remain pinned as written and are never raised or pushed by the product queue. This repository already carries the transition declaration `landing: external` in `.yrd.yml`; that declaration does not enable automatic component pushes or recovery. Yrd owns the declaration syntax and passes the pin policy to git-super; git-super does not read queue configuration.
 
 ### Worktree with submodules
 
