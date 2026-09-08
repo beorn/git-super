@@ -45,6 +45,25 @@ function candidateWithRootChange(fixture: ProductFixture, name: string): string 
 }
 
 describe("git super merge", () => {
+  /**
+   * @failure Merge settlement reads main although Git config selects another component branch.
+   * @level l1
+   * @consumer Configured component merge containment
+   */
+  it("settles against the configured component branch", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-configured-branch-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    git(fixture.alpha, "switch", "-q", "-c", "stable")
+    const stable = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 'stable'\n")
+    git(fixture.product, "config", "submodule.packages/alpha.branch", "stable")
+    const candidate = candidateWithRootChange(fixture, "candidate-stable")
+    const result = await superMerge({ repo: fixture.product, commit: candidate })
+    expect(result).toMatchObject({ state: "updated", gitlinks: [expect.objectContaining({ path: "packages/alpha", to: stable, state: "raised" })] })
+    expect(git(fixture.product, "rev-parse", "HEAD:packages/alpha")).toBe(stable)
+    expect(git(fixture.alpha, "rev-parse", "main")).toBe(fixture.alphaBase)
+  })
+
   it("refuses moved off-main pins, reports untouched off-main pins, and raises behind pins", async () => {
     const refusedRoot = mkdtempSync(join(tmpdir(), "git-super-merge-refused-"))
     roots.push(refusedRoot)

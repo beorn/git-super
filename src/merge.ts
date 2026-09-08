@@ -1,5 +1,5 @@
 import { isAbsolute, join, resolve } from "node:path"
-import { readCommitSubmodules } from "./commit-graph.ts"
+import { readCommitSubmodules, resolveSubmoduleBranch, type CommitSubmodule } from "./commit-graph.ts"
 import { createExclusive, type Exclusive } from "./exclusive.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
 import type { GitResultDetail, GitSuperRepositoryResult, GitSuperResult } from "./result.ts"
@@ -726,7 +726,7 @@ async function planGitlinks(
   const checkouts = new Map<string, GitlinkCheckoutPlan>()
   for (const entry of merged) {
     const component = join(root, entry.path)
-    const main = await fetchComponentMain(git, component, entry.path, entry.target, timeoutMs)
+    const main = await fetchComponentMain(git, root, component, entry, timeoutMs)
     const recordedBefore = before.get(entry.path)
     const recorded = recordedBefore ?? entry.target
     const changedByMerge = recordedBefore !== entry.target
@@ -802,15 +802,17 @@ async function mergeApplicationFailure(
 
 async function fetchComponentMain(
   git: GitProcess,
+  superproject: string,
   component: string,
-  path: string,
-  pin: string,
+  entry: CommitSubmodule,
   timeoutMs: number,
 ): Promise<string> {
-  const fetchArgs = ["fetch", "--no-tags", "origin", "+refs/heads/main:refs/remotes/origin/main"]
+  const branch = await resolveSubmoduleBranch({ run: (request) => git.run({ ...request, timeoutMs }) }, superproject, component, entry, "origin")
+  const { path, target: pin } = entry
+  const fetchArgs = ["fetch", "--no-tags", "origin", `+refs/heads/${branch}:refs/remotes/origin/${branch}`]
   const fetched = await run(git, component, fetchArgs, timeoutMs)
   if (fetched.code !== 0) throw componentMainError(component, path, pin, fetchArgs, fetched)
-  const resolveArgs = ["rev-parse", "refs/remotes/origin/main^{commit}"]
+  const resolveArgs = ["rev-parse", `refs/remotes/origin/${branch}^{commit}`]
   const resolved = await run(git, component, resolveArgs, timeoutMs)
   if (resolved.code !== 0) throw componentMainError(component, path, pin, resolveArgs, resolved)
   return resolved.stdout.trim()
@@ -832,7 +834,7 @@ function componentMainError(
       "component-main-unreadable",
       `Component main for ${path} could not be read while inspecting gitlink ${pin}.`,
       `git -C ${component} ${args.join(" ")}`,
-      `Repair access to ${path} origin/main, then rerun the same git super merge command.`,
+      `Repair access to the configured component branch named in the Git command, then rerun the same git super merge command.`,
       "the component writer",
       { paths: [path], objectIds: [pin], phase: "read-component-main" },
     ),

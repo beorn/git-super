@@ -363,6 +363,61 @@ describe("explicit recursive push mechanics", () => {
     if (rootMoves) expect(result.repositories.at(-1)).toMatchObject({ repository: fixture.root, state: "updated" })
   })
 
+  /**
+   * @failure Recursive push sends a local task tip to the wrong component branch.
+   * @level l1
+   * @consumer Configured component forwarding and child-first queue publication
+   */
+  test.each(["manifest", "override", "remote-head", "dot"] as const)(
+    "on-demand publishes only the captured pin using %s branch selection",
+    async (selection) => {
+      const fixture = recursivePushFixture(`branch-${selection}`)
+      const branch = selection === "dot" ? "release" : "stable"
+      git(fixture.childRemote, "update-ref", `refs/heads/${branch}`, fixture.childBefore)
+      if (selection === "remote-head") {
+        git(fixture.childRemote, "symbolic-ref", "HEAD", `refs/heads/${branch}`)
+      } else {
+        git(fixture.root, "config", "--file", ".gitmodules", "submodule.child.branch", selection === "dot" ? "." : selection === "override" ? "wrong" : branch)
+        git(fixture.root, "add", ".gitmodules")
+        git(fixture.root, "commit", "-q", "-m", "declare forwarding branch")
+      }
+      if (selection === "override") git(fixture.root, "config", "submodule.child.branch", branch)
+      if (selection === "dot") git(fixture.root, "switch", "-q", "-c", branch)
+      const rootSource = git(fixture.root, "rev-parse", "HEAD")
+      git(fixture.child, "switch", "-q", "-c", "task/unrelated")
+      const extra = advanceRepository(fixture.child, "child.txt", "unrecorded task work\n")
+      git(fixture.child, "switch", "-q", "--detach", extra)
+      git(fixture.root, "config", "--file", ".gitmodules", "submodule.child.branch", "uncommitted")
+
+      const result = await superPush({ repo: fixture.root, remote: "origin", refspecs: [`${rootSource}:refs/heads/main`], recurseSubmodules: "on-demand" })
+
+      expect(result).toMatchObject({ state: "updated", partial: false })
+      expect(git(fixture.childRemote, "rev-parse", `refs/heads/${branch}`)).toBe(fixture.childSource)
+      expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(fixture.childBefore)
+      expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(rootSource)
+      expect(result.repositories[0]?.refs[0]).toMatchObject({ source: fixture.childSource, destination: `refs/heads/${branch}` })
+    },
+  )
+
+  /**
+   * @failure Missing branch authority silently publishes to an assumed main.
+   * @level l1
+   * @consumer Recursive push refusal before any remote mutation
+   */
+  test.each(["detached-dot", "missing-remote-head"] as const)("refuses %s before publishing", async (selection) => {
+    const fixture = recursivePushFixture(selection)
+    if (selection === "detached-dot") {
+      git(fixture.root, "config", "submodule.child.branch", ".")
+      git(fixture.root, "switch", "-q", "--detach", "HEAD")
+    } else {
+      git(fixture.childRemote, "symbolic-ref", "HEAD", "refs/heads/missing")
+    }
+    const result = await superPush({ repo: fixture.root, remote: "origin", refspecs: ["HEAD:refs/heads/main"], recurseSubmodules: "on-demand" })
+    expect(result).toMatchObject({ state: "failed", partial: false, detail: { code: selection === "detached-dot" ? "detached-superproject-branch" : "submodule-remote-head-unresolved" } })
+    expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(fixture.childBefore)
+    expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(fixture.rootBefore)
+  })
+
   test("on-demand preserves a published child when the later root hook rejects", async () => {
     const fixture = recursivePushFixture("on-demand-partial")
     const hook = join(fixture.root, ".git", "hooks", "pre-push")

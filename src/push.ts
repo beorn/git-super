@@ -1,6 +1,6 @@
 import { isAbsolute, join, resolve } from "node:path"
 
-import { readCommitGitlinks } from "./commit-graph.ts"
+import { readCommitSubmodules, resolveSubmoduleBranch, type CommitSubmodule } from "./commit-graph.ts"
 import { createExclusive, type Exclusive } from "./exclusive.ts"
 import { ensureCommitObject } from "./objects.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
@@ -72,6 +72,8 @@ type PushGroup = Readonly<{
 }>
 
 type CommitRequirement = Readonly<{
+  superproject: string
+  entry: CommitSubmodule
   repository: string
   path: string
   target: string
@@ -800,13 +802,13 @@ async function collectCommitRequirements(
       })
     }
     visiting.add(key)
-    for (const entry of await readCommitGitlinks(git, repository, commit)) {
+    for (const entry of await readCommitSubmodules(git, repository, commit)) {
       const childPath = path === "." ? entry.path : `${path}/${entry.path}`
       const child = join(repository, entry.path)
       const discovered = await required(git, child, ["rev-parse", "--show-toplevel"], "discover-submodule")
       await required(git, discovered, ["cat-file", "-e", `${entry.target}^{commit}`], "verify-submodule-commit")
       await walk(discovered, childPath, entry.target)
-      requirements.push({ repository: discovered, path: childPath, target: entry.target })
+      requirements.push({ superproject: repository, entry, repository: discovered, path: childPath, target: entry.target })
     }
     visiting.delete(key)
     completed.add(key)
@@ -815,7 +817,7 @@ async function collectCommitRequirements(
   return requirements.filter(
     (requirement, index, all) =>
       all.findIndex(
-        (candidate) => candidate.repository === requirement.repository && candidate.target === requirement.target,
+        (candidate) => candidate.repository === requirement.repository && candidate.target === requirement.target && candidate.entry.name === requirement.entry.name && candidate.entry.branch === requirement.entry.branch,
       ) === index,
   )
 }
@@ -943,40 +945,9 @@ async function commitAvailableOnAnyRemote(git: GitProcess, requirement: CommitRe
 }
 
 async function childUpdate(git: GitProcess, requirement: CommitRequirement): Promise<RefUpdate> {
-  const head = await git.run({ repo: requirement.repository, args: ["symbolic-ref", "--quiet", "HEAD"] })
-  const containing = await required(
-    git,
-    requirement.repository,
-    ["for-each-ref", "--format=%(refname)", "--contains", requirement.target, "refs/heads"],
-    "find-submodule-push-ref",
-  )
-  const candidates = containing.split(/\r?\n/u).filter((ref) => ref.startsWith("refs/heads/"))
-  const current = head.code === 0 && candidates.includes(head.stdout.trim()) ? head.stdout.trim() : undefined
-  const branch = current ?? (candidates.length === 1 ? candidates[0] : undefined)
-  if (branch === undefined) {
-    throw Object.assign(new Error(`no unambiguous local branch publishes ${requirement.target}`), {
-      resultDetail: detail(
-        candidates.length === 0 ? "submodule-commit-unpublishable" : "ambiguous-submodule-push-ref",
-        "find-submodule-push-ref",
-        candidates.length === 0
-          ? `No local branch in ${requirement.path} contains ${requirement.target}.`
-          : `More than one local branch in ${requirement.path} contains ${requirement.target}.`,
-        {
-          paths: [requirement.path],
-          objectIds: [requirement.target],
-          remedy: "Check out or leave exactly one intended local branch containing the recorded commit, then retry.",
-        },
-      ),
-    })
-  }
-  const source = await required(
-    git,
-    requirement.repository,
-    ["rev-parse", `${branch}^{commit}`],
-    "resolve-submodule-push-source",
-  )
   const remote = await configuredPushRemote(git, requirement.repository)
-  return { repository: requirement.repository, remote, source, destination: branch }
+  const branch = await resolveSubmoduleBranch(git, requirement.superproject, requirement.repository, requirement.entry, remote)
+  return { repository: requirement.repository, remote, source: requirement.target, destination: `refs/heads/${branch}` }
 }
 
 function availabilityResult(
