@@ -490,6 +490,46 @@ describe("git super pull --ff-only", () => {
     expect((JSON.parse(stdout.output) as { repositories: unknown[] }).repositories).toHaveLength(4)
   })
 
+  /**
+   * @failure Stale remote-tracking refs make a published detached commit look unpublished and stop an updater.
+   * @level l2 (CLI and real Git remote/ref boundary)
+   * @consumer Automated superproject updaters following component publication.
+   */
+  test("refreshes stale refs before rejecting a remotely published detached submodule commit", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-pull-stale-refs-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const checkout = join(fixtureRoot, "checkout")
+    git(
+      fixtureRoot,
+      "-c",
+      "protocol.file.allow=always",
+      "clone",
+      "-q",
+      "--recurse-submodules",
+      fixture.product,
+      checkout,
+    )
+    const target = bumpProductSubmodules(fixture)
+    const alphaTarget = git(fixture.alpha, "rev-parse", "HEAD")
+    const alphaCheckout = join(checkout, "packages/alpha")
+    // Fetching an exact object does not refresh origin/main, as in component-store preparation.
+    git(alphaCheckout, "fetch", "-q", "--no-write-fetch-head", "origin", alphaTarget)
+    git(alphaCheckout, "checkout", "-q", "--detach", alphaTarget)
+    expect(git(alphaCheckout, "rev-parse", "origin/main")).toBe(fixture.alphaBase)
+    expect(git(alphaCheckout, "for-each-ref", "--format=%(refname)", "--contains", alphaTarget)).toBe("")
+    const stdout = outputSink()
+    const stderr = outputSink()
+
+    const exitCode = await runCli(["--repo", checkout, "pull", "--ff-only", "origin", "main", "--json"], stdout, stderr)
+    expect(exitCode, stdout.output).toBe(0)
+    expect(stderr.output).toBe("")
+    expect(git(checkout, "rev-parse", "HEAD")).toBe(target)
+    expect(git(alphaCheckout, "rev-parse", "HEAD")).toBe(alphaTarget)
+    expect(git(alphaCheckout, "rev-parse", "origin/main")).toBe(alphaTarget)
+    expect(JSON.parse(stdout.output)).toMatchObject({ state: "updated", partial: false })
+  })
+
   test("protects an unpublished detached submodule commit before moving the root", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-pull-detached-"))
     roots.push(fixtureRoot)
@@ -518,7 +558,12 @@ describe("git super pull --ff-only", () => {
     expect(JSON.parse(stdout.output)).toMatchObject({
       state: "failed",
       partial: false,
-      detail: { code: "unpublished-detached-submodule", phase: "protect-submodule-head" },
+      detail: {
+        code: "unpublished-detached-submodule",
+        phase: "protect-submodule-head",
+        paths: ["packages/alpha"],
+        message: expect.stringContaining("packages/alpha"),
+      },
     })
   })
 
