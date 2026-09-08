@@ -7,6 +7,7 @@ import { runCli } from "../src/cli.ts"
 import { acquireExclusive, createExclusive, type Exclusive } from "../src/exclusive.ts"
 import { createLocalGitProcess, type GitProcess } from "../src/process.ts"
 import { pushRefUpdates, remoteContainsCommit, superPush } from "../src/push.ts"
+import { encodePushIntent, PUSH_INTENT_TRAILER } from "../src/push-intent.ts"
 import { advanceRepository, canonicalTmpdir as tmpdir, createRepository, git } from "./fixture.ts"
 
 const roots: string[] = []
@@ -1098,6 +1099,115 @@ describe("explicit recursive push mechanics", () => {
     const unpublished = advanceRepository(repository, "README.md", "two\n")
     await expect(remoteContainsCommit({ repository, remote: "origin", commit: unpublished })).resolves.toBe(false)
   })
+
+  /**
+   * M8.5 frozen recovery must reuse captured destinations after child config changes.
+   * Ordinary recursive push tests resolve current config and cannot prove this seam.
+   */
+  test("pushes a frozen merge to its original child destination and resumes an identical result", async () => {
+    const fixture = recursivePushFixture("frozen-destination")
+    const rootUrl = "https://git-super.test/owned/root.git"
+    const childUrl = "https://git-super.test/owned/child.git"
+    git(fixture.root, "config", `url.${fixture.rootRemote}.insteadOf`, rootUrl)
+    git(fixture.child, "config", `url.${fixture.childRemote}.insteadOf`, childUrl)
+    git(fixture.root, "remote", "set-url", "origin", rootUrl)
+    git(fixture.root, "config", "--file", ".gitmodules", "submodule.child.url", childUrl)
+    git(fixture.root, "commit", "-q", "-am", "declare hosted child identity")
+    const candidate = git(fixture.root, "rev-parse", "HEAD")
+    const encoded = encodePushIntent({
+      version: 1,
+      rootRemote: rootUrl,
+      updates: [
+        {
+          path: "child",
+          remote: childUrl,
+          destination: "refs/heads/main",
+          source: fixture.childSource,
+          expectedDestination: { state: "oid", oid: fixture.childBefore },
+        },
+      ],
+    })
+    const merge = git(
+      fixture.root,
+      "commit-tree",
+      `${candidate}^{tree}`,
+      "-p",
+      fixture.rootBefore,
+      "-p",
+      candidate,
+      "-m",
+      `checked merge\n\n${PUSH_INTENT_TRAILER}: ${encoded}`,
+    )
+    git(fixture.root, "config", "submodule.child.branch", "changed-after-checks")
+    git(fixture.child, "remote", "set-url", "origin", "https://elsewhere.test/external/changed.git")
+    const options = {
+      repo: fixture.root,
+      remote: "origin",
+      refspecs: [`${merge}:refs/heads/main`],
+      recurseSubmodules: "on-demand" as const,
+    }
+
+    expect(await superPush(options)).toMatchObject({ state: "updated", partial: false })
+    expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(fixture.childSource)
+    expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(merge)
+    expect(git(fixture.childRemote, "for-each-ref", "--format=%(refname)", "refs/heads/changed-after-checks")).toBe("")
+    expect(await superPush(options)).toMatchObject({ state: "unchanged", partial: false })
+  })
+
+  /** M8.5: malformed or externally targeted saved intent must refuse before any ref write. */
+  test.each(["duplicate-field", "external-remote", "invalid-base64"] as const)(
+    "refuses %s frozen intent without publishing",
+    async (condition) => {
+      const fixture = recursivePushFixture(`frozen-${condition}`)
+      const rootUrl = "https://git-super.test/owned/root.git"
+      git(fixture.root, "config", `url.${fixture.rootRemote}.insteadOf`, rootUrl)
+      git(fixture.root, "remote", "set-url", "origin", rootUrl)
+      let json = JSON.stringify({
+        version: 1,
+        rootRemote: rootUrl,
+        updates: [
+          {
+            path: "child",
+            remote:
+              condition === "external-remote"
+                ? "https://git-super.test/external/child.git"
+                : "https://git-super.test/owned/child.git",
+            destination: "refs/heads/main",
+            source: fixture.childSource,
+            expectedDestination: { state: "oid", oid: fixture.childBefore },
+          },
+        ],
+      })
+      if (condition === "duplicate-field") json = json.replace('{"version":1,', '{"version":0,"version":1,')
+      const encoded = condition === "invalid-base64" ? "%%%" : Buffer.from(json).toString("base64")
+      const merge = git(
+        fixture.root,
+        "commit-tree",
+        `${fixture.rootSource}^{tree}`,
+        "-p",
+        fixture.rootBefore,
+        "-p",
+        fixture.rootSource,
+        "-m",
+        `invalid merge\n\n${PUSH_INTENT_TRAILER}: ${encoded}`,
+      )
+
+      expect(
+        await superPush({
+          repo: fixture.root,
+          remote: "origin",
+          refspecs: [`${merge}:refs/heads/main`],
+          recurseSubmodules: "on-demand",
+        }),
+      ).toMatchObject({
+        state: "failed",
+        partial: false,
+        detail: { code: "invalid-frozen-push-intent" },
+      })
+      expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(fixture.childBefore)
+      expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(fixture.rootBefore)
+    },
+  )
 
   test("reports child success followed by root rejection as partial without rollback", async () => {
     const root = pushFixture("partial-root")

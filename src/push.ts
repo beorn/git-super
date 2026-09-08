@@ -3,6 +3,7 @@ import { isAbsolute, join, resolve } from "node:path"
 import { readCommitSubmodules, resolveSubmoduleBranch, type CommitSubmodule } from "./commit-graph.ts"
 import { createExclusive, type Exclusive } from "./exclusive.ts"
 import { ensureCommitObject } from "./objects.ts"
+import { decodePushIntent, PUSH_INTENT_TRAILER, sameHostedRepository } from "./push-intent.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
 import {
   gitSuperResult,
@@ -146,12 +147,8 @@ function sameExpected(left: ExpectedDestination, right: ExpectedDestination): bo
   return expectedKey(left) === expectedKey(right)
 }
 
-function isIdenticalCreateOnly(
-  source: string,
-  expected: ExpectedDestination | undefined,
-  observed: ExpectedDestination,
-): boolean {
-  return expected?.state === "missing" && observed.state === "oid" && observed.oid === source
+function isIdenticalSuccess(source: string, observed: ExpectedDestination): boolean {
+  return observed.state === "oid" && observed.oid === source
 }
 
 async function observeDestination(
@@ -258,13 +255,13 @@ async function planUpdates(git: GitProcess, input: readonly RefUpdate[], timeout
         })
       }
     }
-    const identicalCreateOnlyRetry = isIdenticalCreateOnly(update.source, update.expectedDestination, observed)
+    const identicalRetry = isIdenticalSuccess(update.source, observed)
     const planned = {
       repository,
       remote: update.remote,
       source: update.source,
       destination: update.destination,
-      expectedDestination: identicalCreateOnlyRetry ? observed : (update.expectedDestination ?? observed),
+      expectedDestination: identicalRetry ? observed : (update.expectedDestination ?? observed),
       explicitExpectation: update.expectedDestination !== undefined,
       allowNonFastForward: update.allowNonFastForward === true,
     }
@@ -272,7 +269,7 @@ async function planUpdates(git: GitProcess, input: readonly RefUpdate[], timeout
     if (
       update.expectedDestination !== undefined &&
       !sameExpected(update.expectedDestination, observed) &&
-      !identicalCreateOnlyRetry
+      !identicalRetry
     ) {
       mismatches.set(planned, mismatchDetail(planned, observed, "observe-destination"))
     }
@@ -457,7 +454,7 @@ async function applyGroup(
       update !== undefined &&
       observed !== undefined &&
       !sameExpected(update.expectedDestination, observed) &&
-      !isIdenticalCreateOnly(update.source, update.expectedDestination, observed)
+      !isIdenticalSuccess(update.source, observed)
     ) {
       const failure = mismatchDetail(update, observed, "recheck-destination")
       return {
@@ -815,6 +812,77 @@ function applyExplicitLeases(updates: readonly RefUpdate[], values: readonly str
   return leased
 }
 
+/** The configured logical URL is frozen before transport rewrites are applied by Git. */
+async function logicalPushUrl(git: GitProcess, repository: string, remote: string): Promise<string> {
+  if (remote.includes(":") || remote.startsWith("/") || remote.startsWith(".")) return remote
+  for (const property of ["pushurl", "url"]) {
+    const args = ["config", "--get-all", `remote.${remote}.${property}`]
+    const result = await git.run({ repo: repository, args })
+    if (result.code === 1 && result.failure === undefined && result.timedOut !== true) continue
+    if (result.code !== 0 || result.failure !== undefined || result.timedOut === true) {
+      throw operationError(repository, args, "resolve-frozen-remote", result)
+    }
+    const urls = result.stdout.trim().split(/\r?\n/u)
+    if (urls.length !== 1 || urls[0] === undefined || urls[0] === "") {
+      throw new Error(`Frozen push requires exactly one logical URL for ${remote} in ${repository}`)
+    }
+    return urls[0]
+  }
+  throw new Error(`Frozen push remote ${remote} has no declared URL in ${repository}`)
+}
+
+async function frozenChildUpdates(
+  git: GitProcess,
+  root: string,
+  remote: string,
+  rootUpdates: readonly RefUpdate[],
+  requirements: readonly CommitRequirement[],
+): Promise<RefUpdate[] | undefined> {
+  const updates: RefUpdate[] = []
+  let found = false
+  for (const source of new Set(rootUpdates.map((update) => update.source))) {
+    const message = await required(
+      git,
+      root,
+      ["show", "-s", "--format=%(trailers:only,unfold)", source],
+      "read-frozen-push-intent",
+    )
+    const values = message.split(/\r?\n/u).filter((line) => line.startsWith(`${PUSH_INTENT_TRAILER}:`))
+    if (values.length === 0) continue
+    if (values.length !== 1) throw new Error(`Merge ${source} carries duplicate ${PUSH_INTENT_TRAILER} trailers`)
+    const value = values[0]
+    if (value === undefined) throw new Error(`Merge ${source} lost its frozen push trailer`)
+    const intent = decodePushIntent(value.slice(PUSH_INTENT_TRAILER.length + 1).trim())
+    const actualRemote = await logicalPushUrl(git, root, remote)
+    if (!sameHostedRepository(intent.rootRemote, actualRemote)) {
+      throw new Error(`Merge ${source} freezes root remote ${intent.rootRemote}, but this push selects ${actualRemote}`)
+    }
+    const parents = (await required(git, root, ["show", "-s", "--format=%P", source], "bind-frozen-merge")).split(" ")
+    if (parents.length !== 2) throw new Error(`Frozen push intent must belong to an actual two-parent merge: ${source}`)
+    found = true
+    const selected = rootUpdates.length === 1 ? requirements : await collectCommitRequirements(git, root, [source])
+    for (const row of intent.updates) {
+      const requirement = selected.find((entry) => entry.path === row.path && entry.target === row.source)
+      if (requirement === undefined) {
+        throw new Error(`Frozen child ${row.path}@${row.source} is not selected by merge ${source}`)
+      }
+      updates.push({
+        repository: requirement.repository,
+        remote: row.remote,
+        destination: row.destination,
+        source: row.source,
+        expectedDestination: row.expectedDestination,
+      })
+    }
+    for (const requirement of selected) {
+      if (!intent.updates.some((row) => row.path === requirement.path && row.source === requirement.target)) {
+        throw new Error(`Frozen merge ${source} has no child disposition for ${requirement.path}@${requirement.target}`)
+      }
+    }
+  }
+  return found ? updates : undefined
+}
+
 async function collectCommitRequirements(
   git: GitProcess,
   root: string,
@@ -1131,8 +1199,11 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
       })
       return prependRepositories(pushed, available)
     }
-    const childUpdates: RefUpdate[] = []
-    for (const requirement of requirements) childUpdates.push(await childUpdate(git, requirement, timeoutMs))
+    const frozen = await frozenChildUpdates(git, root, remote, rootUpdates, requirements)
+    const childUpdates: RefUpdate[] = frozen ?? []
+    if (frozen === undefined) {
+      for (const requirement of requirements) childUpdates.push(await childUpdate(git, requirement, timeoutMs))
+    }
     if (childUpdates.length === 0 && options.recurseSubmodules === "only") {
       return gitSuperResult([
         {
