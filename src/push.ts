@@ -851,8 +851,9 @@ export async function capturePushIntent(
   tree: string,
   rootPins: ReadonlyMap<string, string>,
   timeoutMs: number,
+  rootStores?: ReadonlyMap<string, string>,
 ): Promise<string | undefined> {
-  const requirements = await collectCommitRequirements(git, root, [tree], rootPins)
+  const requirements = await collectCommitRequirements(git, root, [tree], rootPins, undefined, rootStores)
   if (requirements.length === 0) return undefined
   const rootRemote = await logicalPushUrl(git, root, await configuredPushRemote(git, root))
   const before = new Map(
@@ -1034,6 +1035,7 @@ async function collectCommitRequirements(
   commits: readonly string[],
   rootPins?: ReadonlyMap<string, string>,
   frozen?: FrozenPushIntent,
+  rootStores?: ReadonlyMap<string, string>,
 ): Promise<CommitRequirement[]> {
   const completed = new Set<string>()
   const visiting = new Set<string>()
@@ -1060,7 +1062,8 @@ async function collectCommitRequirements(
       if (stores !== undefined && store === undefined) {
         throw new Error(`No prepared store for frozen child ${childPath}`)
       }
-      const child = store?.gitdir ?? join(repository, entry.path)
+      const child =
+        store?.gitdir ?? (path === "." ? rootStores?.get(entry.path) : undefined) ?? join(repository, entry.path)
       const discovered = await discoverRepository(git, child, "discover-submodule")
       if (frozen !== undefined) {
         const row = frozen.children.find((candidate) => candidate.path === childPath && candidate.pin === entry.target)

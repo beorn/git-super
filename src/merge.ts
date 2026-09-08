@@ -1,5 +1,7 @@
 import { isAbsolute, join, resolve } from "node:path"
 import { readCommitSubmodules, resolveSubmoduleBranch, type CommitSubmodule } from "./commit-graph.ts"
+import { ensureCommitObject } from "./objects.ts"
+import { prepareSubmoduleTreeUnderLock } from "./submodule-prepare.ts"
 import { capturePushIntent, rootPushIdentity } from "./push.ts"
 import { PUSH_INTENT_TRAILER, sameHostedOwner } from "./push-intent.ts"
 import { createExclusive, type Exclusive } from "./exclusive.ts"
@@ -51,6 +53,7 @@ type GitlinkPlan = Readonly<{
 
 type GitlinkPlans = Readonly<{
   settlements: readonly GitlinkPlan[]
+  stores: ReadonlyMap<string, string>
   checkouts: readonly GitlinkCheckoutPlan[]
 }>
 
@@ -197,6 +200,7 @@ async function mergeUnderLock(
       prospective.tree,
       new Map(visiblePlans.filter((plan) => plan.state === "raised").map((plan) => [plan.path, plan.to])),
       timeoutMs,
+      planned.stores,
     )
     if (frozen !== undefined) trailers.push(`${PUSH_INTENT_TRAILER}: ${frozen}`)
   } catch (error) {
@@ -887,10 +891,29 @@ async function planGitlinks(
   const before = new Map((await readCommitSubmodules(git, root, head)).map((entry) => [entry.path, entry.target]))
   const merged = await readCommitSubmodules(git, root, tree)
   const rootRemote = merged.length === 0 ? undefined : await rootPushIdentity(git, root)
+  const added = new Set(merged.filter((entry) => !before.has(entry.path)).map((entry) => entry.path))
+  const stores = new Map<string, string>()
+  if (added.size > 0 && rootRemote !== undefined) {
+    const prepared = await prepareSubmoduleTreeUnderLock({ repo: root, commit: tree, remote: rootRemote, git }, added)
+    if (prepared.state === "failed" || prepared.state === "unknown") {
+      const message = prepared.detail?.message ?? `Cannot prepare components added by tree ${tree} in ${root}`
+      throw Object.assign(new Error(message), { resultDetail: prepared.detail })
+    }
+    for (const component of prepared.components) {
+      await ensureCommitObject({
+        repository: component.gitdir,
+        remote: component.url,
+        commit: component.gitlink,
+        timeoutMs,
+        git,
+      })
+      stores.set(component.path, component.gitdir)
+    }
+  }
   const plans: GitlinkPlan[] = []
   const checkouts = new Map<string, GitlinkCheckoutPlan>()
   for (const entry of merged) {
-    const component = join(root, entry.path)
+    const component = stores.get(entry.path) ?? join(root, entry.path)
     const recordedBefore = before.get(entry.path)
     const recorded = recordedBefore ?? entry.target
     const changedByMerge = recordedBefore !== entry.target
@@ -900,18 +923,22 @@ async function planGitlinks(
       )
     }
     if (rootRemote !== undefined && !sameHostedOwner(rootRemote, entry.url)) {
-      if (changedByMerge) checkouts.set(entry.path, { path: entry.path, recorded, index: entry.target })
+      if (changedByMerge && recordedBefore !== undefined) {
+        checkouts.set(entry.path, { path: entry.path, recorded, index: entry.target })
+      }
       plans.push({ path: entry.path, from: entry.target, to: entry.target, state: "as-written", changedByMerge })
       continue
     }
     const main = await fetchComponentMain(git, root, component, entry, timeoutMs)
     if (entry.target === main) {
-      if (changedByMerge) checkouts.set(entry.path, { path: entry.path, recorded, index: entry.target })
+      if (changedByMerge && recordedBefore !== undefined) {
+        checkouts.set(entry.path, { path: entry.path, recorded, index: entry.target })
+      }
       continue
     }
     const ancestry = await run(git, component, ["merge-base", "--is-ancestor", entry.target, main], timeoutMs)
     if (ancestry.code === 0) {
-      checkouts.set(entry.path, { path: entry.path, recorded, index: main })
+      if (recordedBefore !== undefined) checkouts.set(entry.path, { path: entry.path, recorded, index: main })
       plans.push({
         path: entry.path,
         from: entry.target,
@@ -927,7 +954,9 @@ async function planGitlinks(
       if (reverse.code !== 0 && reverse.code !== 1) {
         throw operationError(component, "prove-gitlink-ahead", reverseArgs, reverse)
       }
-      if (changedByMerge) checkouts.set(entry.path, { path: entry.path, recorded, index: entry.target })
+      if (changedByMerge && recordedBefore !== undefined) {
+        checkouts.set(entry.path, { path: entry.path, recorded, index: entry.target })
+      }
       plans.push({
         path: entry.path,
         from: entry.target,
@@ -944,7 +973,7 @@ async function planGitlinks(
       ancestry,
     )
   }
-  return { settlements: plans, checkouts: [...checkouts.values()] }
+  return { settlements: plans, checkouts: [...checkouts.values()], stores }
 }
 
 async function mergeApplicationFailure(
