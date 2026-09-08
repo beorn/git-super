@@ -28,7 +28,11 @@ export async function superWorktreeRemove(options: SuperWorktreeRemoveOptions): 
         },
       },
     })
-    return { ...gitSuperResult([{ repository: repo, state: "updated", refs: [] }]), path, proof }
+    return {
+      ...gitSuperResult([{ repository: repo, state: "updated", refs: [] }]),
+      path,
+      ...(proof === undefined ? {} : { proof }),
+    }
   } catch (error) {
     const detail = {
       code: "worktree-remove-failed",

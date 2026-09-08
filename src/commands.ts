@@ -239,7 +239,12 @@ const worktreeRemove = commandNode<CommandContext, WorktreeRemoveParams, GitSupe
     }
     return { path: input.path, retain: input.retain }
   }),
-  run: (context, input) => superWorktreeRemove({ repo: context.repo, ...input, report: context.report }),
+  run: (context, input) =>
+    superWorktreeRemove({
+      repo: context.repo,
+      ...input,
+      ...(context.report === undefined ? {} : { report: context.report }),
+    }),
 })
 
 export type GitSuperCommands = Readonly<{
