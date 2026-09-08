@@ -856,6 +856,10 @@ export async function capturePushIntent(
   const children: FrozenPushIntent["children"][number][] = []
   for (const requirement of requirements) {
     const declared = requirement.entry.url
+    if (declared === undefined)
+      {throw new Error(
+        `Gitlink ${requirement.path}@${requirement.target} has no declared .gitmodules URL; declare its remote before freezing the push.`,
+      )}
     const pin = { path: requirement.path, remote: declared, pin: requirement.target }
     // An external declaration can never be converted into write authority by local config.
     if (!sameHostedOwner(rootRemote, declared)) {

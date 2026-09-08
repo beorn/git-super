@@ -787,6 +787,10 @@ async function planGitlinks(
     const recordedBefore = before.get(entry.path)
     const recorded = recordedBefore ?? entry.target
     const changedByMerge = recordedBefore !== entry.target
+    if (entry.url === undefined)
+      {throw new Error(
+        `Gitlink ${entry.path}@${entry.target} has no declared .gitmodules URL; declare its remote before merging.`,
+      )}
     if (rootRemote !== undefined && !sameHostedOwner(rootRemote, entry.url)) {
       if (changedByMerge) checkouts.set(entry.path, { path: entry.path, recorded, index: entry.target })
       plans.push({ path: entry.path, from: entry.target, to: entry.target, state: "as-written", changedByMerge })
@@ -812,8 +816,9 @@ async function planGitlinks(
     if (ancestry.code === 1) {
       const reverseArgs = ["merge-base", "--is-ancestor", main, entry.target]
       const reverse = await run(git, component, reverseArgs, timeoutMs)
-      if (reverse.code !== 0 && reverse.code !== 1)
-        {throw operationError(component, "prove-gitlink-ahead", reverseArgs, reverse)}
+      if (reverse.code !== 0 && reverse.code !== 1) {
+        throw operationError(component, "prove-gitlink-ahead", reverseArgs, reverse)
+      }
       if (changedByMerge) checkouts.set(entry.path, { path: entry.path, recorded, index: entry.target })
       plans.push({
         path: entry.path,
