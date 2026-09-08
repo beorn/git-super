@@ -34,10 +34,14 @@ export async function superWorktreeRemove(options: SuperWorktreeRemoveOptions): 
       code: "worktree-remove-failed",
       phase: proof === undefined ? "retention" : "remove",
       message: `worktree ${path} could not be removed: ${error instanceof Error ? error.message : String(error)}`,
-      remedy: "Resolve the reported condition and inspect git worktree list before retrying; retained stores are never removed automatically.",
+      remedy:
+        "Resolve the reported condition and inspect git worktree list before retrying; retained stores are never removed automatically.",
     }
     return {
-      ...gitSuperResult([{ repository: repo, state: proof === undefined ? "failed" : "unknown", refs: [], detail }], detail),
+      ...gitSuperResult(
+        [{ repository: repo, state: proof === undefined ? "failed" : "unknown", refs: [], detail }],
+        detail,
+      ),
       path,
       ...(proof === undefined ? {} : { proof }),
     }

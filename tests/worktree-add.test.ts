@@ -135,20 +135,38 @@ describe("git super worktree add", () => {
     for (const dirty of [join(worktree, "untracked.txt"), join(child, "untracked.txt")]) {
       writeFileSync(dirty, "preserve me")
       const failure = outputSink()
-      expect(await runCli(["--repo", fixture.product, "--json", "worktree", "remove", worktree, "--retain", retained], failure, outputSink())).toBe(2)
+      expect(
+        await runCli(
+          ["--repo", fixture.product, "--json", "worktree", "remove", worktree, "--retain", retained],
+          failure,
+          outputSink(),
+        ),
+      ).toBe(2)
       expect(failure.output).toContain("dirty")
       expect(existsSync(worktree)).toBe(true)
       unlinkSync(dirty)
     }
     git(fixture.product, ["worktree", "lock", "--reason", "held by test", worktree])
     const locked = outputSink()
-    expect(await runCli(["--repo", fixture.product, "--json", "worktree", "remove", worktree, "--retain", retained], locked, outputSink())).toBe(2)
+    expect(
+      await runCli(
+        ["--repo", fixture.product, "--json", "worktree", "remove", worktree, "--retain", retained],
+        locked,
+        outputSink(),
+      ),
+    ).toBe(2)
     expect(locked.output).toContain("held by test")
     git(fixture.product, ["worktree", "unlock", worktree])
 
     for (const unsafe of [join(worktree, "backup"), join(source, "backup")]) {
       const failure = outputSink()
-      expect(await runCli(["--repo", fixture.product, "--json", "worktree", "remove", worktree, "--retain", unsafe], failure, outputSink())).toBe(2)
+      expect(
+        await runCli(
+          ["--repo", fixture.product, "--json", "worktree", "remove", worktree, "--retain", unsafe],
+          failure,
+          outputSink(),
+        ),
+      ).toBe(2)
       expect(failure.output).toContain("inside worktree removal paths")
       expect(existsSync(worktree)).toBe(true)
     }
@@ -159,7 +177,13 @@ describe("git super worktree add", () => {
         if (value.startsWith("worktree removal proof ")) proofBeforeRemoval = existsSync(worktree)
       },
     }
-    expect(await runCli(["--repo", fixture.product, "--json", "worktree", "remove", worktree, "--retain", retained], output, diagnostic)).toBe(0)
+    expect(
+      await runCli(
+        ["--repo", fixture.product, "--json", "worktree", "remove", worktree, "--retain", retained],
+        output,
+        diagnostic,
+      ),
+    ).toBe(0)
     const result = JSON.parse(output.output) as { state: string; proof: { retained: string; manifest: string } }
     expect(result.state).toBe("updated")
     expect(proofBeforeRemoval).toBe(true)
@@ -182,9 +206,17 @@ describe("git super worktree add", () => {
     const worktree = join(fixtureRoot, "candidate")
     const blocker = join(fixtureRoot, "not-a-directory")
     writeFileSync(blocker, "blocked")
-    expect(await runCli(["--repo", fixture.product, "worktree", "add", worktree, "HEAD"], outputSink(), outputSink())).toBe(0)
+    expect(
+      await runCli(["--repo", fixture.product, "worktree", "add", worktree, "HEAD"], outputSink(), outputSink()),
+    ).toBe(0)
     const out = outputSink()
-    expect(await runCli(["--repo", fixture.product, "--json", "worktree", "remove", worktree, "--retain", blocker], out, outputSink())).toBe(2)
+    expect(
+      await runCli(
+        ["--repo", fixture.product, "--json", "worktree", "remove", worktree, "--retain", blocker],
+        out,
+        outputSink(),
+      ),
+    ).toBe(2)
     expect(out.output).toContain(blocker)
     expect(existsSync(worktree)).toBe(true)
     expect(git(fixture.product, ["worktree", "list", "--porcelain"])).toContain(worktree)

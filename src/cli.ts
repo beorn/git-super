@@ -458,11 +458,12 @@ export async function runCli(
     .description(commands.worktree.remove.description ?? commands.worktree.remove.title)
     .requiredOption("--retain <directory>", "durable directory outside the worktree and its Git directory")
     .argument("<path>", "registered clean worktree to remove")
-    .action((path, options, command) => {
+    .action((path, _options, command) => {
       const globals = command.optsWithGlobals() as { repo: string; json?: boolean }
+      const options = command.opts() as { retain: string }
       captured = {
         node: commands.worktree.remove,
-        params: { path, retain: String(options.retain) },
+        params: { path, retain: options.retain },
         json: globals.json === true,
         nul: false,
       }
@@ -541,7 +542,11 @@ export async function runCli(
     | SuperSubmodulePrepareResult
     | GitSuperResult
   try {
-    result = await commandResult(captured.node, { repo: globals.repo, report: (message) => stderr.write(message) }, captured.params)
+    result = await commandResult(
+      captured.node,
+      { repo: globals.repo, report: (message) => stderr.write(message) },
+      captured.params,
+    )
   } catch (error) {
     stderr.write(`${error instanceof Error ? error.message : String(error)}\n`)
     return 2
