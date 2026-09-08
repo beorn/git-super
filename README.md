@@ -17,21 +17,21 @@ Git has display flags for submodule diffs, but no native flag that turns gitlink
 ## Commands
 
 ```bash
-git super diff --name-only <range>
-git super diff --stat <range>
-git super diff --patch <range>
-git super status --porcelain
-git super merge-base --is-ancestor <sha> <superproject-ref>
-git super merge <commit> [-m <message>] [--no-verify]
-git super gitlink write <path> <commit>
-git super submodule prepare <exact-root-commit> --remote <root-remote-name-or-url> --json
-git super pull --ff-only [<repository> [<refspec>...]]
-git super push [--recurse-submodules=check|on-demand|only|no] [<remote> [<refspec>...]]
-git super worktree add <path> <commit> [--reference <path>]
-git super --json worktree remove <path> --retain <directory>
+git super --repo /work/product diff --name-only <range>
+git super --repo /work/product diff --stat <range>
+git super --repo /work/product diff --patch <range>
+git super --repo /work/product status --porcelain
+git super --repo /work/product merge-base --is-ancestor <sha> <superproject-ref>
+git super --repo /work/product merge <commit> [-m <message>] [--no-verify]
+git super --repo /work/product gitlink write <path> <commit>
+git super --repo /work/product submodule prepare <exact-root-commit> --remote <root-remote-name-or-url> --json
+git super --repo /work/product pull --ff-only [<repository> [<refspec>...]]
+git super --repo /work/product push [--recurse-submodules=check|on-demand|only|no] [<remote> [<refspec>...]]
+git super --repo /work/product worktree add <path> <commit> [--reference <path>]
+git super --repo /work/product --json worktree remove <path> --retain <directory>
 ```
 
-`diff` accepts `--diff-filter`, `--cached`, and `-z`. `status` includes tracked and untracked changes in checked-out submodules. `merge-base --is-ancestor` discovers which repository owns the first commit and compares it with that repository's pin in the selected superproject ref.
+Use `--repo` to name the superproject explicitly for enriched operations. `diff` accepts `--diff-filter`, `--cached`, and `-z`. `status` includes tracked and untracked changes in checked-out submodules. `merge-base --is-ancestor` discovers which repository owns the first commit and compares it with that repository's pin in the selected superproject ref.
 
 Normal path or porcelain output stays on stdout. A rendered report of the repositories consulted goes to stderr, so existing pipelines stay composable. `--json` puts the result and the consulted repositories together on stdout.
 
@@ -55,13 +55,24 @@ Missing checkouts, missing commit objects, added or removed gitlinks without a r
 
 ### Merge and settle gitlinks
 
-`merge <commit>` computes the prospective merge tree before writing. A gitlink value authored by that merge must be carried by its component's freshly fetched `origin/main`; otherwise the command exits `1` with `gitlink-off-main` and leaves HEAD, the index, and the worktree unchanged. A pre-existing off-main pin is not attributed to the incoming change, so it is left untouched and reported as `left-off-main` with both object IDs.
+`merge <commit>` computes the prospective merge tree before applying it. Components with the same logical remote host and namespace as the root participate in branch forwarding; other hosted components remain `as-written` and receive no publication. Logical identities are read before Git's transport URL rewrites. A local path or file URL cannot establish this ownership relation.
 
-Git first applies the no-ff merge without committing it, then raises every merged-index pin proven ancestral to and behind component main. Before the concluding commit and its hooks run, each affected component checkout is detached at its staged index pin. Hooks therefore observe one coherent product: the root index pin and the component checkout agree. Each raise is printed on stderr as `<path> <old7> -> <new7> (component main)`, and every raise or retained off-main anomaly is added to the merge commit's existing trailer block as a `Settled:` trailer. Equal pins remain unchanged; divergent pins are never overwritten.
+The component branch comes from `submodule.<name>.branch` in local Git config, then the frozen `.gitmodules`, then the remote's symbolic HEAD. A value of `.` uses the current superproject branch and refuses when that HEAD is detached. Each participating pin is compared with the fetched branch:
+
+| Authored pin relative to the component branch | Result                                                                          |
+| --------------------------------------------- | ------------------------------------------------------------------------------- |
+| Equal                                         | Keep the pin.                                                                   |
+| Behind                                        | Raise the root gitlink to the fetched branch tip.                               |
+| Ahead                                         | Keep the authored pin and freeze its branch publication.                        |
+| Diverged                                      | Refuse an incoming change; preserve an untouched divergence as `left-off-main`. |
+
+Git applies a no-ff merge without committing it, then writes the proved raises. Existing affected component checkouts settle at their staged pins before the concluding commit and hooks. Newly introduced components use persistent stores for object and branch inspection and remain unmaterialized until a later submodule update or worktree preparation. Raises and retained anomalies appear in `Settled:` trailers; the merge also freezes recursive publication inputs for [ordered pushing](#landing-across-repositories).
+
+When Git Super raises root gitlinks, it writes a temporary receipt at `refs/git-super/receipts/<merge>`. The receipt's sole parent is that exact merge, and its `receipt.json` contains only the automatic root-entry changes. Callers can copy the exact payload into a durable record before deleting the temporary ref under its exact old-value lease.
 
 Human output puts the resulting merge commit on stdout and settlement evidence on stderr. `--json` emits one byte-clean `SuperMergeResult` with the same commit and gitlink rows. Its additive `checkouts` rows record, for every checkout the operation touches, the pin in root `HEAD` (`recorded`), the staged gitlink (`index`), the exact pre-operation checkout (`preCheckout`), the observed checkout, and whether it is `settled`, `settle-failed`, `restored`, `restore-failed`, or `not-run`.
 
-A failure before the root merge exits `1` and writes nothing. A failure after Git applies the uncommitted merge exits `2` with `partial: true`, completed and `not-run` gitlink rows, and checkout recovery evidence. If the concluding commit is rejected, Git Super keeps the root merge and staged index intact while restoring each component to the pin recorded by pre-merge root `HEAD`. If any restoration cannot be proved, it leaves the partial state untouched, marks the affected row `restore-failed`, and prints full `recorded`, `staged-index`, `checkout`, and `pre-checkout` object IDs; do not retry until those rows are restored and re-observed. A repository with no submodules or nothing to raise still returns the real merge commit plus an empty gitlink-row set. `--no-verify` is an explicit emergency bypass, not the normal settlement path.
+A failure before the root merge exits `1` and leaves root HEAD, index and working files unchanged; object fetching and component-store preparation may already have occurred. A failure after Git applies the uncommitted merge exits `2` with `partial: true`, completed and `not-run` gitlink rows, and checkout recovery evidence. If the concluding commit is rejected, Git Super keeps the root merge and staged index intact while restoring each component to the pin recorded by pre-merge root `HEAD`. If any restoration cannot be proved, it leaves the partial state untouched, marks the affected row `restore-failed`, and prints full `recorded`, `staged-index`, `checkout`, and `pre-checkout` object IDs; do not retry until those rows are restored and re-observed. A repository with no submodules or nothing to raise still returns the real merge commit plus an empty gitlink-row set. `--no-verify` is an explicit emergency bypass, not the normal settlement path.
 
 ### Exact gitlink write
 
@@ -93,12 +104,14 @@ Unrelated staged, tracked, untracked, and ignored files survive. A path the inco
 
 ### Recursive push
 
-`push` resolves every selected source to an exact object ID, freezes each destination's advertised old value, and rechecks it under the shared lock. With no refspecs it asks Git for the configured default push selection using a non-writing dry run, then applies exactly those rows. General force refspecs and implicit fetch-racy leases are refused; `--force-with-lease=<full-ref>:<expected>` is explicit, and an empty expected value means create-only.
+`push` resolves every nonempty selected source to an exact object ID, freezes each destination's advertised old value, and rechecks it under the shared lock. With no refspecs it asks Git for the configured default push selection using a non-writing dry run, then applies exactly those rows. General force refspecs and implicit fetch-racy leases are refused; `--force-with-lease=<full-ref>:<expected>` is explicit, and an empty expected value means create-only.
 
 - `check` requires every recorded child commit to be reachable from at least one configured remote, then pushes root refs.
 - `on-demand` pushes missing nested commits leaf-first and root-last.
 - `only` publishes the nested commits and leaves root refs untouched.
 - `no` pushes only the selected root refs.
+
+An explicit `:<destination>` refspec deletes that ref only with an exact `--force-with-lease=<destination>:<expected-old-oid>` (or a library `expectedDestination`). A missing lease refuses. An already absent destination is an unchanged retry. Deletions can share one atomic root group with ordinary updates; every ref keeps its lease.
 
 `--atomic` is passed separately to each single-repository push. **It never makes several repositories atomic.** A child may stay published when a later root hook or remote rejects; the result then reports `partial: true`. Hooks run unless `--no-verify` is explicit. Signed-push mode and push options pass through unchanged.
 
@@ -108,15 +121,13 @@ Hooks, credential helpers, and remote helpers stay native Git behavior. A timeou
 
 Gerrit's cross-repository topics and Aviator's ChangeSets each group several repositories' changes into one submission gesture, but neither documents an atomic guarantee once repositories start merging independently. Gerrit: a same-repository topic submits atomically, while a multi-repository topic can fail into a partial submission ([cross-repository-changes](https://gerrit-review.googlesource.com/Documentation/cross-repository-changes.html)); Gerrit documents compensating revert commits, reviewed and submitted normally, but it does not guarantee automatic rollback of a partial multi-repository submission. Aviator: a ChangeSet is validated as a whole and fails before merging if any check fails, but partial-merge behavior once some repositories in a set have already merged isn't documented ([ChangeSets](https://docs.aviator.co/mergequeue/concepts/changesets)). git-super does not claim an automatic cross-repository rollback guarantee either; see [Yrd's own README](https://github.com/beorn/yrd#readme) for submission policy, which this section does not repeat.
 
-**Present today.** `git super merge` already classifies an incoming gitlink pin against the component's freshly fetched main and refuses outright (`gitlink-off-main`) rather than land a pin main doesn't contain (`src/merge.ts`). `git super push --recurse-submodules=on-demand` already applies remote ref updates child-first, root-last (`src/push.ts:542,1095`). The two are not wired together yet: advancing a component's own main today still takes a separate `git super push`, not an automatic consequence of a root merge.
+The merge stores resolved child remotes, destination branches, source commits and expected old values in its `Git-Super-Push:` trailer. An ordinary recursive push of that exact merge uses these frozen values even if local branch or remote configuration has changed. It validates destinations before publication, advances children before root refs, and accepts an identical completed update on retry. A third destination value refuses further writes.
 
-**Planned queue integration.** For a component whose main the product queue owns, a future landing compares the authored pin with current main. K1/K2/K3 label the three cases where they differ; equal pins need no change:
+A record can retain the merge through commit ancestry while keeping its own tree empty. Before publishing such a record, Git Super finds newly reachable frozen merges, retains owned child sources at `refs/git-super/pins/<oid>`, and verifies that each source can be fetched through its retained ref. This does not advance child branches. Later record pushes do not replay already published historical intents.
 
-- **K1 — the pin descends from main.** Component main (A) is an ancestor of the authored pin (P); landing fast-forwards main from A to P, pushing the author's commits there before the root's gitlink moves.
-- **K2 — main already contains the pin.** The authored pin (P) is an ancestor of a newer main (A); nothing is pushed, and the merged root takes A, the component's current main, as its pin.
-- **K3 — diverged.** Neither is an ancestor of the other; landing fails "component main moved" before any write, and the author rebases before resubmitting.
+A fresh clone can fetch the record and retry publication of its exact merge using the retained child sources, without the author's checkout, a replacement merge, or a materialized child worktree. Retention refs are not automatically reclaimed. External components receive no retention writes; indirect record publication refuses when it cannot establish durable external sources without writing external refs.
 
-The planned integration adds journaled recovery: a run killed between component and root pushes resumes the recorded work on restart. The queue's component declaration determines which queue advances each main. Components with their own process remain pinned as written and are never raised or pushed by the product queue. This repository already carries the transition declaration `landing: external` in `.yrd.yml`; that declaration does not enable automatic component pushes or recovery. Yrd owns the declaration syntax and passes the pin policy to git-super; git-super does not read queue configuration.
+These mechanisms provide ordered publication and retry, not cross-repository rollback. A queue must publish its checked record durably before beginning the landing and retain its root leases for recovery. [Yrd](https://github.com/beorn/yrd#readme) owns queue activation and restart orchestration; the Git Super mechanisms alone do not enable that integration.
 
 ### Worktree with submodules
 
