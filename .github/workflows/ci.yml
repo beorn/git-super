@@ -19,6 +19,30 @@ jobs:
           bun-version: 1.4.2
       - run: bun install --frozen-lockfile
       - run: bun run check
+      # The production descriptor owner needs both OS witnesses. Keep these
+      # existing cases pinned separately from the historic conformance corpus.
+      - uses: actions/checkout@v4
+        with:
+          repository: beorn/yrd
+          ref: 313e8df637e68f4d6f14214d3fff6dfe4082e5fe
+          path: .yrd-process-contract
+      - run: bun install --frozen-lockfile
+        working-directory: .yrd-process-contract
+      - name: Yrd production process settlement
+        working-directory: .yrd-process-contract
+        run: >-
+          bun --bun x vitest run
+          packages/yrd-process/tests/process.test.ts
+          packages/yrd-process/tests/process-tree.test.ts
+          packages/yrd-process/tests/process-escaped-descendant.test.ts
+          --reporter=default --reporter=json
+          --outputFile=${{ github.workspace }}/yrd-process-results.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: yrd-process-${{ matrix.os }}-${{ github.sha }}
+          path: yrd-process-results.json
+          if-no-files-found: error
 
   yrd-conformance:
     runs-on: ubuntu-latest
