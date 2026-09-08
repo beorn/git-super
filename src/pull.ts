@@ -282,10 +282,22 @@ async function refuseUnpublishedDetachedHead(
   path: string,
   recorded: string | undefined,
   actual: string,
+  target: string,
 ): Promise<void> {
   if (recorded === undefined || actual === recorded) return
   const branch = await run(git, repository, ["symbolic-ref", "-q", "HEAD"])
   if (branch.code === 0) return
+  const args = ["merge-base", "--is-ancestor", actual, target]
+  const ancestor = await run(git, repository, args)
+  if (
+    ancestor.failure !== undefined ||
+    ancestor.timedOut ||
+    ancestor.stalled ||
+    (ancestor.code !== 0 && ancestor.code !== 1)
+  ) {
+    throw operationError(repository, "prove-submodule-ancestry", args, ancestor)
+  }
+  if (ancestor.code === 0) return
   const refArgs = ["for-each-ref", "--format=%(refname)", "--contains", actual]
   if ((await required(git, repository, refArgs, "find-durable-submodule-ref")) !== "") return
   // Exact-object preparation can leave remote-tracking refs behind a published HEAD.
@@ -302,11 +314,11 @@ async function refuseUnpublishedDetachedHead(
       resultDetail: detail(
         "unpublished-detached-submodule",
         "protect-submodule-head",
-        `Detached HEAD ${actual} in submodule ${path} differs from recorded commit ${recorded ?? "missing"} and is not reachable from a durable ref.`,
+        `Detached HEAD ${actual} in submodule ${path} differs from recorded commit ${recorded} and is contained in neither incoming commit ${target} nor any local durable ref after fetching origin.`,
         {
           paths: [path],
-          objectIds: [actual, ...(recorded === undefined ? [] : [recorded])],
-          remedy: "Create a branch or tag for the detached commit, then rerun git super pull.",
+          objectIds: [actual, recorded, target],
+          remedy: `In ${repository}, run: git branch preserve/detached-${actual} ${actual}. Then rerun git super pull.`,
         },
       ),
     },
@@ -345,7 +357,7 @@ async function freezeRepositoryGraph(
       const actual = await required(git, childRepository, ["rev-parse", "HEAD^{commit}"], "freeze-submodule-current")
       const priorTree = await run(git, repository, ["ls-tree", from, "--", entry.path])
       const recorded = /^160000 commit ([0-9a-f]+)\t/mu.exec(priorTree.stdout)?.[1]
-      await refuseUnpublishedDetachedHead(git, childRepository, childPath, recorded, actual)
+      await refuseUnpublishedDetachedHead(git, childRepository, childPath, recorded, actual, entry.target)
       await walk(childRepository, childPath, actual, entry.target)
     }
   }

@@ -491,6 +491,74 @@ describe("git super pull --ff-only", () => {
   })
 
   /**
+   * @failure An incoming pin can preserve a detached commit even when local refs are stale; Git read failures must still refuse.
+   * @level l2 (pull and real Git commit-graph boundary)
+   * @consumer Automated superproject updaters following exact incoming gitlinks.
+   */
+  test("accepts a detached commit contained in the incoming pin despite stale local refs", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-pull-stale-refs-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const checkout = join(fixtureRoot, "checkout")
+    git(
+      fixtureRoot,
+      "-c",
+      "protocol.file.allow=always",
+      "clone",
+      "-q",
+      "--recurse-submodules",
+      fixture.product,
+      checkout,
+    )
+    const alphaCheckout = join(checkout, "packages/alpha")
+    const intermediate = advanceRepository(fixture.alpha, "intermediate.ts", "export const intermediate = true\n")
+    git(alphaCheckout, "fetch", "--no-tags", "origin", intermediate)
+    git(alphaCheckout, "checkout", "--detach", intermediate)
+    const target = bumpProductSubmodules(fixture)
+    const alphaTarget = git(fixture.alpha, "rev-parse", "HEAD")
+    expect(git(alphaCheckout, "for-each-ref", "--format=%(refname)", "--contains", intermediate)).toBe("")
+    expect(git(alphaCheckout, "rev-parse", "origin/main")).toBe(fixture.alphaBase)
+    const local = createLocalGitProcess()
+    for (const injectedFailure of [
+      { code: 128, stdout: "", stderr: "cannot read commit graph" },
+      { code: 1, stdout: "", stderr: "cannot start git", failure: "cannot start git" },
+    ]) {
+      let ancestryFailureInjected = false
+      const failed = await superPull({
+        repo: checkout,
+        repository: "origin",
+        refspecs: ["main"],
+        ffOnly: true,
+        git: {
+          run(request) {
+            if (request.repo === alphaCheckout && request.args[0] === "merge-base") {
+              ancestryFailureInjected = true
+              return Promise.resolve(injectedFailure)
+            }
+            return local.run(request)
+          },
+        },
+      })
+      expect(ancestryFailureInjected).toBe(true)
+      expect(failed).toMatchObject({
+        state: "failed",
+        detail: { code: "git-failed", phase: "prove-submodule-ancestry" },
+      })
+      expect(git(checkout, "rev-parse", "HEAD")).toBe(fixture.productBase)
+      expect(git(alphaCheckout, "rev-parse", "HEAD")).toBe(intermediate)
+    }
+    const stdout = outputSink()
+    const stderr = outputSink()
+
+    expect(await runCli(["--repo", checkout, "pull", "--ff-only", "origin", "main", "--json"], stdout, stderr)).toBe(0)
+    expect(stderr.output).toBe("")
+    expect(git(checkout, "rev-parse", "HEAD")).toBe(target)
+    expect(git(alphaCheckout, "rev-parse", "HEAD")).toBe(alphaTarget)
+    expect(git(alphaCheckout, "merge-base", "--is-ancestor", intermediate, "HEAD")).toBe("")
+    expect(git(alphaCheckout, "rev-parse", "origin/main")).toBe(fixture.alphaBase)
+  })
+
+  /**
    * @failure Stale remote-tracking refs make a published detached commit look unpublished and stop an updater.
    * @level l2 (CLI and real Git remote/ref boundary)
    * @consumer Automated superproject updaters following component publication.
@@ -512,12 +580,13 @@ describe("git super pull --ff-only", () => {
     )
     const target = bumpProductSubmodules(fixture)
     const alphaTarget = git(fixture.alpha, "rev-parse", "HEAD")
+    const published = advanceRepository(fixture.alpha, "future.ts", "export const future = true\n")
     const alphaCheckout = join(checkout, "packages/alpha")
     // Fetching an exact object does not refresh origin/main, as in component-store preparation.
-    git(alphaCheckout, "fetch", "-q", "--no-write-fetch-head", "origin", alphaTarget)
-    git(alphaCheckout, "checkout", "-q", "--detach", alphaTarget)
+    git(alphaCheckout, "fetch", "-q", "--no-write-fetch-head", "origin", published)
+    git(alphaCheckout, "checkout", "-q", "--detach", published)
     expect(git(alphaCheckout, "rev-parse", "origin/main")).toBe(fixture.alphaBase)
-    expect(git(alphaCheckout, "for-each-ref", "--format=%(refname)", "--contains", alphaTarget)).toBe("")
+    expect(git(alphaCheckout, "for-each-ref", "--format=%(refname)", "--contains", published)).toBe("")
     const stdout = outputSink()
     const stderr = outputSink()
 
@@ -526,7 +595,7 @@ describe("git super pull --ff-only", () => {
     expect(stderr.output).toBe("")
     expect(git(checkout, "rev-parse", "HEAD")).toBe(target)
     expect(git(alphaCheckout, "rev-parse", "HEAD")).toBe(alphaTarget)
-    expect(git(alphaCheckout, "rev-parse", "origin/main")).toBe(alphaTarget)
+    expect(git(alphaCheckout, "rev-parse", "origin/main")).toBe(published)
     expect(JSON.parse(stdout.output)).toMatchObject({ state: "updated", partial: false })
   })
 
@@ -563,6 +632,7 @@ describe("git super pull --ff-only", () => {
         phase: "protect-submodule-head",
         paths: ["packages/alpha"],
         message: expect.stringContaining("packages/alpha"),
+        remedy: `In ${alphaCheckout}, run: git branch preserve/detached-${unpublished} ${unpublished}. Then rerun git super pull.`,
       },
     })
   })
