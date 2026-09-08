@@ -12,7 +12,7 @@ import { runCli } from "../src/cli.ts"
 import { acquireExclusive } from "../src/exclusive.ts"
 import { writeGitlink } from "../src/gitlink.ts"
 import { createLocalGitProcess, type GitProcess } from "../src/process.ts"
-import { advanceRepository, canonicalTmpdir as tmpdir, createProductFixture, git } from "./fixture.ts"
+import { advanceRepository, canonicalTmpdir as tmpdir, createProductFixture, git, injectionProbe } from "./fixture.ts"
 
 const roots: string[] = []
 
@@ -48,6 +48,49 @@ function fetchWithoutCheckout(repository: string, path: string, commit: string):
 }
 
 describe("policy-free gitlink writes", () => {
+  test("keeps malformed index records visible without changing the established error prefix", async () => {
+    const product = fixture("malformed-index-record")
+    const path = "packages/alpha"
+    const malformed = `160000 invalid-object 0\t${path}`
+    const indexBefore = stage(product.product, path)
+    const local = createLocalGitProcess()
+    const probe = injectionProbe()
+
+    const result = await writeGitlink({
+      repo: product.product,
+      path,
+      commit: product.alphaBase,
+      git: {
+        run: async (request) => {
+          probe.observe(request)
+          if (request.args[0] === "ls-files") {
+            probe.fire("malformed index record")
+            return { code: 0, stdout: `${malformed}\0`, stderr: "" }
+          }
+          return local.run(request)
+        },
+      },
+    })
+
+    probe.expectFired("malformed index record")
+    expect(result).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: {
+        code: "invalid-index-entry",
+        phase: "observe-index",
+        remedy: "Inspect the index with `git ls-files --stage` and repair it before retrying.",
+        paths: [path],
+      },
+    })
+    expect(
+      result.detail?.message.startsWith(`Git returned an invalid index entry while inspecting ${product.product}.`),
+    ).toBe(true)
+    expect(result.detail?.message).toContain(JSON.stringify(malformed))
+    expect(result.detail?.evidence).toContain(JSON.stringify(malformed))
+    expect(stage(product.product, path)).toBe(indexBefore)
+  })
+
   test("writes the exact index pin without moving the submodule checkout and reports idempotence", async () => {
     const product = fixture("library")
     const next = advanceRepository(product.alpha, "alpha.ts", "export const alpha = 2\n")

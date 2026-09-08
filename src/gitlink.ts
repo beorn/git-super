@@ -1,6 +1,7 @@
 import { isAbsolute, join, resolve } from "node:path"
 
 import { createExclusive } from "./exclusive.ts"
+import { parseIndexEntries, type IndexEntry } from "./index-entries.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
 import { gitSuperResult, type GitResultDetail, type GitSuperResult } from "./result.ts"
 
@@ -11,7 +12,6 @@ export type WriteGitlinkOptions = Readonly<{
   git?: GitProcess
 }>
 
-type IndexEntry = Readonly<{ mode: string; oid: string; stage: number; path: string }>
 type SubmoduleRepository = Readonly<{ repo: string; env?: NodeJS.ProcessEnv }>
 
 const DEFAULT_GIT_TIMEOUT_MS = 30_000
@@ -243,33 +243,25 @@ async function required(git: GitProcess, repository: string, args: readonly stri
   return result.stdout.trim()
 }
 
-function parseIndexEntries(output: string, repository: string): IndexEntry[] {
-  return output
-    .split("\0")
-    .filter((row) => row !== "")
-    .map((row) => {
-      const separator = row.indexOf("\t")
-      const header = separator < 0 ? "" : row.slice(0, separator)
-      const match = /^(\d{6}) ([0-9a-f]{40}|[0-9a-f]{64}) ([0-3])$/iu.exec(header)
-      if (separator < 1 || match?.[1] === undefined || match[2] === undefined || match[3] === undefined) {
-        throw Object.assign(new Error(`git-super: invalid index entry returned by ${repository}`), {
-          resultDetail: detail(
-            "invalid-index-entry",
-            "observe-index",
-            `Git returned an invalid index entry while inspecting ${repository}.`,
-            { remedy: "Inspect the index with `git ls-files --stage` and repair it before retrying." },
-          ),
-        })
-      }
-      return { mode: match[1], oid: match[2], stage: Number(match[3]), path: row.slice(separator + 1) }
-    })
-}
-
 async function indexEntries(git: GitProcess, repository: string, path: string): Promise<IndexEntry[]> {
   const args = ["ls-files", "--stage", "-z", "--full-name", "--", path]
   const result = await git.run({ repo: repository, args })
   if (result.code !== 0) throw operationError(repository, args, "observe-index", result, { paths: [path] })
-  return parseIndexEntries(result.stdout, repository).filter((entry) => entry.path === path)
+  return parseIndexEntries(result.stdout, (record, entryPath) => {
+    const evidence = `Invalid index record: ${JSON.stringify(record)}`
+    return Object.assign(new Error(`git-super: invalid index entry returned by ${repository}`), {
+      resultDetail: detail(
+        "invalid-index-entry",
+        "observe-index",
+        `Git returned an invalid index entry while inspecting ${repository}. ${evidence}`,
+        {
+          remedy: "Inspect the index with `git ls-files --stage` and repair it before retrying.",
+          evidence,
+          ...(entryPath === undefined ? {} : { paths: [entryPath] }),
+        },
+      ),
+    })
+  }).filter((entry) => entry.path === path)
 }
 
 function notGitlink(repository: string, path: string, commit: string, entries: readonly IndexEntry[]): GitSuperResult {

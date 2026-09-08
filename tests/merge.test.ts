@@ -828,51 +828,90 @@ describe("git super merge", () => {
     expect(git(repository, "rev-parse", "HEAD")).toBe(headBefore)
   })
 
-  it("reports a conflict before writing HEAD, the index, or the worktree", async () => {
-    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-conflict-"))
-    roots.push(fixtureRoot)
-    const repository = join(fixtureRoot, "conflict")
-    createRepository(repository, "shared.txt", "base\n")
-    git(repository, "switch", "-q", "-c", "candidate")
-    writeFileSync(join(repository, "shared.txt"), "candidate\n")
-    git(repository, "commit", "-q", "-am", "candidate conflict")
-    const candidate = git(repository, "rev-parse", "HEAD")
-    git(repository, "switch", "-q", "main")
-    writeFileSync(join(repository, "shared.txt"), "main\n")
-    git(repository, "commit", "-q", "-am", "main conflict")
-    const headBefore = git(repository, "rev-parse", "HEAD")
-    const statusBefore = git(repository, "status", "--porcelain=v1")
-    const stdout = outputSink()
-    const stderr = outputSink()
+  it.each(["shared.txt", "space \tand\nnewline.txt"])(
+    "reports a conflict at %j before writing HEAD, the index, or the worktree",
+    async (sharedPath) => {
+      const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-conflict-"))
+      roots.push(fixtureRoot)
+      const repository = join(fixtureRoot, "conflict")
+      createRepository(repository, sharedPath, "base\n")
+      git(repository, "switch", "-q", "-c", "candidate")
+      writeFileSync(join(repository, sharedPath), "candidate\n")
+      git(repository, "commit", "-q", "-am", "candidate conflict")
+      const candidate = git(repository, "rev-parse", "HEAD")
+      git(repository, "switch", "-q", "main")
+      writeFileSync(join(repository, sharedPath), "main\n")
+      git(repository, "commit", "-q", "-am", "main conflict")
+      const headBefore = git(repository, "rev-parse", "HEAD")
+      const statusBefore = git(repository, "status", "--porcelain=v1")
+      const stdout = outputSink()
+      const stderr = outputSink()
 
-    expect(await runCli(["--repo", repository, "merge", candidate], stdout, stderr)).toBe(1)
-    expect(stdout.output).toBe("")
-    expect(stderr.output).toContain("merge-conflict")
-    expect(stderr.output).toContain("shared.txt")
-    const detailed = await superMerge({ repo: repository, commit: candidate })
-    expect(detailed.detail?.paths).toEqual(["shared.txt"])
+      expect(await runCli(["--repo", repository, "merge", candidate], stdout, stderr)).toBe(1)
+      expect(stdout.output).toBe("")
+      expect(stderr.output).toContain("merge-conflict")
+      expect(stderr.output).toContain(JSON.stringify(sharedPath))
+      const detailed = await superMerge({ repo: repository, commit: candidate })
+      expect(detailed.detail?.paths).toEqual([sharedPath])
+      expect(detailed.detail?.objectIds).toEqual([headBefore, candidate])
+      const local = createLocalGitProcess()
+      const probe = injectionProbe()
+      const mergeTreeStderr = "verbatim merge-tree conflict hint"
+      const detailedWithStderr = await superMerge({
+        repo: repository,
+        commit: candidate,
+        git: {
+          run: async (request) => {
+            const result = await local.run(request)
+            probe.observe(request)
+            if (request.args.includes("merge-tree")) {
+              probe.fire("merge-tree stderr")
+              return { ...result, stderr: mergeTreeStderr }
+            }
+            return result
+          },
+        },
+      })
+      probe.expectFired("merge-tree stderr")
+      expect(detailedWithStderr.detail?.message).toContain(mergeTreeStderr)
+      expect(git(repository, "rev-parse", "HEAD")).toBe(headBefore)
+      expect(git(repository, "status", "--porcelain=v1")).toBe(statusBefore)
+    },
+  )
+
+  it("reports malformed merge-tree stage records before writing the merge", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-malformed-stages-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const candidate = candidateWithRootChange(fixture, "candidate-malformed-stages")
+    const headBefore = git(fixture.product, "rev-parse", "HEAD")
+    const statusBefore = git(fixture.product, "status", "--porcelain=v1")
+    const malformed = "160000 not-an-object 2\tpackages/alpha"
     const local = createLocalGitProcess()
     const probe = injectionProbe()
-    const mergeTreeStderr = "verbatim merge-tree conflict hint"
-    const detailedWithStderr = await superMerge({
-      repo: repository,
+
+    const result = await superMerge({
+      repo: fixture.product,
       commit: candidate,
       git: {
         run: async (request) => {
-          const result = await local.run(request)
+          const observed = await local.run(request)
           probe.observe(request)
           if (request.args.includes("merge-tree")) {
-            probe.fire("merge-tree stderr")
-            return { ...result, stderr: mergeTreeStderr }
+            probe.fire("malformed stage record")
+            return { ...observed, code: 1, stdout: `${observed.stdout.split("\0")[0]}\0${malformed}\0` }
           }
-          return result
+          return observed
         },
       },
     })
-    probe.expectFired("merge-tree stderr")
-    expect(detailedWithStderr.detail?.message).toContain(mergeTreeStderr)
-    expect(git(repository, "rev-parse", "HEAD")).toBe(headBefore)
-    expect(git(repository, "status", "--porcelain=v1")).toBe(statusBefore)
+
+    probe.expectFired("malformed stage record")
+    expect(result).toMatchObject({ state: "failed", partial: false, detail: { code: "merge-preflight-failed" } })
+    expect(result.detail?.message).toContain(JSON.stringify(malformed))
+    expect(result.detail?.message).toContain(fixture.product)
+    expect(git(fixture.product, "rev-parse", "HEAD")).toBe(headBefore)
+    expect(git(fixture.product, "status", "--porcelain=v1")).toBe(statusBefore)
   })
 
   it("merges base-to-ours-to-theirs gitlinks at the descendant pin", async () => {
@@ -901,38 +940,53 @@ describe("git super merge", () => {
     expect(git(fixture.product, "status", "--porcelain=v1")).toBe("")
   })
 
-  it("names the base, ours, and theirs component pins when gitlinks conflict", async () => {
-    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-conflicting-pins-"))
-    roots.push(fixtureRoot)
-    const fixture = createProductFixture(fixtureRoot)
-    const ours = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 'ours'\n")
-    git(fixture.alpha, "switch", "-q", "-c", "component-theirs", fixture.alphaBase)
-    const theirs = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 'theirs'\n")
-    const component = join(fixture.product, "packages/alpha")
-    git(component, "fetch", "-q", "origin")
-    git(fixture.product, "switch", "-q", "-c", "candidate-conflicting-pin")
-    git(component, "checkout", "-q", theirs)
-    git(fixture.product, "add", "packages/alpha")
-    git(fixture.product, "commit", "-q", "-m", "pin theirs")
-    const candidate = git(fixture.product, "rev-parse", "HEAD")
-    git(fixture.product, "switch", "-q", "main")
-    git(component, "checkout", "-q", ours)
-    git(fixture.product, "add", "packages/alpha")
-    git(fixture.product, "commit", "-q", "-m", "pin ours")
-    const headBefore = git(fixture.product, "rev-parse", "HEAD")
-    const statusBefore = git(fixture.product, "status", "--porcelain=v1")
-    const stdout = outputSink()
-    const stderr = outputSink()
+  it.each([true, false])(
+    "names the base, ours, and theirs component pins when gitlinks conflict (base present: %s)",
+    async (hasBase) => {
+      const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-conflicting-pins-"))
+      roots.push(fixtureRoot)
+      const fixture = createProductFixture(fixtureRoot)
+      if (!hasBase) {
+        git(fixture.product, "update-index", "--force-remove", "packages/alpha")
+        git(fixture.product, "commit", "-q", "-m", "remove base gitlink")
+      }
+      const ours = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 'ours'\n")
+      git(fixture.alpha, "switch", "-q", "-c", "component-theirs", fixture.alphaBase)
+      const theirs = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 'theirs'\n")
+      const component = join(fixture.product, "packages/alpha")
+      git(component, "fetch", "-q", "origin")
+      git(fixture.product, "switch", "-q", "-c", "candidate-conflicting-pin")
+      git(component, "checkout", "-q", theirs)
+      git(fixture.product, "add", "packages/alpha")
+      git(fixture.product, "commit", "-q", "-m", "pin theirs")
+      const candidate = git(fixture.product, "rev-parse", "HEAD")
+      git(fixture.product, "switch", "-q", "main")
+      git(component, "checkout", "-q", ours)
+      git(fixture.product, "add", "packages/alpha")
+      git(fixture.product, "commit", "-q", "-m", "pin ours")
+      const headBefore = git(fixture.product, "rev-parse", "HEAD")
+      const statusBefore = git(fixture.product, "status", "--porcelain=v1")
+      const stdout = outputSink()
+      const stderr = outputSink()
 
-    expect(await runCli(["--repo", fixture.product, "--json", "merge", candidate], stdout, stderr)).toBe(1)
-    const result = JSON.parse(stdout.output)
-    expect(result).toMatchObject({ state: "failed", partial: false, detail: { code: "merge-conflict" } })
-    expect(result.detail.paths).toEqual(["packages/alpha"])
-    expect(result.detail.objectIds).toEqual(expect.arrayContaining([fixture.alphaBase, ours, theirs]))
-    expect(result.detail.message).toContain(`packages/alpha: base=${fixture.alphaBase} ours=${ours} theirs=${theirs}`)
-    expect(git(fixture.product, "rev-parse", "HEAD")).toBe(headBefore)
-    expect(git(fixture.product, "status", "--porcelain=v1")).toBe(statusBefore)
-  })
+      expect(await runCli(["--repo", fixture.product, "--json", "merge", candidate], stdout, stderr)).toBe(1)
+      const result = JSON.parse(stdout.output)
+      expect(result).toMatchObject({ state: "failed", partial: false, detail: { code: "merge-conflict" } })
+      expect(result.detail.paths).toEqual(["packages/alpha"])
+      expect(result.detail.objectIds).toEqual(
+        expect.arrayContaining(hasBase ? [fixture.alphaBase, ours, theirs] : [ours, theirs]),
+      )
+      expect(result.detail.message).toContain(
+        `"packages/alpha": ${hasBase ? `base=${fixture.alphaBase} ` : ""}ours=${ours} theirs=${theirs}`,
+      )
+      if (!hasBase) {
+        expect(result.detail.objectIds).not.toContain(fixture.alphaBase)
+        expect(result.detail.message).not.toContain("base=")
+      }
+      expect(git(fixture.product, "rev-parse", "HEAD")).toBe(headBefore)
+      expect(git(fixture.product, "status", "--porcelain=v1")).toBe(statusBefore)
+    },
+  )
 
   it("disables commit graphs when alternate-backed worktree history makes a clean gitlink merge unreadable", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-stale-commit-graph-"))

@@ -1,6 +1,7 @@
 import { isAbsolute, join, resolve } from "node:path"
 import { readCommitSubmodules } from "./commit-graph.ts"
 import { createExclusive, type Exclusive } from "./exclusive.ts"
+import { parseIndexEntries, type IndexEntry } from "./index-entries.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
 import type { GitResultDetail, GitSuperRepositoryResult, GitSuperResult } from "./result.ts"
 
@@ -646,19 +647,9 @@ async function prospectiveTree(
   target: string,
   timeoutMs: number,
 ): Promise<Readonly<{ tree: string }> | Readonly<{ failure: GitResultDetail }>> {
-  const args = [
-    "-c",
-    "core.commitGraph=false",
-    "merge-tree",
-    "--write-tree",
-    "--name-only",
-    "-z",
-    "--no-messages",
-    head,
-    target,
-  ]
+  const args = ["-c", "core.commitGraph=false", "merge-tree", "--write-tree", "-z", "--no-messages", head, target]
   const result = await run(git, root, args, timeoutMs)
-  const [tree, ...paths] = nulRecords(result.stdout)
+  const [tree, ...records] = nulRecords(result.stdout)
   if (result.code === 0 && tree !== undefined && OBJECT_ID.test(tree)) return { tree }
   const unreadable = /(?:^|\n)error: Could not read ([0-9a-f]{40,64})(?:\r?$|\s)/imu.exec(result.stderr)?.[1]
   if (unreadable !== undefined) {
@@ -678,6 +669,46 @@ async function prospectiveTree(
     }
   }
   if (result.code === 1) {
+    let entries: IndexEntry[]
+    try {
+      entries = parseIndexEntries(
+        records.join("\0"),
+        (record) => new Error(`${root}: git merge-tree returned a malformed stage record ${JSON.stringify(record)}.`),
+      )
+      const stageZero = entries.find((entry) => entry.stage === 0)
+      if (stageZero !== undefined) {
+        throw new Error(
+          `${root}: git merge-tree returned stage zero for conflicted path ${JSON.stringify(stageZero.path)}.`,
+        )
+      }
+    } catch (error) {
+      return {
+        failure: resultDetailFromGit(
+          "merge-preflight-failed",
+          "preflight-merge",
+          root,
+          args,
+          result,
+          `${error instanceof Error ? error.message : String(error)} No commit was written.`,
+          undefined,
+          "Inspect the named merge-tree output before retrying the same git super merge command.",
+          undefined,
+          { objectIds: [head, target] },
+        ),
+      }
+    }
+    const paths = [...new Set(entries.map((entry) => entry.path))]
+    const gitlinks = entries.filter((entry) => entry.mode === "160000")
+    const stagesByPath = new Map<string, string[]>()
+    for (const entry of gitlinks) {
+      const labels = stagesByPath.get(entry.path) ?? []
+      const label = entry.stage === 1 ? "base" : entry.stage === 2 ? "ours" : "theirs"
+      labels.push(`${label}=${entry.oid}`)
+      stagesByPath.set(entry.path, labels)
+    }
+    const stageEvidence = [...stagesByPath]
+      .map(([path, stages]) => `${JSON.stringify(path)}: ${stages.join(" ")}`)
+      .join("; ")
     const location =
       paths.length === 0
         ? "; Git reported no conflicted paths"
@@ -689,11 +720,11 @@ async function prospectiveTree(
         root,
         args,
         result,
-        `Merge ${target} conflicts with current HEAD ${head}${location}; no commit was written.`,
+        `Merge ${target} conflicts with current HEAD ${head}${location}; no commit was written.${stageEvidence ? ` ${stageEvidence}` : ""}`,
         `git -C ${root} ${args.join(" ")}`,
         "Resolve the named conflict on the submitted branch, then rerun the same git super merge command.",
         "the caller",
-        { paths, objectIds: [head, target] },
+        { paths, objectIds: [...new Set([head, target, ...gitlinks.map((entry) => entry.oid)])] },
       ),
     }
   }
