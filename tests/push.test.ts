@@ -583,6 +583,70 @@ describe("explicit recursive push mechanics", () => {
     expect(git(conflict.remote, "rev-parse", "refs/heads/main")).toBe(conflict.source)
   })
 
+  /**
+   * M8.5: a third destination OID must stop all writes and retain every ref outcome.
+   * The single-ref lease test cannot detect lost sibling or root rows.
+   */
+  test("reports every planned ref when a later child has a stale destination", async () => {
+    const root = pushFixture("preflight-root")
+    const earlier = pushFixture("preflight-earlier-child")
+    const stale = pushFixture("preflight-stale-child")
+    git(stale.repository, "push", "-q", stale.remote, `${stale.source}:refs/heads/main`)
+    const wanted = advanceRepository(stale.repository, "wanted.txt", "wanted\n")
+    git(stale.repository, "switch", "-q", "-c", "competing", stale.source)
+    const third = advanceRepository(stale.repository, "third.txt", "third\n")
+    git(stale.repository, "push", "-q", stale.remote, `${third}:refs/heads/main`)
+
+    const result = await pushRefUpdates({
+      root: root.repository,
+      updates: [
+        update(root.repository, root.remote, root.source, { state: "missing" }),
+        update(earlier.repository, earlier.remote, earlier.source, { state: "missing" }),
+        update(stale.repository, stale.remote, wanted, { state: "oid", oid: stale.source }),
+        {
+          ...update(root.repository, root.remote, root.source, { state: "missing" }),
+          destination: "refs/checks/frozen",
+        },
+      ],
+    })
+
+    expect(result).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: { code: "destination-changed", phase: "observe-destination" },
+      repositories: [
+        {
+          repository: earlier.repository,
+          state: "not-run",
+          refs: [{ source: earlier.source, destination: "refs/heads/main", state: "not-run" }],
+        },
+        {
+          repository: stale.repository,
+          state: "failed",
+          refs: [
+            {
+              source: wanted,
+              destination: "refs/heads/main",
+              state: "failed",
+              detail: { objectIds: [stale.source, third] },
+            },
+          ],
+        },
+        {
+          repository: root.repository,
+          state: "not-run",
+          refs: [
+            { source: root.source, destination: "refs/heads/main", state: "not-run" },
+            { source: root.source, destination: "refs/checks/frozen", state: "not-run" },
+          ],
+        },
+      ],
+    })
+    expect(git(earlier.remote, "for-each-ref", "--format=%(refname)")).toBe("")
+    expect(git(root.remote, "for-each-ref", "--format=%(refname)")).toBe("")
+    expect(git(stale.remote, "rev-parse", "refs/heads/main")).toBe(third)
+  })
+
   test("updates only when the explicit expected old object still matches", async () => {
     const { repository, remote, source: before } = pushFixture("lease")
     git(repository, "push", "-q", remote, `${before}:refs/heads/main`)
