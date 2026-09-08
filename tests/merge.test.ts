@@ -50,7 +50,7 @@ function createProductFixture(root: string): ProductFixture {
     git(join(fixture.product, path), "remote", "set-url", "origin", url)
     git(join(fixture.product, path), "config", `url.${repository}.insteadOf`, url)
   }
-  git(fixture.product, "commit", "-q", "-am", "declare hosted merge fixture identities")
+  git(fixture.product, "commit", "-q", "--amend", "-am", "declare hosted merge fixture identities")
   return { ...fixture, productBase: git(fixture.product, "rev-parse", "HEAD") }
 }
 
@@ -235,12 +235,12 @@ describe("git super merge", () => {
     const intent = decodePushIntent(encoded)
     const row = intent.children.find((entry) => entry.path === "packages/alpha")
     expect(row).toMatchObject({ pin })
-    if (kind === "owned")
-      {expect(row?.publication).toMatchObject({
+    if (kind === "owned") {
+      expect(row?.publication).toMatchObject({
         source: pin,
         expectedDestination: { state: "oid", oid: fixture.alphaBase },
-      })}
-    else expect(row?.publication).toBeUndefined()
+      })
+    } else expect(row?.publication).toBeUndefined()
     expect(git(fixture.alpha, "rev-parse", "main")).toBe(fixture.alphaBase)
     git(child, "remote", "set-url", "origin", "https://elsewhere.test/moved/alpha.git")
     git(fixture.product, "config", "submodule.packages/alpha.branch", "changed-after-freeze")
@@ -368,7 +368,7 @@ describe("git super merge", () => {
       noVerify: true,
       git: {
         run: (request) =>
-          request.args[0] === "interpret-trailers"
+          request.args[0] === "interpret-trailers" && request.args.includes("--trailer")
             ? Promise.resolve({ code: 1, stdout: "", stderr: "injected trailer composition refusal" })
             : local.run(request),
       },
@@ -1133,6 +1133,14 @@ describe("git super merge", () => {
       await runCli(["--repo", fixture.product, "worktree", "add", worktree, "HEAD"], addedStdout, addedStderr),
     ).toBe(0)
     const worktreeAlpha = join(worktree, "packages/alpha")
+    // Each materialized child has its own config; transport rewrites are fixture-local.
+    git(worktreeAlpha, "config", `url.${fixture.alpha}.insteadOf`, "https://git-super.test/owned/alpha.git")
+    git(
+      join(worktree, "vendor/beta"),
+      "config",
+      `url.${fixture.beta}.insteadOf`,
+      "https://git-super.test/owned/beta.git",
+    )
     git(worktree, "switch", "-q", "-c", "newer-than-graph")
     git(worktreeAlpha, "checkout", "-q", targetAlpha)
     git(worktreeAlpha, "commit-graph", "write", "--reachable", "--split")
@@ -1164,7 +1172,7 @@ describe("git super merge", () => {
 
     const result = await superMerge({ repo: worktree, commit: target })
 
-    expect(result.state).toBe("updated")
+    expect(result.state, JSON.stringify(result)).toBe("updated")
     expect(result.partial).toBe(false)
     expect(git(worktree, "ls-tree", "HEAD", "packages/alpha")).toContain(newerAlpha)
   })
