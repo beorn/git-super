@@ -47,6 +47,7 @@ function createProductFixture(root: string): ProductFixture {
   ] as const) {
     const url = `https://git-super.test/owned/${name}.git`
     git(fixture.product, "config", "--file", ".gitmodules", `submodule.${path}.url`, url)
+    git(fixture.product, "config", `submodule.${path}.url`, url)
     git(join(fixture.product, path), "remote", "set-url", "origin", url)
     git(join(fixture.product, path), "config", `url.${repository}.insteadOf`, url)
   }
