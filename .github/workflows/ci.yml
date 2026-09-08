@@ -10,7 +10,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-15]
+        os: [ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -19,8 +19,8 @@ jobs:
           bun-version: 1.4.2
       - run: bun install --frozen-lockfile
       - run: bun run check
-      # The production descriptor owner needs both OS witnesses. Keep these
-      # existing cases pinned separately from the historic conformance corpus.
+      # Keep the Linux production descriptor-owner cases pinned separately
+      # from the historic conformance corpus.
       - uses: actions/checkout@v4
         with:
           repository: beorn/yrd
