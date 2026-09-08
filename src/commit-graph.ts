@@ -2,7 +2,7 @@ import type { GitProcess, GitProcessResult } from "./process.ts"
 import type { GitResultDetail } from "./result.ts"
 
 export type CommitGitlink = Readonly<{ path: string; target: string }>
-export type CommitSubmodule = CommitGitlink & Readonly<{ name: string; url?: string }>
+export type CommitSubmodule = CommitGitlink & Readonly<{ name: string; url?: string; branch?: string }>
 
 function detail(code: string, phase: string, message: string, extra: Partial<GitResultDetail> = {}): GitResultDetail {
   return { code, phase, message, ...extra }
@@ -92,16 +92,16 @@ export async function readCommitSubmodules(
     "--blob",
     `${commit}:.gitmodules`,
     "--get-regexp",
-    "^submodule\\..*\\.(path|url)$",
+    "^submodule\\..*\\.(path|url|branch)$",
   ]
   const configured = await git.run({ repo: repository, args: configuredArgs })
   if (gitProcessFailed(configured)) {
     throw operationError(repository, "read-target-submodules", configuredArgs, configured)
   }
-  const configuredByName = new Map<string, { path?: string; url?: string }>()
+  const configuredByName = new Map<string, { path?: string; url?: string; branch?: string }>()
   for (const entry of configured.stdout.split("\0").filter((value) => value !== "")) {
     const separator = entry.indexOf("\n")
-    const match = /^submodule\.(.+)\.(path|url)$/u.exec(separator < 0 ? "" : entry.slice(0, separator))
+    const match = /^submodule\.(.+)\.(path|url|branch)$/u.exec(separator < 0 ? "" : entry.slice(0, separator))
     if (separator < 1 || match?.[1] === undefined || match[2] === undefined) {
       throw Object.assign(new Error(`target ${commit} has invalid submodule metadata`), {
         resultDetail: detail(
@@ -112,7 +112,7 @@ export async function readCommitSubmodules(
         ),
       })
     }
-    const property = match[2] as "path" | "url"
+    const property = match[2] as "path" | "url" | "branch"
     const value = entry.slice(separator + 1)
     const current = configuredByName.get(match[1]) ?? {}
     if (current[property] !== undefined && current[property] !== value) {
@@ -151,14 +151,15 @@ export async function readCommitSubmodules(
       path,
       target,
       ...(configuredEntry.url === undefined ? {} : { url: configuredEntry.url }),
+      ...(configuredEntry.branch === undefined ? {} : { branch: configuredEntry.branch }),
     }
     const previous = configuredPaths.get(path)
-    if (previous !== undefined && previous.url !== submodule.url) {
-      throw Object.assign(new Error(`target ${commit} has conflicting submodule URLs for ${path}`), {
+    if (previous !== undefined && (previous.url !== submodule.url || previous.branch !== submodule.branch)) {
+      throw Object.assign(new Error(`target ${commit} has conflicting submodule metadata for ${path}`), {
         resultDetail: detail(
           "conflicting-target-submodule-path",
           "read-target-submodules",
-          `Target ${commit} maps submodule path ${path} to conflicting URLs.`,
+          `Target ${commit} maps submodule path ${path} to conflicting URLs or branches.`,
           { paths: [path], objectIds: [commit] },
         ),
       })

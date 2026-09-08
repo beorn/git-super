@@ -14,13 +14,25 @@ afterEach(() => {
 })
 
 describe("commit submodule graph", () => {
-  test("reads names, paths, URLs, and exact gitlinks from one frozen commit", async () => {
+  /**
+   * @failure Forwarding loses a declared branch or takes ambiguous metadata from a different tree.
+   * @level l1
+   * @consumer GitSuper component destination resolution
+   */
+  test("reads branch metadata from one frozen commit and refuses conflicting declarations", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-commit-graph-"))
     roots.push(fixtureRoot)
     const fixture = createProductFixture(fixtureRoot)
 
-    await expect(readCommitSubmodules(createLocalGitProcess(), fixture.product, fixture.productBase)).resolves.toEqual([
+    git(fixture.product, "config", "--file", ".gitmodules", "submodule.packages/alpha.branch", "release/stable")
+    git(fixture.product, "add", ".gitmodules")
+    git(fixture.product, "commit", "-q", "-m", "declare component branch")
+    const declared = git(fixture.product, "rev-parse", "HEAD")
+    git(fixture.product, "config", "--file", ".gitmodules", "submodule.packages/alpha.branch", "uncommitted")
+
+    await expect(readCommitSubmodules(createLocalGitProcess(), fixture.product, declared)).resolves.toEqual([
       {
+        branch: "release/stable",
         name: "packages/alpha",
         path: "packages/alpha",
         target: fixture.alphaBase,
@@ -33,6 +45,23 @@ describe("commit submodule graph", () => {
         url: fixture.beta,
       },
     ])
+
+    git(fixture.product, "config", "--file", ".gitmodules", "--add", "submodule.packages/alpha.branch", "other")
+    git(fixture.product, "add", ".gitmodules")
+    git(fixture.product, "commit", "-q", "-m", "record conflicting branches")
+    await expect(readCommitSubmodules(createLocalGitProcess(), fixture.product, "HEAD")).rejects.toMatchObject({
+      resultDetail: { code: "conflicting-target-submodule-config", paths: [".gitmodules"] },
+    })
+
+    git(fixture.product, "config", "--file", ".gitmodules", "--unset-all", "submodule.packages/alpha.branch")
+    git(fixture.product, "config", "--file", ".gitmodules", "submodule.alias.path", "packages/alpha")
+    git(fixture.product, "config", "--file", ".gitmodules", "submodule.alias.url", fixture.alpha)
+    git(fixture.product, "config", "--file", ".gitmodules", "submodule.alias.branch", "other")
+    git(fixture.product, "add", ".gitmodules")
+    git(fixture.product, "commit", "-q", "-m", "record conflicting path aliases")
+    await expect(readCommitSubmodules(createLocalGitProcess(), fixture.product, "HEAD")).rejects.toMatchObject({
+      resultDetail: { code: "conflicting-target-submodule-path", paths: ["packages/alpha"] },
+    })
   })
 
   test("refuses a gitlink graph whose manifest was deleted", async () => {
