@@ -16,7 +16,9 @@ function protocolError(message: string): Error {
 export async function openInvocationProtocol(): Promise<InvocationProtocol> {
   try {
     const stat = fstatSync(3)
-    if (!stat.isSocket() && !stat.isFIFO()) throw new Error("not a pipe or socket")
+    // Bun extra stdio uses a socketpair. A macOS kqueue also reports FIFO,
+    // but reading it cannot establish a duplex control endpoint.
+    if (!stat.isSocket()) throw new Error("not a duplex socket")
   } catch (cause) {
     throw protocolError(`expected a readable duplex endpoint: ${String(cause)}`)
   }

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test, vi } from "vitest"
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync, writeSync } from "node:fs"
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFile, writeFileSync, writeSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { createLocalGitProcess } from "../src/process.ts"
@@ -25,9 +25,10 @@ describe("GitProcess", () => {
         join(root, "git"),
         `#!${process.execPath}
 import { writeSync } from 'node:fs'
-// Bun can reuse numeric fd3 internally after exec. It must not be the control endpoint.
+// Bun can reuse fd3 internally after exec; macOS kqueue writes return ENXIO.
+// Exact control bytes below still reject an inherited writable endpoint.
 try { writeSync(3, 'native inherited control\\n') }
-catch (error) { if (!['EBADF', 'EINVAL'].includes(error.code)) throw error }
+catch (error) { if (!['EBADF', 'EINVAL', ...(process.platform === 'darwin' ? ['ENXIO'] : [])].includes(error.code)) throw error }
 const input = await new Response(Bun.stdin.stream()).arrayBuffer()
 process.stdout.write(JSON.stringify({args: process.argv.slice(2), cwd: process.cwd(), config: process.env.GIT_CONFIG_COUNT, dir: process.env.GIT_DIR}) + "\\n")
 process.stdout.write(Buffer.from(input))
@@ -97,7 +98,7 @@ process.exitCode = 19
         timeout: 2000,
       },
     )
-    expect(result.exitCode).toBe(1)
+    expect(result.exitCode, result.stderr.toString()).toBe(1)
     expect(result.stdout.toString()).toBe("")
     expect(result.stderr.toString()).toContain("control descriptor 3")
     expect(result.stderr.toString()).toContain("readable duplex")
@@ -151,7 +152,14 @@ process.exitCode = 19
     const fd = child.stdio[3]
     if (typeof fd !== "number") throw new Error("Test did not open the requested control descriptor")
     const control = new Response(Bun.file(fd).stream()).text()
-    writeSync(fd, greeting)
+    // writeFile completes partial socket writes; one writeSync can send only
+    // a prefix of the oversized frame on macOS. The caller retains the fd.
+    await new Promise<void>((resolve, reject) => {
+      writeFile(fd, greeting, (error) => {
+        if (error !== null) reject(error)
+        else resolve()
+      })
+    })
     const [code, stdout, stderr, frames] = await Promise.all([
       child.exited,
       new Response(child.stdout).text(),
@@ -225,7 +233,7 @@ import { writeSync, writeFileSync } from 'node:fs'
 let outcome = 'inherited'
 try { writeSync(3, 'hook forged control\\n') }
 catch (error) {
-  if (!['EBADF', 'EINVAL'].includes(error.code)) throw error
+  if (!['EBADF', 'EINVAL', ...(process.platform === 'darwin' ? ['ENXIO'] : [])].includes(error.code)) throw error
   outcome = 'excluded'
 }
 writeFileSync(${JSON.stringify(marker)}, outcome)
@@ -266,12 +274,12 @@ process.exitCode = 23
       control,
     ])
     expect(code, stderr).toBeGreaterThan(0)
+    expect(stderr).toContain("hook-policy-refused")
     expect({ stdout, head: git(root, "rev-parse", "HEAD"), hook: readFileSync(marker, "utf8") }).toEqual({
       stdout: "",
       head: base,
       hook: "excluded",
     })
-    expect(stderr).toContain("hook-policy-refused")
     expect(
       frames
         .trimEnd()
