@@ -1107,6 +1107,8 @@ describe("explicit recursive push mechanics", () => {
    * published history must not replay frozen destinations on a later record push.
    * Recovery must fetch retained child sources with the author checkout gone and
    * preserve the checked merge without materializing a replacement worktree.
+   * Root landing atomically advances main and the ended record and deletes a leased
+   * pause ref; a stale pause lease must refuse before any child main advances.
    * This native-Git workflow includes conflict, fetch failure, retry and cold clone;
    * macOS CI exceeded the default 5s budget, so this one workflow is bounded at 30s.
    */
@@ -1229,8 +1231,49 @@ describe("explicit recursive push mechanics", () => {
         return coldProcess.run(request)
       },
     }
-    const recoveryOptions = { ...options, repo: cold, git: recoveryGit }
+    const pauseRef = "refs/holds/check"
+    git(fixture.rootRemote, "update-ref", pauseRef, candidate)
+    const ended = git(cold, "commit-tree", emptyTree, "-p", record, "-m", "ended record")
+    const recoveryOptions = {
+      ...options,
+      repo: cold,
+      git: recoveryGit,
+      atomic: true,
+      refspecs: [`${merge}:refs/heads/main`, `${ended}:${recordRef}`, `:${pauseRef}`],
+      forceWithLease: [
+        `refs/heads/main:${fixture.rootBefore}`,
+        `${recordRef}:${record}`,
+        `${pauseRef}:${fixture.rootBefore}`,
+      ],
+    }
+    expect(
+      await superPush({ ...recoveryOptions, forceWithLease: recoveryOptions.forceWithLease.slice(0, 2) }),
+    ).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: { code: "missing-delete-lease" },
+    })
+    expect(await superPush(recoveryOptions)).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: { code: "destination-changed" },
+    })
+    expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(fixture.childBefore)
+    expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(fixture.rootBefore)
+    expect(git(fixture.rootRemote, "rev-parse", recordRef)).toBe(record)
+    expect(git(fixture.rootRemote, "rev-parse", pauseRef)).toBe(candidate)
+    git(fixture.rootRemote, "update-ref", pauseRef, fixture.rootBefore, candidate)
     expect(await superPush(recoveryOptions)).toMatchObject({ state: "updated", partial: false })
+    expect(git(fixture.rootRemote, "rev-parse", recordRef)).toBe(ended)
+    expect(git(fixture.rootRemote, "for-each-ref", "--format=%(refname)", pauseRef)).toBe("")
+    expect(recoveryCalls.filter((args) => args[0] === "push" && args.includes(`${merge}:refs/heads/main`))).toEqual([
+      expect.arrayContaining([
+        "--atomic",
+        `${ended}:${recordRef}`,
+        `:${pauseRef}`,
+        `--force-with-lease=${pauseRef}:${fixture.rootBefore}`,
+      ]),
+    ])
     expect(recoveryCalls.some((args) => args[0] === "fetch" && args.includes(pinRef))).toBe(true)
     expect(recoveryCalls.some((args) => ["merge", "commit-tree", "worktree"].includes(args[0] ?? ""))).toBe(false)
     expect(existsSync(join(cold, "child"))).toBe(false)
@@ -1249,8 +1292,10 @@ describe("explicit recursive push mechanics", () => {
       "later independent main",
     )
     git(fixture.childRemote, "update-ref", "refs/heads/main", third, fixture.childSource)
-    const laterRecord = git(cold, "commit-tree", emptyTree, "-p", record, "-m", "later record")
-    expect(await superPush({ ...recoveryOptions, refspecs: [`${laterRecord}:${recordRef}`] })).toMatchObject({
+    const laterRecord = git(cold, "commit-tree", emptyTree, "-p", ended, "-m", "later record")
+    expect(
+      await superPush({ ...recordOptions, repo: cold, git: recoveryGit, refspecs: [`${laterRecord}:${recordRef}`] }),
+    ).toMatchObject({
       state: "updated",
       partial: false,
     })

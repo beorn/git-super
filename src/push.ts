@@ -160,7 +160,7 @@ function sameExpected(left: ExpectedDestination, right: ExpectedDestination): bo
 }
 
 function isIdenticalSuccess(source: string, observed: ExpectedDestination): boolean {
-  return observed.state === "oid" && observed.oid === source
+  return source === "" ? observed.state === "missing" : observed.state === "oid" && observed.oid === source
 }
 
 async function observeDestination(
@@ -222,7 +222,19 @@ async function planUpdates(git: GitProcess, input: readonly RefUpdate[], timeout
   const normalized: PlannedUpdate[] = []
   const mismatches = new Map<PlannedUpdate, GitResultDetail>()
   for (const update of input) {
-    if (!OBJECT_ID.test(update.source)) {
+    if (update.source === "" && update.expectedDestination === undefined) {
+      throw Object.assign(new Error(`Deleting ${update.destination} requires an exact destination lease`), {
+        resultDetail: detail(
+          "missing-delete-lease",
+          "validate",
+          `Deletion of ${update.destination} has no explicit expected destination.`,
+          {
+            remedy: "Supply --force-with-lease=<ref>:<expected-old-oid> or an explicit RefUpdate.expectedDestination.",
+          },
+        ),
+      })
+    }
+    if (update.source !== "" && !OBJECT_ID.test(update.source)) {
       throw Object.assign(new Error(`push source must be an exact object ID: ${update.source}`), {
         resultDetail: detail(
           "non-object-source",
@@ -240,7 +252,9 @@ async function planUpdates(git: GitProcess, input: readonly RefUpdate[], timeout
       })
     }
     const repository = await discoverRepository(git, update.repository, "discover-repository")
-    await required(git, repository, ["cat-file", "-e", `${update.source}^{object}`], "verify-source-object")
+    if (update.source !== "") {
+      await required(git, repository, ["cat-file", "-e", `${update.source}^{object}`], "verify-source-object")
+    }
     const validDestination = await git.run({ repo: repository, args: ["check-ref-format", update.destination] })
     if (validDestination.code !== 0) {
       throw Object.assign(new Error(`invalid push destination ${update.destination}`), {
@@ -255,7 +269,7 @@ async function planUpdates(git: GitProcess, input: readonly RefUpdate[], timeout
       "observe-destination",
     )
     const branchDestination = update.destination.startsWith("refs/heads/")
-    if (branchDestination) {
+    if (branchDestination && update.source !== "") {
       await required(git, repository, ["cat-file", "-e", `${update.source}^{commit}`], "verify-branch-source")
       if (observed.state === "oid" && update.allowNonFastForward !== true) {
         await ensureCommitObject({
@@ -421,6 +435,7 @@ function pushFailureCode(result: GitProcessResult): string {
 
 async function verifyFastForwardUpdate(git: GitProcess, update: PlannedUpdate): Promise<GitResultDetail | undefined> {
   if (
+    update.source === "" ||
     update.allowNonFastForward ||
     !update.destination.startsWith("refs/heads/") ||
     update.expectedDestination.state === "missing" ||
@@ -490,9 +505,7 @@ async function applyGroup(
     }
   }
 
-  const pending = group.updates.filter(
-    (update) => update.expectedDestination.state === "missing" || update.expectedDestination.oid !== update.source,
-  )
+  const pending = group.updates.filter((update) => !isIdenticalSuccess(update.source, update.expectedDestination))
   if (pending.length === 0) {
     return {
       repository: group.repository,
@@ -550,11 +563,8 @@ async function applyGroup(
       return refResult(update, "unknown", unknown)
     }
     const observed = observation.value
-    if (observed?.state === "oid" && observed.oid === update.source) {
-      const state =
-        update.expectedDestination.state === "oid" && update.expectedDestination.oid === update.source
-          ? "unchanged"
-          : "updated"
+    if (isIdenticalSuccess(update.source, observed)) {
+      const state = isIdenticalSuccess(update.source, update.expectedDestination) ? "unchanged" : "updated"
       return refResult(update, state)
     }
     if (pushFailure === undefined) {
@@ -643,13 +653,6 @@ async function refspecUpdate(git: GitProcess, root: string, remote: string, refs
   }
   const separator = refspec.indexOf(":")
   const sourceName = separator < 0 ? refspec : refspec.slice(0, separator)
-  if (sourceName === "") {
-    throw Object.assign(new Error(`deleting a remote ref is outside the git super push subset: ${refspec}`), {
-      resultDetail: detail("delete-refspec-refused", "validate", `Delete refspec ${refspec} is not accepted.`, {
-        remedy: "Delete the ref with an explicit ordinary Git command after confirming its exact target.",
-      }),
-    })
-  }
   if (sourceName.includes("*")) {
     throw Object.assign(new Error(`pattern refspec is outside the git super push subset: ${refspec}`), {
       resultDetail: detail("pattern-refspec-refused", "validate", `Pattern refspec ${refspec} is not accepted.`, {
@@ -657,9 +660,10 @@ async function refspecUpdate(git: GitProcess, root: string, remote: string, refs
       }),
     })
   }
-  const source = await required(git, root, ["rev-parse", `${sourceName}^{object}`], "resolve-push-source")
+  const source =
+    sourceName === "" ? "" : await required(git, root, ["rev-parse", `${sourceName}^{object}`], "resolve-push-source")
   let destination = separator < 0 ? "" : refspec.slice(separator + 1)
-  if (destination === "") {
+  if (destination === "" && sourceName !== "") {
     destination = await required(
       git,
       root,
@@ -920,7 +924,8 @@ async function frozenChildUpdates(
   const updates: RefUpdate[] = []
   const retention: RefUpdate[] = []
   const publications: RefUpdate[] = []
-  const direct = new Set(rootUpdates.map((update) => update.source))
+  const direct = new Set(rootUpdates.map((update) => update.source).filter((source) => source !== ""))
+  if (direct.size === 0) return { updates: undefined, retention, publications }
   const advertised = await advertisedCommitTips(git, root, remote)
   const reachable = await required(
     git,
@@ -1319,6 +1324,7 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
         ? await configuredPushUpdates(git, root, remote, options)
         : await Promise.all(refspecs.map((refspec) => refspecUpdate(git, root, remote, refspec)))
     const rootUpdates = applyExplicitLeases(selectedUpdates, options.forceWithLease ?? [])
+    const rootSources = rootUpdates.map((update) => update.source).filter((source) => source !== "")
     if (options.recurseSubmodules === "no") {
       return await pushRefUpdates({
         root,
@@ -1333,11 +1339,7 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
       })
     }
     if (options.recurseSubmodules === "check") {
-      const requirements = await collectCommitRequirements(
-        git,
-        root,
-        rootUpdates.map((update) => update.source),
-      )
+      const requirements = await collectCommitRequirements(git, root, rootSources)
       const available: GitSuperRepositoryResult[] = []
       for (const requirement of requirements) {
         if (await commitAvailableOnAnyRemote(git, requirement)) {
@@ -1384,11 +1386,7 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
     const frozen = await frozenChildUpdates(git, root, remote, rootUpdates)
     const childUpdates: RefUpdate[] = frozen.updates ?? []
     if (frozen.updates === undefined) {
-      const requirements = await collectCommitRequirements(
-        git,
-        root,
-        rootUpdates.map((update) => update.source),
-      )
+      const requirements = await collectCommitRequirements(git, root, rootSources)
       for (const requirement of requirements) childUpdates.push(await childUpdate(git, requirement, timeoutMs))
     }
     if (frozen.retention.length > 0) {
