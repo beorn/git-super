@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test, vi } from "vitest"
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFile, writeFileSync, writeSync } from "node:fs"
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, write, writeFileSync, writeSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { createLocalGitProcess } from "../src/process.ts"
@@ -142,7 +142,7 @@ process.exitCode = 19
     ["invalid JSON", Buffer.from("{\n")],
     ["unknown version", Buffer.from('{"version":2,"token":"test"}\n')],
     ["oversized greeting", Buffer.from(JSON.stringify({ version: 1, token: "x".repeat(64 * 1024) }) + "\n")],
-  ])("invalid control greeting (%s) fails before command execution", async (_label, greeting) => {
+  ])("invalid control greeting (%s) fails before command execution", async (label, greeting) => {
     const child = Bun.spawn(
       [process.execPath, join(import.meta.dirname, "../bin/git-super"), "--protocol-fd=3", "--version"],
       {
@@ -152,14 +152,25 @@ process.exitCode = 19
     const fd = child.stdio[3]
     if (typeof fd !== "number") throw new Error("Test did not open the requested control descriptor")
     const control = new Response(Bun.file(fd).stream()).text()
-    // writeFile completes partial socket writes; one writeSync can send only
-    // a prefix of the oversized frame on macOS. The caller retains the fd.
-    await new Promise<void>((resolve, reject) => {
-      writeFile(fd, greeting, (error) => {
-        if (error !== null) reject(error)
-        else resolve()
-      })
-    })
+    // The test owns delivery: macOS sockets can return a short write or
+    // EAGAIN before the child begins reading. Bound backpressure handling so
+    // the assertion measures producer validation, not a truncated fixture.
+    const deadline = Date.now() + 2_000
+    for (let offset = 0; offset < greeting.length; ) {
+      try {
+        const count = await new Promise<number>((resolve, reject) => {
+          write(fd, greeting, offset, greeting.length - offset, null, (error, count) => {
+            if (error !== null) reject(error)
+            else resolve(count)
+          })
+        })
+        if (count === 0) throw new Error(`Control fixture wrote zero bytes at ${offset}`)
+        offset += count
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EAGAIN" || Date.now() >= deadline) throw error
+        await new Promise((resolve) => setTimeout(resolve, 1))
+      }
+    }
     const [code, stdout, stderr, frames] = await Promise.all([
       child.exited,
       new Response(child.stdout).text(),
@@ -168,6 +179,7 @@ process.exitCode = 19
     ])
     expect({ code, stdout, frames }).toEqual({ code: 1, stdout: "", frames: "" })
     expect(stderr).toContain("git-super: control descriptor 3")
+    if (label === "oversized greeting") expect(stderr).toContain("greeting exceeds the 65536-byte limit")
   })
 
   test("a second greeting after readiness is a visible protocol defect", async () => {
