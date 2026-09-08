@@ -414,6 +414,24 @@ async function mergeUnderLock(
     )
   }
   const mergeCommit = observedSettled.stdout.trim()
+  try {
+    await writeRootReceipt(git, root, mergeCommit, head, target, raises, timeoutMs)
+  } catch (error) {
+    return partial(
+      root,
+      mergeCommit,
+      completed,
+      obviousDetail(
+        "root-receipt-failed",
+        `Merge ${mergeCommit} was committed, but its automatic-change receipt could not be published.`,
+        resultError(error, "write-root-receipt").message,
+        `Preserve merge ${mergeCommit} and inspect refs/git-super/receipts/${mergeCommit} before retrying receipt publication.`,
+        "the caller",
+        { phase: "write-root-receipt", objectIds: [mergeCommit] },
+      ),
+      settledCheckouts.rows,
+    )
+  }
 
   return {
     state: "updated",
@@ -423,6 +441,95 @@ async function mergeUnderLock(
     ...(settledCheckouts.rows.length === 0 ? {} : { checkouts: settledCheckouts.rows }),
     repositories: [{ repository: root, state: "updated", refs: [] }],
   }
+}
+
+/** Bind only the producer's actual automatic raises to the completed native merge. */
+async function writeRootReceipt(
+  git: GitProcess,
+  root: string,
+  merge: string,
+  head: string,
+  target: string,
+  raises: readonly SuperMergeGitlinkResult[],
+  timeoutMs: number,
+): Promise<void> {
+  if (raises.length === 0) return
+  const phase = "write-root-receipt"
+  if (!OBJECT_ID.test(merge) || merge.length !== head.length) throw new Error("Receipt merge has an invalid full OID")
+  const parents = await required(git, root, ["show", "-s", "--format=%P", merge], phase, timeoutMs)
+  if (parents !== `${head} ${target}`) throw new Error(`Receipt merge ${merge} does not retain its exact two parents`)
+  const actual = new Map(
+    (await readCommitSubmodules({ run: (request) => git.run({ ...request, timeoutMs }) }, root, merge)).map((entry) => [
+      entry.path,
+      entry.target,
+    ]),
+  )
+  const paths = new Set<string>()
+  const changes = raises.map(({ path, from, to, state }) => {
+    if (
+      state !== "raised" ||
+      paths.has(path) ||
+      !OBJECT_ID.test(from) ||
+      from.length !== merge.length ||
+      !OBJECT_ID.test(to) ||
+      to.length !== merge.length ||
+      from === to ||
+      actual.get(path) !== to
+    ) {
+      throw new Error(`Receipt row ${path} does not match an actual automatic gitlink raise in ${merge}`)
+    }
+    paths.add(path)
+    return { path, mode: "160000", from, to }
+  })
+  const payload = `${JSON.stringify({ version: 1, merge, changes })}\n`
+  const blob = await required(git, root, ["hash-object", "-w", "--stdin"], phase, timeoutMs, payload)
+  const tree = await required(git, root, ["mktree", "-z"], phase, timeoutMs, `100644 blob ${blob}\treceipt.json\0`)
+  const ref = `refs/git-super/receipts/${merge}`
+  const readExisting = async (): Promise<string | undefined> => {
+    const args = ["rev-parse", "--verify", "--quiet", ref]
+    const result = await run(git, root, args, timeoutMs)
+    if (
+      result.code === 1 &&
+      !result.timedOut &&
+      result.failure === undefined &&
+      result.stdout === "" &&
+      result.stderr === ""
+    ) {
+      return undefined
+    }
+    if (result.code !== 0 || result.timedOut || result.failure !== undefined) {
+      throw operationError(root, phase, args, result)
+    }
+    const existing = result.stdout.trim()
+    if (
+      !OBJECT_ID.test(existing) ||
+      existing.length !== merge.length ||
+      (await required(git, root, ["cat-file", "-t", existing], phase, timeoutMs)) !== "commit"
+    ) {
+      throw new Error(`Existing receipt ref ${ref} does not name a commit`)
+    }
+    // Equal tree OIDs prove the exact sole file and JSON bytes without parsing a second format.
+    const binding = await required(git, root, ["show", "-s", "--format=%P%n%T", existing], phase, timeoutMs)
+    if (binding !== `${merge}\n${tree}`) {
+      throw new Error(`Existing receipt ${existing} at ${ref} conflicts with the validated payload for ${merge}`)
+    }
+    return existing
+  }
+  if ((await readExisting()) !== undefined) return
+  const receipt = await required(
+    git,
+    root,
+    ["commit-tree", tree, "-p", merge],
+    phase,
+    timeoutMs,
+    `Automatic root changes for ${merge}\n`,
+  )
+  const args = ["update-ref", ref, receipt, "0".repeat(merge.length)]
+  const published = await run(git, root, args, timeoutMs)
+  if (published.code === 0 && !published.timedOut && published.failure === undefined) return
+  // A competing identical producer may have won the create-only CAS.
+  if ((await readExisting()) !== undefined) return
+  throw operationError(root, phase, args, published)
 }
 
 async function prepareComponentCheckouts(
@@ -1053,9 +1160,12 @@ async function required(
   args: readonly string[],
   phase: string,
   timeoutMs: number,
+  stdin?: string,
 ): Promise<string> {
-  const result = await run(git, repository, args, timeoutMs)
-  if (result.code !== 0) throw operationError(repository, phase, args, result)
+  const result = await run(git, repository, args, timeoutMs, stdin)
+  if (result.code !== 0 || result.timedOut || result.failure !== undefined) {
+    throw operationError(repository, phase, args, result)
+  }
   return result.stdout.trim()
 }
 

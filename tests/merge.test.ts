@@ -278,6 +278,66 @@ describe("git super merge", () => {
     )
     expect(git(raised.product, "ls-tree", "HEAD", "packages/alpha")).toContain(newestAlpha)
     expect(git(raised.product, "show", "-s", "--format=%B", "HEAD")).toContain(`Settled: packages/alpha@${newestAlpha}`)
+    const merge = git(raised.product, "rev-parse", "HEAD")
+    const receipt = git(raised.product, "rev-parse", `refs/git-super/receipts/${merge}`)
+    expect(git(raised.product, "show", "-s", "--format=%P", receipt)).toBe(merge)
+    expect(git(raised.product, "ls-tree", "--name-only", receipt)).toBe("receipt.json")
+    expect(JSON.parse(git(raised.product, "show", `${receipt}:receipt.json`))).toEqual({
+      version: 1,
+      merge,
+      changes: [{ path: "packages/alpha", mode: "160000", from: raised.alphaBase, to: newestAlpha }],
+    })
+  })
+
+  /**
+   * @failure A concurrent receipt writer overwrites attribution or hides a completed merge on failure.
+   * @level l1
+   * @consumer GitSuper merge receipt create-only publication
+   */
+  it.each(["identical", "conflicting"])("preserves a %s receipt created during publication", async (kind) => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-receipt-race-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
+    const candidate = candidateWithRootChange(fixture, "candidate-receipt-race")
+    const local = createLocalGitProcess()
+    const probe = injectionProbe()
+    let winner: string | undefined
+    let receiptRef: string | undefined
+    const result = await superMerge({
+      repo: fixture.product,
+      commit: candidate,
+      git: {
+        async run(request) {
+          probe.observe(request)
+          if (request.args[0] === "update-ref" && request.args[1]?.startsWith("refs/git-super/receipts/")) {
+            probe.fire("receipt-race")
+            receiptRef = request.args[1]
+            winner = kind === "identical" ? request.args[2] : git(fixture.product, "rev-parse", "HEAD")
+            if (winner === undefined) throw new Error("missing proposed receipt")
+            git(fixture.product, "update-ref", receiptRef, winner)
+          }
+          return local.run(request)
+        },
+      },
+    })
+    probe.expectFired("receipt-race")
+    const merge = git(fixture.product, "rev-parse", "HEAD")
+    expect(result).toMatchObject(
+      kind === "identical"
+        ? { state: "updated", partial: false, commit: merge }
+        : {
+            state: "failed",
+            partial: true,
+            commit: merge,
+            detail: {
+              code: "root-receipt-failed",
+              message: expect.stringContaining("conflicts with the validated payload"),
+            },
+          },
+    )
+    expect(git(fixture.product, "rev-parse", receiptRef!)).toBe(winner)
+    expect(git(fixture.product, "show", "-s", "--format=%P", merge).split(" ")).toHaveLength(2)
   })
 
   it("preserves the queue record trailer block when it adds Settled trailers", async () => {
