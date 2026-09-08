@@ -1,5 +1,15 @@
 import { afterEach, describe, expect, test, vi } from "vitest"
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, write, writeFileSync, writeSync } from "node:fs"
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  write,
+  writeFileSync,
+  writeSync,
+} from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { createLocalGitProcess } from "../src/process.ts"
@@ -185,15 +195,40 @@ process.exitCode = 19
   test("a second greeting after readiness is a visible protocol defect", async () => {
     const root = mkdtempSync(join(canonicalTmpdir(), "git-super-control-duplicate-"))
     roots.push(root)
+    createRepository(root, "base.txt", "base\n")
+    git(root, "switch", "-q", "-c", "candidate")
+    const candidate = advanceRepository(root, "candidate.txt", "candidate\n")
+    git(root, "switch", "-q", "main")
+    git(root, "config", "user.name", "Git Super Test")
+    git(root, "config", "user.email", "git-super@example.test")
+    const entered = join(root, ".git", "hook-entered")
+    const release = join(root, ".git", "hook-release")
+    // An absent repository may finish before the second frame is sent. Hold
+    // this real enriched operation at its hook until that frame is queued.
+    writeFileSync(
+      join(root, ".git", "hooks", "pre-commit"),
+      `#!${process.execPath}
+import { existsSync, writeFileSync } from "node:fs"
+writeFileSync(${JSON.stringify(entered)}, "entered")
+const deadline = Date.now() + 2000
+while (!existsSync(${JSON.stringify(release)})) {
+  if (Date.now() >= deadline) throw new Error("Control fixture hook was not released")
+  await Bun.sleep(1)
+}
+process.stderr.write("control fixture hook refuses\\n")
+process.exitCode = 23
+`,
+      { mode: 0o755 },
+    )
     const child = Bun.spawn(
       [
         process.execPath,
         join(import.meta.dirname, "../bin/git-super"),
         "--protocol-fd=3",
         "--repo",
-        join(root, "absent"),
-        "status",
-        "--json",
+        root,
+        "merge",
+        candidate,
       ],
       {
         stdio: ["ignore", "pipe", "pipe", "pipe"],
@@ -211,7 +246,14 @@ process.exitCode = 19
       frames += Buffer.from(next.value).toString()
     }
     expect(JSON.parse(frames)).toEqual({ version: 1, token: "duplicate", ready: true })
-    writeSync(fd, greeting)
+    try {
+      const deadline = Date.now() + 2_000
+      while (!existsSync(entered) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 1))
+      expect(existsSync(entered), "Producer never reached the blocking hook").toBe(true)
+      writeSync(fd, greeting)
+    } finally {
+      writeFileSync(release, "released")
+    }
     while (true) {
       const next = await reader.read()
       if (next.done) break

@@ -29,6 +29,7 @@ jobs:
       - run: bun install --frozen-lockfile
         working-directory: .yrd-process-contract
       - name: Yrd production process settlement
+        id: yrd-process
         working-directory: .yrd-process-contract
         run: >-
           bun --bun x vitest run
@@ -38,7 +39,7 @@ jobs:
           --reporter=default --reporter=json
           --outputFile=${{ github.workspace }}/yrd-process-results.json
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: ${{ !cancelled() && (steps.yrd-process.outcome == 'success' || steps.yrd-process.outcome == 'failure') }}
         with:
           name: yrd-process-${{ matrix.os }}-${{ github.sha }}
           path: yrd-process-results.json
