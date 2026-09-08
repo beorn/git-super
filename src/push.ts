@@ -954,7 +954,7 @@ async function commitAvailableOnAnyRemote(git: GitProcess, requirement: CommitRe
   return false
 }
 
-async function childUpdate(git: GitProcess, requirement: CommitRequirement): Promise<RefUpdate> {
+async function childUpdate(git: GitProcess, requirement: CommitRequirement, timeoutMs: number): Promise<RefUpdate> {
   const remote = await configuredPushRemote(git, requirement.repository)
   const branch = await resolveSubmoduleBranch(
     git,
@@ -963,7 +963,23 @@ async function childUpdate(git: GitProcess, requirement: CommitRequirement): Pro
     requirement.entry,
     remote,
   )
-  return { repository: requirement.repository, remote, source: requirement.target, destination: `refs/heads/${branch}` }
+  const destination = `refs/heads/${branch}`
+  const observed = await observeDestination(
+    git,
+    { repository: requirement.repository, remote, destination },
+    "observe-submodule-destination",
+  )
+  let source = requirement.target
+  if (observed.state === "oid") {
+    await ensureCommitObject({ repository: requirement.repository, remote, commit: observed.oid, timeoutMs, git })
+    const args = ["merge-base", "--is-ancestor", requirement.target, observed.oid]
+    const contained = await git.run({ repo: requirement.repository, args })
+    if (contained.code === 0 && !contained.timedOut && contained.failure === undefined) source = observed.oid
+    else if (contained.code !== 1 || contained.timedOut || contained.failure !== undefined) {
+      throw operationError(requirement.repository, args, "prove-submodule-destination-contains-pin", contained)
+    }
+  }
+  return { repository: requirement.repository, remote, source, destination, expectedDestination: observed }
 }
 
 function availabilityResult(
@@ -1082,7 +1098,7 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
       return prependRepositories(pushed, available)
     }
     const childUpdates: RefUpdate[] = []
-    for (const requirement of requirements) childUpdates.push(await childUpdate(git, requirement))
+    for (const requirement of requirements) childUpdates.push(await childUpdate(git, requirement, timeoutMs))
     if (childUpdates.length === 0 && options.recurseSubmodules === "only") {
       return gitSuperResult([
         {

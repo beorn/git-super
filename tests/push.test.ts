@@ -444,6 +444,29 @@ describe("explicit recursive push mechanics", () => {
     expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(fixture.rootBefore)
   })
 
+  /**
+   * @failure Publishing an older root pin attempts to rewind its already-ahead component branch.
+   * @level l1
+   * @consumer Recursive publication of commits already contained at the configured destination
+   */
+  test.each(["on-demand", "only"] as const)("%s keeps an already-ahead child destination", async (mode) => {
+    const fixture = recursivePushFixture(`already-ahead-${mode}`)
+    const ahead = advanceRepository(fixture.child, "child.txt", "already published\n")
+    git(fixture.child, "push", "-q", "origin", "HEAD:refs/heads/main")
+    const result = await superPush({
+      repo: fixture.root,
+      remote: "origin",
+      refspecs: ["HEAD:refs/heads/main"],
+      recurseSubmodules: mode,
+    })
+    expect(result.state).toBe(mode === "on-demand" ? "updated" : "unchanged")
+    expect(result.repositories[0]).toMatchObject({ repository: fixture.child, state: "unchanged" })
+    expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(ahead)
+    expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(
+      mode === "on-demand" ? fixture.rootSource : fixture.rootBefore,
+    )
+  })
+
   test("on-demand preserves a published child when the later root hook rejects", async () => {
     const fixture = recursivePushFixture("on-demand-partial")
     const hook = join(fixture.root, ".git", "hooks", "pre-push")
