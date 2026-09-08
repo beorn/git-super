@@ -1,3 +1,4 @@
+import type { GitProcess } from "./process.ts"
 import type { ExpectedDestination } from "./result.ts"
 
 export const PUSH_INTENT_TRAILER = "Git-Super-Push"
@@ -175,4 +176,35 @@ export function encodePushIntent(intent: FrozenPushIntent): string {
   const encoded = Buffer.from(JSON.stringify(intent)).toString("base64")
   decodePushIntent(encoded)
   return encoded
+}
+
+/** One owner reads and binds the trailer to the actual containing merge. */
+export async function readFrozenPushIntent(
+  git: GitProcess,
+  root: string,
+  source: string,
+): Promise<FrozenPushIntent | undefined> {
+  const read = async (args: readonly string[]) => {
+    const result = await git.run({ repo: root, args })
+    if (result.code !== 0 || result.timedOut === true || result.failure !== undefined || result.signal) {
+      throw new Error(
+        `Merge ${source}: git ${args.join(" ")} failed in ${root} (exit ${result.code})\n${result.failure ?? result.stderr}`,
+      )
+    }
+    return result.stdout.trim()
+  }
+  const message = await read(["show", "-s", "--format=%(trailers:only,unfold)", source])
+  const values = message
+    .split(/\r?\n/u)
+    .filter(
+      (line) => line.slice(0, PUSH_INTENT_TRAILER.length + 1).toLowerCase() === `${PUSH_INTENT_TRAILER.toLowerCase()}:`,
+    )
+  if (values.length === 0) return undefined
+  if (values.length !== 1) throw new Error(`Merge ${source} carries duplicate ${PUSH_INTENT_TRAILER} trailers`)
+  const value = values[0]
+  if (value === undefined) throw new Error(`Merge ${source} lost its frozen push trailer`)
+  const intent = decodePushIntent(value.slice(PUSH_INTENT_TRAILER.length + 1).trim())
+  const parents = (await read(["show", "-s", "--format=%P", source])).split(" ")
+  if (parents.length !== 2) throw new Error(`Frozen push intent must belong to an actual two-parent merge: ${source}`)
+  return intent
 }

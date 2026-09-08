@@ -266,6 +266,7 @@ export async function runCli(
   stderr: OutputSink,
   replaceProcess = false,
 ): Promise<number> {
+  if (argv[0] === "observe") argv = ["super", ...argv]
   if (!argv[0]?.startsWith("--protocol-fd")) return runInvocation(argv, stdout, stderr, replaceProcess)
   let protocol: InvocationProtocol | undefined
   let code = 1
@@ -293,6 +294,14 @@ async function runInvocation(
   replaceProcess: boolean,
   protocol?: InvocationProtocol,
 ): Promise<number> {
+  const observationArgs = argv[0] === "super" && argv[1] === "observe" ? argv.slice(2) : undefined
+  if (observationArgs !== undefined) {
+    if (protocol !== undefined) {
+      throw new Error("super observe uses stdin/stdout, not the ordinary Git control descriptor")
+    }
+    const { observeCli } = await import("./observe.ts")
+    return observeCli(observationArgs, process.cwd(), stdout)
+  }
   let delegated = false
   try {
     const enriched = await enrichedInvocation(argv)
@@ -320,6 +329,7 @@ async function runInvocation(
     .description("Git commands that treat superprojects and submodule interiors as one product")
     .option("--repo <path>", "repository to inspect", ".")
     .option("--json", "emit one stable JSON result")
+    .addHelpText("after", "\nObservation protocol: git-super super observe --protocol=1 < captured-root.json\n")
     .exitOverride()
     .configureOutput({
       writeOut: (value) => stdout.write(value),

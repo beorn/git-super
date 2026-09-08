@@ -4,9 +4,8 @@ import { readCommitSubmodules, resolveSubmoduleBranch, type CommitSubmodule } fr
 import { createExclusive, type Exclusive } from "./exclusive.ts"
 import { ensureCommitObject } from "./objects.ts"
 import {
-  decodePushIntent,
+  readFrozenPushIntent,
   encodePushIntent,
-  PUSH_INTENT_TRAILER,
   sameHostedOwner,
   sameHostedRepository,
   type FrozenPushIntent,
@@ -935,29 +934,12 @@ async function frozenChildUpdates(
   )
   let found = false
   for (const source of new Set([...direct, ...reachable.split(/\r?\n/u).filter(Boolean)])) {
-    const message = await required(
-      git,
-      root,
-      ["show", "-s", "--format=%(trailers:only,unfold)", source],
-      "read-frozen-push-intent",
-    )
-    const values = message
-      .split(/\r?\n/u)
-      .filter(
-        (line) =>
-          line.slice(0, PUSH_INTENT_TRAILER.length + 1).toLowerCase() === `${PUSH_INTENT_TRAILER.toLowerCase()}:`,
-      )
-    if (values.length === 0) continue
-    if (values.length !== 1) throw new Error(`Merge ${source} carries duplicate ${PUSH_INTENT_TRAILER} trailers`)
-    const value = values[0]
-    if (value === undefined) throw new Error(`Merge ${source} lost its frozen push trailer`)
-    const intent = decodePushIntent(value.slice(PUSH_INTENT_TRAILER.length + 1).trim())
+    const intent = await readFrozenPushIntent(git, root, source)
+    if (intent === undefined) continue
     const actualRemote = await logicalPushUrl(git, root, remote)
     if (!sameHostedRepository(intent.rootRemote, actualRemote)) {
       throw new Error(`Merge ${source} freezes root remote ${intent.rootRemote}, but this push selects ${actualRemote}`)
     }
-    const parents = (await required(git, root, ["show", "-s", "--format=%P", source], "bind-frozen-merge")).split(" ")
-    if (parents.length !== 2) throw new Error(`Frozen push intent must belong to an actual two-parent merge: ${source}`)
     if (direct.has(source)) found = true
     const selected = await collectCommitRequirements(git, root, [source], undefined, intent)
     for (const row of intent.children) {

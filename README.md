@@ -88,6 +88,38 @@ First use needs a readable root and exact commit, a configured remote name or ex
 
 An unresolved root, malformed frozen descriptor, unsafe store location, or partial/invalid existing store returns a nonzero structured detail; it is never an empty result or implicit reinitialization. Cold local stores are reported as `updated`, warm stores as `unchanged`, and a later failure keeps already prepared rows as partial evidence rather than deleting them. The returned stores are compatible with a later ordinary `git submodule update`; observation code remains responsible for any network read and exact-object fetch.
 
+### Observe component tips
+
+`git-super super observe --protocol=1` (or `git super observe --protocol=1`) reads one UTF-8 JSON document from stdin in the owning root repository:
+
+```json
+{
+  "version": 1,
+  "root": {
+    "remote": "https://example.org/team/product.git",
+    "targetRef": "refs/heads/main",
+    "targetOid": "<full root OID>"
+  },
+  "checked": [
+    {
+      "mergeOid": "<actual checked merge OID>",
+      "recordRef": "refs/changes/main/example",
+      "recordOid": "<captured record OID>"
+    }
+  ],
+  "fence": {
+    "prefixes": ["refs/changes/main/"],
+    "refs": [{ "ref": "refs/changes/main/example", "oid": "<captured record OID>" }]
+  }
+}
+```
+
+The caller supplies every advertised ref under its literal prefixes, including refs it does not otherwise recognize. Each checked record must match that same reading. Empty checked/history lists still examine current direct-component tips. GitSuper reads frozen descriptors and merge intents, uses the existing native branch resolver, and excludes children outside the root's hosted namespace. Local paths cannot establish ownership. A current tip is explained only by the captured root pin or the exact published source of a current checked merge; its expected old value is not authority.
+
+Each read gets one attempt. After all child reads, a complete root advertisement must still match the captured target and selected refs. Only then does stdout receive `{version:1,outcome,message,notices:[{id,text}]}`. IDs are stable opaque strings; text is complete human wording. Exit 0 means `observed`, including an explicitly described empty observation; 3 means `changed-during-read`; 4 means `unavailable-transport`; 2 means `invalid`. Every non-observed result has no notices. These exits belong to this protocol only.
+
+The operation may prepare and fetch into the existing isolated component object stores. It writes no caller refs, `FETCH_HEAD`, worktrees, queue records or remote refs. Missing objects, invalid descriptors and malformed witnesses remain explicit failures. The caller owns observation cadence, process deadline, raw evidence retention and notice delivery; this command adds no service or verdict cache.
+
 ### Safe fast-forward pull
 
 `pull --ff-only` fetches and freezes one exact root target. It then works out the full graph of initialized submodules without checking anything out, fetches only the recorded child commits it is missing, and tests every working-tree change before the first write. Applying the change rechecks the remote ref and every repository HEAD under a shared lock, fast-forwards the root, then checks out changed submodules at their exact recorded commits.
