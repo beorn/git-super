@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it } from "vitest"
 import { runCli } from "../src/cli.ts"
 import { superMerge } from "../src/merge.ts"
 import { createLocalGitProcess } from "../src/process.ts"
+import type { GitResultDetail } from "../src/result.ts"
 import {
   advanceRepository,
   canonicalTmpdir as tmpdir,
@@ -960,7 +961,8 @@ describe("git super merge", () => {
       git(fixture.product, "add", "packages/alpha")
       git(fixture.product, "commit", "-q", "-m", "pin theirs")
       const candidate = git(fixture.product, "rev-parse", "HEAD")
-      git(fixture.product, "switch", "-q", "main")
+      // The no-base branch has no gitlink; retain its checkout for the next pin.
+      git(fixture.product, "switch", "--no-recurse-submodules", "-q", "main")
       git(component, "checkout", "-q", ours)
       git(fixture.product, "add", "packages/alpha")
       git(fixture.product, "commit", "-q", "-m", "pin ours")
@@ -970,7 +972,7 @@ describe("git super merge", () => {
       const stderr = outputSink()
 
       expect(await runCli(["--repo", fixture.product, "--json", "merge", candidate], stdout, stderr)).toBe(1)
-      const result = JSON.parse(stdout.output)
+      const result = JSON.parse(stdout.output) as { detail: GitResultDetail }
       expect(result).toMatchObject({ state: "failed", partial: false, detail: { code: "merge-conflict" } })
       expect(result.detail.paths).toEqual(["packages/alpha"])
       expect(result.detail.objectIds).toEqual(
