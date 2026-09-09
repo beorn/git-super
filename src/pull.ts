@@ -48,7 +48,9 @@ async function run(git: GitProcess, repository: string, args: readonly string[],
 
 async function required(git: GitProcess, repository: string, args: readonly string[], phase: string): Promise<string> {
   const result = await run(git, repository, args)
-  if (result.code !== 0) throw operationError(repository, phase, args, result)
+  if (result.failure !== undefined || result.timedOut || result.stalled || result.code !== 0) {
+    throw operationError(repository, phase, args, result)
+  }
   return result.stdout.trim()
 }
 
@@ -58,9 +60,12 @@ function operationError(
   args: readonly string[],
   result: GitProcessResult,
 ): Error & Readonly<{ resultDetail: GitResultDetail }> {
-  const message = result.timedOut
+  const summary = result.timedOut
     ? `git ${args.join(" ")} timed out in ${repository}`
-    : `git ${args.join(" ")} failed in ${repository} (exit ${result.code})${result.stderr ? `\n${result.stderr}` : ""}`
+    : result.stalled
+      ? `git ${args.join(" ")} stalled in ${repository}`
+      : `git ${args.join(" ")} failed in ${repository} (exit ${result.code})`
+  const message = `${summary}${result.stderr ? `\n${result.stderr}` : ""}${result.failure === undefined ? "" : `\n${result.failure}`}`
   return Object.assign(new Error(message), {
     resultDetail: detail(result.timedOut ? "git-timeout" : "git-failed", phase, message, {
       remedy: "Resolve the reported Git condition, then rerun the same git super pull command.",
