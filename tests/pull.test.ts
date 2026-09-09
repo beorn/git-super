@@ -602,8 +602,9 @@ describe("git super pull --ff-only", () => {
               if (
                 request.repo !== alphaCheckout ||
                 request.args.join(" ") !== "fetch --no-recurse-submodules --no-write-fetch-head origin"
-              )
-                {return local.run(request)}
+              ) {
+                return local.run(request)
+              }
               injected++
               const result = await local.run(request)
               expect(result.code).toBe(0)
