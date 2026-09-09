@@ -5,7 +5,7 @@
  * @consumer Yrd worktree mutation store
  */
 
-import { mkdtemp, readFile, rm } from "node:fs/promises"
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { describe, expect, test } from "vitest"
@@ -20,9 +20,11 @@ describe("exclusive writer policy", () => {
         pid: process.pid,
         holder: "first mutation",
       })
-      await expect(acquireExclusive(dir, { timeoutMs: 0 }, "second mutation")).rejects.toThrow(
-        /holder=first mutation.*operation=second mutation/u,
+      const startedAt = Date.now()
+      await expect(acquireExclusive(dir, { timeoutMs: 25 }, "second mutation")).rejects.toThrow(
+        /lock is busy after \d+ms \(timeout=25ms; holder=first mutation; age=\d+ms;.*operation=second mutation/u,
       )
+      expect(Date.now() - startedAt).toBeGreaterThanOrEqual(25)
     } finally {
       first.release()
     }
@@ -31,4 +33,29 @@ describe("exclusive writer policy", () => {
     successor.release()
     await rm(dir, { recursive: true, force: true })
   })
+
+  /**
+   * @failure A legacy or unreadable holder timestamp becomes a fabricated age in a timeout refusal.
+   * @level l1
+   * @consumer Yrd worktree mutation store
+   */
+  test.each([undefined, "invalid", "9999-01-01T00:00:00.000Z"])(
+    "reports unknown age when holder metadata has no usable start time: %j",
+    async (startedAt) => {
+      const dir = await mkdtemp(join(tmpdir(), "git-super-exclusive-"))
+      const lock = await acquireExclusive(dir, { timeoutMs: 0 }, "legacy writer")
+      try {
+        await writeFile(
+          join(dir, "writer.lock"),
+          JSON.stringify({ pid: process.pid, holder: "legacy writer", startedAt }),
+        )
+        await expect(acquireExclusive(dir, { timeoutMs: 0 }, "contender")).rejects.toThrow(
+          /holder=legacy writer; age=unknown;.*operation=contender/u,
+        )
+      } finally {
+        lock.release()
+        await rm(dir, { recursive: true, force: true })
+      }
+    },
+  )
 })

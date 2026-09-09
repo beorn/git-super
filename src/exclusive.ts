@@ -45,7 +45,8 @@ export async function acquireExclusive(
   const path = join(dir, "writer.lock")
   const timeoutMs = Math.max(0, options.timeoutMs ?? 30_000)
   const pollMs = Math.max(1, options.pollIntervalMs ?? 10)
-  const deadline = Date.now() + timeoutMs
+  const startedAt = Date.now()
+  const deadline = startedAt + timeoutMs
   const backoff = (): Promise<void> => Bun.sleep(1 + Math.floor(Math.random() * pollMs))
 
   while (true) {
@@ -56,18 +57,24 @@ export async function acquireExclusive(
     })
     const lock = tryAcquireFlock(path, { body })
     if (lock !== null) return { release: () => lock.release() }
-    if (Date.now() >= deadline) throw busy(path, holder)
+    const now = Date.now()
+    if (now >= deadline) throw busy(path, now, now - startedAt, timeoutMs, holder)
     await backoff()
   }
 }
 
-function busy(path: string, contender?: string): Error {
+function busy(path: string, now: number, waitedMs: number, timeoutMs: number, contender?: string): Error {
   let owner = "another process"
   let holder = "unknown operation"
+  let age = "unknown"
   try {
-    const value = JSON.parse(readFileSync(path, "utf8")) as { pid?: unknown; holder?: unknown }
+    const value = JSON.parse(readFileSync(path, "utf8")) as { pid?: unknown; holder?: unknown; startedAt?: unknown }
     if (typeof value.pid === "number") owner = `pid:${value.pid}`
     if (typeof value.holder === "string" && value.holder.trim() !== "") holder = value.holder
+    if (typeof value.startedAt === "string") {
+      const startedAt = Date.parse(value.startedAt)
+      if (Number.isFinite(startedAt) && startedAt <= now) age = `${now - startedAt}ms`
+    }
   } catch {
     // silent-fallback-allow: this enriches an error that is ALREADY being
     // thrown, so the failure is never hidden — only its detail is. The lock
@@ -79,7 +86,8 @@ function busy(path: string, contender?: string): Error {
     // Diagnostic metadata never decides authoritative lock ownership.
   }
   return new Error(
-    `git-super: worktree mutation lock is busy (holder=${holder}; owner=${owner}; contender=pid:${process.pid}` +
+    `git-super: worktree mutation lock is busy after ${waitedMs}ms ` +
+      `(timeout=${timeoutMs}ms; holder=${holder}; age=${age}; owner=${owner}; contender=pid:${process.pid}` +
       `${contender === undefined ? "" : ` operation=${contender}`}; ${path})`,
   )
 }
