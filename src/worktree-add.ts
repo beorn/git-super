@@ -5,6 +5,66 @@ import { materializeSubmodulesFromLocalWorktreeParallel } from "./submodules.ts"
 import { createLocalGitWorktreeStore, type GitWorktreeStore } from "./worktree.ts"
 
 /**
+ * Owner attribution for a worktree registration (@i/4-supervision/24306).
+ *
+ * Git derives a worktree registration name from the basename of the path it is
+ * added at, and there is no flag to set it independently. MEASURED on git 2.53,
+ * because the whole mechanism hinges on it:
+ *
+ *   - `git worktree list --porcelain` emits worktree/HEAD/branch and does NOT
+ *     print the registration name, so the field a reconciler reads is the PATH;
+ *   - two paths sharing a basename COLLIDE, and git dedupes with a numeric
+ *     suffix (same, same1) — so a registration name is not unique by
+ *     construction and cannot be trusted to identify anything on its own.
+ *
+ * That second point is why this belongs here rather than in a caller: the
+ * collision is a REGISTRATION concern, and this module is where a worktree gets
+ * registered, so it is the only layer that can refuse an ambiguous name at
+ * composition time instead of discovering a dedupe afterwards.
+ *
+ * Measured on the live estate 2026-09-08: 866 registered worktrees against a
+ * ceiling of 5, across fifteen parent directories, and not one path said who
+ * owned it — so a reconciler needed a lookup table beside git own registry, and
+ * a second source of truth is the drift 24306 exists to remove.
+ *
+ * The separator is the whole parsing contract, so an owner id may not contain
+ * it. A name without exactly one separator is UNATTRIBUTABLE rather than owned
+ * by an accidental prefix: every worktree registered before this must read that
+ * way, because a false attribution is worse than none for a reconciler that will
+ * act on the answer.
+ */
+const OWNER_SEPARATOR = "~"
+
+export function registrationNameForOwner(ownerId: string, label: string): string {
+  assertRegistrationComponent(ownerId, "owner id")
+  assertRegistrationComponent(label, "label")
+  return `${label}${OWNER_SEPARATOR}${ownerId}`
+}
+
+export function ownerFromRegistrationName(name: string): string | undefined {
+  const parts = name.split(OWNER_SEPARATOR)
+  if (parts.length !== 2) return undefined
+  const [label, ownerId] = parts
+  if (label === undefined || ownerId === undefined) return undefined
+  if (label.length === 0 || ownerId.length === 0) return undefined
+  return ownerId
+}
+
+function assertRegistrationComponent(value: string, what: string): void {
+  if (value.length === 0) {
+    throw new Error(`worktree registration ${what} may not be empty`)
+  }
+  if (value.includes(OWNER_SEPARATOR)) {
+    throw new Error(
+      `worktree registration ${what} may not contain ${OWNER_SEPARATOR}: it is the owner separator, and an id carrying it could register a name that reads as another owner (${value})`,
+    )
+  }
+  if (value.includes("/") || value.includes("\\") || value.includes("\u0000")) {
+    throw new Error(`worktree registration ${what} must be one path segment (${value})`)
+  }
+}
+
+/**
  * How many gitlinks may open their own connection to their configured remote.
  *
  * Unbounded HERE and nowhere else. The materializer defaults to zero because

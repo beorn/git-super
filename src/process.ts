@@ -117,20 +117,24 @@ export function isRetryableRead(args: readonly string[]): boolean {
  * whole point is behaviour under a condition that is expensive and flaky to
  * reproduce, and a retry policy nobody can test is one nobody can change.
  */
-export function withStallRetry(inner: GitProcess): GitProcess {
+export type StallRetryOptions = Readonly<{ attempts?: 1 | 3 }>
+
+export function withStallRetry(inner: GitProcess, options: StallRetryOptions = {}): GitProcess {
+  const attempts = options.attempts ?? STALL_ATTEMPTS
+  if (attempts !== 1 && attempts !== STALL_ATTEMPTS) throw new Error("Git read attempts must be 1 or 3.")
   return {
     async run(request) {
       // Only a STALL is retried, never a non-zero exit: an exit code is git
       // answering the question, and re-asking would paper over a real failure.
       if (!isRetryableRead(request.args)) return inner.run(request)
       let result = await inner.run(request)
-      for (let attempt = 2; result.timedOut === true && attempt <= STALL_ATTEMPTS; attempt += 1) {
+      for (let attempt = 2; result.timedOut === true && attempt <= attempts; attempt += 1) {
         // NO SILENT ERRORS: a retry nobody can see turns a measurable stall
         // rate into an invisible one, and this defect cost an evening precisely
         // because the stalls were being read as something else.
         console.error(
           `git-super: ${request.args[0] ?? "git"} stalled after ${String(request.timeoutMs)}ms in ${request.repo}; ` +
-            `retry ${String(attempt)}/${String(STALL_ATTEMPTS)}`,
+            `retry ${String(attempt)}/${String(attempts)}`,
         )
         await new Promise((resolve) => {
           setTimeout(resolve, STALL_BACKOFF_MS)
@@ -214,7 +218,10 @@ export function adaptProcessGit(process: SupervisedProcess, defaults: GitProcess
   }
 }
 
-export function createLocalGitProcess(environment: NodeJS.ProcessEnv = process.env): GitProcess {
+export function createLocalGitProcess(
+  environment: NodeJS.ProcessEnv = process.env,
+  options: StallRetryOptions = {},
+): GitProcess {
   // Local callers own Git policy (for example GIT_ALLOW_PROTOCOL and GIT_CONFIG_*),
   // so only inherited repository pointers are removed; the supervised port uses the full scrubber.
   const baseEnvironment = cleanGitRepositoryEnvironment(environment)
@@ -255,5 +262,5 @@ export function createLocalGitProcess(environment: NodeJS.ProcessEnv = process.e
     }
   }
 
-  return withStallRetry({ run: runOnce })
+  return withStallRetry({ run: runOnce }, options)
 }

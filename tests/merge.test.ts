@@ -7,13 +7,15 @@ import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { join } from "node:path"
 import { afterEach, describe, expect, it } from "vitest"
 import { runCli } from "../src/cli.ts"
+import { superPush } from "../src/push.ts"
+import { decodePushIntent, PUSH_INTENT_TRAILER } from "../src/push-intent.ts"
 import { superMerge } from "../src/merge.ts"
 import { createLocalGitProcess } from "../src/process.ts"
 import type { GitResultDetail } from "../src/result.ts"
 import {
   advanceRepository,
   canonicalTmpdir as tmpdir,
-  createProductFixture,
+  createProductFixture as createLocalProductFixture,
   createRepository,
   git,
   injectionProbe,
@@ -33,6 +35,24 @@ function outputSink(): { output: string; write(value: string): void } {
       this.output += value
     },
   }
+}
+
+/** Merge ownership is hosted identity; Git's rewrite keeps fixture transport local. */
+function createProductFixture(root: string): ProductFixture {
+  const fixture = createLocalProductFixture(root)
+  git(fixture.product, "remote", "add", "origin", "https://git-super.test/owned/product.git")
+  for (const [path, repository, name] of [
+    ["packages/alpha", fixture.alpha, "alpha"],
+    ["vendor/beta", fixture.beta, "beta"],
+  ] as const) {
+    const url = `https://git-super.test/owned/${name}.git`
+    git(fixture.product, "config", "--file", ".gitmodules", `submodule.${path}.url`, url)
+    git(fixture.product, "config", `submodule.${path}.url`, url)
+    git(join(fixture.product, path), "remote", "set-url", "origin", url)
+    git(join(fixture.product, path), "config", `url.${repository}.insteadOf`, url)
+  }
+  git(fixture.product, "commit", "-q", "--amend", "-am", "declare hosted merge fixture identities")
+  return { ...fixture, productBase: git(fixture.product, "rev-parse", "HEAD") }
 }
 
 function candidateWithRootChange(fixture: ProductFixture, name: string): string {
@@ -72,6 +92,7 @@ describe("git super merge", () => {
     const refusedRoot = mkdtempSync(join(tmpdir(), "git-super-merge-refused-"))
     roots.push(refusedRoot)
     const refused = createProductFixture(refusedRoot)
+    const refusedMain = advanceRepository(refused.alpha, "alpha.ts", "export const alpha = 'competing'\n")
     const refusedAlpha = join(refused.product, "packages/alpha")
     git(refused.product, "switch", "-q", "-c", "candidate-off-main")
     writeFileSync(join(refusedAlpha, "alpha.ts"), "export const alpha = 'unpushed'\n")
@@ -99,7 +120,7 @@ describe("git super merge", () => {
     expect(refusedStderr.output).toContain("gitlink-off-main")
     expect(refusedStderr.output).toContain("packages/alpha")
     expect(refusedStderr.output).toContain(unpublished)
-    expect(refusedStderr.output).toContain(refused.alphaBase)
+    expect(refusedStderr.output).toContain(refusedMain)
     expect(refusedStderr.output).toContain("evidence:")
     expect(refusedStderr.output).toContain("next:")
     expect(refusedStderr.output).toContain("owner: the component writer")
@@ -123,7 +144,7 @@ describe("git super merge", () => {
         code: "gitlink-off-main",
         subject: expect.stringContaining("packages/alpha"),
         evidence: expect.stringContaining("merge-base --is-ancestor"),
-        next: expect.stringContaining("Push"),
+        next: expect.stringContaining("Rebase"),
         owner: "the component writer",
       },
     })
@@ -133,6 +154,7 @@ describe("git super merge", () => {
     const leftRoot = mkdtempSync(join(tmpdir(), "git-super-merge-left-off-main-"))
     roots.push(leftRoot)
     const left = createProductFixture(leftRoot)
+    const leftMain = advanceRepository(left.alpha, "alpha.ts", "export const alpha = 'diverged'\n")
     const leftAlpha = join(left.product, "packages/alpha")
     writeFileSync(join(leftAlpha, "alpha.ts"), "export const alpha = 'already ahead'\n")
     git(leftAlpha, "add", "alpha.ts")
@@ -154,11 +176,85 @@ describe("git super merge", () => {
     expect(leftStderr.output).toContain("left-off-main")
     expect(leftStderr.output).toContain("packages/alpha")
     expect(leftStderr.output).toContain(leftOffMain)
-    expect(leftStderr.output).toContain(left.alphaBase)
+    expect(leftStderr.output).toContain(leftMain)
     expect(git(left.product, "ls-tree", "HEAD", "packages/alpha")).toContain(leftOffMain)
     expect(git(left.product, "show", "-s", "--format=%B", "HEAD")).toContain(
-      `Settled: packages/alpha@${leftOffMain} left-off-main component-main@${left.alphaBase}`,
+      `Settled: packages/alpha@${leftOffMain} left-off-main component-main@${leftMain}`,
     )
+  })
+
+  /**
+   * M8.5: the real merge must freeze an owned ahead pin before checks, and ordinary
+   * push must advance it before root. External pins remain as written with no ref
+   * writes; unjudged local identity refuses before merge. Prior consumer fixtures
+   * manually authored trailers and could not prove the producer or its policy.
+   */
+  it.each(["owned", "external", "local"] as const)("freezes %s child disposition in the actual merge", async (kind) => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), `git-super-merge-freeze-${kind}-`))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const child = join(fixture.product, "packages/alpha")
+    const remote = join(fixtureRoot, "root.git")
+    git(fixture.product, "clone", "-q", "--bare", fixture.product, remote)
+    git(fixture.product, "config", `url.${remote}.insteadOf`, "https://git-super.test/owned/product.git")
+    git(fixture.alpha, "config", "receive.denyCurrentBranch", "ignore")
+    git(fixture.product, "switch", "-q", "-c", "candidate-frozen")
+    const pin = advanceRepository(child, "alpha.ts", "export const alpha = 'candidate'\n")
+    if (kind !== "owned") {
+      const url = kind === "external" ? "https://git-super.test/foreign/alpha.git" : fixture.alpha
+      git(fixture.product, "config", "--file", ".gitmodules", "submodule.packages/alpha.url", url)
+    }
+    git(fixture.product, "add", "packages/alpha", ".gitmodules")
+    git(fixture.product, "commit", "-q", "-m", "pin candidate alpha")
+    const candidate = git(fixture.product, "rev-parse", "HEAD")
+    git(fixture.product, "switch", "-q", "main")
+    git(child, "switch", "-q", "--detach", fixture.alphaBase)
+    const result = await superMerge({ repo: fixture.product, commit: candidate })
+    if (kind === "local") {
+      expect(result).toMatchObject({ state: "failed", partial: false, detail: { code: "invalid-frozen-push-intent" } })
+      expect(git(fixture.product, "rev-parse", "HEAD")).toBe(fixture.productBase)
+      expect(git(fixture.alpha, "rev-parse", "main")).toBe(fixture.alphaBase)
+      return
+    }
+    expect(result).toMatchObject({
+      state: "updated",
+      partial: false,
+      gitlinks: [
+        expect.objectContaining({ path: "packages/alpha", state: kind === "owned" ? "kept-ahead" : "as-written" }),
+      ],
+    })
+    const merge = git(fixture.product, "rev-parse", "HEAD")
+    expect(git(fixture.product, "show", "-s", "--format=%P", merge)).toBe(`${fixture.productBase} ${candidate}`)
+    expect(git(fixture.product, "rev-parse", "HEAD:packages/alpha")).toBe(pin)
+    const encoded = git(
+      fixture.product,
+      "show",
+      "-s",
+      `--format=%(trailers:key=${PUSH_INTENT_TRAILER},valueonly)`,
+      merge,
+    )
+    const intent = decodePushIntent(encoded)
+    const row = intent.children.find((entry) => entry.path === "packages/alpha")
+    expect(row).toMatchObject({ pin })
+    if (kind === "owned") {
+      expect(row?.publication).toMatchObject({
+        source: pin,
+        expectedDestination: { state: "oid", oid: fixture.alphaBase },
+      })
+    } else expect(row?.publication).toBeUndefined()
+    expect(git(fixture.alpha, "rev-parse", "main")).toBe(fixture.alphaBase)
+    git(child, "remote", "set-url", "origin", "https://elsewhere.test/moved/alpha.git")
+    git(fixture.product, "config", "submodule.packages/alpha.branch", "changed-after-freeze")
+    expect(
+      await superPush({
+        repo: fixture.product,
+        remote: "origin",
+        refspecs: [`${merge}:refs/heads/main`],
+        recurseSubmodules: "on-demand",
+      }),
+    ).toMatchObject({ state: "updated", partial: false })
+    expect(git(fixture.alpha, "rev-parse", "main")).toBe(kind === "owned" ? pin : fixture.alphaBase)
+    expect(git(remote, "rev-parse", "main")).toBe(merge)
   })
 
   it("raises behind pins to the component destination", async () => {
@@ -182,6 +278,66 @@ describe("git super merge", () => {
     )
     expect(git(raised.product, "ls-tree", "HEAD", "packages/alpha")).toContain(newestAlpha)
     expect(git(raised.product, "show", "-s", "--format=%B", "HEAD")).toContain(`Settled: packages/alpha@${newestAlpha}`)
+    const merge = git(raised.product, "rev-parse", "HEAD")
+    const receipt = git(raised.product, "rev-parse", `refs/git-super/receipts/${merge}`)
+    expect(git(raised.product, "show", "-s", "--format=%P", receipt)).toBe(merge)
+    expect(git(raised.product, "ls-tree", "--name-only", receipt)).toBe("receipt.json")
+    expect(JSON.parse(git(raised.product, "show", `${receipt}:receipt.json`))).toEqual({
+      version: 1,
+      merge,
+      changes: [{ path: "packages/alpha", mode: "160000", from: raised.alphaBase, to: newestAlpha }],
+    })
+  })
+
+  /**
+   * @failure A concurrent receipt writer overwrites attribution or hides a completed merge on failure.
+   * @level l1
+   * @consumer GitSuper merge receipt create-only publication
+   */
+  it.each(["identical", "conflicting"])("preserves a %s receipt created during publication", async (kind) => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-receipt-race-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
+    const candidate = candidateWithRootChange(fixture, "candidate-receipt-race")
+    const local = createLocalGitProcess()
+    const probe = injectionProbe()
+    let winner: string | undefined
+    let receiptRef: string | undefined
+    const result = await superMerge({
+      repo: fixture.product,
+      commit: candidate,
+      git: {
+        async run(request) {
+          probe.observe(request)
+          if (request.args[0] === "update-ref" && request.args[1]?.startsWith("refs/git-super/receipts/")) {
+            probe.fire("receipt-race")
+            receiptRef = request.args[1]
+            winner = kind === "identical" ? request.args[2] : git(fixture.product, "rev-parse", "HEAD")
+            if (winner === undefined) throw new Error("missing proposed receipt")
+            git(fixture.product, "update-ref", receiptRef, winner)
+          }
+          return local.run(request)
+        },
+      },
+    })
+    probe.expectFired("receipt-race")
+    const merge = git(fixture.product, "rev-parse", "HEAD")
+    expect(result).toMatchObject(
+      kind === "identical"
+        ? { state: "updated", partial: false, commit: merge }
+        : {
+            state: "failed",
+            partial: true,
+            commit: merge,
+            detail: {
+              code: "root-receipt-failed",
+              message: expect.stringContaining("conflicts with the validated payload"),
+            },
+          },
+    )
+    expect(git(fixture.product, "rev-parse", receiptRef!)).toBe(winner)
+    expect(git(fixture.product, "show", "-s", "--format=%P", merge).split(" ")).toHaveLength(2)
   })
 
   it("preserves the queue record trailer block when it adds Settled trailers", async () => {
@@ -273,7 +429,7 @@ describe("git super merge", () => {
       noVerify: true,
       git: {
         run: (request) =>
-          request.args[0] === "interpret-trailers"
+          request.args[0] === "interpret-trailers" && request.args.includes("--trailer")
             ? Promise.resolve({ code: 1, stdout: "", stderr: "injected trailer composition refusal" })
             : local.run(request),
       },
@@ -1038,6 +1194,14 @@ describe("git super merge", () => {
       await runCli(["--repo", fixture.product, "worktree", "add", worktree, "HEAD"], addedStdout, addedStderr),
     ).toBe(0)
     const worktreeAlpha = join(worktree, "packages/alpha")
+    // Each materialized child has its own config; transport rewrites are fixture-local.
+    git(worktreeAlpha, "config", `url.${fixture.alpha}.insteadOf`, "https://git-super.test/owned/alpha.git")
+    git(
+      join(worktree, "vendor/beta"),
+      "config",
+      `url.${fixture.beta}.insteadOf`,
+      "https://git-super.test/owned/beta.git",
+    )
     git(worktree, "switch", "-q", "-c", "newer-than-graph")
     git(worktreeAlpha, "checkout", "-q", targetAlpha)
     git(worktreeAlpha, "commit-graph", "write", "--reachable", "--split")
@@ -1069,7 +1233,7 @@ describe("git super merge", () => {
 
     const result = await superMerge({ repo: worktree, commit: target })
 
-    expect(result.state).toBe("updated")
+    expect(result.state, JSON.stringify(result)).toBe("updated")
     expect(result.partial).toBe(false)
     expect(git(worktree, "ls-tree", "HEAD", "packages/alpha")).toContain(newerAlpha)
   })

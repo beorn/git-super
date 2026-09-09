@@ -44,6 +44,22 @@ type FrozenSubmodule = Readonly<{
 export async function superSubmodulePrepare(
   options: SuperSubmodulePrepareOptions,
 ): Promise<SuperSubmodulePrepareResult> {
+  return prepareSubmodules(options, "commit")
+}
+
+/** Internal merge path: the caller holds this repository's mutation lock. */
+export async function prepareSubmoduleTreeUnderLock(
+  options: SuperSubmodulePrepareOptions,
+  paths: ReadonlySet<string>,
+): Promise<SuperSubmodulePrepareResult> {
+  return prepareSubmodules({ ...options, exclusive: { run: (operation) => operation() } }, "tree", paths)
+}
+
+async function prepareSubmodules(
+  options: SuperSubmodulePrepareOptions,
+  objectType: "commit" | "tree",
+  paths?: ReadonlySet<string>,
+): Promise<SuperSubmodulePrepareResult> {
   const repository = resolve(options.repo)
   const git = options.git ?? createLocalGitProcess()
   const frozenGit: GitProcess = {
@@ -59,9 +75,11 @@ export async function superSubmodulePrepare(
         detail("invalid-root-commit", "validate-root-commit", `Root commit ${options.commit} is not a full object ID.`),
       )
     }
-    await requireCommit(frozenGit, repository, options.commit)
+    await requireObject(frozenGit, repository, options.commit, objectType)
     const selectedOrigin = await rootRemote(git, repository, options.remote)
-    const frozen = await frozenSubmodules(frozenGit, repository, options.commit, selectedOrigin)
+    const frozen = (await frozenSubmodules(frozenGit, repository, options.commit, selectedOrigin)).filter(
+      (component) => paths === undefined || paths.has(component.path),
+    )
     if (frozen.length === 0) return result(repositories, [])
     const common = await commonDirectory(git, repository)
     components = frozen.map((component) => ({ ...component, gitdir: safeStorePath(common, component.name) }))
@@ -69,7 +87,9 @@ export async function superSubmodulePrepare(
     await exclusive.run(
       async () => {
         const lockedOrigin = await rootRemote(git, repository, options.remote)
-        const locked = await frozenSubmodules(frozenGit, repository, options.commit, lockedOrigin)
+        const locked = (await frozenSubmodules(frozenGit, repository, options.commit, lockedOrigin)).filter(
+          (component) => paths === undefined || paths.has(component.path),
+        )
         if (lockedOrigin !== selectedOrigin || !sameFrozen(frozen, locked)) {
           fail(
             detail(
@@ -146,14 +166,19 @@ async function required(git: GitProcess, repository: string, args: readonly stri
   return result.stdout.trim()
 }
 
-async function requireCommit(git: GitProcess, repository: string, commit: string): Promise<void> {
+async function requireObject(
+  git: GitProcess,
+  repository: string,
+  commit: string,
+  objectType: "commit" | "tree",
+): Promise<void> {
   const type = await required(git, repository, ["cat-file", "-t", commit], "validate-root-commit")
-  if (type !== "commit") {
+  if (type !== objectType) {
     fail(
       detail(
         "invalid-root-commit",
         "validate-root-commit",
-        `Root object ${commit} is a ${type}, not a commit object.`,
+        `Root object ${commit} is a ${type}, not a ${objectType} object.`,
         { objectIds: [commit] },
       ),
     )

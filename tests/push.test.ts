@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { afterEach, describe, expect, test } from "vitest"
@@ -7,6 +7,7 @@ import { runCli } from "../src/cli.ts"
 import { acquireExclusive, createExclusive, type Exclusive } from "../src/exclusive.ts"
 import { createLocalGitProcess, type GitProcess } from "../src/process.ts"
 import { pushRefUpdates, remoteContainsCommit, superPush } from "../src/push.ts"
+import { encodePushIntent, PUSH_INTENT_TRAILER } from "../src/push-intent.ts"
 import { advanceRepository, canonicalTmpdir as tmpdir, createRepository, git } from "./fixture.ts"
 
 const roots: string[] = []
@@ -1098,6 +1099,267 @@ describe("explicit recursive push mechanics", () => {
     const unpublished = advanceRepository(repository, "README.md", "two\n")
     await expect(remoteContainsCommit({ repository, remote: "origin", commit: unpublished })).resolves.toBe(false)
   })
+
+  /**
+   * M8.5 frozen recovery must reuse captured destinations after child config changes.
+   * Ordinary recursive push tests resolve current config and cannot prove this seam.
+   * Empty-tree records must retain reachable merge sources without advancing mains;
+   * published history must not replay frozen destinations on a later record push.
+   * Recovery must fetch retained child sources with the author checkout gone and
+   * preserve the checked merge without materializing a replacement worktree.
+   * Root landing atomically advances main and the ended record and deletes a leased
+   * pause ref; a stale pause lease must refuse before any child main advances.
+   * This native-Git workflow includes conflict, fetch failure, retry and cold clone;
+   * macOS CI exceeded the default 5s budget, so this one workflow is bounded at 30s.
+   */
+  test("pushes a frozen merge to its original child destination and resumes an identical result", async () => {
+    const fixture = recursivePushFixture("frozen-destination")
+    const rootUrl = "https://git-super.test/owned/root.git"
+    const childUrl = "https://git-super.test/owned/child.git"
+    git(fixture.root, "config", `url.${fixture.rootRemote}.insteadOf`, rootUrl)
+    git(fixture.child, "config", `url.${fixture.childRemote}.insteadOf`, childUrl)
+    git(fixture.root, "remote", "set-url", "origin", rootUrl)
+    git(fixture.root, "config", "--file", ".gitmodules", "submodule.child.url", childUrl)
+    git(fixture.root, "commit", "-q", "-am", "declare hosted child identity")
+    const candidate = git(fixture.root, "rev-parse", "HEAD")
+    const encoded = encodePushIntent({
+      version: 1,
+      rootRemote: rootUrl,
+      children: [
+        {
+          path: "child",
+          remote: childUrl,
+          pin: fixture.childSource,
+          publication: {
+            destination: "refs/heads/main",
+            source: fixture.childSource,
+            expectedDestination: { state: "oid", oid: fixture.childBefore },
+          },
+        },
+      ],
+    })
+    const merge = git(
+      fixture.root,
+      "commit-tree",
+      `${candidate}^{tree}`,
+      "-p",
+      fixture.rootBefore,
+      "-p",
+      candidate,
+      "-m",
+      `checked merge\n\n${PUSH_INTENT_TRAILER}: ${encoded}`,
+    )
+    git(fixture.root, "config", "submodule.child.branch", "changed-after-checks")
+    git(fixture.child, "remote", "set-url", "origin", "https://elsewhere.test/external/changed.git")
+    const options = {
+      repo: fixture.root,
+      remote: "origin",
+      refspecs: [`${merge}:refs/heads/main`],
+      recurseSubmodules: "on-demand" as const,
+    }
+
+    const emptyTree = git(fixture.root, "hash-object", "-w", "-t", "tree", "--stdin")
+    const record = git(fixture.root, "commit-tree", emptyTree, "-p", merge, "-m", "retain checked merge")
+    const recordRef = "refs/checks/frozen"
+    const pinRef = `refs/git-super/pins/${fixture.childSource}`
+    const recordOptions = { ...options, refspecs: [`${record}:${recordRef}`] }
+    git(fixture.childRemote, "update-ref", pinRef, fixture.childBefore)
+    expect(await superPush(recordOptions)).toMatchObject({ state: "failed", partial: false })
+    expect(git(fixture.rootRemote, "for-each-ref", "--format=%(refname)", recordRef)).toBe("")
+    expect(git(fixture.childRemote, "rev-parse", pinRef)).toBe(fixture.childBefore)
+    git(fixture.childRemote, "update-ref", "-d", pinRef, fixture.childBefore)
+
+    const process = createLocalGitProcess()
+    const calls: string[][] = []
+    let rejectFetch = true
+    const injected: GitProcess = {
+      run: async (request) => {
+        calls.push([...request.args])
+        if (rejectFetch && request.args[0] === "fetch" && request.args.includes(pinRef)) {
+          return { code: 73, stdout: "", stderr: "retained source fetch refused" }
+        }
+        return process.run(request)
+      },
+    }
+    expect(await superPush({ ...recordOptions, git: injected })).toMatchObject({
+      state: "failed",
+      partial: true,
+      detail: {
+        phase: "verify-retained-source-fetch",
+        message: expect.stringContaining("retained source fetch refused"),
+      },
+    })
+    expect(git(fixture.childRemote, "rev-parse", pinRef)).toBe(fixture.childSource)
+    expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(fixture.childBefore)
+    expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(fixture.rootBefore)
+    expect(git(fixture.rootRemote, "for-each-ref", "--format=%(refname)", recordRef)).toBe("")
+    rejectFetch = false
+    expect(await superPush({ ...recordOptions, git: injected })).toMatchObject({ state: "updated", partial: false })
+    expect(git(fixture.rootRemote, "rev-parse", recordRef)).toBe(record)
+    expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(fixture.childBefore)
+    expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(fixture.rootBefore)
+    const retentionPush = calls.findIndex(
+      (args) => args[0] === "push" && args.includes(`${fixture.childSource}:${pinRef}`),
+    )
+    const retentionFetch = calls.findIndex((args) => args[0] === "fetch" && args.includes(pinRef))
+    const recordPush = calls.findIndex((args) => args[0] === "push" && args.includes(`${record}:${recordRef}`))
+    expect(retentionPush).toBeGreaterThanOrEqual(0)
+    expect(retentionFetch).toBeGreaterThan(retentionPush)
+    expect(recordPush).toBeGreaterThan(retentionFetch)
+
+    const cold = join(fixture.fixture, "cold")
+    git(fixture.fixture, "clone", "-q", "--no-checkout", "--no-local", fixture.rootRemote, cold)
+    git(cold, "fetch", "-q", "origin", `${recordRef}:${recordRef}`)
+    git(cold, "remote", "set-url", "origin", rootUrl)
+    git(cold, "config", "submodule.child.branch", "changed-after-restart")
+    expect(existsSync(join(cold, ".git", "objects", "info", "alternates"))).toBe(false)
+    expect(existsSync(join(cold, ".git", "modules", "child"))).toBe(false)
+    rmSync(fixture.root, { recursive: true, force: true })
+    expect(existsSync(fixture.root)).toBe(false)
+    const coldProcess = createLocalGitProcess({
+      ...globalThis.process.env,
+      GIT_CONFIG_COUNT: "2",
+      GIT_CONFIG_KEY_0: `url.${fixture.rootRemote}.insteadOf`,
+      GIT_CONFIG_VALUE_0: rootUrl,
+      GIT_CONFIG_KEY_1: `url.${fixture.childRemote}.insteadOf`,
+      GIT_CONFIG_VALUE_1: childUrl,
+    })
+    const recoveryCalls: string[][] = []
+    const recoveryGit: GitProcess = {
+      run: (request) => {
+        recoveryCalls.push([...request.args])
+        return coldProcess.run(request)
+      },
+    }
+    const pauseRef = "refs/holds/check"
+    git(fixture.rootRemote, "update-ref", pauseRef, candidate)
+    const ended = git(cold, "commit-tree", emptyTree, "-p", record, "-m", "ended record")
+    const recoveryOptions = {
+      ...options,
+      repo: cold,
+      git: recoveryGit,
+      atomic: true,
+      refspecs: [`${merge}:refs/heads/main`, `${ended}:${recordRef}`, `:${pauseRef}`],
+      forceWithLease: [
+        `refs/heads/main:${fixture.rootBefore}`,
+        `${recordRef}:${record}`,
+        `${pauseRef}:${fixture.rootBefore}`,
+      ],
+    }
+    expect(
+      await superPush({ ...recoveryOptions, forceWithLease: recoveryOptions.forceWithLease.slice(0, 2) }),
+    ).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: { code: "missing-delete-lease" },
+    })
+    expect(await superPush(recoveryOptions)).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: { code: "destination-changed" },
+    })
+    expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(fixture.childBefore)
+    expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(fixture.rootBefore)
+    expect(git(fixture.rootRemote, "rev-parse", recordRef)).toBe(record)
+    expect(git(fixture.rootRemote, "rev-parse", pauseRef)).toBe(candidate)
+    git(fixture.rootRemote, "update-ref", pauseRef, fixture.rootBefore, candidate)
+    expect(await superPush(recoveryOptions)).toMatchObject({ state: "updated", partial: false })
+    expect(git(fixture.rootRemote, "rev-parse", recordRef)).toBe(ended)
+    expect(git(fixture.rootRemote, "for-each-ref", "--format=%(refname)", pauseRef)).toBe("")
+    expect(recoveryCalls.filter((args) => args[0] === "push" && args.includes(`${merge}:refs/heads/main`))).toEqual([
+      expect.arrayContaining([
+        "--atomic",
+        `${ended}:${recordRef}`,
+        `:${pauseRef}`,
+        `--force-with-lease=${pauseRef}:${fixture.rootBefore}`,
+      ]),
+    ])
+    expect(recoveryCalls.some((args) => args[0] === "fetch" && args.includes(pinRef))).toBe(true)
+    expect(recoveryCalls.some((args) => ["merge", "commit-tree", "worktree"].includes(args[0] ?? ""))).toBe(false)
+    expect(existsSync(join(cold, "child"))).toBe(false)
+    expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(fixture.childSource)
+    expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(merge)
+    expect(git(fixture.childRemote, "for-each-ref", "--format=%(refname)", "refs/heads/changed-after-checks")).toBe("")
+    expect(await superPush(recoveryOptions)).toMatchObject({ state: "unchanged", partial: false })
+
+    const third = git(
+      fixture.childRemote,
+      "commit-tree",
+      `${fixture.childSource}^{tree}`,
+      "-p",
+      fixture.childSource,
+      "-m",
+      "later independent main",
+    )
+    git(fixture.childRemote, "update-ref", "refs/heads/main", third, fixture.childSource)
+    const laterRecord = git(cold, "commit-tree", emptyTree, "-p", ended, "-m", "later record")
+    expect(
+      await superPush({ ...recordOptions, repo: cold, git: recoveryGit, refspecs: [`${laterRecord}:${recordRef}`] }),
+    ).toMatchObject({
+      state: "updated",
+      partial: false,
+    })
+    expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(third)
+    expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(merge)
+  }, 30_000)
+
+  /** M8.5: malformed or externally targeted saved intent must refuse before any ref write. */
+  test.each(["duplicate-field", "external-remote", "invalid-base64"] as const)(
+    "refuses %s frozen intent without publishing",
+    async (condition) => {
+      const fixture = recursivePushFixture(`frozen-${condition}`)
+      const rootUrl = "https://git-super.test/owned/root.git"
+      git(fixture.root, "config", `url.${fixture.rootRemote}.insteadOf`, rootUrl)
+      git(fixture.root, "remote", "set-url", "origin", rootUrl)
+      let json = JSON.stringify({
+        version: 1,
+        rootRemote: rootUrl,
+        children: [
+          {
+            path: "child",
+            remote:
+              condition === "external-remote"
+                ? "https://git-super.test/external/child.git"
+                : "https://git-super.test/owned/child.git",
+            pin: fixture.childSource,
+            publication: {
+              destination: "refs/heads/main",
+              source: fixture.childSource,
+              expectedDestination: { state: "oid", oid: fixture.childBefore },
+            },
+          },
+        ],
+      })
+      if (condition === "duplicate-field") json = json.replace('{"version":1,', '{"version":0,"version":1,')
+      const encoded = condition === "invalid-base64" ? "%%%" : Buffer.from(json).toString("base64")
+      const merge = git(
+        fixture.root,
+        "commit-tree",
+        `${fixture.rootSource}^{tree}`,
+        "-p",
+        fixture.rootBefore,
+        "-p",
+        fixture.rootSource,
+        "-m",
+        `invalid merge\n\n${PUSH_INTENT_TRAILER}: ${encoded}`,
+      )
+
+      expect(
+        await superPush({
+          repo: fixture.root,
+          remote: "origin",
+          refspecs: [`${merge}:refs/heads/main`],
+          recurseSubmodules: "on-demand",
+        }),
+      ).toMatchObject({
+        state: "failed",
+        partial: false,
+        detail: { code: "invalid-frozen-push-intent" },
+      })
+      expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(fixture.childBefore)
+      expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(fixture.rootBefore)
+    },
+  )
 
   test("reports child success followed by root rejection as partial without rollback", async () => {
     const root = pushFixture("partial-root")

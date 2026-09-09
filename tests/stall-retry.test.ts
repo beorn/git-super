@@ -62,15 +62,17 @@ describe("withStallRetry", () => {
     expect(announced).toHaveBeenNthCalledWith(2, expect.stringContaining("retry 3/3"))
   })
 
-  test("gives up after the attempt cap and reports the stall rather than hiding it", async () => {
+  test.each([1, 3] as const)("reports a stalled read after the selected %i attempt cap", async (attempts) => {
     const announced = vi.spyOn(console, "error").mockImplementation(() => {})
     const inner = scripted([STALL])
-    const result = await withStallRetry(inner).run(req(["ls-remote", "origin"]))
-    expect(result.timedOut).toBe(true)
-    expect(inner.calls).toHaveLength(3)
-    expect(announced).toHaveBeenCalledTimes(2)
-    expect(announced).toHaveBeenNthCalledWith(1, expect.stringContaining("retry 2/3"))
-    expect(announced).toHaveBeenNthCalledWith(2, expect.stringContaining("retry 3/3"))
+    const result = await withStallRetry(inner, { attempts }).run(req(["ls-remote", "origin"]))
+    expect(result).toBe(STALL)
+    expect(inner.calls).toHaveLength(attempts)
+    expect(announced).toHaveBeenCalledTimes(attempts - 1)
+    if (attempts === 3) {
+      expect(announced).toHaveBeenNthCalledWith(1, expect.stringContaining("retry 2/3"))
+      expect(announced).toHaveBeenNthCalledWith(2, expect.stringContaining("retry 3/3"))
+    }
   })
 
   // The dangerous direction. A stalled mutation may ALREADY have reached the

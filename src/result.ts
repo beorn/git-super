@@ -5,6 +5,7 @@ export type ExpectedDestination = Readonly<{ state: "missing" }> | Readonly<{ st
 export type RefUpdate = Readonly<{
   repository: string
   remote: string
+  /** Exact object ID, or an empty source for deletion with an explicit expected destination. */
   source: string
   destination: string
   expectedDestination?: ExpectedDestination

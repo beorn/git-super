@@ -60,7 +60,35 @@ export async function readCommitSubmodules(
         ),
       })
     }
-    gitlinks.set(entry.slice(separator + 1), match[3])
+    const path = entry.slice(separator + 1)
+    const invalidPath = (reason: string): never => {
+      throw Object.assign(new Error(`target ${commit} has an unsupported gitlink path: ${reason}`), {
+        resultDetail: detail(
+          "invalid-target-gitlink-path",
+          "read-target-tree",
+          `Target ${commit} has an unsupported gitlink path: ${reason}.`,
+          {
+            paths: [path],
+            objectIds: [commit],
+            remedy: "Use unique UTF-8 root-relative gitlink paths without traversal or backslashes.",
+          },
+        ),
+      })
+    }
+    if (
+      path.includes("\\") ||
+      path.includes("\0") ||
+      path.split("/").some((part) => part === "" || part === "." || part === "..") ||
+      gitlinks.has(path)
+    ) {
+      invalidPath("path is not unique and root-relative")
+    }
+    // A replacement-decoded byte path must not become a different valid Unicode path.
+    const literalArgs = ["--literal-pathspecs", "ls-tree", "-r", "-z", "--full-tree", commit, "--", path]
+    const literal = await git.run({ repo: repository, args: literalArgs })
+    if (gitProcessFailed(literal)) throw operationError(repository, "read-target-tree", literalArgs, literal)
+    if (literal.stdout !== `${entry}\0`) invalidPath("native tree path does not match its UTF-8 representation")
+    gitlinks.set(path, match[3])
   }
   const manifestArgs = ["ls-tree", commit, "--", ".gitmodules"]
   const manifest = await git.run({ repo: repository, args: manifestArgs })
