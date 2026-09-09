@@ -365,9 +365,9 @@ describe("explicit recursive push mechanics", () => {
   })
 
   /**
-   * @failure Recursive push sends a local task tip to the wrong component branch.
+   * @failure Recursive push sends a local task tip to the wrong submodule branch.
    * @level l1
-   * @consumer Configured component forwarding and child-first queue publication
+   * @consumer Configured submodule forwarding and child-first queue publication
    */
   test.each(["manifest", "override", "remote-head", "dot"] as const)(
     "on-demand publishes only the captured pin using %s branch selection",
@@ -446,7 +446,7 @@ describe("explicit recursive push mechanics", () => {
   })
 
   /**
-   * @failure Publishing an older root pin attempts to rewind its already-ahead component branch.
+   * @failure Publishing an older root pin attempts to rewind its already-ahead submodule branch.
    * @level l1
    * @consumer Recursive publication of commits already contained at the configured destination
    */

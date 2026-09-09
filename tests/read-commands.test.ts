@@ -285,7 +285,7 @@ describe("Phase 1 read commands", () => {
     expect(cached.paths).toEqual(["root.ts"])
   })
 
-  test("requires an exact commit and explicit remote for JSON component preparation", async () => {
+  test("requires an exact commit and explicit remote for JSON submodule preparation", async () => {
     // The prepare command has no HEAD or stored-origin fallback. Existing CLI
     // coverage exercises read output but not this persistent-store boundary.
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-prepare-cli-"))
@@ -328,7 +328,7 @@ describe("Phase 1 read commands", () => {
       ),
     ).toBe(0)
     expect(errors.output).toBe("")
-    expect(JSON.parse(output.output)).toMatchObject({ state: "unchanged", partial: false, components: [] })
+    expect(JSON.parse(output.output)).toMatchObject({ state: "unchanged", partial: false, submodules: [] })
   })
 
   test.each([
@@ -359,7 +359,7 @@ describe("Phase 1 read commands", () => {
       state: "failed",
       partial: false,
       detail: { code: "invalid-root-commit", phase: "validate-root-commit" },
-      components: [],
+      submodules: [],
     })
   })
 })

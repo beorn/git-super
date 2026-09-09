@@ -29,7 +29,7 @@ export type SuperMergeResult = GitSuperResult &
   Readonly<{
     commit?: string
     gitlinks: readonly SuperMergeGitlinkResult[]
-    /** Additive recovery evidence for component checkouts touched by a merge. */
+    /** Additive recovery evidence for submodule checkouts touched by a merge. */
     checkouts?: readonly SuperMergeCheckoutResult[]
   }>
 
@@ -165,10 +165,10 @@ async function mergeUnderLock(
       [],
       obviousDetail(
         "gitlink-off-main",
-        `Merge ${target} would change ${refusal.path} to ${refusal.from}, which fetched component main ${refusal.to} does not contain.`,
+        `Merge ${target} would change ${refusal.path} to ${refusal.from}, which fetched submodule main ${refusal.to} does not contain.`,
         `git -C ${join(root, refusal.path)} merge-base --is-ancestor ${refusal.from} ${refusal.to}`,
-        `Rebase ${refusal.path} onto its configured component branch, then rerun the same git super merge command.`,
-        "the component writer",
+        `Rebase ${refusal.path} onto its configured submodule branch, then rerun the same git super merge command.`,
+        "the submodule writer",
         { paths: [refusal.path], objectIds: [refusal.from, refusal.to] },
       ),
     )
@@ -179,7 +179,7 @@ async function mergeUnderLock(
   const trailers = visiblePlans.map((plan) =>
     plan.state === "raised"
       ? `Settled: ${plan.path}@${plan.to}`
-      : `Settled: ${plan.path}@${plan.from} ${plan.state} component-main@${plan.to}`,
+      : `Settled: ${plan.path}@${plan.from} ${plan.state} submodule-main@${plan.to}`,
   )
   try {
     const parsed = await run(git, root, ["interpret-trailers", "--parse"], timeoutMs, requestedMessage)
@@ -230,7 +230,7 @@ async function mergeUnderLock(
     settledMessage = trailerResult.stdout
   }
 
-  const prepared = await prepareComponentCheckouts(git, root, planned.checkouts, timeoutMs)
+  const prepared = await prepareSubmoduleCheckouts(git, root, planned.checkouts, timeoutMs)
   if ("failure" in prepared) return failed(root, [], prepared.failure, prepared.rows)
   const preparedCheckouts = prepared.checkouts
   const preparedRows = checkoutResults(preparedCheckouts)
@@ -294,9 +294,9 @@ async function mergeUnderLock(
     completed.push({ ...raise })
   }
 
-  const settledCheckouts = await settleComponentCheckouts(git, root, preparedCheckouts, timeoutMs)
+  const settledCheckouts = await settleSubmoduleCheckouts(git, root, preparedCheckouts, timeoutMs)
   if (settledCheckouts.failure !== undefined) {
-    const restored = await restoreComponentCheckouts(git, root, preparedCheckouts, settledCheckouts.rows, timeoutMs)
+    const restored = await restoreSubmoduleCheckouts(git, root, preparedCheckouts, settledCheckouts.rows, timeoutMs)
     const failure = restored.failure
     const evidence = formatCheckoutEvidence(restored.rows)
     return partial(
@@ -305,12 +305,12 @@ async function mergeUnderLock(
       completed,
       failure === undefined
         ? resultDetailFromGit(
-            "component-checkout-failed",
-            "settle-component-checkout",
+            "submodule-checkout-failed",
+            "settle-submodule-checkout",
             join(root, settledCheckouts.failure.plan.path),
             settledCheckouts.failure.args,
             settledCheckouts.failure.result,
-            `The prospective merge remains uncommitted because ${settledCheckouts.failure.plan.path} could not be checked out at staged index pin ${settledCheckouts.failure.plan.index}; every affected component checkout was restored to its recorded pin.`,
+            `The prospective merge remains uncommitted because ${settledCheckouts.failure.plan.path} could not be checked out at staged index pin ${settledCheckouts.failure.plan.index}; every affected submodule checkout was restored to its recorded pin.`,
             evidence,
             "Inspect the preserved root merge and the named checkout failure before deciding whether a retry is safe.",
             "the caller",
@@ -321,7 +321,7 @@ async function mergeUnderLock(
           )
         : rollbackFailureDetail(
             root,
-            "component checkout preparation",
+            "submodule checkout preparation",
             settledCheckouts.failure,
             failure,
             restored.rows,
@@ -345,9 +345,9 @@ async function mergeUnderLock(
           root,
           ["rev-parse", "HEAD^{commit}"],
           observedHead,
-          `Git reported that the settled merge commit failed, and HEAD could not be read, so component checkouts were not rolled back.`,
+          `Git reported that the settled merge commit failed, and HEAD could not be read, so submodule checkouts were not rolled back.`,
           formatCheckoutEvidence(settledCheckouts.rows),
-          "Preserve the root and component checkouts until the commit outcome is known.",
+          "Preserve the root and submodule checkouts until the commit outcome is known.",
           "the caller",
         ),
         settledCheckouts.rows,
@@ -365,7 +365,7 @@ async function mergeUnderLock(
           root,
           commitArgs,
           committed,
-          `Git reported that the settled merge commit failed, but HEAD moved from ${head} to ${observedCommit}; component checkouts remain at the staged pins.`,
+          `Git reported that the settled merge commit failed, but HEAD moved from ${head} to ${observedCommit}; submodule checkouts remain at the staged pins.`,
           formatCheckoutEvidence(settledCheckouts.rows),
           "Preserve the observed commit and inspect the named Git failure before any retry.",
           "the caller",
@@ -375,7 +375,7 @@ async function mergeUnderLock(
       )
     }
 
-    const restored = await restoreComponentCheckouts(git, root, preparedCheckouts, settledCheckouts.rows, timeoutMs)
+    const restored = await restoreSubmoduleCheckouts(git, root, preparedCheckouts, settledCheckouts.rows, timeoutMs)
     const evidence = formatCheckoutEvidence(restored.rows)
     return partial(
       root,
@@ -388,9 +388,9 @@ async function mergeUnderLock(
             root,
             commitArgs,
             committed,
-            `The prospective merge of ${target} and its Settled report remain staged, the concluding commit was not written, and every component checkout was restored to its recorded pin.`,
+            `The prospective merge of ${target} and its Settled report remain staged, the concluding commit was not written, and every submodule checkout was restored to its recorded pin.`,
             evidence,
-            "Inspect the preserved root merge and named Git failure; move each component to its staged index pin before retrying the commit.",
+            "Inspect the preserved root merge and named Git failure; move each submodule to its staged index pin before retrying the commit.",
             "the caller",
           )
         : rollbackFailureDetail(root, "the rejected settled merge commit", undefined, restored.failure, restored.rows),
@@ -536,7 +536,7 @@ async function writeRootReceipt(
   throw operationError(root, phase, args, published)
 }
 
-async function prepareComponentCheckouts(
+async function prepareSubmoduleCheckouts(
   git: GitProcess,
   root: string,
   plans: readonly GitlinkCheckoutPlan[],
@@ -547,19 +547,19 @@ async function prepareComponentCheckouts(
 > {
   const checkouts: PreparedCheckout[] = []
   for (const plan of plans) {
-    const component = join(root, plan.path)
+    const submodule = join(root, plan.path)
     const args = ["rev-parse", "HEAD^{commit}"]
-    const observed = await run(git, component, args, timeoutMs)
+    const observed = await run(git, submodule, args, timeoutMs)
     if (observed.code !== 0) {
       return {
         failure: resultDetailFromGit(
-          "component-checkout-unreadable",
-          "prepare-component-checkout",
-          component,
+          "submodule-checkout-unreadable",
+          "prepare-submodule-checkout",
+          submodule,
           args,
           observed,
           `The pre-merge checkout pin for ${plan.path} could not be read, so no merge was started.`,
-          `git -C ${component} rev-parse HEAD^{commit}`,
+          `git -C ${submodule} rev-parse HEAD^{commit}`,
           `Restore an initialized checkout for ${plan.path} at recorded pin ${plan.recorded}, then rerun the merge.`,
           "the caller",
           { paths: [plan.path], objectIds: [plan.recorded, plan.index] },
@@ -577,7 +577,7 @@ async function prepareComponentCheckouts(
       }
       return {
         failure: obviousDetail(
-          "component-checkout-drift",
+          "submodule-checkout-drift",
           `Before the merge, ${plan.path} records ${plan.recorded} but its checkout is ${preCheckout}; no merge was started.`,
           formatCheckoutEvidence([row]),
           `Restore ${plan.path} to recorded pin ${plan.recorded}, then rerun the merge.`,
@@ -606,18 +606,18 @@ async function validateWorktreeStatus(
   if (unexpectedRootRecords.length > 0) return dirtyWorktreeDetail(root, commit, unexpectedRootRecords)
 
   for (const plan of alreadySettled) {
-    const component = join(root, plan.path)
+    const submodule = join(root, plan.path)
     const args = ["status", "--porcelain=v1", "-z", "--untracked-files=all"]
-    const componentStatus = await run(git, component, args, timeoutMs)
-    if (componentStatus.code !== 0) {
-      return resultDetailFromGit("git-failed", "verify-clean", component, args, componentStatus)
+    const submoduleStatus = await run(git, submodule, args, timeoutMs)
+    if (submoduleStatus.code !== 0) {
+      return resultDetailFromGit("git-failed", "verify-clean", submodule, args, submoduleStatus)
     }
-    const componentRecords = nulRecords(componentStatus.stdout)
-    if (componentRecords.length > 0) {
+    const submoduleRecords = nulRecords(submoduleStatus.stdout)
+    if (submoduleRecords.length > 0) {
       return dirtyWorktreeDetail(
         root,
         commit,
-        componentRecords.map((record) => `${plan.path}: ${record}`),
+        submoduleRecords.map((record) => `${plan.path}: ${record}`),
       )
     }
   }
@@ -647,7 +647,7 @@ function checkoutResults(plans: readonly PreparedCheckout[]): SuperMergeCheckout
   }))
 }
 
-async function settleComponentCheckouts(
+async function settleSubmoduleCheckouts(
   git: GitProcess,
   root: string,
   plans: readonly PreparedCheckout[],
@@ -663,15 +663,15 @@ async function settleComponentCheckouts(
     const plan = plans[index]
     if (plan === undefined) continue
     if (plan.preCheckout === plan.index) continue
-    const component = join(root, plan.path)
+    const submodule = join(root, plan.path)
     const args = ["checkout", "--detach", plan.index]
-    const checkedOut = await run(git, component, args, timeoutMs)
+    const checkedOut = await run(git, submodule, args, timeoutMs)
     if (checkedOut.code !== 0) {
       rows[index] = { ...plan, checkout: plan.preCheckout, state: "settle-failed" }
       return { rows, failure: { plan, args, result: checkedOut } }
     }
     const observeArgs = ["rev-parse", "HEAD^{commit}"]
-    const observed = await run(git, component, observeArgs, timeoutMs)
+    const observed = await run(git, submodule, observeArgs, timeoutMs)
     const checkout = observed.stdout.trim()
     if (observed.code !== 0 || checkout !== plan.index) {
       const result =
@@ -690,7 +690,7 @@ async function settleComponentCheckouts(
   return { rows }
 }
 
-async function restoreComponentCheckouts(
+async function restoreSubmoduleCheckouts(
   git: GitProcess,
   root: string,
   plans: readonly PreparedCheckout[],
@@ -704,10 +704,10 @@ async function restoreComponentCheckouts(
     if (plan === undefined) continue
     const row = rows[index]
     if (row?.state !== "settled" && row?.state !== "settle-failed") continue
-    const component = join(root, plan.path)
+    const submodule = join(root, plan.path)
     const args = ["checkout", "--detach", plan.recorded]
-    const restored = await run(git, component, args, timeoutMs)
-    const observed = await run(git, component, ["rev-parse", "HEAD^{commit}"], timeoutMs)
+    const restored = await run(git, submodule, args, timeoutMs)
+    const observed = await run(git, submodule, ["rev-parse", "HEAD^{commit}"], timeoutMs)
     const checkout = observed.code === 0 ? observed.stdout.trim() : undefined
     if (restored.code !== 0 || checkout !== plan.recorded) {
       const result =
@@ -730,7 +730,7 @@ async function restoreComponentCheckouts(
 }
 
 function formatCheckoutEvidence(rows: readonly SuperMergeCheckoutResult[]): string {
-  if (rows.length === 0) return "component-checkouts: none"
+  if (rows.length === 0) return "submodule-checkouts: none"
   return rows
     .map(
       (row) =>
@@ -752,14 +752,14 @@ function rollbackFailureDetail(
       ? cause
       : `${cause} failed for ${checkoutFailure.plan.path} before ${path} rollback was attempted`
   return resultDetailFromGit(
-    "component-checkout-rollback-failed",
-    "restore-component-checkout",
+    "submodule-checkout-rollback-failed",
+    "restore-submodule-checkout",
     join(root, path),
     rollbackFailure.args,
     rollbackFailure.result,
     `The root merge remains preserved after ${causeText}, but ${path} could not be restored exactly to recorded pin ${rollbackFailure.plan.recorded}.`,
     formatCheckoutEvidence(rows),
-    "Do not retry the commit; preserve the root and components, restore every restore-failed row to its recorded pin, then prove recorded, index, and checkout pins again.",
+    "Do not retry the commit; preserve the root and submodules, restore every restore-failed row to its recorded pin, then prove recorded, index, and checkout pins again.",
     "the caller",
     {
       paths: rows.filter((row) => row.state === "restore-failed").map((row) => row.path),
@@ -792,12 +792,12 @@ async function prospectiveTree(
   if (unreadable !== undefined) {
     return {
       failure: resultDetailFromGit(
-        "component-history-unreadable",
+        "submodule-history-unreadable",
         "preflight-merge",
         root,
         args,
         result,
-        `The prospective merge of ${target} into ${head} could not read component history object ${unreadable}; no commit was written.`,
+        `The prospective merge of ${target} into ${head} could not read submodule history object ${unreadable}; no commit was written.`,
         `git -C ${root} ${args.join(" ")}`,
         "Repair the named object or its commit graph, then rerun the same git super merge command.",
         "the caller",
@@ -896,24 +896,24 @@ async function planGitlinks(
   if (added.size > 0 && rootRemote !== undefined) {
     const prepared = await prepareSubmoduleTreeUnderLock({ repo: root, commit: tree, remote: rootRemote, git }, added)
     if (prepared.state === "failed" || prepared.state === "unknown") {
-      const message = prepared.detail?.message ?? `Cannot prepare components added by tree ${tree} in ${root}`
+      const message = prepared.detail?.message ?? `Cannot prepare submodules added by tree ${tree} in ${root}`
       throw Object.assign(new Error(message), { resultDetail: prepared.detail })
     }
-    for (const component of prepared.components) {
+    for (const submodule of prepared.submodules) {
       await ensureCommitObject({
-        repository: component.gitdir,
-        remote: component.url,
-        commit: component.gitlink,
+        repository: submodule.gitdir,
+        remote: submodule.url,
+        commit: submodule.gitlink,
         timeoutMs,
         git,
       })
-      stores.set(component.path, component.gitdir)
+      stores.set(submodule.path, submodule.gitdir)
     }
   }
   const plans: GitlinkPlan[] = []
   const checkouts = new Map<string, GitlinkCheckoutPlan>()
   for (const entry of merged) {
-    const component = stores.get(entry.path) ?? join(root, entry.path)
+    const submodule = stores.get(entry.path) ?? join(root, entry.path)
     const recordedBefore = before.get(entry.path)
     const recorded = recordedBefore ?? entry.target
     const changedByMerge = recordedBefore !== entry.target
@@ -929,14 +929,14 @@ async function planGitlinks(
       plans.push({ path: entry.path, from: entry.target, to: entry.target, state: "as-written", changedByMerge })
       continue
     }
-    const main = await fetchComponentMain(git, root, component, entry, timeoutMs)
+    const main = await fetchSubmoduleMain(git, root, submodule, entry, timeoutMs)
     if (entry.target === main) {
       if (changedByMerge && recordedBefore !== undefined) {
         checkouts.set(entry.path, { path: entry.path, recorded, index: entry.target })
       }
       continue
     }
-    const ancestry = await run(git, component, ["merge-base", "--is-ancestor", entry.target, main], timeoutMs)
+    const ancestry = await run(git, submodule, ["merge-base", "--is-ancestor", entry.target, main], timeoutMs)
     if (ancestry.code === 0) {
       if (recordedBefore !== undefined) checkouts.set(entry.path, { path: entry.path, recorded, index: main })
       plans.push({
@@ -950,9 +950,9 @@ async function planGitlinks(
     }
     if (ancestry.code === 1) {
       const reverseArgs = ["merge-base", "--is-ancestor", main, entry.target]
-      const reverse = await run(git, component, reverseArgs, timeoutMs)
+      const reverse = await run(git, submodule, reverseArgs, timeoutMs)
       if (reverse.code !== 0 && reverse.code !== 1) {
-        throw operationError(component, "prove-gitlink-ahead", reverseArgs, reverse)
+        throw operationError(submodule, "prove-gitlink-ahead", reverseArgs, reverse)
       }
       if (changedByMerge && recordedBefore !== undefined) {
         checkouts.set(entry.path, { path: entry.path, recorded, index: entry.target })
@@ -967,7 +967,7 @@ async function planGitlinks(
       continue
     }
     throw operationError(
-      component,
+      submodule,
       "prove-gitlink-on-main",
       ["merge-base", "--is-ancestor", entry.target, main],
       ancestry,
@@ -1009,49 +1009,49 @@ async function mergeApplicationFailure(
   return changed ? partial(root, commit, [], detail) : failed(root, [], detail)
 }
 
-async function fetchComponentMain(
+async function fetchSubmoduleMain(
   git: GitProcess,
   superproject: string,
-  component: string,
+  submodule: string,
   entry: CommitSubmodule,
   timeoutMs: number,
 ): Promise<string> {
   const branch = await resolveSubmoduleBranch(
     { run: (request) => git.run({ ...request, timeoutMs }) },
     superproject,
-    component,
+    submodule,
     entry,
     "origin",
   )
   const { path, target: pin } = entry
   const fetchArgs = ["fetch", "--no-tags", "origin", `+refs/heads/${branch}:refs/remotes/origin/${branch}`]
-  const fetched = await run(git, component, fetchArgs, timeoutMs)
-  if (fetched.code !== 0) throw componentMainError(component, path, pin, fetchArgs, fetched)
+  const fetched = await run(git, submodule, fetchArgs, timeoutMs)
+  if (fetched.code !== 0) throw submoduleMainError(submodule, path, pin, fetchArgs, fetched)
   const resolveArgs = ["rev-parse", `refs/remotes/origin/${branch}^{commit}`]
-  const resolved = await run(git, component, resolveArgs, timeoutMs)
-  if (resolved.code !== 0) throw componentMainError(component, path, pin, resolveArgs, resolved)
+  const resolved = await run(git, submodule, resolveArgs, timeoutMs)
+  if (resolved.code !== 0) throw submoduleMainError(submodule, path, pin, resolveArgs, resolved)
   return resolved.stdout.trim()
 }
 
-function componentMainError(
-  component: string,
+function submoduleMainError(
+  submodule: string,
   path: string,
   pin: string,
   args: readonly string[],
   result: GitProcessResult,
 ): Error & Readonly<{ resultDetail: GitResultDetail }> {
   return operationError(
-    component,
-    "read-component-main",
+    submodule,
+    "read-submodule-main",
     args,
     result,
     obviousDetail(
-      "component-main-unreadable",
-      `Component main for ${path} could not be read while inspecting gitlink ${pin}.`,
-      `git -C ${component} ${args.join(" ")}`,
-      `Repair access to the configured component branch named in the Git command, then rerun the same git super merge command.`,
-      "the component writer",
-      { paths: [path], objectIds: [pin], phase: "read-component-main" },
+      "submodule-main-unreadable",
+      `Submodule main for ${path} could not be read while inspecting gitlink ${pin}.`,
+      `git -C ${submodule} ${args.join(" ")}`,
+      `Repair access to the configured submodule branch named in the Git command, then rerun the same git super merge command.`,
+      "the submodule writer",
+      { paths: [path], objectIds: [pin], phase: "read-submodule-main" },
     ),
   )
 }

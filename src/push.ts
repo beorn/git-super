@@ -1013,7 +1013,7 @@ async function prepareFrozenChildren(
       )
     throw Object.assign(new Error(failure.message), { resultDetail: failure })
   }
-  return new Map(prepared.components.map((entry) => [entry.path, entry]))
+  return new Map(prepared.submodules.map((entry) => [entry.path, entry]))
 }
 
 async function collectCommitRequirements(

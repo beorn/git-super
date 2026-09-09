@@ -168,10 +168,10 @@ async function prepared(
   const result = await superSubmodulePrepare({ repo, commit, remote, git })
   if (result.state !== "updated" && result.state !== "unchanged") {
     throw new Error(
-      result.detail?.message ?? `Root ${commit}: component store preparation ended ${result.state} in ${repo}`,
+      result.detail?.message ?? `Root ${commit}: submodule store preparation ended ${result.state} in ${repo}`,
     )
   }
-  return result.components
+  return result.submodules
 }
 
 async function advertisements(git: GitProcess, repo: string, remote: string): Promise<Map<string, string>> {
@@ -277,7 +277,7 @@ export async function observe(repo: string, value: unknown, process?: GitProcess
       version: 1,
       outcome: "observed",
       notices,
-      message: `${input.root.remote} ${input.root.targetRef} at ${input.root.targetOid}: examined ${examined} owned direct components; excluded ${external} external components. Root and all selected refs still match the captured reading.`,
+      message: `${input.root.remote} ${input.root.targetRef} at ${input.root.targetOid}: examined ${examined} owned direct submodules; excluded ${external} external submodules. Root and all selected refs still match the captured reading.`,
     }
   } catch (error) {
     return {

@@ -96,7 +96,7 @@ const mergeBase = commandNode<CommandContext, MergeBaseParams, SuperIsAncestorRe
 
 const merge = commandNode<CommandContext, MergeParams, SuperMergeResult>({
   title: "Merge and settle a superproject",
-  description: "Merge one commit, stage component-main gitlinks, settle their checkouts, then commit once.",
+  description: "Merge one commit, stage submodule-main gitlinks, settle their checkouts, then commit once.",
   params: params(
     (value) => {
       const input = record(value)
@@ -185,7 +185,7 @@ const gitlinkWrite = commandNode<CommandContext, GitlinkWriteParams, GitSuperRes
 })
 
 const submodulePrepare = commandNode<CommandContext, SubmodulePrepareParams, SuperSubmodulePrepareResult>({
-  title: "Prepare persistent component stores",
+  title: "Prepare persistent submodule stores",
   description: "Bind direct gitlinks from one exact root commit to durable checkout-free Git directories.",
   params: params(
     (value) => {

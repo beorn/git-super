@@ -237,7 +237,7 @@ describe("git super pull --ff-only", () => {
     ).toMatchObject({ state: "unchanged", partial: false })
   })
 
-  test("preserves an ahead root and its newer component pins in dry-run and actual pull", async () => {
+  test("preserves an ahead root and its newer submodule pins in dry-run and actual pull", async () => {
     // A feature branch already contains the remote target. The equal-root and
     // forward-pull cases do not catch rejecting it or restoring the older pins.
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-pull-ahead-"))
@@ -271,7 +271,7 @@ describe("git super pull --ff-only", () => {
       expect(result.repositories.map((repository) => repository.state)).toEqual(["unchanged", "unchanged", "unchanged"])
       expect(result.repositories[0]?.refs).toEqual([{ destination: "HEAD", source: head, state: "unchanged" }])
       expect(result.detail).toMatchObject({ code: "already-up-to-date", objectIds: [head, fixture.productBase] })
-      expect(result.detail?.message).toContain("kept the current root tree and its recorded component pins")
+      expect(result.detail?.message).toContain("kept the current root tree and its recorded submodule pins")
       expect(git(checkout, "rev-parse", "HEAD")).toBe(head)
       expect(git(checkout, "write-tree")).toBe(index)
       expect(git(checkout, "status", "--short")).toBe("")

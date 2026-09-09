@@ -136,7 +136,7 @@ async function planPull(git: GitProcess, options: SuperPullOptions): Promise<Pul
       rootDetail = detail(
         "already-up-to-date",
         "prove-root-ancestry",
-        `Target ${target} is an ancestor of current ${current}; kept the current root tree and its recorded component pins.`,
+        `Target ${target} is an ancestor of current ${current}; kept the current root tree and its recorded submodule pins.`,
         { objectIds: [current, target] },
       )
       target = current
