@@ -115,6 +115,44 @@ function nestedRecursivePushFixture(name: string) {
   return { ...fixture, rootSource, childSource, leaf, leafRemote, leafBefore, leafSource }
 }
 
+/**
+ * A nested gitlink (child/leaf) whose pin never reaches the physical nested clone — the shape a
+ * compose checkout takes when it records a submodule bump without ever fetching it. `leafSource`
+ * is committed only in a throwaway seed clone, optionally published to `leafRemote` (the nested
+ * clone's own `origin`), and pinned into child's tree via `update-index --cacheinfo` so the
+ * nested checkout under child/leaf is never advanced past `leafBefore`.
+ */
+function unfetchedLeafFixture(name: string, publishLeafToOrigin: boolean) {
+  const fixture = recursivePushFixture(name)
+  const leafRemote = join(fixture.fixture, "leaf.git")
+  const leafSeed = join(fixture.fixture, "leaf-seed")
+  git(fixture.fixture, "init", "--bare", "-q", "-b", "main", leafRemote)
+  const leafBefore = createRepository(leafSeed, "leaf.txt", "one\n")
+  git(leafSeed, "remote", "add", "origin", leafRemote)
+  git(leafSeed, "push", "-q", "-u", "origin", "main")
+  git(fixture.child, "-c", "protocol.file.allow=always", "submodule", "add", "-q", leafRemote, "leaf")
+  git(fixture.child, "commit", "-q", "-am", "add leaf")
+
+  const leafSource = advanceRepository(leafSeed, "leaf.txt", "two\n")
+  if (publishLeafToOrigin) git(leafSeed, "push", "-q", "origin", "main")
+
+  git(fixture.child, "update-index", "--cacheinfo", "160000", leafSource, "leaf")
+  git(fixture.child, "commit", "-q", "-m", "bump leaf without fetching it locally")
+  const childSource = git(fixture.child, "rev-parse", "HEAD")
+  git(fixture.root, "add", "child")
+  git(fixture.root, "commit", "-q", "-m", "bump nested child")
+  const rootSource = git(fixture.root, "rev-parse", "HEAD")
+  return {
+    ...fixture,
+    rootSource,
+    childSource,
+    leaf: join(fixture.child, "leaf"),
+    leafRemote,
+    leafBefore,
+    leafSource,
+  }
+}
+
 describe("explicit recursive push mechanics", () => {
   test("documents every recursive mode and pushes an explicit root ref through the real CLI", async () => {
     const { repository, remote, source } = pushFixture("cli")
@@ -510,6 +548,50 @@ describe("explicit recursive push mechanics", () => {
     expect(git(fixture.leafRemote, "rev-parse", "refs/heads/main")).toBe(fixture.leafSource)
     expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(fixture.childSource)
     expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(fixture.rootSource)
+  })
+
+  test("recovers a nested gitlink commit by fetching it from the nested clone's origin", async () => {
+    const fixture = unfetchedLeafFixture("nested-fetch-on-miss-present", true)
+    expect(() => git(fixture.leaf, "cat-file", "-e", `${fixture.leafSource}^{commit}`)).toThrow()
+
+    const result = await superPush({
+      repo: fixture.root,
+      remote: "origin",
+      refspecs: [`${fixture.rootSource}:refs/heads/main`],
+      recurseSubmodules: "on-demand",
+    })
+
+    expect(result).toMatchObject({ state: "updated", partial: false })
+    expect(git(fixture.leafRemote, "rev-parse", "refs/heads/main")).toBe(fixture.leafSource)
+    expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(fixture.childSource)
+    expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(fixture.rootSource)
+    expect(() => git(fixture.leaf, "cat-file", "-e", `${fixture.leafSource}^{commit}`)).not.toThrow()
+  })
+
+  test("refuses a nested gitlink commit missing from both the nested clone and its origin", async () => {
+    const fixture = unfetchedLeafFixture("nested-fetch-on-miss-absent", false)
+    expect(() => git(fixture.leaf, "cat-file", "-e", `${fixture.leafSource}^{commit}`)).toThrow()
+
+    const result = await superPush({
+      repo: fixture.root,
+      remote: "origin",
+      refspecs: [`${fixture.rootSource}:refs/heads/main`],
+      recurseSubmodules: "on-demand",
+    })
+
+    expect(result).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: {
+        phase: "verify-submodule-commit",
+        message: expect.stringContaining(fixture.leafSource),
+      },
+    })
+    expect(result.detail?.paths).toContain("child/leaf")
+    expect(result.detail?.objectIds).toContain(fixture.leafSource)
+    expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(fixture.rootBefore)
+    expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(fixture.childBefore)
+    expect(git(fixture.leafRemote, "rev-parse", "refs/heads/main")).toBe(fixture.leafBefore)
   })
 
   test("creates a missing destination through an explicit create-only lease", async () => {

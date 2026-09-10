@@ -1016,6 +1016,53 @@ async function prepareFrozenChildren(
   return new Map(prepared.submodules.map((entry) => [entry.path, entry]))
 }
 
+/**
+ * Verify a child's pinned commit exists in its discovered store, recovering it from the store's
+ * own `origin` remote when it is missing. The frozen path recovers a retained pin from its
+ * declared remote; an ordinary (non-frozen) child — most commonly a nested gitlink resolved from
+ * the parent's on-disk checkout rather than a prefetched store — has no such declaration, so this
+ * is the fallback for that case.
+ */
+async function verifyOrRecoverSubmoduleCommit(
+  git: GitProcess,
+  discovered: string,
+  childPath: string,
+  target: string,
+): Promise<void> {
+  const verifyArgs = ["cat-file", "-e", `${target}^{commit}`]
+  const present = await git.run({ repo: discovered, args: verifyArgs })
+  if (present.code === 0) return
+  if (present.timedOut === true || present.failure !== undefined) {
+    throw operationError(discovered, verifyArgs, "verify-submodule-commit", present)
+  }
+  const originArgs = ["remote", "get-url", "origin"]
+  const origin = await git.run({ repo: discovered, args: originArgs })
+  if (origin.code !== 0) {
+    const message = `Nested submodule ${childPath}@${target} is missing from ${discovered}, which has no origin remote to recover it from.`
+    throw Object.assign(new Error(message), {
+      resultDetail: detail("submodule-has-no-remote", "verify-submodule-commit", message, {
+        paths: [childPath],
+        objectIds: [target],
+        remedy:
+          "Configure an origin remote for the nested submodule clone, or fetch the exact commit manually, then rerun the same push.",
+      }),
+    })
+  }
+  try {
+    await ensureCommitObject({ repository: discovered, remote: "origin", commit: target, git })
+  } catch (error) {
+    const cause = error instanceof Error ? error.message : String(error)
+    const message = `Nested submodule ${childPath}@${target} is missing from ${discovered} and could not be recovered from origin (${origin.stdout.trim()}): ${cause}`
+    throw Object.assign(new Error(message), {
+      resultDetail: detail("submodule-commit-unrecoverable", "verify-submodule-commit", message, {
+        paths: [childPath],
+        objectIds: [target],
+        remedy: "Publish the exact nested commit to its origin remote, then rerun the same push.",
+      }),
+    })
+  }
+}
+
 async function collectCommitRequirements(
   git: GitProcess,
   root: string,
@@ -1076,7 +1123,7 @@ async function collectCommitRequirements(
           await required(git, discovered, args, "verify-recovered-source")
         }
       }
-      await required(git, discovered, ["cat-file", "-e", `${entry.target}^{commit}`], "verify-submodule-commit")
+      await verifyOrRecoverSubmoduleCommit(git, discovered, childPath, entry.target)
       await walk(discovered, childPath, entry.target)
       requirements.push({
         superproject: repository,
