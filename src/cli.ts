@@ -317,7 +317,12 @@ async function runInvocation(
     const message = error instanceof Error ? error.message : String(error)
     stderr.write(`${message}\n`)
     if (!delegated) await protocol?.refuse("unjudged", message)
-    return 1
+    // A refusal to select or measure exits 2, like every commandResult refusal
+    // below. It must never exit 1: for merge-base that code is a measured verdict
+    // ("not an ancestor"), and the post-land audit read a superproject's
+    // "carries gitlinks ... use --repo" refusal as its settled pin being
+    // unreachable (2026-09-10, @i/1-instruments/24411).
+    return 2
   }
   const [{ Command: CliCommand, CommanderError }, { commands }] = await Promise.all([
     import("@silvery/commander"),

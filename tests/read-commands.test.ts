@@ -229,6 +229,72 @@ describe("Phase 1 read commands", () => {
     expect(result.isAncestor).toBe(true)
   })
 
+  test("merge-base resolves a ref-name ancestor in the --repo root, never by asking each nested store for the name", () => {
+    // Every fixture repository is `init -b main`, so the NAME main exists in the
+    // product and in both submodules. Before the fix the resolver asked each
+    // nested store `cat-file -e main` and found it everywhere: "ambiguous across
+    // ., packages/alpha, vendor/beta" - the refusal that left km's equality half
+    // unmeasured on every nightly post-land audit (24411). A name is a question
+    // for the root; the oid it names is what ownership is decided on.
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-name-ancestor-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const productHead = bumpProductSubmodules(fixture)
+
+    const result = superIsAncestor({ repo: fixture.product, ancestor: "main", descendant: productHead })
+
+    expect(result.owningRepository).toBe(".")
+    expect(result.comparedTo).toBe(productHead)
+    expect(result.isAncestor).toBe(true)
+  })
+
+  test("merge-base refuses a ref-name ancestor that resolves only in a nested store, naming the root it looked in", async () => {
+    // The name exists - but only inside packages/alpha. The old path would have
+    // found it there and answered; the rule is that a name resolves in the --repo
+    // root or the call is refused with its own exit 2, never a fall-through.
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-nested-only-name-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    git(join(fixture.product, "packages/alpha"), "branch", "alpha-only")
+
+    const stdout = outputSink()
+    const stderr = outputSink()
+    const code = await runCli(
+      ["--repo", fixture.product, "merge-base", "--is-ancestor", "alpha-only", fixture.productBase],
+      stdout,
+      stderr,
+    )
+
+    expect(code).toBe(2)
+    expect(stderr.output).toContain("ancestor 'alpha-only' is a name, and it does not resolve to a commit in")
+    expect(stderr.output).toContain(fixture.product)
+    expect(stderr.output).not.toContain("ambiguous")
+  })
+
+  test("the implicit front door refuses a gitlink-carrying argument with exit 2, never merge-base's 1, and still names the --repo form", async () => {
+    // The km shape: an argument whose tree carries gitlinks. The refusal is
+    // right; its exit code was 1, which merge-base callers read as a measured
+    // "not an ancestor" - the post-land audit reported km's settled pin
+    // unreachable on that code (24411). A refusal to measure is 2, and the
+    // breadcrumb naming the explicit interface must survive the change.
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-front-door-refusal-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+
+    const stdout = outputSink()
+    const stderr = outputSink()
+    const code = await runCli(
+      ["-C", fixture.product, "merge-base", "--is-ancestor", fixture.productBase, "HEAD"],
+      stdout,
+      stderr,
+    )
+
+    expect(code).not.toBe(1)
+    expect(code).toBe(2)
+    expect(stderr.output).toContain("carries gitlinks")
+    expect(stderr.output).toContain(`--repo ${fixture.product}`)
+  })
+
   test("merge-base refuses when no consulted repository owns the commit", () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-missing-owner-"))
     roots.push(fixtureRoot)
