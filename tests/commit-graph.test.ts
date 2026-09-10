@@ -17,7 +17,7 @@ describe("commit submodule graph", () => {
   /**
    * @failure Forwarding loses a declared branch or takes ambiguous metadata from a different tree.
    * @level l1
-   * @consumer GitSuper component destination resolution
+   * @consumer GitSuper submodule destination resolution
    */
   test("reads branch metadata from one frozen commit and refuses conflicting declarations", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-commit-graph-"))
@@ -26,7 +26,7 @@ describe("commit submodule graph", () => {
 
     git(fixture.product, "config", "--file", ".gitmodules", "submodule.packages/alpha.branch", "release/stable")
     git(fixture.product, "add", ".gitmodules")
-    git(fixture.product, "commit", "-q", "-m", "declare component branch")
+    git(fixture.product, "commit", "-q", "-m", "declare submodule branch")
     const declared = git(fixture.product, "rev-parse", "HEAD")
     git(fixture.product, "config", "--file", ".gitmodules", "submodule.packages/alpha.branch", "uncommitted")
 

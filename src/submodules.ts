@@ -31,6 +31,18 @@ export type SubmoduleMaterializationResult = SubmoduleGitResult &
     remoteFallbacks: number
     unreferenced: number
     warmed: number
+    /**
+     * WHICH gitlinks went to the network, and which had no reference at all.
+     *
+     * The counters alone are not actionable: a consumer told `fetched: 3` of
+     * fifteen knows a reference is degraded and cannot say which three stores
+     * to repair, so the only way to act on the number is to re-derive it by
+     * hand. `remotePaths` is every path counted in `remoteFallbacks` plus every
+     * path counted in `warmed`; `unreferencedPaths` is every path counted in
+     * `unreferenced`. Both are at every depth, as the counters are.
+     */
+    remotePaths: readonly string[]
+    unreferencedPaths: readonly string[]
   }>
 
 export type SubmoduleMaterializationOptions = Readonly<{
@@ -59,6 +71,12 @@ export type SubmoduleMaterializationOptions = Readonly<{
    * every gitlink borrows locally, so an unrepairable fallback is an incident
    * and not a tolerance. On 2026-08-21 sixteen of them per bay, several bays at
    * once, made GitHub refuse SSH from the host and stopped the whole fleet.
+   *
+   * IT IS A FETCH BUDGET AND NOTHING ELSE. It bounds how many pins a reference
+   * store HAS but cannot serve; it does not reach a gitlink the reference holds
+   * no store for at all, which is refused unconditionally below
+   * ({@link referenceStoreAt}). Raising it says "this pin may come over the
+   * wire", never "materialize this whole reference from the network".
    */
   maxRemoteFallbacks?: number
 }>
@@ -72,6 +90,9 @@ export type HostSubmoduleMaterializationResult = Readonly<{
   remoteFallbacks: number
   unreferenced: number
   warmed: number
+  /** See {@link SubmoduleMaterializationResult}: which paths, not only how many. */
+  remotePaths: readonly string[]
+  unreferencedPaths: readonly string[]
 }>
 
 export type HostSubmoduleMaterializationOptions = Omit<SubmoduleMaterializationOptions, "force"> &
@@ -254,6 +275,34 @@ async function referenceContains(git: SubmoduleGit, reference: string, sha: stri
 }
 
 /**
+ * Whether the reference offers an object store for this gitlink AT ALL.
+ *
+ * The distinction this draws is the difference between a repairable miss and an
+ * unrepairable one. A store that EXISTS and lacks the pin is one fetch from
+ * healthy ({@link warmReference}). A store that does not exist cannot be
+ * fetched into, cannot be warmed, and cannot be borrowed from — every gitlink
+ * under it goes to the network, one connection each, per materialization,
+ * forever. Measured 2026-09-09 on the Yrd queue's reference repository, which
+ * was cloned `--no-checkout` and never populated: fifteen submodules cloned
+ * from scratch per compose, 82 to 1449 seconds each, for four hours.
+ *
+ * `existsSync` alone is NOT the probe, and `rev-parse --git-dir` is worse than
+ * nothing. An uninitialized submodule inside a checked-out reference is an
+ * EMPTY DIRECTORY that git happily accepts as a cwd, discovering the
+ * SUPERPROJECT by walking up — so both weaker probes answer about the wrong
+ * repository and report a store that is not there. `--show-toplevel` is the
+ * discriminator: a materialized submodule checkout reports ITSELF, an empty
+ * directory reports the superproject above it.
+ */
+async function referenceStoreAt(git: SubmoduleGit, referenceSubmodule: string): Promise<boolean> {
+  if (!existsSync(referenceSubmodule)) return false
+  const top = await git.run(referenceSubmodule, ["rev-parse", "--path-format=absolute", "--show-toplevel"], true)
+  const toplevel = top.stdout.trim()
+  if (top.code !== 0 || toplevel === "") return false
+  return canonical(toplevel) === canonical(referenceSubmodule)
+}
+
+/**
  * `cat-file -e <sha>^{commit}` proves the commit object is present. It does NOT
  * prove the commit's closure is local: in a partial clone the check passes and
  * the borrow then lazily fetches trees and blobs from the promisor remote, so
@@ -287,6 +336,11 @@ async function promisorRemote(git: SubmoduleGit, repo: string): Promise<string |
  * its reference cannot is the fan-out shape this exists to stop — but it is a
  * behaviour change, so the refusal prints both the commit and the reference it
  * consulted rather than leaving the caller to guess which remote was short.
+ *
+ * Only ever reached for a store {@link referenceStoreAt} has already proved is
+ * there; the absence check below is a belt for a direct caller, not the path a
+ * walk takes. An absent store is classified BEFORE this point, because "fetch
+ * into it" is the wrong remedy for something there is nothing to fetch into.
  */
 async function warmReference(git: SubmoduleGit, reference: string, sha: string): Promise<SubmoduleGitResult> {
   if (!existsSync(reference)) {
@@ -410,13 +464,25 @@ export async function materializeSubmodules(
   if (requestedReference !== undefined) {
     const primary = await primaryWorktree(git, requestedReference)
     if (typeof primary !== "string") {
-      return { ...primary, considered: 0, borrowed: 0, remoteFallbacks: 0, unreferenced: 0, warmed: 0 }
+      return {
+        ...primary,
+        considered: 0,
+        borrowed: 0,
+        remoteFallbacks: 0,
+        unreferenced: 0,
+        warmed: 0,
+        remotePaths: [],
+        unreferencedPaths: [],
+      }
     }
     if (canonical(primary) !== canonical(options.worktree)) referenceRoot = primary
   }
   let borrowed = 0
   let remoteFallbacks = 0
   let warmed = 0
+  /** The paths behind `remoteFallbacks + warmed`, and behind `unreferenced`. */
+  const remotePaths: string[] = []
+  const unreferencedPaths: string[] = []
   /** Gitlinks materialized straight from the network because NO reference store
    * was supplied for them. Legitimate for a plain clone; a silent bug when the
    * caller meant to pass `referenceWorktree`. Counted so the two are separable. */
@@ -442,7 +508,21 @@ export async function materializeSubmodules(
    * used to assert.
    */
   const misses: Array<
-    Readonly<{ detached: Detachment | undefined; path: string; reference: string; required: string; why: string }>
+    Readonly<{
+      /**
+       * The reference holds no object store for this path at all
+       * ({@link referenceStoreAt}). Its own class because its remedy is its own:
+       * populate the reference, which no fetch budget and no retry can stand in
+       * for, and which no amount of network fallback is an acceptable substitute
+       * for.
+       */
+      absentStore: boolean
+      detached: Detachment | undefined
+      path: string
+      reference: string
+      required: string
+      why: string
+    }>
   > = []
 
   /**
@@ -555,13 +635,20 @@ export async function materializeSubmodules(
       if (!canBorrow && referenceSubmodule !== undefined) {
         // One connection into the reference repairs it for every later bay;
         // sixteen connections out of sixteen candidates repair nothing.
-        const promisor = detached !== undefined ? undefined : await promisorRemote(git, referenceSubmodule)
+        //
+        // ORDER IS THE CLASSIFICATION. A removed submodule first, because no
+        // store is expected for it; then whether a store exists at all, because
+        // the two probes below both read config INSIDE one and answer about the
+        // superproject when there is none.
+        const store = detached !== undefined || (await referenceStoreAt(git, referenceSubmodule))
+        const promisor = !store ? undefined : await promisorRemote(git, referenceSubmodule)
         if (detached !== undefined) {
           // NO WARM-UP. The reference dropped this submodule, so the fetch below
           // would ask a store that does not exist for an object nothing will
           // ever put there. Skipping it is the pre-flight: the refusal lands
           // before the network rather than after a failure that reads retryable.
           misses.push({
+            absentStore: false,
             detached,
             path,
             reference: referenceSubmodule,
@@ -570,8 +657,24 @@ export async function materializeSubmodules(
               `the reference no longer carries this submodule` +
               (detached.removedBy === undefined ? "" : `; removed by ${detached.removedBy}`),
           })
+        } else if (!store) {
+          // NO WARM-UP EITHER, and for the opposite reason: the reference still
+          // DECLARES this submodule, it simply has no store for it. A fetch
+          // needs somewhere to land, so the remedy is to populate the reference
+          // — never to let this gitlink clone itself from the network, which is
+          // what turned one unpopulated queue clone into fifteen full clones per
+          // compose on 2026-09-09.
+          misses.push({
+            absentStore: true,
+            detached: undefined,
+            path,
+            reference: referenceSubmodule,
+            required,
+            why: "the reference holds no object store for this submodule; there is nothing to borrow and nothing to warm",
+          })
         } else if (promisor !== undefined) {
           misses.push({
+            absentStore: false,
             detached: undefined,
             path,
             reference: referenceSubmodule,
@@ -592,8 +695,12 @@ export async function materializeSubmodules(
           }
           if (canBorrow) {
             warmed += 1
+            // The object came over the wire even though the borrow succeeded, so
+            // the path belongs beside the fallbacks: both are network work.
+            remotePaths.push(path)
           } else {
             misses.push({
+              absentStore: false,
               detached: undefined,
               path,
               reference: referenceSubmodule,
@@ -671,6 +778,7 @@ export async function materializeSubmodules(
         borrowed += 1
       } else if (referenceSubmodule !== undefined) {
         remoteFallbacks += 1
+        remotePaths.push(path)
         log?.warn?.("local store lacks the pin; using the configured remote fallback", { path, required })
       } else {
         // NO REFERENCE STORE AT ALL — counted, because the alternative is the
@@ -681,6 +789,7 @@ export async function materializeSubmodules(
         // one of the three causes 2026-08-21 could not tell apart, and it was
         // the one the fail-loud did not reach.
         unreferenced += 1
+        unreferencedPaths.push(path)
       }
       prepared.push({ args, name, nestedReference: borrowFrom, path })
     }
@@ -718,7 +827,17 @@ export async function materializeSubmodules(
         pass: "referenceWorktree to borrow locally instead",
       })
     }
-    if (reference !== undefined && viaRemote.length > maxRemoteFallbacks) {
+    // AN ABSENT STORE IS NOT A FETCH BUDGET QUESTION, so it is not weighed
+    // against one. `maxRemoteFallbacks` bounds how many pins a reference HAS
+    // but cannot serve; `git super worktree add` deliberately sets it unbounded
+    // because a pin the reference has never seen is its ordinary case. Nothing
+    // in that reasoning covers a reference with no store for the gitlink at all,
+    // and on 2026-09-09 the unbounded budget carried that case straight through:
+    // the Yrd queue's `--no-checkout` reference clone had no `modules/` at all,
+    // so all fifteen gitlinks cloned themselves from GitHub, on every compose,
+    // for four hours. Refuse it whatever the budget says.
+    const absentStores = misses.filter(({ absentStore }) => absentStore)
+    if (reference !== undefined && (absentStores.length > 0 || viaRemote.length > maxRemoteFallbacks)) {
       const detail = misses
         // `reference` is always defined here — every misses.push sits inside
         // `referenceSubmodule !== undefined`. It used to render
@@ -731,12 +850,14 @@ export async function materializeSubmodules(
             `  ${path} needs ${required}\n    reference: ${reference}\n    why: ${why}`,
         )
         .join("\n")
-      // TWO CLASSES, TWO REMEDIES, AND ONLY THE APPLICABLE ONE PRINTS. A cold
-      // store is repaired by a fetch; a removed submodule is not repairable at
-      // all, and printing the fetch beside it is what sent branch owners to
-      // provision a store the repository had deliberately dropped.
+      // THREE CLASSES, THREE REMEDIES, AND ONLY THE APPLICABLE ONES PRINT. A
+      // cold store is repaired by a fetch; an absent store must be populated
+      // first, and a fetch aimed at one lands nowhere; a removed submodule is
+      // not repairable at all, and printing either command beside it is what
+      // sent branch owners to provision a store the repository had deliberately
+      // dropped.
       const removed = misses.filter(({ detached }) => detached !== undefined)
-      const repairable = misses.filter(({ detached }) => detached === undefined)
+      const repairable = misses.filter(({ absentStore, detached }) => !absentStore && detached === undefined)
       const detachmentRemedy =
         removed.length === 0
           ? ""
@@ -761,12 +882,25 @@ export async function materializeSubmodules(
               .join("\n") +
             `\nRaise --max-remote-fallbacks only with a reason; one connection per submodule across several ` +
             `candidates is what made GitHub refuse SSH from this host on 2026-08-21.\n`
+      const absentRemedy =
+        absentStores.length === 0
+          ? ""
+          : `The reference must carry a store for every gitlink it is borrowed from, and carries none for:\n` +
+            absentStores.map(({ path, reference: store }) => `  ${path} — no store at ${store}`).join("\n") +
+            `\nPopulate the reference, then retry:\n` +
+            absentStores.map(({ path }) => `  git -C ${reference} submodule update --init -- ${path}`).join("\n") +
+            `\n--max-remote-fallbacks does not reach this: a store that does not exist cannot be fetched into, ` +
+            `so raising the budget only trades a refusal for one full network clone per gitlink per worktree.\n`
+      const headline =
+        absentStores.length > 0
+          ? `git-super: the reference '${reference}' holds no object store for ` +
+            `${absentStores.length} of ${prepared.length} gitlink(s); refusing to clone them from the network.`
+          : `git-super: ${viaRemote.length} submodule(s) would open their own network connection after warm-up ` +
+            `(limit ${maxRemoteFallbacks}); refusing.`
       return {
         code: 1,
         stdout: "",
-        stderr:
-          `git-super: ${viaRemote.length} submodule(s) would open their own network connection after warm-up ` +
-          `(limit ${maxRemoteFallbacks}); refusing.\n${detail}\n${detachmentRemedy}${repairRemedy}`,
+        stderr: `${headline}\n${detail}\n${detachmentRemedy}${absentRemedy}${repairRemedy}`,
       }
     }
     const update = async ({
@@ -828,7 +962,7 @@ export async function materializeSubmodules(
       outcome: result.code === 0 ? "ok" : "failed",
     })
   }
-  return { ...result, considered, borrowed, remoteFallbacks, unreferenced, warmed }
+  return { ...result, considered, borrowed, remoteFallbacks, unreferenced, warmed, remotePaths, unreferencedPaths }
 }
 
 function adaptGitProcess(process: GitProcess): SubmoduleGit {
@@ -926,6 +1060,8 @@ export async function materializeSubmodulesFromLocalWorktreeParallel(
       remoteFallbacks: 0,
       unreferenced: 0,
       warmed: 0,
+      remotePaths: [],
+      unreferencedPaths: [],
     }
   }
   const referenceWorktree =
@@ -980,6 +1116,8 @@ export function materializeSubmodulesFromLocalWorktree(
       remoteFallbacks: 0,
       unreferenced: 0,
       warmed: 0,
+      remotePaths: [],
+      unreferencedPaths: [],
     }
   }
   try {
@@ -1005,6 +1143,8 @@ export function materializeSubmodulesFromLocalWorktree(
       remoteFallbacks: 0,
       unreferenced: 0,
       warmed: 0,
+      remotePaths: [],
+      unreferencedPaths: [],
     }
   }
 }

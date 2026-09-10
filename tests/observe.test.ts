@@ -1,5 +1,5 @@
 /**
- * The approved root-v1 observer must judge current component tips even when
+ * The approved root-v1 observer must judge current submodule tips even when
  * the queue has no history, and publish no findings from a changed reading.
  * This executable boundary is absent from the ordinary status/merge corpus.
  */
@@ -37,7 +37,7 @@ function fixture() {
   git(product.product, "config", "-f", ".gitmodules", "submodule.vendor/beta.url", betaRemote)
   git(product.product, "config", "-f", ".gitmodules", "submodule.packages/alpha.branch", "main")
   git(product.product, "config", "-f", ".gitmodules", "submodule.vendor/beta.branch", "main")
-  git(product.product, "commit", "-qam", "freeze hosted component identities")
+  git(product.product, "commit", "-qam", "freeze hosted submodule identities")
   const targetOid = git(product.product, "rev-parse", "HEAD")
   const input: ObservationInput = {
     version: 1,

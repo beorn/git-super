@@ -1,9 +1,9 @@
 /**
- * @failure An exact root commit cannot bind its direct components to durable,
+ * @failure An exact root commit cannot bind its direct submodules to durable,
  *          checkout-free stores, or a repeated preparation changes that binding.
  * @level l4 — real Git common-dir module stores and ordinary submodule materialization.
- * @consumer Yrd captured component readers
- * retire-when: the component-store command is subsumed by a broader Git Super persistent-store lifecycle suite.
+ * @consumer Yrd captured submodule readers
+ * retire-when: the submodule-store command is subsumed by a broader Git Super persistent-store lifecycle suite.
  */
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -57,7 +57,7 @@ function outputSink(): { output: string; write(value: string): void } {
   }
 }
 
-test("prepares frozen direct components into durable stores and reuses them through JSON", async () => {
+test("prepares frozen direct submodules into durable stores and reuses them through JSON", async () => {
   const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-prepare-"))
   roots.push(fixtureRoot)
   const fixture = createProductFixture(fixtureRoot)
@@ -87,12 +87,12 @@ test("prepares frozen direct components into durable stores and reuses them thro
   const first = JSON.parse(firstOut.output) as {
     state: string
     partial: boolean
-    components: Array<{ name: string; path: string; gitlink: string; url: string; gitdir: string }>
+    submodules: Array<{ name: string; path: string; gitlink: string; url: string; gitdir: string }>
   }
   expect(first).toMatchObject({
     state: "updated",
     partial: false,
-    components: [
+    submodules: [
       {
         name: "packages/alpha",
         path: "packages/alpha",
@@ -103,11 +103,11 @@ test("prepares frozen direct components into durable stores and reuses them thro
       { name: "vendor/beta", path: "vendor/beta", gitlink: fixture.betaBase, url: fixture.beta, gitdir: betaStore },
     ],
   })
-  for (const component of first.components) {
-    expect(existsSync(component.gitdir)).toBe(true)
-    expect(git(component.gitdir, "config", "--get", "core.bare")).toBe("false")
-    expect(git(component.gitdir, "for-each-ref", "--format=%(refname) %(objectname)")).toBe("")
-    expect(existsSync(join(component.gitdir, "FETCH_HEAD"))).toBe(false)
+  for (const submodule of first.submodules) {
+    expect(existsSync(submodule.gitdir)).toBe(true)
+    expect(git(submodule.gitdir, "config", "--get", "core.bare")).toBe("false")
+    expect(git(submodule.gitdir, "for-each-ref", "--format=%(refname) %(objectname)")).toBe("")
+    expect(existsSync(join(submodule.gitdir, "FETCH_HEAD"))).toBe(false)
   }
   expect(existsSync(join(fixture.product, "packages", "alpha", ".git"))).toBe(false)
   expect(existsSync(join(fixture.product, "vendor", "beta", ".git"))).toBe(false)
@@ -135,7 +135,7 @@ test("prepares frozen direct components into durable stores and reuses them thro
   expect(JSON.parse(warmOut.output)).toMatchObject({
     state: "unchanged",
     partial: false,
-    components: first.components,
+    submodules: first.submodules,
   })
   expect(git(betaStore, "remote", "get-url", "origin")).toBe(fixture.alpha)
   writeFileSync(manifest, originalManifest)
@@ -143,20 +143,20 @@ test("prepares frozen direct components into durable stores and reuses them thro
 
   // This is deliberately source-only: the observer may later fetch one exact
   // OID without creating a tracking ref or FETCH_HEAD before normal checkout.
-  for (const component of first.components) {
+  for (const submodule of first.submodules) {
     git(
-      component.gitdir,
+      submodule.gitdir,
       "fetch",
       "--quiet",
       "--no-tags",
       "--no-recurse-submodules",
       "--no-write-fetch-head",
       "--refmap=",
-      component.url,
-      component.gitlink,
+      submodule.url,
+      submodule.gitlink,
     )
-    expect(git(component.gitdir, "for-each-ref", "--format=%(refname) %(objectname)")).toBe("")
-    expect(existsSync(join(component.gitdir, "FETCH_HEAD"))).toBe(false)
+    expect(git(submodule.gitdir, "for-each-ref", "--format=%(refname) %(objectname)")).toBe("")
+    expect(existsSync(join(submodule.gitdir, "FETCH_HEAD"))).toBe(false)
   }
   git(
     fixture.product,
@@ -204,7 +204,7 @@ test("serializes concurrent cold preparation through the shared common-dir lock"
   const one = JSON.parse(oneOut.output) as SuperSubmodulePrepareResult
   const two = JSON.parse(twoOut.output) as SuperSubmodulePrepareResult
   expect([one.state, two.state].sort()).toEqual(["unchanged", "updated"])
-  expect(one.components).toEqual(two.components)
+  expect(one.submodules).toEqual(two.submodules)
   expect(oneErr.output + twoErr.output).toBe("")
 })
 
@@ -232,7 +232,7 @@ test("uses the primary common directory for a linked root", async () => {
     ).toBe(0)
     expect(errors.output).toBe("")
     const result = JSON.parse(output.output) as SuperSubmodulePrepareResult
-    expect(result.components.map((component) => component.gitdir)).toEqual([
+    expect(result.submodules.map((submodule) => submodule.gitdir)).toEqual([
       join(common, "modules", "packages", "alpha"),
       join(common, "modules", "vendor", "beta"),
     ])
@@ -277,7 +277,7 @@ test("accounts for a store written before its initialization fails", async () =>
   expect(prepared).toMatchObject({
     state: "failed",
     partial: true,
-    detail: { code: "git-failed", phase: "initialize-component-store" },
+    detail: { code: "git-failed", phase: "initialize-submodule-store" },
   })
   expect(prepared.repositories).toEqual(
     expect.arrayContaining([
@@ -400,7 +400,7 @@ test("accounts for a store that a failed initialization already created", async 
   expect(prepared).toMatchObject({
     state: "failed",
     partial: true,
-    detail: { code: "git-failed", phase: "initialize-component-store" },
+    detail: { code: "git-failed", phase: "initialize-submodule-store" },
   })
   expect(prepared.repositories).toEqual(
     expect.arrayContaining([
@@ -442,7 +442,7 @@ test.each(abnormalProcessResults)(
     expect(prepared).toMatchObject({
       state: "failed",
       partial: true,
-      detail: { code: expectedCode, phase: "validate-component-store" },
+      detail: { code: expectedCode, phase: "validate-submodule-store" },
     })
     expect(prepared.detail?.message).toContain(resultCause(failedResult))
   },
@@ -511,7 +511,7 @@ test("refuses partial and symlinked stores instead of reinitializing them", asyn
   expect(JSON.parse(partialOut.output)).toMatchObject({
     state: "failed",
     partial: false,
-    detail: { code: "invalid-component-store", phase: "validate-component-store" },
+    detail: { code: "invalid-submodule-store", phase: "validate-submodule-store" },
   })
   expect(existsSync(join(alphaStore, "partial"))).toBe(true)
 
@@ -561,6 +561,6 @@ test("refuses partial and symlinked stores instead of reinitializing them", asyn
   expect(JSON.parse(linkedOut.output)).toMatchObject({
     state: "failed",
     partial: false,
-    detail: { code: "invalid-component-store", phase: "validate-component-store" },
+    detail: { code: "invalid-submodule-store", phase: "validate-submodule-store" },
   })
 })
