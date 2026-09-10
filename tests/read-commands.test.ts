@@ -295,6 +295,30 @@ describe("Phase 1 read commands", () => {
     expect(stderr.output).toContain(`--repo ${fixture.product}`)
   })
 
+  test("inverse control: a real merge-base non-ancestor answer is still exit 1, and only that", async () => {
+    // The refusal rule (exit 2, never 1) is only meaningful while a measured
+    // negative keeps exit 1: the product head is NOT an ancestor of the
+    // product base, the root owns both, and the CLI answers 1 with nothing on
+    // stderr but the consulted-repositories report - no refusal text.
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-inverse-control-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const productHead = bumpProductSubmodules(fixture)
+
+    const stdout = outputSink()
+    const stderr = outputSink()
+    const code = await runCli(
+      ["--repo", fixture.product, "merge-base", "--is-ancestor", productHead, fixture.productBase],
+      stdout,
+      stderr,
+    )
+
+    expect(code).toBe(1)
+    expect(stderr.output).not.toContain("git super:")
+    expect(stderr.output).not.toContain("git-super:")
+    expect(stderr.output).toContain("Consulted repositories")
+  })
+
   test("merge-base refuses when no consulted repository owns the commit", () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-missing-owner-"))
     roots.push(fixtureRoot)
