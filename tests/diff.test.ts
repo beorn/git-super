@@ -100,7 +100,7 @@ describe("superDiff --stat / --patch", () => {
     expect(result.patches?.[0]?.patch).toContain("root.ts")
   })
 
-  test("one moved gitlink: component stat/patch appear, root excludes the pointer bump from its own totals, unmoved beta prints nothing", () => {
+  test("one moved gitlink: submodule stat/patch appear, root excludes the pointer bump from its own totals, unmoved beta prints nothing", () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-diff-stat-one-"))
     roots.push(fixtureRoot)
     const fixture = createProductFixture(fixtureRoot)
@@ -131,7 +131,7 @@ describe("superDiff --stat / --patch", () => {
     expect(result.patches?.[1]?.patch).toContain("alpha.ts")
   })
 
-  test("two moved gitlinks: both component stats appear under the root, totals add up", () => {
+  test("two moved gitlinks: both submodule stats appear under the root, totals add up", () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-diff-stat-two-"))
     roots.push(fixtureRoot)
     const fixture = createProductFixture(fixtureRoot)
@@ -273,7 +273,7 @@ describe("superDiff reported range", () => {
 })
 
 describe("git super diff --stat / --patch human output", () => {
-  /** Root file change + one moved component (alpha) + one unmoved component (beta). */
+  /** Root file change + one moved submodule (alpha) + one unmoved submodule (beta). */
   function createOneMovedFixture(fixtureRoot: string): {
     fixture: ReturnType<typeof createProductFixture>
     alphaHead: string
@@ -289,7 +289,7 @@ describe("git super diff --stat / --patch human output", () => {
     return { fixture, alphaHead, head: git(fixture.product, "rev-parse", "HEAD") }
   }
 
-  test("--stat prints the root stat, the moved component under its own header, and nothing for the unmoved one", async () => {
+  test("--stat prints the root stat, the moved submodule under its own header, and nothing for the unmoved one", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-diff-cli-stat-"))
     roots.push(fixtureRoot)
     const { fixture, alphaHead, head } = createOneMovedFixture(fixtureRoot)
@@ -316,7 +316,7 @@ describe("git super diff --stat / --patch human output", () => {
     expect(stdout.output).not.toContain("vendor/beta")
   })
 
-  test("--patch prints the root patch and the moved component's own patch, nothing for the unmoved one", async () => {
+  test("--patch prints the root patch and the moved submodule's own patch, nothing for the unmoved one", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-diff-cli-patch-"))
     roots.push(fixtureRoot)
     const { fixture, head } = createOneMovedFixture(fixtureRoot)

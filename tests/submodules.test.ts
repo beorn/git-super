@@ -43,6 +43,30 @@ function withPrimaryWorktree(git: SubmoduleGit, primary: string): SubmoduleGit {
 }
 
 /**
+ * Answer "yes, a store lives here" to the probe that separates a COLD reference
+ * store from an ABSENT one.
+ *
+ * A mocked reference store is a bare directory, never a repository, so the
+ * probe's `rev-parse --show-toplevel` finds nothing and every fixture below
+ * would be classified absent — refused before the warm-up path most of these
+ * tests exist to measure. Wrapping states what the fixture means: the store IS
+ * there, it is simply missing the pin. A fixture that means the opposite leaves
+ * the directory out and does NOT wrap, which is exactly the difference the
+ * production probe reads off disk.
+ */
+function withReferenceStores(git: SubmoduleGit): SubmoduleGit {
+  return {
+    ...git,
+    async run(repo, args, allowFailure) {
+      if (args[0] === "rev-parse" && args.includes("--show-toplevel")) {
+        return { ...success(), stdout: `${repo}\n` }
+      }
+      return git.run(repo, args, allowFailure)
+    },
+  }
+}
+
+/**
  * Answer the anchor's two `rev-parse` reads so a mocked submodule store already
  * LIVES at its durable home (`<root>/modules/<name>/objects`) — the anchor then
  * has nothing to append, exactly like materializing the primary checkout
@@ -205,16 +229,63 @@ describe("materializeSubmodules", () => {
     // Was: resolves code 0 with remoteFallbacks 1. The title said "loudly" and
     // the assertion said "succeed" — the counter was incremented, printed, and
     // consumed by nobody. That is the silent error this suite now forbids.
+    //
+    // NOTE the fixture: `<reference>/apps/maddoc` was never created, so this is
+    // the ABSENT store, not a cold one. The refusal must say so and must name
+    // the command that populates the reference — a fetch aimed at a store that
+    // does not exist lands nowhere, and printing it is what sends an operator
+    // to run a repair that cannot work.
     const refused = await materializeSubmodules(withPrimaryWorktree(git, referenceWorktree), {
       worktree,
       referenceWorktree,
       log: capturingLogger(messages),
     })
     expect(refused.code).toBe(1)
-    expect(refused.stderr).toContain("would open their own network connection")
+    expect(refused.stderr).toContain("holds no object store for 1 of 1 gitlink(s)")
     expect(refused.stderr).toContain("apps/maddoc")
     expect(refused.stderr).toContain("a".repeat(40))
+    expect(refused.stderr).toContain(`git -C ${referenceWorktree} submodule update --init -- apps/maddoc`)
+    expect(refused.stderr).not.toContain(`fetch --no-tags origin ${"a".repeat(40)}`)
     expect(commands.some(({ repo }) => repo === `${referenceWorktree}/apps/maddoc`)).toBe(false)
+  })
+
+  it("refuses an absent reference store however high the fetch budget is raised", async () => {
+    const worktree = "/candidate"
+    const referenceWorktree = await mkdtemp(join(tmpdir(), "git-super-absent-unbounded-"))
+    roots.push(referenceWorktree)
+    const commands: Array<Readonly<{ repo: string; args: readonly string[] }>> = []
+    const git: SubmoduleGit = {
+      async run(repo, args) {
+        commands.push({ repo, args })
+        if (args[0] === "cat-file" && args.at(-1) === "HEAD:.gitmodules") {
+          return repo === worktree ? success() : { ...success(), code: 1 }
+        }
+        if (args[0] === "config" && args[1] === "--blob") {
+          return { ...success(), stdout: "submodule.maddoc.path apps/maddoc" }
+        }
+        if (args[0] === "ls-tree") return { ...success(), stdout: `160000 commit ${"a".repeat(40)}\tapps/maddoc\n` }
+        if (args[0] === "config" && args[1] === "--get") {
+          return { ...success(), stdout: "https://example.invalid/maddoc.git\n" }
+        }
+        return success()
+      },
+    }
+
+    // `git super worktree add` passes exactly this, so an absent store rode the
+    // budget straight through to the network on 2026-09-09: fifteen full clones
+    // per compose out of one unpopulated queue reference.
+    const refused = await materializeSubmodules(withPrimaryWorktree(git, referenceWorktree), {
+      worktree,
+      referenceWorktree,
+      maxRemoteFallbacks: Number.POSITIVE_INFINITY,
+    })
+
+    expect(refused.code).toBe(1)
+    expect(refused.stderr).toContain("holds no object store")
+    expect(refused.stderr).toContain("--max-remote-fallbacks does not reach this")
+    // Nothing was updated and nothing was fetched: the refusal is a pre-flight.
+    expect(commands.some(({ args }) => args.includes("update"))).toBe(false)
+    expect(commands.some(({ args }) => args[0] === "fetch")).toBe(false)
   })
 
   it("batches the local probes but NEVER overlaps two warm-up fetches", async () => {
@@ -270,7 +341,7 @@ describe("materializeSubmodules", () => {
       },
     }
 
-    const refused = await materializeSubmodules(withPrimaryWorktree(git, referenceWorktree), {
+    const refused = await materializeSubmodules(withReferenceStores(withPrimaryWorktree(git, referenceWorktree)), {
       worktree,
       referenceWorktree,
     })
@@ -366,6 +437,9 @@ describe("materializeSubmodules", () => {
     const worktree = "/candidate"
     const referenceWorktree = await mkdtemp(join(tmpdir(), "git-super-remedy-reference-"))
     roots.push(referenceWorktree)
+    // A COLD store, deliberately: the directory is there and the pin is not, so
+    // the fetch remedy asserted below is the one that can actually be followed.
+    await mkdir(join(referenceWorktree, "apps/maddoc"), { recursive: true })
     const git: SubmoduleGit = {
       async run(repo, args) {
         if (args[0] === "cat-file" && args.at(-1) === "HEAD:.gitmodules") {
@@ -375,14 +449,20 @@ describe("materializeSubmodules", () => {
           return { ...success(), stdout: "submodule.maddoc.path apps/maddoc" }
         }
         if (args[0] === "ls-tree") return { ...success(), stdout: `160000 commit ${"b".repeat(40)}\tapps/maddoc\n` }
+        if (args[0] === "config" && args[1] === "--get-regexp") return { ...success(), code: 1 }
         if (args[0] === "config" && args[1] === "--get") {
           return { ...success(), stdout: "https://example.invalid/maddoc.git\n" }
         }
+        // Cold before the warm-up and cold after it: the store is there, the
+        // pin is not, and the one fetch that would repair it does not reach the
+        // remote. That is precisely the state the fetch remedy is written for.
+        if (args[0] === "cat-file" && args[1] === "-e") return { ...success(), code: 1 }
+        if (args[0] === "fetch") return { ...success(), code: 1, stderr: "could not read from remote\n" }
         return success()
       },
     }
 
-    const refused = await materializeSubmodules(withPrimaryWorktree(git, referenceWorktree), {
+    const refused = await materializeSubmodules(withReferenceStores(withPrimaryWorktree(git, referenceWorktree)), {
       worktree,
       referenceWorktree,
     })
@@ -453,7 +533,9 @@ describe("materializeSubmodules", () => {
     const commands: Array<Readonly<{ repo: string; args: readonly string[] }>> = []
 
     const refused = await materializeSubmodules(
-      withPrimaryWorktree(detachedReferenceGit(worktree, referenceWorktree, commands), referenceWorktree),
+      withReferenceStores(
+        withPrimaryWorktree(detachedReferenceGit(worktree, referenceWorktree, commands), referenceWorktree),
+      ),
       { worktree, referenceWorktree },
     )
 
@@ -489,9 +571,11 @@ describe("materializeSubmodules", () => {
     const commands: Array<Readonly<{ repo: string; args: readonly string[] }>> = []
 
     const refused = await materializeSubmodules(
-      withPrimaryWorktree(
-        detachedReferenceGit(worktree, referenceWorktree, commands, { referenceTreeReadable: false }),
-        referenceWorktree,
+      withReferenceStores(
+        withPrimaryWorktree(
+          detachedReferenceGit(worktree, referenceWorktree, commands, { referenceTreeReadable: false }),
+          referenceWorktree,
+        ),
       ),
       { worktree, referenceWorktree },
     )
@@ -542,7 +626,7 @@ describe("materializeSubmodules", () => {
       },
     }
 
-    const refused = await materializeSubmodules(withPrimaryWorktree(git, referenceWorktree), {
+    const refused = await materializeSubmodules(withReferenceStores(withPrimaryWorktree(git, referenceWorktree)), {
       worktree,
       referenceWorktree,
     })
@@ -564,6 +648,9 @@ describe("materializeSubmodules", () => {
     const worktree = "/candidate"
     const referenceWorktree = await mkdtemp(join(tmpdir(), "git-super-fallback-reference-"))
     roots.push(referenceWorktree)
+    // A COLD store: the budget is about pins a store cannot serve, and there is
+    // no budget at all for a store that is not there.
+    await mkdir(join(referenceWorktree, "apps/maddoc"), { recursive: true })
     const messages: string[] = []
     const git: SubmoduleGit = {
       async run(repo, args) {
@@ -574,18 +661,25 @@ describe("materializeSubmodules", () => {
           return { ...success(), stdout: "submodule.maddoc.path apps/maddoc" }
         }
         if (args[0] === "ls-tree") return { ...success(), stdout: `160000 commit ${"c".repeat(40)}\tapps/maddoc\n` }
+        if (args[0] === "config" && args[1] === "--get-regexp") return { ...success(), code: 1 }
         if (args[0] === "config" && args[1] === "--get") {
           return { ...success(), stdout: "https://example.invalid/maddoc.git\n" }
         }
+        // The store is there and stays cold: the warm-up runs, fails, and the
+        // raised budget is what lets the fallback happen instead of a refusal.
+        if (args[0] === "cat-file" && args[1] === "-e") return { ...success(), code: 1 }
+        if (args[0] === "fetch") return { ...success(), code: 1, stderr: "could not read from remote\n" }
         return success()
       },
     }
 
     await expect(
       materializeSubmodules(
-        withDurableStores(withPrimaryWorktree(git, referenceWorktree), worktree, "/durable", {
-          "apps/maddoc": "maddoc",
-        }),
+        withReferenceStores(
+          withDurableStores(withPrimaryWorktree(git, referenceWorktree), worktree, "/durable", {
+            "apps/maddoc": "maddoc",
+          }),
+        ),
         {
           worktree,
           referenceWorktree,
@@ -638,9 +732,11 @@ describe("materializeSubmodules", () => {
 
     await expect(
       materializeSubmodules(
-        withDurableStores(withPrimaryWorktree(git, referenceWorktree), worktree, "/durable", {
-          "apps/maddoc": "maddoc",
-        }),
+        withReferenceStores(
+          withDurableStores(withPrimaryWorktree(git, referenceWorktree), worktree, "/durable", {
+            "apps/maddoc": "maddoc",
+          }),
+        ),
         {
           worktree,
           referenceWorktree,
@@ -789,7 +885,7 @@ describe("materializeSubmodules", () => {
       },
     }
 
-    const refused = await materializeSubmodules(withPrimaryWorktree(git, referenceWorktree), {
+    const refused = await materializeSubmodules(withReferenceStores(withPrimaryWorktree(git, referenceWorktree)), {
       worktree,
       referenceWorktree,
     })
@@ -869,7 +965,11 @@ describe("materializeSubmodules", () => {
     const borrowable = ["vendor/local-a", "vendor/local-b", "vendor/local-c"]
     const remote = ["vendor/remote-a", "vendor/remote-b", "vendor/remote-c"]
     const paths = [...borrowable, ...remote]
-    for (const path of borrowable) await mkdir(join(referenceWorktree, path), { recursive: true })
+    // EVERY path gets a store directory, the fallback ones included: this test
+    // is about a store that HAS no pin, not one that is not there. A reference
+    // with no store for a gitlink is refused outright, budget or no budget, so
+    // leaving these out would test that refusal instead of this ordering.
+    for (const path of paths) await mkdir(join(referenceWorktree, path), { recursive: true })
     let inFlightLocal = 0
     let inFlightRemote = 0
     let peakLocal = 0
@@ -921,14 +1021,16 @@ describe("materializeSubmodules", () => {
     // three unrepairable fallbacks before any of them ran.
     await expect(
       materializeSubmodules(
-        withDurableStores(withPrimaryWorktree(git, referenceWorktree), worktree, "/durable", {
-          "vendor/local-a": "module-0",
-          "vendor/local-b": "module-1",
-          "vendor/local-c": "module-2",
-          "vendor/remote-a": "module-3",
-          "vendor/remote-b": "module-4",
-          "vendor/remote-c": "module-5",
-        }),
+        withReferenceStores(
+          withDurableStores(withPrimaryWorktree(git, referenceWorktree), worktree, "/durable", {
+            "vendor/local-a": "module-0",
+            "vendor/local-b": "module-1",
+            "vendor/local-c": "module-2",
+            "vendor/remote-a": "module-3",
+            "vendor/remote-b": "module-4",
+            "vendor/remote-c": "module-5",
+          }),
+        ),
         {
           worktree,
           referenceWorktree,

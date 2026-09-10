@@ -19,7 +19,7 @@ export type PreparedSubmodule = Readonly<{
 
 export type SuperSubmodulePrepareResult = GitSuperResult &
   Readonly<{
-    components: readonly PreparedSubmodule[]
+    submodules: readonly PreparedSubmodule[]
   }>
 
 export type SuperSubmodulePrepareOptions = Readonly<{
@@ -68,7 +68,7 @@ async function prepareSubmodules(
     },
   }
   const repositories: GitSuperRepositoryResult[] = [{ repository, state: "unchanged", refs: [] }]
-  let components: PreparedSubmodule[] = []
+  let submodules: PreparedSubmodule[] = []
   try {
     if (!OBJECT_ID.test(options.commit)) {
       fail(
@@ -78,37 +78,37 @@ async function prepareSubmodules(
     await requireObject(frozenGit, repository, options.commit, objectType)
     const selectedOrigin = await rootRemote(git, repository, options.remote)
     const frozen = (await frozenSubmodules(frozenGit, repository, options.commit, selectedOrigin)).filter(
-      (component) => paths === undefined || paths.has(component.path),
+      (submodule) => paths === undefined || paths.has(submodule.path),
     )
     if (frozen.length === 0) return result(repositories, [])
     const common = await commonDirectory(git, repository)
-    components = frozen.map((component) => ({ ...component, gitdir: safeStorePath(common, component.name) }))
+    submodules = frozen.map((submodule) => ({ ...submodule, gitdir: safeStorePath(common, submodule.name) }))
     const exclusive = options.exclusive ?? createExclusive(join(common, "yrd-worktree-mutations"))
     await exclusive.run(
       async () => {
         const lockedOrigin = await rootRemote(git, repository, options.remote)
         const locked = (await frozenSubmodules(frozenGit, repository, options.commit, lockedOrigin)).filter(
-          (component) => paths === undefined || paths.has(component.path),
+          (submodule) => paths === undefined || paths.has(submodule.path),
         )
         if (lockedOrigin !== selectedOrigin || !sameFrozen(frozen, locked)) {
           fail(
             detail(
               "frozen-root-input-changed",
               "revalidate-frozen-root",
-              `Root commit ${options.commit} or selected remote ${options.remote} changed while component preparation waited for the mutation lock.`,
+              `Root commit ${options.commit} or selected remote ${options.remote} changed while submodule preparation waited for the mutation lock.`,
               { objectIds: [options.commit] },
             ),
           )
         }
-        for (const component of components) {
+        for (const submodule of submodules) {
           try {
-            const state = await prepareStore(git, common, component)
-            repositories.push({ repository: component.gitdir, state, refs: [] })
+            const state = await prepareStore(git, common, submodule)
+            repositories.push({ repository: submodule.gitdir, state, refs: [] })
           } catch (error) {
             repositories.push({
-              repository: component.gitdir,
+              repository: submodule.gitdir,
               state: (error as InitializedStoreError).initializedStore === true ? "updated" : "failed",
-              detail: failureDetail(error, "prepare-component-store"),
+              detail: failureDetail(error, "prepare-submodule-store"),
               refs: [],
             })
             throw error
@@ -117,11 +117,11 @@ async function prepareSubmodules(
       },
       { holder: "git super submodule prepare" },
     )
-    return result(repositories, components)
+    return result(repositories, submodules)
   } catch (error) {
     const failure = failureDetail(error, "prepare-submodules")
     repositories[0] = { repository, state: "failed", detail: failure, refs: [] }
-    return result(repositories, components, failure)
+    return result(repositories, submodules, failure)
   }
 }
 
@@ -139,7 +139,7 @@ function failureDetail(error: unknown, phase: string): GitResultDetail {
     if (value !== undefined) return value
   }
   return detail("submodule-prepare-failed", phase, error instanceof Error ? error.message : String(error), {
-    remedy: "Resolve the named repository or component store condition, then rerun the same prepare command.",
+    remedy: "Resolve the named repository or submodule store condition, then rerun the same prepare command.",
   })
 }
 
@@ -226,22 +226,22 @@ async function frozenSubmodules(
   commit: string,
   rootOrigin: string,
 ): Promise<FrozenSubmodule[]> {
-  return (await readCommitSubmodules(git, repository, commit)).map((component) => {
-    if (component.url === undefined || component.url.trim() === "") {
+  return (await readCommitSubmodules(git, repository, commit)).map((submodule) => {
+    if (submodule.url === undefined || submodule.url.trim() === "") {
       fail(
         detail(
           "missing-submodule-url",
           "resolve-submodule-origin",
-          `Gitlink ${component.path} at ${commit} has no usable frozen submodule URL.`,
-          { paths: [component.path], objectIds: [commit] },
+          `Gitlink ${submodule.path} at ${commit} has no usable frozen submodule URL.`,
+          { paths: [submodule.path], objectIds: [commit] },
         ),
       )
     }
     return {
-      name: component.name,
-      path: component.path,
-      gitlink: component.target,
-      url: resolveSubmoduleOrigin(repository, rootOrigin, component.url),
+      name: submodule.name,
+      path: submodule.path,
+      gitlink: submodule.target,
+      url: resolveSubmoduleOrigin(repository, rootOrigin, submodule.url),
     }
   })
 }
@@ -312,7 +312,7 @@ async function requirePhysicalDirectories(common: string, store: string): Promis
           detail(
             "unsafe-submodule-store",
             "validate-store-path",
-            `Component store path ${current} is not a real directory.`,
+            `Submodule store path ${current} is not a real directory.`,
           ),
         )
       }
@@ -328,14 +328,14 @@ async function validateStore(git: GitProcess, store: string): Promise<void> {
     git,
     store,
     ["rev-parse", "--path-format=absolute", "--git-dir"],
-    "validate-component-store",
+    "validate-submodule-store",
   )
   if (resolve(gitDir) !== store) {
     fail(
       detail(
-        "invalid-component-store",
-        "validate-component-store",
-        `Component store ${store} is not an independently bound Git directory.`,
+        "invalid-submodule-store",
+        "validate-submodule-store",
+        `Submodule store ${store} is not an independently bound Git directory.`,
       ),
     )
   }
@@ -343,37 +343,37 @@ async function validateStore(git: GitProcess, store: string): Promise<void> {
     git,
     store,
     ["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    "validate-component-store",
+    "validate-submodule-store",
   )
   if (resolve(commonDir) !== store) {
     fail(
       detail(
-        "invalid-component-store",
-        "validate-component-store",
-        `Component store ${store} shares refs or objects through ${commonDir} instead of owning an independent common directory.`,
+        "invalid-submodule-store",
+        "validate-submodule-store",
+        `Submodule store ${store} shares refs or objects through ${commonDir} instead of owning an independent common directory.`,
       ),
     )
   }
-  if ((await required(git, store, ["config", "--get", "core.bare"], "validate-component-store")) !== "false") {
+  if ((await required(git, store, ["config", "--get", "core.bare"], "validate-submodule-store")) !== "false") {
     fail(
       detail(
-        "invalid-component-store",
-        "validate-component-store",
-        `Component store ${store} must set core.bare=false for later ordinary materialization.`,
+        "invalid-submodule-store",
+        "validate-submodule-store",
+        `Submodule store ${store} must set core.bare=false for later ordinary materialization.`,
       ),
     )
   }
   const originArgs = ["remote", "get-url", "origin"]
   const origin = await git.run({ repo: store, args: originArgs })
   if (origin.timedOut === true || origin.failure !== undefined) {
-    throw operationError(store, originArgs, "validate-component-store", origin)
+    throw operationError(store, originArgs, "validate-submodule-store", origin)
   }
   if (origin.code !== 0 || origin.stdout.trim() === "") {
     fail(
       detail(
-        "invalid-component-store",
-        "validate-component-store",
-        `Component store ${store} has no usable initial origin for later ordinary materialization.`,
+        "invalid-submodule-store",
+        "validate-submodule-store",
+        `Submodule store ${store} has no usable initial origin for later ordinary materialization.`,
       ),
     )
   }
@@ -382,24 +382,24 @@ async function validateStore(git: GitProcess, store: string): Promise<void> {
 async function prepareStore(
   git: GitProcess,
   common: string,
-  component: PreparedSubmodule,
+  submodule: PreparedSubmodule,
 ): Promise<"updated" | "unchanged"> {
-  await requirePhysicalDirectories(common, component.gitdir)
+  await requirePhysicalDirectories(common, submodule.gitdir)
   try {
-    await lstat(component.gitdir)
+    await lstat(submodule.gitdir)
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
-    await mkdir(dirname(component.gitdir), { recursive: true })
-    await requirePhysicalDirectories(common, component.gitdir)
+    await mkdir(dirname(submodule.gitdir), { recursive: true })
+    await requirePhysicalDirectories(common, submodule.gitdir)
     try {
-      await required(git, common, ["init", "--bare", component.gitdir], "initialize-component-store")
-      await required(git, component.gitdir, ["config", "core.bare", "false"], "initialize-component-store")
-      await required(git, component.gitdir, ["remote", "add", "origin", component.url], "initialize-component-store")
-      await validateStore(git, component.gitdir)
+      await required(git, common, ["init", "--bare", submodule.gitdir], "initialize-submodule-store")
+      await required(git, submodule.gitdir, ["config", "core.bare", "false"], "initialize-submodule-store")
+      await required(git, submodule.gitdir, ["remote", "add", "origin", submodule.url], "initialize-submodule-store")
+      await validateStore(git, submodule.gitdir)
     } catch (error) {
       let initializedStore = true
       try {
-        await lstat(component.gitdir)
+        await lstat(submodule.gitdir)
       } catch (observation) {
         if ((observation as NodeJS.ErrnoException).code === "ENOENT") initializedStore = false
       }
@@ -409,14 +409,14 @@ async function prepareStore(
     }
     return "updated"
   }
-  await validateStore(git, component.gitdir)
+  await validateStore(git, submodule.gitdir)
   return "unchanged"
 }
 
 function result(
   repositories: readonly GitSuperRepositoryResult[],
-  components: readonly PreparedSubmodule[],
+  submodules: readonly PreparedSubmodule[],
   failure?: GitResultDetail,
 ): SuperSubmodulePrepareResult {
-  return { ...gitSuperResult(repositories, failure), components }
+  return { ...gitSuperResult(repositories, failure), submodules }
 }

@@ -55,24 +55,24 @@ Missing checkouts, missing commit objects, added or removed gitlinks without a r
 
 ### Merge and settle gitlinks
 
-`merge <commit>` computes the prospective merge tree before applying it. Components with the same logical remote host and namespace as the root participate in branch forwarding; other hosted components remain `as-written` and receive no publication. Logical identities are read before Git's transport URL rewrites. A local path or file URL cannot establish this ownership relation.
+`merge <commit>` computes the prospective merge tree before applying it. Submodules with the same logical remote host and namespace as the root participate in branch forwarding; other hosted submodules remain `as-written` and receive no publication. Logical identities are read before Git's transport URL rewrites. A local path or file URL cannot establish this ownership relation.
 
-The component branch comes from `submodule.<name>.branch` in local Git config, then the frozen `.gitmodules`, then the remote's symbolic HEAD. A value of `.` uses the current superproject branch and refuses when that HEAD is detached. Each participating pin is compared with the fetched branch:
+The submodule branch comes from `submodule.<name>.branch` in local Git config, then the frozen `.gitmodules`, then the remote's symbolic HEAD. A value of `.` uses the current superproject branch and refuses when that HEAD is detached. Each participating pin is compared with the fetched branch:
 
-| Authored pin relative to the component branch | Result                                                                          |
+| Authored pin relative to the submodule branch | Result                                                                          |
 | --------------------------------------------- | ------------------------------------------------------------------------------- |
 | Equal                                         | Keep the pin.                                                                   |
 | Behind                                        | Raise the root gitlink to the fetched branch tip.                               |
 | Ahead                                         | Keep the authored pin and freeze its branch publication.                        |
 | Diverged                                      | Refuse an incoming change; preserve an untouched divergence as `left-off-main`. |
 
-Git applies a no-ff merge without committing it, then writes the proved raises. Existing affected component checkouts settle at their staged pins before the concluding commit and hooks. Newly introduced components use persistent stores for object and branch inspection and remain unmaterialized until a later submodule update or worktree preparation. Raises and retained anomalies appear in `Settled:` trailers; the merge also freezes recursive publication inputs for [ordered pushing](#landing-across-repositories).
+Git applies a no-ff merge without committing it, then writes the proved raises. Existing affected submodule checkouts settle at their staged pins before the concluding commit and hooks. Newly introduced submodules use persistent stores for object and branch inspection and remain unmaterialized until a later submodule update or worktree preparation. Raises and retained anomalies appear in `Settled:` trailers; the merge also freezes recursive publication inputs for [ordered pushing](#landing-across-repositories).
 
 When Git Super raises root gitlinks, it writes a temporary receipt at `refs/git-super/receipts/<merge>`. The receipt's sole parent is that exact merge, and its `receipt.json` contains only the automatic root-entry changes. Callers can copy the exact payload into a durable record before deleting the temporary ref under its exact old-value lease.
 
 Human output puts the resulting merge commit on stdout and settlement evidence on stderr. `--json` emits one byte-clean `SuperMergeResult` with the same commit and gitlink rows. Its additive `checkouts` rows record, for every checkout the operation touches, the pin in root `HEAD` (`recorded`), the staged gitlink (`index`), the exact pre-operation checkout (`preCheckout`), the observed checkout, and whether it is `settled`, `settle-failed`, `restored`, `restore-failed`, or `not-run`.
 
-A failure before the root merge exits `1` and leaves root HEAD, index and working files unchanged; object fetching and component-store preparation may already have occurred. A failure after Git applies the uncommitted merge exits `2` with `partial: true`, completed and `not-run` gitlink rows, and checkout recovery evidence. If the concluding commit is rejected, Git Super keeps the root merge and staged index intact while restoring each component to the pin recorded by pre-merge root `HEAD`. If any restoration cannot be proved, it leaves the partial state untouched, marks the affected row `restore-failed`, and prints full `recorded`, `staged-index`, `checkout`, and `pre-checkout` object IDs; do not retry until those rows are restored and re-observed. A repository with no submodules or nothing to raise still returns the real merge commit plus an empty gitlink-row set. `--no-verify` is an explicit emergency bypass, not the normal settlement path.
+A failure before the root merge exits `1` and leaves root HEAD, index and working files unchanged; object fetching and submodule-store preparation may already have occurred. A failure after Git applies the uncommitted merge exits `2` with `partial: true`, completed and `not-run` gitlink rows, and checkout recovery evidence. If the concluding commit is rejected, Git Super keeps the root merge and staged index intact while restoring each submodule to the pin recorded by pre-merge root `HEAD`. If any restoration cannot be proved, it leaves the partial state untouched, marks the affected row `restore-failed`, and prints full `recorded`, `staged-index`, `checkout`, and `pre-checkout` object IDs; do not retry until those rows are restored and re-observed. A repository with no submodules or nothing to raise still returns the real merge commit plus an empty gitlink-row set. `--no-verify` is an explicit emergency bypass, not the normal settlement path.
 
 ### Exact gitlink write
 
@@ -80,15 +80,15 @@ A failure before the root merge exits `1` and leaves root HEAD, index and workin
 
 The path must already be a gitlink, and the exact commit object must exist in either its initialized checkout or its configured repository under the superproject's common Git directory. A missing path, repository, or commit fails with a diagnostic naming the repository, path, object ID, and remedy. The operation never adds a path, fetches a commit, checks out a submodule, or chooses whether a pin should advance. `--json` emits the same `GitSuperResult` returned by the `writeGitlink` library export.
 
-### Prepare persistent component stores
+### Prepare persistent submodule stores
 
-`submodule prepare <exact-root-commit> --remote <root-remote-name-or-url> --json` reads direct gitlinks and `.gitmodules` only from the named root commit. Both inputs are required: it never chooses checkout `HEAD` or treats a stored component origin as authority. The selected root remote resolves relative frozen URLs; JSON returns the normal `GitSuperResult` envelope plus `components`, each with `name`, `path`, `gitlink`, resolved `url`, and absolute `gitdir`.
+`submodule prepare <exact-root-commit> --remote <root-remote-name-or-url> --json` reads direct gitlinks and `.gitmodules` only from the named root commit. Both inputs are required: it never chooses checkout `HEAD` or treats a stored submodule origin as authority. The selected root remote resolves relative frozen URLs; JSON returns the normal `GitSuperResult` envelope plus `submodules`, each with `name`, `path`, `gitlink`, resolved `url`, and absolute `gitdir`.
 
-First use needs a readable root and exact commit, a configured remote name or explicit URL, and a writable root common Git directory. Under the shared mutation lock it creates one checkout-free repository at that common directory's existing `modules/<name>` location, configures it non-bare with an initial frozen URL origin, and validates it again. It performs no clone, fetch, checkout, root ref, or index write. Warm calls preserve existing store configuration and origin while returning the frozen descriptor URL. A valid root with no direct gitlinks succeeds with `components: []`.
+First use needs a readable root and exact commit, a configured remote name or explicit URL, and a writable root common Git directory. Under the shared mutation lock it creates one checkout-free repository at that common directory's existing `modules/<name>` location, configures it non-bare with an initial frozen URL origin, and validates it again. It performs no clone, fetch, checkout, root ref, or index write. Warm calls preserve existing store configuration and origin while returning the frozen descriptor URL. A valid root with no direct gitlinks succeeds with `submodules: []`.
 
 An unresolved root, malformed frozen descriptor, unsafe store location, or partial/invalid existing store returns a nonzero structured detail; it is never an empty result or implicit reinitialization. Cold local stores are reported as `updated`, warm stores as `unchanged`, and a later failure keeps already prepared rows as partial evidence rather than deleting them. The returned stores are compatible with a later ordinary `git submodule update`; observation code remains responsible for any network read and exact-object fetch.
 
-### Observe component tips
+### Observe submodule tips
 
 `git-super super observe --protocol=1` (or `git super observe --protocol=1`) reads one UTF-8 JSON document from stdin in the owning root repository:
 
@@ -114,17 +114,17 @@ An unresolved root, malformed frozen descriptor, unsafe store location, or parti
 }
 ```
 
-The caller supplies every advertised ref under its literal prefixes, including refs it does not otherwise recognize. Each checked record must match that same reading. Empty checked/history lists still examine current direct-component tips. GitSuper reads frozen descriptors and merge intents, uses the existing native branch resolver, and excludes children outside the root's hosted namespace. Local paths cannot establish ownership. A current tip is explained only by the captured root pin or the exact published source of a current checked merge; its expected old value is not authority.
+The caller supplies every advertised ref under its literal prefixes, including refs it does not otherwise recognize. Each checked record must match that same reading. Empty checked/history lists still examine current direct-submodule tips. GitSuper reads frozen descriptors and merge intents, uses the existing native branch resolver, and excludes children outside the root's hosted namespace. Local paths cannot establish ownership. A current tip is explained only by the captured root pin or the exact published source of a current checked merge; its expected old value is not authority.
 
 Each read gets one attempt. After all child reads, a complete root advertisement must still match the captured target and selected refs. Only then does stdout receive `{version:1,outcome,message,notices:[{id,text}]}`. IDs are stable opaque strings; text is complete human wording. Exit 0 means `observed`, including an explicitly described empty observation; 3 means `changed-during-read`; 4 means `unavailable-transport`; 2 means `invalid`. Every non-observed result has no notices. These exits belong to this protocol only.
 
-The operation may prepare and fetch into the existing isolated component object stores. It writes no caller refs, `FETCH_HEAD`, worktrees, queue records or remote refs. Missing objects, invalid descriptors and malformed witnesses remain explicit failures. The caller owns observation cadence, process deadline, raw evidence retention and notice delivery; this command adds no service or verdict cache.
+The operation may prepare and fetch into the existing isolated submodule object stores. It writes no caller refs, `FETCH_HEAD`, worktrees, queue records or remote refs. Missing objects, invalid descriptors and malformed witnesses remain explicit failures. The caller owns observation cadence, process deadline, raw evidence retention and notice delivery; this command adds no service or verdict cache.
 
 ### Safe fast-forward pull
 
 `pull --ff-only` fetches and freezes one exact root target. It then works out the full graph of initialized submodules without checking anything out, fetches only the recorded child commits it is missing, and tests every working-tree change before the first write. Applying the change rechecks the remote ref and every repository HEAD under a shared lock, fast-forwards the root, then checks out changed submodules at their exact recorded commits.
 
-If the root already contains the target, pull keeps the current root tree and its component pins and reports why it is already up to date.
+If the root already contains the target, pull keeps the current root tree and its submodule pins and reports why it is already up to date.
 
 With no repository or refspec, pull uses the current branch's configured upstream. With no refspec, a named repository supplies that same upstream branch. A branch with no upstream fails and says so, rather than guessing `origin/main`.
 
@@ -157,7 +157,7 @@ The merge stores resolved child remotes, destination branches, source commits an
 
 A record can retain the merge through commit ancestry while keeping its own tree empty. Before publishing such a record, Git Super finds newly reachable frozen merges, retains owned child sources at `refs/git-super/pins/<oid>`, and verifies that each source can be fetched through its retained ref. This does not advance child branches. Later record pushes do not replay already published historical intents.
 
-A fresh clone can fetch the record and retry publication of its exact merge using the retained child sources, without the author's checkout, a replacement merge, or a materialized child worktree. Retention refs are not automatically reclaimed. External components receive no retention writes; indirect record publication refuses when it cannot establish durable external sources without writing external refs.
+A fresh clone can fetch the record and retry publication of its exact merge using the retained child sources, without the author's checkout, a replacement merge, or a materialized child worktree. Retention refs are not automatically reclaimed. External submodules receive no retention writes; indirect record publication refuses when it cannot establish durable external sources without writing external refs.
 
 These mechanisms provide ordered publication and retry, not cross-repository rollback. A queue must publish its checked record durably before beginning the landing and retain its root leases for recovery. [Yrd](https://github.com/beorn/yrd#readme) owns queue activation and restart orchestration; the Git Super mechanisms alone do not enable that integration.
 
@@ -213,7 +213,7 @@ bun run typecheck
 - `src/commit-graph.ts` is the strict, read-only parser for gitlinks recorded in an exact commit. Pull and push share it rather than reading `.gitmodules` independently.
 - `src/objects.ts` is the exact-commit presence and fetch primitive shared by graph consumers.
 - `src/gitlink.ts` is the update-only index-pin writer. It validates the existing gitlink and target commit, writes under the shared mutation lock, and never checks out or chooses a target.
-- `src/merge.ts` preflights one no-ff merge, fetches component main refs, refuses incoming off-main pins, and settles proven-behind pins while preserving partial-write evidence.
+- `src/merge.ts` preflights one no-ff merge, fetches submodule main refs, refuses incoming off-main pins, and settles proven-behind pins while preserving partial-write evidence.
 - `src/process.ts` is the public injected Git process capability. `src/result.ts` owns the shared repository/ref result vocabulary and how results aggregate.
 - `src/pull.ts` owns the fetch, freeze, check, recheck, and apply fast-forward operation.
 - `src/worktree-add.ts` composes the two write services: one detached `git worktree add` plus one recursive

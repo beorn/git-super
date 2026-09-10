@@ -317,7 +317,12 @@ async function runInvocation(
     const message = error instanceof Error ? error.message : String(error)
     stderr.write(`${message}\n`)
     if (!delegated) await protocol?.refuse("unjudged", message)
-    return 1
+    // A refusal to select or measure exits 2, like every commandResult refusal
+    // below. It must never exit 1: for merge-base that code is a measured verdict
+    // ("not an ancestor"), and the post-land audit read a superproject's
+    // "carries gitlinks ... use --repo" refusal as its settled pin being
+    // unreachable (2026-09-10, @i/1-instruments/24411).
+    return 2
   }
   const [{ Command: CliCommand, CommanderError }, { commands }] = await Promise.all([
     import("@silvery/commander"),
@@ -440,13 +445,13 @@ async function runInvocation(
       }
     })
 
-  const submodule = program.command("submodule").description("Inspect or prepare durable direct-component stores")
+  const submodule = program.command("submodule").description("Inspect or prepare durable direct-submodule stores")
   submodule
     .command("prepare")
     .description(commands.submodule.prepare.description ?? commands.submodule.prepare.title)
     .requiredOption(
       "--remote <name-or-url>",
-      "explicit root remote name or URL used to resolve frozen relative component URLs",
+      "explicit root remote name or URL used to resolve frozen relative submodule URLs",
     )
     .argument("<commit>", "exact root commit whose direct gitlinks are prepared")
     .action((commit, options, command) => {
@@ -521,8 +526,8 @@ async function runInvocation(
     .option("-z, --null", "terminate paths with NUL instead of newline")
     .option("--cached", "compare the index instead of the working tree")
     .option("--diff-filter <letters>", "select paths by Git diff status")
-    .option("--stat", "show per-repository diffstat, including each moved gitlink's own component diff")
-    .option("-p, --patch", "show per-repository patch, including each moved gitlink's own component diff")
+    .option("--stat", "show per-repository diffstat, including each moved gitlink's own submodule diff")
+    .option("-p, --patch", "show per-repository patch, including each moved gitlink's own submodule diff")
     .argument("[refs...]", "Git revision range or refs")
     .action((refs, options, command) => {
       const globals = command.optsWithGlobals() as { repo: string; json?: boolean }
@@ -677,10 +682,10 @@ async function writeResult(
     for (const gitlink of merge.gitlinks) {
       stderr.write(
         gitlink.state === "raised"
-          ? `${gitlink.path} ${gitlink.from.slice(0, 7)} -> ${gitlink.to.slice(0, 7)} (component main)\n`
+          ? `${gitlink.path} ${gitlink.from.slice(0, 7)} -> ${gitlink.to.slice(0, 7)} (submodule main)\n`
           : gitlink.state === "left-off-main"
-            ? `left-off-main ${gitlink.path} ${gitlink.from} (component main ${gitlink.to})\n`
-            : `not-run ${gitlink.path} ${gitlink.from} -> ${gitlink.to} (component main)\n`,
+            ? `left-off-main ${gitlink.path} ${gitlink.from} (submodule main ${gitlink.to})\n`
+            : `not-run ${gitlink.path} ${gitlink.from} -> ${gitlink.to} (submodule main)\n`,
       )
     }
     if (merge.partial) {

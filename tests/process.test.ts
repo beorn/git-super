@@ -137,8 +137,10 @@ process.exitCode = 19
       new Response(child.stderr).text(),
       control,
     ])
+    // A launch that never selected native Git is a refusal, exit 2 - never 1,
+    // which merge-base callers read as a measured "not an ancestor" (24411).
     expect({ code, stdout, frames }).toEqual({
-      code: 1,
+      code: 2,
       stdout: "",
       frames: JSON.stringify({ version: 1, token: "launch-failure", ready: true }) + "\n",
     })
@@ -394,7 +396,8 @@ setInterval(() => {}, 1000)
       stderr: "pipe",
       timeout: 2000,
     })
-    expect(refused.exitCode).toBe(1)
+    // Refusing to recurse is a refusal to select an executable: exit 2, not a verdict.
+    expect(refused.exitCode).toBe(2)
     expect(refused.stderr.toString()).toContain("native Git resolves to git-super itself")
     const missing = Bun.spawnSync([process.execPath, cli, "opaque"], {
       cwd: root,
@@ -402,7 +405,7 @@ setInterval(() => {}, 1000)
       stdout: "pipe",
       stderr: "pipe",
     })
-    expect(missing.exitCode).toBe(1)
+    expect(missing.exitCode).toBe(2)
     expect(missing.stderr.toString()).toContain("native Git executable 'git' was not found on PATH")
   })
 

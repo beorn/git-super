@@ -347,6 +347,89 @@ describe("git super worktree add", () => {
     )
   })
 
+  /**
+   * @failure A --reference with no store for a gitlink network-clones it instead of refusing.
+   *
+   * The dependency is deliberately left REACHABLE and `protocol.file.allow` is
+   * set to `always`, so the network fallback would succeed if it were taken. A
+   * refusal here can therefore only mean the fallback was never reached — which
+   * is the whole claim, since `worktree add` passes an unbounded fetch budget.
+   */
+  it("refuses a reference that holds no store for a gitlink, and borrows once it does", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-worktree-unpopulated-"))
+    roots.push(fixtureRoot)
+    const fixture = createSuperproject(fixtureRoot)
+    git(fixture.product, ["config", "--local", "protocol.file.allow", "always"])
+    const worktree = join(fixtureRoot, "candidate")
+
+    // The queue's own shape: cloned --no-checkout, so nothing was ever
+    // materialized under it and the gitlink path does not exist at all.
+    const bare = join(fixtureRoot, "reference-no-checkout")
+    const cloneBare = spawnSync("git", ["clone", "-q", "--no-checkout", fixture.product, bare], {
+      encoding: "utf8",
+      env: environment,
+    })
+    if (cloneBare.status !== 0) throw new Error(cloneBare.stderr || "could not clone the product")
+    expect(existsSync(join(bare, "vendor/dep"))).toBe(false)
+
+    const bareErr = outputSink()
+    expect(
+      await runCli(
+        ["--repo", fixture.product, "worktree", "add", worktree, "HEAD", "--reference", bare],
+        outputSink(),
+        bareErr,
+      ),
+    ).toBe(2)
+    expect(bareErr.output).toContain("holds no object store for 1 of 1 gitlink(s)")
+    expect(bareErr.output).toContain("vendor/dep — no store at")
+    expect(bareErr.output).toContain(`git -C ${bare} submodule update --init -- vendor/dep`)
+    expect(bareErr.output).toContain("--max-remote-fallbacks does not reach this")
+    // Nothing was cloned and nothing was left standing.
+    expect(existsSync(worktree)).toBe(false)
+    expect(existsSync(join(bare, "vendor/dep"))).toBe(false)
+    expect(git(fixture.product, ["worktree", "list", "--porcelain"])).not.toContain(worktree)
+
+    // The harder shape, and the one a naive existsSync probe passes: a checked
+    // out clone whose submodule was never initialized leaves vendor/dep as an
+    // EMPTY DIRECTORY, and every git command run there discovers the
+    // superproject by walking up rather than failing.
+    const empty = join(fixtureRoot, "reference-uninitialized")
+    const cloneEmpty = spawnSync("git", ["clone", "-q", fixture.product, empty], {
+      encoding: "utf8",
+      env: environment,
+    })
+    if (cloneEmpty.status !== 0) throw new Error(cloneEmpty.stderr || "could not clone the product")
+    expect(existsSync(join(empty, "vendor/dep"))).toBe(true)
+    expect(existsSync(join(empty, "vendor/dep/dep.ts"))).toBe(false)
+
+    const emptyErr = outputSink()
+    expect(
+      await runCli(
+        ["--repo", fixture.product, "worktree", "add", worktree, "HEAD", "--reference", empty],
+        outputSink(),
+        emptyErr,
+      ),
+    ).toBe(2)
+    expect(emptyErr.output).toContain("holds no object store for 1 of 1 gitlink(s)")
+    expect(emptyErr.output).toContain(`git -C ${empty} submodule update --init -- vendor/dep`)
+    expect(existsSync(worktree)).toBe(false)
+
+    // POSITIVE CONTROL. The one command the refusal named, and nothing else,
+    // turns the same reference into one that borrows.
+    git(empty, ["-c", "protocol.file.allow=always", "submodule", "update", "--init", "-q", "--", "vendor/dep"])
+    const stdout = outputSink()
+    const stderr = outputSink()
+    expect(
+      await runCli(
+        ["--repo", fixture.product, "worktree", "add", worktree, "HEAD", "--reference", empty],
+        stdout,
+        stderr,
+      ),
+    ).toBe(0)
+    expect(stderr.output).toContain("1 gitlink (1 borrowed, 0 fetched, 0 absent)")
+    expect(git(join(worktree, "vendor/dep"), ["rev-parse", "HEAD"])).toBe(fixture.pin)
+  }, 30_000)
+
   it("exits 2 with usage for an unknown worktree subcommand", async () => {
     const stdout = outputSink()
     const stderr = outputSink()

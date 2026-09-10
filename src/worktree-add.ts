@@ -72,6 +72,13 @@ function assertRegistrationComponent(value: string, what: string): void {
  * this command's whole contract is the opposite — a pin the reference lacks is
  * expected, and refusing it would leave the caller with no way to create a
  * worktree for a commit whose submodules the reference has never seen.
+ *
+ * UNBOUNDED PINS, NOT UNBOUNDED CLONES. A reference that holds no object store
+ * for a gitlink at all is refused by the materializer regardless of this value,
+ * and deliberately so: this budget was written for a store that exists and is
+ * one pin behind, and on 2026-09-09 it silently also licensed a `--no-checkout`
+ * queue reference with no `modules/` to clone all fifteen of its submodules
+ * from GitHub on every compose.
  */
 const UNBOUNDED_REMOTE_FALLBACKS = Number.POSITIVE_INFINITY
 
@@ -85,7 +92,9 @@ const UNBOUNDED_REMOTE_FALLBACKS = Number.POSITIVE_INFINITY
  *
  * - `borrowed` = `borrowed - warmed` — already present in the reference's store.
  * - `fetched` = `remoteFallbacks + warmed` — had to come over the network.
- * - `absent` = `unreferenced` — the reference offered no store for it at all.
+ * - `absent` = `unreferenced` — NO reference was in play for it, so the network
+ *   was the only source. Not the same thing as a reference that has no store
+ *   for the gitlink: that is refused outright and reaches no count at all.
  *
  * `warmed` is a SUBSET of the materializer's `borrowed`: the pins that only
  * became borrowable after one fetch into the reference. Reporting those as
@@ -98,6 +107,17 @@ export type WorktreeGitlinkCounts = Readonly<{
   borrowed: number
   fetched: number
   absent: number
+  /**
+   * WHICH gitlinks each non-borrowed count is about.
+   *
+   * A consumer that reads `fetched: 3` on a fifteen-gitlink compose knows its
+   * reference is degraded and cannot say which three stores to look at, so the
+   * only way to act on the number is to re-derive it. `fetchedPaths.length ===
+   * fetched` and `absentPaths.length === absent`; both are empty on the healthy
+   * path, which is the ordinary case and costs nothing to carry.
+   */
+  fetchedPaths: readonly string[]
+  absentPaths: readonly string[]
 }>
 
 export type SuperWorktreeAddOptions = Readonly<{
@@ -122,7 +142,14 @@ export type SuperWorktreeAddResult = GitSuperResult &
     gitlinks?: WorktreeGitlinkCounts
   }>
 
-const NO_GITLINKS: WorktreeGitlinkCounts = { considered: 0, borrowed: 0, fetched: 0, absent: 0 }
+const NO_GITLINKS: WorktreeGitlinkCounts = {
+  considered: 0,
+  borrowed: 0,
+  fetched: 0,
+  absent: 0,
+  fetchedPaths: [],
+  absentPaths: [],
+}
 
 function detail(code: string, phase: string, message: string, remedy?: string): GitResultDetail {
   return { code, phase, message, ...(remedy === undefined ? {} : { remedy }) }
@@ -246,6 +273,8 @@ export async function superWorktreeAdd(options: SuperWorktreeAddOptions): Promis
       borrowed: materialized.borrowed - materialized.warmed,
       fetched: materialized.remoteFallbacks + materialized.warmed,
       absent: materialized.unreferenced,
+      fetchedPaths: materialized.remotePaths,
+      absentPaths: materialized.unreferencedPaths,
     }
     const report = `${at(path, options.commit, commit)}: ${counts(gitlinks)}`
     return {

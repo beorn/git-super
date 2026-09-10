@@ -48,7 +48,9 @@ async function run(git: GitProcess, repository: string, args: readonly string[],
 
 async function required(git: GitProcess, repository: string, args: readonly string[], phase: string): Promise<string> {
   const result = await run(git, repository, args)
-  if (result.code !== 0) throw operationError(repository, phase, args, result)
+  if (result.failure !== undefined || result.timedOut || result.stalled || result.code !== 0) {
+    throw operationError(repository, phase, args, result)
+  }
   return result.stdout.trim()
 }
 
@@ -58,9 +60,12 @@ function operationError(
   args: readonly string[],
   result: GitProcessResult,
 ): Error & Readonly<{ resultDetail: GitResultDetail }> {
-  const message = result.timedOut
+  const summary = result.timedOut
     ? `git ${args.join(" ")} timed out in ${repository}`
-    : `git ${args.join(" ")} failed in ${repository} (exit ${result.code})${result.stderr ? `\n${result.stderr}` : ""}`
+    : result.stalled
+      ? `git ${args.join(" ")} stalled in ${repository}`
+      : `git ${args.join(" ")} failed in ${repository} (exit ${result.code})`
+  const message = `${summary}${result.stderr ? `\n${result.stderr}` : ""}${result.failure === undefined ? "" : `\n${result.failure}`}`
   return Object.assign(new Error(message), {
     resultDetail: detail(result.timedOut ? "git-timeout" : "git-failed", phase, message, {
       remedy: "Resolve the reported Git condition, then rerun the same git super pull command.",
@@ -136,7 +141,7 @@ async function planPull(git: GitProcess, options: SuperPullOptions): Promise<Pul
       rootDetail = detail(
         "already-up-to-date",
         "prove-root-ancestry",
-        `Target ${target} is an ancestor of current ${current}; kept the current root tree and its recorded component pins.`,
+        `Target ${target} is an ancestor of current ${current}; kept the current root tree and its recorded submodule pins.`,
         { objectIds: [current, target] },
       )
       target = current
@@ -279,29 +284,46 @@ async function observeRemoteTarget(
 async function refuseUnpublishedDetachedHead(
   git: GitProcess,
   repository: string,
+  path: string,
   recorded: string | undefined,
   actual: string,
+  target: string,
 ): Promise<void> {
   if (recorded === undefined || actual === recorded) return
   const branch = await run(git, repository, ["symbolic-ref", "-q", "HEAD"])
   if (branch.code === 0) return
-  const refs = await required(
+  const args = ["merge-base", "--is-ancestor", actual, target]
+  const ancestor = await run(git, repository, args)
+  if (
+    ancestor.failure !== undefined ||
+    ancestor.timedOut ||
+    ancestor.stalled ||
+    (ancestor.code !== 0 && ancestor.code !== 1)
+  ) {
+    throw operationError(repository, "prove-submodule-ancestry", args, ancestor)
+  }
+  if (ancestor.code === 0) return
+  const refArgs = ["for-each-ref", "--format=%(refname)", "--contains", actual]
+  if ((await required(git, repository, refArgs, "find-durable-submodule-ref")) !== "") return
+  // Exact-object preparation can leave remote-tracking refs behind a published HEAD.
+  await required(
     git,
     repository,
-    ["for-each-ref", "--format=%(refname)", "--contains", actual],
-    "find-durable-submodule-ref",
+    ["fetch", "--no-recurse-submodules", "--no-write-fetch-head", "origin"],
+    "refresh-submodule-refs",
   )
-  if (refs !== "") return
+  if ((await required(git, repository, refArgs, "find-durable-submodule-ref")) !== "") return
   throw Object.assign(
     new Error(`detached submodule HEAD ${actual} in ${repository} is not reachable from a durable ref`),
     {
       resultDetail: detail(
         "unpublished-detached-submodule",
         "protect-submodule-head",
-        `Detached HEAD ${actual} differs from recorded commit ${recorded ?? "missing"} and is not reachable from a durable ref.`,
+        `Detached HEAD ${actual} in submodule ${path} differs from recorded commit ${recorded} and is contained in neither incoming commit ${target} nor any local durable ref after fetching origin.`,
         {
-          objectIds: [actual, ...(recorded === undefined ? [] : [recorded])],
-          remedy: "Create a branch or tag for the detached commit, then rerun git super pull.",
+          paths: [path],
+          objectIds: [actual, recorded, target],
+          remedy: `In ${repository}, run: git branch preserve/detached-${actual} ${actual}. Then rerun git super pull.`,
         },
       ),
     },
@@ -340,7 +362,7 @@ async function freezeRepositoryGraph(
       const actual = await required(git, childRepository, ["rev-parse", "HEAD^{commit}"], "freeze-submodule-current")
       const priorTree = await run(git, repository, ["ls-tree", from, "--", entry.path])
       const recorded = /^160000 commit ([0-9a-f]+)\t/mu.exec(priorTree.stdout)?.[1]
-      await refuseUnpublishedDetachedHead(git, childRepository, recorded, actual)
+      await refuseUnpublishedDetachedHead(git, childRepository, childPath, recorded, actual, entry.target)
       await walk(childRepository, childPath, actual, entry.target)
     }
   }
