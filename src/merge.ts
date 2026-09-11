@@ -946,7 +946,29 @@ async function planGitlinks(
     //
     // The ADDED-submodule branch above has done this since it was written; only
     // the EXISTING one was missing it.
-    await ensureCommitObject({ repository: submodule, remote: entry.url, commit: entry.target, timeoutMs, git })
+    // A FETCH THAT CANNOT SUCCEED IS A MISS, NOT AN ERROR, AND THE DIFFERENCE IS
+    // WHO OWNS THE FAILURE. `ensureCommitObject` throws when the object cannot be
+    // had; letting that throw escape re-owns a condition that was always the
+    // SUBMITTER's. Before this fetch existed, an unfetchable candidate pin
+    // surfaced as the `is-ancestor` exit 128 below and the queue failed the
+    // change — its author fixes their pin and everyone else keeps merging. A
+    // throw here instead STICKS the queue: one bad pin from one seat stops the
+    // line for the whole fleet.
+    //
+    // So the fetch is best-effort by construction. It is here to make a pin that
+    // IS publishable readable; a pin that is not stays exactly as unreadable as
+    // it was, and the containment check below reports it the way it always did.
+    // `tests/../gitlink.test.ts` in the yrd consumer is the acceptance, and it is
+    // what caught this — git-super's own suite cannot see the ownership question
+    // because ownership is decided one layer up.
+    try {
+      await ensureCommitObject({ repository: submodule, remote: entry.url, commit: entry.target, timeoutMs, git })
+    } catch {
+      // Deliberately swallowed, and ONLY here. The next line re-asks the same
+      // question against the same store and answers it loudly either way, so
+      // nothing is lost — the object is either readable now or it is reported
+      // missing by the check that has always reported it.
+    }
     const ancestry = await run(git, submodule, ["merge-base", "--is-ancestor", entry.target, main], timeoutMs)
     if (ancestry.code === 0) {
       if (recordedBefore !== undefined) checkouts.set(entry.path, { path: entry.path, recorded, index: main })
