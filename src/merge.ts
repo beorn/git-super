@@ -1024,7 +1024,12 @@ async function planGitlinks(
     for (const entry of await readCommitSubmodules(git, repository, commit)) {
       const path = nested ? `${prefix}/${entry.path}` : entry.path
       const submodule = nested
-        ? await discoverRepository(git, join(repository, entry.path), "discover-nested-submodule")
+        ? await discoverRepository(
+            git,
+            join(repository, entry.path),
+            "discover-nested-submodule",
+            join(repository, entry.path),
+          )
         : (stores.get(path) ?? join(repository, entry.path))
       const recordedBefore = before.get(entry.path)
       const recorded = recordedBefore ?? entry.target
@@ -1050,6 +1055,19 @@ async function planGitlinks(
       // for a nested gitlink is declared in its parent component, not in km.
       const main = await fetchSubmoduleMain(git, repository, submodule, entry, timeoutMs)
       if (entry.target === main) {
+        // EQUAL to its own main, and still checked for a lowering (@cto N1).
+        // A nested pin equal to its own main can fail to descend from what the
+        // parent's main records for it -- but only when that parent main
+        // already pins an off-main child, which is the hand-push shape the
+        // universal check exists for. Leaving the check out of this branch
+        // would make it absent in precisely the case it was written for.
+        //
+        // It runs per RUNG rather than once above, because DIVERGED must be
+        // decided first and suppress it: re-recording a gitlink cannot cure a
+        // commit that is off its own main.
+        if (nested && parentMainPins !== undefined) {
+          await refuseNestedLowering(submodule, path, entry, prefix, parentMainPins)
+        }
         if (changedByMerge) settleCheckout(entry.target)
         continue
       }

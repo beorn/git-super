@@ -1789,6 +1789,70 @@ describe("git super merge — the nested gitlink chain (24454 row 4)", () => {
     expect(git(fixture.product, "status", "--porcelain=v1")).toBe(statusBefore)
   })
 
+  it("refuses a lowering even when the nested pin EQUALS its own main", async () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-merge-nested-equal-lowered-"))
+    roots.push(root)
+    const fixture = createNestedProductFixture(root)
+    // ALPHA MAIN PINS AN OFF-MAIN LEAF COMMIT -- left there by a hand push, the
+    // one way a parent main can break "a gitlink points at a commit its own
+    // main contains". It is the only shape where a nested pin equal to its own
+    // main is still a lowering, and the Equal rung short-circuits before the
+    // ladder, so this is the case a check placed after it would never see.
+    const alphaLeafCheckout = join(fixture.alpha, "apps/maddoc")
+    git(fixture.leaf, "switch", "-q", "-c", "hand-pushed")
+    const offLeafMain = advanceRepository(fixture.leaf, "leaf.ts", "export const leaf = 'hand pushed'\n")
+    git(fixture.leaf, "switch", "-q", "main")
+    const newerLeafMain = advanceRepository(fixture.leaf, "leaf.ts", "export const leaf = 'main moved on'\n")
+    git(alphaLeafCheckout, "fetch", "-q", "origin")
+    git(alphaLeafCheckout, "checkout", "-q", offLeafMain)
+    git(fixture.alpha, "commit", "-q", "-am", "alpha main pins an off-main nested commit")
+    // The candidate records the leaf at its own main exactly: the EQUAL rung.
+    const lowered = repinNestedThroughAlpha(fixture, "candidate-equal-lowered", newerLeafMain)
+    const headBefore = git(fixture.product, "rev-parse", "HEAD")
+    const stdout = outputSink()
+    const stderr = outputSink()
+
+    const code = await runCli(
+      ["--repo", fixture.product, "merge", lowered.candidate, "-m", "merge candidate"],
+      stdout,
+      stderr,
+    )
+
+    expect(code).toBe(1)
+    expect(stderr.output).toContain("nested-pin-lowered")
+    expect(stderr.output).toContain("packages/alpha/apps/maddoc")
+    expect(stderr.output).toContain(offLeafMain)
+    expect(git(fixture.product, "rev-parse", "HEAD")).toBe(headBefore)
+  })
+
+  it("refuses a nested gitlink whose checkout is absent, instead of reading its PARENT", async () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-merge-nested-absent-"))
+    roots.push(root)
+    const fixture = createNestedProductFixture(root)
+    const moved = advanceNestedThroughAlpha(fixture, "candidate-absent", "export const leaf = 6\n")
+    // Git discovery walks UP. With no checkout at the nested path,
+    // `rev-parse --show-toplevel` answers with ALPHA -- so without the guard the
+    // walk fetches a main, compares an ancestry and classifies a pin in the
+    // wrong repository, every step succeeding and every answer meaningless.
+    const alphaCheckout = join(fixture.product, "packages/alpha")
+    git(alphaCheckout, "submodule", "deinit", "-f", "apps/maddoc")
+    const headBefore = git(fixture.product, "rev-parse", "HEAD")
+    const stdout = outputSink()
+    const stderr = outputSink()
+
+    const code = await runCli(
+      ["--repo", fixture.product, "merge", moved.candidate, "-m", "merge candidate"],
+      stdout,
+      stderr,
+    )
+
+    expect(code).toBe(1)
+    expect(stderr.output).toContain("gitlink-store-absent")
+    expect(stderr.output).toContain("apps/maddoc")
+    expect(stderr.output, "the refusal says what to do about it").toContain("initialize that submodule checkout")
+    expect(git(fixture.product, "rev-parse", "HEAD")).toBe(headBefore)
+  })
+
   it("reports Diverged, not lowered, when a nested pin is both", async () => {
     const root = mkdtempSync(join(tmpdir(), "git-super-merge-nested-both-"))
     roots.push(root)
