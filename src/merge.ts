@@ -25,12 +25,48 @@ export type SuperMergeCheckoutResult = Readonly<{
   state: "settled" | "settle-failed" | "restored" | "restore-failed" | "not-run"
 }>
 
+/**
+ * One nested child seen while descending into an Ahead parent.
+ *
+ * `equal` is why this record exists. Every other classification pushes a
+ * settlement row, so it reaches the consumer's journal on its own; an Equal
+ * gitlink is recorded as-is and emits NOTHING, which makes the most common
+ * nested outcome indistinguishable from a walk that never ran. Proving the
+ * descent happened then means grepping for the side effect of a git flag in a
+ * subprocess whose stderr git-super captures — which is not evidence anyone
+ * can reach from the output.
+ */
+export type SuperMergeDescentChildResult = Readonly<{
+  /** Full path from the root, e.g. `km/apps/maddoc`. */
+  path: string
+  /** The gitlink the parent records for this child. */
+  target: string
+  /** How the walk classified it. */
+  state: "equal" | "raised" | "kept-ahead" | "kept-behind" | "as-written" | "left-off-main"
+}>
+
+/** The descent into one Ahead parent: what it found and how it classified each. */
+export type SuperMergeDescentResult = Readonly<{
+  /** The Ahead parent whose walk this records. */
+  parent: string
+  /** The parent gitlink that was descended into. */
+  parentTarget: string
+  /** Every nested child found beneath it, in walk order. */
+  children: readonly SuperMergeDescentChildResult[]
+}>
+
 export type SuperMergeResult = GitSuperResult &
   Readonly<{
     commit?: string
     gitlinks: readonly SuperMergeGitlinkResult[]
     /** Additive recovery evidence for submodule checkouts touched by a merge. */
     checkouts?: readonly SuperMergeCheckoutResult[]
+    /**
+     * Additive descent evidence: one row per Ahead parent the walk descended
+     * into. Optional and absent when no parent was Ahead, so a consumer that
+     * does not read it is unaffected.
+     */
+    descents?: readonly SuperMergeDescentResult[]
   }>
 
 export type SuperMergeOptions = Readonly<{
@@ -55,6 +91,7 @@ type GitlinkPlans = Readonly<{
   settlements: readonly GitlinkPlan[]
   stores: ReadonlyMap<string, string>
   checkouts: readonly GitlinkCheckoutPlan[]
+  descents: readonly SuperMergeDescentResult[]
 }>
 
 type GitlinkCheckoutPlan = Readonly<{
@@ -443,6 +480,7 @@ async function mergeUnderLock(
     commit: mergeCommit,
     gitlinks: completed,
     ...(settledCheckouts.rows.length === 0 ? {} : { checkouts: settledCheckouts.rows }),
+    ...(planned.descents.length === 0 ? {} : { descents: planned.descents }),
     repositories: [{ repository: root, state: "updated", refs: [] }],
   }
 }
@@ -889,13 +927,14 @@ async function planGitlinks(
   timeoutMs: number,
 ): Promise<GitlinkPlans> {
   const plans: GitlinkPlan[] = []
+  const descents: SuperMergeDescentResult[] = []
   const checkouts = new Map<string, GitlinkCheckoutPlan>()
   const stores = new Map<string, string>()
   const visiting = new Set<string>()
   const completed = new Set<string>()
 
   const rootMerged = await readCommitSubmodules(git, root, tree)
-  if (rootMerged.length === 0) return { settlements: plans, checkouts: [], stores }
+  if (rootMerged.length === 0) return { settlements: plans, checkouts: [], stores, descents: [] }
   const rootRemote = await rootPushIdentity(git, root)
   const rootBefore = new Map((await readCommitSubmodules(git, root, head)).map((entry) => [entry.path, entry.target]))
   const added = new Set(rootMerged.filter((entry) => !rootBefore.has(entry.path)).map((entry) => entry.path))
@@ -1011,6 +1050,12 @@ async function planGitlinks(
     beforeCommit: string | undefined,
     commit: string,
     parentMainPins: ReadonlyMap<string, string> | undefined,
+    /**
+     * When present, every child classified at THIS rung is appended here.
+     * Supplied only by the Ahead descent below, so the root rung -- whose
+     * children each emit their own settlement row -- journals nothing extra.
+     */
+    descentSink?: SuperMergeDescentChildResult[],
   ): Promise<void> => {
     const key = `${repository}\0${commit}`
     if (completed.has(key)) return
@@ -1037,6 +1082,10 @@ async function planGitlinks(
       // A checkout plan is settled against the ROOT index and worktree, so only
       // the root's own gitlinks can have one -- for the same reason a nested
       // raise cannot be applied.
+      /** Journal this child's classification when the caller asked for one. */
+      const recordDescent = (state: SuperMergeDescentChildResult["state"]): void => {
+        descentSink?.push({ path, target: entry.target, state })
+      }
       const settleCheckout = (index: string): void => {
         if (nested || recordedBefore === undefined) return
         checkouts.set(path, { path, recorded, index })
@@ -1048,6 +1097,7 @@ async function planGitlinks(
       }
       if (!sameHostedOwner(rootRemote, entry.url)) {
         if (changedByMerge) settleCheckout(entry.target)
+        recordDescent("as-written")
         plans.push({ path, from: entry.target, to: entry.target, state: "as-written", changedByMerge })
         continue
       }
@@ -1069,6 +1119,12 @@ async function planGitlinks(
           await refuseNestedLowering(submodule, path, entry, prefix, parentMainPins)
         }
         if (changedByMerge) settleCheckout(entry.target)
+        // RECORDED AFTER THE LOWERING CHECK, not before: a refusal throws out of
+        // the walk, and a journal claiming a clean Equal for a rung that refused
+        // would be worse than no journal at all. This is the one classification
+        // that pushes no settlement row, so without this line the descent leaves
+        // no trace in the output at all.
+        recordDescent("equal")
         continue
       }
       // THE CANDIDATE PIN HAS TO BE HERE BEFORE ANYTHING COMPARES IT. Compose opens
@@ -1114,10 +1170,12 @@ async function planGitlinks(
         // -- and only checked for going backwards.
         if (!nested) {
           settleCheckout(main)
+          recordDescent("raised")
           plans.push({ path, from: entry.target, to: main, state: "raised", changedByMerge })
           continue
         }
         if (parentMainPins !== undefined) await refuseNestedLowering(submodule, path, entry, prefix, parentMainPins)
+        recordDescent("kept-behind")
         plans.push({ path, from: entry.target, to: main, state: "kept-behind", changedByMerge })
         continue
       }
@@ -1134,12 +1192,26 @@ async function planGitlinks(
           await refuseNestedLowering(submodule, path, entry, prefix, parentMainPins)
         }
         if (changedByMerge) settleCheckout(entry.target)
+        recordDescent(state)
         plans.push({ path, from: entry.target, to: main, state, changedByMerge })
         if (state === "kept-ahead") {
           const mainPins = new Map(
             (await readCommitSubmodules(git, submodule, main)).map((child) => [child.path, child.target] as const),
           )
-          await walk(submodule, path, recordedBefore, entry.target, mainPins)
+          // The row is pushed BEFORE the walk and filled by it, so a parent's
+          // row precedes the rows of the parents found beneath it. Appending
+          // afterwards would invert that and read as leaf-first, which is the
+          // opposite of how the walk actually proceeded.
+          //
+          // KNOWN LIMIT, stated rather than implied: a refusal anywhere below
+          // throws out of `planGitlinks`, and the caller turns that into a
+          // failed result carrying no plan at all -- so the journal is lost with
+          // everything else on exactly the runs where it would say the most.
+          // Carrying partial evidence through the failure path is a separate
+          // change to the failure shape, not something to smuggle in here.
+          const children: SuperMergeDescentChildResult[] = []
+          descents.push({ parent: path, parentTarget: entry.target, children })
+          await walk(submodule, path, recordedBefore, entry.target, mainPins, children)
         }
         continue
       }
@@ -1150,7 +1222,7 @@ async function planGitlinks(
   }
 
   await walk(root, "", head, tree, undefined)
-  return { settlements: plans, checkouts: [...checkouts.values()], stores }
+  return { settlements: plans, checkouts: [...checkouts.values()], stores, descents }
 }
 
 async function mergeApplicationFailure(

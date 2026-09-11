@@ -1962,3 +1962,92 @@ describe("git super merge — the nested gitlink chain (24454 row 4)", () => {
     ).toBeLessThan(paths.indexOf("packages/alpha"))
   })
 })
+
+/**
+ * Advance ALPHA only, leaving its nested pin exactly where it is.
+ *
+ * This is the production shape the descent journal exists for, and the one the
+ * 2026-09-11 round `q-20260911T172747065Z-d40efc18` had: the parent is AHEAD and
+ * gets published, its nested child is EQUAL to its own main and is recorded as
+ * it stands. Equal is the ONLY classification that pushes no settlement row, so
+ * before the journal this descent produced no output at all.
+ */
+function advanceAlphaOnly(
+  fixture: NestedProductFixture,
+  name: string,
+): Readonly<{ candidate: string; alphaHead: string; leafPin: string }> {
+  const alphaCheckout = join(fixture.product, "packages/alpha")
+  git(fixture.product, "switch", "-q", "-c", name)
+  writeFileSync(join(alphaCheckout, "alpha-only.ts"), `export const only = "${name}"\n`)
+  git(alphaCheckout, "add", "alpha-only.ts")
+  git(alphaCheckout, "commit", "-q", "-m", `${name}: advance alpha without touching maddoc`)
+  const alphaHead = git(alphaCheckout, "rev-parse", "HEAD")
+  const leafPin = git(alphaCheckout, "rev-parse", "HEAD:apps/maddoc")
+  git(fixture.product, "add", "packages/alpha")
+  git(fixture.product, "commit", "-q", "-m", `${name}: re-pin alpha`)
+  const candidate = git(fixture.product, "rev-parse", "HEAD")
+  git(fixture.product, "switch", "-q", "main")
+  return { candidate, alphaHead, leafPin }
+}
+
+describe("git super merge — the descent journal (24454 follow-up)", () => {
+  it("journals an EQUAL nested child, which emits no settlement row of its own", async () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-descent-equal-"))
+    roots.push(root)
+    const fixture = createNestedProductFixture(root)
+    const moved = advanceAlphaOnly(fixture, "candidate-alpha-only")
+    const result = await superMerge({ repo: fixture.product, commit: moved.candidate })
+
+    expect(result.state).toBe("updated")
+    // THE GAP, asserted as a gap: the nested child is classified and produces
+    // NOTHING in gitlinks. If this ever starts containing maddoc, the journal is
+    // no longer the only evidence and this test should be re-read, not deleted.
+    expect(
+      result.gitlinks.map((entry) => entry.path),
+      "an Equal nested child must still emit no settlement row",
+    ).not.toContain("packages/alpha/apps/maddoc")
+
+    // ...and the descent is nevertheless provable from the output alone.
+    expect(result.descents).toEqual([
+      {
+        parent: "packages/alpha",
+        parentTarget: moved.alphaHead,
+        children: [{ path: "packages/alpha/apps/maddoc", target: moved.leafPin, state: "equal" }],
+      },
+    ])
+  })
+
+  it("journals a non-EQUAL nested child too, beside the settlement row it already emits", async () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-descent-ahead-"))
+    roots.push(root)
+    const fixture = createNestedProductFixture(root)
+    const moved = advanceNestedThroughAlpha(fixture, "candidate-descent-ahead", "export const leaf = 9\n")
+    const result = await superMerge({ repo: fixture.product, commit: moved.candidate })
+
+    expect(result.descents).toEqual([
+      {
+        parent: "packages/alpha",
+        parentTarget: moved.alphaHead,
+        children: [{ path: "packages/alpha/apps/maddoc", target: moved.leafHead, state: "kept-ahead" }],
+      },
+      // THE SECOND ROW IS THE POINT, not noise. An Ahead child is itself a
+      // parent the walk descends into, and maddoc has no gitlinks of its own, so
+      // its row carries no children. "Descended and found none" and "never
+      // descended" are precisely the two states this journal exists to separate,
+      // and an empty children array is how the first one says so.
+      { parent: "packages/alpha/apps/maddoc", parentTarget: moved.leafHead, children: [] },
+    ])
+  })
+
+  it("is ABSENT when no parent was Ahead, so a consumer that ignores it sees no change", async () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-descent-none-"))
+    roots.push(root)
+    const fixture = createNestedProductFixture(root)
+    // A root-only change: nothing descends, so there is nothing to journal.
+    const candidate = candidateWithRootChange(fixture, "candidate-root-only")
+    const result = await superMerge({ repo: fixture.product, commit: candidate })
+
+    expect(result.state).toBe("updated")
+    expect(result.descents).toBeUndefined()
+  })
+})
