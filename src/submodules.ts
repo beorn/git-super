@@ -348,7 +348,20 @@ async function warmReference(git: SubmoduleGit, reference: string, sha: string):
   }
   return git.run(
     reference,
-    ["fetch", "--no-tags", "--no-recurse-submodules", "--no-write-fetch-head", "origin", sha],
+    // A destination ref, not a bare want: a fetch that lands the object with no
+    // ref pointing at it leaves it unreachable, and the next `gc` in that store
+    // is free to take it (reference.ts:130-138's own local pin already learned
+    // this the hard way on 2026-09-09). Named by the sha itself, so a repeat
+    // warm-up for the same pin only ever rewrites the ref to the value it
+    // already has.
+    [
+      "fetch",
+      "--no-tags",
+      "--no-recurse-submodules",
+      "--no-write-fetch-head",
+      "origin",
+      `${sha}:refs/git-super/pins/${sha}`,
+    ],
     true,
   )
 }
@@ -878,7 +891,10 @@ export async function materializeSubmodules(
           ? ""
           : `Repair the reference store, then retry:\n` +
             repairable
-              .map(({ reference, required }) => `  git -C ${reference} fetch --no-tags origin ${required}`)
+              .map(
+                ({ reference, required }) =>
+                  `  git -C ${reference} fetch --no-tags origin ${required}:refs/git-super/pins/${required}`,
+              )
               .join("\n") +
             `\nRaise --max-remote-fallbacks only with a reason; one connection per submodule across several ` +
             `candidates is what made GitHub refuse SSH from this host on 2026-08-21.\n`

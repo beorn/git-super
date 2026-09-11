@@ -472,7 +472,7 @@ describe("materializeSubmodules", () => {
     expect(refused.code).toBe(1)
     expect(refused.stderr).toContain("apps/maddoc")
     expect(refused.stderr).toContain(`${referenceWorktree}/apps/maddoc`)
-    expect(refused.stderr).toContain(`fetch --no-tags origin ${"b".repeat(40)}`)
+    expect(refused.stderr).toContain(`fetch --no-tags origin ${"b".repeat(40)}:refs/git-super/pins/${"b".repeat(40)}`)
     expect(refused.stderr).toContain("2026-08-21")
   })
 
@@ -638,7 +638,7 @@ describe("materializeSubmodules", () => {
     // Both remedies present, each attached to the miss it can actually fix.
     expect(refused.stderr).toMatch(/re-author/iu)
     expect(refused.stderr).toContain("Repair the reference store")
-    expect(refused.stderr).toContain(`fetch --no-tags origin ${cold}`)
+    expect(refused.stderr).toContain(`fetch --no-tags origin ${cold}:refs/git-super/pins/${cold}`)
     // The regression this test exists for: the removed submodule's sha must
     // never appear in a fetch command, however the two blocks are assembled.
     expect(refused.stderr).not.toContain(`fetch --no-tags origin ${removed}`)
@@ -703,10 +703,12 @@ describe("materializeSubmodules", () => {
     const worktree = "/candidate"
     const required = "d".repeat(40)
     const messages: string[] = []
+    const commands: Array<Readonly<{ repo: string; args: readonly string[] }>> = []
     let fetched = 0
 
     const git: SubmoduleGit = {
       async run(repo, args) {
+        commands.push({ repo, args })
         if (args[0] === "cat-file" && args.at(-1) === "HEAD:.gitmodules") {
           return repo === worktree ? success() : { ...success(), code: 1 }
         }
@@ -748,6 +750,13 @@ describe("materializeSubmodules", () => {
     // candidate, instead of one connection per submodule repairing nothing.
     expect(fetched).toBe(1)
     expect(messages).toEqual([expect.stringContaining("warming the reference with one fetch")])
+    // The warm-up must land a DURABLE ref, not a bare object: a fetch with no
+    // destination leaves the commit unreachable, and the next gc in that store
+    // is free to take it — the exact loss reference.ts:130-138 already measured
+    // once for its own local pin. Same fix, same reasoning, this call site.
+    expect(commands.find(({ args }) => args[0] === "fetch")?.args.at(-1)).toBe(
+      `${required}:refs/git-super/pins/${required}`,
+    )
   })
 
   it("times each phase and ships the DENOMINATOR beside the counters", async () => {
