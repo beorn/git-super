@@ -951,8 +951,13 @@ async function planGitlinks(
       try {
         await ensureCommitObject({ repository: submodule, remote: entry.url, commit: onParentMain, timeoutMs, git })
       } catch {
-        // Deliberately swallowed. The check below asks the same question against
-        // the same store and answers it loudly either way.
+        // silent-fallback-allow: the next three lines re-ask the same question
+        // against the same store and answer it LOUDLY either way — an
+        // unexpected code throws `operationError`, and a lowered pin throws
+        // with `nested-pin-lowered`, its own cure, and the submodule writer
+        // named as owner. The fetch only makes a publishable pin readable; a
+        // pin that is not publishable stays exactly as unreadable as it was,
+        // and is reported by the check that has always reported it.
       }
     }
     const args = ["merge-base", "--is-ancestor", onParentMain, entry.target]
@@ -1094,10 +1099,12 @@ async function planGitlinks(
       try {
         await ensureCommitObject({ repository: submodule, remote: entry.url, commit: entry.target, timeoutMs, git })
       } catch {
-        // Deliberately swallowed, and ONLY here. The next line re-asks the same
+        // silent-fallback-allow: and ONLY here. The next line re-asks the same
         // question against the same store and answers it loudly either way, so
         // nothing is lost — the object is either readable now or it is reported
-        // missing by the check that has always reported it.
+        // missing by the check that has always reported it. Throwing instead
+        // STICKS the queue: one bad pin from one seat stops the line for the
+        // whole fleet, which is why this fetch is best-effort by construction.
       }
       const ancestryArgs = ["merge-base", "--is-ancestor", entry.target, main]
       const ancestry = await run(git, submodule, ancestryArgs, timeoutMs)
