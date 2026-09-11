@@ -115,33 +115,50 @@ async function required(git: GitProcess, repository: string, args: readonly stri
  *
  * Both gitlink walks -- push's requirement collector and merge's planner --
  * resolve nested stores through here, so the guard lives here once (@cto N2,
- * 24454 row 4). `expected` is the path the caller believes it asked about;
- * omit it where discovery upward is the intent, as it is for the root.
+ * 24454 row 4). Pass `guard` where the path is the CLAIM -- a gitlink that must
+ * be its own repository; leave it off where discovery upward is the intent, as
+ * it is for the root and for a prepared store that deliberately lives
+ * elsewhere.
  */
-export async function discoverRepository(
-  git: GitProcess,
-  path: string,
-  phase: string,
-  expected?: string,
-): Promise<string> {
+export async function discoverRepository(git: GitProcess, path: string, phase: string, guard = false): Promise<string> {
   const topLevelArgs = ["rev-parse", "--show-toplevel"]
   const topLevel = await git.run({ repo: path, args: topLevelArgs })
   if (topLevel.code === 0 && topLevel.stdout.trim() !== "") {
     const discovered = resolve(topLevel.stdout.trim())
-    if (expected !== undefined && discovered !== resolve(expected)) {
-      // The code is IN the message, as the merge planner's refusals put it
-      // there: this reaches a reader through the CLI as text, and a reader who
-      // cannot see the code cannot look the condition up.
-      const message =
-        `gitlink-store-absent: gitlink ${path} has no repository of its own; Git discovery answered with ` +
-        `${discovered}, a different repository, so nothing read there would be about ${path}. ` +
-        `next: initialize that submodule checkout, then rerun the same command; owner: the caller`
-      throw Object.assign(new Error(message), {
-        resultDetail: detail("gitlink-store-absent", phase, message, {
-          paths: [path],
-          remedy: `Initialize the submodule checkout at ${path} (git submodule update --init -- ${path}), then rerun the same command.`,
-        }),
-      })
+    if (guard) {
+      // ASK GIT, DO NOT COMPARE PATHS. `--show-prefix` is the path from the
+      // discovered repository's root down to the directory git was run in, so
+      // "" means this directory IS that root and anything else means discovery
+      // walked up out of it. Comparing `--show-toplevel` against the caller's
+      // string instead compares a PHYSICAL path with a LEXICAL one, and any
+      // symlink anywhere above either would make them differ while naming the
+      // same directory (@cto, 24454 row 4; no path under /hh or /tmp is a
+      // symlink today, so that mismatch cannot fire yet -- which is exactly
+      // when to remove the way it could).
+      const prefixArgs = ["rev-parse", "--show-prefix"]
+      const prefix = await git.run({ repo: path, args: prefixArgs })
+      if (prefix.code !== 0) throw operationError(path, prefixArgs, phase, prefix)
+      if (prefix.stdout.trim() !== "") {
+        // NOTE the distinction this rests on: an EMPTY working tree that still
+        // carries its own `.git` is that gitlink's repository and passes here.
+        // The queue's own clone holds `km/apps/maddoc` in exactly that shape.
+        // Only a path with NO repository at all makes discovery answer with the
+        // parent, and that is the condition worth refusing.
+        //
+        // The code is IN the message, as the merge planner's refusals put it
+        // there: this reaches a reader through the CLI as text, and a reader who
+        // cannot see the code cannot look the condition up.
+        const message =
+          `gitlink-store-absent: gitlink ${path} has no repository of its own; Git discovery answered with ` +
+          `${discovered}, a different repository, so nothing read there would be about ${path}. ` +
+          `next: initialize that submodule checkout, then rerun the same command; owner: the caller`
+        throw Object.assign(new Error(message), {
+          resultDetail: detail("gitlink-store-absent", phase, message, {
+            paths: [path],
+            remedy: `Initialize the submodule checkout at ${path}, then rerun the same command.`,
+          }),
+        })
+      }
     }
     return discovered
   }
@@ -1138,12 +1155,7 @@ async function collectCommitRequirements(
       // it. The guard is for the fallback, where the path IS the claim.
       const prepared = store?.gitdir ?? (path === "." ? rootStores?.get(entry.path) : undefined)
       const child = prepared ?? join(repository, entry.path)
-      const discovered = await discoverRepository(
-        git,
-        child,
-        "discover-submodule",
-        prepared === undefined ? child : undefined,
-      )
+      const discovered = await discoverRepository(git, child, "discover-submodule", prepared === undefined)
       if (frozen !== undefined) {
         const row = frozen.children.find((candidate) => candidate.path === childPath && candidate.pin === entry.target)
         if (row === undefined) throw new Error(`Frozen merge has no child disposition for ${childPath}@${entry.target}`)

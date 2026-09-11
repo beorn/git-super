@@ -1024,12 +1024,7 @@ async function planGitlinks(
     for (const entry of await readCommitSubmodules(git, repository, commit)) {
       const path = nested ? `${prefix}/${entry.path}` : entry.path
       const submodule = nested
-        ? await discoverRepository(
-            git,
-            join(repository, entry.path),
-            "discover-nested-submodule",
-            join(repository, entry.path),
-          )
+        ? await discoverRepository(git, join(repository, entry.path), "discover-nested-submodule", true)
         : (stores.get(path) ?? join(repository, entry.path))
       const recordedBefore = before.get(entry.path)
       const recorded = recordedBefore ?? entry.target
