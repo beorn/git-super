@@ -70,12 +70,20 @@ function createProductFixture(root: string): ProductFixture {
 function createNestedProductFixture(root: string): NestedProductFixture {
   const fixture = addNestedAlphaSubmodule(createProductFixture(root))
   const url = "https://git-super.test/owned/leaf.git"
+  // ALPHA MAIN declares the nested identity, exactly as km main declares
+  // maddoc's. Declaring it only on the product's checkout loses it the moment an
+  // arm cuts its candidate from alpha main -- and the freeze then refuses the
+  // leaf as an unhosted local path, which is a fixture fault wearing the costume
+  // of a real refusal.
+  git(fixture.alpha, "config", "--file", ".gitmodules", "submodule.apps/maddoc.url", url)
+  git(fixture.alpha, "config", "submodule.apps/maddoc.url", url)
+  git(fixture.alpha, "config", `url.${fixture.leaf}.insteadOf`, url)
+  git(fixture.alpha, "commit", "-q", "-am", "declare hosted nested identity")
   const alphaCheckout = join(fixture.product, "packages/alpha")
-  git(alphaCheckout, "config", "--file", ".gitmodules", "submodule.apps/maddoc.url", url)
-  git(alphaCheckout, "config", "submodule.apps/maddoc.url", url)
+  git(alphaCheckout, "fetch", "-q", "origin")
+  git(alphaCheckout, "checkout", "-q", git(fixture.alpha, "rev-parse", "HEAD"))
   git(join(alphaCheckout, "apps/maddoc"), "remote", "set-url", "origin", url)
   git(join(alphaCheckout, "apps/maddoc"), "config", `url.${fixture.leaf}.insteadOf`, url)
-  git(alphaCheckout, "commit", "-q", "-am", "declare hosted nested identity")
   git(fixture.product, "add", "packages/alpha")
   git(fixture.product, "commit", "-q", "-m", "pin alpha with hosted nested identity")
   return { ...fixture, productWithNestedBase: git(fixture.product, "rev-parse", "HEAD") }
@@ -1542,25 +1550,351 @@ describe("git super merge", () => {
  * @level    l1
  * @consumer every root submit that carries a nested component.
  */
+/**
+ * A candidate in the SHAPE OF THE REAL LANDING: a maddoc commit, an alpha commit
+ * pinning it, a root commit pinning that alpha. Neither component commit is on
+ * its own main, so both are on the AHEAD rung and both get published.
+ *
+ * Ahead is not decoration. The walk descends only into parents that will be
+ * published, so a fixture whose alpha is Equal or Behind never reaches depth 2
+ * at all and every nested assertion below would pass vacuously on a level that
+ * was never walked.
+ */
+function advanceNestedThroughAlpha(
+  fixture: NestedProductFixture,
+  name: string,
+  leafContent: string,
+): Readonly<{ candidate: string; alphaHead: string; leafHead: string }> {
+  const alphaCheckout = join(fixture.product, "packages/alpha")
+  const leafCheckout = join(alphaCheckout, "apps/maddoc")
+  git(fixture.product, "switch", "-q", "-c", name)
+  writeFileSync(join(leafCheckout, "leaf.ts"), leafContent)
+  git(leafCheckout, "add", "leaf.ts")
+  git(leafCheckout, "commit", "-q", "-m", `${name}: advance maddoc`)
+  const leafHead = git(leafCheckout, "rev-parse", "HEAD")
+  git(alphaCheckout, "add", "apps/maddoc")
+  git(alphaCheckout, "commit", "-q", "-m", `${name}: re-pin maddoc`)
+  const alphaHead = git(alphaCheckout, "rev-parse", "HEAD")
+  git(fixture.product, "add", "packages/alpha")
+  git(fixture.product, "commit", "-q", "-m", `${name}: re-pin alpha`)
+  const candidate = git(fixture.product, "rev-parse", "HEAD")
+  git(fixture.product, "switch", "-q", "main")
+  return { candidate, alphaHead, leafHead }
+}
+
+/**
+ * Re-pin the nested gitlink at an EXISTING leaf commit, through an Ahead alpha.
+ *
+ * The candidate alpha is cut from alpha's CURRENT main, not from whatever the
+ * product happens to pin. That is what makes it Ahead rather than Diverged --
+ * and Diverged would be refused on the more basic rung, so a lowering arm built
+ * on a diverged parent can never reach the check it means to exercise.
+ */
+function repinNestedThroughAlpha(
+  fixture: NestedProductFixture,
+  name: string,
+  leafTarget: string,
+): Readonly<{ candidate: string; alphaHead: string }> {
+  const alphaCheckout = join(fixture.product, "packages/alpha")
+  const leafCheckout = join(alphaCheckout, "apps/maddoc")
+  git(fixture.product, "switch", "-q", "-c", name)
+  git(alphaCheckout, "fetch", "-q", "origin")
+  git(alphaCheckout, "checkout", "-q", git(fixture.alpha, "rev-parse", "main"))
+  git(leafCheckout, "fetch", "-q", "origin")
+  git(leafCheckout, "checkout", "-q", leafTarget)
+  git(alphaCheckout, "add", "apps/maddoc")
+  git(alphaCheckout, "commit", "-q", "-m", `${name}: re-pin maddoc at ${leafTarget}`)
+  const alphaHead = git(alphaCheckout, "rev-parse", "HEAD")
+  git(fixture.product, "add", "packages/alpha")
+  git(fixture.product, "commit", "-q", "-m", `${name}: re-pin alpha`)
+  const candidate = git(fixture.product, "rev-parse", "HEAD")
+  git(fixture.product, "switch", "-q", "main")
+  return { candidate, alphaHead }
+}
+
+/** Move the leaf's main on, and have ALPHA MAIN record the newer pin. */
+function raiseNestedPinOnAlphaMain(fixture: NestedProductFixture, leafContent: string): string {
+  const raised = advanceRepository(fixture.leaf, "leaf.ts", leafContent)
+  const alphaLeafCheckout = join(fixture.alpha, "apps/maddoc")
+  git(alphaLeafCheckout, "fetch", "-q", "origin")
+  git(alphaLeafCheckout, "checkout", "-q", raised)
+  git(fixture.alpha, "commit", "-q", "-am", "alpha main raises its nested pin")
+  return raised
+}
+
 describe("git super merge — the nested gitlink chain (24454 row 4)", () => {
-  it("classifies a nested gitlink against its OWN main, not just the root's", async () => {
+  it("walks into an Ahead parent and classifies its nested pin against the nested main", async () => {
     const root = mkdtempSync(join(tmpdir(), "git-super-merge-nested-"))
     roots.push(root)
     const fixture = createNestedProductFixture(root)
-    // The leaf's own main moves ahead of the pin alpha records, which is the
-    // BEHIND rung of the same ladder the root level already walks.
-    const newestLeaf = advanceRepository(fixture.leaf, "leaf.ts", "export const leaf = 3\n")
-    const candidate = candidateWithRootChange(fixture, "candidate-nested")
+    const moved = advanceNestedThroughAlpha(fixture, "candidate-nested", "export const leaf = 3\n")
+    const result = await superMerge({ repo: fixture.product, commit: moved.candidate })
+
+    // DEPTH 2 MUST APPEAR AT ALL. Before this row the planner stopped at depth 1
+    // and this array held only `packages/alpha` and `vendor/beta`.
+    expect(
+      result.gitlinks.map((entry) => entry.path),
+      "the nested path must be classified, not skipped",
+    ).toContain("packages/alpha/apps/maddoc")
+    expect(result).toMatchObject({
+      state: "updated",
+      gitlinks: expect.arrayContaining([
+        expect.objectContaining({ path: "packages/alpha", from: moved.alphaHead, state: "kept-ahead" }),
+        expect.objectContaining({
+          path: "packages/alpha/apps/maddoc",
+          from: moved.leafHead,
+          to: fixture.leafBase,
+          state: "kept-ahead",
+        }),
+      ]),
+    })
+    // VALIDATE-ONLY: the nested pin is classified, never rewritten. `to` above is
+    // the nested MAIN it was measured against, and the recorded pin is untouched.
+    expect(git(join(fixture.product, "packages/alpha"), "rev-parse", `${moved.alphaHead}:apps/maddoc`)).toBe(
+      moved.leafHead,
+    )
+    // A checkout plan is settled against the ROOT index and worktree, so a
+    // nested path must never get one -- the same reason a nested raise cannot
+    // be applied. The nested checkout happens to exist under the root worktree
+    // in this fixture, so nothing would fail loudly if one were planned.
+    expect(
+      (result.checkouts ?? []).map((row) => row.path),
+      "nested paths must not get a root checkout plan",
+    ).not.toContain("packages/alpha/apps/maddoc")
+  })
+
+  it("does NOT walk into an Equal parent, whose nested pins were validated when it landed", async () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-merge-nested-equal-"))
+    roots.push(root)
+    const fixture = createNestedProductFixture(root)
+    // Alpha's pin already equals alpha main, so the root merge lands a commit
+    // alpha main already holds. Re-walking it would re-litigate a landing that
+    // was validated when it happened -- and it is what bounds the walk.
+    //
+    // THE LEAF'S MAIN MOVES ON FIRST, and that is what gives this arm teeth. If
+    // the nested pin were Equal as well, a walk into this parent would produce
+    // no row either, and the arm would pass whether or not the bound holds.
+    // Behind its own main, a walk would classify it `kept-behind` and the row
+    // would appear.
+    advanceRepository(fixture.leaf, "leaf.ts", "export const leaf = 'moved on'\n")
+    const candidate = candidateWithRootChange(fixture, "candidate-equal")
     const result = await superMerge({ repo: fixture.product, commit: candidate })
 
-    // The nested level must appear at all. Today it does not: the planner stops
-    // at depth 1 and this array holds only `packages/alpha`.
-    expect(result.gitlinks.map((entry) => entry.path), "the nested path must be classified, not skipped").toContain(
-      "packages/alpha/apps/maddoc",
+    expect(result.state).toBe("updated")
+    expect(
+      result.gitlinks.map((entry) => entry.path),
+      "an Equal parent is not descended into",
+    ).not.toContain("packages/alpha/apps/maddoc")
+  })
+
+  it("records a nested pin BEHIND its own main without raising it", async () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-merge-nested-behind-"))
+    roots.push(root)
+    const fixture = createNestedProductFixture(root)
+    // The nested main moves on; the candidate keeps pinning the older commit,
+    // which is exactly what a parent legitimately pinning an older child looks
+    // like. It is not a lowering -- alpha main records the same pin.
+    const newerLeaf = advanceRepository(fixture.leaf, "leaf.ts", "export const leaf = 9\n")
+    const alphaCheckout = join(fixture.product, "packages/alpha")
+    git(fixture.product, "switch", "-q", "-c", "candidate-behind")
+    writeFileSync(join(alphaCheckout, "alpha.ts"), "export const alpha = 'ahead'\n")
+    git(alphaCheckout, "add", "alpha.ts")
+    git(alphaCheckout, "commit", "-q", "-m", "advance alpha without touching its nested pin")
+    git(fixture.product, "add", "packages/alpha")
+    git(fixture.product, "commit", "-q", "-m", "re-pin alpha")
+    const candidate = git(fixture.product, "rev-parse", "HEAD")
+    git(fixture.product, "switch", "-q", "main")
+
+    const result = await superMerge({ repo: fixture.product, commit: candidate })
+
+    expect(result.state).toBe("updated")
+    // KEPT-BEHIND, NOT RAISED. A raise here would rewrite what alpha's commit
+    // means, and cannot be applied anyway: raises go through the ROOT index,
+    // which holds no entry for a nested path.
+    expect(result.gitlinks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          path: "packages/alpha/apps/maddoc",
+          from: fixture.leafBase,
+          to: newerLeaf,
+          state: "kept-behind",
+        }),
+      ]),
     )
     expect(
-      result.gitlinks.find((entry) => entry.path === "packages/alpha/apps/maddoc"),
-      "and classified on the BEHIND rung against the leaf's own main",
-    ).toMatchObject({ to: newestLeaf, state: "raised" })
+      git(alphaCheckout, "rev-parse", `${git(fixture.product, "rev-parse", "HEAD:packages/alpha")}:apps/maddoc`),
+      "the recorded nested pin is untouched",
+    ).toBe(fixture.leafBase)
+  })
+
+  it("refuses a nested pin that is off its OWN main, before any write", async () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-merge-nested-diverged-"))
+    roots.push(root)
+    const fixture = createNestedProductFixture(root)
+    const moved = advanceNestedThroughAlpha(fixture, "candidate-diverged", "export const leaf = 'unpublished'\n")
+    // The nested main moves to a COMPETING commit, so the candidate's nested pin
+    // is neither behind it nor ahead of it. This is D1, one level down.
+    const competingLeaf = advanceRepository(fixture.leaf, "leaf.ts", "export const leaf = 'competing'\n")
+    const headBefore = git(fixture.product, "rev-parse", "HEAD")
+    const statusBefore = git(fixture.product, "status", "--porcelain=v1")
+    const stdout = outputSink()
+    const stderr = outputSink()
+
+    const code = await runCli(
+      ["--repo", fixture.product, "merge", moved.candidate, "-m", "merge candidate"],
+      stdout,
+      stderr,
+    )
+
+    expect(code).toBe(1)
+    expect(stdout.output).toBe("")
+    expect(stderr.output).toContain("gitlink-off-main")
+    expect(stderr.output, "the refusal names the NESTED path, not just its parent").toContain(
+      "packages/alpha/apps/maddoc",
+    )
+    expect(stderr.output).toContain(moved.leafHead)
+    expect(stderr.output).toContain(competingLeaf)
+    expect(stderr.output).toContain("owner: the submodule writer")
+    expect(git(fixture.product, "rev-parse", "HEAD")).toBe(headBefore)
+    expect(git(fixture.product, "status", "--porcelain=v1")).toBe(statusBefore)
+  })
+
+  it("refuses a nested pin LOWERED below what the parent's own main records, before any write", async () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-merge-nested-lowered-"))
+    roots.push(root)
+    const fixture = createNestedProductFixture(root)
+    // Alpha main advances its nested pin. The candidate then re-records maddoc at
+    // the OLDER commit through an Ahead alpha -- the shape a stale nested
+    // checkout committed by accident produces.
+    const raisedLeaf = raiseNestedPinOnAlphaMain(fixture, "export const leaf = 2\n")
+    const lowered = repinNestedThroughAlpha(fixture, "candidate-lowered", fixture.leafBase)
+    const headBefore = git(fixture.product, "rev-parse", "HEAD")
+    const statusBefore = git(fixture.product, "status", "--porcelain=v1")
+    const stdout = outputSink()
+    const stderr = outputSink()
+
+    const code = await runCli(
+      ["--repo", fixture.product, "merge", lowered.candidate, "-m", "merge candidate"],
+      stdout,
+      stderr,
+    )
+
+    expect(code).toBe(1)
+    expect(stdout.output).toBe("")
+    expect(stderr.output).toContain("nested-pin-lowered")
+    expect(stderr.output).toContain("packages/alpha/apps/maddoc")
+    expect(stderr.output, "the remedy names the pin the author must re-record at or after").toContain(raisedLeaf)
+    expect(stderr.output).toContain("owner: the submodule writer")
+    expect(git(fixture.product, "rev-parse", "HEAD")).toBe(headBefore)
+    expect(git(fixture.product, "status", "--porcelain=v1")).toBe(statusBefore)
+  })
+
+  it("reports Diverged, not lowered, when a nested pin is both", async () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-merge-nested-both-"))
+    roots.push(root)
+    const fixture = createNestedProductFixture(root)
+    const raisedLeaf = raiseNestedPinOnAlphaMain(fixture, "export const leaf = 2\n")
+    // The parent must be AHEAD, or it is refused on its own rung and the nested
+    // level is never walked at all -- an arm that asserts a nested precedence
+    // while the parent is Diverged passes on the parent's refusal.
+    const alphaCheckout = join(fixture.product, "packages/alpha")
+    const leafCheckout = join(alphaCheckout, "apps/maddoc")
+    git(fixture.product, "switch", "-q", "-c", "candidate-both")
+    git(alphaCheckout, "fetch", "-q", "origin")
+    git(alphaCheckout, "checkout", "-q", git(fixture.alpha, "rev-parse", "main"))
+    // A nested commit cut from the OLD leaf tip: off leaf main, and below what
+    // alpha main records for it. Both refusals apply to the same pin.
+    git(leafCheckout, "checkout", "-q", fixture.leafBase)
+    writeFileSync(join(leafCheckout, "leaf.ts"), "export const leaf = 'unpublished'\n")
+    git(leafCheckout, "add", "leaf.ts")
+    git(leafCheckout, "commit", "-q", "-m", "advance maddoc off its own main")
+    const divergedLeaf = git(leafCheckout, "rev-parse", "HEAD")
+    git(alphaCheckout, "add", "apps/maddoc")
+    git(alphaCheckout, "commit", "-q", "-m", "re-pin maddoc at a diverged commit")
+    git(fixture.product, "add", "packages/alpha")
+    git(fixture.product, "commit", "-q", "-m", "re-pin alpha")
+    const candidate = git(fixture.product, "rev-parse", "HEAD")
+    git(fixture.product, "switch", "-q", "main")
+    const stdout = outputSink()
+    const stderr = outputSink()
+
+    const code = await runCli(["--repo", fixture.product, "merge", candidate, "-m", "merge candidate"], stdout, stderr)
+
+    expect(code).toBe(1)
+    // Re-recording the gitlink cannot cure a commit that is off its own main, so
+    // the lowering remedy would send the author to the wrong fix.
+    expect(stderr.output).toContain("gitlink-off-main")
+    expect(stderr.output).toContain("packages/alpha/apps/maddoc")
+    expect(stderr.output).toContain(divergedLeaf)
+    expect(stderr.output, "the more basic refusal wins, and it wins alone").not.toContain("nested-pin-lowered")
+    expect(raisedLeaf).not.toBe(divergedLeaf)
+  })
+
+  it("classifies the nested level against its PARENT's configured submodule branch", async () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-merge-nested-branch-"))
+    roots.push(root)
+    const fixture = createNestedProductFixture(root)
+    // `submodule.apps/maddoc.branch` is declared by ALPHA, the nested gitlink's
+    // superproject. Reading it from the root instead finds nothing, falls back to
+    // the leaf's remote HEAD, and measures the pin against the wrong branch.
+    git(fixture.leaf, "switch", "-q", "-c", "stable")
+    const stable = advanceRepository(fixture.leaf, "leaf.ts", "export const leaf = 'stable'\n")
+    git(fixture.leaf, "switch", "-q", "main")
+    advanceRepository(fixture.leaf, "leaf.ts", "export const leaf = 'main moved elsewhere'\n")
+    const alphaCheckout = join(fixture.product, "packages/alpha")
+    git(alphaCheckout, "config", "submodule.apps/maddoc.branch", "stable")
+    // The candidate leads `stable`, not `main`. Cutting it from the leaf
+    // checkout's current tip would leave it diverged from the very branch this
+    // arm is about, and the merge would refuse on the wrong rung.
+    const leafCheckout = join(alphaCheckout, "apps/maddoc")
+    git(leafCheckout, "fetch", "-q", "origin")
+    git(leafCheckout, "checkout", "-q", stable)
+    const moved = advanceNestedThroughAlpha(fixture, "candidate-branch", "export const leaf = 'stable + one'\n")
+    const result = await superMerge({ repo: fixture.product, commit: moved.candidate })
+
+    expect(result.state).toBe("updated")
+    expect(result.gitlinks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ path: "packages/alpha/apps/maddoc", to: stable, state: "kept-ahead" }),
+      ]),
+    )
+  })
+
+  it("freezes a publication row for the nested pin, ordered leaf-first", async () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-merge-nested-freeze-"))
+    roots.push(root)
+    const fixture = createNestedProductFixture(root)
+    const moved = advanceNestedThroughAlpha(fixture, "candidate-freeze", "export const leaf = 4\n")
+    const result = await superMerge({ repo: fixture.product, commit: moved.candidate })
+    expect(result.state).toBe("updated")
+
+    const message = git(fixture.product, "log", "-1", "--format=%B", "HEAD")
+    const encoded = message
+      .split(/\r?\n/u)
+      .find((line) => line.startsWith(`${PUSH_INTENT_TRAILER}:`))
+      ?.slice(PUSH_INTENT_TRAILER.length + 1)
+      .trim()
+    expect(encoded, `the merge must carry a ${PUSH_INTENT_TRAILER} trailer`).toBeDefined()
+    const intent = decodePushIntent(encoded ?? "")
+    const paths = intent.children.map((child) => child.path)
+
+    // OBJECTS EXISTING IS NOT A LANDING. Without a publication row the nested pin
+    // is only retained at refs/git-super/pins and maddoc main never moves, so
+    // alpha main would pin a maddoc commit maddoc main does not contain -- the
+    // 24493 half-landing, one level down.
+    const nested = intent.children.find((child) => child.path === "packages/alpha/apps/maddoc")
+    expect(nested, "the nested pin must have a frozen row at all").toBeDefined()
+    expect(nested?.pin).toBe(moved.leafHead)
+    expect(nested?.publication?.source, "and a publication row that MOVES its main").toBe(moved.leafHead)
+
+    // LEAF-FIRST, ASSERTED BY POSITION. The consumer pushes publication rows in
+    // this order and `groupUpdates` preserves first-seen order inside its
+    // non-root partition, so this ordering is what keeps alpha main from moving
+    // before the maddoc commit it pins is publishable.
+    expect(paths.indexOf("packages/alpha/apps/maddoc")).toBeGreaterThanOrEqual(0)
+    expect(
+      paths.indexOf("packages/alpha/apps/maddoc"),
+      "maddoc's row must precede alpha's, or alpha main lands pinning a commit maddoc main lacks",
+    ).toBeLessThan(paths.indexOf("packages/alpha"))
   })
 })

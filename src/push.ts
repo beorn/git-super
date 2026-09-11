@@ -104,7 +104,7 @@ async function required(git: GitProcess, repository: string, args: readonly stri
   return result.stdout.trim()
 }
 
-async function discoverRepository(git: GitProcess, path: string, phase: string): Promise<string> {
+export async function discoverRepository(git: GitProcess, path: string, phase: string): Promise<string> {
   const topLevelArgs = ["rev-parse", "--show-toplevel"]
   const topLevel = await git.run({ repo: path, args: topLevelArgs })
   if (topLevel.code === 0 && topLevel.stdout.trim() !== "") return resolve(topLevel.stdout.trim())

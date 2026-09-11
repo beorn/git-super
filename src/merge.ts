@@ -2,7 +2,7 @@ import { isAbsolute, join, resolve } from "node:path"
 import { readCommitSubmodules, resolveSubmoduleBranch, type CommitSubmodule } from "./commit-graph.ts"
 import { ensureCommitObject } from "./objects.ts"
 import { prepareSubmoduleTreeUnderLock } from "./submodule-prepare.ts"
-import { capturePushIntent, rootPushIdentity } from "./push.ts"
+import { capturePushIntent, discoverRepository, rootPushIdentity } from "./push.ts"
 import { PUSH_INTENT_TRAILER, sameHostedOwner } from "./push-intent.ts"
 import { createExclusive, type Exclusive } from "./exclusive.ts"
 import { parseIndexEntries, type IndexEntry } from "./index-entries.ts"
@@ -13,7 +13,7 @@ export type SuperMergeGitlinkResult = Readonly<{
   path: string
   from: string
   to: string
-  state: "raised" | "kept-ahead" | "as-written" | "left-off-main" | "not-run"
+  state: "raised" | "kept-ahead" | "kept-behind" | "as-written" | "left-off-main" | "not-run"
 }>
 
 export type SuperMergeCheckoutResult = Readonly<{
@@ -47,7 +47,7 @@ type GitlinkPlan = Readonly<{
   path: string
   from: string
   to: string
-  state: "raised" | "kept-ahead" | "as-written" | "left-off-main"
+  state: "raised" | "kept-ahead" | "kept-behind" | "as-written" | "left-off-main"
   changedByMerge: boolean
 }>
 
@@ -888,12 +888,18 @@ async function planGitlinks(
   tree: string,
   timeoutMs: number,
 ): Promise<GitlinkPlans> {
-  const before = new Map((await readCommitSubmodules(git, root, head)).map((entry) => [entry.path, entry.target]))
-  const merged = await readCommitSubmodules(git, root, tree)
-  const rootRemote = merged.length === 0 ? undefined : await rootPushIdentity(git, root)
-  const added = new Set(merged.filter((entry) => !before.has(entry.path)).map((entry) => entry.path))
+  const plans: GitlinkPlan[] = []
+  const checkouts = new Map<string, GitlinkCheckoutPlan>()
   const stores = new Map<string, string>()
-  if (added.size > 0 && rootRemote !== undefined) {
+  const visiting = new Set<string>()
+  const completed = new Set<string>()
+
+  const rootMerged = await readCommitSubmodules(git, root, tree)
+  if (rootMerged.length === 0) return { settlements: plans, checkouts: [], stores }
+  const rootRemote = await rootPushIdentity(git, root)
+  const rootBefore = new Map((await readCommitSubmodules(git, root, head)).map((entry) => [entry.path, entry.target]))
+  const added = new Set(rootMerged.filter((entry) => !rootBefore.has(entry.path)).map((entry) => entry.path))
+  if (added.size > 0) {
     const prepared = await prepareSubmoduleTreeUnderLock({ repo: root, commit: tree, remote: rootRemote, git }, added)
     if (prepared.state === "failed" || prepared.state === "unknown") {
       const message = prepared.detail?.message ?? `Cannot prepare submodules added by tree ${tree} in ${root}`
@@ -910,102 +916,220 @@ async function planGitlinks(
       stores.set(submodule.path, submodule.gitdir)
     }
   }
-  const plans: GitlinkPlan[] = []
-  const checkouts = new Map<string, GitlinkCheckoutPlan>()
-  for (const entry of merged) {
-    const submodule = stores.get(entry.path) ?? join(root, entry.path)
-    const recordedBefore = before.get(entry.path)
-    const recorded = recordedBefore ?? entry.target
-    const changedByMerge = recordedBefore !== entry.target
-    if (entry.url === undefined) {
-      throw new Error(
-        `Gitlink ${entry.path}@${entry.target} has no declared .gitmodules URL; declare its remote before merging.`,
-      )
-    }
-    if (rootRemote !== undefined && !sameHostedOwner(rootRemote, entry.url)) {
-      if (changedByMerge && recordedBefore !== undefined) {
-        checkouts.set(entry.path, { path: entry.path, recorded, index: entry.target })
+
+  /**
+   * REFUSE A NESTED PIN THAT MOVES BACKWARDS relative to what its parent's main
+   * already records for it (@cto 2026-09-11, 24454 row 4).
+   *
+   * At depth 0 this cannot happen: a root gitlink behind its main is RAISED to
+   * main, so the recorded pin is main itself. At depth 1 and below nothing
+   * raises, and a stale nested checkout committed by accident is exactly how a
+   * pin goes backwards. The invariant is about the parent COMMIT being
+   * published, not about which rung the pin landed on, so this runs for every
+   * nested entry of a published parent rather than only the Behind ones -- it
+   * can refuse nothing that should pass, because equal passes and any
+   * descendant passes.
+   *
+   * DIVERGED IS CHECKED FIRST AND WINS. A pin that is both off its own main and
+   * lowered gets the Diverged refusal, because re-recording the gitlink cannot
+   * cure a commit that is off its own main and the lowering remedy would send
+   * the author to the wrong fix.
+   */
+  const refuseNestedLowering = async (
+    submodule: string,
+    path: string,
+    entry: CommitSubmodule,
+    parentPath: string,
+    parentMainPins: ReadonlyMap<string, string>,
+  ): Promise<void> => {
+    const onParentMain = parentMainPins.get(entry.path)
+    if (onParentMain === undefined || onParentMain === entry.target) return
+    if (entry.url !== undefined) {
+      // Best effort, and for the same reason as the candidate-pin fetch above:
+      // a pin this repository cannot read is the SUBMITTER's problem, reported
+      // by the command below, never an exception that stops the queue.
+      try {
+        await ensureCommitObject({ repository: submodule, remote: entry.url, commit: onParentMain, timeoutMs, git })
+      } catch {
+        // Deliberately swallowed. The check below asks the same question against
+        // the same store and answers it loudly either way.
       }
-      plans.push({ path: entry.path, from: entry.target, to: entry.target, state: "as-written", changedByMerge })
-      continue
     }
-    const main = await fetchSubmoduleMain(git, root, submodule, entry, timeoutMs)
-    if (entry.target === main) {
-      if (changedByMerge && recordedBefore !== undefined) {
-        checkouts.set(entry.path, { path: entry.path, recorded, index: entry.target })
-      }
-      continue
-    }
-    // THE CANDIDATE PIN HAS TO BE HERE BEFORE ANYTHING COMPARES IT. Compose opens
-    // the worktree at the TARGET sha and populates reference stores for TARGET
-    // pins only, and the fetch above brings `+refs/heads/main` and nothing else.
-    // So a CREATE-ONLY pin — a new commit in a submodule, which is every real fix
-    // in one — is simply absent, and the containment check below dies with exit
-    // 128 "Not a valid commit name" for a commit that IS published. `submit`
-    // publishes it as `refs/git-super/pins/<sha>`; nothing on this path asked.
-    //
-    // The ADDED-submodule branch above has done this since it was written; only
-    // the EXISTING one was missing it.
-    // A FETCH THAT CANNOT SUCCEED IS A MISS, NOT AN ERROR, AND THE DIFFERENCE IS
-    // WHO OWNS THE FAILURE. `ensureCommitObject` throws when the object cannot be
-    // had; letting that throw escape re-owns a condition that was always the
-    // SUBMITTER's. Before this fetch existed, an unfetchable candidate pin
-    // surfaced as the `is-ancestor` exit 128 below and the queue failed the
-    // change — its author fixes their pin and everyone else keeps merging. A
-    // throw here instead STICKS the queue: one bad pin from one seat stops the
-    // line for the whole fleet.
-    //
-    // So the fetch is best-effort by construction. It is here to make a pin that
-    // IS publishable readable; a pin that is not stays exactly as unreadable as
-    // it was, and the containment check below reports it the way it always did.
-    // `tests/../gitlink.test.ts` in the yrd consumer is the acceptance, and it is
-    // what caught this — git-super's own suite cannot see the ownership question
-    // because ownership is decided one layer up.
-    try {
-      await ensureCommitObject({ repository: submodule, remote: entry.url, commit: entry.target, timeoutMs, git })
-    } catch {
-      // Deliberately swallowed, and ONLY here. The next line re-asks the same
-      // question against the same store and answers it loudly either way, so
-      // nothing is lost — the object is either readable now or it is reported
-      // missing by the check that has always reported it.
-    }
-    const ancestry = await run(git, submodule, ["merge-base", "--is-ancestor", entry.target, main], timeoutMs)
-    if (ancestry.code === 0) {
-      if (recordedBefore !== undefined) checkouts.set(entry.path, { path: entry.path, recorded, index: main })
-      plans.push({
-        path: entry.path,
-        from: entry.target,
-        to: main,
-        state: "raised",
-        changedByMerge,
-      })
-      continue
-    }
-    if (ancestry.code === 1) {
-      const reverseArgs = ["merge-base", "--is-ancestor", main, entry.target]
-      const reverse = await run(git, submodule, reverseArgs, timeoutMs)
-      if (reverse.code !== 0 && reverse.code !== 1) {
-        throw operationError(submodule, "prove-gitlink-ahead", reverseArgs, reverse)
-      }
-      if (changedByMerge && recordedBefore !== undefined) {
-        checkouts.set(entry.path, { path: entry.path, recorded, index: entry.target })
-      }
-      plans.push({
-        path: entry.path,
-        from: entry.target,
-        to: main,
-        state: reverse.code === 0 ? "kept-ahead" : "left-off-main",
-        changedByMerge,
-      })
-      continue
-    }
-    throw operationError(
-      submodule,
-      "prove-gitlink-on-main",
-      ["merge-base", "--is-ancestor", entry.target, main],
-      ancestry,
-    )
+    const args = ["merge-base", "--is-ancestor", onParentMain, entry.target]
+    const descends = await run(git, submodule, args, timeoutMs)
+    if (descends.code === 0) return
+    if (descends.code !== 1) throw operationError(submodule, "prove-nested-pin-not-lowered", args, descends)
+    const subject =
+      `Merge would publish ${parentPath}, recording ${path}@${entry.target}, which does not descend from ` +
+      `${onParentMain} already recorded at ${path} by ${parentPath} main.`
+    throw Object.assign(new Error(subject), {
+      resultDetail: obviousDetail(
+        "nested-pin-lowered",
+        subject,
+        `git -C ${submodule} ${args.join(" ")}`,
+        `Re-record the ${path} gitlink in ${parentPath} at or after ${onParentMain}, then rerun the same git super merge command.`,
+        "the submodule writer",
+        { phase: "inspect-gitlinks", paths: [path], objectIds: [entry.target, onParentMain] },
+      ),
+    })
   }
+
+  /**
+   * ONE LEVEL of the gitlink chain, then the levels below it (24454 row 4).
+   *
+   * The Equal/Behind/Ahead/Diverged ladder is unchanged; what is new is that it
+   * now runs at every depth instead of only the root's own gitlinks. A nested
+   * pin -- km/apps/maddoc in production -- used to be neither classified nor
+   * validated by a merge, so a landing could record a nested pin diverged from
+   * its own main and say nothing about it.
+   *
+   * NESTED LEVELS ARE VALIDATE-ONLY. A nested pin lives inside its PARENT
+   * component's commit, and rewriting that commit is not a root merge's
+   * business. It is also mechanically impossible here, which is worth recording
+   * because it is easy to talk yourself into: raises are applied with
+   * `update-index --cacheinfo 160000,<to>,<path>` against the ROOT index, which
+   * holds no entry for `packages/alpha/apps/maddoc`, so a nested raise returns
+   * `not-run` and turns a healthy merge partial. Measured 2026-09-11.
+   *
+   * THE WALK DESCENDS ONLY INTO PARENTS THAT WILL BE PUBLISHED -- the Ahead
+   * rung. An Equal or Behind parent lands a commit its own main already holds,
+   * and that commit's nested pins were validated when IT landed; re-walking
+   * them would re-litigate history. This is also what bounds the walk.
+   *
+   * The cycle guard and the memo mirror `collectCommitRequirements` in push.ts
+   * rather than introducing a second walker; push has walked this chain for as
+   * long as it has ordered publication leaf-first.
+   */
+  const walk = async (
+    repository: string,
+    prefix: string,
+    beforeCommit: string | undefined,
+    commit: string,
+    parentMainPins: ReadonlyMap<string, string> | undefined,
+  ): Promise<void> => {
+    const key = `${repository}\0${commit}`
+    if (completed.has(key)) return
+    if (visiting.has(key)) {
+      throw new Error(`recursive gitlink cycle at ${prefix === "" ? "." : prefix} ${commit}`)
+    }
+    visiting.add(key)
+    const nested = prefix !== ""
+    const before = new Map(
+      beforeCommit === undefined
+        ? []
+        : (await readCommitSubmodules(git, repository, beforeCommit)).map(
+            (entry) => [entry.path, entry.target] as const,
+          ),
+    )
+    for (const entry of await readCommitSubmodules(git, repository, commit)) {
+      const path = nested ? `${prefix}/${entry.path}` : entry.path
+      const submodule = nested
+        ? await discoverRepository(git, join(repository, entry.path), "discover-nested-submodule")
+        : (stores.get(path) ?? join(repository, entry.path))
+      const recordedBefore = before.get(entry.path)
+      const recorded = recordedBefore ?? entry.target
+      const changedByMerge = recordedBefore !== entry.target
+      // A checkout plan is settled against the ROOT index and worktree, so only
+      // the root's own gitlinks can have one -- for the same reason a nested
+      // raise cannot be applied.
+      const settleCheckout = (index: string): void => {
+        if (nested || recordedBefore === undefined) return
+        checkouts.set(path, { path, recorded, index })
+      }
+      if (entry.url === undefined) {
+        throw new Error(
+          `Gitlink ${path}@${entry.target} has no declared .gitmodules URL; declare its remote before merging.`,
+        )
+      }
+      if (!sameHostedOwner(rootRemote, entry.url)) {
+        if (changedByMerge) settleCheckout(entry.target)
+        plans.push({ path, from: entry.target, to: entry.target, state: "as-written", changedByMerge })
+        continue
+      }
+      // The superproject is the PARENT, not the root: `submodule.<name>.branch`
+      // for a nested gitlink is declared in its parent component, not in km.
+      const main = await fetchSubmoduleMain(git, repository, submodule, entry, timeoutMs)
+      if (entry.target === main) {
+        if (changedByMerge) settleCheckout(entry.target)
+        continue
+      }
+      // THE CANDIDATE PIN HAS TO BE HERE BEFORE ANYTHING COMPARES IT. Compose opens
+      // the worktree at the TARGET sha and populates reference stores for TARGET
+      // pins only, and the fetch above brings `+refs/heads/main` and nothing else.
+      // So a CREATE-ONLY pin — a new commit in a submodule, which is every real fix
+      // in one — is simply absent, and the containment check below dies with exit
+      // 128 "Not a valid commit name" for a commit that IS published. `submit`
+      // publishes it as `refs/git-super/pins/<sha>`; nothing on this path asked.
+      //
+      // The ADDED-submodule branch above has done this since it was written; only
+      // the EXISTING one was missing it.
+      // A FETCH THAT CANNOT SUCCEED IS A MISS, NOT AN ERROR, AND THE DIFFERENCE IS
+      // WHO OWNS THE FAILURE. `ensureCommitObject` throws when the object cannot be
+      // had; letting that throw escape re-owns a condition that was always the
+      // SUBMITTER's. Before this fetch existed, an unfetchable candidate pin
+      // surfaced as the `is-ancestor` exit 128 below and the queue failed the
+      // change — its author fixes their pin and everyone else keeps merging. A
+      // throw here instead STICKS the queue: one bad pin from one seat stops the
+      // line for the whole fleet.
+      //
+      // So the fetch is best-effort by construction. It is here to make a pin that
+      // IS publishable readable; a pin that is not stays exactly as unreadable as
+      // it was, and the containment check below reports it the way it always did.
+      // `tests/../gitlink.test.ts` in the yrd consumer is the acceptance, and it is
+      // what caught this — git-super's own suite cannot see the ownership question
+      // because ownership is decided one layer up.
+      try {
+        await ensureCommitObject({ repository: submodule, remote: entry.url, commit: entry.target, timeoutMs, git })
+      } catch {
+        // Deliberately swallowed, and ONLY here. The next line re-asks the same
+        // question against the same store and answers it loudly either way, so
+        // nothing is lost — the object is either readable now or it is reported
+        // missing by the check that has always reported it.
+      }
+      const ancestryArgs = ["merge-base", "--is-ancestor", entry.target, main]
+      const ancestry = await run(git, submodule, ancestryArgs, timeoutMs)
+      if (ancestry.code === 0) {
+        // BEHIND its own main. At the root this is raised to main. Nested, it is
+        // recorded as it stands -- a parent may legitimately pin an older child
+        // -- and only checked for going backwards.
+        if (!nested) {
+          settleCheckout(main)
+          plans.push({ path, from: entry.target, to: main, state: "raised", changedByMerge })
+          continue
+        }
+        if (parentMainPins !== undefined) await refuseNestedLowering(submodule, path, entry, prefix, parentMainPins)
+        plans.push({ path, from: entry.target, to: main, state: "kept-behind", changedByMerge })
+        continue
+      }
+      if (ancestry.code === 1) {
+        const reverseArgs = ["merge-base", "--is-ancestor", main, entry.target]
+        const reverse = await run(git, submodule, reverseArgs, timeoutMs)
+        if (reverse.code !== 0 && reverse.code !== 1) {
+          throw operationError(submodule, "prove-gitlink-ahead", reverseArgs, reverse)
+        }
+        const state = reverse.code === 0 ? "kept-ahead" : "left-off-main"
+        // DIVERGED IS DECIDED BEFORE LOWERING AND SUPPRESSES IT. The caller turns
+        // a changed `left-off-main` into the D1 refusal.
+        if (state === "kept-ahead" && nested && parentMainPins !== undefined) {
+          await refuseNestedLowering(submodule, path, entry, prefix, parentMainPins)
+        }
+        if (changedByMerge) settleCheckout(entry.target)
+        plans.push({ path, from: entry.target, to: main, state, changedByMerge })
+        if (state === "kept-ahead") {
+          const mainPins = new Map(
+            (await readCommitSubmodules(git, submodule, main)).map((child) => [child.path, child.target] as const),
+          )
+          await walk(submodule, path, recordedBefore, entry.target, mainPins)
+        }
+        continue
+      }
+      throw operationError(submodule, "prove-gitlink-on-main", ancestryArgs, ancestry)
+    }
+    visiting.delete(key)
+    completed.add(key)
+  }
+
+  await walk(root, "", head, tree, undefined)
   return { settlements: plans, checkouts: [...checkouts.values()], stores }
 }
 
