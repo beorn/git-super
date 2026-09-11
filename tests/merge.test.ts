@@ -13,12 +13,14 @@ import { superMerge } from "../src/merge.ts"
 import { createLocalGitProcess } from "../src/process.ts"
 import type { GitResultDetail } from "../src/result.ts"
 import {
+  addNestedAlphaSubmodule,
   advanceRepository,
   canonicalTmpdir as tmpdir,
   createProductFixture as createLocalProductFixture,
   createRepository,
   git,
   injectionProbe,
+  type NestedProductFixture,
   type ProductFixture,
 } from "./fixture.ts"
 
@@ -53,6 +55,30 @@ function createProductFixture(root: string): ProductFixture {
   }
   git(fixture.product, "commit", "-q", "--amend", "-am", "declare hosted merge fixture identities")
   return { ...fixture, productBase: git(fixture.product, "rev-parse", "HEAD") }
+}
+
+/**
+ * The hosted fixture, one level deeper: `packages/alpha/apps/maddoc`, which is
+ * the shape of the real `km/apps/maddoc` this row's acceptance names.
+ *
+ * The nested leaf needs a HOSTED identity of its own, exactly as
+ * `createProductFixture` gives alpha and beta. Without it `planGitlinks` takes
+ * the `sameHostedOwner` branch, records the pin `as-written` and never asks its
+ * main anything -- so the arm would pass for the wrong reason, on a level that
+ * was skipped rather than classified.
+ */
+function createNestedProductFixture(root: string): NestedProductFixture {
+  const fixture = addNestedAlphaSubmodule(createProductFixture(root))
+  const url = "https://git-super.test/owned/leaf.git"
+  const alphaCheckout = join(fixture.product, "packages/alpha")
+  git(alphaCheckout, "config", "--file", ".gitmodules", "submodule.apps/maddoc.url", url)
+  git(alphaCheckout, "config", "submodule.apps/maddoc.url", url)
+  git(join(alphaCheckout, "apps/maddoc"), "remote", "set-url", "origin", url)
+  git(join(alphaCheckout, "apps/maddoc"), "config", `url.${fixture.leaf}.insteadOf`, url)
+  git(alphaCheckout, "commit", "-q", "-am", "declare hosted nested identity")
+  git(fixture.product, "add", "packages/alpha")
+  git(fixture.product, "commit", "-q", "-m", "pin alpha with hosted nested identity")
+  return { ...fixture, productWithNestedBase: git(fixture.product, "rev-parse", "HEAD") }
 }
 
 function candidateWithRootChange(fixture: ProductFixture, name: string): string {
@@ -1500,5 +1526,41 @@ describe("git super merge", () => {
     })
     expect(result.commit).toBeUndefined()
     expect(git(repository, "rev-list", "--parents", "-n", "1", "HEAD").split(" ")).toHaveLength(3)
+  })
+})
+
+/**
+ * @failure  `planGitlinks` reads ONE level. It classifies the root's own
+ *           gitlinks against their mains and never descends, so a nested pin --
+ *           `km/apps/maddoc` in production, `packages/alpha/apps/maddoc` here --
+ *           is neither classified nor validated by a merge. A landing can
+ *           therefore record a nested pin that is diverged from its own main, or
+ *           that no one can fetch, and say nothing. Until this lands, a nested
+ *           component is one of only two cases still allowed a direct hand push
+ *           to its component main (@cto, 2026-09-11), so this closes that
+ *           exception rather than merely improving the planner.
+ * @level    l1
+ * @consumer every root submit that carries a nested component.
+ */
+describe("git super merge — the nested gitlink chain (24454 row 4)", () => {
+  it("classifies a nested gitlink against its OWN main, not just the root's", async () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-merge-nested-"))
+    roots.push(root)
+    const fixture = createNestedProductFixture(root)
+    // The leaf's own main moves ahead of the pin alpha records, which is the
+    // BEHIND rung of the same ladder the root level already walks.
+    const newestLeaf = advanceRepository(fixture.leaf, "leaf.ts", "export const leaf = 3\n")
+    const candidate = candidateWithRootChange(fixture, "candidate-nested")
+    const result = await superMerge({ repo: fixture.product, commit: candidate })
+
+    // The nested level must appear at all. Today it does not: the planner stops
+    // at depth 1 and this array holds only `packages/alpha`.
+    expect(result.gitlinks.map((entry) => entry.path), "the nested path must be classified, not skipped").toContain(
+      "packages/alpha/apps/maddoc",
+    )
+    expect(
+      result.gitlinks.find((entry) => entry.path === "packages/alpha/apps/maddoc"),
+      "and classified on the BEHIND rung against the leaf's own main",
+    ).toMatchObject({ to: newestLeaf, state: "raised" })
   })
 })
