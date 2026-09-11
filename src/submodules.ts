@@ -4,6 +4,7 @@ import { appendFile, mkdir, readFile } from "node:fs/promises"
 import { isAbsolute, join, resolve } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 import { createLogger, type ConditionalLogger, type LogLevel } from "loggily"
+import { pinRef } from "./objects.ts"
 import { cleanGitRepositoryEnvironment } from "./git.ts"
 import { createLocalGitProcess, type GitProcess } from "./process.ts"
 
@@ -354,14 +355,7 @@ async function warmReference(git: SubmoduleGit, reference: string, sha: string):
     // this the hard way on 2026-09-09). Named by the sha itself, so a repeat
     // warm-up for the same pin only ever rewrites the ref to the value it
     // already has.
-    [
-      "fetch",
-      "--no-tags",
-      "--no-recurse-submodules",
-      "--no-write-fetch-head",
-      "origin",
-      `${sha}:refs/git-super/pins/${sha}`,
-    ],
+    ["fetch", "--no-tags", "--no-recurse-submodules", "--no-write-fetch-head", "origin", `${sha}:${pinRef(sha)}`],
     true,
   )
 }

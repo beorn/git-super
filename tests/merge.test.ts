@@ -184,6 +184,60 @@ describe("git super merge", () => {
   })
 
   /**
+   * THE CLEAN-ROOM CASE, and it is the one the queue actually runs.
+   *
+   * `composeCandidate` opens the compose worktree at the TARGET sha and populates
+   * reference stores for TARGET pins only. `planGitlinks` then fetches nothing
+   * but `+refs/heads/main` before asking whether the candidate pin is contained
+   * in it. So for a CREATE-ONLY pin — a new commit in a submodule, which is every
+   * real fix in one — the object is simply not there, and the containment check
+   * dies with exit 128 "Not a valid commit name" for a commit that IS published.
+   *
+   * `submit` publishes it as `refs/git-super/pins/<sha>`, so the object is
+   * reachable from the remote and nothing on this path ever asks for it.
+   *
+   * Specimen: `task/dev4-24385` bounced FIVE times on exactly this, across four
+   * distinct upstream causes that each masked it in turn.
+   *
+   * The fixture reproduces the clean room without destroying anything: the pin is
+   * made in a SEPARATE clone and pushed to the remote as a pin ref only, and the
+   * product's gitlink is written with `update-index --cacheinfo`, so the
+   * product's own submodule store has never seen the object.
+   */
+  it("settles kept-ahead for a pin published only as a pin ref, which its store has never seen", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-cleanroom-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+
+    // The candidate pin is created somewhere the product cannot see, and reaches
+    // the remote ONLY as a pin ref — never on a branch.
+    const authoring = join(fixtureRoot, "alpha-authoring")
+    git(fixtureRoot, "clone", "-q", fixture.alpha, authoring)
+    const pin = advanceRepository(authoring, "alpha.ts", "export const alpha = 'create-only'\n")
+    git(authoring, "push", "-q", "origin", `${pin}:refs/git-super/pins/${pin}`)
+
+    git(fixture.product, "switch", "-q", "-c", "candidate-clean-room")
+    git(fixture.product, "update-index", "--add", "--cacheinfo", `160000,${pin},packages/alpha`)
+    git(fixture.product, "commit", "-q", "-m", "pin alpha at a create-only commit")
+    const candidate = git(fixture.product, "rev-parse", "HEAD")
+    git(fixture.product, "switch", "-q", "main")
+
+    // POSITIVE CONTROL for the clean room: without this the test could pass on a
+    // store that happened to hold the object, proving nothing about the fetch.
+    const child = join(fixture.product, "packages/alpha")
+    expect(() => git(child, "cat-file", "-e", `${pin}^{commit}`)).toThrow()
+    expect(git(fixture.alpha, "rev-parse", "main")).toBe(fixture.alphaBase)
+
+    const result = await superMerge({ repo: fixture.product, commit: candidate })
+    expect(result).toMatchObject({
+      state: "updated",
+      partial: false,
+      gitlinks: [expect.objectContaining({ path: "packages/alpha", state: "kept-ahead" })],
+    })
+    expect(git(fixture.product, "rev-parse", "HEAD:packages/alpha")).toBe(pin)
+  })
+
+  /**
    * M8.5: the real merge must freeze an owned ahead pin before checks, and ordinary
    * push must advance it before root. External pins remain as written with no ref
    * writes; unjudged local identity refuses before merge. Prior consumer fixtures

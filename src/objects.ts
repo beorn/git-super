@@ -7,6 +7,17 @@ export type EnsureCommitObjectOptions = Readonly<{
   commit: string
   timeoutMs?: number
   git?: GitProcess
+  /**
+   * Whether the fetch anchors the object under {@link pinRef}. Defaults to TRUE,
+   * because an object fetched with no ref pointing at it is prunable and the
+   * caller that asked for it usually needs it to still be there afterwards.
+   *
+   * `false` is for a caller that must leave the store's REFS untouched —
+   * `observe` is the one, and its own test asserts exactly that. Such a caller
+   * accepts that what it fetched is garbage-collectable, which is the right
+   * trade for an observation and the wrong one for anything that then acts.
+   */
+  anchor?: boolean
 }>
 
 const DEFAULT_GIT_TIMEOUT_MS = 30_000
@@ -31,6 +42,19 @@ function operationError(
   })
 }
 
+/**
+ * Where a fetched exact commit is anchored, named for the object itself.
+ *
+ * ONE HOME FOR THIS SPELLING. The reference warm-up and the retention rows
+ * already write into this namespace; this is the third construction of the same
+ * string and the point at which a fourth literal becomes the defect rather than
+ * the convenience. Naming the ref after the sha means a repeat fetch for the
+ * same object only ever rewrites the ref to the value it already has.
+ */
+export function pinRef(commit: string): string {
+  return `refs/git-super/pins/${commit}`
+}
+
 /** Ensure an exact commit exists locally, fetching only that object when it is missing. */
 export async function ensureCommitObject(options: EnsureCommitObjectOptions): Promise<"fetched" | "present"> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS
@@ -53,7 +77,11 @@ export async function ensureCommitObject(options: EnsureCommitObjectOptions): Pr
     "--no-recurse-submodules",
     "--no-write-fetch-head",
     options.remote,
-    options.commit,
+    // A DESTINATION REF, not a bare want. A fetch that lands the object with no
+    // ref pointing at it leaves it unreachable, and the next `gc` in this
+    // repository is free to take it — `reference.ts` learned exactly this on
+    // 2026-09-09 and this was the third bare-sha fetch left in the tree.
+    options.anchor === false ? options.commit : `${options.commit}:${pinRef(options.commit)}`,
   ]
   const fetched = await git.run({ repo: options.repository, args: fetchArgs })
   if (fetched.code !== 0) throw operationError(options.repository, fetchArgs, "fetch-exact-commit", fetched)

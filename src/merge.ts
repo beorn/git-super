@@ -936,6 +936,17 @@ async function planGitlinks(
       }
       continue
     }
+    // THE CANDIDATE PIN HAS TO BE HERE BEFORE ANYTHING COMPARES IT. Compose opens
+    // the worktree at the TARGET sha and populates reference stores for TARGET
+    // pins only, and the fetch above brings `+refs/heads/main` and nothing else.
+    // So a CREATE-ONLY pin — a new commit in a submodule, which is every real fix
+    // in one — is simply absent, and the containment check below dies with exit
+    // 128 "Not a valid commit name" for a commit that IS published. `submit`
+    // publishes it as `refs/git-super/pins/<sha>`; nothing on this path asked.
+    //
+    // The ADDED-submodule branch above has done this since it was written; only
+    // the EXISTING one was missing it.
+    await ensureCommitObject({ repository: submodule, remote: entry.url, commit: entry.target, timeoutMs, git })
     const ancestry = await run(git, submodule, ["merge-base", "--is-ancestor", entry.target, main], timeoutMs)
     if (ancestry.code === 0) {
       if (recordedBefore !== undefined) checkouts.set(entry.path, { path: entry.path, recorded, index: main })

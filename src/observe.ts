@@ -216,8 +216,19 @@ export async function observe(repo: string, value: unknown, process?: GitProcess
         }
         if (row.publication === undefined) continue
         // Source N is authority only after the frozen merge proves this pin.
-        await ensureCommitObject({ repository: module.gitdir, remote: row.remote, commit: row.pin, git })
-        await ensureCommitObject({ repository: module.gitdir, remote: row.remote, commit: row.publication.source, git })
+        // `anchor: false` THROUGHOUT THIS FILE. Observation must leave the store's
+        // REFS untouched — its own test asserts refs and FETCH_HEAD are identical
+        // before and after — so what it fetches stays garbage-collectable. That is
+        // the right trade for a read, and the wrong one for anything that then
+        // acts on the object, which is why the default is the other way.
+        await ensureCommitObject({ repository: module.gitdir, remote: row.remote, commit: row.pin, git, anchor: false })
+        await ensureCommitObject({
+          repository: module.gitdir,
+          remote: row.remote,
+          commit: row.publication.source,
+          git,
+          anchor: false,
+        })
         await required(git, module.gitdir, ["merge-base", "--is-ancestor", row.pin, row.publication.source])
         explained.add(identity(row.remote, row.publication.destination, row.publication.source))
       }
@@ -240,7 +251,7 @@ export async function observe(repo: string, value: unknown, process?: GitProcess
       if (tip === undefined) {
         throw new Error(`${module.url}: required branch ${ref} is absent from the completed advertisement`)
       }
-      await ensureCommitObject({ repository: module.gitdir, remote: module.url, commit: tip, git })
+      await ensureCommitObject({ repository: module.gitdir, remote: module.url, commit: tip, git, anchor: false })
       examined += 1
       if (tip === module.gitlink || explained.has(identity(module.url, ref, tip))) continue
       const id = createHash("sha256")
