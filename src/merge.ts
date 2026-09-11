@@ -37,12 +37,21 @@ export type SuperMergeCheckoutResult = Readonly<{
  * can reach from the output.
  */
 export type SuperMergeDescentChildResult = Readonly<{
-  /** Full path from the root, e.g. `km/apps/maddoc`. */
+  /**
+   * Full path from the root, e.g. `km/apps/maddoc`.
+   *
+   * THE PRESENCE OF THIS ROW IS THE GUARD'S RESULT. `discoverRepository(...,
+   * guard=true)` runs before any classification arm, so a child appears here
+   * only after the guard admitted its store; a guard that refuses throws
+   * `gitlink-store-absent` and the run returns a failed result with no plan at
+   * all. There is no separate `guard` field because there is no state it could
+   * hold other than "passed".
+   */
   path: string
   /** The gitlink the parent records for this child. */
   target: string
   /** How the walk classified it. */
-  state: "equal" | "raised" | "kept-ahead" | "kept-behind" | "as-written" | "left-off-main"
+  state: "equal" | "kept-ahead" | "kept-behind" | "as-written" | "left-off-main"
 }>
 
 /** The descent into one Ahead parent: what it found and how it classified each. */
@@ -1170,7 +1179,6 @@ async function planGitlinks(
         // -- and only checked for going backwards.
         if (!nested) {
           settleCheckout(main)
-          recordDescent("raised")
           plans.push({ path, from: entry.target, to: main, state: "raised", changedByMerge })
           continue
         }

@@ -1721,6 +1721,17 @@ describe("git super merge — the nested gitlink chain (24454 row 4)", () => {
         }),
       ]),
     )
+    // The descent journal records this rung too (@cto, 24454 row-1 review). This
+    // arm is the one worth pinning of the three non-Equal journal lines, because
+    // it runs a lowering refusal BEFORE recording -- so the assertion also proves
+    // the journal line sits after the check that can throw past it.
+    expect(result.descents).toEqual([
+      {
+        parent: "packages/alpha",
+        parentTarget: git(fixture.product, "rev-parse", "HEAD:packages/alpha"),
+        children: [{ path: "packages/alpha/apps/maddoc", target: fixture.leafBase, state: "kept-behind" }],
+      },
+    ])
     expect(
       git(alphaCheckout, "rev-parse", `${git(fixture.product, "rev-parse", "HEAD:packages/alpha")}:apps/maddoc`),
       "the recorded nested pin is untouched",
