@@ -1013,7 +1013,9 @@ async function logicalPushUrl(git: GitProcess, repository: string, remote: strin
     }
     return urls[0]
   }
-  throw new Error(`Frozen push remote ${remote} has no declared URL in ${repository}`)
+  // With no configured URL, Git interprets the token literally (for example,
+  // bare.git). Callback planning canonicalizes relative paths before use.
+  return remote
 }
 
 /** Freeze the existing recursive planner's inputs before the merge is committed or checked. */
@@ -1631,7 +1633,12 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
               git,
               ...(options.exclusive === undefined ? {} : { exclusive: options.exclusive }),
             })
-          : await applyPlannedUpdates(git, root, retainedPlan, (options.exclusive === undefined ? {} : { exclusive: options.exclusive }))
+          : await applyPlannedUpdates(
+              git,
+              root,
+              retainedPlan,
+              options.exclusive === undefined ? {} : { exclusive: options.exclusive },
+            )
       retained.push(...result.repositories)
       if (result.state === "failed" || result.state === "unknown") {
         return gitSuperResult(

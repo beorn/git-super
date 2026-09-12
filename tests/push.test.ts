@@ -47,6 +47,154 @@ function remoteRefs(repository: string): string {
   return git(repository, "for-each-ref", "--format=%(objectname) %(refname)")
 }
 
+/**
+ * @failure A bare local remote name without ./ or ../ is rejected only when beforePush needs its canonical identity.
+ * @level l1
+ * @consumer Library callers using Git's ordinary repository-relative transport syntax with optional policy injection
+ */
+test.each([
+  ["pushRefUpdates", "omitted"],
+  ["pushRefUpdates", "callback"],
+  ["superPush no", "omitted"],
+  ["superPush no", "callback"],
+] as const)("accepts raw relative bare.git through %s with %s beforePush", async (surface, callbackMode) => {
+  const fixture = pushFixture(`raw-relative-${surface}-${callbackMode}`)
+  const remote = join(fixture.repository, "bare.git")
+  git(fixture.fixture, "init", "--bare", "-q", remote)
+  let calls = 0
+  const beforePush =
+    callbackMode === "callback"
+      ? (operation: BeforePushOperation) => {
+          calls += 1
+          expect(operation).toMatchObject({
+            root: fixture.repository,
+            updates: [
+              {
+                repository: fixture.repository,
+                remote,
+                source: fixture.source,
+                destination: "refs/heads/main",
+                expectedDestination: { state: "missing" },
+                purpose: "publication",
+              },
+            ],
+          })
+        }
+      : undefined
+
+  const result =
+    surface === "pushRefUpdates"
+      ? await pushRefUpdates({
+          root: fixture.repository,
+          updates: [update(fixture.repository, "bare.git", fixture.source, { state: "missing" })],
+          ...(beforePush === undefined ? {} : { beforePush }),
+        })
+      : await superPush({
+          repo: fixture.repository,
+          remote: "bare.git",
+          refspecs: [`${fixture.source}:refs/heads/main`],
+          recurseSubmodules: "no",
+          ...(beforePush === undefined ? {} : { beforePush }),
+        })
+
+  expect(result).toMatchObject({ state: "updated", partial: false })
+  expect(calls).toBe(callbackMode === "callback" ? 1 : 0)
+  expect(remoteRefs(remote)).toBe(`${fixture.source} refs/heads/main`)
+})
+
+/**
+ * @failure A configured alias can be mistaken for a same-spelled local bare path, bypassing pushurl precedence.
+ * @level l1
+ * @consumer Policy callbacks that review the actual configured push transport
+ */
+test("prefers configured pushurl over url and a same-spelled local bare path", async () => {
+  const fixture = pushFixture("configured-raw-relative")
+  const localBare = join(fixture.repository, "bare.git")
+  const urlRemote = join(fixture.fixture, "url.git")
+  const pushRemote = join(fixture.fixture, "push.git")
+  git(fixture.fixture, "init", "--bare", "-q", localBare)
+  git(fixture.fixture, "init", "--bare", "-q", urlRemote)
+  git(fixture.fixture, "init", "--bare", "-q", pushRemote)
+  git(fixture.repository, "config", "remote.bare.git.url", urlRemote)
+  git(fixture.repository, "config", "remote.bare.git.pushurl", pushRemote)
+  let calls = 0
+
+  const result = await pushRefUpdates({
+    root: fixture.repository,
+    updates: [update(fixture.repository, "bare.git", fixture.source, { state: "missing" })],
+    beforePush: (operation) => {
+      calls += 1
+      expect(operation.updates[0]).toMatchObject({ remote: pushRemote })
+    },
+  })
+
+  expect(result).toMatchObject({ state: "updated", partial: false })
+  expect(calls).toBe(1)
+  expect(remoteRefs(pushRemote)).toBe(`${fixture.source} refs/heads/main`)
+  expect(remoteRefs(urlRemote)).toBe("")
+  expect(remoteRefs(localBare)).toBe("")
+})
+
+/**
+ * @failure Remote configuration errors or malformed values silently fall through to a same-spelled local bare path.
+ * @level l1
+ * @consumer Callback callers that need local-path fallback only after both ordinary missing config reads
+ */
+test.each([
+  ["missing local path", { code: "git-failed", phase: "observe-destination" }],
+  ["empty pushurl", { code: "unexpected-error", phase: "push" }],
+  ["multiple pushurls", { code: "unexpected-error", phase: "push" }],
+  ["failed config read", { code: "git-failed", phase: "resolve-frozen-remote" }],
+  ["timed out config read", { code: "git-timeout", phase: "resolve-frozen-remote" }],
+] as const)("fails loudly for %s instead of treating it as a raw relative remote", async (condition, expected) => {
+  const fixture = pushFixture(`raw-relative-${condition}`)
+  const localBare = join(fixture.repository, "bare.git")
+  if (condition !== "missing local path") git(fixture.fixture, "init", "--bare", "-q", localBare)
+  if (condition === "empty pushurl") git(fixture.repository, "config", "remote.bare.git.pushurl", "")
+  if (condition === "multiple pushurls") {
+    git(fixture.repository, "config", "remote.bare.git.pushurl", join(fixture.fixture, "first.git"))
+    git(fixture.repository, "config", "--add", "remote.bare.git.pushurl", join(fixture.fixture, "second.git"))
+  }
+  const local = createLocalGitProcess()
+  const gitProcess: GitProcess | undefined =
+    condition === "failed config read" || condition === "timed out config read"
+      ? {
+          run(request) {
+            if (request.args[0] === "config" && request.args[2] === "remote.bare.git.pushurl") {
+              return Promise.resolve({
+                code: condition === "timed out config read" ? 143 : 128,
+                stdout: "",
+                stderr: "injected pushurl config failure",
+                ...(condition === "timed out config read" ? { timedOut: true } : {}),
+              })
+            }
+            return local.run(request)
+          },
+        }
+      : undefined
+  let calls = 0
+
+  const result = await pushRefUpdates({
+    root: fixture.repository,
+    updates: [update(fixture.repository, "bare.git", fixture.source, { state: "missing" })],
+    beforePush: () => {
+      calls += 1
+    },
+    ...(gitProcess === undefined ? {} : { git: gitProcess }),
+  })
+
+  expect(result).toMatchObject({ state: "failed", partial: false, detail: expected })
+  expect(calls).toBe(0)
+  if (condition === "missing local path") expect(result.detail?.message).toContain(localBare)
+  if (condition === "failed config read" || condition === "timed out config read") {
+    expect(result.detail?.message).toContain("remote.bare.git.pushurl")
+    expect(result.detail?.message).toContain(
+      condition === "timed out config read" ? "timed out" : "injected pushurl config failure",
+    )
+  }
+  if (condition !== "missing local path") expect(remoteRefs(localBare)).toBe("")
+})
+
 function outputSink(): { output: string; write(value: string): void } {
   return {
     output: "",
