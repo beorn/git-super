@@ -12,6 +12,7 @@ import {
 } from "./push-intent.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
 import { superSubmodulePrepare, type PreparedSubmodule } from "./submodule-prepare.ts"
+import { resolveSubmoduleOrigin } from "./submodule-origin.ts"
 import {
   gitSuperResult,
   type ExpectedDestination,
@@ -25,6 +26,23 @@ import {
 
 export type PushSignedMode = "false" | "if-asked" | "true"
 export type PushRecurseMode = "check" | "no" | "on-demand" | "only"
+export type PushPurpose = "retention" | "publication"
+
+export type BeforePushUpdate = Readonly<{
+  repository: string
+  remote: string
+  source: string
+  destination: string
+  expectedDestination: ExpectedDestination
+  purpose: PushPurpose
+}>
+
+export type BeforePushOperation = Readonly<{
+  root: string
+  updates: readonly BeforePushUpdate[]
+}>
+
+export type BeforePush = (operation: BeforePushOperation) => void | Promise<void>
 
 export type SuperPushOptions = Readonly<{
   repo: string
@@ -39,6 +57,7 @@ export type SuperPushOptions = Readonly<{
   timeoutMs?: number
   git?: GitProcess
   exclusive?: Exclusive
+  beforePush?: BeforePush
 }>
 
 export type PushRefUpdatesOptions = Readonly<{
@@ -52,6 +71,7 @@ export type PushRefUpdatesOptions = Readonly<{
   timeoutMs?: number
   git?: GitProcess
   exclusive?: Exclusive
+  beforePush?: BeforePush
 }>
 
 export type RemoteCommitAvailabilityOptions = Readonly<{
@@ -71,6 +91,14 @@ type PlannedUpdate = Readonly<{
   expectedDestination: ExpectedDestination
   explicitExpectation: boolean
   allowNonFastForward: boolean
+  purpose: PushPurpose
+  selected: boolean
+}>
+
+type UpdatePlanRequest = Readonly<{
+  update: RefUpdate
+  purpose: PushPurpose
+  selected: boolean
 }>
 
 type PushGroup = Readonly<{
@@ -212,6 +240,10 @@ function sameExpected(left: ExpectedDestination, right: ExpectedDestination): bo
   return expectedKey(left) === expectedKey(right)
 }
 
+function copyExpectedDestination(expected: ExpectedDestination): ExpectedDestination {
+  return expected.state === "missing" ? { state: "missing" } : { state: "oid", oid: expected.oid }
+}
+
 function isIdenticalSuccess(source: string, observed: ExpectedDestination): boolean {
   return source === "" ? observed.state === "missing" : observed.state === "oid" && observed.oid === source
 }
@@ -264,7 +296,25 @@ function mismatchDetail(update: PlannedUpdate, observed: ExpectedDestination, ph
   )
 }
 
-async function planUpdates(git: GitProcess, input: readonly RefUpdate[], timeoutMs: number): Promise<PlannedUpdate[]> {
+function isUpdatePlanRequest(value: RefUpdate | UpdatePlanRequest): value is UpdatePlanRequest {
+  return "update" in value
+}
+
+/**
+ * Canonical callback identity, resolving a local relative URL at the repository
+ * that Git would use for the push without applying any product policy.
+ */
+async function callbackRemoteIdentity(git: GitProcess, repository: string, remote: string): Promise<string> {
+  const logical = await logicalPushUrl(git, repository, remote)
+  return resolveSubmoduleOrigin(repository, repository, logical)
+}
+
+async function planUpdates(
+  git: GitProcess,
+  input: readonly (RefUpdate | UpdatePlanRequest)[],
+  timeoutMs: number,
+  freezeRemote = false,
+): Promise<PlannedUpdate[]> {
   if (input.length === 0) {
     throw Object.assign(new Error("git super push requires at least one ref update"), {
       resultDetail: detail("empty-push", "validate", "No ref updates were selected.", {
@@ -274,7 +324,9 @@ async function planUpdates(git: GitProcess, input: readonly RefUpdate[], timeout
   }
   const normalized: PlannedUpdate[] = []
   const mismatches = new Map<PlannedUpdate, GitResultDetail>()
-  for (const update of input) {
+  for (const item of input) {
+    const request = isUpdatePlanRequest(item) ? item : { update: item, purpose: "publication" as const, selected: true }
+    const update = request.update
     if (update.source === "" && update.expectedDestination === undefined) {
       throw Object.assign(new Error(`Deleting ${update.destination} requires an exact destination lease`), {
         resultDetail: detail(
@@ -305,6 +357,7 @@ async function planUpdates(git: GitProcess, input: readonly RefUpdate[], timeout
       })
     }
     const repository = await discoverRepository(git, update.repository, "discover-repository")
+    const remote = freezeRemote ? await callbackRemoteIdentity(git, repository, update.remote) : update.remote
     if (update.source !== "") {
       await required(git, repository, ["cat-file", "-e", `${update.source}^{object}`], "verify-source-object")
     }
@@ -318,7 +371,7 @@ async function planUpdates(git: GitProcess, input: readonly RefUpdate[], timeout
     }
     const observed = await observeDestination(
       git,
-      { repository, remote: update.remote, destination: update.destination },
+      { repository, remote, destination: update.destination },
       "observe-destination",
     )
     const branchDestination = update.destination.startsWith("refs/heads/")
@@ -327,7 +380,7 @@ async function planUpdates(git: GitProcess, input: readonly RefUpdate[], timeout
       if (observed.state === "oid" && update.allowNonFastForward !== true) {
         await ensureCommitObject({
           repository,
-          remote: update.remote,
+          remote,
           commit: observed.oid,
           timeoutMs,
           git,
@@ -335,14 +388,17 @@ async function planUpdates(git: GitProcess, input: readonly RefUpdate[], timeout
       }
     }
     const identicalRetry = isIdenticalSuccess(update.source, observed)
+    const expectedDestination = identicalRetry ? observed : (update.expectedDestination ?? observed)
     const planned = {
       repository,
-      remote: update.remote,
+      remote,
       source: update.source,
       destination: update.destination,
-      expectedDestination: identicalRetry ? observed : (update.expectedDestination ?? observed),
+      expectedDestination: freezeRemote ? copyExpectedDestination(expectedDestination) : expectedDestination,
       explicitExpectation: update.expectedDestination !== undefined,
       allowNonFastForward: update.allowNonFastForward === true,
+      purpose: request.purpose,
+      selected: request.selected,
     }
     normalized.push(planned)
     if (
@@ -367,6 +423,9 @@ async function planUpdates(git: GitProcess, input: readonly RefUpdate[], timeout
       sameExpected(prior.expectedDestination, update.expectedDestination) &&
       prior.allowNonFastForward === update.allowNonFastForward
     ) {
+      if (!prior.selected && update.selected) {
+        byDestination.set(key, { ...update, selected: true })
+      }
       continue
     }
     throw Object.assign(new Error(`conflicting updates select ${update.remote} ${update.destination}`), {
@@ -392,6 +451,52 @@ async function planUpdates(git: GitProcess, input: readonly RefUpdate[], timeout
     })
   }
   return planned
+}
+
+function frozenBeforePushOperation(root: string, planned: readonly PlannedUpdate[]): BeforePushOperation {
+  const updates: BeforePushUpdate[] = []
+  for (const update of groupUpdates(planned, root).flatMap((group) => group.updates)) {
+    if (!update.selected) continue
+    const expectedDestination: ExpectedDestination =
+      update.expectedDestination.state === "missing"
+        ? Object.freeze({ state: "missing" })
+        : Object.freeze({ state: "oid", oid: update.expectedDestination.oid })
+    updates.push(
+      Object.freeze({
+        repository: update.repository,
+        remote: update.remote,
+        source: update.source,
+        destination: update.destination,
+        expectedDestination,
+        purpose: update.purpose,
+      }),
+    )
+  }
+  return Object.freeze({ root, updates: Object.freeze(updates) })
+}
+
+async function runBeforePush(
+  callback: BeforePush | undefined,
+  root: string,
+  planned: readonly PlannedUpdate[],
+): Promise<void> {
+  if (callback === undefined) return
+  try {
+    await callback(frozenBeforePushOperation(root, planned))
+  } catch (cause) {
+    const reason = cause instanceof Error ? cause.message : String(cause)
+    throw Object.assign(new Error("beforePush callback rejected the resolved operation"), {
+      resultDetail: detail(
+        "before-push-failed",
+        "before-push",
+        `The beforePush callback rejected the resolved push operation rooted at ${root}: ${reason}`,
+        {
+          paths: [root, ...planned.filter((update) => update.selected).map((update) => update.repository)],
+          remedy: "Inspect the policy decision and retry only with an accepted complete operation.",
+        },
+      ),
+    })
+  }
 }
 
 function groupUpdates(updates: readonly PlannedUpdate[], root: string): PushGroup[] {
@@ -641,6 +746,33 @@ async function applyGroup(
   }
 }
 
+async function applyPlannedUpdates(
+  git: GitProcess,
+  root: string,
+  planned: readonly PlannedUpdate[],
+  options: Pick<PushRefUpdatesOptions, "atomic" | "exclusive" | "pushOptions" | "receivePack" | "signed" | "verify">,
+): Promise<GitSuperResult> {
+  const groups = groupUpdates(planned, root)
+  const exclusive = options.exclusive ?? createExclusive(await lockDirectory(git, root))
+  return exclusive.run(
+    async () => {
+      const results: GitSuperRepositoryResult[] = []
+      for (const [index, group] of groups.entries()) {
+        const result = await applyGroup(git, group, options)
+        results.push(result)
+        if (result.state === "failed" || result.state === "unknown") {
+          const failure =
+            result.detail ?? detail("push-incomplete", "push-refs", `Push did not complete in ${group.repository}.`)
+          results.push(...groups.slice(index + 1).map((remaining) => notRunGroup(remaining, failure)))
+          return gitSuperResult(results, failure)
+        }
+      }
+      return gitSuperResult(results)
+    },
+    { holder: "git super push" },
+  )
+}
+
 /** Apply exact remote ref updates child-first and root-last using explicit leases. */
 export async function pushRefUpdates(options: PushRefUpdatesOptions): Promise<GitSuperResult> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS
@@ -655,25 +787,9 @@ export async function pushRefUpdates(options: PushRefUpdatesOptions): Promise<Gi
   }
   try {
     root = await discoverRepository(git, root, "discover-root")
-    const groups = groupUpdates(await planUpdates(git, options.updates, timeoutMs), root)
-    const exclusive = options.exclusive ?? createExclusive(await lockDirectory(git, root))
-    return await exclusive.run(
-      async () => {
-        const results: GitSuperRepositoryResult[] = []
-        for (const [index, group] of groups.entries()) {
-          const result = await applyGroup(git, group, options)
-          results.push(result)
-          if (result.state === "failed" || result.state === "unknown") {
-            const failure =
-              result.detail ?? detail("push-incomplete", "push-refs", `Push did not complete in ${group.repository}.`)
-            results.push(...groups.slice(index + 1).map((remaining) => notRunGroup(remaining, failure)))
-            return gitSuperResult(results, failure)
-          }
-        }
-        return gitSuperResult(results)
-      },
-      { holder: "git super push" },
-    )
+    const planned = await planUpdates(git, options.updates, timeoutMs, options.beforePush !== undefined)
+    await runBeforePush(options.beforePush, root, planned)
+    return await applyPlannedUpdates(git, root, planned, options)
   } catch (error) {
     if (typeof error === "object" && error !== null && "plannedUpdates" in error && "preflightMismatches" in error) {
       const preflight = error as {
@@ -1422,6 +1538,7 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
         timeoutMs,
         git,
         ...(options.exclusive === undefined ? {} : { exclusive: options.exclusive }),
+        ...(options.beforePush === undefined ? {} : { beforePush: options.beforePush }),
       })
     }
     if (options.recurseSubmodules === "check") {
@@ -1466,6 +1583,7 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
         timeoutMs,
         git,
         ...(options.exclusive === undefined ? {} : { exclusive: options.exclusive }),
+        ...(options.beforePush === undefined ? {} : { beforePush: options.beforePush }),
       })
       return prependRepositories(pushed, available)
     }
@@ -1475,16 +1593,45 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
       const requirements = await collectCommitRequirements(git, root, rootSources)
       for (const requirement of requirements) childUpdates.push(await childUpdate(git, requirement, timeoutMs))
     }
+    const publicationInputs = [...childUpdates, ...(options.recurseSubmodules === "on-demand" ? rootUpdates : [])]
+    let retainedPlan: readonly PlannedUpdate[] | undefined
+    let publicationPlan: readonly PlannedUpdate[] | undefined
+    if (options.beforePush !== undefined) {
+      const validateFrozen = frozen.retention.length > 0
+      const requests: UpdatePlanRequest[] = [
+        ...frozen.retention.map((update) => ({ update, purpose: "retention" as const, selected: true })),
+        ...(validateFrozen
+          ? frozen.publications.map((update) => ({ update, purpose: "publication" as const, selected: false }))
+          : []),
+        ...publicationInputs.map((update) => ({ update, purpose: "publication" as const, selected: true })),
+        ...(validateFrozen && options.recurseSubmodules === "only"
+          ? rootUpdates.map((update) => ({ update, purpose: "publication" as const, selected: false }))
+          : []),
+      ]
+      const planned = requests.length === 0 ? [] : await planUpdates(git, requests, timeoutMs, true)
+      await runBeforePush(options.beforePush, root, planned)
+      retainedPlan = planned.filter((update) => update.selected && update.purpose === "retention")
+      publicationPlan = planned.filter((update) => update.selected && update.purpose === "publication")
+    }
     if (frozen.retention.length > 0) {
       // Validate every frozen destination and root lease before the first retention write.
-      await planUpdates(git, [...frozen.retention, ...frozen.publications, ...childUpdates, ...rootUpdates], timeoutMs)
-      const result = await pushRefUpdates({
-        root,
-        updates: frozen.retention,
-        timeoutMs,
-        git,
-        ...(options.exclusive === undefined ? {} : { exclusive: options.exclusive }),
-      })
+      if (retainedPlan === undefined) {
+        await planUpdates(
+          git,
+          [...frozen.retention, ...frozen.publications, ...childUpdates, ...rootUpdates],
+          timeoutMs,
+        )
+      }
+      const result =
+        retainedPlan === undefined
+          ? await pushRefUpdates({
+              root,
+              updates: frozen.retention,
+              timeoutMs,
+              git,
+              ...(options.exclusive === undefined ? {} : { exclusive: options.exclusive }),
+            })
+          : await applyPlannedUpdates(git, root, retainedPlan, (options.exclusive === undefined ? {} : { exclusive: options.exclusive }))
       retained.push(...result.repositories)
       if (result.state === "failed" || result.state === "unknown") {
         return gitSuperResult(
@@ -1499,7 +1646,7 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
           result.detail,
         )
       }
-      for (const update of frozen.retention) await verifyRetainedSource(git, update)
+      for (const update of retainedPlan ?? frozen.retention) await verifyRetainedSource(git, update)
     }
     if (childUpdates.length === 0 && options.recurseSubmodules === "only") {
       if (retained.length > 0) return gitSuperResult(retained)
@@ -1515,17 +1662,20 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
         },
       ])
     }
-    const pushed = await pushRefUpdates({
-      root,
-      updates: [...childUpdates, ...(options.recurseSubmodules === "on-demand" ? rootUpdates : [])],
-      ...(options.atomic === undefined ? {} : { atomic: options.atomic }),
-      ...(options.verify === undefined ? {} : { verify: options.verify }),
-      ...(options.pushOptions === undefined ? {} : { pushOptions: options.pushOptions }),
-      ...(options.signed === undefined ? {} : { signed: options.signed }),
-      timeoutMs,
-      git,
-      ...(options.exclusive === undefined ? {} : { exclusive: options.exclusive }),
-    })
+    const pushed =
+      publicationPlan === undefined
+        ? await pushRefUpdates({
+            root,
+            updates: publicationInputs,
+            ...(options.atomic === undefined ? {} : { atomic: options.atomic }),
+            ...(options.verify === undefined ? {} : { verify: options.verify }),
+            ...(options.pushOptions === undefined ? {} : { pushOptions: options.pushOptions }),
+            ...(options.signed === undefined ? {} : { signed: options.signed }),
+            timeoutMs,
+            git,
+            ...(options.exclusive === undefined ? {} : { exclusive: options.exclusive }),
+          })
+        : await applyPlannedUpdates(git, root, publicationPlan, options)
     return prependRepositories(pushed, retained)
   } catch (error) {
     const failure = resultError(error, "plan-push")

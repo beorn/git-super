@@ -161,6 +161,8 @@ A fresh clone can fetch the record and retry publication of its exact merge usin
 
 These mechanisms provide ordered publication and retry, not cross-repository rollback. A queue must publish its checked record durably before beginning the landing and retain its root leases for recovery. [Yrd](https://github.com/beorn/yrd#readme) owns queue activation and restart orchestration; the Git Super mechanisms alone do not enable that integration.
 
+Library callers of `superPush` and `pushRefUpdates` can supply an asynchronous `beforePush` callback. It receives the resolved root and immutable updates, including repository paths, logical remote URLs, exact source objects, destinations, expected old values, and whether each update retains a source or publishes a selected ref. Git Super awaits it once for the whole operation before any remote write, including retention. Throwing or rejecting fails preflight without publishing any ref. The reviewed updates are the updates executed; existing destination leases still detect remote movement. Callers that omit the callback retain the existing behavior. This optional callback supplies a policy decision point, not authenticated caller identity or protection against callers that omit it.
+
 ### Worktree with submodules
 
 `worktree add <path> <commit>` creates a detached worktree and materializes every gitlink at the pins that commit records. It is one program for the whole operation, because `git worktree add` alone leaves every submodule an empty directory and the recursive checkout that fills them is where callers reimplement borrowing, fallback limits, and rollback slightly differently each time.
@@ -213,7 +215,7 @@ bun run typecheck
 - `src/commit-graph.ts` is the strict, read-only parser for gitlinks recorded in an exact commit. Pull and push share it rather than reading `.gitmodules` independently.
 - `src/objects.ts` is the exact-commit presence and fetch primitive shared by graph consumers.
 - `src/gitlink.ts` is the update-only index-pin writer. It validates the existing gitlink and target commit, writes under the shared mutation lock, and never checks out or chooses a target.
-- `src/merge.ts` preflights one no-ff merge, fetches submodule main refs, refuses incoming off-main pins, and settles proven-behind pins while preserving partial-write evidence.
+- `src/merge.ts` preflights one no-ff merge, fetches submodule main refs, refuses incoming diverged pins, and settles proven-behind pins while preserving partial-write evidence.
 - `src/process.ts` is the public injected Git process capability. `src/result.ts` owns the shared repository/ref result vocabulary and how results aggregate.
 - `src/pull.ts` owns the fetch, freeze, check, recheck, and apply fast-forward operation.
 - `src/worktree-add.ts` composes the two write services: one detached `git worktree add` plus one recursive

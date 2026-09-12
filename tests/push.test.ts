@@ -1,12 +1,12 @@
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
-import { join } from "node:path"
+import { join, relative } from "node:path"
 import { fileURLToPath } from "node:url"
 import { afterEach, describe, expect, test } from "vitest"
 
 import { runCli } from "../src/cli.ts"
 import { acquireExclusive, createExclusive, type Exclusive } from "../src/exclusive.ts"
 import { createLocalGitProcess, type GitProcess } from "../src/process.ts"
-import { pushRefUpdates, remoteContainsCommit, superPush } from "../src/push.ts"
+import { pushRefUpdates, remoteContainsCommit, superPush, type BeforePushOperation } from "../src/push.ts"
 import { encodePushIntent, PUSH_INTENT_TRAILER } from "../src/push-intent.ts"
 import { advanceRepository, canonicalTmpdir as tmpdir, createRepository, git } from "./fixture.ts"
 
@@ -41,6 +41,10 @@ function update(
     destination: "refs/heads/main",
     ...(expectedDestination === undefined ? {} : { expectedDestination }),
   }
+}
+
+function remoteRefs(repository: string): string {
+  return git(repository, "for-each-ref", "--format=%(objectname) %(refname)")
 }
 
 function outputSink(): { output: string; write(value: string): void } {
@@ -1442,6 +1446,560 @@ describe("explicit recursive push mechanics", () => {
       expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(fixture.rootBefore)
     },
   )
+
+  /**
+   * @failure A direct multi-repository batch can publish an earlier child before a caller rejects the operation.
+   * @level l1
+   * @consumer Callers that need one all-or-nothing preflight before child-first ref writes
+   */
+  test.each(["throw", "reject"] as const)("refuses direct batches when beforePush %ss", async (failure) => {
+    const root = pushFixture(`before-push-direct-root-${failure}`)
+    const child = pushFixture(`before-push-direct-child-${failure}`)
+    let calls = 0
+    let reviewed: unknown
+
+    const result = await pushRefUpdates({
+      root: root.repository,
+      updates: [
+        update(root.repository, relative(root.repository, root.remote), root.source, { state: "missing" }),
+        update(child.repository, relative(child.repository, child.remote), child.source, { state: "missing" }),
+      ],
+      beforePush: (operation) => {
+        calls += 1
+        reviewed = operation
+        if (failure === "throw") throw new Error("policy refused direct batch")
+        return Promise.reject(new Error("policy rejected direct batch"))
+      },
+    })
+
+    expect(calls).toBe(1)
+    expect(reviewed).toMatchObject({
+      updates: [
+        {
+          repository: child.repository,
+          remote: child.remote,
+          source: child.source,
+          destination: "refs/heads/main",
+          expectedDestination: { state: "missing" },
+          purpose: "publication",
+        },
+        {
+          repository: root.repository,
+          remote: root.remote,
+          source: root.source,
+          destination: "refs/heads/main",
+          expectedDestination: { state: "missing" },
+          purpose: "publication",
+        },
+      ],
+    })
+    expect(result).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: { code: "before-push-failed", phase: "before-push" },
+    })
+    expect(result.detail?.message).toContain(
+      failure === "throw" ? "policy refused direct batch" : "policy rejected direct batch",
+    )
+    expect(remoteRefs(child.remote)).toBe("")
+    expect(remoteRefs(root.remote)).toBe("")
+  })
+
+  /**
+   * @failure An operation policy cannot inspect or refuse an exact leased deletion before the remote ref is removed.
+   * @level l1
+   * @consumer Callers that protect deletion alongside ordinary publication updates
+   */
+  test("refuses an exact deletion before its remote ref changes", async () => {
+    const fixture = pushFixture("before-push-delete")
+    git(fixture.repository, "remote", "add", "origin", fixture.remote)
+    git(fixture.repository, "push", "-q", "origin", `${fixture.source}:refs/heads/main`)
+    let calls = 0
+    let reviewed: unknown
+
+    const result = await pushRefUpdates({
+      root: fixture.repository,
+      updates: [update(fixture.repository, "origin", "", { state: "oid", oid: fixture.source })],
+      beforePush: (operation) => {
+        calls += 1
+        reviewed = operation
+        throw new Error("policy refused deletion")
+      },
+    })
+
+    expect(calls).toBe(1)
+    expect(reviewed).toMatchObject({
+      updates: [
+        {
+          repository: fixture.repository,
+          remote: fixture.remote,
+          source: "",
+          destination: "refs/heads/main",
+          expectedDestination: { state: "oid", oid: fixture.source },
+          purpose: "publication",
+        },
+      ],
+    })
+    expect(result).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: {
+        code: "before-push-failed",
+        phase: "before-push",
+        message: expect.stringContaining("policy refused deletion"),
+      },
+    })
+    expect(git(fixture.remote, "rev-parse", "refs/heads/main")).toBe(fixture.source)
+  })
+
+  /**
+   * @failure Recursive publication may advance a child or root after policy rejection because the policy sees no complete operation.
+   * @level l1
+   * @consumer Recursive push callers that must reject before any root or child remote ref changes
+   */
+  test("refuses an on-demand root task before every child and root remote write", async () => {
+    const fixture = recursivePushFixture("before-push-recursive-refusal")
+    const rootBefore = remoteRefs(fixture.rootRemote)
+    const childBefore = remoteRefs(fixture.childRemote)
+    let calls = 0
+    let reviewed: unknown
+
+    const result = await superPush({
+      repo: fixture.root,
+      remote: "origin",
+      refspecs: [`${fixture.rootSource}:refs/heads/task/preflight`],
+      recurseSubmodules: "on-demand",
+      beforePush: (operation) => {
+        calls += 1
+        reviewed = operation
+        throw new Error("policy refused recursive publication")
+      },
+    })
+
+    expect(calls).toBe(1)
+    expect(reviewed).toMatchObject({
+      root: fixture.root,
+      updates: [
+        expect.objectContaining({
+          repository: fixture.child,
+          source: fixture.childSource,
+          destination: "refs/heads/main",
+          purpose: "publication",
+        }),
+        expect.objectContaining({
+          repository: fixture.root,
+          source: fixture.rootSource,
+          destination: "refs/heads/task/preflight",
+          purpose: "publication",
+        }),
+      ],
+    })
+    expect(result).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: { code: "before-push-failed", phase: "before-push" },
+    })
+    expect(remoteRefs(fixture.childRemote)).toBe(childBefore)
+    expect(remoteRefs(fixture.rootRemote)).toBe(rootBefore)
+  })
+
+  /**
+   * @failure A callback is skipped for ordinary no/check pushes, leaving a caller unable to apply one operation policy.
+   * @level l1
+   * @consumer Policy injection across every successful recurse-submodules mode
+   */
+  test.each(["no", "check"] as const)("calls beforePush once for successful %s mode", async (mode) => {
+    let calls = 0
+    let reviewed: unknown
+    const beforePush = (operation: BeforePushOperation) => {
+      calls += 1
+      reviewed = operation
+      expect(Object.isFrozen(operation)).toBe(true)
+      expect(Object.isFrozen(operation.updates)).toBe(true)
+      expect(Object.isFrozen(operation.updates[0])).toBe(true)
+      expect(Object.isFrozen(operation.updates[0]?.expectedDestination)).toBe(true)
+    }
+    if (mode === "no") {
+      const fixture = pushFixture("before-push-no")
+      const result = await superPush({
+        repo: fixture.repository,
+        remote: fixture.remote,
+        refspecs: [`${fixture.source}:refs/heads/main`],
+        recurseSubmodules: mode,
+        beforePush,
+      })
+      expect(result).toMatchObject({ state: "updated", partial: false })
+    } else {
+      const fixture = recursivePushFixture("before-push-check")
+      git(fixture.child, "push", "-q", "origin", `${fixture.childSource}:refs/heads/main`)
+      const result = await superPush({
+        repo: fixture.root,
+        remote: "origin",
+        refspecs: [`${fixture.rootSource}:refs/heads/main`],
+        recurseSubmodules: mode,
+        beforePush,
+      })
+      expect(result).toMatchObject({ state: "updated", partial: false })
+    }
+    expect(calls).toBe(1)
+    expect(reviewed).toMatchObject({ updates: [{ purpose: "publication", destination: "refs/heads/main" }] })
+  })
+
+  /**
+   * @failure A remote ref changed after review can advance despite the reviewed exact old value.
+   * @level l1
+   * @consumer Policy callbacks that need existing explicit leases to remain authoritative after review
+   */
+  test("retains the reviewed lease when a callback advances the remote ref", async () => {
+    const fixture = pushFixture("before-push-lease")
+    git(fixture.repository, "remote", "add", "origin", fixture.remote)
+    git(fixture.repository, "push", "-q", "origin", `${fixture.source}:refs/heads/main`)
+    const source = advanceRepository(fixture.repository, "README.md", "two\n")
+    let calls = 0
+    let reviewed: unknown
+    let competing = ""
+
+    const result = await superPush({
+      repo: fixture.repository,
+      remote: "origin",
+      refspecs: [`${source}:refs/heads/main`],
+      recurseSubmodules: "no",
+      beforePush: (operation) => {
+        calls += 1
+        reviewed = operation
+        competing = git(
+          fixture.remote,
+          "commit-tree",
+          `${fixture.source}^{tree}`,
+          "-p",
+          fixture.source,
+          "-m",
+          "competing remote advance",
+        )
+        git(fixture.remote, "update-ref", "refs/heads/main", competing, fixture.source)
+      },
+    })
+
+    expect(calls).toBe(1)
+    expect(reviewed).toMatchObject({
+      updates: [
+        {
+          repository: fixture.repository,
+          remote: fixture.remote,
+          source,
+          destination: "refs/heads/main",
+          expectedDestination: { state: "oid", oid: fixture.source },
+          purpose: "publication",
+        },
+      ],
+    })
+    expect(result).toMatchObject({ state: "failed", partial: false, detail: { code: "destination-changed" } })
+    expect(git(fixture.remote, "rev-parse", "refs/heads/main")).toBe(competing)
+  })
+
+  /**
+   * @failure A callback can mutate its caller-owned expected destination after review and replace the lease that executes.
+   * @level l1
+   * @consumer Callers that retain mutable RefUpdate input while a beforePush callback runs
+   */
+  test("keeps a reviewed lease when the caller mutates its original expected destination", async () => {
+    const fixture = pushFixture("before-push-mutable-lease")
+    git(fixture.repository, "remote", "add", "origin", fixture.remote)
+    git(fixture.repository, "push", "-q", "origin", `${fixture.source}:refs/heads/main`)
+    const staged = advanceRepository(fixture.repository, "README.md", "staged\n")
+    git(fixture.repository, "push", "-q", "origin", `${staged}:refs/heads/staged`)
+    const source = advanceRepository(fixture.repository, "README.md", "selected source\n")
+    const expectedDestination = { state: "oid" as const, oid: fixture.source }
+    let calls = 0
+
+    const result = await pushRefUpdates({
+      root: fixture.repository,
+      updates: [
+        {
+          repository: fixture.repository,
+          remote: "origin",
+          source,
+          destination: "refs/heads/main",
+          expectedDestination,
+        },
+      ],
+      beforePush: (operation) => {
+        calls += 1
+        expect(operation.updates[0]?.expectedDestination).toEqual({ state: "oid", oid: fixture.source })
+        expectedDestination.oid = staged
+        git(fixture.remote, "update-ref", "refs/heads/main", staged, fixture.source)
+      },
+    })
+
+    expect(calls).toBe(1)
+    expect(result).toMatchObject({ state: "failed", partial: false, detail: { code: "destination-changed" } })
+    expect(git(fixture.remote, "rev-parse", "refs/heads/main")).toBe(staged)
+  })
+
+  /**
+   * @failure A remote alias changed in the callback diverts a reviewed child update to a different remote.
+   * @level l1
+   * @consumer Callers relying on exact reviewed repository and remote identities
+   */
+  test("executes the reviewed remote when beforePush changes a child remote alias", async () => {
+    const fixture = recursivePushFixture("before-push-freeze-remote")
+    const alternate = join(fixture.fixture, "alternate-child.git")
+    git(fixture.fixture, "init", "--bare", "-q", "-b", "main", alternate)
+    let calls = 0
+
+    const result = await superPush({
+      repo: fixture.root,
+      remote: "origin",
+      refspecs: ["HEAD:refs/heads/main"],
+      recurseSubmodules: "on-demand",
+      beforePush: (operation) => {
+        calls += 1
+        expect(operation.updates[0]).toMatchObject({ repository: fixture.child, remote: fixture.childRemote })
+        git(fixture.child, "remote", "set-url", "origin", alternate)
+        advanceRepository(fixture.root, "after-review.txt", "move root source after review\n")
+      },
+    })
+
+    expect(result).toMatchObject({ state: "updated", partial: false })
+    expect(calls).toBe(1)
+    expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(fixture.childSource)
+    expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(fixture.rootSource)
+    expect(remoteRefs(alternate)).toBe("")
+  })
+
+  /**
+   * @failure only mode leaks a root update to policy even though it cannot execute that update.
+   * @level l1
+   * @consumer Policy injection that distinguishes selected child publication from root preservation
+   */
+  test("excludes the root update from an only-mode beforePush operation", async () => {
+    const fixture = recursivePushFixture("before-push-only")
+    let calls = 0
+
+    const result = await superPush({
+      repo: fixture.root,
+      remote: "origin",
+      refspecs: [`${fixture.rootSource}:refs/heads/main`],
+      recurseSubmodules: "only",
+      beforePush: (operation) => {
+        calls += 1
+        expect(operation.root).toBe(fixture.root)
+        expect(operation.updates).toHaveLength(1)
+        expect(operation.updates[0]).toMatchObject({
+          repository: fixture.child,
+          source: fixture.childSource,
+          destination: "refs/heads/main",
+          purpose: "publication",
+        })
+      },
+    })
+
+    expect(result).toMatchObject({ state: "updated", partial: false })
+    expect(calls).toBe(1)
+    expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(fixture.childSource)
+    expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(fixture.rootBefore)
+  })
+
+  /**
+   * @failure An empty only-mode operation skips policy or leaks its root-only input as a write.
+   * @level l1
+   * @consumer Policy callbacks that distinguish no selected writes from root preservation
+   */
+  test("calls beforePush once with no updates for an empty only-mode operation", async () => {
+    const fixture = pushFixture("before-push-empty-only")
+    let calls = 0
+
+    const result = await superPush({
+      repo: fixture.repository,
+      remote: fixture.remote,
+      refspecs: [`${fixture.source}:refs/heads/main`],
+      recurseSubmodules: "only",
+      beforePush: (operation) => {
+        calls += 1
+        expect(operation.root).toBe(fixture.repository)
+        expect(operation.updates).toEqual([])
+      },
+    })
+
+    expect(result).toMatchObject({ state: "unchanged", partial: false })
+    expect(calls).toBe(1)
+    expect(remoteRefs(fixture.remote)).toBe("")
+  })
+
+  /**
+   * @failure A frozen child main can be preceded by an immutable pin write before operation policy rejects it.
+   * @level l1
+   * @consumer Frozen checked publication refusal before retention, child, or root remotes move
+   */
+  test("refuses a direct frozen merge before immutable retention or publication", async () => {
+    const fixture = recursivePushFixture("before-push-frozen-refusal")
+    const rootUrl = "https://git-super.test/owned/root.git"
+    const childUrl = "https://git-super.test/owned/child.git"
+    git(fixture.root, "config", `url.${fixture.rootRemote}.insteadOf`, rootUrl)
+    git(fixture.child, "config", `url.${fixture.childRemote}.insteadOf`, childUrl)
+    git(fixture.root, "remote", "set-url", "origin", rootUrl)
+    const intent = encodePushIntent({
+      version: 1,
+      rootRemote: rootUrl,
+      children: [
+        {
+          path: "child",
+          remote: childUrl,
+          pin: fixture.childSource,
+          publication: {
+            destination: "refs/heads/main",
+            source: fixture.childSource,
+            expectedDestination: { state: "oid", oid: fixture.childBefore },
+          },
+        },
+      ],
+    })
+    const merge = git(
+      fixture.root,
+      "commit-tree",
+      `${fixture.rootSource}^{tree}`,
+      "-p",
+      fixture.rootBefore,
+      "-p",
+      fixture.rootSource,
+      "-m",
+      `checked merge\n\n${PUSH_INTENT_TRAILER}: ${intent}`,
+    )
+    const rootBefore = remoteRefs(fixture.rootRemote)
+    const childBefore = remoteRefs(fixture.childRemote)
+    let calls = 0
+    let reviewed: unknown
+
+    const result = await superPush({
+      repo: fixture.root,
+      remote: "origin",
+      refspecs: [`${merge}:refs/heads/main`],
+      recurseSubmodules: "on-demand",
+      beforePush: (operation) => {
+        calls += 1
+        reviewed = operation
+        throw new Error("policy refused frozen publication")
+      },
+    })
+
+    expect(calls).toBe(1)
+    expect(reviewed).toMatchObject({
+      root: fixture.root,
+      updates: [
+        expect.objectContaining({
+          repository: fixture.child,
+          source: fixture.childSource,
+          destination: `refs/git-super/pins/${fixture.childSource}`,
+          purpose: "retention",
+        }),
+        expect.objectContaining({
+          repository: fixture.child,
+          source: fixture.childSource,
+          destination: "refs/heads/main",
+          purpose: "publication",
+        }),
+        expect.objectContaining({
+          repository: fixture.root,
+          source: merge,
+          destination: "refs/heads/main",
+          purpose: "publication",
+        }),
+      ],
+    })
+    expect(result).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: { code: "before-push-failed", phase: "before-push" },
+    })
+    expect(remoteRefs(fixture.childRemote)).toBe(childBefore)
+    expect(remoteRefs(fixture.rootRemote)).toBe(rootBefore)
+  })
+
+  /**
+   * @failure Retention policy either replays a historical frozen branch publication or rejects the record-only retention it needs.
+   * @level l1
+   * @consumer Inherited checked records that retain immutable sources without branch replay
+   */
+  test("retains an inherited frozen source without exposing its historical publication", async () => {
+    const fixture = recursivePushFixture("before-push-inherited-retention")
+    const rootUrl = "https://git-super.test/owned/root.git"
+    const childUrl = "https://git-super.test/owned/child.git"
+    git(fixture.root, "config", `url.${fixture.rootRemote}.insteadOf`, rootUrl)
+    git(fixture.child, "config", `url.${fixture.childRemote}.insteadOf`, childUrl)
+    git(fixture.root, "remote", "set-url", "origin", rootUrl)
+    const intent = encodePushIntent({
+      version: 1,
+      rootRemote: rootUrl,
+      children: [
+        {
+          path: "child",
+          remote: childUrl,
+          pin: fixture.childSource,
+          publication: {
+            destination: "refs/heads/main",
+            source: fixture.childSource,
+            expectedDestination: { state: "oid", oid: fixture.childBefore },
+          },
+        },
+      ],
+    })
+    const merge = git(
+      fixture.root,
+      "commit-tree",
+      `${fixture.rootSource}^{tree}`,
+      "-p",
+      fixture.rootBefore,
+      "-p",
+      fixture.rootSource,
+      "-m",
+      `checked merge\n\n${PUSH_INTENT_TRAILER}: ${intent}`,
+    )
+    const emptyTree = git(fixture.root, "hash-object", "-w", "-t", "tree", "--stdin")
+    const record = git(fixture.root, "commit-tree", emptyTree, "-p", merge, "-m", "retain checked merge")
+    const recordRef = "refs/checks/frozen"
+    let calls = 0
+
+    const result = await superPush({
+      repo: fixture.root,
+      remote: "origin",
+      refspecs: [`${record}:${recordRef}`],
+      recurseSubmodules: "on-demand",
+      beforePush: (operation) => {
+        calls += 1
+        expect(operation.updates).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              repository: fixture.child,
+              source: fixture.childSource,
+              destination: `refs/git-super/pins/${fixture.childSource}`,
+              purpose: "retention",
+            }),
+            expect.objectContaining({
+              repository: fixture.root,
+              source: record,
+              destination: recordRef,
+              purpose: "publication",
+            }),
+          ]),
+        )
+        expect(operation.updates).not.toContainEqual(
+          expect.objectContaining({
+            repository: fixture.child,
+            destination: "refs/heads/main",
+            purpose: "publication",
+          }),
+        )
+      },
+    })
+
+    expect(result).toMatchObject({ state: "updated", partial: false })
+    expect(calls).toBe(1)
+    expect(git(fixture.childRemote, "rev-parse", `refs/git-super/pins/${fixture.childSource}`)).toBe(
+      fixture.childSource,
+    )
+    expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(fixture.childBefore)
+    expect(git(fixture.rootRemote, "rev-parse", recordRef)).toBe(record)
+  })
 
   test("reports child success followed by root rejection as partial without rollback", async () => {
     const root = pushFixture("partial-root")
