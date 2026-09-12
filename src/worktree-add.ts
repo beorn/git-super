@@ -1,4 +1,4 @@
-import { resolve } from "node:path"
+import { isAbsolute, resolve } from "node:path"
 import type { ConditionalLogger } from "loggily"
 import { gitSuperResult, type GitResultDetail, type GitSuperResult } from "./result.ts"
 import { materializeSubmodulesFromLocalWorktreeParallel } from "./submodules.ts"
@@ -62,6 +62,34 @@ function assertRegistrationComponent(value: string, what: string): void {
   if (value.includes("/") || value.includes("\\") || value.includes("\u0000")) {
     throw new Error(`worktree registration ${what} must be one path segment (${value})`)
   }
+}
+
+/**
+ * The one worktree home (@i/4-supervision/24306).
+ *
+ * Creation is already one primitive (`superWorktreeAdd`); what multiplied is
+ * the HOME, because each caller hardcoded its own. This is the one reader
+ * those callers pass a path from. The default is flat: one directory per
+ * worktree, no per-owner or per-kind subfolder.
+ *
+ * A relative override is refused: a home that depends on cwd is a different
+ * directory from every seat, which is the defect this function exists to
+ * remove. Tests pass an env object; they do not mutate process.env.
+ */
+export const DEFAULT_WORKTREE_HOME = "/hh/var/wt"
+export const WORKTREE_HOME_ENV = "HH_WORKTREE_HOME"
+
+export function worktreeHomeRoot(env: NodeJS.ProcessEnv = process.env): string {
+  const override = env[WORKTREE_HOME_ENV]
+  if (override !== undefined && override.length > 0) {
+    if (!isAbsolute(override)) {
+      throw new Error(
+        `${WORKTREE_HOME_ENV} must be an absolute path (got '${override}'): a relative home is a different directory from every cwd, which is the three-homes defect this function exists to remove`,
+      )
+    }
+    return override
+  }
+  return DEFAULT_WORKTREE_HOME
 }
 
 /**
