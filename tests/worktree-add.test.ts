@@ -440,3 +440,31 @@ describe("git super worktree add", () => {
     expect(stdout.output).toBe("")
   })
 })
+
+describe("git super worktree remove routing (24622)", () => {
+  it("reaches git-super through runCli without --repo, not native Git", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-worktree-remove-route-"))
+    roots.push(fixtureRoot)
+    const fixture = createSuperproject(fixtureRoot)
+    const worktree = join(fixtureRoot, "candidate")
+    const retained = join(fixtureRoot, "retained")
+    expect(
+      await runCli(["--repo", fixture.product, "worktree", "add", worktree, "HEAD"], outputSink(), outputSink()),
+    ).toBe(0)
+    const stdout = outputSink()
+    const stderr = outputSink()
+    const previous = process.cwd()
+    process.chdir(fixture.product)
+    let code: number
+    try {
+      code = await runCli(["worktree", "remove", "--retain", retained, worktree], stdout, stderr)
+    } finally {
+      process.chdir(previous)
+    }
+    expect(stderr.output).not.toMatch(/unknown option [`']retain[`']/)
+    expect(stderr.output).not.toContain("working trees containing submodules cannot be moved or removed")
+    expect(stderr.output).not.toMatch(/^usage: git worktree/m)
+    expect(code).toBe(0)
+    expect(existsSync(worktree)).toBe(false)
+  }, 30_000)
+})

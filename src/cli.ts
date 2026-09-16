@@ -99,6 +99,7 @@ async function commandResult(
 // Only these existing operations interpret superproject topology. Ordinary Git
 // commands are delegated by default; there is no registry of native commands.
 const ENRICHED_COMMANDS = new Set(["diff", "status", "merge-base", "merge", "pull", "push", "worktree"])
+const OWNED_WORKTREE_SUBCOMMANDS = new Set(["add", "remove"])
 
 function inputObjects(command: string, args: readonly string[]): readonly { argument: string; object: string }[] {
   if (command === "status") return []
@@ -199,7 +200,10 @@ async function enrichedInvocation(argv: readonly string[]): Promise<readonly str
   }
   const command = argv[commandIndex]
   if (command === undefined || !ENRICHED_COMMANDS.has(command)) return undefined
-  if (command === "worktree" && argv[commandIndex + 1] !== "add") return undefined
+  if (command === "worktree") {
+    if (!OWNED_WORKTREE_SUBCOMMANDS.has(argv[commandIndex + 1] ?? "")) return undefined
+    return argv
+  }
   const globals = argv.slice(0, commandIndex)
   const bare = await readNativeGit([...globals, "rev-parse", "--is-bare-repository"])
   if (bare.code !== 0 || !["true\n", "false\n"].includes(bare.stdout)) {
