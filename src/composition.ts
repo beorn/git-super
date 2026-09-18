@@ -1,13 +1,16 @@
 const GITLINK_MODE = "160000"
 /**
- * EVERY path a side changed, DELETIONS INCLUDED. A delete is a change, and it is
- * the one a rename hides: with `--no-renames` a rename is a delete at the old
- * path plus an add at the new one, so leaving `D` out lets a side that renamed a
- * file read as disjoint from a side that edited it where it used to be.
+ * EVERY path a side changed, DELETIONS INCLUDED, and ONE spelling of it.
+ *
+ * A delete is a change, and it is the one a rename hides: with `--no-renames` a
+ * rename is a delete at the old path plus an add at the new one, so dropping `D`
+ * lets a side that renamed a file read as disjoint from a side that edited it
+ * where it used to be. The disjointness gate and the review evidence read the
+ * same list for the same reason two readings of one predicate must not be able
+ * to disagree; a deleted path simply has no blob in the composed tree, which the
+ * evidence reader already skips.
  */
-const EVERY_CHANGE = "ACDMRT"
-/** Paths whose composed blob a caller can read back as review evidence. */
-const READABLE_BLOBS = "AMRT"
+const CHANGED = "AMRTD"
 const OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu
 
 export type SubmoduleConflictStage = Readonly<{
@@ -160,8 +163,8 @@ export async function findSubmoduleCompositionOverlaps(
     if (resolution.kind === "pin") continue
     const store = options.inject.storeForOrigin(resolution.origin)
     if (store.length === 0) throw new Error(`store locator returned an empty path for '${resolution.path}'`)
-    const current = await changedPaths(context, store, resolution.baseSha, resolution.currentSha, EVERY_CHANGE)
-    const incoming = await changedPaths(context, store, resolution.baseSha, resolution.incomingSha, EVERY_CHANGE)
+    const current = await changedPaths(context, store, resolution.baseSha, resolution.currentSha)
+    const incoming = await changedPaths(context, store, resolution.baseSha, resolution.incomingSha)
     const both = new Set(incoming)
     overlaps.push({
       path: resolution.path,
@@ -352,10 +355,8 @@ async function readBothChangedBlobs(
   include: ((path: string) => boolean) | undefined,
 ): Promise<SubmoduleReviewedBlob[]> {
   if (include === undefined) return []
-  const current = await changedPaths(context, store, resolution.baseSha, resolution.currentSha, READABLE_BLOBS)
-  const incoming = new Set(
-    await changedPaths(context, store, resolution.baseSha, resolution.incomingSha, READABLE_BLOBS),
-  )
+  const current = await changedPaths(context, store, resolution.baseSha, resolution.currentSha)
+  const incoming = new Set(await changedPaths(context, store, resolution.baseSha, resolution.incomingSha))
   const paths = current.filter((path) => incoming.has(path) && include(path)).toSorted(compareText)
   const reviewed: SubmoduleReviewedBlob[] = []
   for (const path of paths) {
@@ -381,17 +382,11 @@ async function readBothChangedBlobs(
  * one side and edited at its old path on the other reads as two disjoint paths
  * and passes a path-set intersection that should have refused it.
  */
-async function changedPaths(
-  context: GitContext,
-  store: string,
-  base: string,
-  tip: string,
-  filter: string,
-): Promise<string[]> {
+async function changedPaths(context: GitContext, store: string, base: string, tip: string): Promise<string[]> {
   const output = await requiredGit(
     context,
     store,
-    ["diff", "--name-only", "-z", "--no-renames", `--diff-filter=${filter}`, base, tip, "--"],
+    ["diff", "--name-only", "-z", "--no-renames", `--diff-filter=${CHANGED}`, base, tip, "--"],
     "enumerate changed paths",
     { trim: false },
   )

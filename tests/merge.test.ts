@@ -2122,8 +2122,25 @@ describe("git super merge — a diverged gitlink the merge composes", () => {
       [["change-side.ts", "export const change = 1\n"]],
     )
     const submodule = join(fixture.product, "packages/alpha")
+    const local = createLocalGitProcess()
+    // WHAT THE COMPONENT REMOTE HELD AT THE MOMENT THE ROOT MERGE WAS WRITTEN.
+    // "Retained BEFORE the root merge records it" is an ORDER, and an order can
+    // only be observed while it happens: read after the fact, a present ref says
+    // nothing about which of the two writes came first.
+    let retainedAtCommit: string[] = []
 
-    const result = await superMerge({ repo: fixture.product, commit: pins.candidate })
+    const result = await superMerge({
+      repo: fixture.product,
+      commit: pins.candidate,
+      git: {
+        run: async (request) => {
+          if (request.repo === fixture.product && request.args[0] === "commit") {
+            retainedAtCommit = retainedPins(fixture.alpha)
+          }
+          return local.run(request)
+        },
+      },
+    })
 
     expect(result).toMatchObject({ state: "updated", partial: false })
     const settled = result.gitlinks.find((row) => row.path === "packages/alpha")
@@ -2131,13 +2148,20 @@ describe("git super merge — a diverged gitlink the merge composes", () => {
     const composed = settled?.from ?? ""
     expect(composed).toMatch(/^[0-9a-f]{40}$/u)
     // (a) the component main tip is the FIRST parent and the pin the second.
-    expect(git(submodule, "show", "-s", "--format=%P", composed)).toBe(`${pins.ours} ${pins.theirs}`)
-    expect(git(fixture.product, "ls-tree", "HEAD", "packages/alpha")).toContain(composed)
+    expect(git(submodule, "cat-file", "-p", composed).split("\n").slice(1, 3)).toEqual([
+      `parent ${pins.ours}`,
+      `parent ${pins.theirs}`,
+    ])
+    // The merge TREE records the composition, not only the report about it.
+    expect(git(fixture.product, "ls-tree", "HEAD", "--", "packages/alpha")).toBe(
+      `160000 commit ${composed}\tpackages/alpha`,
+    )
     expect(git(fixture.product, "log", "-1", "--format=%B", "HEAD")).toContain(
       `Settled: packages/alpha@${composed} merged submodule-main@${pins.ours}`,
     )
-    // (b) retained at the component remote before the root merge records it.
-    expect(retainedPins(fixture.alpha)).toContain(`refs/git-super/pins/${composed}`)
+    // (b) retained at the component remote BEFORE the root merge commit existed.
+    expect(retainedAtCommit).toContain(`refs/git-super/pins/${composed}`)
+    expect(git(fixture.alpha, "ls-remote", fixture.alpha, `refs/git-super/pins/${composed}`)).toContain(composed)
     // (c) nothing moved the component's own main.
     expect(git(fixture.alpha, "rev-parse", "refs/heads/main")).toBe(pins.ours)
     expect(git(submodule, "rev-parse", "HEAD")).toBe(composed)
@@ -2239,7 +2263,9 @@ describe("git super merge — a diverged gitlink the merge composes", () => {
     expect(git(fixture.product, "rev-parse", "HEAD")).toBe(headBefore)
   })
 
-  it("never composes when an ordinary file conflicts beside the diverged gitlink", async () => {
+  // Test 4c: the mixed content-and-gitlink conflict. The composition is never
+  // attempted, because one conflicted path is not a gitlink at all.
+  it("never composes when an ordinary file conflicts beside the diverged gitlink (4c)", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-compose-content-"))
     roots.push(fixtureRoot)
     const fixture = createProductFixture(fixtureRoot)

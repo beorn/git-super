@@ -1038,6 +1038,9 @@ type ComposedGitlinks = Readonly<{ tree: string; composed: ReadonlyMap<string, C
 /** The scratch index the composed pins are staged into; the repository lock makes one name enough. */
 const COMPOSE_INDEX = "git-super-compose.index"
 
+/** Git's expected-old value for a ref that must not exist yet; the retention push is create-only. */
+const ABSENT_OBJECT = "0".repeat(40)
+
 /** Carried from the root merge message so the component history names the same change. */
 const CARRIED_TRAILER = /^(?:Change|Merged-By):\s*\S/u
 
@@ -1070,6 +1073,15 @@ async function composeDivergedGitlinks(
   }
 
   const reader = { run: (request: GitProcessRequest) => git.run({ timeoutMs, ...request }) }
+  // The root's own merge base, which the three-way resolution below reads. Two
+  // histories with no base are not this merge's to judge, exactly as two
+  // component histories with no base are not.
+  const baseArgs = ["merge-base", head, target]
+  const merged = await run(git, root, baseArgs, timeoutMs)
+  const base = merged.stdout.trim()
+  if (merged.code !== 0 || !OBJECT_ID.test(base)) {
+    return { failure: composeUnavailable(root, paths, "find the merge base", gitFailureText(root, baseArgs, merged)) }
+  }
   let declared: Map<string, string>
   try {
     declared = new Map(
@@ -1162,28 +1174,6 @@ async function composeDivergedGitlinks(
   for (const resolution of executed.resolutions) {
     substituted.set(resolution.path, resolution.sha)
     if (resolution.kind !== "compose") continue
-    /**
-     * RETAINED BEFORE THE ROOT MERGE RECORDS IT. The root commit must never name
-     * an object the component remote cannot supply, and a later check can fail
-     * this round long after the composition was created — so the retention ref
-     * is written here, create-only, and nothing advances the component's own
-     * branch. That publication belongs to the consumer, after the merge lands.
-     */
-    const store = join(root, resolution.path)
-    const ref = pinRef(resolution.sha)
-    const absent = "0".repeat(resolution.sha.length)
-    const args = ["push", "--quiet", `--force-with-lease=${ref}:${absent}`, "origin", `${resolution.sha}:${ref}`]
-    const pushed = await run(git, store, args, timeoutMs)
-    if (pushed.code !== 0) {
-      return {
-        failure: composeUnavailable(
-          root,
-          [resolution.path],
-          `retain ${resolution.sha} at ${ref}`,
-          gitFailureText(store, args, pushed),
-        ),
-      }
-    }
     const counts = measured.get(resolution.path)
     if (counts === undefined) throw new Error(`git-super: composed '${resolution.path}' without measuring its sides`)
     composed.set(resolution.path, {
@@ -1197,54 +1187,70 @@ async function composeDivergedGitlinks(
     })
   }
 
-  const substitute = await substituteGitlinks(git, root, head, substituted, timeoutMs)
-  if ("failure" in substitute) return substitute
-  const rerunArgs = [
-    "-c",
-    "core.commitGraph=false",
-    "merge-tree",
-    "--write-tree",
-    "-z",
-    "--no-messages",
-    substitute.commit,
-    target,
-  ]
-  const rerun = await run(git, root, rerunArgs, timeoutMs)
-  const [tree] = nulRecords(rerun.stdout)
-  if (rerun.code !== 0 || tree === undefined || !OBJECT_ID.test(tree)) {
-    return {
-      failure: composeUnavailable(root, paths, "merge the composed pins", gitFailureText(root, rerunArgs, rerun)),
+  /**
+   * THE MERGE TREE IS RESOLVED IN A SCRATCH INDEX, NOT BY A SECOND merge-tree.
+   *
+   * Substituting the composed sha on the head side and asking `merge-tree`
+   * again is not guaranteed clean: the path still carries three distinct
+   * gitlink shas, and Git's submodule fast-forward resolution needs the
+   * component's objects reachable from the ROOT repository, which is not
+   * something a merge can assume. A three-way `read-tree` leaves the gitlink at
+   * stages 1-3 and `update-index --cacheinfo` replaces all three with one
+   * stage-0 entry — the resolution stated rather than re-derived.
+   */
+  const resolvedTree = await resolveComposedTree(git, root, base, head, target, substituted, timeoutMs)
+  if ("failure" in resolvedTree) return resolvedTree
+  if (resolvedTree.tree === undefined) return undefined
+
+  for (const [path, sha] of substituted) {
+    if (!composed.has(path)) continue
+    /**
+     * RETAINED ONLY ONCE THE TREE IS CLEAN, AND BEFORE THE ROOT MERGE RECORDS
+     * IT (D1 b). The root commit must never name an object the component remote
+     * cannot supply; a round that later fails leaves the ref exactly as any
+     * other retained pin, for the existing prune. Nothing here advances the
+     * component's own branch — that publication is the consumer's, after the
+     * merge lands.
+     */
+    const store = join(root, path)
+    const ref = pinRef(sha)
+    const args = ["push", "--quiet", `--force-with-lease=${ref}:${ABSENT_OBJECT}`, "origin", `${sha}:${ref}`]
+    const pushed = await run(git, store, args, timeoutMs)
+    if (pushed.code !== 0) {
+      return {
+        failure: composeUnavailable(root, [path], `retain ${sha} at ${ref}`, gitFailureText(store, args, pushed)),
+      }
     }
   }
-  return { composed, tree }
+  return { composed, tree: resolvedTree.tree }
 }
 
 /**
- * Write the composed pins into a scratch index over HEAD's tree and return a
- * commit carrying it.
+ * The merge tree, with every composed gitlink stated as a stage-zero entry.
  *
- * `merge-tree` takes commits, not trees, so the substituted tree is wrapped in
- * a commit whose only parent is HEAD — which leaves the merge base of the
- * re-request exactly the merge base of the original.
+ * `tree: undefined` means an entry stayed unmerged after the substitution — a
+ * content conflict the composition cannot settle — and the caller's own refusal
+ * stands. `GIT_INDEX_FILE` is passed per command and never exported, because it
+ * bleeds into anything that inherits it; the scratch file is removed either way.
  */
-async function substituteGitlinks(
+async function resolveComposedTree(
   git: GitProcess,
   root: string,
+  base: string,
   head: string,
+  target: string,
   pins: ReadonlyMap<string, string>,
   timeoutMs: number,
-): Promise<Readonly<{ commit: string }> | Readonly<{ failure: GitResultDetail }>> {
+): Promise<Readonly<{ tree: string | undefined }> | Readonly<{ failure: GitResultDetail }>> {
   const commonDir = await required(git, root, ["rev-parse", "--git-common-dir"], "compose-gitlinks", timeoutMs)
   const indexFile = join(isAbsolute(commonDir) ? commonDir : resolve(root, commonDir), COMPOSE_INDEX)
   const env = { GIT_INDEX_FILE: indexFile }
   const paths = [...pins.keys()]
   try {
     const staging = [
-      ["read-tree", head],
+      ["read-tree", "-i", "-m", base, head, target],
       ...[...pins].map(([path, sha]) => ["update-index", "--cacheinfo", `160000,${sha},${path}`]),
-      ["write-tree"],
     ]
-    let tree = ""
     for (const args of staging) {
       const result = await git.run({ args, env, repo: root, timeoutMs })
       if (result.code !== 0) {
@@ -1252,20 +1258,31 @@ async function substituteGitlinks(
           failure: composeUnavailable(root, paths, "stage the composed pins", gitFailureText(root, args, result)),
         }
       }
-      tree = result.stdout.trim()
     }
-    if (!OBJECT_ID.test(tree)) {
-      return { failure: composeUnavailable(root, paths, "stage the composed pins", `wrote invalid tree '${tree}'`) }
-    }
-    const args = ["commit-tree", tree, "-p", head]
-    const written = await run(git, root, args, timeoutMs, "git-super: composed submodule pins\n")
-    const commit = written.stdout.trim()
-    if (written.code !== 0 || !OBJECT_ID.test(commit)) {
+    const unmergedArgs = ["ls-files", "-u", "-z"]
+    const unmerged = await git.run({ args: unmergedArgs, env, repo: root, timeoutMs })
+    if (unmerged.code !== 0) {
       return {
-        failure: composeUnavailable(root, paths, "hold the composed pins", gitFailureText(root, args, written)),
+        failure: composeUnavailable(
+          root,
+          paths,
+          "read the composed index",
+          gitFailureText(root, unmergedArgs, unmerged),
+        ),
       }
     }
-    return { commit }
+    // A path still unmerged is content neither side's gitlink can explain, and
+    // the caller's existing conflict refusal is the right one for it.
+    if (nulRecords(unmerged.stdout).length > 0) return { tree: undefined }
+    const writeArgs = ["write-tree"]
+    const written = await git.run({ args: writeArgs, env, repo: root, timeoutMs })
+    const tree = written.stdout.trim()
+    if (written.code !== 0 || !OBJECT_ID.test(tree)) {
+      return {
+        failure: composeUnavailable(root, paths, "write the composed tree", gitFailureText(root, writeArgs, written)),
+      }
+    }
+    return { tree }
   } finally {
     await rm(indexFile, { force: true })
   }
