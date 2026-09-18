@@ -2109,18 +2109,18 @@ describe("git super merge — a diverged gitlink the merge composes", () => {
 
   /** Every retention ref the component remote holds, newest spelling first. */
   function retainedPins(repository: string): string[] {
-    return git(repository, "for-each-ref", "--format=%(refname)", "refs/git-super/pins")
-      .split("\n")
-      .filter(Boolean)
+    return git(repository, "for-each-ref", "--format=%(refname)", "refs/git-super/pins").split("\n").filter(Boolean)
   }
 
   it("merges the component itself when the two sides changed disjoint files", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-compose-disjoint-"))
     roots.push(fixtureRoot)
     const fixture = createProductFixture(fixtureRoot)
-    const pins = divergedAlphaPins(fixture, [["main-side.ts", "export const main = 1\n"]], [
-      ["change-side.ts", "export const change = 1\n"],
-    ])
+    const pins = divergedAlphaPins(
+      fixture,
+      [["main-side.ts", "export const main = 1\n"]],
+      [["change-side.ts", "export const change = 1\n"]],
+    )
     const submodule = join(fixture.product, "packages/alpha")
 
     const result = await superMerge({ repo: fixture.product, commit: pins.candidate })
