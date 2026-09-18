@@ -1,4 +1,13 @@
 const GITLINK_MODE = "160000"
+/**
+ * EVERY path a side changed, DELETIONS INCLUDED. A delete is a change, and it is
+ * the one a rename hides: with `--no-renames` a rename is a delete at the old
+ * path plus an add at the new one, so leaving `D` out lets a side that renamed a
+ * file read as disjoint from a side that edited it where it used to be.
+ */
+const EVERY_CHANGE = "ACDMRT"
+/** Paths whose composed blob a caller can read back as review evidence. */
+const READABLE_BLOBS = "AMRT"
 const OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu
 
 export type SubmoduleConflictStage = Readonly<{
@@ -116,6 +125,51 @@ export function planSubmoduleComposition(conflicts: readonly SubmoduleTreeConfli
     resolutions.push({ kind: "compose", path: conflict.path, origin, ...stages })
   }
   return { status: "planned", resolutions }
+}
+
+/**
+ * What each side of a planned composition changed since its base, and where the
+ * two sides touched the same path.
+ *
+ * `files` empty means the two sides are disjoint at PATH level — a stricter
+ * predicate than Git's own line-level merge, and one a caller can put in a
+ * refusal a person reads. `counts` is the size of each side's change, which is
+ * the evidence a caller's journal carries for a composition it admitted.
+ */
+export type SubmoduleCompositionOverlap = Readonly<{
+  path: string
+  files: readonly string[]
+  counts: Readonly<{ current: number; incoming: number }>
+}>
+
+/**
+ * Measure every planned composition's two sides BEFORE any of them is composed.
+ *
+ * Separate from `composeSubmoduleCommits` because a caller that gates on path
+ * disjointness must refuse before a commit object exists — a composition
+ * created and then discarded leaves an object in the store that the refusal
+ * says nothing about.
+ */
+export async function findSubmoduleCompositionOverlaps(
+  plan: Extract<SubmoduleCompositionPlan, { status: "planned" }>,
+  options: SubmoduleCompositionExecutionOptions,
+): Promise<readonly SubmoduleCompositionOverlap[]> {
+  const context = createGitContext(options)
+  const overlaps: SubmoduleCompositionOverlap[] = []
+  for (const resolution of plan.resolutions) {
+    if (resolution.kind === "pin") continue
+    const store = options.inject.storeForOrigin(resolution.origin)
+    if (store.length === 0) throw new Error(`store locator returned an empty path for '${resolution.path}'`)
+    const current = await changedPaths(context, store, resolution.baseSha, resolution.currentSha, EVERY_CHANGE)
+    const incoming = await changedPaths(context, store, resolution.baseSha, resolution.incomingSha, EVERY_CHANGE)
+    const both = new Set(incoming)
+    overlaps.push({
+      path: resolution.path,
+      files: current.filter((path) => both.has(path)).toSorted(compareText),
+      counts: { current: current.length, incoming: incoming.length },
+    })
+  }
+  return overlaps
 }
 
 /** Construct deterministic two-parent composition commits without publishing refs. */
@@ -298,8 +352,10 @@ async function readBothChangedBlobs(
   include: ((path: string) => boolean) | undefined,
 ): Promise<SubmoduleReviewedBlob[]> {
   if (include === undefined) return []
-  const current = await changedPaths(context, store, resolution.baseSha, resolution.currentSha)
-  const incoming = new Set(await changedPaths(context, store, resolution.baseSha, resolution.incomingSha))
+  const current = await changedPaths(context, store, resolution.baseSha, resolution.currentSha, READABLE_BLOBS)
+  const incoming = new Set(
+    await changedPaths(context, store, resolution.baseSha, resolution.incomingSha, READABLE_BLOBS),
+  )
   const paths = current.filter((path) => incoming.has(path) && include(path)).toSorted(compareText)
   const reviewed: SubmoduleReviewedBlob[] = []
   for (const path of paths) {
@@ -319,11 +375,23 @@ async function readBothChangedBlobs(
   return reviewed
 }
 
-async function changedPaths(context: GitContext, store: string, base: string, tip: string): Promise<string[]> {
+/**
+ * `--no-renames` IS THE GATE, not a formatting preference. Under rename
+ * detection `--name-only` reports only a rename's NEW path, so a file renamed on
+ * one side and edited at its old path on the other reads as two disjoint paths
+ * and passes a path-set intersection that should have refused it.
+ */
+async function changedPaths(
+  context: GitContext,
+  store: string,
+  base: string,
+  tip: string,
+  filter: string,
+): Promise<string[]> {
   const output = await requiredGit(
     context,
     store,
-    ["diff", "--name-only", "-z", "--diff-filter=AMRT", base, tip, "--"],
+    ["diff", "--name-only", "-z", "--no-renames", `--diff-filter=${filter}`, base, tip, "--"],
     "enumerate changed paths",
     { trim: false },
   )

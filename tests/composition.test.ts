@@ -301,8 +301,8 @@ describe("workflow-neutral submodule composition refusals", () => {
       commit: { author: { name: "Queue Actor", email: "queue@example.test" }, message: () => "compose dependency" },
     })
 
-    expect(overlaps).toEqual([
-      { path: "vendor/dependency", files: ["notes.md"], counts: { current: 1, incoming: 1 } },
-    ])
+    // The incoming side's two changes are the rename's halves: `notes.md`
+    // deleted and `renamed.md` added.
+    expect(overlaps).toEqual([{ path: "vendor/dependency", files: ["notes.md"], counts: { current: 1, incoming: 2 } }])
   })
 })
