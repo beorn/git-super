@@ -2342,4 +2342,66 @@ describe("git super merge — a diverged gitlink the merge composes", () => {
     expect(result.detail?.paths).toEqual(expect.arrayContaining(["root.txt"]))
     expect(retainedPins(fixture.alpha)).toEqual([])
   })
+
+  it("fetches an absent component commit from its remote before composing (25011)", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-compose-absent-fetch-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+
+    git(fixture.alpha, "switch", "-q", "--detach", fixture.alphaBase)
+    const theirs = advanceRepository(fixture.alpha, "change-side.ts", "export const change = 1\n")
+    git(fixture.alpha, "switch", "-q", "main")
+    git(fixture.alpha, "update-ref", `refs/git-super/pins/${theirs}`, theirs)
+
+    git(fixture.product, "switch", "-q", "-c", "candidate-absent-pin")
+    git(fixture.product, "update-index", "--cacheinfo", `160000,${theirs},packages/alpha`)
+    git(fixture.product, "commit", "-q", "-m", "pin theirs without fetching it into submodule")
+    const candidate = git(fixture.product, "rev-parse", "HEAD")
+
+    const ours = advanceRepository(fixture.alpha, "main-side.ts", "export const main = 1\n")
+    const submodule = join(fixture.product, "packages/alpha")
+    git(fixture.product, "switch", "-q", "main")
+    git(submodule, "fetch", "-q", "origin")
+    git(submodule, "checkout", "-q", ours)
+    git(fixture.product, "add", "packages/alpha")
+    git(fixture.product, "commit", "-q", "-m", "pin ours")
+
+    expect(() => git(submodule, "cat-file", "-e", `${theirs}^{commit}`)).toThrow()
+
+    const result = await superMerge({ repo: fixture.product, commit: candidate })
+
+    expect(result).toMatchObject({ state: "updated", partial: false })
+    const settled = result.gitlinks.find((row) => row.path === "packages/alpha")
+    expect(settled).toMatchObject({ path: "packages/alpha", state: "merged", to: ours })
+    const composed = settled?.from ?? ""
+    expect(composed).toMatch(/^[0-9a-f]{40}$/u)
+    expect(git(submodule, "cat-file", "-e", `${composed}^{commit}`)).toBe("")
+    expect(git(submodule, "cat-file", "-e", `${theirs}^{commit}`)).toBe("")
+  })
+
+  it("refuses a diverged gitlink when the component commit cannot be fetched from origin (25011)", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-compose-unfetchable-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const ours = advanceRepository(fixture.alpha, "main-side.ts", "export const main = 1\n")
+    const fakeTheirs = "0123456789012345678901234567890123456789"
+
+    const submodule = join(fixture.product, "packages/alpha")
+    git(fixture.product, "switch", "-q", "-c", "candidate-unfetchable-pin")
+    git(fixture.product, "update-index", "--cacheinfo", `160000,${fakeTheirs},packages/alpha`)
+    git(fixture.product, "commit", "-q", "-m", "pin fake theirs")
+    const candidate = git(fixture.product, "rev-parse", "HEAD")
+
+    git(fixture.product, "switch", "-q", "main")
+    git(submodule, "fetch", "-q", "origin")
+    git(submodule, "checkout", "-q", ours)
+    git(fixture.product, "add", "packages/alpha")
+    git(fixture.product, "commit", "-q", "-m", "pin ours")
+
+    const result = await superMerge({ repo: fixture.product, commit: candidate })
+
+    expect(result).toMatchObject({ state: "failed", partial: false, detail: { code: "gitlink-compose-refused" } })
+    expect(result.detail?.message).toContain("could not be fetched")
+    expect(result.detail?.paths).toEqual(["packages/alpha"])
+  })
 })

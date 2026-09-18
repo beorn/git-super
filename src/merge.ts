@@ -1066,6 +1066,49 @@ const ABSENT_OBJECT = "0".repeat(40)
 /** Carried from the root merge message so the component history names the same change. */
 const CARRIED_TRAILER = /^(?:Change|Merged-By):\s*\S/u
 
+async function ensureCompositionCommit(
+  git: GitProcess,
+  store: string,
+  remote: string,
+  sha: string,
+  taskBranch: string | undefined,
+  timeoutMs: number,
+): Promise<boolean> {
+  const verified = await run(git, store, ["cat-file", "-e", `${sha}^{commit}`], timeoutMs)
+  if (verified.code === 0) return true
+
+  // The change's component commit has not been fetched into this checkout yet (25011).
+  // Fetch by its pin ref, direct sha, or task branch before enumerating paths.
+  const pin = pinRef(sha)
+  const branchRef =
+    taskBranch === undefined
+      ? undefined
+      : taskBranch.startsWith("refs/heads/")
+        ? taskBranch
+        : `refs/heads/${taskBranch}`
+  const refspecs = [`+${pin}:${pin}`, `+${sha}:${pin}`, ...(branchRef === undefined ? [] : [`+${branchRef}:${pin}`])]
+  const remotes = remote === "origin" ? ["origin"] : ["origin", remote]
+  for (const targetRemote of remotes) {
+    for (const refspec of refspecs) {
+      const fetchArgs = [
+        "fetch",
+        "--quiet",
+        "--no-tags",
+        "--no-recurse-submodules",
+        "--no-write-fetch-head",
+        targetRemote,
+        refspec,
+      ]
+      const fetched = await run(git, store, fetchArgs, timeoutMs)
+      if (fetched.code === 0) {
+        const check = await run(git, store, ["cat-file", "-e", `${sha}^{commit}`], timeoutMs)
+        if (check.code === 0) return true
+      }
+    }
+  }
+  return false
+}
+
 /**
  * Merge the components of a conflict whose every path is a gitlink.
  *
@@ -1132,6 +1175,35 @@ async function composeDivergedGitlinks(
     }
   } catch (error) {
     return { failure: composeUnavailable(root, paths, "read this repository's committer identity", messageOf(error)) }
+  }
+
+  const taskBranch = /Change:\s*([^@\s]+)/u.exec(message ?? "")?.[1]
+  for (const resolution of plan.resolutions) {
+    if (resolution.kind !== "compose") continue
+    const store = storeByOrigin.get(resolution.origin) ?? join(root, resolution.path)
+    const hasCommit = await ensureCompositionCommit(
+      git,
+      store,
+      resolution.origin,
+      resolution.incomingSha,
+      taskBranch,
+      timeoutMs,
+    )
+    if (!hasCommit) {
+      return {
+        failure: composeRefused({
+          entries,
+          evidence: `git -C ${store} fetch origin refs/git-super/pins/${resolution.incomingSha}`,
+          head,
+          paths,
+          reasons: [
+            `gitlink ${resolution.path}: diverged; component commit ${resolution.incomingSha} could not be fetched`,
+          ],
+          stageEvidence,
+          target,
+        }),
+      }
+    }
   }
 
   /**

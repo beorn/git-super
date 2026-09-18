@@ -1495,7 +1495,8 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
     if (frozen.updates === undefined) {
       const requirements = await collectCommitRequirements(git, root, rootSources)
       const rootDestinations = rootUpdates.map((update) => update.destination)
-      for (const requirement of requirements) childUpdates.push(await childUpdate(git, requirement, timeoutMs, rootDestinations))
+      for (const requirement of requirements)
+        childUpdates.push(await childUpdate(git, requirement, timeoutMs, rootDestinations))
     }
     if (frozen.retention.length > 0) {
       // Validate every frozen destination and root lease before the first retention write.
