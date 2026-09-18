@@ -10,7 +10,7 @@ const GITLINK_MODE = "160000"
  * to disagree; a deleted path simply has no blob in the composed tree, which the
  * evidence reader already skips.
  */
-const CHANGED = "AMRTD"
+export const CHANGED_PATH_FILTER = "AMRTD"
 const OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu
 
 export type SubmoduleConflictStage = Readonly<{
@@ -386,7 +386,7 @@ async function changedPaths(context: GitContext, store: string, base: string, ti
   const output = await requiredGit(
     context,
     store,
-    ["diff", "--name-only", "-z", "--no-renames", `--diff-filter=${CHANGED}`, base, tip, "--"],
+    ["diff", "--name-only", "-z", "--no-renames", `--diff-filter=${CHANGED_PATH_FILTER}`, base, tip, "--"],
     "enumerate changed paths",
     { trim: false },
   )

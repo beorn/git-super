@@ -2,6 +2,7 @@ import { rm } from "node:fs/promises"
 import { isAbsolute, join, resolve } from "node:path"
 import { readCommitSubmodules, resolveSubmoduleBranch, type CommitSubmodule } from "./commit-graph.ts"
 import {
+  CHANGED_PATH_FILTER,
   composeSubmoduleCommits,
   findSubmoduleCompositionOverlaps,
   planSubmoduleComposition,
@@ -1139,7 +1140,11 @@ async function composeDivergedGitlinks(
     return {
       failure: composeRefused({
         entries,
-        evidence: `git -C ${join(root, first)} diff --name-only --no-renames --diff-filter=ACDMRT <base> <side>`,
+        // The command a person runs to see what this refused, built from the
+        // SAME constant the gate ran with: an evidence line that drifts from
+        // the predicate sends the reader to a different answer than the one
+        // that refused them.
+        evidence: `git -C ${join(root, first)} diff --name-only --no-renames --diff-filter=${CHANGED_PATH_FILTER} <base> <side>`,
         head,
         paths,
         reasons: overlapping.map(
