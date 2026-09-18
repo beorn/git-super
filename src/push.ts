@@ -930,7 +930,7 @@ export async function capturePushIntent(
       children.push(pin)
       continue
     }
-    const update = await childUpdate(git, requirement, timeoutMs)
+    const update = await childUpdate(git, requirement, timeoutMs, ["refs/heads/main"])
     const remote = await logicalPushUrl(git, requirement.repository, update.remote)
     if (!sameHostedOwner(rootRemote, remote)) {
       children.push({ ...pin, remote })
@@ -1328,8 +1328,29 @@ async function commitAvailableOnAnyRemote(git: GitProcess, requirement: CommitRe
   return false
 }
 
-async function childUpdate(git: GitProcess, requirement: CommitRequirement, timeoutMs: number): Promise<RefUpdate> {
+/**
+ * 24901: when no root destination is refs/heads/main, the child must not go to
+ * its .gitmodules branch (which is usually main).  Instead it publishes to
+ * refs/git-super/pins/<sha>, exactly like the frozen-intent path.
+ */
+async function childUpdate(
+  git: GitProcess,
+  requirement: CommitRequirement,
+  timeoutMs: number,
+  rootDestinations: readonly string[],
+): Promise<RefUpdate> {
   const remote = await configuredPushRemote(git, requirement.repository)
+  const rootTargetsMain = rootDestinations.some((destination) => destination === "refs/heads/main")
+  if (!rootTargetsMain) {
+    // Create-only pin: the child commit is reachable but no branch moves.
+    return {
+      repository: requirement.repository,
+      remote,
+      source: requirement.target,
+      destination: `refs/git-super/pins/${requirement.target}`,
+      expectedDestination: { state: "missing" },
+    }
+  }
   const branch = await resolveSubmoduleBranch(
     git,
     requirement.superproject,
@@ -1473,7 +1494,8 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
     const childUpdates: RefUpdate[] = frozen.updates ?? []
     if (frozen.updates === undefined) {
       const requirements = await collectCommitRequirements(git, root, rootSources)
-      for (const requirement of requirements) childUpdates.push(await childUpdate(git, requirement, timeoutMs))
+      const rootDestinations = rootUpdates.map((update) => update.destination)
+      for (const requirement of requirements) childUpdates.push(await childUpdate(git, requirement, timeoutMs, rootDestinations))
     }
     if (frozen.retention.length > 0) {
       // Validate every frozen destination and root lease before the first retention write.

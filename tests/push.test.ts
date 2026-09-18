@@ -1468,4 +1468,68 @@ describe("explicit recursive push mechanics", () => {
     expect(git(child.remote, "rev-parse", "refs/heads/main")).toBe(child.source)
     expect(git(root.remote, "for-each-ref", "--format=%(refname)", "refs/heads/main")).toBe("")
   })
+
+  /**
+   * 24901: a root push to refs/heads/task/x while a child tracks origin/main
+   * must leave that child's origin main unchanged. Before the fix, childUpdate
+   * read .gitmodules branch=main and sent the child commit to refs/heads/main
+   * regardless of the root destination.
+   *
+   * @failure A task-branch push silently advances every child's main.
+   * @level l1
+   * @consumer 24901 regression — git-super push to a non-main root destination
+   */
+  test.each(["on-demand", "only"] as const)(
+    "%s to a task branch leaves the child's main unchanged (24901)",
+    async (mode) => {
+      const fixture = recursivePushFixture(`task-branch-child-main-${mode}`)
+
+      const result = await superPush({
+        repo: fixture.root,
+        remote: "origin",
+        refspecs: [`${fixture.rootSource}:refs/heads/task/feature-x`],
+        recurseSubmodules: mode,
+      })
+
+      // The child's main must not have moved.
+      expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(fixture.childBefore)
+
+      // The child commit must be reachable somewhere (pins ref or the task branch itself).
+      const childPinRef = `refs/git-super/pins/${fixture.childSource}`
+      const childReachable =
+        git(fixture.childRemote, "for-each-ref", "--format=%(refname)", childPinRef) === childPinRef
+      expect(childReachable).toBe(true)
+
+      // The root task branch was created (on-demand pushes root too; only does not).
+      if (mode === "on-demand") {
+        expect(git(fixture.rootRemote, "rev-parse", "refs/heads/task/feature-x")).toBe(fixture.rootSource)
+      }
+      expect(result.state).not.toBe("failed")
+    },
+  )
+
+  /**
+   * Control for 24901: the queue's publication to main still moves each child's
+   * main to the merged commit — the non-main guard does not break the happy path.
+   *
+   * @level l1
+   * @consumer Queue publication to main with recursive child forwarding
+   */
+  test.each(["on-demand", "only"] as const)(
+    "%s to main still forwards the child's main (24901 control)",
+    async (mode) => {
+      const fixture = recursivePushFixture(`main-child-forward-${mode}`)
+
+      const result = await superPush({
+        repo: fixture.root,
+        remote: "origin",
+        refspecs: [`${fixture.rootSource}:refs/heads/main`],
+        recurseSubmodules: mode,
+      })
+
+      // The child's main must have advanced.
+      expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(fixture.childSource)
+      expect(result.state).toBe("updated")
+    },
+  )
 })
