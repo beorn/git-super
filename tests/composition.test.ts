@@ -11,6 +11,7 @@ import { join } from "node:path"
 import { afterEach, describe, expect, it } from "vitest"
 import {
   composeSubmoduleCommits,
+  findSubmoduleCompositionOverlaps,
   planSubmoduleComposition,
   type SubmoduleCompositionGitRequest,
   type SubmoduleTreeConflict,
@@ -228,5 +229,80 @@ describe("workflow-neutral submodule composition construction", () => {
         )
       ).stdout,
     ).toBe("")
+  })
+})
+
+/** One store, one `git`: the composer's only injected process capability. */
+function storeGit() {
+  return {
+    async run(request: SubmoduleCompositionGitRequest) {
+      const child = Bun.spawn(["git", "-C", request.repo, ...request.args], {
+        env: request.env,
+        stdin: request.stdin === undefined ? "ignore" : new Blob([request.stdin]),
+        stdout: "pipe",
+        stderr: "pipe",
+      })
+      const [stdout, stderr, code] = await Promise.all([
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+        child.exited,
+      ])
+      return { code, stdout, stderr }
+    },
+  }
+}
+
+describe("workflow-neutral submodule composition refusals", () => {
+  it("refuses with `conflict` when Git itself cannot merge the two sides, and creates nothing", async () => {
+    const repo = await divergentRepository()
+    // Both sides rewrite the SAME line, which merge-tree cannot settle.
+    await runGit(repo.store, ["switch", "-q", "current"])
+    await writeFile(join(repo.store, "notes.md"), "top-current\nmiddle-current\nbottom\n")
+    await runGit(repo.store, ["commit", "-qam", "current line"])
+    const currentSha = (await runGit(repo.store, ["rev-parse", "HEAD"])).stdout
+    await runGit(repo.store, ["switch", "-q", "incoming"])
+    await writeFile(join(repo.store, "notes.md"), "top\nmiddle-incoming\nbottom-incoming\n")
+    await runGit(repo.store, ["commit", "-qam", "incoming line"])
+    const incomingSha = (await runGit(repo.store, ["rev-parse", "HEAD"])).stdout
+    const objectsBefore = (await runGit(repo.store, ["rev-list", "--all", "--count"])).stdout
+    const plan = planSubmoduleComposition([
+      gitlinkConflict("vendor/dependency", repo.baseSha, currentSha, incomingSha, repo.origin),
+    ])
+    if (plan.status !== "planned") throw new Error("expected a composition plan")
+
+    const executed = await composeSubmoduleCommits(plan, {
+      inject: { git: storeGit(), storeForOrigin: () => repo.store },
+      commit: { author: { name: "Queue Actor", email: "queue@example.test" }, message: () => "compose dependency" },
+    })
+
+    expect(executed).toMatchObject({
+      status: "refused",
+      failure: { kind: "conflict", path: "vendor/dependency", operation: "materialize the composed tree" },
+    })
+    expect((await runGit(repo.store, ["rev-list", "--all", "--count"])).stdout).toBe(objectsBefore)
+  })
+
+  it("reports which paths both sides changed since the base, ignoring renames", async () => {
+    const repo = await divergentRepository()
+    // The incoming side RENAMES the file the current side edited; under rename
+    // detection `--name-only` would report only the new path and the two sides
+    // would read as disjoint.
+    await runGit(repo.store, ["switch", "-q", "incoming"])
+    await runGit(repo.store, ["mv", "notes.md", "renamed.md"])
+    await runGit(repo.store, ["commit", "-qm", "rename the notes"])
+    const incomingSha = (await runGit(repo.store, ["rev-parse", "HEAD"])).stdout
+    const plan = planSubmoduleComposition([
+      gitlinkConflict("vendor/dependency", repo.baseSha, repo.currentSha, incomingSha, repo.origin),
+    ])
+    if (plan.status !== "planned") throw new Error("expected a composition plan")
+
+    const overlaps = await findSubmoduleCompositionOverlaps(plan, {
+      inject: { git: storeGit(), storeForOrigin: () => repo.store },
+      commit: { author: { name: "Queue Actor", email: "queue@example.test" }, message: () => "compose dependency" },
+    })
+
+    expect(overlaps).toEqual([
+      { path: "vendor/dependency", files: ["notes.md"], counts: { current: 1, incoming: 1 } },
+    ])
   })
 })

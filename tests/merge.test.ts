@@ -1243,7 +1243,15 @@ describe("git super merge", () => {
 
       expect(await runCli(["--repo", fixture.product, "--json", "merge", candidate], stdout, stderr)).toBe(1)
       const result = JSON.parse(stdout.output) as { detail: GitResultDetail }
-      expect(result).toMatchObject({ state: "failed", partial: false, detail: { code: "merge-conflict" } })
+      // WITH a base the two pins are a composable shape, so the refusal is now
+      // the composer's, which names WHICH predicate failed (both sides edited
+      // `alpha.ts`) on top of the same stage evidence. Without a base there are
+      // no three stages to plan from, so the merge refuses exactly as it did.
+      expect(result).toMatchObject({
+        state: "failed",
+        partial: false,
+        detail: { code: hasBase ? "gitlink-compose-refused" : "merge-conflict" },
+      })
       expect(result.detail.paths).toEqual(["packages/alpha"])
       expect(result.detail.objectIds).toEqual(
         expect.arrayContaining(hasBase ? [fixture.alphaBase, ours, theirs] : [ours, theirs]),
@@ -2060,5 +2068,206 @@ describe("git super merge — the descent journal (24454 follow-up)", () => {
 
     expect(result.state).toBe("updated")
     expect(result.descents).toBeUndefined()
+  })
+})
+
+/**
+ * @failure A diverged submodule pin is refused although the two sides changed
+ * disjoint files and the component could be merged.
+ * @level l1
+ * @consumer Yrd settled candidate preparation and landing
+ */
+describe("git super merge — a diverged gitlink the merge composes", () => {
+  /**
+   * Main pins `ours`, the candidate pins `theirs`, and the two component
+   * commits diverged from the same base. The shape the queue bounces today.
+   */
+  function divergedAlphaPins(
+    fixture: ProductFixture,
+    ours: readonly (readonly [string, string])[],
+    theirs: readonly (readonly [string, string])[],
+  ): Readonly<{ candidate: string; ours: string; theirs: string }> {
+    let oursSha = fixture.alphaBase
+    for (const [file, content] of ours) oursSha = advanceRepository(fixture.alpha, file, content)
+    git(fixture.alpha, "switch", "-q", "-c", "submodule-theirs", fixture.alphaBase)
+    let theirsSha = fixture.alphaBase
+    for (const [file, content] of theirs) theirsSha = advanceRepository(fixture.alpha, file, content)
+    git(fixture.alpha, "switch", "-q", "main")
+    const submodule = join(fixture.product, "packages/alpha")
+    git(submodule, "fetch", "-q", "origin")
+    git(fixture.product, "switch", "-q", "-c", "candidate-diverged-pin")
+    git(submodule, "checkout", "-q", theirsSha)
+    git(fixture.product, "add", "packages/alpha")
+    git(fixture.product, "commit", "-q", "-m", "pin theirs")
+    const candidate = git(fixture.product, "rev-parse", "HEAD")
+    git(fixture.product, "switch", "-q", "main")
+    git(submodule, "checkout", "-q", oursSha)
+    git(fixture.product, "add", "packages/alpha")
+    git(fixture.product, "commit", "-q", "-m", "pin ours")
+    return { candidate, ours: oursSha, theirs: theirsSha }
+  }
+
+  /** Every retention ref the component remote holds, newest spelling first. */
+  function retainedPins(repository: string): string[] {
+    return git(repository, "for-each-ref", "--format=%(refname)", "refs/git-super/pins")
+      .split("\n")
+      .filter(Boolean)
+  }
+
+  it("merges the component itself when the two sides changed disjoint files", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-compose-disjoint-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const pins = divergedAlphaPins(fixture, [["main-side.ts", "export const main = 1\n"]], [
+      ["change-side.ts", "export const change = 1\n"],
+    ])
+    const submodule = join(fixture.product, "packages/alpha")
+
+    const result = await superMerge({ repo: fixture.product, commit: pins.candidate })
+
+    expect(result).toMatchObject({ state: "updated", partial: false })
+    const settled = result.gitlinks.find((row) => row.path === "packages/alpha")
+    expect(settled).toMatchObject({ path: "packages/alpha", state: "merged", to: pins.ours })
+    const composed = settled?.from ?? ""
+    expect(composed).toMatch(/^[0-9a-f]{40}$/u)
+    // (a) the component main tip is the FIRST parent and the pin the second.
+    expect(git(submodule, "show", "-s", "--format=%P", composed)).toBe(`${pins.ours} ${pins.theirs}`)
+    expect(git(fixture.product, "ls-tree", "HEAD", "packages/alpha")).toContain(composed)
+    expect(git(fixture.product, "log", "-1", "--format=%B", "HEAD")).toContain(
+      `Settled: packages/alpha@${composed} merged submodule-main@${pins.ours}`,
+    )
+    // (b) retained at the component remote before the root merge records it.
+    expect(retainedPins(fixture.alpha)).toContain(`refs/git-super/pins/${composed}`)
+    // (c) nothing moved the component's own main.
+    expect(git(fixture.alpha, "rev-parse", "refs/heads/main")).toBe(pins.ours)
+    expect(git(submodule, "rev-parse", "HEAD")).toBe(composed)
+    expect(git(fixture.product, "status", "--porcelain=v1")).toBe("")
+    expect(settled).toMatchObject({
+      composition: { base: fixture.alphaBase, parent: pins.ours, pin: pins.theirs, files: { parent: 1, pin: 1 } },
+    })
+  })
+
+  it("refuses a diverged gitlink whose two sides changed the same file, naming the file", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-compose-overlap-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const pins = divergedAlphaPins(
+      fixture,
+      [["shared.ts", "export const shared = 'main'\n"]],
+      [["shared.ts", "export const shared = 'change'\n"]],
+    )
+    const headBefore = git(fixture.product, "rev-parse", "HEAD")
+    const commitsBefore = git(fixture.alpha, "rev-list", "--all", "--count")
+
+    const result = await superMerge({ repo: fixture.product, commit: pins.candidate })
+
+    expect(result).toMatchObject({ state: "failed", partial: false, detail: { code: "gitlink-compose-refused" } })
+    expect(result.detail?.message).toContain("packages/alpha")
+    expect(result.detail?.message).toContain("shared.ts")
+    expect(result.detail?.paths).toEqual(["packages/alpha"])
+    // Nothing created in the store, nothing pushed.
+    expect(git(fixture.alpha, "rev-list", "--all", "--count")).toBe(commitsBefore)
+    expect(retainedPins(fixture.alpha)).toEqual([])
+    expect(git(fixture.product, "rev-parse", "HEAD")).toBe(headBefore)
+    expect(git(fixture.product, "status", "--porcelain=v1")).toBe("")
+  })
+
+  it("refuses a rename on one side and an edit at the old path on the other, naming the old path", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-compose-rename-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    // `alpha.ts` is the fixture's base file: main renames it, the change edits it.
+    const ours = (() => {
+      git(fixture.alpha, "mv", "alpha.ts", "renamed.ts")
+      git(fixture.alpha, "commit", "-q", "-m", "rename alpha.ts")
+      return git(fixture.alpha, "rev-parse", "HEAD")
+    })()
+    git(fixture.alpha, "switch", "-q", "-c", "submodule-theirs", fixture.alphaBase)
+    const theirs = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 'change'\n")
+    git(fixture.alpha, "switch", "-q", "main")
+    const submodule = join(fixture.product, "packages/alpha")
+    git(submodule, "fetch", "-q", "origin")
+    git(fixture.product, "switch", "-q", "-c", "candidate-rename")
+    git(submodule, "checkout", "-q", theirs)
+    git(fixture.product, "add", "packages/alpha")
+    git(fixture.product, "commit", "-q", "-m", "pin theirs")
+    const candidate = git(fixture.product, "rev-parse", "HEAD")
+    git(fixture.product, "switch", "-q", "main")
+    git(submodule, "checkout", "-q", ours)
+    git(fixture.product, "add", "packages/alpha")
+    git(fixture.product, "commit", "-q", "-m", "pin ours")
+
+    const result = await superMerge({ repo: fixture.product, commit: candidate })
+
+    expect(result).toMatchObject({ state: "failed", partial: false, detail: { code: "gitlink-compose-refused" } })
+    expect(result.detail?.message).toContain("alpha.ts")
+    expect(retainedPins(fixture.alpha)).toEqual([])
+  })
+
+  it("refuses a diverged gitlink whose two sides share no history as unavailable", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-compose-no-base-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const ours = advanceRepository(fixture.alpha, "main-side.ts", "export const main = 1\n")
+    git(fixture.alpha, "checkout", "-q", "--orphan", "submodule-orphan")
+    git(fixture.alpha, "rm", "-rq", "--cached", ".")
+    rmSync(join(fixture.alpha, "alpha.ts"), { force: true })
+    rmSync(join(fixture.alpha, "main-side.ts"), { force: true })
+    writeFileSync(join(fixture.alpha, "orphan.ts"), "export const orphan = 1\n")
+    git(fixture.alpha, "add", "orphan.ts")
+    git(fixture.alpha, "commit", "-q", "-m", "an unrelated history")
+    const theirs = git(fixture.alpha, "rev-parse", "HEAD")
+    git(fixture.alpha, "checkout", "-q", "-f", "main")
+    const submodule = join(fixture.product, "packages/alpha")
+    git(submodule, "fetch", "-q", "origin")
+    git(fixture.product, "switch", "-q", "-c", "candidate-orphan")
+    git(submodule, "checkout", "-q", theirs)
+    git(fixture.product, "add", "packages/alpha")
+    git(fixture.product, "commit", "-q", "-m", "pin an unrelated history")
+    const candidate = git(fixture.product, "rev-parse", "HEAD")
+    git(fixture.product, "switch", "-q", "main")
+    git(submodule, "checkout", "-q", ours)
+    git(fixture.product, "add", "packages/alpha")
+    git(fixture.product, "commit", "-q", "-m", "pin ours")
+    const headBefore = git(fixture.product, "rev-parse", "HEAD")
+
+    const result = await superMerge({ repo: fixture.product, commit: candidate })
+
+    expect(result).toMatchObject({ state: "failed", partial: false, detail: { code: "gitlink-compose-unavailable" } })
+    expect(result.detail?.message).toContain("packages/alpha")
+    expect(retainedPins(fixture.alpha)).toEqual([])
+    expect(git(fixture.product, "rev-parse", "HEAD")).toBe(headBefore)
+  })
+
+  it("never composes when an ordinary file conflicts beside the diverged gitlink", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-compose-content-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    writeFileSync(join(fixture.product, "root.txt"), "base\n")
+    git(fixture.product, "add", "root.txt")
+    git(fixture.product, "commit", "-q", "-m", "a root file both sides edit")
+    const ours = advanceRepository(fixture.alpha, "main-side.ts", "export const main = 1\n")
+    git(fixture.alpha, "switch", "-q", "-c", "submodule-theirs", fixture.alphaBase)
+    const theirs = advanceRepository(fixture.alpha, "change-side.ts", "export const change = 1\n")
+    git(fixture.alpha, "switch", "-q", "main")
+    const submodule = join(fixture.product, "packages/alpha")
+    git(submodule, "fetch", "-q", "origin")
+    git(fixture.product, "switch", "-q", "-c", "candidate-content-conflict")
+    git(submodule, "checkout", "-q", theirs)
+    writeFileSync(join(fixture.product, "root.txt"), "change\n")
+    git(fixture.product, "add", "packages/alpha", "root.txt")
+    git(fixture.product, "commit", "-q", "-m", "pin theirs and edit the root file")
+    const candidate = git(fixture.product, "rev-parse", "HEAD")
+    git(fixture.product, "switch", "-q", "main")
+    git(submodule, "checkout", "-q", ours)
+    writeFileSync(join(fixture.product, "root.txt"), "main\n")
+    git(fixture.product, "add", "packages/alpha", "root.txt")
+    git(fixture.product, "commit", "-q", "-m", "pin ours and edit the root file")
+
+    const result = await superMerge({ repo: fixture.product, commit: candidate })
+
+    expect(result).toMatchObject({ state: "failed", partial: false, detail: { code: "merge-conflict" } })
+    expect(result.detail?.paths).toEqual(expect.arrayContaining(["root.txt"]))
+    expect(retainedPins(fixture.alpha)).toEqual([])
   })
 })
