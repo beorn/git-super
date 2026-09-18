@@ -923,7 +923,23 @@ function rollbackFailureDetail(
  */
 type ProspectiveFailure = Readonly<{
   failure: GitResultDetail
-  conflict?: Readonly<{ entries: readonly IndexEntry[]; paths: readonly string[]; stageEvidence: string }>
+  conflict?: Readonly<{
+    entries: readonly IndexEntry[]
+    paths: readonly string[]
+    stageEvidence: string
+    /**
+     * THE TREE `merge-tree --write-tree` WROTE ANYWAY. A conflicted run still
+     * emits a toplevel tree on its first line, and in it every unconflicted
+     * path is merged by Git's real strategy — content merges included. Only the
+     * listed paths are unresolved. A caller that can resolve exactly those
+     * paths therefore has the whole merge already made for it, which a
+     * rebuilt-from-scratch three-way could not reproduce.
+     *
+     * Absent when merge-tree printed no usable tree, which is the caller's cue
+     * that there is nothing to seed from.
+     */
+    tree?: string
+  }>
 }>
 
 async function prospectiveTree(
@@ -1000,7 +1016,12 @@ async function prospectiveTree(
         ? "; Git reported no conflicted paths"
         : ` at ${paths.map((path) => JSON.stringify(path)).join(", ")}`
     return {
-      conflict: { entries, paths, stageEvidence },
+      conflict: {
+        entries,
+        paths,
+        stageEvidence,
+        ...(tree !== undefined && OBJECT_ID.test(tree) ? { tree } : {}),
+      },
       failure: resultDetailFromGit(
         "merge-conflict",
         "preflight-merge",
@@ -1074,15 +1095,6 @@ async function composeDivergedGitlinks(
   }
 
   const reader = { run: (request: GitProcessRequest) => git.run({ timeoutMs, ...request }) }
-  // The root's own merge base, which the three-way resolution below reads. Two
-  // histories with no base are not this merge's to judge, exactly as two
-  // component histories with no base are not.
-  const baseArgs = ["merge-base", head, target]
-  const merged = await run(git, root, baseArgs, timeoutMs)
-  const base = merged.stdout.trim()
-  if (merged.code !== 0 || !OBJECT_ID.test(base)) {
-    return { failure: composeUnavailable(root, paths, "find the merge base", gitFailureText(root, baseArgs, merged)) }
-  }
   let declared: Map<string, string>
   try {
     declared = new Map(
@@ -1193,17 +1205,24 @@ async function composeDivergedGitlinks(
   }
 
   /**
-   * THE MERGE TREE IS RESOLVED IN A SCRATCH INDEX, NOT BY A SECOND merge-tree.
+   * THE MERGE IS NOT REBUILT; ONLY THE GITLINKS ARE STATED.
    *
-   * Substituting the composed sha on the head side and asking `merge-tree`
-   * again is not guaranteed clean: the path still carries three distinct
-   * gitlink shas, and Git's submodule fast-forward resolution needs the
-   * component's objects reachable from the ROOT repository, which is not
-   * something a merge can assume. A three-way `read-tree` leaves the gitlink at
-   * stages 1-3 and `update-index --cacheinfo` replaces all three with one
-   * stage-0 entry — the resolution stated rather than re-derived.
+   * `merge-tree --write-tree` already wrote the whole merge, and a conflicted
+   * run still emits it: every path but the conflicted ones is merged by Git's
+   * real strategy, content merges included. Since this runs only when EVERY
+   * conflicted path is a gitlink this merge composed, seeding the scratch index
+   * from that tree and stating the composed sha at each gitlink finishes it.
+   *
+   * Asking `merge-tree` a SECOND time over a substituted head side would not be
+   * guaranteed clean — the path still carries three distinct gitlink shas, and
+   * Git's submodule resolution needs the component's objects reachable from the
+   * ROOT repository. Rebuilding with a three-way `read-tree` instead would be
+   * clean but WEAKER: it is a trivial merge, so two sides that edited the same
+   * file in different hunks would come back conflicted although Git had already
+   * merged them here.
    */
-  const resolvedTree = await resolveComposedTree(git, root, base, head, target, substituted, timeoutMs)
+  if (conflict.tree === undefined) return undefined
+  const resolvedTree = await resolveComposedTree(git, root, conflict.tree, substituted, timeoutMs)
   if ("failure" in resolvedTree) return resolvedTree
   if (resolvedTree.tree === undefined) return undefined
 
@@ -1231,19 +1250,21 @@ async function composeDivergedGitlinks(
 }
 
 /**
- * The merge tree, with every composed gitlink stated as a stage-zero entry.
+ * The merge Git already wrote, with every composed gitlink stated as a
+ * stage-zero entry.
  *
  * `tree: undefined` means an entry stayed unmerged after the substitution — a
  * content conflict the composition cannot settle — and the caller's own refusal
- * stands. `GIT_INDEX_FILE` is passed per command and never exported, because it
- * bleeds into anything that inherits it; the scratch file is removed either way.
+ * stands. A plain `read-tree` writes no stages, so that check can only fire on
+ * something genuinely unexpected; it is kept as the guard that says so rather
+ * than as a condition anyone expects to see. `GIT_INDEX_FILE` is passed per
+ * command and never exported, because it bleeds into anything that inherits it;
+ * the scratch file is removed either way.
  */
 async function resolveComposedTree(
   git: GitProcess,
   root: string,
-  base: string,
-  head: string,
-  target: string,
+  merged: string,
   pins: ReadonlyMap<string, string>,
   timeoutMs: number,
 ): Promise<Readonly<{ tree: string | undefined }> | Readonly<{ failure: GitResultDetail }>> {
@@ -1253,7 +1274,7 @@ async function resolveComposedTree(
   const paths = [...pins.keys()]
   try {
     const staging = [
-      ["read-tree", "-i", "-m", base, head, target],
+      ["read-tree", merged],
       ...[...pins].map(([path, sha]) => ["update-index", "--cacheinfo", `160000,${sha},${path}`]),
     ]
     for (const args of staging) {
@@ -1394,7 +1415,7 @@ function composeRefused(
     "gitlink-compose-refused",
     `Merge ${target} conflicts with current HEAD ${head} at ${located}, and the diverged submodule could not be merged: ${reasons.join("; ")}; no commit was written.${stageEvidence ? ` ${stageEvidence}` : ""}`,
     evidence,
-    "Rebase the submodule commit onto its own main and submit again; a diverged submodule is merged only where the two sides changed different files.",
+    "Merge the submodule's own main into the submodule commit, re-record the gitlink, and submit again; a diverged submodule is merged here only where the two sides changed different files.",
     "the caller",
     {
       objectIds: [...new Set([head, target, ...entries.map((entry) => entry.oid)])],

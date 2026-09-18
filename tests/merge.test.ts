@@ -2171,6 +2171,52 @@ describe("git super merge — a diverged gitlink the merge composes", () => {
     })
   })
 
+  /**
+   * THE CASE A REBUILT THREE-WAY WOULD HAVE LOST. Both sides edit one root file
+   * in different hunks, which Git merges cleanly, beside a diverged gitlink
+   * whose sides are disjoint. The merge Git already wrote carries the merged
+   * content; only the gitlink is stated over it. A trivial `read-tree -m`
+   * rebuild would have returned this file conflicted and bounced the change.
+   */
+  it("keeps Git's own content merge for a file both sides changed in different hunks", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-compose-hunks-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    writeFileSync(join(fixture.product, "root.txt"), "one\ntwo\nthree\nfour\nfive\nsix\nseven\n")
+    git(fixture.product, "add", "root.txt")
+    git(fixture.product, "commit", "-q", "-m", "a root file both sides will edit")
+    const ours = advanceRepository(fixture.alpha, "main-side.ts", "export const main = 1\n")
+    git(fixture.alpha, "switch", "-q", "-c", "submodule-theirs", fixture.alphaBase)
+    const theirs = advanceRepository(fixture.alpha, "change-side.ts", "export const change = 1\n")
+    git(fixture.alpha, "switch", "-q", "main")
+    const submodule = join(fixture.product, "packages/alpha")
+    git(submodule, "fetch", "-q", "origin")
+    git(fixture.product, "switch", "-q", "-c", "candidate-hunks")
+    git(submodule, "checkout", "-q", theirs)
+    writeFileSync(join(fixture.product, "root.txt"), "one\ntwo\nthree\nfour\nfive\nsix\nCHANGE\n")
+    git(fixture.product, "add", "packages/alpha", "root.txt")
+    git(fixture.product, "commit", "-q", "-m", "pin theirs and edit the last line")
+    const candidate = git(fixture.product, "rev-parse", "HEAD")
+    git(fixture.product, "switch", "-q", "main")
+    git(submodule, "checkout", "-q", ours)
+    writeFileSync(join(fixture.product, "root.txt"), "MAIN\ntwo\nthree\nfour\nfive\nsix\nseven\n")
+    git(fixture.product, "add", "packages/alpha", "root.txt")
+    git(fixture.product, "commit", "-q", "-m", "pin ours and edit the first line")
+
+    const result = await superMerge({ repo: fixture.product, commit: candidate })
+
+    expect(result).toMatchObject({ state: "updated", partial: false })
+    const settled = result.gitlinks.find((row) => row.path === "packages/alpha")
+    expect(settled).toMatchObject({ path: "packages/alpha", state: "merged" })
+    const composed = settled?.from ?? ""
+    expect(git(fixture.product, "ls-tree", "HEAD", "--", "packages/alpha")).toBe(
+      `160000 commit ${composed}\tpackages/alpha`,
+    )
+    // BOTH hunks survive: this is Git's content merge, not one side chosen.
+    expect(git(fixture.product, "show", "HEAD:root.txt")).toBe("MAIN\ntwo\nthree\nfour\nfive\nsix\nCHANGE")
+    expect(git(fixture.product, "status", "--porcelain=v1")).toBe("")
+  })
+
   it("refuses a diverged gitlink whose two sides changed the same file, naming the file", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-compose-overlap-"))
     roots.push(fixtureRoot)
