@@ -163,8 +163,9 @@ describe("explicit recursive push mechanics", () => {
     expect(await runCli(["push", "--help"], help, helpErrors)).toBe(0)
     expect(help.output).toContain("check|on-demand|only|no")
     expect(help.output).toContain("at least one submodule remote")
-    expect(help.output).toContain("submodules before the root")
-    expect(help.output).toContain("to refs/git-super/pins/<sha> unless the root destination is main")
+    expect(help.output).toContain(
+      "to refs/git-super/pins/<sha> unless the root destination is main, which publishes to refs/heads/<branch> from .gitmodules",
+    )
     expect(help.output).toContain("only publishes submodules the same way")
     expect(help.output).toContain("no updates only root refs")
     expect(helpErrors.output).toBe("")

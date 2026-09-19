@@ -392,7 +392,7 @@ async function runInvocation(
     .description(commands.push.description ?? commands.push.title)
     .option(
       "--recurse-submodules <check|on-demand|only|no>",
-      "check requires commits on at least one submodule remote; on-demand publishes missing submodules before the root (to refs/git-super/pins/<sha> unless the root destination is main); only publishes submodules the same way; no updates only root refs",
+      "check requires commits on at least one submodule remote; on-demand publishes missing submodules before the root (to refs/git-super/pins/<sha> unless the root destination is main, which publishes to refs/heads/<branch> from .gitmodules); only publishes submodules the same way; no updates only root refs",
       "check",
     )
     .option("--atomic", "request an atomic update only within each one remote repository")
