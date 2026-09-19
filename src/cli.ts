@@ -392,7 +392,7 @@ async function runInvocation(
     .description(commands.push.description ?? commands.push.title)
     .option(
       "--recurse-submodules <check|on-demand|only|no>",
-      "check requires commits on at least one submodule remote; on-demand publishes missing submodules before the root; only publishes submodules; no updates only root refs",
+      "check requires commits on at least one submodule remote; on-demand publishes missing submodules before the root (to refs/git-super/pins/<sha> unless the root destination is main); only publishes submodules the same way; no updates only root refs",
       "check",
     )
     .option("--atomic", "request an atomic update only within each one remote repository")
@@ -700,6 +700,17 @@ async function writeResult(
       }
     }
     if (merge.detail !== undefined) stderr.write(`${merge.detail.message}\n`)
+  } else if (captured.node === nodes.push) {
+    const push = result as GitSuperResult
+    stdout.write(`${push.state}\n`)
+    for (const repository of push.repositories) {
+      for (const ref of repository.refs) {
+        if (ref.state === "updated") {
+          stdout.write(`${repository.repository}: ${ref.destination}\n`)
+        }
+      }
+    }
+    if (push.detail !== undefined) stderr.write(`${push.detail.message}\n`)
   } else {
     const pull = result as GitSuperResult
     stdout.write(`${pull.state}\n`)

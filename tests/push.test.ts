@@ -164,6 +164,9 @@ describe("explicit recursive push mechanics", () => {
     expect(help.output).toContain("check|on-demand|only|no")
     expect(help.output).toContain("at least one submodule remote")
     expect(help.output).toContain("submodules before the root")
+    expect(help.output).toContain("to refs/git-super/pins/<sha> unless the root destination is main")
+    expect(help.output).toContain("only publishes submodules the same way")
+    expect(help.output).toContain("no updates only root refs")
     expect(helpErrors.output).toBe("")
 
     const stdout = outputSink()
@@ -1532,4 +1535,59 @@ describe("explicit recursive push mechanics", () => {
       expect(result.state).toBe("updated")
     },
   )
+
+  /**
+   * 24901 row 4: push reports every ref it moved, by repository and ref name.
+   *
+   * @level l1
+   * @consumer 24901 row 4 — reporting of moved refs
+   */
+  test("push reports every ref it moved by repository and ref name (24901)", async () => {
+    const fixture = recursivePushFixture("report-moved-refs")
+
+    const result = await superPush({
+      repo: fixture.root,
+      remote: "origin",
+      refspecs: [`${fixture.rootSource}:refs/heads/task/feature-x`],
+      recurseSubmodules: "on-demand",
+    })
+
+    expect(result.state).toBe("updated")
+    const movedRefs = result.repositories.flatMap((repo) =>
+      repo.refs
+        .filter((ref) => ref.state === "updated")
+        .map((ref) => ({ repository: repo.repository, destination: ref.destination })),
+    )
+    expect(movedRefs).toEqual([
+      { repository: fixture.child, destination: `refs/git-super/pins/${fixture.childSource}` },
+      { repository: fixture.root, destination: "refs/heads/task/feature-x" },
+    ])
+  })
+
+  test("CLI push reports every ref it moved by repository and ref name (24901)", async () => {
+    const fixture = recursivePushFixture("cli-report-moved-refs")
+    const stdout = outputSink()
+    const stderr = outputSink()
+
+    expect(
+      await runCli(
+        [
+          "--repo",
+          fixture.root,
+          "push",
+          "--recurse-submodules=on-demand",
+          "origin",
+          `${fixture.rootSource}:refs/heads/task/feature-x`,
+        ],
+        stdout,
+        stderr,
+      ),
+    ).toBe(0)
+
+    expect(stdout.output).toContain(fixture.child)
+    expect(stdout.output).toContain(`refs/git-super/pins/${fixture.childSource}`)
+    expect(stdout.output).toContain(fixture.root)
+    expect(stdout.output).toContain("refs/heads/task/feature-x")
+    expect(stderr.output).toBe("")
+  })
 })
