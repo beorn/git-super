@@ -1493,10 +1493,26 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
     const frozen = await frozenChildUpdates(git, root, remote, rootUpdates)
     const childUpdates: RefUpdate[] = frozen.updates ?? []
     if (frozen.updates === undefined) {
-      const requirements = await collectCommitRequirements(git, root, rootSources)
-      const rootDestinations = rootUpdates.map((update) => update.destination)
-      for (const requirement of requirements)
-        childUpdates.push(await childUpdate(git, requirement, timeoutMs, rootDestinations))
+      const requirementDestinations = new Map<string, { requirement: CommitRequirement; destinations: Set<string> }>()
+      for (const update of rootUpdates) {
+        if (update.source === "") continue
+        const reqs = await collectCommitRequirements(git, root, [update.source])
+        for (const req of reqs) {
+          const key = `${req.repository}\0${req.target}\0${req.entry.name}\0${req.entry.branch ?? ""}`
+          const existing = requirementDestinations.get(key)
+          if (existing !== undefined) {
+            existing.destinations.add(update.destination)
+          } else {
+            requirementDestinations.set(key, {
+              requirement: req,
+              destinations: new Set([update.destination]),
+            })
+          }
+        }
+      }
+      for (const { requirement, destinations } of requirementDestinations.values()) {
+        childUpdates.push(await childUpdate(git, requirement, timeoutMs, Array.from(destinations)))
+      }
     }
     if (frozen.retention.length > 0) {
       // Validate every frozen destination and root lease before the first retention write.

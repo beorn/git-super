@@ -1591,4 +1591,95 @@ describe("explicit recursive push mechanics", () => {
     expect(stdout.output).toContain("refs/heads/task/feature-x")
     expect(stderr.output).toBe("")
   })
+
+  /**
+   * 24901 R9: a mixed root push containing both an unchanged root main and a task
+   * branch that introduces or updates a child must leave that child's remote main
+   * unchanged. Before the fix, rootTargetsMain checked whether ANY root destination
+   * was refs/heads/main, which advanced child main to the task-only commit.
+   *
+   * @failure Mixed-ref push advances child main to task-only commit.
+   * @level l1
+   * @consumer 24901 R9 regression — mixed-ref root push child isolation
+   */
+  test("mixed root push leaves child main unchanged and publishes task pin (24901 R9)", async () => {
+    const fixture = recursivePushFixture("mixed-root-push-r9")
+
+    const result = await superPush({
+      repo: fixture.root,
+      remote: "origin",
+      recurseSubmodules: "on-demand",
+      refspecs: [`${fixture.rootBefore}:refs/heads/main`, `${fixture.rootSource}:refs/heads/task/new-feature`],
+    })
+
+    // Child remote main must not move to childSource
+    expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(fixture.childBefore)
+
+    // Child remote pin must be created for the task's child commit
+    const childPinRef = `refs/git-super/pins/${fixture.childSource}`
+    expect(git(fixture.childRemote, "for-each-ref", "--format=%(refname)", childPinRef)).toBe(childPinRef)
+
+    // Root remote main remains at rootBefore, root remote task branch points to rootSource
+    expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(fixture.rootBefore)
+    expect(git(fixture.rootRemote, "rev-parse", "refs/heads/task/new-feature")).toBe(fixture.rootSource)
+    expect(result.state).not.toBe("failed")
+  })
+
+  /**
+   * 24901 R9 control: mixed root push with shared child forwards child main when
+   * the updated child commit is required by root main as well as task refs.
+   *
+   * @level l1
+   * @consumer 24901 R9 shared-child control — identical child commit
+   */
+  test("mixed root push with shared child forwards child main when required by main (24901 control)", async () => {
+    const fixture = recursivePushFixture("mixed-root-shared-child")
+
+    const result = await superPush({
+      repo: fixture.root,
+      remote: "origin",
+      recurseSubmodules: "on-demand",
+      refspecs: [`${fixture.rootSource}:refs/heads/main`, `${fixture.rootSource}:refs/heads/task/feature-shared`],
+    })
+
+    // Because root main requires childSource, child main forwards to childSource
+    expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(fixture.childSource)
+    expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(fixture.rootSource)
+    expect(git(fixture.rootRemote, "rev-parse", "refs/heads/task/feature-shared")).toBe(fixture.rootSource)
+    expect(result.state).toBe("updated")
+  })
+
+  /**
+   * 24901 R9 control: mixed root push with divergent child commits forwards child
+   * main to the commit required by root main and publishes a pin for the task-only commit.
+   *
+   * @level l1
+   * @consumer 24901 R9 shared-child control — divergent child commits
+   */
+  test("mixed root push with divergent child commits forwards main commit and pins task commit (24901 control)", async () => {
+    const fixture = recursivePushFixture("mixed-root-divergent-child")
+
+    const childTaskCommit = advanceRepository(fixture.child, "child.txt", "three-task\n")
+    git(fixture.root, "add", "child")
+    git(fixture.root, "commit", "-q", "-m", "root task with child three")
+    const rootTaskSource = git(fixture.root, "rev-parse", "HEAD")
+
+    const result = await superPush({
+      repo: fixture.root,
+      remote: "origin",
+      recurseSubmodules: "on-demand",
+      refspecs: [`${fixture.rootSource}:refs/heads/main`, `${rootTaskSource}:refs/heads/task/feature-divergent`],
+    })
+
+    // Child remote main must advance to childSource (required by root main), NOT childTaskCommit
+    expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(fixture.childSource)
+
+    // Child remote pin must exist for childTaskCommit (required only by root task)
+    const taskPinRef = `refs/git-super/pins/${childTaskCommit}`
+    expect(git(fixture.childRemote, "for-each-ref", "--format=%(refname)", taskPinRef)).toBe(taskPinRef)
+
+    expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(fixture.rootSource)
+    expect(git(fixture.rootRemote, "rev-parse", "refs/heads/task/feature-divergent")).toBe(rootTaskSource)
+    expect(result.state).toBe("updated")
+  })
 })
