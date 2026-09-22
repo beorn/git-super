@@ -370,6 +370,7 @@ async function runInvocation(
     .description(commands.pull.description ?? commands.pull.title)
     .option("--ff-only", "refuse merge, rebase, stash, force, or conflict resolution")
     .option("--dry-run", "fetch and show the frozen plan without changing a checkout or local branch")
+    .option("--progress", "report each phase to stderr as it starts, with the elapsed milliseconds")
     .argument("[repository]", "remote repository to fetch")
     .argument("[refspecs...]", "root refspecs to fetch")
     .action((repository, refspecs, options, command) => {
@@ -381,6 +382,7 @@ async function runInvocation(
           refspecs,
           ffOnly: options.ffOnly === true,
           ...(options.dryRun === true ? { dryRun: true } : {}),
+          ...(options.progress === true ? { progress: true } : {}),
         },
         json: globals.json === true,
         nul: false,

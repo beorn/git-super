@@ -16,7 +16,15 @@ export type SuperPullOptions = Readonly<{
   timeoutMs?: number
   git?: GitProcess
   exclusive?: Exclusive
+  /**
+   * Receives one line as each phase starts, with the milliseconds since the pull began, so a caller that kills a
+   * slow pull still holds the phase it was in (24907). The CLI binds it to stderr.
+   */
+  report?: (message: string) => void
 }>
+
+/** Announce that a named phase is starting. */
+type Phase = (name: string) => void
 
 type PullPlan = Readonly<{
   root: string
@@ -87,7 +95,7 @@ function resultError(error: unknown, phase: string): GitResultDetail {
   })
 }
 
-async function planPull(git: GitProcess, options: SuperPullOptions): Promise<PullPlan> {
+async function planPull(git: GitProcess, options: SuperPullOptions, phase: Phase): Promise<PullPlan> {
   if (!options.ffOnly) {
     throw Object.assign(new Error("git super pull requires --ff-only"), {
       resultDetail: detail("ff-only-required", "validate", "git super pull requires --ff-only"),
@@ -95,12 +103,14 @@ async function planPull(git: GitProcess, options: SuperPullOptions): Promise<Pul
   }
   const root = await required(git, options.repo, ["rev-parse", "--show-toplevel"], "discover-root")
   const { repository, refspecs, remoteRef, exactTarget } = await resolvePullTarget(git, root, options)
+  phase("fetch-root-target")
   await required(
     git,
     root,
     ["fetch", "--no-recurse-submodules", "--no-write-fetch-head", repository, ...refspecs],
     "fetch-root-target",
   )
+  phase("observe-root-target")
   const observedRemoteTarget =
     remoteRef === undefined
       ? undefined
@@ -116,6 +126,7 @@ async function planPull(git: GitProcess, options: SuperPullOptions): Promise<Pul
       ),
     })
   }
+  phase("verify-root-target")
   await ensureCommitObject({
     repository: root,
     remote: repository,
@@ -159,7 +170,9 @@ async function planPull(git: GitProcess, options: SuperPullOptions): Promise<Pul
       })
     }
   }
-  const repositories = await freezeRepositoryGraph(git, root, current, target)
+  phase("freeze-target-graph")
+  const repositories = await freezeRepositoryGraph(git, root, current, target, phase)
+  phase("preflight-tree-transitions")
   await proveRepositoryTransitions(git, repositories)
   return {
     root,
@@ -335,6 +348,7 @@ async function freezeRepositoryGraph(
   root: string,
   current: string,
   target: string,
+  phase: Phase,
 ): Promise<PullRepositoryPlan[]> {
   const repositories: PullRepositoryPlan[] = []
   const walk = async (repository: string, path: string, from: string, to: string): Promise<void> => {
@@ -358,6 +372,7 @@ async function freezeRepositoryGraph(
           ),
         })
       }
+      phase(`freeze-submodule ${childPath}`)
       await ensureCommitObject({ repository: childRepository, remote: "origin", commit: entry.target, git })
       const actual = await required(git, childRepository, ["rev-parse", "HEAD^{commit}"], "freeze-submodule-current")
       const priorTree = await run(git, repository, ["ls-tree", from, "--", entry.path])
@@ -512,9 +527,11 @@ export async function superPull(options: SuperPullOptions): Promise<GitSuperResu
   const git: GitProcess = {
     run: (request) => process.run({ ...request, timeoutMs: request.timeoutMs ?? timeoutMs }),
   }
+  const startedAt = Date.now()
+  const phase: Phase = (name) => options.report?.(`git-super pull: ${name} +${Date.now() - startedAt}ms\n`)
   let plan: PullPlan
   try {
-    plan = await planPull(git, options)
+    plan = await planPull(git, options, phase)
   } catch (error) {
     const failure = resultError(error, "plan")
     return gitSuperResult([{ repository: resolve(options.repo), state: "failed", detail: failure, refs: [] }], failure)
@@ -528,10 +545,16 @@ export async function superPull(options: SuperPullOptions): Promise<GitSuperResu
       plan.detail,
     )
   }
-  const exclusive = options.exclusive ?? createExclusive(await lockDirectory(git, plan.root))
+  const exclusive =
+    options.exclusive ??
+    createExclusive(await lockDirectory(git, plan.root), {
+      onContended: (holder) => phase(`lock-wait held by ${holder}`),
+    })
+  phase("lock-wait")
   try {
     return await exclusive.run(
       async () => {
+        phase("lock-acquired")
         if (plan.remoteRef !== undefined && plan.observedRemoteTarget !== undefined) {
           const observed = await observeRemoteTarget(
             git,
@@ -579,6 +602,7 @@ export async function superPull(options: SuperPullOptions): Promise<GitSuperResu
             )
           }
         }
+        phase("apply-preflight")
         await proveRepositoryTransitions(git, plan.repositories)
         const results: GitSuperRepositoryResult[] = []
         for (const [index, repository] of plan.repositories.entries()) {
@@ -586,6 +610,7 @@ export async function superPull(options: SuperPullOptions): Promise<GitSuperResu
             results.push(repositoryResult(repository, "unchanged"))
             continue
           }
+          phase(index === 0 ? "apply-root" : `apply-submodule ${repository.path}`)
           const args =
             index === 0
               ? ["-c", "submodule.recurse=false", "merge", "--ff-only", "--no-edit", repository.target]
@@ -606,6 +631,7 @@ export async function superPull(options: SuperPullOptions): Promise<GitSuperResu
           }
           results.push(repositoryResult(repository, "updated"))
         }
+        phase("applied")
         return gitSuperResult(results, plan.detail)
       },
       { holder: "git super pull --ff-only" },
