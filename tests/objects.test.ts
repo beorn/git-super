@@ -1,9 +1,10 @@
-import { mkdtempSync, rmSync } from "node:fs"
+import { mkdtempSync, readFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, test } from "vitest"
 
-import { ensureCommitObject, pinRef } from "../src/objects.ts"
+import { danglingRefs, ensureCommitObject, pinRef } from "../src/objects.ts"
+import { createLocalGitProcess, type GitProcess } from "../src/process.ts"
 import { advanceRepository, createRepository, git } from "./fixture.ts"
 
 const roots: string[] = []
@@ -68,5 +69,56 @@ describe("exact commit objects", () => {
 
     await ensureCommitObject({ repository: checkout, remote: "origin", commit: target })
     expect(git(checkout, "rev-parse", pinRef(target))).toBe(target)
+  })
+})
+
+describe("danglingRefs", () => {
+  /**
+   * A packed ref whose object is gone makes every fetch fail with git's "bad
+   * object" text, which can name a different ref (hh 25050, 25051). The scan
+   * must list it, read no object while listing, and cost two processes.
+   */
+  test("names a packed ref whose object is gone, in two git processes, and nothing else", async () => {
+    const fixture = mkdtempSync(join(tmpdir(), "git-super-dangling-"))
+    roots.push(fixture)
+    const repository = join(fixture, "repository")
+    createRepository(repository, "README.md", "one\n")
+    const lost = git(repository, "commit-tree", git(repository, "write-tree"), "-p", "HEAD", "-m", "record")
+    git(repository, "update-ref", "refs/yrd/main/task/lost@abc", lost)
+    git(repository, "pack-refs", "--all")
+    expect(readFileSync(join(repository, ".git", "packed-refs"), "utf8")).toContain(
+      `${lost} refs/yrd/main/task/lost@abc`,
+    )
+    rmSync(join(repository, ".git", "objects", lost.slice(0, 2), lost.slice(2)))
+
+    const inner = createLocalGitProcess()
+    const calls: string[][] = []
+    const counted: GitProcess = {
+      run: async (request) => {
+        calls.push([...request.args])
+        return inner.run(request)
+      },
+    }
+
+    await expect(danglingRefs(counted, repository)).resolves.toEqual([
+      { ref: "refs/yrd/main/task/lost@abc", oid: lost },
+    ])
+    expect(calls.map((args) => args[0])).toEqual(["for-each-ref", "cat-file"])
+  })
+
+  test("an intact repository scans to an empty list", async () => {
+    const fixture = mkdtempSync(join(tmpdir(), "git-super-dangling-"))
+    roots.push(fixture)
+    const repository = join(fixture, "repository")
+    createRepository(repository, "README.md", "one\n")
+    await expect(danglingRefs(createLocalGitProcess(), repository)).resolves.toEqual([])
+  })
+
+  test("a scan that cannot run throws with git's text, never an empty list", async () => {
+    const fixture = mkdtempSync(join(tmpdir(), "git-super-dangling-"))
+    roots.push(fixture)
+    await expect(danglingRefs(createLocalGitProcess(), join(fixture, "not-a-repository"))).rejects.toThrow(
+      /git for-each-ref .*failed/u,
+    )
   })
 })
