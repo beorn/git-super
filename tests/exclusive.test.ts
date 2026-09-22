@@ -35,6 +35,36 @@ describe("exclusive writer policy", () => {
   })
 
   /**
+   * @failure A pull killed while waiting for the writer lock leaves no trace of who held it (24907).
+   * @level l1
+   * @consumer a caller that bounds a pull and must name what it waited on
+   */
+  test("names the holder once, when the first acquire finds the lock held", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "git-super-exclusive-"))
+    const first = await acquireExclusive(dir, { timeoutMs: 0 }, "first mutation")
+    const contended: string[] = []
+    try {
+      await expect(
+        acquireExclusive(dir, { timeoutMs: 40, onContended: (holder) => contended.push(holder) }, "second mutation"),
+      ).rejects.toThrow(/lock is busy/u)
+      expect(contended).toEqual([
+        expect.stringMatching(new RegExp(`^first mutation \\(pid:${process.pid}, age \\d+ms\\)$`, "u")),
+      ])
+    } finally {
+      first.release()
+    }
+    const uncontended: string[] = []
+    const free = await acquireExclusive(
+      dir,
+      { timeoutMs: 0, onContended: (holder) => uncontended.push(holder) },
+      "free",
+    )
+    free.release()
+    expect(uncontended).toEqual([])
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  /**
    * @failure A legacy or unreadable holder timestamp becomes a fabricated age in a timeout refusal.
    * @level l1
    * @consumer Yrd worktree mutation store

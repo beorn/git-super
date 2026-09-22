@@ -381,6 +381,10 @@ async function runInvocation(
           refspecs,
           ffOnly: options.ffOnly === true,
           ...(options.dryRun === true ? { dryRun: true } : {}),
+          // GIT_SUPER_PROGRESS=1 reports each phase to stderr as it starts. An environment switch, not a flag: a
+          // caller that sets it still works against an older git-super, which ignores it, so a half-landed update
+          // that moved the caller before this binary cannot wedge every pull on an unknown option (24907).
+          ...(process.env.GIT_SUPER_PROGRESS === "1" ? { progress: true } : {}),
         },
         json: globals.json === true,
         nul: false,

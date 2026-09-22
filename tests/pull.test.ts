@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "vitest"
+import { afterEach, describe, expect, test, vi } from "vitest"
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -215,6 +215,97 @@ describe("git super pull --ff-only", () => {
         refs: [{ destination: "HEAD", observed: priorBeta, source: betaTarget, state: "updated" }],
       },
     ])
+  })
+
+  // 24907: a caller that kills a slow pull at its bound must still hold the phase the pull was in, so
+  // GIT_SUPER_PROGRESS=1 reports each phase as it starts, with the milliseconds since the pull began.
+  test("GIT_SUPER_PROGRESS=1 reports every phase to stderr as it starts, root before submodules", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-pull-progress-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const checkout = join(fixtureRoot, "checkout")
+    git(
+      fixtureRoot,
+      "-c",
+      "protocol.file.allow=always",
+      "clone",
+      "-q",
+      "--recurse-submodules",
+      fixture.product,
+      checkout,
+    )
+    const target = bumpProductSubmodules(fixture)
+    const stdout = outputSink()
+    const stderr = outputSink()
+
+    vi.stubEnv("GIT_SUPER_PROGRESS", "1")
+    const exitCode = await runCli(
+      ["--repo", checkout, "pull", "--ff-only", "origin", "main", "--json"],
+      stdout,
+      stderr,
+    ).finally(() => vi.unstubAllEnvs())
+
+    expect(exitCode, stderr.output).toBe(0)
+    expect(git(checkout, "rev-parse", "HEAD")).toBe(target)
+    const lines = stderr.output.trimEnd().split("\n")
+    for (const line of lines) expect(line).toMatch(/^git-super pull: \S.* \+\d+ms$/u)
+    expect(lines.map((line) => line.replace(/^git-super pull: /u, "").replace(/ \+\d+ms$/u, ""))).toEqual([
+      "fetch-root-target",
+      "observe-root-target",
+      "verify-root-target",
+      "freeze-target-graph",
+      "freeze-submodule packages/alpha",
+      "freeze-submodule vendor/beta",
+      "preflight-tree-transitions",
+      "lock-wait",
+      "lock-acquired",
+      "apply-preflight",
+      "apply-root",
+      "apply-submodule packages/alpha",
+      "apply-submodule vendor/beta",
+      "applied",
+    ])
+    const elapsed = lines.map((line) => Number(/\+(\d+)ms$/u.exec(line)?.[1]))
+    expect(elapsed).toEqual([...elapsed].sort((left, right) => left - right))
+  })
+
+  test("progress names the holder while the pull waits for another writer's lock", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-pull-progress-lock-"))
+    roots.push(fixtureRoot)
+    const upstream = join(fixtureRoot, "upstream")
+    const checkout = join(fixtureRoot, "checkout")
+    createRepository(upstream, "README.md", "one\n")
+    git(fixtureRoot, "clone", "-q", upstream, checkout)
+    const target = advanceRepository(upstream, "README.md", "two\n")
+    const common = git(checkout, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    const other = await acquireExclusive(join(common, "yrd-worktree-mutations"), { timeoutMs: 0 }, "other writer")
+    const lines: string[] = []
+
+    const pulled = superPull({
+      repo: checkout,
+      repository: "origin",
+      refspecs: ["main"],
+      ffOnly: true,
+      report: (message) => lines.push(message),
+    })
+    const deadline = Date.now() + 3_000
+    while (!lines.some((line) => line.includes("lock-wait held by")) && Date.now() < deadline) {
+      await new Promise((settle) => setTimeout(settle, 10))
+    }
+    other.release()
+    const result = await pulled
+
+    expect(result.state, JSON.stringify(result)).toBe("updated")
+    expect(git(checkout, "rev-parse", "HEAD")).toBe(target)
+    expect(lines.find((line) => line.includes("lock-wait held by"))).toMatch(
+      new RegExp(
+        `^git-super pull: lock-wait held by other writer \\(pid:${process.pid}, age \\d+ms\\) \\+\\d+ms\n$`,
+        "u",
+      ),
+    )
+    expect(lines.findIndex((line) => line.includes("lock-wait held by"))).toBeLessThan(
+      lines.findIndex((line) => line.includes("lock-acquired")),
+    )
   })
 
   test("reports an unchanged root without touching it", async () => {
