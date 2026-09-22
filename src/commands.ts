@@ -26,7 +26,7 @@ export type DiffParams = Omit<SuperDiffOptions, "repo">
 export type StatusParams = Record<string, never>
 export type MergeBaseParams = Omit<SuperIsAncestorOptions, "repo">
 export type MergeParams = Omit<SuperMergeOptions, "repo" | "git" | "exclusive">
-export type PullParams = Omit<SuperPullOptions, "repo" | "git" | "exclusive">
+export type PullParams = Omit<SuperPullOptions, "repo" | "git" | "exclusive" | "report"> & { progress?: boolean }
 export type PushParams = Omit<SuperPushOptions, "repo" | "git" | "exclusive">
 export type GitlinkWriteParams = Omit<WriteGitlinkOptions, "repo" | "git">
 export type SubmodulePrepareParams = Omit<SuperSubmodulePrepareOptions, "repo" | "git" | "exclusive">
@@ -128,9 +128,16 @@ const pull = commandNode<CommandContext, PullParams, GitSuperResult>({
       ...(typeof input.repository === "string" ? { repository: input.repository } : {}),
       refspecs: stringArray(input.refspecs, "refspecs"),
       ...(input.dryRun === true ? { dryRun: true } : {}),
+      ...(input.progress === true ? { progress: true } : {}),
     }
   }),
-  run: (context, input) => superPull({ repo: context.repo, ...input }),
+  // --progress reports each phase as it starts (24907); without it a successful pull stays silent on stderr.
+  run: (context, { progress, ...input }) =>
+    superPull({
+      repo: context.repo,
+      ...input,
+      ...(progress === true && context.report !== undefined ? { report: context.report } : {}),
+    }),
 })
 
 const push = commandNode<CommandContext, PushParams, GitSuperResult>({
