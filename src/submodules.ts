@@ -447,16 +447,14 @@ async function anchorDurableAlternates(
  * module store (`<superproject common dir>/modules/<name>/objects`), because
  * either alone leaves a hole that killed 62 stores on 2026-08-25:
  *
- * 1. Borrows are REDIRECTED to the primary worktree (`primaryWorktree` above),
- *    so a fresh clone's alternates line lands on the durable store instead of
- *    a disposable linked worktree's `worktrees/<wt>/modules` store.
+ * 1. Without an explicit reference, borrows use the primary worktree. An
+ *    explicit reference uses its own submodule stores first, including local
+ *    commits in a linked worktree that have not been published yet.
  * 2. After EVERY successful update — fresh clone or warm no-op — the durable
  *    line is appended to the store's `objects/info/alternates` unless already
  *    present (`anchorDurableAlternates` below). Redirection alone cannot do
- *    this: a warm `submodule update` never rewrites alternates, so a store
- *    that was emitted before the redirect existed would stay chained to its
- *    disposable borrow forever. Any pre-existing borrow line is kept — it is
- *    a performance borrow, additive and optional, never the store of record.
+ *    this: a warm `submodule update` never rewrites alternates. The explicit
+ *    reference line stays first; the durable line is also present.
  */
 export async function materializeSubmodules(
   git: SubmoduleGit,
@@ -482,7 +480,7 @@ export async function materializeSubmodules(
         unreferencedPaths: [],
       }
     }
-    if (canonical(primary) !== canonical(options.worktree)) referenceRoot = primary
+    referenceRoot = requestedReference
   }
   let borrowed = 0
   let remoteFallbacks = 0

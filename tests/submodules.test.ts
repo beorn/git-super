@@ -1078,7 +1078,7 @@ describe("materializeSubmodules", () => {
     })
   })
 
-  it("borrows from the primary submodule store when given a linked reference worktree", async () => {
+  it("borrows an explicit linked store first and anchors the durable store after it", async () => {
     const root = await mkdtemp(join(tmpdir(), "git-super-primary-reference-"))
     roots.push(root)
     const dependency = join(root, "dependency")
@@ -1105,6 +1105,16 @@ describe("materializeSubmodules", () => {
 
     git(owner, ["worktree", "add", "-q", "--detach", linked, "HEAD"])
     git(linked, ["-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive"])
+    const linkedDependency = join(linked, "vendor/dependency")
+    writeFileSync(join(linkedDependency, "dependency.txt"), "private linked commit\n")
+    git(linkedDependency, ["add", "dependency.txt"])
+    git(linkedDependency, ["commit", "-qm", "private linked commit"])
+    const privatePin = git(linkedDependency, ["rev-parse", "HEAD"]).trim()
+    expect(
+      spawnSync("git", ["-C", join(owner, "vendor/dependency"), "cat-file", "-e", `${privatePin}^{commit}`], {
+        encoding: "utf8",
+      }).status,
+    ).not.toBe(0)
     git(owner, ["worktree", "add", "-q", "--detach", candidate, "HEAD"])
 
     const previousGitAllowProtocol = process.env.GIT_ALLOW_PROTOCOL
@@ -1133,7 +1143,24 @@ describe("materializeSubmodules", () => {
       "--path-format=absolute",
       "--git-dir",
     ]).trim()
-    expect(readFileSync(alternatesFile, "utf8").trim()).toBe(join(primaryGitDir, "objects"))
+    const linkedGitDir = git(linkedDependency, ["rev-parse", "--path-format=absolute", "--git-dir"]).trim()
+    expect(readFileSync(alternatesFile, "utf8").trim().split("\n")).toEqual([
+      join(linkedGitDir, "objects"),
+      join(primaryGitDir, "objects"),
+    ])
+    expect(git(candidateDependency, ["cat-file", "-e", `${privatePin}^{commit}`])).toBe("")
+
+    const defaultCandidate = join(root, "default-candidate")
+    git(owner, ["worktree", "add", "-q", "--detach", defaultCandidate, "HEAD"])
+    const ordinary = await materializeSubmodulesFromLocalWorktreeParallel({ worktree: defaultCandidate })
+    expect(ordinary, ordinary.stderr).toMatchObject({ exitCode: 0, borrowed: 1 })
+    const defaultAlternates = git(join(defaultCandidate, "vendor/dependency"), [
+      "rev-parse",
+      "--path-format=absolute",
+      "--git-path",
+      "objects/info/alternates",
+    ]).trim()
+    expect(readFileSync(defaultAlternates, "utf8").trim()).toBe(join(primaryGitDir, "objects"))
 
     git(owner, ["worktree", "remove", "--force", linked])
     expect(git(candidateDependency, ["cat-file", "-e", "HEAD^{commit}"])).toBe("")

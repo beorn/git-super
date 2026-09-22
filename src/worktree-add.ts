@@ -284,7 +284,7 @@ export async function superWorktreeAdd(options: SuperWorktreeAddOptions): Promis
     }
     const materialized = await materializeSubmodulesFromLocalWorktreeParallel({
       worktree: path,
-      referenceWorktree: reference,
+      ...(options.reference === undefined ? {} : { referenceWorktree: reference }),
       maxRemoteFallbacks: UNBOUNDED_REMOTE_FALLBACKS,
       ...(env === undefined ? {} : { env }),
       ...(options.log === undefined ? {} : { log: options.log }),
