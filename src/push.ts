@@ -5,7 +5,6 @@ import {
   readCommitGitlinks,
   readCommitSubmodules,
   resolveSubmoduleBranch,
-  underChangedGitlink,
   type CommitGitlink,
   type CommitSubmodule,
 } from "./commit-graph.ts"
@@ -962,13 +961,13 @@ export async function capturePushIntent(
   const requirements = await collectCommitRequirements(git, root, [tree], rootPins, undefined, rootStores)
   if (requirements.length === 0) return undefined
   const rootRemote = await logicalPushUrl(git, root, await configuredPushRemote(git, root))
-  const changed = new Set(
-    changedGitlinks(
-      await readCommitGitlinks(git, root, head),
-      requirements
-        .filter((requirement) => requirement.superproject === root)
-        .map((requirement) => ({ path: requirement.path, target: requirement.target })),
-    ).map((entry) => entry.path),
+  const changed = await changedRowPaths(
+    git,
+    await readCommitGitlinks(git, root, head),
+    requirements
+      .filter((requirement) => requirement.superproject === root)
+      .map((requirement) => ({ path: requirement.path, target: requirement.target })),
+    requirements,
   )
   const children: FrozenPushIntent["children"][number][] = []
   for (const requirement of requirements) {
@@ -994,7 +993,7 @@ export async function capturePushIntent(
     if (update.expectedDestination.state === "oid") {
       const args = ["merge-base", "--is-ancestor", update.expectedDestination.oid, update.source]
       const ancestry = await git.run({ repo: requirement.repository, args })
-      if (ancestry.code === 1 && !underChangedGitlink(changed, requirement.path)) {
+      if (ancestry.code === 1 && !changed.has(requirement.path)) {
         children.push({ ...pin, remote })
         continue
       }
@@ -1065,15 +1064,18 @@ async function frozenChildUpdates(
     if (direct.has(source)) found = true
     const selected = await collectCommitRequirements(git, root, [source], undefined, intent)
     const moved = await readCommitGitlinks(git, root, source)
-    const changed = new Set(
-      bases.reduce((still, base) => changedGitlinks(base, still), moved).map((entry) => entry.path),
-    )
+    // A row is unchanged when ANY base the remote holds already records it.
+    let changed = new Set(selected.map((requirement) => requirement.path))
+    for (const base of bases) {
+      const against = await changedRowPaths(git, base, moved, selected)
+      changed = new Set([...changed].filter((path) => against.has(path)))
+    }
     for (const row of intent.children) {
       const requirement = selected.find((entry) => entry.path === row.path && entry.target === row.pin)
       if (requirement === undefined) {
         throw new Error(`Frozen child ${row.path}@${row.pin} is not selected by merge ${source}`)
       }
-      if (!underChangedGitlink(changed, row.path)) continue
+      if (!changed.has(row.path)) continue
       if (sameHostedOwner(intent.rootRemote, row.remote)) {
         for (const pin of new Set([row.pin, ...(row.publication === undefined ? [] : [row.publication.source])])) {
           retention.push({
@@ -1277,6 +1279,49 @@ async function collectCommitRequirements(
           candidate.entry.branch === requirement.entry.branch,
       ) === index,
   )
+}
+
+/**
+ * The exact rows `after` moves relative to `before`: the top-level gitlinks
+ * from the one rule, changedGitlinks, and under each moved parent the nested
+ * gitlinks its OWN two commits differ in, read from the parent's store (one
+ * tree read per moved parent that has nested rows). A parent new to `after`
+ * has no previous commit, so every row under it counts as changed. An
+ * unreadable previous commit throws: the merge fails loud rather than
+ * guessing (25303, review of P1).
+ */
+async function changedRowPaths(
+  git: GitProcess,
+  before: readonly CommitGitlink[],
+  after: readonly CommitGitlink[],
+  requirements: readonly CommitRequirement[],
+  prefix = "",
+): Promise<Set<string>> {
+  const paths = new Set<string>()
+  const previous = new Map(before.map((entry) => [entry.path, entry.target]))
+  for (const entry of changedGitlinks(before, after)) {
+    const path = prefix === "" ? entry.path : `${prefix}/${entry.path}`
+    paths.add(path)
+    const nested = requirements.filter((requirement) => requirement.path.startsWith(`${path}/`))
+    if (nested.length === 0) continue
+    const was = previous.get(entry.path)
+    const store = requirements.find(
+      (requirement) => requirement.path === path && requirement.target === entry.target,
+    )?.repository
+    if (was === undefined || store === undefined) {
+      for (const requirement of nested) paths.add(requirement.path)
+      continue
+    }
+    const inner = await changedRowPaths(
+      git,
+      await readCommitGitlinks(git, store, was),
+      await readCommitGitlinks(git, store, entry.target),
+      requirements,
+      path,
+    )
+    for (const nestedPath of inner) paths.add(nestedPath)
+  }
+  return paths
 }
 
 type AdvertisedRef = Readonly<{ oid: string; ref: string }>
@@ -1545,6 +1590,243 @@ function prependRepositories(
   return gitSuperResult([...repositories, ...result.repositories], result.detail)
 }
 
+type LeasedChildPush = Readonly<{
+  repository: string
+  remote: string
+  refspecs: readonly string[]
+  publication?: Readonly<{ destination: string; source: string; expected: ExpectedDestination }>
+}>
+
+const PORCELAIN_REF = /^([ +\-*!=])\t([^\t]*):([^\t]+)\t(.*)$/u
+
+/** One child's leased atomic push, judged by git's own `--porcelain` report: no observation before or after. */
+async function pushLeasedChild(
+  git: GitProcess,
+  child: LeasedChildPush,
+  options: Pick<SuperPushOptions, "pushOptions" | "signed" | "verify">,
+): Promise<GitSuperRepositoryResult> {
+  const lease =
+    child.publication === undefined
+      ? []
+      : [
+          `--force-with-lease=${child.publication.destination}:${child.publication.expected.state === "oid" ? child.publication.expected.oid : ""}`,
+        ]
+  const args = [
+    "push",
+    "--porcelain",
+    "--atomic",
+    "--recurse-submodules=no",
+    ...(options.verify === false ? ["--no-verify"] : []),
+    ...(options.signed === undefined ? [] : [`--signed=${options.signed}`]),
+    ...(options.pushOptions ?? []).map((option) => `--push-option=${option}`),
+    ...lease,
+    child.remote,
+    ...child.refspecs,
+  ]
+  const pushed = await git.run({ repo: child.repository, args })
+  const reported = new Map<string, { flag: string; summary: string }>()
+  for (const line of pushed.stdout.split(/\r?\n/u)) {
+    const match = PORCELAIN_REF.exec(line)
+    if (match?.[1] !== undefined && match[3] !== undefined) {
+      reported.set(match[3], { flag: match[1], summary: match[4] ?? "" })
+    }
+  }
+  let failure: GitResultDetail | undefined
+  if (pushed.code !== 0 || pushed.timedOut === true || pushed.failure !== undefined) {
+    const publication = child.publication
+    const refused = publication === undefined ? undefined : reported.get(publication.destination)
+    if (publication !== undefined && refused?.flag === "!") {
+      // The one diagnostic read: WHO holds the ref the lease expected.
+      const holder = await observeDestination(
+        git,
+        { repository: child.repository, remote: child.remote, destination: publication.destination },
+        "name-lease-holder",
+      ).then(expectedKey, (error: unknown) => `unreadable (${error instanceof Error ? error.message : String(error)})`)
+      failure = detail(
+        "destination-changed",
+        "leased-child-push",
+        `Leased push to ${child.remote} ${publication.destination} was refused (${refused.summary}): the merge expected ${expectedKey(publication.expected)} and the remote holds ${holder}. The push is atomic, so none of its refs was written.`,
+        {
+          objectIds: [...(publication.expected.state === "oid" ? [publication.expected.oid] : []), publication.source],
+          remedy: "The child main moved after the merge was captured; re-judge the change against the current main.",
+        },
+      )
+    } else {
+      failure = detail(
+        pushFailureCode(pushed),
+        "leased-child-push",
+        pushed.timedOut === true
+          ? `git push timed out in ${child.repository}`
+          : `git push failed in ${child.repository} (exit ${pushed.code})${pushed.stderr ? `\n${pushed.stderr}` : ""}`,
+        { remedy: "Inspect the exact repository/ref result and remote evidence before retrying." },
+      )
+    }
+  }
+  const refs = child.refspecs.map((refspec): GitSuperRefResult => {
+    const separator = refspec.indexOf(":")
+    const source = refspec.slice(0, separator)
+    const destination = refspec.slice(separator + 1)
+    const row = reported.get(destination)
+    if (row === undefined) {
+      return refResult(
+        { source, destination },
+        failure === undefined ? "unknown" : "failed",
+        failure ??
+          detail("missing-push-report", "leased-child-push", `git push reported nothing for ${destination}.`, {
+            remedy: "Inspect the exact remote ref before retrying.",
+          }),
+      )
+    }
+    if (row.flag === "!") return refResult({ source, destination }, "failed", failure)
+    if (failure !== undefined) return refResult({ source, destination }, "not-run", failure)
+    return refResult({ source, destination }, row.flag === "=" ? "unchanged" : "updated")
+  })
+  return {
+    repository: child.repository,
+    state: repositoryState(refs),
+    ...(failure === undefined ? {} : { detail: failure }),
+    refs,
+  }
+}
+
+/**
+ * ITEM 9 OF THE 25303 MERGE-PATH REDESIGN: A LEASED PUSH REPLACES EVERY PRE-CHECK.
+ * A queue merge publishes by pushing ONE frozen merge to the root's main. Each
+ * child whose gitlink the merge moved (the one changed-set rule, first parent
+ * against the merge) gets ONE atomic push carrying its pin and its main, leased
+ * on the main capture observed. There is no pre-validate, retention recheck or
+ * fetch-back, and no observation afterwards: git's porcelain report is the
+ * outcome. A child main that moved after capture is refused by the lease (one
+ * diagnostic read names who holds it). A child main that DIVERGED from the pin
+ * is refused before any push, because a lease would otherwise overwrite it.
+ * Any other shape (records, several refspecs, a non-main destination) answers
+ * undefined and takes the observed path.
+ */
+async function leasedFrozenPush(
+  git: GitProcess,
+  root: string,
+  remote: string,
+  rootUpdates: readonly RefUpdate[],
+  options: SuperPushOptions,
+  timeoutMs: number,
+): Promise<GitSuperResult | undefined> {
+  const [update, ...others] = rootUpdates
+  if (update === undefined || others.length > 0 || update.source === "" || update.destination !== "refs/heads/main") {
+    return undefined
+  }
+  const intent = await readFrozenPushIntent(git, root, update.source)
+  if (intent === undefined) return undefined
+  const actualRemote = await logicalPushUrl(git, root, remote)
+  if (!sameHostedRepository(intent.rootRemote, actualRemote)) {
+    throw new Error(
+      `Merge ${update.source} freezes root remote ${intent.rootRemote}, but this push selects ${actualRemote}`,
+    )
+  }
+  const firstParent = await required(
+    git,
+    root,
+    ["rev-parse", "--verify", `${update.source}^1^{commit}`],
+    "read-merge-first-parent",
+  )
+  const selected = await collectCommitRequirements(git, root, [update.source], undefined, intent)
+  const changed = await changedRowPaths(
+    git,
+    await readCommitGitlinks(git, root, firstParent),
+    await readCommitGitlinks(git, root, update.source),
+    selected,
+  )
+  const children: LeasedChildPush[] = []
+  for (const row of intent.children) {
+    const requirement = selected.find((entry) => entry.path === row.path && entry.target === row.pin)
+    if (requirement === undefined) {
+      throw new Error(`Frozen child ${row.path}@${row.pin} is not selected by merge ${update.source}`)
+    }
+    if (!changed.has(row.path) || !sameHostedOwner(intent.rootRemote, row.remote)) continue
+    const pins = [...new Set([row.pin, ...(row.publication === undefined ? [] : [row.publication.source])])]
+    const refspecs = pins.map((pin) => `${pin}:refs/git-super/pins/${pin}`)
+    if (row.publication === undefined) {
+      children.push({ repository: requirement.repository, remote: row.remote, refspecs })
+      continue
+    }
+    const { destination, source, expectedDestination } = row.publication
+    const bindArgs = ["merge-base", "--is-ancestor", row.pin, source]
+    const bound = await git.run({ repo: requirement.repository, args: bindArgs })
+    if (bound.code !== 0) throw operationError(requirement.repository, bindArgs, "bind-frozen-publication", bound)
+    if (expectedDestination.state === "oid" && expectedDestination.oid !== source) {
+      // A lease lets a NON-fast-forward through whenever the remote still holds
+      // the expected value, so a diverged main would be overwritten and its
+      // commits lost. ADR-0015's diverged-pin refusal, before any push.
+      const args = ["merge-base", "--is-ancestor", expectedDestination.oid, source]
+      const ancestry = await git.run({ repo: requirement.repository, args })
+      if (ancestry.code !== 0) {
+        const failure = detail(
+          "diverged-pin",
+          "leased-child-fast-forward",
+          `Merge ${update.source} would move ${row.remote} ${destination} from ${expectedDestination.oid} to ${source} (pin ${row.pin}), which is not a fast-forward${ancestry.code === 1 ? "" : ` (git merge-base exited ${ancestry.code}${ancestry.stderr ? `: ${ancestry.stderr.trim()}` : ""})`}; nothing was pushed.`,
+          {
+            paths: [row.path],
+            objectIds: [expectedDestination.oid, source, row.pin],
+            remedy:
+              "The child main diverged from the pinned history; re-judge the change against the current child main.",
+          },
+        )
+        return gitSuperResult(
+          [
+            { repository: requirement.repository, state: "failed", detail: failure, refs: [] },
+            { repository: root, state: "not-run", detail: failure, refs: [refResult(update, "not-run", failure)] },
+          ],
+          failure,
+        )
+      }
+    }
+    refspecs.push(`${source}:${destination}`)
+    children.push({
+      repository: requirement.repository,
+      remote: row.remote,
+      refspecs,
+      publication: { destination, source, expected: expectedDestination },
+    })
+  }
+  const exclusive = options.exclusive ?? createExclusive(await lockDirectory(git, root))
+  return exclusive.run(
+    async () => {
+      const results = await mapInOrder(children, PLAN_READ_CONCURRENCY, (child) => pushLeasedChild(git, child, options))
+      const failed = results.find((result) => result.state === "failed" || result.state === "unknown")
+      if (failed !== undefined) {
+        const failure =
+          failed.detail ??
+          detail("push-incomplete", "leased-child-push", `Push did not complete in ${failed.repository}.`)
+        return gitSuperResult(
+          [
+            ...results,
+            { repository: root, state: "not-run", detail: failure, refs: [refResult(update, "not-run", failure)] },
+          ],
+          failure,
+        )
+      }
+      if (options.recurseSubmodules !== "on-demand") {
+        return gitSuperResult(
+          results.length > 0 ? results : [{ repository: root, state: "not-run", refs: [refResult(update, "not-run")] }],
+        )
+      }
+      // The root is the commit point, so it goes last, on the ordinary leased path.
+      const pushed = await pushRefUpdates({
+        root,
+        updates: rootUpdates,
+        ...(options.atomic === undefined ? {} : { atomic: options.atomic }),
+        ...(options.verify === undefined ? {} : { verify: options.verify }),
+        ...(options.pushOptions === undefined ? {} : { pushOptions: options.pushOptions }),
+        ...(options.signed === undefined ? {} : { signed: options.signed }),
+        timeoutMs,
+        git,
+        exclusive: { run: (operation) => operation() },
+      })
+      return prependRepositories(pushed, results)
+    },
+    { holder: "git super push" },
+  )
+}
+
 /** Plan ordinary CLI refspecs into exact rows, then execute the selected recursive mode. */
 export async function superPush(options: SuperPushOptions): Promise<GitSuperResult> {
   if (!(["check", "no", "on-demand", "only"] as const).includes(options.recurseSubmodules)) {
@@ -1638,6 +1920,8 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
       })
       return prependRepositories(pushed, available)
     }
+    const leased = await leasedFrozenPush(git, root, remote, rootUpdates, options, timeoutMs)
+    if (leased !== undefined) return leased
     const frozen = await frozenChildUpdates(git, root, remote, rootUpdates)
     const childUpdates: RefUpdate[] = frozen.updates ?? []
     if (frozen.updates === undefined) {

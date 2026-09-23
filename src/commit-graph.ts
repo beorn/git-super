@@ -244,18 +244,6 @@ export async function changedCommitGitlinks(
   )
 }
 
-/**
- * Whether a (possibly nested) gitlink path lies under a changed top-level
- * gitlink. A nested pin can only move when its top-level parent moves, so an
- * unchanged parent proves its whole subtree unchanged; under a changed parent
- * every nested row counts as changed, which is the conservative side.
- */
-export function underChangedGitlink(changed: ReadonlySet<string>, path: string): boolean {
-  if (changed.has(path)) return true
-  for (const parent of changed) if (path.startsWith(`${parent}/`)) return true
-  return false
-}
-
 /** Resolve Git's read branch policy for GitSuper's additional forwarding use. */
 export async function resolveSubmoduleBranch(
   git: GitProcess,
