@@ -1690,8 +1690,11 @@ describe("explicit recursive push mechanics", () => {
  * them: 16 retentions, 16 child mains observed twice, a fetch-back per pin and
  * two spawns per advertised root ref. These fixtures give a root two owned
  * children and a frozen merge that moves only `child`; `other` keeps its pin.
+ * `childMain` shapes the moved child's remote main at capture: at its pin
+ * (`pinned`), run ahead by a direct push that the new pin contains (`ahead`),
+ * or diverged from the pinned history (`diverged`).
  */
-function twoChildFrozenMerge(name: string) {
+function twoChildFrozenMerge(name: string, childMain: "pinned" | "ahead" | "diverged" = "pinned") {
   const fixture = mkdtempSync(join(tmpdir(), `git-super-push-25303-${name}-`))
   roots.push(fixture)
   const hosted = (repo: string) => `https://git-super.test/owned/${repo}.git`
@@ -1721,7 +1724,18 @@ function twoChildFrozenMerge(name: string) {
   git(root, "push", "-q", "-u", "origin", "main")
 
   const child = join(root, "child")
+  let expected = before.child
+  if (childMain === "ahead") {
+    expected = advanceRepository(child, "child.txt", "ahead\n")
+    git(child, "push", "-q", remotes.child, `${expected}:refs/heads/main`)
+  }
   const childSource = advanceRepository(child, "child.txt", "two\n")
+  if (childMain === "diverged") {
+    const elsewhere = join(fixture, "child-elsewhere")
+    git(fixture, "clone", "-q", remotes.child, elsewhere)
+    expected = advanceRepository(elsewhere, "child.txt", "diverged\n")
+    git(elsewhere, "push", "-q", "origin", `${expected}:refs/heads/main`)
+  }
   git(root, "add", "child")
   git(root, "commit", "-q", "-m", "move child only")
   for (const name of ["root", "child", "other"] as const) {
@@ -1749,7 +1763,7 @@ function twoChildFrozenMerge(name: string) {
         publication: {
           destination: "refs/heads/main",
           source: childSource,
-          expectedDestination: { state: "oid", oid: before.child },
+          expectedDestination: { state: "oid", oid: expected },
         },
       },
       {
@@ -1775,6 +1789,10 @@ function twoChildFrozenMerge(name: string) {
     "-m",
     `checked merge\n\n${PUSH_INTENT_TRAILER}: ${encoded}`,
   )
+  const emptyTree = git(root, "hash-object", "-w", "-t", "tree", "--stdin")
+  // A record retaining the merge: its push takes the OBSERVED path, because
+  // its direct source carries no intent.
+  const record = git(root, "commit-tree", emptyTree, "-p", merge, "-m", "retain checked merge")
   const calls: { args: string[]; repo: string }[] = []
   let inFlight = 0
   let maxObserveInFlight = 0
@@ -1791,17 +1809,27 @@ function twoChildFrozenMerge(name: string) {
       }
     },
   }
+  const moveMain = (repo: "child" | "other"): string => {
+    const tree = git(remotes[repo], "hash-object", "-w", "-t", "tree", "--stdin")
+    const moved = git(remotes[repo], "commit-tree", tree, "-m", "moved outside the queue")
+    git(remotes[repo], "update-ref", "refs/heads/main", moved)
+    return moved
+  }
   return {
     fixture,
     root,
     remotes,
     hosted,
     before,
+    expected,
     rootBefore,
     childSource,
     merge,
+    record,
     calls,
+    moveMain,
     maxObserveInFlight: () => maxObserveInFlight,
+    /** One frozen merge to main: the leased path, yrd's publish command. */
     push: () =>
       superPush({
         repo: root,
@@ -1810,18 +1838,24 @@ function twoChildFrozenMerge(name: string) {
         recurseSubmodules: "only",
         git: recording,
       }),
+    /** The merge to main plus its record: the observed path. */
+    pushWithRecord: () =>
+      superPush({
+        repo: root,
+        remote: "origin",
+        refspecs: [`${merge}:refs/heads/main`, `${record}:refs/checks/retained`],
+        recurseSubmodules: "only",
+        git: recording,
+      }),
   }
 }
 
-describe("a frozen push works only on the children its merge moved (25303)", () => {
+describe("a frozen push works only on the children its merge moved (25303, observed path)", () => {
   test("publishes and retains the moved child and never asks the unchanged one's remote", async () => {
     const shape = twoChildFrozenMerge("moved-only")
-    // The unchanged child's main moves elsewhere: not this change's fact.
-    const emptyTree = git(shape.remotes.other, "hash-object", "-w", "-t", "tree", "--stdin")
-    const elsewhere = git(shape.remotes.other, "commit-tree", emptyTree, "-m", "moved outside the queue")
-    git(shape.remotes.other, "update-ref", "refs/heads/main", elsewhere)
+    const elsewhere = shape.moveMain("other")
 
-    expect(await shape.push()).toMatchObject({ state: "updated", partial: false })
+    expect(await shape.pushWithRecord()).toMatchObject({ state: "updated", partial: false })
 
     expect(git(shape.remotes.child, "rev-parse", "refs/heads/main")).toBe(shape.childSource)
     expect(git(shape.remotes.child, "rev-parse", `refs/git-super/pins/${shape.childSource}`)).toBe(shape.childSource)
@@ -1829,8 +1863,8 @@ describe("a frozen push works only on the children its merge moved (25303)", () 
     expect(git(shape.remotes.other, "for-each-ref", "--format=%(refname)", "refs/git-super/pins")).toBe("")
     const touchingOther = shape.calls.filter(({ args }) => args.some((arg) => arg.includes(shape.hosted("other"))))
     expect(touchingOther).toEqual([])
-    // The root is not pushed in "only" mode; the moved child's main is observed
-    // once per plan and once after its push, never twice in one plan.
+    // The moved child's main is observed once per plan and once after its
+    // push, never twice in one plan.
     const childMainReads = shape.calls.filter(
       ({ args }) => args[0] === "ls-remote" && args.includes(shape.hosted("child")) && args.includes("refs/heads/main"),
     )
@@ -1842,7 +1876,7 @@ describe("a frozen push works only on the children its merge moved (25303)", () 
     const pinRef = `refs/git-super/pins/${shape.childSource}`
     git(join(shape.root, "child"), "push", "-q", shape.remotes.child, `${shape.childSource}:${pinRef}`)
 
-    expect(await shape.push()).toMatchObject({ state: "updated", partial: false })
+    expect(await shape.pushWithRecord()).toMatchObject({ state: "updated", partial: false })
 
     expect(git(shape.remotes.child, "rev-parse", "refs/heads/main")).toBe(shape.childSource)
     const fetchBack = shape.calls.filter(({ args }) => args[0] === "fetch" && args.includes(pinRef))
@@ -1864,7 +1898,7 @@ describe("a frozen push works only on the children its merge moved (25303)", () 
     })
     expect(() => git(shape.root, "cat-file", "-e", `${unseen[0]}^{commit}`)).toThrow()
 
-    expect(await shape.push()).toMatchObject({ state: "updated", partial: false })
+    expect(await shape.pushWithRecord()).toMatchObject({ state: "updated", partial: false })
 
     const inRoot = shape.calls.filter(({ repo }) => repo === shape.root)
     const perRef = inRoot.filter(
@@ -1873,7 +1907,7 @@ describe("a frozen push works only on the children its merge moved (25303)", () 
         (args[0] === "rev-parse" && args[1]?.endsWith("^{commit}")),
     )
     // The plan still checks each pushed source once; what may not appear is a spawn per advertised ref
-    // (44 refs here, two spawns each before 25303).
+    // (45 refs here, two spawns each before 25303).
     expect(perRef.length).toBeLessThan(5)
     const foreignFetches = inRoot.filter(
       ({ args }) => args[0] === "fetch" && args.some((arg) => arg.startsWith("refs/heads/foreign-")),
@@ -1887,15 +1921,9 @@ describe("a frozen push works only on the children its merge moved (25303)", () 
     for (const commit of unseen) expect(git(shape.root, "cat-file", "-t", commit)).toBe("commit")
   })
 
-  test("capture asks the one changed-set helper: an unchanged child whose main diverged freezes no publication", async () => {
+  test("capture asks the one changed-set rule: an unchanged child whose main diverged freezes no publication", async () => {
     const shape = twoChildFrozenMerge("capture")
-    const emptyTree = git(shape.remotes.other, "hash-object", "-w", "-t", "tree", "--stdin")
-    git(
-      shape.remotes.other,
-      "update-ref",
-      "refs/heads/main",
-      git(shape.remotes.other, "commit-tree", emptyTree, "-m", "x"),
-    )
+    shape.moveMain("other")
     const tree = git(shape.root, "rev-parse", `${shape.merge}^{tree}`)
 
     const encoded = await capturePushIntent(
@@ -1922,9 +1950,173 @@ describe("a frozen push works only on the children its merge moved (25303)", () 
   test("observes a plan's destinations concurrently, at most four at a time", async () => {
     const shape = twoChildFrozenMerge("concurrent")
 
-    expect(await shape.push()).toMatchObject({ state: "updated", partial: false })
+    expect(await shape.pushWithRecord()).toMatchObject({ state: "updated", partial: false })
 
     expect(shape.maxObserveInFlight()).toBeGreaterThan(1)
     expect(shape.maxObserveInFlight()).toBeLessThanOrEqual(4)
+  })
+})
+
+describe("one frozen merge to main is published by leased pushes alone (25303 item 9)", () => {
+  const pushesIn = (shape: ReturnType<typeof twoChildFrozenMerge>) =>
+    shape.calls.filter(({ args }) => args[0] === "push")
+
+  test("(a) a one-gitlink merge makes no ls-remote and exactly one push, to the moved child", async () => {
+    const shape = twoChildFrozenMerge("leased")
+    const elsewhere = shape.moveMain("other")
+
+    expect(await shape.push()).toMatchObject({ state: "updated", partial: false })
+
+    expect(shape.calls.filter(({ args }) => args[0] === "ls-remote")).toEqual([])
+    const pushes = pushesIn(shape)
+    expect(pushes).toHaveLength(1)
+    expect(pushes[0]?.args).toEqual(
+      expect.arrayContaining([
+        "--atomic",
+        `--force-with-lease=refs/heads/main:${shape.before.child}`,
+        shape.hosted("child"),
+        `${shape.childSource}:refs/git-super/pins/${shape.childSource}`,
+        `${shape.childSource}:refs/heads/main`,
+      ]),
+    )
+    expect(git(shape.remotes.child, "rev-parse", "refs/heads/main")).toBe(shape.childSource)
+    expect(git(shape.remotes.child, "rev-parse", `refs/git-super/pins/${shape.childSource}`)).toBe(shape.childSource)
+    expect(git(shape.remotes.other, "rev-parse", "refs/heads/main")).toBe(elsewhere)
+    expect(git(shape.remotes.root, "rev-parse", "refs/heads/main")).toBe(shape.rootBefore)
+  })
+
+  test("(b) a child main moved after capture is refused at the push, naming the ref and its holder", async () => {
+    const shape = twoChildFrozenMerge("moved-after-capture")
+    const holder = shape.moveMain("child")
+
+    const result = await shape.push()
+
+    expect(result).toMatchObject({
+      state: "failed",
+      detail: { code: "destination-changed", phase: "leased-child-push" },
+    })
+    expect(result.detail?.message).toContain("refs/heads/main")
+    expect(result.detail?.message).toContain(`the remote holds oid:${holder}`)
+    expect(result.detail?.message).toContain(`expected oid:${shape.before.child}`)
+    expect(git(shape.remotes.child, "rev-parse", "refs/heads/main")).toBe(holder)
+    // Atomic: the pin in the same push was not written either.
+    expect(git(shape.remotes.child, "for-each-ref", "--format=%(refname)", "refs/git-super/pins")).toBe("")
+    expect(pushesIn(shape)).toHaveLength(1)
+  })
+
+  test("(c) a child main that ran ahead but lies in the new pin's history lands through the lease", async () => {
+    const shape = twoChildFrozenMerge("ran-ahead", "ahead")
+    expect(git(shape.remotes.child, "rev-parse", "refs/heads/main")).toBe(shape.expected)
+    expect(shape.expected).not.toBe(shape.before.child)
+
+    expect(await shape.push()).toMatchObject({ state: "updated", partial: false })
+
+    expect(git(shape.remotes.child, "rev-parse", "refs/heads/main")).toBe(shape.childSource)
+    expect(shape.calls.filter(({ args }) => args[0] === "ls-remote")).toEqual([])
+  })
+
+  test("(d) a diverged child main is refused BEFORE any push, naming the three commits", async () => {
+    const shape = twoChildFrozenMerge("diverged", "diverged")
+
+    const result = await shape.push()
+
+    expect(result).toMatchObject({
+      state: "failed",
+      detail: { code: "diverged-pin", phase: "leased-child-fast-forward" },
+    })
+    for (const oid of [shape.expected, shape.childSource]) expect(result.detail?.message).toContain(oid)
+    expect(result.detail?.objectIds).toEqual([shape.expected, shape.childSource, shape.childSource])
+    expect(pushesIn(shape)).toEqual([])
+    expect(git(shape.remotes.child, "rev-parse", "refs/heads/main")).toBe(shape.expected)
+  })
+
+  test("re-running a landed publication is an identical no-op through the same leased push", async () => {
+    const shape = twoChildFrozenMerge("resume")
+    expect(await shape.push()).toMatchObject({ state: "updated", partial: false })
+    shape.calls.length = 0
+
+    // Git reports a ref that already holds the pushed value as up to date, lease
+    // or not, so the retry settles as unchanged with no read and no write.
+    const again = await shape.push()
+
+    expect(again).toMatchObject({ state: "unchanged", partial: false })
+    expect(shape.calls.filter(({ args }) => args[0] === "ls-remote")).toEqual([])
+    expect(git(shape.remotes.child, "rev-parse", "refs/heads/main")).toBe(shape.childSource)
+  })
+})
+
+describe("a nested gitlink counts as moved only when its own pin moved (25303, review of P1)", () => {
+  test("capture freezes no publication for a nested child whose parent moved but whose own pin did not", async () => {
+    const fixture = mkdtempSync(join(tmpdir(), "git-super-push-25303-nested-"))
+    roots.push(fixture)
+    const hosted = (repo: string) => `https://git-super.test/owned/${repo}.git`
+    const remotes = {
+      root: join(fixture, "root.git"),
+      child: join(fixture, "child.git"),
+      leaf: join(fixture, "leaf.git"),
+    }
+    const allow = ["-c", "protocol.file.allow=always"]
+
+    git(fixture, "init", "--bare", "-q", "-b", "main", remotes.leaf)
+    const leafSeed = join(fixture, "leaf-seed")
+    const leafFirst = createRepository(leafSeed, "leaf.txt", "zero\n")
+    const leafPin = advanceRepository(leafSeed, "leaf.txt", "one\n")
+    git(leafSeed, "push", "-q", remotes.leaf, "main")
+
+    git(fixture, "init", "--bare", "-q", "-b", "main", remotes.child)
+    const childSeed = join(fixture, "child-seed")
+    createRepository(childSeed, "child.txt", "one\n")
+    git(childSeed, ...allow, "submodule", "add", "-q", remotes.leaf, "leaf")
+    git(childSeed, "commit", "-q", "-am", "add leaf")
+    git(childSeed, "push", "-q", remotes.child, "main")
+
+    git(fixture, "init", "--bare", "-q", "-b", "main", remotes.root)
+    const root = join(fixture, "root")
+    mkdirSync(root, { recursive: true })
+    git(root, "init", "-q", "-b", "main")
+    git(root, ...allow, "submodule", "add", "-q", remotes.child, "child")
+    git(root, ...allow, "submodule", "update", "-q", "--init", "--recursive")
+    git(root, "commit", "-q", "-am", "root one")
+    const rootBefore = git(root, "rev-parse", "HEAD")
+    git(root, "remote", "add", "origin", remotes.root)
+    git(root, "push", "-q", "-u", "origin", "main")
+
+    const child = join(root, "child")
+    const leaf = join(child, "leaf")
+    for (const repo of [root, child, leaf]) {
+      for (const target of ["root", "child", "leaf"] as const) {
+        git(repo, "config", `url.${remotes[target]}.insteadOf`, hosted(target))
+      }
+    }
+    git(root, "remote", "set-url", "origin", hosted("root"))
+    git(child, "remote", "set-url", "origin", hosted("child"))
+    git(leaf, "remote", "set-url", "origin", hosted("leaf"))
+    // The child moves (a file and its declared leaf identity); the leaf's own pin does not.
+    git(child, "config", "--file", ".gitmodules", "submodule.leaf.url", hosted("leaf"))
+    advanceRepository(child, "child.txt", "two\n")
+    git(child, "commit", "-q", "-am", "declare the hosted leaf")
+    git(root, "config", "--file", ".gitmodules", "submodule.child.url", hosted("child"))
+    git(root, "add", "child", ".gitmodules")
+    git(root, "commit", "-q", "-m", "move child only")
+    expect(git(root, "rev-parse", "HEAD:child")).not.toBe(git(root, "rev-parse", `${rootBefore}:child`))
+    expect(git(child, "rev-parse", "HEAD:leaf")).toBe(leafPin)
+
+    // The leaf's main diverged from its pin: a sibling of the pin, not in its history.
+    const elsewhere = join(fixture, "leaf-elsewhere")
+    git(fixture, "clone", "-q", remotes.leaf, elsewhere)
+    git(elsewhere, "checkout", "-q", "-b", "sibling", leafFirst)
+    const diverged = advanceRepository(elsewhere, "leaf.txt", "sibling\n")
+    git(elsewhere, "push", "-q", "--force", "origin", `${diverged}:refs/heads/main`)
+
+    const tree = git(root, "rev-parse", "HEAD^{tree}")
+    const encoded = await capturePushIntent(createLocalGitProcess(), root, rootBefore, tree, new Map(), 30_000)
+
+    const intent = decodePushIntent(encoded ?? "")
+    expect(intent.children.find((row) => row.path === "child/leaf")).toEqual({
+      path: "child/leaf",
+      remote: hosted("leaf"),
+      pin: leafPin,
+    })
+    expect(intent.children.find((row) => row.path === "child")?.publication).toBeDefined()
   })
 })
