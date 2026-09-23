@@ -6,8 +6,8 @@ import { afterEach, describe, expect, test } from "vitest"
 import { runCli } from "../src/cli.ts"
 import { acquireExclusive, createExclusive, type Exclusive } from "../src/exclusive.ts"
 import { createLocalGitProcess, type GitProcess } from "../src/process.ts"
-import { pushRefUpdates, remoteContainsCommit, superPush } from "../src/push.ts"
-import { encodePushIntent, PUSH_INTENT_TRAILER } from "../src/push-intent.ts"
+import { capturePushIntent, pushRefUpdates, remoteContainsCommit, superPush } from "../src/push.ts"
+import { decodePushIntent, encodePushIntent, PUSH_INTENT_TRAILER } from "../src/push-intent.ts"
 import { advanceRepository, canonicalTmpdir as tmpdir, createRepository, git } from "./fixture.ts"
 
 const roots: string[] = []
@@ -1681,5 +1681,250 @@ describe("explicit recursive push mechanics", () => {
     expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(fixture.rootSource)
     expect(git(fixture.rootRemote, "rev-parse", "refs/heads/task/feature-divergent")).toBe(rootTaskSource)
     expect(result.state).toBe("updated")
+  })
+})
+
+/**
+ * @i/10-yrd/25303. A queue merge that moves ONE of a root's children froze a
+ * publication row for every child, and `git super push` worked through all of
+ * them: 16 retentions, 16 child mains observed twice, a fetch-back per pin and
+ * two spawns per advertised root ref. These fixtures give a root two owned
+ * children and a frozen merge that moves only `child`; `other` keeps its pin.
+ */
+function twoChildFrozenMerge(name: string) {
+  const fixture = mkdtempSync(join(tmpdir(), `git-super-push-25303-${name}-`))
+  roots.push(fixture)
+  const hosted = (repo: string) => `https://git-super.test/owned/${repo}.git`
+  const remotes = {
+    root: join(fixture, "root.git"),
+    child: join(fixture, "child.git"),
+    other: join(fixture, "other.git"),
+  }
+  const before: Record<"child" | "other", string> = { child: "", other: "" }
+  for (const name of ["child", "other"] as const) {
+    const seed = join(fixture, `${name}-seed`)
+    git(fixture, "init", "--bare", "-q", "-b", "main", remotes[name])
+    before[name] = createRepository(seed, `${name}.txt`, "one\n")
+    git(seed, "remote", "add", "origin", remotes[name])
+    git(seed, "push", "-q", "-u", "origin", "main")
+  }
+  const root = join(fixture, "root")
+  git(fixture, "init", "--bare", "-q", "-b", "main", remotes.root)
+  mkdirSync(root, { recursive: true })
+  git(root, "init", "-q", "-b", "main")
+  for (const name of ["child", "other"] as const) {
+    git(root, "-c", "protocol.file.allow=always", "submodule", "add", "-q", remotes[name], name)
+  }
+  git(root, "commit", "-q", "-am", "root one")
+  const rootBefore = git(root, "rev-parse", "HEAD")
+  git(root, "remote", "add", "origin", remotes.root)
+  git(root, "push", "-q", "-u", "origin", "main")
+
+  const child = join(root, "child")
+  const childSource = advanceRepository(child, "child.txt", "two\n")
+  git(root, "add", "child")
+  git(root, "commit", "-q", "-m", "move child only")
+  for (const name of ["root", "child", "other"] as const) {
+    const repo = name === "root" ? root : join(root, name)
+    for (const target of ["root", "child", "other"] as const) {
+      git(repo, "config", `url.${remotes[target]}.insteadOf`, hosted(target))
+    }
+  }
+  git(root, "remote", "set-url", "origin", hosted("root"))
+  for (const name of ["child", "other"] as const) git(join(root, name), "remote", "set-url", "origin", hosted(name))
+  git(root, "config", "--file", ".gitmodules", "submodule.child.url", hosted("child"))
+  git(root, "config", "--file", ".gitmodules", "submodule.other.url", hosted("other"))
+  git(root, "commit", "-q", "-am", "declare hosted identities")
+  const candidate = git(root, "rev-parse", "HEAD")
+  // The intent exactly as capture froze it before 25303: a publication row for
+  // EVERY owned child, the unchanged one a no-op at its own main.
+  const encoded = encodePushIntent({
+    version: 1,
+    rootRemote: hosted("root"),
+    children: [
+      {
+        path: "child",
+        remote: hosted("child"),
+        pin: childSource,
+        publication: {
+          destination: "refs/heads/main",
+          source: childSource,
+          expectedDestination: { state: "oid", oid: before.child },
+        },
+      },
+      {
+        path: "other",
+        remote: hosted("other"),
+        pin: before.other,
+        publication: {
+          destination: "refs/heads/main",
+          source: before.other,
+          expectedDestination: { state: "oid", oid: before.other },
+        },
+      },
+    ],
+  })
+  const merge = git(
+    root,
+    "commit-tree",
+    `${candidate}^{tree}`,
+    "-p",
+    rootBefore,
+    "-p",
+    candidate,
+    "-m",
+    `checked merge\n\n${PUSH_INTENT_TRAILER}: ${encoded}`,
+  )
+  const calls: { args: string[]; repo: string }[] = []
+  let inFlight = 0
+  let maxObserveInFlight = 0
+  const local = createLocalGitProcess()
+  const recording: GitProcess = {
+    run: async (request) => {
+      calls.push({ args: [...request.args], repo: request.repo })
+      const observe = request.args[0] === "ls-remote"
+      if (observe) maxObserveInFlight = Math.max(maxObserveInFlight, ++inFlight)
+      try {
+        return await local.run(request)
+      } finally {
+        if (observe) inFlight -= 1
+      }
+    },
+  }
+  return {
+    fixture,
+    root,
+    remotes,
+    hosted,
+    before,
+    rootBefore,
+    childSource,
+    merge,
+    calls,
+    maxObserveInFlight: () => maxObserveInFlight,
+    push: () =>
+      superPush({
+        repo: root,
+        remote: "origin",
+        refspecs: [`${merge}:refs/heads/main`],
+        recurseSubmodules: "only",
+        git: recording,
+      }),
+  }
+}
+
+describe("a frozen push works only on the children its merge moved (25303)", () => {
+  test("publishes and retains the moved child and never asks the unchanged one's remote", async () => {
+    const shape = twoChildFrozenMerge("moved-only")
+    // The unchanged child's main moves elsewhere: not this change's fact.
+    const emptyTree = git(shape.remotes.other, "hash-object", "-w", "-t", "tree", "--stdin")
+    const elsewhere = git(shape.remotes.other, "commit-tree", emptyTree, "-m", "moved outside the queue")
+    git(shape.remotes.other, "update-ref", "refs/heads/main", elsewhere)
+
+    expect(await shape.push()).toMatchObject({ state: "updated", partial: false })
+
+    expect(git(shape.remotes.child, "rev-parse", "refs/heads/main")).toBe(shape.childSource)
+    expect(git(shape.remotes.child, "rev-parse", `refs/git-super/pins/${shape.childSource}`)).toBe(shape.childSource)
+    expect(git(shape.remotes.other, "rev-parse", "refs/heads/main")).toBe(elsewhere)
+    expect(git(shape.remotes.other, "for-each-ref", "--format=%(refname)", "refs/git-super/pins")).toBe("")
+    const touchingOther = shape.calls.filter(({ args }) => args.some((arg) => arg.includes(shape.hosted("other"))))
+    expect(touchingOther).toEqual([])
+    // The root is not pushed in "only" mode; the moved child's main is observed
+    // once per plan and once after its push, never twice in one plan.
+    const childMainReads = shape.calls.filter(
+      ({ args }) => args[0] === "ls-remote" && args.includes(shape.hosted("child")) && args.includes("refs/heads/main"),
+    )
+    expect(childMainReads.length).toBe(4)
+  })
+
+  test("does not fetch back a pin the retention push found already at its source", async () => {
+    const shape = twoChildFrozenMerge("retained")
+    const pinRef = `refs/git-super/pins/${shape.childSource}`
+    git(join(shape.root, "child"), "push", "-q", shape.remotes.child, `${shape.childSource}:${pinRef}`)
+
+    expect(await shape.push()).toMatchObject({ state: "updated", partial: false })
+
+    expect(git(shape.remotes.child, "rev-parse", "refs/heads/main")).toBe(shape.childSource)
+    const fetchBack = shape.calls.filter(({ args }) => args[0] === "fetch" && args.includes(pinRef))
+    expect(fetchBack).toEqual([])
+  })
+
+  test("reads the root's advertisement in a fixed number of processes, however many refs it has", async () => {
+    const shape = twoChildFrozenMerge("advertisement")
+    for (let index = 0; index < 40; index += 1) {
+      git(shape.remotes.root, "update-ref", `refs/heads/extra-${index}`, shape.rootBefore)
+    }
+    // Three advertised refs whose commits this clone has never seen.
+    const foreign = join(shape.fixture, "foreign")
+    git(shape.fixture, "clone", "-q", shape.remotes.root, foreign)
+    const unseen = [0, 1, 2].map((index) => {
+      const commit = advanceRepository(foreign, "foreign.txt", `foreign ${index}\n`)
+      git(foreign, "push", "-q", "origin", `${commit}:refs/heads/foreign-${index}`)
+      return commit
+    })
+    expect(() => git(shape.root, "cat-file", "-e", `${unseen[0]}^{commit}`)).toThrow()
+
+    expect(await shape.push()).toMatchObject({ state: "updated", partial: false })
+
+    const inRoot = shape.calls.filter(({ repo }) => repo === shape.root)
+    const perRef = inRoot.filter(
+      ({ args }) =>
+        (args[0] === "cat-file" && args[1] === "-e" && args[2]?.endsWith("^{object}")) ||
+        (args[0] === "rev-parse" && args[1]?.endsWith("^{commit}")),
+    )
+    // The plan still checks each pushed source once; what may not appear is a spawn per advertised ref
+    // (44 refs here, two spawns each before 25303).
+    expect(perRef.length).toBeLessThan(5)
+    const foreignFetches = inRoot.filter(
+      ({ args }) => args[0] === "fetch" && args.some((arg) => arg.startsWith("refs/heads/foreign-")),
+    )
+    expect(foreignFetches).toHaveLength(1)
+    expect(foreignFetches[0]?.args.filter((arg) => arg.startsWith("refs/heads/foreign-")).sort()).toEqual([
+      "refs/heads/foreign-0",
+      "refs/heads/foreign-1",
+      "refs/heads/foreign-2",
+    ])
+    for (const commit of unseen) expect(git(shape.root, "cat-file", "-t", commit)).toBe("commit")
+  })
+
+  test("capture asks the one changed-set helper: an unchanged child whose main diverged freezes no publication", async () => {
+    const shape = twoChildFrozenMerge("capture")
+    const emptyTree = git(shape.remotes.other, "hash-object", "-w", "-t", "tree", "--stdin")
+    git(
+      shape.remotes.other,
+      "update-ref",
+      "refs/heads/main",
+      git(shape.remotes.other, "commit-tree", emptyTree, "-m", "x"),
+    )
+    const tree = git(shape.root, "rev-parse", `${shape.merge}^{tree}`)
+
+    const encoded = await capturePushIntent(
+      createLocalGitProcess(),
+      shape.root,
+      shape.rootBefore,
+      tree,
+      new Map(),
+      30_000,
+    )
+
+    const intent = decodePushIntent(encoded ?? "")
+    expect(intent.children.find((row) => row.path === "other")).toEqual({
+      path: "other",
+      remote: shape.hosted("other"),
+      pin: shape.before.other,
+    })
+    expect(intent.children.find((row) => row.path === "child")?.publication).toMatchObject({
+      destination: "refs/heads/main",
+      source: shape.childSource,
+    })
+  })
+
+  test("observes a plan's destinations concurrently, at most four at a time", async () => {
+    const shape = twoChildFrozenMerge("concurrent")
+
+    expect(await shape.push()).toMatchObject({ state: "updated", partial: false })
+
+    expect(shape.maxObserveInFlight()).toBeGreaterThan(1)
+    expect(shape.maxObserveInFlight()).toBeLessThanOrEqual(4)
   })
 })
