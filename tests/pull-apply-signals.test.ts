@@ -150,10 +150,8 @@ describe("git super pull: the apply is not stopped by a signal (24907 row 2)", (
       backstopMs: 4_000,
     })
     expect(result.timedOut).toBe(true)
-    // git's own group, then one per apply command: the root merge, each checkout and the hook, all recorded.
-    expect(result.backstop).toMatch(
-      /^backstop at 4000ms: SIGKILL to process group\(s\) [\d, ]+ \(4 recorded by the command\)$/u,
-    )
+    // The kill first (a5dcfc6b): the hung hook, which only the record names, dies, and no group it named keeps a
+    // member. The report's wording is checked after, so a missing record fails here, not on the message.
     const hook = Number(readFileSync(join(w.marks, "hook.pid"), "utf8").trim())
     const alive = (pid: number) => {
       try {
@@ -164,13 +162,17 @@ describe("git super pull: the apply is not stopped by a signal (24907 row 2)", (
       }
     }
     await until(() => !alive(hook), "the hung hook to die")
-    const groups = [...(result.backstop ?? "").matchAll(/(\d+)(?=[, ]|$)/gu)].map((match) => Number(match[1]))
-    for (const group of groups.filter((value) => value > 4000)) {
-      const members = Bun.spawnSync(["ps", "-o", "pid=", "-g", String(group)])
-        .stdout.toString()
-        .trim()
-      expect(members, `process group ${String(group)} still has members`).toBe("")
+    const named = /process group\(s\) ([\d, ]+) \(/u.exec(result.backstop ?? "")?.[1] ?? ""
+    const groups = named.split(", ").filter((group) => group !== "")
+    expect(groups.length, result.backstop).toBeGreaterThan(0)
+    for (const group of groups) {
+      const members = Bun.spawnSync(["ps", "-o", "pid=", "-g", group]).stdout.toString().trim()
+      expect(members, `process group ${group} still has members`).toBe("")
     }
+    // git's own group, then one per apply command: the root merge, each checkout and the hook, all recorded.
+    expect(result.backstop).toMatch(
+      /^backstop at 4000ms: SIGKILL to process group\(s\) [\d, ]+ \(4 recorded by the command\)$/u,
+    )
     // The checkouts finished before the hook: every repository is at the target, and the lock is free.
     expect(git(w.checkout, "rev-parse", "HEAD")).toBe(w.target)
     const stdout = {
