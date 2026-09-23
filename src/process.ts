@@ -288,15 +288,25 @@ function withReadRetry(inner: GitProcess, options: StallRetryOptions, environmen
           isExactPublickeyRefusal(result)
         ) {
           retriedPublickey = true
+          if (request.signal?.aborted) return result
           const effectiveEnv = { ...environment, ...request.env }
-          const config =
-            effectiveEnv.GIT_SSH_COMMAND === undefined
-              ? coreSshCommandFromConfig(
-                  await inner.run({ ...request, args: ["config", "--get", "core.sshCommand"] }),
-                  request.repo,
-                )
-              : undefined
-          const verbose = verboseSshRetryEnvironment(effectiveEnv, config)
+          let verbose: ReturnType<typeof verboseSshRetryEnvironment>
+          try {
+            const config =
+              effectiveEnv.GIT_SSH_COMMAND === undefined
+                ? coreSshCommandFromConfig(
+                    await inner.run({ ...request, args: ["config", "--get", "core.sshCommand"] }),
+                    request.repo,
+                  )
+                : undefined
+            verbose = verboseSshRetryEnvironment(effectiveEnv, config)
+          } catch (error) {
+            console.error(
+              `git-super: git ${request.args.join(" ")} in ${request.repo}: Permission denied (publickey).; ` +
+                `SSH retry skipped: ${String(error)}`,
+            )
+            return result
+          }
           console.error(
             `git-super: git ${request.args.join(" ")} in ${request.repo}: Permission denied (publickey).; ` +
               `retry 2/2 after ${String(PUBLICKEY_BACKOFF_MS)}ms with ${verbose.command}`,

@@ -144,6 +144,41 @@ describe("withStallRetry", () => {
     expect(announced).toHaveBeenCalledOnce()
   })
 
+  test("an abort during publickey backoff returns the first refusal without a second read", async () => {
+    vi.useFakeTimers()
+    vi.spyOn(console, "error").mockImplementation(() => {})
+    const controller = new AbortController()
+    const inner = scripted([PUBLICKEY_REFUSAL, OK])
+    const pending = withStallRetry(inner).run({
+      ...req(["fetch", "origin"]),
+      env: { GIT_SSH_COMMAND: "ssh -i fleet-key" },
+      signal: controller.signal,
+    })
+    await vi.advanceTimersByTimeAsync(1_000)
+    controller.abort()
+    expect(await pending).toBe(PUBLICKEY_REFUSAL)
+    expect(inner.calls).toHaveLength(1)
+  })
+
+  test("attempts: 1 disables the publickey retry", async () => {
+    const inner = scripted([PUBLICKEY_REFUSAL, OK])
+    const result = await withStallRetry(inner, { attempts: 1 }).run(req(["fetch", "origin"]))
+    expect(result).toBe(PUBLICKEY_REFUSAL)
+    expect(inner.calls).toHaveLength(1)
+  })
+
+  test.each([
+    ["exit 128", { code: 128, stdout: "", stderr: "fatal: broken config" }],
+    ["timeout", { code: 1, stdout: "", stderr: "", timedOut: true }],
+  ] as const)("returns the first refusal and announces an SSH config %s", async (_name, config) => {
+    const announced = vi.spyOn(console, "error").mockImplementation(() => {})
+    const inner = scripted([PUBLICKEY_REFUSAL, OK], config)
+    const result = await withStallRetry(inner).run(req(["fetch", "origin"]))
+    expect(result).toBe(PUBLICKEY_REFUSAL)
+    expect(inner.calls.map((call) => call.args.join(" "))).toEqual(["fetch origin", "config --get core.sshCommand"])
+    expect(announced.mock.calls[0]?.[0]).toContain("cannot read core.sshCommand")
+  })
+
   test("reads core.sshCommand and retries with its identity flags intact", async () => {
     vi.useFakeTimers()
     const announced = vi.spyOn(console, "error").mockImplementation(() => {})
