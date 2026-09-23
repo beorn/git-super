@@ -1,6 +1,6 @@
 {
   "name": "git-super",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Git commands that treat superprojects and submodule interiors as one product",
   "license": "MIT",
   "repository": "github:beorn/git-super",
@@ -100,6 +100,7 @@
     "@bearly/flock": "0.1.0",
     "@silvery/command": "0.23.2",
     "@silvery/commander": "0.23.2",
+    "gitomic": "^0.2.0",
     "loggily": "^0.10.2",
     "react": "19.2.0",
     "silvery": "0.23.2"
@@ -131,7 +132,8 @@
       "src/submodule-origin.ts",
       "src/worktree.ts"
     ],
-    "format": "esm"
+    "format": "esm",
+    "target": "es2022"
   },
   "engines": {
     "bun": ">=1.3.14"
