@@ -1269,11 +1269,11 @@ async function composeDivergedGitlinks(
         ),
       }
     }
-    if (incomingContainsCurrent)
-      {settledResolutions.push({ kind: "pin", path: resolution.path, sha: resolution.incomingSha })}
-    else if (currentContainsIncoming)
-      {settledResolutions.push({ kind: "pin", path: resolution.path, sha: resolution.currentSha })}
-    else settledResolutions.push(resolution)
+    if (incomingContainsCurrent) {
+      settledResolutions.push({ kind: "pin", path: resolution.path, sha: resolution.incomingSha })
+    } else if (currentContainsIncoming) {
+      settledResolutions.push({ kind: "pin", path: resolution.path, sha: resolution.currentSha })
+    } else settledResolutions.push(resolution)
   }
   const settled = { ...plan, resolutions: settledResolutions }
 
