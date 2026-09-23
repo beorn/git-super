@@ -9,7 +9,7 @@ import { afterEach, describe, expect, it } from "vitest"
 import { runCli } from "../src/cli.ts"
 import { superPush } from "../src/push.ts"
 import { decodePushIntent, PUSH_INTENT_TRAILER } from "../src/push-intent.ts"
-import { superMerge } from "../src/merge.ts"
+import { SUPER_MERGE_STEPS, superMerge } from "../src/merge.ts"
 import { createLocalGitProcess, type GitProcess } from "../src/process.ts"
 import type { GitResultDetail } from "../src/result.ts"
 import {
@@ -2646,5 +2646,125 @@ describe("git super merge — the root's child mains are fetched together (25303
     expect(result).toMatchObject({ state: "failed", detail: { code: "submodule-main-unreadable" } })
     expect(result.detail?.paths).toEqual(["packages/alpha"])
     expect(git(fixture.product, "rev-parse", "HEAD")).toBe(headBefore)
+  })
+})
+
+/**
+ * @failure A root merge's phases run with no timing evidence, so its caller's journal is silent across the whole call.
+ * @level l1
+ * @consumer Yrd's compose journal rows (@i/10-yrd/25303 tier 2)
+ */
+describe("git super merge — each phase reports how long it took (25303 tier 2)", () => {
+  /**
+   * The phases cover the whole call, so their sum is the call's wall time. The
+   * slack is timer noise: eight values rounded to whole ms, plus the await
+   * between the last phase closing and the caller's clock reading. A phase
+   * that goes unnamed opens a gap far larger than this.
+   */
+  const SUM_SLACK_MS = 25
+
+  async function timedMerge(options: Parameters<typeof superMerge>[0]) {
+    const started = performance.now()
+    const result = await superMerge(options)
+    return { result, wall: performance.now() - started }
+  }
+
+  function expectCovers(steps: readonly { name: string; ms: number }[] | undefined, wall: number): void {
+    expect(steps).toBeDefined()
+    for (const step of steps ?? []) expect(Number.isInteger(step.ms) && step.ms >= 0, JSON.stringify(step)).toBe(true)
+    const sum = (steps ?? []).reduce((total, step) => total + step.ms, 0)
+    expect(Math.abs(wall - sum), `wall ${wall.toFixed(1)} ms, steps sum ${sum} ms`).toBeLessThanOrEqual(SUM_SLACK_MS)
+  }
+
+  it("names all eight phases of a pin-moving merge, in order, summing to the call's wall time", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-steps-raise-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const newestAlpha = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 'stepped'\n")
+    const candidate = candidateWithRootChange(fixture, "candidate-steps")
+    // The call's first and last git commands (finding the root, publishing the
+    // receipt) are slowed, so time left outside every step at either edge is
+    // far larger than the slack.
+    const local = createLocalGitProcess()
+    const edges: string[] = []
+    let calls = 0
+    const slowEdges: GitProcess = {
+      run: async (request) => {
+        const first = calls++ === 0
+        const receipt = request.args[0] === "update-ref" && request.args[1]?.startsWith("refs/git-super/receipts/")
+        if (first || receipt === true) {
+          edges.push(request.args.slice(0, 2).join(" "))
+          await new Promise((resolve) => setTimeout(resolve, 150))
+        }
+        return local.run(request)
+      },
+    }
+
+    const { result, wall } = await timedMerge({ repo: fixture.product, commit: candidate, git: slowEdges })
+
+    expect(result).toMatchObject({
+      state: "updated",
+      gitlinks: [expect.objectContaining({ path: "packages/alpha", to: newestAlpha, state: "raised" })],
+    })
+    expect(edges).toEqual([
+      "rev-parse --show-toplevel",
+      expect.stringMatching(/^update-ref refs\/git-super\/receipts\//u),
+    ])
+    expect(result.steps?.map((step) => step.name)).toEqual([...SUPER_MERGE_STEPS])
+    expectCovers(result.steps, wall)
+  })
+
+  it("puts a slow merge-tree's time on the merge-tree step, not on a neighbour", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-steps-slow-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 'slow'\n")
+    const candidate = candidateWithRootChange(fixture, "candidate-steps-slow")
+    const local = createLocalGitProcess()
+    const slowed: GitProcess = {
+      run: async (request) => {
+        if (request.args.includes("merge-tree")) await new Promise((resolve) => setTimeout(resolve, 400))
+        return local.run(request)
+      },
+    }
+
+    const { result, wall } = await timedMerge({ repo: fixture.product, commit: candidate, git: slowed })
+
+    expect(result).toMatchObject({ state: "updated" })
+    const mergeTree = result.steps?.find((step) => step.name === "merge-tree")
+    expect(mergeTree?.ms).toBeGreaterThanOrEqual(400)
+    for (const step of result.steps ?? []) {
+      if (step.name !== "merge-tree") expect(step.ms, step.name).toBeLessThan(400)
+    }
+    expectCovers(result.steps, wall)
+  })
+
+  it("ends a refused merge on the phase that refused it, in the --json result too", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-steps-refused-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 'competing'\n")
+    const alpha = join(fixture.product, "packages/alpha")
+    git(fixture.product, "switch", "-q", "-c", "candidate-steps-off-main")
+    writeFileSync(join(alpha, "alpha.ts"), "export const alpha = 'unpushed'\n")
+    git(alpha, "add", "alpha.ts")
+    git(alpha, "commit", "-q", "-m", "advance alpha off main")
+    git(fixture.product, "add", "packages/alpha")
+    git(fixture.product, "commit", "-q", "-m", "pin unpublished alpha")
+    const candidate = git(fixture.product, "rev-parse", "HEAD")
+    git(fixture.product, "switch", "-q", "main")
+    git(alpha, "switch", "-q", "--detach", fixture.alphaBase)
+
+    const { result, wall } = await timedMerge({ repo: fixture.product, commit: candidate })
+
+    expect(result).toMatchObject({ state: "failed", detail: { code: "gitlink-off-main" } })
+    expect(result.steps?.map((step) => step.name)).toEqual(["preflight", "merge-tree", "plan"])
+    expectCovers(result.steps, wall)
+
+    const stdout = outputSink()
+    const stderr = outputSink()
+    expect(await runCli(["--repo", fixture.product, "--json", "merge", candidate], stdout, stderr)).toBe(1)
+    const printed = JSON.parse(stdout.output) as { steps: readonly { name: string }[] }
+    expect(printed.steps.map((step) => step.name)).toEqual(["preflight", "merge-tree", "plan"])
   })
 })

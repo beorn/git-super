@@ -105,10 +105,50 @@ export type SuperMergeDescentResult = Readonly<{
   children: readonly SuperMergeDescentChildResult[]
 }>
 
+/**
+ * The merge's phases, in the order they run. They never overlap, and together
+ * they cover the whole `superMerge` call, so the `ms` of the steps a result
+ * carries sum to the call's wall time. The list is closed: a new phase is a new
+ * name here, never time left out of every step.
+ */
+export const SUPER_MERGE_STEPS = [
+  /**
+   * Discovering the root, taking the worktree lock (including any wait for it),
+   * the clean-worktree status, HEAD and target resolution, and the proof that a
+   * merge is needed.
+   */
+  "preflight",
+  /** The prospective `merge-tree`, plus composing any diverged gitlinks it conflicts on. */
+  "merge-tree",
+  /** Classifying every gitlink against its submodule main: child-main fetches and the nested descent. */
+  "plan",
+  /** The Settled trailers and the frozen `Git-Super-Push:` publication inputs. */
+  "capture",
+  /** Preparing affected submodule checkouts and proving the worktree clean. */
+  "checkouts",
+  /** The native no-ff merge and the proved gitlink raises. */
+  "merge",
+  /** Checking affected submodules out at their staged pins. */
+  "settle",
+  /** The concluding commit, its hooks, and the root receipt. */
+  "commit",
+] as const
+
+export type SuperMergeStepName = (typeof SUPER_MERGE_STEPS)[number]
+
+/** How long one phase of the merge took. */
+export type SuperMergeStepResult = Readonly<{ name: SuperMergeStepName; ms: number }>
+
 export type SuperMergeResult = GitSuperResult &
   Readonly<{
     commit?: string
     gitlinks: readonly SuperMergeGitlinkResult[]
+    /**
+     * Additive timing evidence: one row per phase that ran, in the order it
+     * ran. A merge that stops early ends on the phase that stopped it. Optional
+     * because an older git-super does not write it; this one always does.
+     */
+    steps?: readonly SuperMergeStepResult[]
     /** Additive recovery evidence for submodule checkouts touched by a merge. */
     checkouts?: readonly SuperMergeCheckoutResult[]
     /**
@@ -162,6 +202,13 @@ const DEFAULT_GIT_TIMEOUT_MS = 30_000
 const OBJECT_ID = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/u
 
 export async function superMerge(options: SuperMergeOptions): Promise<SuperMergeResult> {
+  const steps = createStepClock()
+  steps.begin("preflight")
+  const result = await mergeWithSteps(options, steps)
+  return { ...result, steps: steps.finish() }
+}
+
+async function mergeWithSteps(options: SuperMergeOptions, steps: StepClock): Promise<SuperMergeResult> {
   const git = options.git ?? createLocalGitProcess()
   const timeoutMs = options.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS
   const fallbackRoot = resolve(options.repo)
@@ -174,11 +221,39 @@ export async function superMerge(options: SuperMergeOptions): Promise<SuperMerge
 
   try {
     const exclusive = options.exclusive ?? createExclusive(await lockDirectory(git, root, timeoutMs))
-    return await exclusive.run(() => mergeUnderLock(git, root, options, timeoutMs), {
+    return await exclusive.run(() => mergeUnderLock(git, root, options, timeoutMs, steps), {
       holder: "git super merge",
     })
   } catch (error) {
     return failed(root, [], resultError(error, "merge"))
+  }
+}
+
+type StepClock = Readonly<{
+  /** Close the phase that is running, if any, and start `name`. */
+  begin(name: SuperMergeStepName): void
+  /** Close the phase that is running and return every phase in order. */
+  finish(): SuperMergeStepResult[]
+}>
+
+function createStepClock(): StepClock {
+  const now = () => performance.now()
+  const done: SuperMergeStepResult[] = []
+  let running: { name: SuperMergeStepName; start: number } | undefined
+  const close = () => {
+    if (running === undefined) return
+    done.push({ name: running.name, ms: Math.max(0, Math.round(now() - running.start)) })
+    running = undefined
+  }
+  return {
+    begin(name) {
+      close()
+      running = { name, start: now() }
+    },
+    finish() {
+      close()
+      return [...done]
+    },
   }
 }
 
@@ -187,6 +262,7 @@ async function mergeUnderLock(
   root: string,
   options: SuperMergeOptions,
   timeoutMs: number,
+  steps: StepClock,
 ): Promise<SuperMergeResult> {
   const statusArgs = ["status", "--porcelain=v1", "-z", "--untracked-files=all"]
   const status = await run(git, root, statusArgs, timeoutMs)
@@ -235,6 +311,7 @@ async function mergeUnderLock(
       ),
     )
   }
+  steps.begin("merge-tree")
   const prospective = await prospectiveTree(git, root, head, target, timeoutMs)
   /**
    * COMPOSE A DIVERGED GITLINK RATHER THAN BOUNCING IT (24951).
@@ -261,6 +338,7 @@ async function mergeUnderLock(
     tree = prospective.tree
   }
 
+  steps.begin("plan")
   let planned: GitlinkPlans
   try {
     planned = await planGitlinks(git, root, head, tree, timeoutMs)
@@ -297,6 +375,7 @@ async function mergeUnderLock(
     return { ...plan, composition: composition.evidence, state: "merged" }
   })
 
+  steps.begin("capture")
   const requestedMessage = options.message ?? `Merge ${target.slice(0, 12)} into ${head.slice(0, 12)}`
   const trailers = visiblePlans.map((plan) =>
     plan.state === "raised"
@@ -352,6 +431,7 @@ async function mergeUnderLock(
     settledMessage = trailerResult.stdout
   }
 
+  steps.begin("checkouts")
   const prepared = await prepareSubmoduleCheckouts(git, root, planned.checkouts, timeoutMs)
   if ("failure" in prepared) return failed(root, [], prepared.failure, prepared.rows)
   const preparedCheckouts = prepared.checkouts
@@ -366,6 +446,7 @@ async function mergeUnderLock(
   )
   if (statusFailure !== undefined) return failed(root, [], statusFailure, preparedRows)
 
+  steps.begin("merge")
   // Interim for alternate-backed worktree modules: Git 2.55 can treat a split
   // commit-graph read failure as a submodule conflict. Keep this on both the
   // preflight and application paths until the minimal reproduction below no
@@ -430,6 +511,7 @@ async function mergeUnderLock(
     completed.push({ ...raise })
   }
 
+  steps.begin("settle")
   const settledCheckouts = await settleSubmoduleCheckouts(git, root, preparedCheckouts, timeoutMs)
   if (settledCheckouts.failure !== undefined) {
     const restored = await restoreSubmoduleCheckouts(git, root, preparedCheckouts, settledCheckouts.rows, timeoutMs)
@@ -466,6 +548,7 @@ async function mergeUnderLock(
     )
   }
 
+  steps.begin("commit")
   const commitArgs = ["commit", ...(options.noVerify === true ? ["--no-verify"] : []), "-F", "-"]
   const committed = await run(git, root, commitArgs, timeoutMs, settledMessage)
   if (committed.code !== 0) {
