@@ -105,6 +105,8 @@ function spawnPull(w: World) {
   })
 }
 
+// Each test drives real signals through git, and the backstop test waits out a 4 s backstop: all run past this
+// package's 5 s default timeout, so each names its own.
 describe("git super pull: the apply is not stopped by a signal (24907 row 2)", () => {
   test("SIGTERM to the top pid mid-apply: the apply finishes, then the pull exits for it", async () => {
     const w = world("sigterm", { "reference-transaction": HOLD_ROOT_MERGE, "post-merge": RECORD_POST_MERGE })
@@ -121,7 +123,7 @@ describe("git super pull: the apply is not stopped by a signal (24907 row 2)", (
       deferredSignal: { signal: "SIGTERM", phase: "apply-root" },
     })
     expectWhole(w)
-  })
+  }, 30_000)
 
   test("SIGINT to the process group mid-apply (a terminal's Ctrl-C): the apply finishes, then the pull exits", async () => {
     const w = world("sigint", { "reference-transaction": HOLD_ROOT_MERGE, "post-merge": RECORD_POST_MERGE })
@@ -134,7 +136,7 @@ describe("git super pull: the apply is not stopped by a signal (24907 row 2)", (
     expect(stderr).toContain("git-super pull: deferring SIGINT until the apply completes (phase apply-root)")
     expect(JSON.parse(stdout)).toMatchObject({ state: "updated", deferredSignal: { signal: "SIGINT" } })
     expectWhole(w)
-  })
+  }, 30_000)
 
   test("the backstop kills every process of the pull, a group it knows only from the record included, and the next pull proceeds", async () => {
     // A post-merge hook that never ends: the backstop's case. It runs in its own group (the apply's), so only the
@@ -190,7 +192,7 @@ describe("git super pull: the apply is not stopped by a signal (24907 row 2)", (
     const next = await runCli(["--repo", w.checkout, "pull", "--ff-only", "origin", "main", "--json"], stdout, stderr)
     expect(next, stderr.output).toBe(0)
     expect(JSON.parse(stdout.output)).toMatchObject({ state: "unchanged" })
-  })
+  }, 30_000)
 
   test("a failing post-merge hook leaves the pull applied, with a detail that says the hook failed", async () => {
     const w = world("hook-fails", { "post-merge": `${RECORD_POST_MERGE}\necho "deps repair failed" >&2\nexit 1` })
@@ -215,5 +217,5 @@ describe("git super pull: the apply is not stopped by a signal (24907 row 2)", (
     })
     expect((JSON.parse(stdout.output) as GitSuperResult).detail?.message).toContain("deps repair failed")
     expectWhole(w)
-  })
+  }, 30_000)
 })
