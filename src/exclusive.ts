@@ -16,6 +16,10 @@ export type ExclusiveOptions = Readonly<{
 
 export type WriterLock = Readonly<{ release(): void }>
 
+// A queue merge held this lock for over 53 s and made submit fail at 30 s;
+// post-merge test 825324 also lost a worktree add after 30,006 ms.
+export const DEFAULT_MUTATION_LOCK_WAIT_MS = 5 * 60_000
+
 /**
  * Acquire the repository-scoped writer lock used by both the former Yrd store
  * and git-super. Keeping `<common-dir>/yrd-worktree-mutations/writer.lock`

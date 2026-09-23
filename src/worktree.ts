@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process"
 import { appendFile } from "node:fs/promises"
 import { isAbsolute, join, relative, resolve, sep } from "node:path"
 import { fileURLToPath } from "node:url"
-import { createExclusive } from "./exclusive.ts"
+import { createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS } from "./exclusive.ts"
 import { retainWorktreeModules, type WorktreeRetention } from "./worktree-removal.ts"
 import { cleanGitEnvironment } from "./git.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
@@ -24,6 +24,8 @@ export type GitWorktreeStoreOptions = Readonly<{
   env?: NodeJS.ProcessEnv
   signal?: AbortSignal
   timeouts?: Partial<GitWorktreeTimeouts>
+  /** Reports writer-lock contention without writing to stderr from the library. */
+  report?: (line: string) => void
 }>
 
 export type GitWorktreeTimeouts = Readonly<{
@@ -272,7 +274,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
   const timeouts: GitWorktreeTimeouts = {
     operation: options.timeouts?.operation ?? GIT_TIMEOUT_MS,
     cleanup: options.timeouts?.cleanup ?? GIT_CLEANUP_TIMEOUT_MS,
-    mutationLock: options.timeouts?.mutationLock ?? GIT_TIMEOUT_MS,
+    mutationLock: options.timeouts?.mutationLock ?? DEFAULT_MUTATION_LOCK_WAIT_MS,
   }
   // Still checked at run time: TypeScript cannot speak for a JavaScript caller,
   // and a missing capability must fail here rather than as a null dereference
@@ -289,6 +291,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       if (commonDir === "") throw new Error("git rev-parse returned an empty common directory")
       const lock = createExclusive(join(commonDir, "yrd-worktree-mutations"), {
         timeoutMs: timeouts.mutationLock,
+        onContended: (holder) => options.report?.(`git-super worktree: waiting for writer lock held by ${holder}\n`),
       })
       if (needsConfigHealing) {
         await lock.run(() => healPoisonedWorktreeConfig(git, repo), { holder: "worktree configuration repair" })
