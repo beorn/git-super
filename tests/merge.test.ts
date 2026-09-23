@@ -10,7 +10,7 @@ import { runCli } from "../src/cli.ts"
 import { superPush } from "../src/push.ts"
 import { decodePushIntent, PUSH_INTENT_TRAILER } from "../src/push-intent.ts"
 import { superMerge } from "../src/merge.ts"
-import { createLocalGitProcess } from "../src/process.ts"
+import { createLocalGitProcess, type GitProcess } from "../src/process.ts"
 import type { GitResultDetail } from "../src/result.ts"
 import {
   addNestedAlphaSubmodule,
@@ -2567,5 +2567,84 @@ describe("git super merge — a diverged gitlink the merge composes", () => {
     expect(result).toMatchObject({ state: "failed", partial: false, detail: { code: "gitlink-compose-refused" } })
     expect(result.detail?.message).toContain("could not be fetched")
     expect(result.detail?.paths).toEqual(["packages/alpha"])
+  })
+})
+
+describe("git super merge — the root's child mains are fetched together (25303 f2)", () => {
+  /** The descent's own read of one child's main: `fetch --no-tags origin +refs/heads/<branch>:...`. */
+  const isMainFetch = (args: readonly string[]): boolean =>
+    args[0] === "fetch" && args[1] === "--no-tags" && args.some((arg) => arg.startsWith("+refs/heads/"))
+
+  it("has both children's main fetches in flight at once, where the walk used to hold one", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-f2-overlap-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const candidate = candidateWithRootChange(fixture, "candidate-overlap")
+    const local = createLocalGitProcess()
+    let inFlight = 0
+    let maxInFlight = 0
+    let fetches = 0
+    let release: () => void = () => undefined
+    const bothStarted = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const recording: GitProcess = {
+      run: async (request) => {
+        if (!isMainFetch(request.args)) return local.run(request)
+        fetches += 1
+        maxInFlight = Math.max(maxInFlight, ++inFlight)
+        if (inFlight >= 2) release()
+        // A one-at-a-time walk never starts the second fetch, so the wait is bounded.
+        await Promise.race([bothStarted, new Promise((resolve) => setTimeout(resolve, 1_000))])
+        try {
+          return await local.run(request)
+        } finally {
+          inFlight -= 1
+        }
+      },
+    }
+
+    const result = await superMerge({ repo: fixture.product, commit: candidate, git: recording })
+
+    expect(result).toMatchObject({ state: "updated" })
+    expect(fetches).toBe(2)
+    expect(maxInFlight).toBe(2)
+  })
+
+  it("still refuses at the first child in entry order when a later child's fetch fails first", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-f2-order-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const candidate = candidateWithRootChange(fixture, "candidate-order")
+    for (const path of ["packages/alpha", "vendor/beta"]) {
+      git(fixture.product, "config", `submodule.${path}.branch`, "main")
+      git(
+        join(fixture.product, path),
+        "remote",
+        "set-url",
+        "origin",
+        join(fixtureRoot, `missing-${path.replace("/", "-")}`),
+      )
+    }
+    const headBefore = git(fixture.product, "rev-parse", "HEAD")
+    const local = createLocalGitProcess()
+    const finished: string[] = []
+    const recording: GitProcess = {
+      run: async (request) => {
+        if (!isMainFetch(request.args)) return local.run(request)
+        // Alpha comes first in entry order, so it is made to fail LAST in time.
+        if (request.repo.endsWith("packages/alpha")) await new Promise((resolve) => setTimeout(resolve, 300))
+        const result = await local.run(request)
+        finished.push(request.repo.endsWith("packages/alpha") ? "packages/alpha" : "vendor/beta")
+        return result
+      },
+    }
+
+    const result = await superMerge({ repo: fixture.product, commit: candidate, git: recording })
+
+    expect(finished).toEqual(["vendor/beta", "packages/alpha"])
+    expect(result).toMatchObject({ state: "failed", detail: { code: "submodule-main-unreadable" } })
+    expect(result.detail?.paths).toEqual(["packages/alpha"])
+    expect(git(fixture.product, "rev-parse", "HEAD")).toBe(headBefore)
   })
 })

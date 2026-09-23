@@ -220,6 +220,17 @@ export async function readCommitGitlinks(
   return (await readCommitSubmodules(git, repository, commit)).map(({ path, target }) => ({ path, target }))
 }
 
+/**
+ * The gitlinks `after` adds or moves relative to `before`. This is the ONE
+ * changed-set rule: the push's planner and its publisher both ask it, so the
+ * work a push does is the K gitlinks that moved, never every child a merge
+ * froze (25303).
+ */
+export function changedGitlinks(before: readonly CommitGitlink[], after: readonly CommitGitlink[]): CommitGitlink[] {
+  const recorded = new Map(before.map((entry) => [entry.path, entry.target]))
+  return after.filter((entry) => recorded.get(entry.path) !== entry.target)
+}
+
 /** Return only gitlinks added or advanced by `head`, using exact commit trees. */
 export async function changedCommitGitlinks(
   git: GitProcess,
@@ -227,8 +238,10 @@ export async function changedCommitGitlinks(
   base: string,
   head: string,
 ): Promise<CommitGitlink[]> {
-  const before = new Map((await readCommitGitlinks(git, repository, base)).map((entry) => [entry.path, entry.target]))
-  return (await readCommitGitlinks(git, repository, head)).filter((entry) => before.get(entry.path) !== entry.target)
+  return changedGitlinks(
+    await readCommitGitlinks(git, repository, base),
+    await readCommitGitlinks(git, repository, head),
+  )
 }
 
 /** Resolve Git's read branch policy for GitSuper's additional forwarding use. */
