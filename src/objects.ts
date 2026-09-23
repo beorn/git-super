@@ -1,5 +1,13 @@
+import {
+  danglingRefs as gitomicDanglingRefs,
+  isMissingObjectFetchError,
+  type DanglingRef,
+  type GitResult,
+} from "gitomic"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
 import type { GitResultDetail } from "./result.ts"
+
+export { isMissingObjectFetchError, type DanglingRef }
 
 export type EnsureCommitObjectOptions = Readonly<{
   repository: string
@@ -90,60 +98,26 @@ export async function ensureCommitObject(options: EnsureCommitObjectOptions): Pr
   return "fetched"
 }
 
-function scanError(repository: string, args: readonly string[], result: GitProcessResult): Error {
-  const reason = result.timedOut
-    ? "timed out"
-    : result.failure !== undefined
-      ? `could not run: ${result.failure}`
-      : `failed (exit ${result.code})`
-  return new Error(
-    `git ${args.join(" ")} ${reason} in ${repository}${result.stderr ? `\n${result.stderr.trim()}` : ""}`,
-  )
-}
-
-/** One local ref whose object this repository no longer has. */
-export type DanglingRef = Readonly<{ ref: string; oid: string }>
-
 /**
- * Every local ref that names a missing object, from ONE `for-each-ref` and ONE
- * `cat-file --batch-check`. The explicit `for-each-ref` format reads no object,
- * so a packed ref whose object is gone is still listed; the default format reads
- * `%(objecttype)` and dies on it. `cat-file` is fed object ids only (a whole
- * "<oid> <ref>" line would be read as one object name) and answers one line per
- * id, in order, so the two lists pair by position.
- *
- * An empty result means scanned, none dangling. A scan that cannot run throws
- * with git's text, never an empty list that would read as a clean repository.
+ * Compatibility adapter for git-super's published process-first API. Gitomic
+ * owns the scan and parser; this wrapper only translates the existing process
+ * result into Gitomic's function-local command seam.
  */
 export async function danglingRefs(git: GitProcess, repository: string): Promise<readonly DanglingRef[]> {
-  const listArgs = ["for-each-ref", "--format=%(objectname) %(refname)"] as const
-  const listed = await git.run({ repo: repository, args: listArgs, timeoutMs: DEFAULT_GIT_TIMEOUT_MS })
-  if (listed.timedOut || listed.failure !== undefined || listed.code !== 0) {
-    throw scanError(repository, listArgs, listed)
-  }
-  const refs = listed.stdout
-    .split("\n")
-    .filter(Boolean)
-    .map((line) => {
-      const space = line.indexOf(" ")
-      return { oid: line.slice(0, space), ref: line.slice(space + 1) }
-    })
-  if (refs.length === 0) return []
-  const checkArgs = ["cat-file", "--batch-check=%(objectname) %(objecttype)"] as const
-  const checked = await git.run({
-    repo: repository,
-    args: checkArgs,
-    stdin: `${refs.map(({ oid }) => oid).join("\n")}\n`,
-    timeoutMs: DEFAULT_GIT_TIMEOUT_MS,
+  return gitomicDanglingRefs(repository, {
+    run: async (args, options): Promise<GitResult> => {
+      const processArgs = args[0] === "-C" ? args.slice(2) : args
+      const result = await git.run({
+        repo: repository,
+        args: processArgs,
+        ...(options?.input === undefined ? {} : { stdin: options.input.toString() }),
+        ...(options?.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+      })
+      return {
+        code: result.code,
+        stderr: Buffer.from(result.failure ?? result.stderr),
+        stdout: Buffer.from(result.stdout),
+      }
+    },
   })
-  if (checked.timedOut || checked.failure !== undefined || checked.code !== 0) {
-    throw scanError(repository, checkArgs, checked)
-  }
-  const answers = checked.stdout.split("\n").filter(Boolean)
-  if (answers.length !== refs.length) {
-    throw new Error(
-      `git cat-file --batch-check answered ${answers.length} lines for ${refs.length} refs in ${repository}`,
-    )
-  }
-  return refs.filter(({ oid }, index) => answers[index] === `${oid} missing`)
 }
