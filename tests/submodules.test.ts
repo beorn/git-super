@@ -2,7 +2,7 @@
  * @failure Worktree consumers can fall back to divergent submodule materializers or serialize sibling clones.
  * @level l1
  * @consumer Yrd, Bearly, and hh worktree adapters
- * @reach fs-walk <fixture-only: every case builds an mkdtemp(join(tmpdir(), ...)) reference/worktree fixture; `spans.named("walk")` asserts on an internal tracing span name for th...>
+ * @reach fs-walk <fixture-only: every case builds mkdtemp(tmpdir()) reference/worktree fixture>
  */
 import { existsSync, readFileSync, writeFileSync } from "node:fs"
 import { mkdir, mkdtemp, rm } from "node:fs/promises"

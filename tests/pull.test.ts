@@ -1,5 +1,5 @@
 /**
- * @reach fs-walk <fixture-only: every case builds a mkdtempSync(join(tmpdir(), ...)) fixture repo; import.meta.url is only used to locate the git-super binary to spawn, not to wal...>
+ * @reach fs-walk <fixture-only: every case builds its own mkdtempSync(tmpdir()) fixture repo>
  */
 import { afterEach, describe, expect, test, vi } from "vitest"
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
