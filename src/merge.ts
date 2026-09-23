@@ -12,6 +12,7 @@ import {
 } from "./composition.ts"
 import { ensureCommitObject, pinRef } from "./objects.ts"
 import { prepareSubmoduleTreeUnderLock } from "./submodule-prepare.ts"
+import { mapInOrder } from "./map-in-order.ts"
 import { capturePushIntent, discoverRepository, rootPushIdentity } from "./push.ts"
 import { PUSH_INTENT_TRAILER, sameHostedOwner } from "./push-intent.ts"
 import { createExclusive, type Exclusive } from "./exclusive.ts"
@@ -1652,7 +1653,31 @@ async function planGitlinks(
             (entry) => [entry.path, entry.target] as const,
           ),
     )
-    for (const entry of await readCommitSubmodules(git, repository, commit)) {
+    const entries = await readCommitSubmodules(git, repository, commit)
+    // THE ROOT'S CHILD MAINS ARE FETCHED TOGETHER, AT MOST FOUR AT A TIME (25303 f2).
+    // One sequential fetch per owned child cost 4-6 s per compose on the garage
+    // (15 children, twice per merge). Each child fetches into its own store, so
+    // the fetches cannot interfere. Every outcome is kept and consumed below in
+    // entry order, so a failed fetch throws at the same child it always did.
+    // Nested rungs are rare (one Ahead parent) and keep the sequential fetch.
+    const prefetched = new Map<string, { ok: true; main: string } | { ok: false; error: unknown }>()
+    if (!nested) {
+      const owned = entries.filter((entry) => entry.url !== undefined && sameHostedOwner(rootRemote, entry.url))
+      const outcomes = await mapInOrder(owned, MAIN_FETCH_CONCURRENCY, (entry) =>
+        fetchSubmoduleMain(
+          git,
+          repository,
+          stores.get(entry.path) ?? join(repository, entry.path),
+          entry,
+          timeoutMs,
+        ).then(
+          (main) => ({ ok: true as const, main }),
+          (error: unknown) => ({ ok: false as const, error }),
+        ),
+      )
+      owned.forEach((entry, index) => prefetched.set(entry.path, outcomes[index] as (typeof outcomes)[number]))
+    }
+    for (const entry of entries) {
       const path = nested ? `${prefix}/${entry.path}` : entry.path
       const submodule = nested
         ? await discoverRepository(git, join(repository, entry.path), "discover-nested-submodule", true)
@@ -1684,7 +1709,9 @@ async function planGitlinks(
       }
       // The superproject is the PARENT, not the root: `submodule.<name>.branch`
       // for a nested gitlink is declared in its parent component, not in km.
-      const main = await fetchSubmoduleMain(git, repository, submodule, entry, timeoutMs)
+      const fetched = prefetched.get(entry.path)
+      if (fetched?.ok === false) throw fetched.error
+      const main = fetched?.main ?? (await fetchSubmoduleMain(git, repository, submodule, entry, timeoutMs))
       if (entry.target === main) {
         // EQUAL to its own main, and still checked for a lowering (@cto N1).
         // A nested pin equal to its own main can fail to descend from what the
@@ -1837,6 +1864,9 @@ async function mergeApplicationFailure(
   const commit = observed.code === 0 && observed.stdout.trim() !== head ? observed.stdout.trim() : undefined
   return changed ? partial(root, commit, [], detail) : failed(root, [], detail)
 }
+
+/** At most this many child mains are fetched at once; the cap push's plan reads use. */
+const MAIN_FETCH_CONCURRENCY = 4
 
 async function fetchSubmoduleMain(
   git: GitProcess,
