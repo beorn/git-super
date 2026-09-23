@@ -170,10 +170,34 @@ const STALL_ATTEMPTS = 3
 
 /** Backoff before re-running a stalled read. Short: the caller holds a deadline. */
 const STALL_BACKOFF_MS = 250
+const PUBLICKEY_BACKOFF_MS = 3_000
 
 export function isRetryableRead(args: readonly string[]): boolean {
   const verb = args.find((arg) => !arg.startsWith("-"))
   return verb !== undefined && RETRYABLE_READ_ONLY.has(verb)
+}
+
+/** OpenSSH's exact publickey refusal line, distinct from other exit-128 failures. */
+export function isExactPublickeyRefusal(result: Pick<GitProcessResult, "code" | "stderr">): boolean {
+  return (
+    result.code !== 0 &&
+    result.stderr.split(/\r?\n/u).some((line) => /^(?:\S+: )?Permission denied \(publickey\)\.$/u.test(line))
+  )
+}
+
+function waitForReadRetry(ms: number, signal: AbortSignal | undefined): Promise<boolean> {
+  if (signal?.aborted) return Promise.resolve(false)
+  return new Promise((resolve) => {
+    const onAbort = () => {
+      clearTimeout(timer)
+      resolve(false)
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort)
+      resolve(true)
+    }, ms)
+    signal?.addEventListener("abort", onAbort, { once: true })
+  })
 }
 
 /**
@@ -186,28 +210,61 @@ export function isRetryableRead(args: readonly string[]): boolean {
 export type StallRetryOptions = Readonly<{ attempts?: 1 | 3 }>
 
 export function withStallRetry(inner: GitProcess, options: StallRetryOptions = {}): GitProcess {
+  return withReadRetry(inner, options, globalThis.process.env)
+}
+
+function withReadRetry(inner: GitProcess, options: StallRetryOptions, environment: NodeJS.ProcessEnv): GitProcess {
   const attempts = options.attempts ?? STALL_ATTEMPTS
   if (attempts !== 1 && attempts !== STALL_ATTEMPTS) throw new Error("Git read attempts must be 1 or 3.")
   return {
     async run(request) {
-      // Only a STALL is retried, never a non-zero exit: an exit code is git
-      // answering the question, and re-asking would paper over a real failure.
       if (!isRetryableRead(request.args)) return inner.run(request)
       let result = await inner.run(request)
-      for (let attempt = 2; result.timedOut === true && attempt <= attempts; attempt += 1) {
-        // NO SILENT ERRORS: a retry nobody can see turns a measurable stall
-        // rate into an invisible one, and this defect cost an evening precisely
-        // because the stalls were being read as something else.
-        console.error(
-          `git-super: ${request.args[0] ?? "git"} stalled after ${String(request.timeoutMs)}ms in ${request.repo}; ` +
-            `retry ${String(attempt)}/${String(attempts)}`,
-        )
-        await new Promise((resolve) => {
-          setTimeout(resolve, STALL_BACKOFF_MS)
-        })
-        result = await inner.run(request)
+      let stallAttempt = 1
+      let retriedPublickey = false
+      while (true) {
+        if (result.timedOut === true && stallAttempt < attempts) {
+          stallAttempt += 1
+          // NO SILENT ERRORS: a retry nobody can see turns a measurable stall
+          // rate into an invisible one, and this defect cost an evening precisely
+          // because the stalls were being read as something else.
+          console.error(
+            `git-super: ${request.args[0] ?? "git"} stalled after ${String(request.timeoutMs)}ms in ${request.repo}; ` +
+              `retry ${String(stallAttempt)}/${String(attempts)}`,
+          )
+          if (!(await waitForReadRetry(STALL_BACKOFF_MS, request.signal))) return result
+          result = await inner.run(request)
+          continue
+        }
+        if (
+          attempts > 1 &&
+          !retriedPublickey &&
+          result.failure === undefined &&
+          (result.signal === undefined || result.signal === null) &&
+          result.timedOut !== true &&
+          result.stalled !== true &&
+          isExactPublickeyRefusal(result)
+        ) {
+          retriedPublickey = true
+          console.error(
+            `git-super: git ${request.args.join(" ")} in ${request.repo}: Permission denied (publickey).; ` +
+              `retry 2/2 after ${String(PUBLICKEY_BACKOFF_MS)}ms with ssh -v`,
+          )
+          if (!(await waitForReadRetry(PUBLICKEY_BACKOFF_MS, request.signal))) return result
+          const ssh =
+            request.env?.GIT_SSH_COMMAND ??
+            environment.GIT_SSH_COMMAND ??
+            request.env?.GIT_SSH ??
+            environment.GIT_SSH ??
+            "ssh"
+          result = await inner.run({
+            ...request,
+            env: { ...request.env, GIT_SSH_COMMAND: `${ssh} -v` },
+          })
+          continue
+        }
+        return result
       }
-      return result
     },
   }
 }
@@ -350,5 +407,5 @@ export function createLocalGitProcess(
     }
   }
 
-  return withStallRetry({ run: runOnce }, options)
+  return withReadRetry({ run: runOnce }, options, baseEnvironment)
 }

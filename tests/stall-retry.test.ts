@@ -13,7 +13,7 @@
  */
 import { afterEach, describe, expect, test, vi } from "vitest"
 import type { GitProcess, GitProcessRequest, GitProcessResult } from "../src/process.ts"
-import { isRetryableRead, withStallRetry } from "../src/process.ts"
+import { isExactPublickeyRefusal, isRetryableRead, withStallRetry } from "../src/process.ts"
 
 /** A GitProcess that replays a scripted list of results and records its calls. */
 function scripted(results: readonly GitProcessResult[]): GitProcess & { calls: GitProcessRequest[] } {
@@ -33,10 +33,16 @@ function scripted(results: readonly GitProcessResult[]): GitProcess & { calls: G
 const STALL: GitProcessResult = { code: 143, stdout: "", stderr: "", timedOut: true }
 const OK: GitProcessResult = { code: 0, stdout: "abc123\trefs/heads/main", stderr: "" }
 const REAL_FAILURE: GitProcessResult = { code: 128, stdout: "", stderr: "fatal: repository not found" }
+const PUBLICKEY_REFUSAL: GitProcessResult = {
+  code: 128,
+  stdout: "",
+  stderr: "git@github.com: Permission denied (publickey).\nfatal: Could not read from remote repository.",
+}
 
 const req = (args: readonly string[]): GitProcessRequest => ({ repo: "/tmp/repo", args, timeoutMs: 1000 })
 
 afterEach(() => {
+  vi.useRealTimers()
   vi.restoreAllMocks()
 })
 
@@ -94,6 +100,55 @@ describe("withStallRetry", () => {
     expect(inner.calls).toHaveLength(1)
   })
 
+  // 25282: the first SSH refusal must be visible, then one read retry may
+  // recover. Existing stall-only coverage misses this settled exit-128 case.
+  test.each(["fetch", "ls-remote"])(
+    "announces one publickey retry for %s and captures the offered key",
+    async (verb) => {
+      vi.useFakeTimers()
+      const announced = vi.spyOn(console, "error").mockImplementation(() => {})
+      const inner = scripted([PUBLICKEY_REFUSAL, OK])
+      const original = req([verb, "origin"])
+      const request = { ...original, env: { GIT_SSH_COMMAND: "ssh -i /tmp/fleet-key -o IdentitiesOnly=yes" } }
+      const pending = withStallRetry(inner).run(request)
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect((await pending).code).toBe(0)
+      expect(inner.calls).toHaveLength(2)
+      expect(inner.calls[0]).toEqual(request)
+      expect(inner.calls[1]?.env?.GIT_SSH_COMMAND).toBe("ssh -i /tmp/fleet-key -o IdentitiesOnly=yes -v")
+      expect(announced).toHaveBeenCalledOnce()
+      expect(announced).toHaveBeenCalledWith(expect.stringContaining("Permission denied (publickey)."))
+    },
+  )
+
+  test("a second publickey refusal remains a failure after exactly one announced retry", async () => {
+    vi.useFakeTimers()
+    const announced = vi.spyOn(console, "error").mockImplementation(() => {})
+    const inner = scripted([PUBLICKEY_REFUSAL, PUBLICKEY_REFUSAL, OK])
+    const pending = withStallRetry(inner).run(req(["ls-remote", "origin"]))
+    await vi.advanceTimersByTimeAsync(5_000)
+    expect(await pending).toBe(PUBLICKEY_REFUSAL)
+    expect(inner.calls).toHaveLength(2)
+    expect(announced).toHaveBeenCalledOnce()
+  })
+
+  test("a publickey refusal on a write never retries", async () => {
+    const inner = scripted([PUBLICKEY_REFUSAL, OK])
+    expect(await withStallRetry(inner).run(req(["push", "origin", "main"]))).toBe(PUBLICKEY_REFUSAL)
+    expect(inner.calls).toHaveLength(1)
+  })
+
+  test.each([
+    { failure: "Git output capture is incomplete" },
+    { signal: "SIGTERM" },
+    { stalled: true },
+  ])("an incomplete publickey result never retries: %j", async (incomplete) => {
+    const first = { ...PUBLICKEY_REFUSAL, ...incomplete }
+    const inner = scripted([first, OK])
+    expect(await withStallRetry(inner).run(req(["fetch", "origin"]))).toBe(first)
+    expect(inner.calls).toHaveLength(1)
+  })
+
   test("passes a successful first call straight through", async () => {
     const inner = scripted([OK])
     await withStallRetry(inner).run(req(["ls-remote", "origin"]))
@@ -114,5 +169,17 @@ describe("isRetryableRead", () => {
     }
     expect(isRetryableRead([])).toBe(false)
     expect(isRetryableRead(["--all"])).toBe(false)
+  })
+})
+
+describe("isExactPublickeyRefusal", () => {
+  // 25282: an arbitrary exit 128 or explanatory prose mentioning the phrase
+  // must not be mistaken for OpenSSH's own exact refusal line.
+  test("accepts only a settled non-zero exit containing the exact SSH refusal line", () => {
+    expect(isExactPublickeyRefusal(PUBLICKEY_REFUSAL)).toBe(true)
+    expect(isExactPublickeyRefusal({ code: 128, stderr: "Permission denied (publickey).\n" })).toBe(true)
+    expect(isExactPublickeyRefusal({ code: 0, stderr: PUBLICKEY_REFUSAL.stderr })).toBe(false)
+    expect(isExactPublickeyRefusal(REAL_FAILURE)).toBe(false)
+    expect(isExactPublickeyRefusal({ code: 128, stderr: "fatal: Permission denied (publickey). maybe" })).toBe(false)
   })
 })

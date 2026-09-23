@@ -231,7 +231,7 @@ bun run typecheck
 - `src/objects.ts` is the exact-commit presence and fetch primitive shared by graph consumers.
 - `src/gitlink.ts` is the update-only index-pin writer. It validates the existing gitlink and target commit, writes under the shared mutation lock, and never checks out or chooses a target.
 - `src/merge.ts` preflights one no-ff merge, fetches submodule main refs, refuses incoming off-main pins, and settles proven-behind pins while preserving partial-write evidence.
-- `src/process.ts` is the public injected Git process capability. `src/result.ts` owns the shared repository/ref result vocabulary and how results aggregate.
+- `src/process.ts` is the public injected Git process capability. Its local process retries stalled `fetch` and `ls-remote` reads up to three attempts. An exact SSH `Permission denied (publickey).` refusal on one of those reads gets one announced retry after three seconds, with `ssh -v` on that second attempt so its stderr records the offered key. Other nonzero exits and writes are never retried. `src/result.ts` owns the shared repository/ref result vocabulary and how results aggregate.
 - `src/pull.ts` owns the fetch, freeze, check, recheck, and apply fast-forward operation.
 - `src/worktree-add.ts` composes the two write services: one detached `git worktree add` plus one recursive
   materialization, joined by the rollback that keeps them a single outcome.
@@ -244,4 +244,4 @@ The package depends only on published packages: `@bearly/flock`, `@silvery/comma
 
 Library consumers may import the root `git-super` surface, or `git-super/gitlink` for exact index-pin writes, `git-super/commit-graph` for frozen submodule descriptors, `git-super/objects` for exact-object loading, `git-super/submodule-origin` for remote resolution, `git-super/worktree` for injected worktree mechanics, and `git-super/submodules` for recursive materialization.
 
-**What this package deliberately does not decide:** worktree naming, leases, branch shapes, queue admission, retry policy, and lifecycle. Those are policy, they belong to the caller, and keeping them out is what lets one mechanics layer serve very different tools.
+**What this package deliberately does not decide:** worktree naming, leases, branch shapes, queue admission, queue-round retry policy, and lifecycle. Those belong to the caller. Yrd's separate one-time retry of a remote-class could-not-judge result re-judges the change in a later round; it does not replace or suppress the bounded Git read retries above. Both layers announce their retry, and a second refusal at the command layer remains a failure.
