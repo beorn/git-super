@@ -1288,7 +1288,8 @@ describe("git super merge", () => {
     expect(result).toMatchObject({ state: "failed", partial: false, detail: { code: "gitlink-compose-unavailable" } })
     const message = (result as { detail?: { message?: string } }).detail?.message ?? ""
     expect(message).toContain("fast-forward")
-    expect(message).toContain(ours)
+    // The probe that failed is the one reading ours, not merely a phrase naming it.
+    expect(message).toContain(`merge-base --is-ancestor ${ours} ${theirs}`)
     expect(git(fixture.product, "rev-parse", "HEAD")).toBe(headBefore)
   })
 
@@ -1324,6 +1325,52 @@ describe("git super merge", () => {
     expect(message).toContain(`${theirs} (theirs), which could not be fetched`)
     expect(message).not.toContain("diverged")
     expect(git(fixture.product, "rev-parse", "HEAD")).toBe(headBefore)
+  })
+
+  /**
+   * Containment alone is not a fast-forward: Git also needs the base pin to be
+   * an ancestor of current (review of 25280, @dev/review2). Here main REWINDS
+   * the pin below the base while the candidate advances from it, so theirs
+   * contains ours yet base is not an ancestor of ours. Pinning theirs would
+   * skip the composition that names the rewind and leave the checkout
+   * mid-merge; the pair must go back to its author as a named refusal.
+   */
+  it("sends a pin that main rewound back to its author instead of fast-forwarding past the rewind (25280)", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-rewound-current-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const rewound = git(fixture.alpha, "rev-parse", "HEAD")
+    const base = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 'base'\n")
+    const child = join(fixture.product, "packages/alpha")
+    git(child, "fetch", "-q", "origin")
+    git(child, "checkout", "-q", base)
+    git(fixture.product, "add", "packages/alpha")
+    git(fixture.product, "commit", "-q", "-m", "pin alpha at base")
+
+    const authoring = join(fixtureRoot, "alpha-authoring")
+    git(fixtureRoot, "clone", "-q", fixture.alpha, authoring)
+    const theirs = advanceRepository(authoring, "alpha.ts", "export const alpha = 'theirs'\n")
+    git(authoring, "push", "-q", "origin", `${theirs}:refs/git-super/pins/${theirs}`)
+    git(fixture.product, "switch", "-q", "-c", "candidate-over-a-rewind")
+    git(fixture.product, "update-index", "--add", "--cacheinfo", `160000,${theirs},packages/alpha`)
+    git(fixture.product, "commit", "-q", "-m", "pin alpha at theirs")
+    const candidate = git(fixture.product, "rev-parse", "HEAD")
+
+    git(fixture.product, "switch", "-q", "main")
+    git(child, "checkout", "-q", rewound)
+    git(fixture.product, "add", "packages/alpha")
+    git(fixture.product, "commit", "-q", "-m", "rewind alpha below the base")
+    const headBefore = git(fixture.product, "rev-parse", "HEAD")
+    // POSITIVE CONTROL: theirs contains ours, and base does not reach ours.
+    git(child, "fetch", "-q", "origin", `refs/git-super/pins/${theirs}`)
+    expect(() => git(child, "merge-base", "--is-ancestor", rewound, theirs)).not.toThrow()
+    expect(() => git(child, "merge-base", "--is-ancestor", base, rewound)).toThrow()
+
+    const result = await superMerge({ repo: fixture.product, commit: candidate })
+
+    expect(result).toMatchObject({ state: "failed", partial: false, detail: { code: "gitlink-compose-refused" } })
+    expect(git(fixture.product, "rev-parse", "HEAD")).toBe(headBefore)
+    expect(git(fixture.product, "status", "--porcelain=v1")).toBe("")
   })
 
   it.each([true, false])(

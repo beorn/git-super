@@ -1234,8 +1234,11 @@ async function composeDivergedGitlinks(
    * simply descends from the other. Composing such a pair makes the path gate
    * read the older side's own changes, which the newer side contains, as an
    * overlap: queue run q-20260923T145509635Z-1de06624 sent two ag
-   * fast-forwards back as "diverged; files overlap" this way. So a side that
-   * contains the other is a pin; only a true divergence is composed.
+   * fast-forwards back as "diverged; files overlap" this way. So incoming is
+   * a pin when base <= current <= incoming, which is Git's own fast-forward
+   * rule. A pair that fails either step stays a composition, and the
+   * composition names the rewind it cannot build on. Git already resolves
+   * "current contains incoming" before this runs, so there is no second pin.
    */
   const settledResolutions: SubmoduleResolution[] = []
   for (const resolution of plan.resolutions) {
@@ -1251,28 +1254,23 @@ async function composeDivergedGitlinks(
       resolution.incomingSha,
       timeoutMs,
     )
-    const currentContainsIncoming = await containsCommit(
-      git,
-      store,
-      resolution.incomingSha,
-      resolution.currentSha,
-      timeoutMs,
-    )
-    if (typeof incomingContainsCurrent === "string" || typeof currentContainsIncoming === "string") {
-      const detail = typeof incomingContainsCurrent === "string" ? incomingContainsCurrent : currentContainsIncoming
+    const currentContainsBase =
+      incomingContainsCurrent === true
+        ? await containsCommit(git, store, resolution.baseSha, resolution.currentSha, timeoutMs)
+        : false
+    if (typeof incomingContainsCurrent === "string" || typeof currentContainsBase === "string") {
+      const detail = typeof incomingContainsCurrent === "string" ? incomingContainsCurrent : currentContainsBase
       return {
         failure: composeUnavailable(
           root,
           [resolution.path],
-          `decide whether ${resolution.incomingSha} and ${resolution.currentSha} are a fast-forward`,
+          `decide whether ${resolution.incomingSha} fast-forwards ${resolution.currentSha} from base ${resolution.baseSha}`,
           String(detail),
         ),
       }
     }
-    if (incomingContainsCurrent) {
+    if (incomingContainsCurrent && currentContainsBase) {
       settledResolutions.push({ kind: "pin", path: resolution.path, sha: resolution.incomingSha })
-    } else if (currentContainsIncoming) {
-      settledResolutions.push({ kind: "pin", path: resolution.path, sha: resolution.currentSha })
     } else settledResolutions.push(resolution)
   }
   const settled = { ...plan, resolutions: settledResolutions }
