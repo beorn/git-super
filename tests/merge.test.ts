@@ -1211,6 +1211,86 @@ describe("git super merge", () => {
     expect(git(fixture.product, "status", "--porcelain=v1")).toBe("")
   })
 
+  /**
+   * @i/10-yrd/25280. The queue clone's submodule store holds OURS (main's pin)
+   * but has never seen THEIRS, which descends from ours and is published only
+   * as `refs/git-super/pins/<sha>`. Git cannot fast-forward a submodule whose
+   * commit is absent, so it hands git-super a three-stage gitlink conflict; the
+   * planner composed it, and the path gate then read ours' own changes (which
+   * theirs contains) as "gitlink …: diverged; files overlap". Queue run
+   * q-20260923T145509635Z-1de06624 sent two fast-forwards back this way.
+   */
+  it("fast-forwards a gitlink whose descendant pin the store has never seen (25280)", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-unseen-descendant-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const ours = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 'ours'\n")
+
+    // THEIRS descends from ours and reaches the remote ONLY as a pin ref.
+    const authoring = join(fixtureRoot, "alpha-authoring")
+    git(fixtureRoot, "clone", "-q", fixture.alpha, authoring)
+    const theirs = advanceRepository(authoring, "alpha.ts", "export const alpha = 'theirs'\n")
+    git(authoring, "push", "-q", "origin", `${theirs}:refs/git-super/pins/${theirs}`)
+
+    // The candidate forks at the base pin and moves it to theirs.
+    git(fixture.product, "switch", "-q", "-c", "candidate-unseen-descendant")
+    git(fixture.product, "update-index", "--add", "--cacheinfo", `160000,${theirs},packages/alpha`)
+    git(fixture.product, "commit", "-q", "-m", "pin alpha at a descendant the store never saw")
+    const candidate = git(fixture.product, "rev-parse", "HEAD")
+
+    // Main moves the same gitlink base → ours.
+    git(fixture.product, "switch", "-q", "main")
+    const child = join(fixture.product, "packages/alpha")
+    git(child, "fetch", "-q", "origin")
+    git(child, "checkout", "-q", ours)
+    git(fixture.product, "add", "packages/alpha")
+    git(fixture.product, "commit", "-q", "-m", "pin alpha at ours")
+
+    // POSITIVE CONTROL: the store holds ours and not theirs, so the merge
+    // really starts from the queue clone's state, not from a warm store.
+    expect(git(child, "cat-file", "-t", ours)).toBe("commit")
+    expect(() => git(child, "cat-file", "-e", `${theirs}^{commit}`)).toThrow()
+
+    const result = await superMerge({ repo: fixture.product, commit: candidate })
+
+    expect(result).toMatchObject({ state: "updated", partial: false })
+    expect(git(fixture.product, "rev-parse", "HEAD:packages/alpha")).toBe(theirs)
+  })
+
+  it("refuses a gitlink whose component commit cannot be fetched by naming it, never as diverged (25280)", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-unfetchable-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const ours = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 'ours'\n")
+
+    // THEIRS exists only in a clone nobody can fetch from: no branch, no pin ref.
+    const authoring = join(fixtureRoot, "alpha-authoring")
+    git(fixtureRoot, "clone", "-q", fixture.alpha, authoring)
+    const theirs = advanceRepository(authoring, "alpha.ts", "export const alpha = 'theirs'\n")
+
+    git(fixture.product, "switch", "-q", "-c", "candidate-unfetchable")
+    git(fixture.product, "update-index", "--add", "--cacheinfo", `160000,${theirs},packages/alpha`)
+    git(fixture.product, "commit", "-q", "-m", "pin alpha at an unpublished commit")
+    const candidate = git(fixture.product, "rev-parse", "HEAD")
+    git(fixture.product, "switch", "-q", "main")
+    const child = join(fixture.product, "packages/alpha")
+    git(child, "fetch", "-q", "origin")
+    git(child, "checkout", "-q", ours)
+    git(fixture.product, "add", "packages/alpha")
+    git(fixture.product, "commit", "-q", "-m", "pin alpha at ours")
+    const headBefore = git(fixture.product, "rev-parse", "HEAD")
+
+    const result = await superMerge({ repo: fixture.product, commit: candidate })
+
+    expect(result).toMatchObject({ state: "failed", partial: false })
+    const message = (result as { detail?: { message?: string } }).detail?.message ?? ""
+    // Named: the sha and the side. "could not be fetched" is the phrase yrd
+    // routes on for its publish-and-resubmit remedy (yrd-queue-core run.ts).
+    expect(message).toContain(`${theirs} (theirs), which could not be fetched`)
+    expect(message).not.toContain("diverged")
+    expect(git(fixture.product, "rev-parse", "HEAD")).toBe(headBefore)
+  })
+
   it.each([true, false])(
     "names the base, ours, and theirs submodule pins when gitlinks conflict (base present: %s)",
     async (hasBase) => {
