@@ -7,6 +7,7 @@ import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { join } from "node:path"
 import { afterEach, describe, expect, it } from "vitest"
 import { runCli } from "../src/cli.ts"
+import { acquireExclusive } from "../src/exclusive.ts"
 import { superPush } from "../src/push.ts"
 import { decodePushIntent, PUSH_INTENT_TRAILER } from "../src/push-intent.ts"
 import { superMerge } from "../src/merge.ts"
@@ -100,6 +101,40 @@ function candidateWithRootChange(fixture: ProductFixture, name: string): string 
 }
 
 describe("git super merge", () => {
+  /**
+   * @failure A submit's candidate merge gives up after 30 s while the queue's merge still holds the writer lock (25274).
+   * @level l1
+   * @consumer Yrd submit candidate verification
+   */
+  it("waits for a queue merge holding the writer lock past 30 seconds", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-writer-wait-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const candidate = candidateWithRootChange(fixture, "candidate-writer-wait")
+    const lockDirectory = join(fixture.product, ".git", "yrd-worktree-mutations")
+    const held = await acquireExclusive(lockDirectory, { timeoutMs: 0 }, "git super merge")
+    // CLI startup takes time before lock acquisition; leave enough margin beyond its 30 s default.
+    const release = Bun.sleep(40_000).then(() => held.release())
+    try {
+      const ordinaryWait = acquireExclusive(lockDirectory, {}, "ordinary mutation").then(
+        (lock) => {
+          lock.release()
+          return "acquired"
+        },
+        (error: unknown) => error,
+      )
+      const stdout = outputSink()
+      const stderr = outputSink()
+      expect(await runCli(["--repo", fixture.product, "--json", "merge", candidate], stdout, stderr)).toBe(0)
+      expect(JSON.parse(stdout.output)).toMatchObject({ state: "updated", partial: false })
+      const ordinaryResult = await ordinaryWait
+      expect(ordinaryResult).toBeInstanceOf(Error)
+      expect((ordinaryResult as Error).message).toMatch(/timeout=30000ms; holder=git super merge/u)
+    } finally {
+      await release
+    }
+  }, 75_000)
+
   /**
    * @failure Merge settlement reads main although Git config selects another submodule branch.
    * @level l1

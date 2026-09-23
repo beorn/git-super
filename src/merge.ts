@@ -157,6 +157,9 @@ type CheckoutFailure = Readonly<{
 }>
 
 const DEFAULT_GIT_TIMEOUT_MS = 30_000
+// A Yrd submit twice exhausted the ordinary 30 s lock wait while a queue merge
+// held this same flock for over 53 s. Candidate merges must outwait that holder.
+const DEFAULT_MERGE_LOCK_WAIT_MS = 5 * 60_000
 const OBJECT_ID = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/u
 
 export async function superMerge(options: SuperMergeOptions): Promise<SuperMergeResult> {
@@ -171,7 +174,9 @@ export async function superMerge(options: SuperMergeOptions): Promise<SuperMerge
   }
 
   try {
-    const exclusive = options.exclusive ?? createExclusive(await lockDirectory(git, root, timeoutMs))
+    const exclusive =
+      options.exclusive ??
+      createExclusive(await lockDirectory(git, root, timeoutMs), { timeoutMs: DEFAULT_MERGE_LOCK_WAIT_MS })
     return await exclusive.run(() => mergeUnderLock(git, root, options, timeoutMs), {
       holder: "git super merge",
     })

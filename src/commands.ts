@@ -12,6 +12,7 @@ import { superIsAncestor, type SuperIsAncestorOptions, type SuperIsAncestorResul
 import { superPull, type SuperPullOptions } from "./pull.ts"
 import { superPush, type SuperPushOptions } from "./push.ts"
 import type { GitSuperResult } from "./result.ts"
+import { shellQuote } from "./shell-command.ts"
 import { superStatus, type SuperStatusResult } from "./status.ts"
 import {
   superSubmodulePrepare,
@@ -115,7 +116,38 @@ const merge = commandNode<CommandContext, MergeParams, SuperMergeResult>({
       return typeof input.commit === "string" ? [] : ["commit"]
     },
   ),
-  run: (context, input) => superMerge({ repo: context.repo, ...input }),
+  run: async (context, input) => {
+    const result = await superMerge({ repo: context.repo, ...input })
+    if (result.detail?.code !== "mutation-lock-busy") return result
+    const argv = [
+      "git",
+      "super",
+      "--repo",
+      context.repo,
+      "merge",
+      input.commit,
+      ...(input.message === undefined ? [] : ["-m", input.message]),
+      ...(input.noVerify === true ? ["--no-verify"] : []),
+    ]
+    const next = `Wait for the named holder to finish, then run ${argv.map(shellQuote).join(" ")}.`
+    const detail = result.detail
+    if (detail.subject === undefined || detail.evidence === undefined || detail.owner === undefined) {
+      throw new Error("git-super: mutation-lock-busy detail is missing its subject, evidence, or owner")
+    }
+    const updated = {
+      ...detail,
+      message: `${detail.code}: ${detail.subject}; evidence: ${detail.evidence}; next: ${next}; owner: ${detail.owner}`,
+      next,
+      remedy: next,
+    }
+    return {
+      ...result,
+      detail: updated,
+      repositories: result.repositories.map((repository) =>
+        repository.detail?.code === "mutation-lock-busy" ? { ...repository, detail: updated } : repository,
+      ),
+    }
+  },
 })
 
 const pull = commandNode<CommandContext, PullParams, GitSuperResult>({
