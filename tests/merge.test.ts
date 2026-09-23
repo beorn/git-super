@@ -2242,6 +2242,72 @@ describe("git super merge — a diverged gitlink the merge composes", () => {
     expect(git(fixture.product, "status", "--porcelain=v1")).toBe("")
   })
 
+  // 24977 (@cto e8368e85, constraint 5): "clean" is merge-tree's own answer,
+  // not file disjointness. The overlap gate this replaces refused exactly this
+  // shape, and 25175 and 25066 bounced on it the day it was ruled.
+  it("merges the component itself when both sides changed the same file in different places (24977)", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-compose-same-file-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const lines = ["one", "two", "three", "four", "five", "six", "seven"]
+    const shared = advanceRepository(fixture.alpha, "shared.ts", `${lines.join("\n")}\n`)
+    const ours = advanceRepository(fixture.alpha, "shared.ts", `${["MAIN", ...lines.slice(1)].join("\n")}\n`)
+    git(fixture.alpha, "switch", "-q", "-c", "submodule-theirs", shared)
+    const theirs = advanceRepository(fixture.alpha, "shared.ts", `${[...lines.slice(0, 6), "CHANGE"].join("\n")}\n`)
+    git(fixture.alpha, "switch", "-q", "main")
+    const submodule = join(fixture.product, "packages/alpha")
+    git(submodule, "fetch", "-q", "origin")
+    git(fixture.product, "switch", "-q", "-c", "candidate-same-file")
+    git(submodule, "checkout", "-q", theirs)
+    git(fixture.product, "add", "packages/alpha")
+    git(fixture.product, "commit", "-q", "-m", "pin theirs")
+    const candidate = git(fixture.product, "rev-parse", "HEAD")
+    git(fixture.product, "switch", "-q", "main")
+    git(submodule, "checkout", "-q", ours)
+    git(fixture.product, "add", "packages/alpha")
+    git(fixture.product, "commit", "-q", "-m", "pin ours")
+
+    const result = await superMerge({ repo: fixture.product, commit: candidate })
+
+    expect(result).toMatchObject({ state: "updated", partial: false })
+    const settled = result.gitlinks.find((row) => row.path === "packages/alpha")
+    expect(settled).toMatchObject({ path: "packages/alpha", state: "merged" })
+    const composed = settled?.from ?? ""
+    expect(git(fixture.alpha, "rev-parse", `${composed}^1`, `${composed}^2`)).toBe(`${ours}\n${theirs}`)
+    expect(git(fixture.alpha, "show", `${composed}:shared.ts`)).toBe(
+      ["MAIN", ...lines.slice(1, 6), "CHANGE"].join("\n"),
+    )
+    expect(git(fixture.product, "ls-tree", "HEAD", "--", "packages/alpha")).toBe(
+      `160000 commit ${composed}\tpackages/alpha`,
+    )
+  })
+
+  it("refuses a real content conflict inside the component, naming the conflicted path and no other (24977)", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-compose-conflict-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const pins = divergedAlphaPins(
+      fixture,
+      [
+        ["alpha.ts", "export const alpha = 'main'\n"],
+        ["main-only.ts", "export const mainOnly = 1\n"],
+      ],
+      [
+        ["alpha.ts", "export const alpha = 'change'\n"],
+        ["change-only.ts", "export const changeOnly = 1\n"],
+      ],
+    )
+
+    const result = await superMerge({ repo: fixture.product, commit: pins.candidate })
+
+    expect(result).toMatchObject({ state: "failed", partial: false, detail: { code: "gitlink-compose-refused" } })
+    expect(result.detail?.message).toContain("gitlink packages/alpha: diverged; content conflict in: alpha.ts")
+    expect(result.detail?.message).not.toContain("main-only.ts")
+    expect(result.detail?.message).not.toContain("change-only.ts")
+    expect(result.detail?.message).not.toContain("changed different files")
+    expect(retainedPins(fixture.alpha)).toEqual([])
+  })
+
   it("refuses a rename on one side and an edit at the old path on the other, naming the old path", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-compose-rename-"))
     roots.push(fixtureRoot)
