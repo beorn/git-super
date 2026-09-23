@@ -2,7 +2,6 @@ import { rm } from "node:fs/promises"
 import { isAbsolute, join, resolve } from "node:path"
 import { readCommitSubmodules, resolveSubmoduleBranch, type CommitSubmodule } from "./commit-graph.ts"
 import {
-  CHANGED_PATH_FILTER,
   composeSubmoduleCommits,
   findSubmoduleCompositionOverlaps,
   planSubmoduleComposition,
@@ -1207,37 +1206,15 @@ async function composeDivergedGitlinks(
   }
 
   /**
-   * THE PATH GATE RUNS FIRST, BEFORE ANY merge-tree. Git's own test is
-   * line-level and would merge two sides that edited the same file in different
-   * places; the ruled predicate is stricter and, more to the point, legible —
-   * a refusal can name the files instead of a hunk.
+   * NO PATH GATE (24977, @cto e8368e85 constraint 5): "clean" is merge-tree's
+   * own answer below, not file disjointness. Both sides' changed files are still
+   * counted, because the composition's evidence reports them.
    */
   let overlaps: readonly SubmoduleCompositionOverlap[]
   try {
     overlaps = await findSubmoduleCompositionOverlaps(plan, options)
   } catch (error) {
     return { failure: composeUnavailable(root, paths, "enumerate what each side changed", messageOf(error)) }
-  }
-  const overlapping = overlaps.filter((overlap) => overlap.files.length > 0)
-  if (overlapping.length > 0) {
-    const first = overlapping[0]?.path ?? paths[0] ?? ""
-    return {
-      failure: composeRefused({
-        entries,
-        // The command a person runs to see what this refused, built from the
-        // SAME constant the gate ran with: an evidence line that drifts from
-        // the predicate sends the reader to a different answer than the one
-        // that refused them.
-        evidence: `git -C ${join(root, first)} diff --name-only --no-renames --diff-filter=${CHANGED_PATH_FILTER} <base> <side>`,
-        head,
-        paths,
-        reasons: overlapping.map(
-          (overlap) => `gitlink ${overlap.path}: diverged; files overlap: ${overlap.files.join(", ")}`,
-        ),
-        stageEvidence,
-        target,
-      }),
-    }
   }
 
   const executed = await composeSubmoduleCommits(plan, options)
@@ -1250,7 +1227,7 @@ async function composeDivergedGitlinks(
         evidence: `git -C ${join(root, path)} merge-tree --write-tree --name-only <main> <pin>`,
         head,
         paths,
-        reasons: [`gitlink ${path}: diverged; Git could not ${operation}: ${detail}`],
+        reasons: [`gitlink ${path}: diverged; ${kind === "conflict" ? detail : `Git could not ${operation}: ${detail}`}`],
         stageEvidence,
         target,
       }),
@@ -1487,7 +1464,7 @@ function composeRefused(
     "gitlink-compose-refused",
     `Merge ${target} conflicts with current HEAD ${head} at ${located}, and the diverged submodule could not be merged: ${reasons.join("; ")}; no commit was written.${stageEvidence ? ` ${stageEvidence}` : ""}`,
     evidence,
-    "Merge the submodule's own main into the submodule commit, re-record the gitlink, and submit again; a diverged submodule is merged here only where the two sides changed different files.",
+    "Merge the submodule's own main into the submodule commit, re-record the gitlink, and submit again; a diverged submodule is merged here unless its own merge conflicts.",
     "the caller",
     {
       objectIds: [...new Set([head, target, ...entries.map((entry) => entry.oid)])],

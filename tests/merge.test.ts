@@ -2308,7 +2308,10 @@ describe("git super merge — a diverged gitlink the merge composes", () => {
     expect(retainedPins(fixture.alpha)).toEqual([])
   })
 
-  it("refuses a rename on one side and an edit at the old path on the other, naming the old path", async () => {
+  // 24977: this was a refusal while the overlap gate stood. Git's merge follows
+  // the rename, so merge-tree reports it clean and the queue composes it: the
+  // edit lands in the renamed file, and nothing is left at the old path.
+  it("composes a rename on one side and an edit at the old path on the other, the edit following the rename (24977)", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-compose-rename-"))
     roots.push(fixtureRoot)
     const fixture = createProductFixture(fixtureRoot)
@@ -2335,9 +2338,11 @@ describe("git super merge — a diverged gitlink the merge composes", () => {
 
     const result = await superMerge({ repo: fixture.product, commit: candidate })
 
-    expect(result).toMatchObject({ state: "failed", partial: false, detail: { code: "gitlink-compose-refused" } })
-    expect(result.detail?.message).toContain("alpha.ts")
-    expect(retainedPins(fixture.alpha)).toEqual([])
+    expect(result).toMatchObject({ state: "updated", partial: false })
+    const composed = result.gitlinks.find((row) => row.path === "packages/alpha")?.from ?? ""
+    expect(git(fixture.alpha, "rev-parse", `${composed}^1`, `${composed}^2`)).toBe(`${ours}\n${theirs}`)
+    expect(git(fixture.alpha, "show", `${composed}:renamed.ts`)).toBe("export const alpha = 'change'")
+    expect(git(fixture.alpha, "ls-tree", "--name-only", composed, "--", "alpha.ts")).toBe("")
   })
 
   it("refuses a diverged gitlink whose two sides share no history as unavailable", async () => {
