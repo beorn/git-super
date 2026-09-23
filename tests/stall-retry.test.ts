@@ -13,7 +13,13 @@
  */
 import { afterEach, describe, expect, test, vi } from "vitest"
 import type { GitProcess, GitProcessRequest, GitProcessResult } from "../src/process.ts"
-import { isExactPublickeyRefusal, isRetryableRead, verboseSshRetryEnvironment, withStallRetry } from "../src/process.ts"
+import {
+  coreSshCommandFromConfig,
+  isExactPublickeyRefusal,
+  isRetryableRead,
+  verboseSshRetryEnvironment,
+  withStallRetry,
+} from "../src/process.ts"
 
 /** A GitProcess that replays a scripted list of results and records its calls. */
 function scripted(
@@ -194,6 +200,13 @@ describe("verboseSshRetryEnvironment", () => {
     )
     expect(verboseSshRetryEnvironment({}, undefined).command).toBe("ssh -v")
   })
+})
+
+test("an incomplete config lookup is never treated as an absent SSH command", () => {
+  expect(coreSshCommandFromConfig({ code: 1, stdout: "", stderr: "" }, "/repo")).toBeUndefined()
+  expect(() => coreSshCommandFromConfig({ code: 1, stdout: "", stderr: "", timedOut: true }, "/repo")).toThrow(
+    "cannot read core.sshCommand",
+  )
 })
 
 describe("isRetryableRead", () => {

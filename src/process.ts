@@ -206,12 +206,23 @@ export function verboseSshRetryEnvironment(
 
 /** An exit 1 with no output is Git's documented absent config answer. */
 export function coreSshCommandFromConfig(result: GitProcessResult, repo: string): string | undefined {
-  if (result.code === 1 && result.stdout === "" && result.stderr === "" && result.failure === undefined)
-    return undefined
-  if (result.code !== 0 || result.failure !== undefined || result.timedOut || result.stalled || result.signal) {
+  if (result.failure !== undefined || result.timedOut || result.stalled || result.signal) {
+    const reason =
+      result.failure ??
+      (result.timedOut
+        ? "timed out"
+        : result.stalled
+          ? "stalled"
+          : result.signal
+            ? `signal ${result.signal}`
+            : "incomplete")
     throw new Error(
-      `git-super: cannot read core.sshCommand in ${repo}: ${result.failure ?? result.stderr ?? String(result.code)}`,
+      `git-super: cannot read core.sshCommand in ${repo}: ${reason}; exit ${String(result.code)}: ${result.stderr}`,
     )
+  }
+  if (result.code === 1 && result.stdout === "" && result.stderr === "") return undefined
+  if (result.code !== 0) {
+    throw new Error(`git-super: cannot read core.sshCommand in ${repo}: exit ${String(result.code)}: ${result.stderr}`)
   }
   return result.stdout.replace(/\r?\n$/u, "")
 }
