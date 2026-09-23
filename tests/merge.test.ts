@@ -1257,6 +1257,41 @@ describe("git super merge", () => {
     expect(git(fixture.product, "rev-parse", "HEAD:packages/alpha")).toBe(theirs)
   })
 
+  it("cannot judge a fast-forward whose current pin is absent, and says so rather than composing (25280)", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-absent-current-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+
+    // OURS exists only in a clone nobody fetches from; main records it anyway.
+    const ghost = join(fixtureRoot, "alpha-ghost")
+    git(fixtureRoot, "clone", "-q", fixture.alpha, ghost)
+    const ours = advanceRepository(ghost, "alpha.ts", "export const alpha = 'ours'\n")
+    // THEIRS is published as a pin ref and fetchable.
+    const authoring = join(fixtureRoot, "alpha-authoring")
+    git(fixtureRoot, "clone", "-q", fixture.alpha, authoring)
+    const theirs = advanceRepository(authoring, "alpha.ts", "export const alpha = 'theirs'\n")
+    git(authoring, "push", "-q", "origin", `${theirs}:refs/git-super/pins/${theirs}`)
+
+    git(fixture.product, "switch", "-q", "-c", "candidate-absent-current")
+    git(fixture.product, "update-index", "--add", "--cacheinfo", `160000,${theirs},packages/alpha`)
+    git(fixture.product, "commit", "-q", "-m", "pin alpha at theirs")
+    const candidate = git(fixture.product, "rev-parse", "HEAD")
+    git(fixture.product, "switch", "-q", "main")
+    git(fixture.product, "update-index", "--add", "--cacheinfo", `160000,${ours},packages/alpha`)
+    git(fixture.product, "commit", "-q", "-m", "pin alpha at an unreadable ours")
+    const headBefore = git(fixture.product, "rev-parse", "HEAD")
+    const child = join(fixture.product, "packages/alpha")
+    expect(() => git(child, "cat-file", "-e", `${ours}^{commit}`)).toThrow()
+
+    const result = await superMerge({ repo: fixture.product, commit: candidate })
+
+    expect(result).toMatchObject({ state: "failed", partial: false, detail: { code: "gitlink-compose-unavailable" } })
+    const message = (result as { detail?: { message?: string } }).detail?.message ?? ""
+    expect(message).toContain("fast-forward")
+    expect(message).toContain(ours)
+    expect(git(fixture.product, "rev-parse", "HEAD")).toBe(headBefore)
+  })
+
   it("refuses a gitlink whose component commit cannot be fetched by naming it, never as diverged (25280)", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-unfetchable-"))
     roots.push(fixtureRoot)
