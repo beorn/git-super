@@ -2,6 +2,7 @@
  * @failure A successful gitlink mutation is reported as a clean pre-write failure when releasing the shared lock fails.
  * @level l1
  * @consumer @i/10-merge-queue/git-super-one-layer F1 and long-running Yrd callers
+ * @reach fs-walk <fixture-only: root = mkdtempSync(join(tmpdir(), ...)) via createProductFixture; all git fixtures are built in a temp dir.>
  */
 
 import { mkdtempSync, rmSync } from "node:fs"

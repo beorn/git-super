@@ -2,6 +2,7 @@
  * @failure A merge records a gitlink commit that submodule main does not contain.
  * @level l1
  * @consumer Yrd settled candidate preparation and landing
+ * @reach fs-walk <fixture-only: every scenario builds its own mkdtempSync(join(tmpdir(), ...)) fixture repo; ls-files/ls-tree calls target these temp repos, not the real checkout.>
  */
 import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"

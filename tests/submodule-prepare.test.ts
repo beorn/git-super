@@ -4,6 +4,7 @@
  * @level l4 — real Git common-dir module stores and ordinary submodule materialization.
  * @consumer Yrd captured submodule readers
  * retire-when: the submodule-store command is subsumed by a broader Git Super persistent-store lifecycle suite.
+ * @reach fs-walk <fixture-only: every case builds a mkdtempSync(join(tmpdir(), ...)) fixture product/submodule tree.>
  */
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"

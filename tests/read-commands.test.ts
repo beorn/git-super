@@ -1,3 +1,6 @@
+/**
+ * @reach fs-walk <fixture-only: every case builds a mkdtempSync(join(canonicalTmpdir()/tmpdir(), ...)) fixture repo.>
+ */
 import { afterEach, describe, expect, test } from "vitest"
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
