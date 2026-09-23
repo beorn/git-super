@@ -127,6 +127,9 @@ describe("git super merge", () => {
       const stderr = outputSink()
       expect(await runCli(["--repo", fixture.product, "--json", "merge", candidate], stdout, stderr)).toBe(0)
       expect(JSON.parse(stdout.output)).toMatchObject({ state: "updated", partial: false })
+      expect(stderr.output).toMatch(
+        /^git-super merge: waiting for writer lock held by git super merge \(pid:\d+, age \d+ms\)\n$/u,
+      )
       const ordinaryResult = await ordinaryWait
       expect(ordinaryResult).toBeInstanceOf(Error)
       expect((ordinaryResult as Error).message).toMatch(/timeout=30000ms; holder=git super merge/u)

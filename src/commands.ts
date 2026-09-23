@@ -26,7 +26,7 @@ export type CommandContext = Readonly<{ repo: string; report?: (message: string)
 export type DiffParams = Omit<SuperDiffOptions, "repo">
 export type StatusParams = Record<string, never>
 export type MergeBaseParams = Omit<SuperIsAncestorOptions, "repo">
-export type MergeParams = Omit<SuperMergeOptions, "repo" | "git" | "exclusive">
+export type MergeParams = Omit<SuperMergeOptions, "repo" | "git" | "exclusive" | "report">
 export type PullParams = Omit<SuperPullOptions, "repo" | "git" | "exclusive" | "report"> & { progress?: boolean }
 export type PushParams = Omit<SuperPushOptions, "repo" | "git" | "exclusive">
 export type GitlinkWriteParams = Omit<WriteGitlinkOptions, "repo" | "git">
@@ -117,7 +117,11 @@ const merge = commandNode<CommandContext, MergeParams, SuperMergeResult>({
     },
   ),
   run: async (context, input) => {
-    const result = await superMerge({ repo: context.repo, ...input })
+    const result = await superMerge({
+      repo: context.repo,
+      ...input,
+      ...(context.report === undefined ? {} : { report: context.report }),
+    })
     if (result.detail?.code !== "mutation-lock-busy") return result
     const argv = [
       "git",
