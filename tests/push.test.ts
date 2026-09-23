@@ -1186,6 +1186,42 @@ describe("explicit recursive push mechanics", () => {
     await expect(remoteContainsCommit({ repository, remote: "origin", commit: unpublished })).resolves.toBe(false)
   })
 
+  // The small push fixtures cannot detect one Git process per newly reachable
+  // merge. A stale root may contain hundreds of unrelated merge commits.
+  test("bounds Git invocations while inspecting many newly reachable merges", async () => {
+    const callsFor = async (count: number): Promise<number> => {
+      const { repository, remote, source } = pushFixture(`intent-scan-${count}`)
+      git(repository, "push", "-q", remote, `${source}:refs/heads/main`)
+      const tree = git(repository, "rev-parse", `${source}^{tree}`)
+      const side = git(repository, "commit-tree", tree, "-p", source, "-m", "side")
+      let head = source
+      for (let index = 0; index < count; index += 1) {
+        head = git(repository, "commit-tree", tree, "-p", head, "-p", side, "-m", `merge ${index}`)
+      }
+      const local = createLocalGitProcess()
+      let calls = 0
+      const counting: GitProcess = {
+        run(request) {
+          calls += 1
+          return local.run(request)
+        },
+      }
+      const result = await superPush({
+        repo: repository,
+        remote,
+        refspecs: [`${head}:refs/heads/main`],
+        recurseSubmodules: "on-demand",
+        git: counting,
+      })
+      expect(result.state).toBe("updated")
+      return calls
+    }
+
+    const one = await callsFor(1)
+    const many = await callsFor(16)
+    expect(many - one).toBeLessThan(5)
+  }, 30_000)
+
   /**
    * M8.5 frozen recovery must reuse captured destinations after child config changes.
    * Ordinary recursive push tests resolve current config and cannot prove this seam.

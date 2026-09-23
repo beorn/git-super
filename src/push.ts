@@ -4,7 +4,7 @@ import { readCommitSubmodules, resolveSubmoduleBranch, type CommitSubmodule } fr
 import { createExclusive, type Exclusive } from "./exclusive.ts"
 import { ensureCommitObject } from "./objects.ts"
 import {
-  readFrozenPushIntent,
+  readFrozenPushIntents,
   encodePushIntent,
   sameHostedOwner,
   sameHostedRepository,
@@ -987,8 +987,10 @@ async function frozenChildUpdates(
     "find-new-frozen-merges",
   )
   let found = false
-  for (const source of new Set([...direct, ...reachable.split(/\r?\n/u).filter(Boolean)])) {
-    const intent = await readFrozenPushIntent(git, root, source)
+  for (const [source, intent] of await readFrozenPushIntents(git, root, [
+    ...direct,
+    ...reachable.split(/\r?\n/u).filter(Boolean),
+  ])) {
     if (intent === undefined) continue
     const actualRemote = await logicalPushUrl(git, root, remote)
     if (!sameHostedRepository(intent.rootRemote, actualRemote)) {

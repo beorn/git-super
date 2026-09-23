@@ -178,23 +178,8 @@ export function encodePushIntent(intent: FrozenPushIntent): string {
   return encoded
 }
 
-/** One owner reads and binds the trailer to the actual containing merge. */
-export async function readFrozenPushIntent(
-  git: GitProcess,
-  root: string,
-  source: string,
-): Promise<FrozenPushIntent | undefined> {
-  const read = async (args: readonly string[]) => {
-    const result = await git.run({ repo: root, args })
-    if (result.code !== 0 || result.timedOut === true || result.failure !== undefined || result.signal) {
-      throw new Error(
-        `Merge ${source}: git ${args.join(" ")} failed in ${root} (exit ${result.code})\n${result.failure ?? result.stderr}`,
-      )
-    }
-    return result.stdout.trim()
-  }
-  const message = await read(["show", "-s", "--format=%(trailers:only,unfold)", source])
-  const values = message
+function decodeIntentFromCommit(source: string, trailers: string, parents: string): FrozenPushIntent | undefined {
+  const values = trailers
     .split(/\r?\n/u)
     .filter(
       (line) => line.slice(0, PUSH_INTENT_TRAILER.length + 1).toLowerCase() === `${PUSH_INTENT_TRAILER.toLowerCase()}:`,
@@ -204,7 +189,52 @@ export async function readFrozenPushIntent(
   const value = values[0]
   if (value === undefined) throw new Error(`Merge ${source} lost its frozen push trailer`)
   const intent = decodePushIntent(value.slice(PUSH_INTENT_TRAILER.length + 1).trim())
-  const parents = (await read(["show", "-s", "--format=%P", source])).split(" ")
-  if (parents.length !== 2) throw new Error(`Frozen push intent must belong to an actual two-parent merge: ${source}`)
+  if (parents.trim().split(/\s+/u).length !== 2) {
+    throw new Error(`Frozen push intent must belong to an actual two-parent merge: ${source}`)
+  }
   return intent
+}
+
+/** Read bounded groups of commits through the same trailer parser as a single intent. */
+export async function readFrozenPushIntents(
+  git: GitProcess,
+  root: string,
+  sources: readonly string[],
+): Promise<ReadonlyMap<string, FrozenPushIntent | undefined>> {
+  const intents = new Map<string, FrozenPushIntent | undefined>()
+  const unique = [...new Set(sources)]
+  for (let offset = 0; offset < unique.length; offset += 128) {
+    const chunk = unique.slice(offset, offset + 128)
+    const args = ["show", "-s", "-z", "--format=%H%x00%(trailers:only,unfold)%x00%P", ...chunk]
+    const result = await git.run({ repo: root, args })
+    if (result.code !== 0 || result.timedOut === true || result.failure !== undefined || result.signal) {
+      throw new Error(
+        `Merge intent batch: git ${args.join(" ")} failed in ${root} (exit ${result.code})\n${result.failure ?? result.stderr}`,
+      )
+    }
+    const fields = result.stdout.split("\0")
+    if (fields.pop() !== "" || fields.length !== chunk.length * 3) {
+      throw new Error(`Merge intent batch in ${root}: expected ${chunk.length} complete commit records`)
+    }
+    for (let index = 0; index < chunk.length; index += 1) {
+      const source = chunk[index]
+      const oid = fields[index * 3]
+      const trailers = fields[index * 3 + 1]
+      const parents = fields[index * 3 + 2]
+      if (source === undefined || oid !== source || trailers === undefined || parents === undefined) {
+        throw new Error(`Merge intent batch in ${root}: expected ${source}, received ${oid}`)
+      }
+      intents.set(source, decodeIntentFromCommit(source, trailers, parents))
+    }
+  }
+  return intents
+}
+
+/** One owner reads and binds the trailer to the actual containing merge. */
+export async function readFrozenPushIntent(
+  git: GitProcess,
+  root: string,
+  source: string,
+): Promise<FrozenPushIntent | undefined> {
+  return (await readFrozenPushIntents(git, root, [source])).get(source)
 }
