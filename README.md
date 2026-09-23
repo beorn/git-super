@@ -4,6 +4,8 @@ Git commands that treat a superproject and its submodule interiors as one produc
 
 Ordinary Git plumbing stops at a gitlink. `git diff --name-only A..B` reports `vendor/tool`; it does not report `vendor/tool/src/index.ts`. `git merge-base --is-ancestor <sha> <ref>` returns a false negative when the SHA belongs to a submodule and the ref is a superproject commit. `git-super` asks each question in the repository that owns the answer, prefixes inner paths, and names every repository it consulted.
 
+> Install from npm; a git install resolves the TypeScript source and runs only under Bun.
+
 ## Why it exists
 
 **The dangerous failure is not an error — it is a check that passes because it never looked.**
