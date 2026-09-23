@@ -1290,6 +1290,8 @@ describe("git super merge", () => {
     expect(message).toContain("fast-forward")
     // The probe that failed is the one reading ours, not merely a phrase naming it.
     expect(message).toContain(`merge-base --is-ancestor ${ours} ${theirs}`)
+    // Git's own stderr names the missing side; the sha alone also appears in the operation phrase.
+    expect(message).toContain(`Not a valid commit name ${ours}`)
     expect(git(fixture.product, "rev-parse", "HEAD")).toBe(headBefore)
   })
 
