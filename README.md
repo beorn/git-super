@@ -74,6 +74,21 @@ When Git Super raises root gitlinks, it writes a temporary receipt at `refs/git-
 
 Human output puts the resulting merge commit on stdout and settlement evidence on stderr. `--json` emits one byte-clean `SuperMergeResult` with the same commit and gitlink rows. Its additive `checkouts` rows record, for every checkout the operation touches, the pin in root `HEAD` (`recorded`), the staged gitlink (`index`), the exact pre-operation checkout (`preCheckout`), the observed checkout, and whether it is `settled`, `settle-failed`, `restored`, `restore-failed`, or `not-run`.
 
+Its additive `steps` rows time the merge's phases as `{ "name", "ms" }`, in the order they ran. The names form a closed list, and the phases run one after another without overlapping, covering the whole call, so their `ms` add up to its wall time:
+
+| name         | covers                                                                                                                              |
+| ------------ | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `preflight`  | finding the root, taking the worktree lock (including any wait for it), the clean-worktree check, and resolving HEAD and the target |
+| `merge-tree` | the prospective merge tree, plus composing any diverged gitlinks it conflicts on                                                    |
+| `plan`       | classifying every gitlink against its submodule main: child-main fetches and the nested descent                                     |
+| `capture`    | the `Settled:` trailers and the frozen push intent                                                                                  |
+| `checkouts`  | preparing affected submodule checkouts and proving the worktree clean                                                               |
+| `merge`      | the native no-ff merge and the gitlink raises                                                                                       |
+| `settle`     | checking affected submodules out at their staged pins                                                                               |
+| `commit`     | the concluding commit, its hooks, and the root receipt                                                                              |
+
+A merge that stops early ends its `steps` on the phase that stopped it. A new phase is added to this list, never left outside every step. Consumers should record an unfamiliar name as given rather than drop it.
+
 A failure before the root merge exits `1` and leaves root HEAD, index and working files unchanged; object fetching and submodule-store preparation may already have occurred. A failure after Git applies the uncommitted merge exits `2` with `partial: true`, completed and `not-run` gitlink rows, and checkout recovery evidence. If the concluding commit is rejected, Git Super keeps the root merge and staged index intact while restoring each submodule to the pin recorded by pre-merge root `HEAD`. If any restoration cannot be proved, it leaves the partial state untouched, marks the affected row `restore-failed`, and prints full `recorded`, `staged-index`, `checkout`, and `pre-checkout` object IDs; do not retry until those rows are restored and re-observed. A repository with no submodules or nothing to raise still returns the real merge commit plus an empty gitlink-row set. `--no-verify` is an explicit emergency bypass, not the normal settlement path.
 
 ### Exact gitlink write
