@@ -1228,7 +1228,9 @@ async function composeDivergedGitlinks(
         evidence: `git -C ${join(root, path)} merge-tree --write-tree --name-only <main> <pin>`,
         head,
         paths,
-        reasons: [`gitlink ${path}: diverged; ${kind === "conflict" ? detail : `Git could not ${operation}: ${detail}`}`],
+        reasons: [
+          `gitlink ${path}: diverged; ${kind === "conflict" ? detail : `Git could not ${operation}: ${detail}`}`,
+        ],
         stageEvidence,
         target,
       }),
