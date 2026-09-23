@@ -367,7 +367,7 @@
 
     "lightningcss-win32-x64-msvc": ["lightningcss-win32-x64-msvc@1.33.0", "", { "os": "win32", "cpu": "x64" }, "sha512-OlEICDx/Xl0FqSp4bry8zFnCvGpig3Gl4gCquvYwHuqJKEC1+n9NgDniFvqHGmMv1ZkqDJrDqKKSykTDX+ehuA=="],
 
-    "gitomic": ["gitomic@0.2.0", "", { "peerDependencies": { "isomorphic-git": "^1.38.7" }, "optionalPeers": ["isomorphic-git"], "bin": { "gitomic": "./src/bin.ts" } }, "sha512-R1VwF+GH118zxZFCnsSXNgP+JmPssKsz4jsFfb9hGcaoPGdOtoMYf0Esi6TThL6EdghDkQj/YAlpI0/NMfZ7jw=="],
+    "gitomic": ["gitomic@0.2.0", "", { "peerDependencies": { "isomorphic-git": "^1.38.7" }, "optionalPeers": ["isomorphic-git"], "bin": { "gitomic": "./src/bin.ts" } }, "sha512-/yTVBC2GGjhzYZzEyYISND745UeOzoxu2dYOrQCQUA7EuCcx8DXK7a6+7Ce7Tkd8VhfIbJLjNeV+AHDDpzSF1g=="],
 
     "loggily": ["loggily@0.10.2", "", { "peerDependencies": { "@opentelemetry/api": ">=1.0.0" }, "optionalPeers": ["@opentelemetry/api"] }, "sha512-c4ihogdduRDl/k3EwBTKL6iryWDt+MO3OBeGiHNQErCeiAVcF076Yw6i1/agltL0Ap4PuaQtZzKslTdi9Cxzgg=="],
 
