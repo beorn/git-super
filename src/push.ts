@@ -1,6 +1,14 @@
 import { isAbsolute, join, resolve } from "node:path"
 
-import { readCommitSubmodules, resolveSubmoduleBranch, type CommitSubmodule } from "./commit-graph.ts"
+import {
+  changedGitlinks,
+  readCommitGitlinks,
+  readCommitSubmodules,
+  resolveSubmoduleBranch,
+  underChangedGitlink,
+  type CommitGitlink,
+  type CommitSubmodule,
+} from "./commit-graph.ts"
 import { createExclusive, type Exclusive } from "./exclusive.ts"
 import { ensureCommitObject } from "./objects.ts"
 import {
@@ -89,6 +97,10 @@ type CommitRequirement = Readonly<{
 
 const DEFAULT_GIT_TIMEOUT_MS = 30_000
 const OBJECT_ID = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/u
+/** Remote observations one push plan runs at once (25303: reads concurrent, writes stay ordered). */
+const PLAN_READ_CONCURRENCY = 4
+/** Absent advertised refs fetched per `git fetch`, bounding argv however many are absent. */
+const ADVERTISED_FETCH_BATCH = 256
 
 function detail(code: string, phase: string, message: string, extra: Partial<GitResultDetail> = {}): GitResultDetail {
   return { code, phase, message, ...extra }
@@ -204,6 +216,33 @@ function resultError(error: unknown, phase: string): GitResultDetail {
   })
 }
 
+/**
+ * Run `task` over `items` with at most `limit` in flight, and answer in input
+ * order. Every item runs to completion; the first failure BY INPUT POSITION is
+ * rethrown, so a concurrent plan fails on the same update a sequential one did.
+ */
+async function mapInOrder<T, R>(items: readonly T[], limit: number, task: (item: T) => Promise<R>): Promise<R[]> {
+  const settled: ({ ok: true; value: R } | { ok: false; error: unknown })[] = []
+  let next = 0
+  const worker = async (): Promise<void> => {
+    while (next < items.length) {
+      const index = next
+      next += 1
+      const item = items[index] as T
+      try {
+        settled[index] = { ok: true, value: await task(item) }
+      } catch (error) {
+        settled[index] = { ok: false, error }
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker))
+  return settled.map((outcome) => {
+    if (!outcome.ok) throw outcome.error
+    return outcome.value
+  })
+}
+
 function expectedKey(expected: ExpectedDestination): string {
   return expected.state === "missing" ? "missing" : `oid:${expected.oid}`
 }
@@ -274,6 +313,10 @@ async function planUpdates(git: GitProcess, input: readonly RefUpdate[], timeout
   }
   const normalized: PlannedUpdate[] = []
   const mismatches = new Map<PlannedUpdate, GitResultDetail>()
+  // Each update's validation and observation are reads, so they run up to
+  // PLAN_READ_CONCURRENCY at a time; the results are assembled, and the first
+  // failure raised, in input order, exactly as the sequential loop did (25303).
+  // Argument checks refuse before any process runs, as the sequential loop did.
   for (const update of input) {
     if (update.source === "" && update.expectedDestination === undefined) {
       throw Object.assign(new Error(`Deleting ${update.destination} requires an exact destination lease`), {
@@ -304,6 +347,8 @@ async function planUpdates(git: GitProcess, input: readonly RefUpdate[], timeout
         resultDetail: detail("empty-remote", "validate", "Push remote must not be empty."),
       })
     }
+  }
+  const planOne = async (update: RefUpdate): Promise<{ planned: PlannedUpdate; mismatch?: GitResultDetail }> => {
     const repository = await discoverRepository(git, update.repository, "discover-repository")
     if (update.source !== "") {
       await required(git, repository, ["cat-file", "-e", `${update.source}^{object}`], "verify-source-object")
@@ -344,14 +389,18 @@ async function planUpdates(git: GitProcess, input: readonly RefUpdate[], timeout
       explicitExpectation: update.expectedDestination !== undefined,
       allowNonFastForward: update.allowNonFastForward === true,
     }
-    normalized.push(planned)
     if (
       update.expectedDestination !== undefined &&
       !sameExpected(update.expectedDestination, observed) &&
       !identicalRetry
     ) {
-      mismatches.set(planned, mismatchDetail(planned, observed, "observe-destination"))
+      return { planned, mismatch: mismatchDetail(planned, observed, "observe-destination") }
     }
+    return { planned }
+  }
+  for (const { planned, mismatch } of await mapInOrder(input, PLAN_READ_CONCURRENCY, planOne)) {
+    normalized.push(planned)
+    if (mismatch !== undefined) mismatches.set(planned, mismatch)
   }
 
   const byDestination = new Map<string, PlannedUpdate>()
@@ -913,8 +962,13 @@ export async function capturePushIntent(
   const requirements = await collectCommitRequirements(git, root, [tree], rootPins, undefined, rootStores)
   if (requirements.length === 0) return undefined
   const rootRemote = await logicalPushUrl(git, root, await configuredPushRemote(git, root))
-  const before = new Map(
-    (await collectCommitRequirements(git, root, [head])).map((entry) => [entry.path, entry.target]),
+  const changed = new Set(
+    changedGitlinks(
+      await readCommitGitlinks(git, root, head),
+      requirements
+        .filter((requirement) => requirement.superproject === root)
+        .map((requirement) => ({ path: requirement.path, target: requirement.target })),
+    ).map((entry) => entry.path),
   )
   const children: FrozenPushIntent["children"][number][] = []
   for (const requirement of requirements) {
@@ -940,7 +994,7 @@ export async function capturePushIntent(
     if (update.expectedDestination.state === "oid") {
       const args = ["merge-base", "--is-ancestor", update.expectedDestination.oid, update.source]
       const ancestry = await git.run({ repo: requirement.repository, args })
-      if (ancestry.code === 1 && before.get(requirement.path) === requirement.target) {
+      if (ancestry.code === 1 && !underChangedGitlink(changed, requirement.path)) {
         children.push({ ...pin, remote })
         continue
       }
@@ -979,7 +1033,21 @@ async function frozenChildUpdates(
   const publications: RefUpdate[] = []
   const direct = new Set(rootUpdates.map((update) => update.source).filter((source) => source !== ""))
   if (direct.size === 0) return { updates: undefined, retention, publications }
-  const advertised = await advertisedCommitTips(git, root, remote)
+  const advertisement = await readAdvertisement(git, root, remote)
+  const advertised = await advertisedTips(git, root, remote, advertisement)
+  // WORK IS PROPORTIONAL TO THE CHANGE (25303). What the remote's root already
+  // records at a destination this push moves was published by the push that
+  // put it there, so only the gitlinks a merge moves past that are retained or
+  // published. The frozen trailer stays the merge's snapshot, never the work
+  // list: a merge moving one of 16 children did 15 no-op publications, and an
+  // unchanged child's main moving elsewhere could stop the line for a change
+  // that never touched it. A destination the remote lacks has no base, so
+  // every gitlink counts as changed there.
+  const destinations = new Set(rootUpdates.filter((update) => update.source !== "").map((update) => update.destination))
+  const bases: CommitGitlink[][] = []
+  for (const row of advertisement) {
+    if (destinations.has(row.ref)) bases.push(await readCommitGitlinks(git, root, row.oid))
+  }
   const reachable = await required(
     git,
     root,
@@ -996,11 +1064,16 @@ async function frozenChildUpdates(
     }
     if (direct.has(source)) found = true
     const selected = await collectCommitRequirements(git, root, [source], undefined, intent)
+    const moved = await readCommitGitlinks(git, root, source)
+    const changed = new Set(
+      bases.reduce((still, base) => changedGitlinks(base, still), moved).map((entry) => entry.path),
+    )
     for (const row of intent.children) {
       const requirement = selected.find((entry) => entry.path === row.path && entry.target === row.pin)
       if (requirement === undefined) {
         throw new Error(`Frozen child ${row.path}@${row.pin} is not selected by merge ${source}`)
       }
+      if (!underChangedGitlink(changed, row.path)) continue
       if (sameHostedOwner(intent.rootRemote, row.remote)) {
         for (const pin of new Set([row.pin, ...(row.publication === undefined ? [] : [row.publication.source])])) {
           retention.push({
@@ -1206,17 +1279,20 @@ async function collectCommitRequirements(
   )
 }
 
-async function advertisedCommitTips(
+type AdvertisedRef = Readonly<{ oid: string; ref: string }>
+
+/** One `ls-remote --refs`: the remote's refs under the prefixes, as it advertised them. */
+async function readAdvertisement(
   git: GitProcess,
   repository: string,
   remote: string,
   refPrefixes: readonly string[] = ["refs/"],
-): Promise<string[]> {
+): Promise<AdvertisedRef[]> {
   const advertised = await git.run({ repo: repository, args: ["ls-remote", "--refs", remote] })
   if (advertised.code !== 0) {
     throw operationError(repository, ["ls-remote", "--refs", remote], "inspect-submodule-remote", advertised)
   }
-  const tips: string[] = []
+  const rows: AdvertisedRef[] = []
   for (const line of advertised.stdout.split(/\r?\n/u).filter((row) => row !== "")) {
     const [oid, ref] = line.split(/\s+/u, 2)
     if (
@@ -1227,19 +1303,91 @@ async function advertisedCommitTips(
     ) {
       continue
     }
-    const present = await git.run({ repo: repository, args: ["cat-file", "-e", `${oid}^{object}`] })
-    if (present.code !== 0) {
-      await required(
-        git,
-        repository,
-        ["fetch", "--no-tags", "--no-write-fetch-head", remote, ref],
-        "fetch-submodule-remote-tip",
-      )
-    }
-    const commit = await git.run({ repo: repository, args: ["rev-parse", `${oid}^{commit}`] })
-    if (commit.code === 0 && OBJECT_ID.test(commit.stdout.trim())) tips.push(commit.stdout.trim())
+    rows.push({ oid, ref })
   }
-  return [...new Set(tips)]
+  return rows
+}
+
+/**
+ * `cat-file --batch-check` over many names in ONE process: one answer line per
+ * name, in order, so answers pair by position. A run that cannot answer every
+ * name throws with git's text; it never shortens into a partial list.
+ */
+async function batchCheck(
+  git: GitProcess,
+  repository: string,
+  names: readonly string[],
+  phase: string,
+): Promise<string[]> {
+  if (names.length === 0) return []
+  const args = ["cat-file", "--batch-check=%(objectname)"]
+  const checked = await git.run({ repo: repository, args, stdin: `${names.join("\n")}\n` })
+  if (checked.code !== 0 || checked.timedOut === true || checked.failure !== undefined) {
+    throw operationError(repository, args, phase, checked)
+  }
+  const answers = checked.stdout.split(/\r?\n/u).filter((line) => line !== "")
+  if (answers.length !== names.length) {
+    throw operationError(repository, args, phase, {
+      ...checked,
+      code: checked.code,
+      stderr: `git cat-file --batch-check answered ${answers.length} lines for ${names.length} names`,
+    })
+  }
+  return answers
+}
+
+/**
+ * The commits an advertisement names, with every advertised object present
+ * locally. Presence and peeling are each ONE batch process however many refs
+ * the remote advertises, and the absent ones arrive in one fetch: a root with
+ * ~10,900 refs cost ~21,800 spawns and 88 s per merge as one `cat-file -e` and
+ * one `rev-parse` per ref (25303, phase A).
+ */
+async function advertisedTips(
+  git: GitProcess,
+  repository: string,
+  remote: string,
+  rows: readonly AdvertisedRef[],
+): Promise<string[]> {
+  const presence = await batchCheck(
+    git,
+    repository,
+    rows.map((row) => row.oid),
+    "inspect-advertised-objects",
+  )
+  const absent = rows.filter((row, index) => presence[index] !== row.oid)
+  for (let start = 0; start < absent.length; start += ADVERTISED_FETCH_BATCH) {
+    await required(
+      git,
+      repository,
+      [
+        "fetch",
+        "--no-tags",
+        "--no-write-fetch-head",
+        remote,
+        ...absent.slice(start, start + ADVERTISED_FETCH_BATCH).map((row) => row.ref),
+      ],
+      "fetch-submodule-remote-tip",
+    )
+  }
+  // A ref naming a tree or blob does not peel to a commit and is answered
+  // "missing"; like the per-ref rev-parse before it, it is simply not a tip.
+  const peeled = await batchCheck(
+    git,
+    repository,
+    rows.map((row) => `${row.oid}^{commit}`),
+    "peel-advertised-commits",
+  )
+  return [...new Set(peeled.filter((answer) => OBJECT_ID.test(answer)))]
+}
+
+async function advertisedCommitTips(
+  git: GitProcess,
+  repository: string,
+  remote: string,
+  refPrefixes: readonly string[] = ["refs/"],
+): Promise<string[]> {
+  return advertisedTips(git, repository, remote, await readAdvertisement(git, repository, remote, refPrefixes))
 }
 
 async function commitAvailableOnRemote(
@@ -1516,7 +1664,13 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
     }
     if (frozen.retention.length > 0) {
       // Validate every frozen destination and root lease before the first retention write.
-      await planUpdates(git, [...frozen.retention, ...frozen.publications, ...childUpdates, ...rootUpdates], timeoutMs)
+      // A direct merge's publications ARE its childUpdates (the same objects); planning them once halves the
+      // child-main observations of this pass (25303).
+      await planUpdates(
+        git,
+        [...frozen.retention, ...new Set([...frozen.publications, ...childUpdates]), ...rootUpdates],
+        timeoutMs,
+      )
       const result = await pushRefUpdates({
         root,
         updates: frozen.retention,
@@ -1538,7 +1692,19 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
           result.detail,
         )
       }
-      for (const update of frozen.retention) await verifyRetainedSource(git, update)
+      // A pin the retention push found already at its exact source was observed there under the lease, so
+      // only a pin this push wrote is fetched back to prove it retained (25303).
+      const alreadyRetained = new Set(
+        result.repositories.flatMap((repository) =>
+          repository.refs
+            .filter((ref) => ref.state === "unchanged")
+            .map((ref) => `${repository.repository}\0${ref.destination}\0${ref.source}`),
+        ),
+      )
+      for (const update of frozen.retention) {
+        if (alreadyRetained.has(`${update.repository}\0${update.destination}\0${update.source}`)) continue
+        await verifyRetainedSource(git, update)
+      }
     }
     if (childUpdates.length === 0 && options.recurseSubmodules === "only") {
       if (retained.length > 0) return gitSuperResult(retained)
