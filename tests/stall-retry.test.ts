@@ -138,16 +138,15 @@ describe("withStallRetry", () => {
     expect(inner.calls).toHaveLength(1)
   })
 
-  test.each([
-    { failure: "Git output capture is incomplete" },
-    { signal: "SIGTERM" },
-    { stalled: true },
-  ])("an incomplete publickey result never retries: %j", async (incomplete) => {
-    const first = { ...PUBLICKEY_REFUSAL, ...incomplete }
-    const inner = scripted([first, OK])
-    expect(await withStallRetry(inner).run(req(["fetch", "origin"]))).toBe(first)
-    expect(inner.calls).toHaveLength(1)
-  })
+  test.each([{ failure: "Git output capture is incomplete" }, { signal: "SIGTERM" }, { stalled: true }])(
+    "an incomplete publickey result never retries: %j",
+    async (incomplete) => {
+      const first = { ...PUBLICKEY_REFUSAL, ...incomplete }
+      const inner = scripted([first, OK])
+      expect(await withStallRetry(inner).run(req(["fetch", "origin"]))).toBe(first)
+      expect(inner.calls).toHaveLength(1)
+    },
+  )
 
   test("passes a successful first call straight through", async () => {
     const inner = scripted([OK])
