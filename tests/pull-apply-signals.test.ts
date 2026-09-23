@@ -168,8 +168,10 @@ describe("git super pull: the apply is not stopped by a signal (24907 row 2)", (
     const groups = named.split(", ").filter((group) => group !== "")
     expect(groups.length, result.backstop).toBeGreaterThan(0)
     for (const group of groups) {
-      const members = Bun.spawnSync(["ps", "-o", "pid=", "-g", group]).stdout.toString().trim()
-      expect(members, `process group ${group} still has members`).toBe("")
+      await until(() => {
+        const members = Bun.spawnSync(["ps", "-o", "pid=", "-g", group]).stdout.toString().trim()
+        return members === ""
+      }, `process group ${group} to have no members`)
     }
     // git's own group, then one per apply command: the root merge, each checkout and the hook, all recorded.
     expect(result.backstop).toMatch(
