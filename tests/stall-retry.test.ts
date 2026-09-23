@@ -13,16 +13,22 @@
  */
 import { afterEach, describe, expect, test, vi } from "vitest"
 import type { GitProcess, GitProcessRequest, GitProcessResult } from "../src/process.ts"
-import { isExactPublickeyRefusal, isRetryableRead, withStallRetry } from "../src/process.ts"
+import { isExactPublickeyRefusal, isRetryableRead, verboseSshRetryEnvironment, withStallRetry } from "../src/process.ts"
 
 /** A GitProcess that replays a scripted list of results and records its calls. */
-function scripted(results: readonly GitProcessResult[]): GitProcess & { calls: GitProcessRequest[] } {
+function scripted(
+  results: readonly GitProcessResult[],
+  config: GitProcessResult = { code: 1, stdout: "", stderr: "" },
+): GitProcess & { calls: GitProcessRequest[] } {
   const calls: GitProcessRequest[] = []
   let index = 0
   return {
     calls,
     run(request) {
       calls.push(request)
+      if (request.args.join(" ") === "config --get core.sshCommand") {
+        return Promise.resolve(config)
+      }
       const result = results[Math.min(index, results.length - 1)]
       index += 1
       return Promise.resolve(result as GitProcessResult)
@@ -128,8 +134,28 @@ describe("withStallRetry", () => {
     const pending = withStallRetry(inner).run(req(["ls-remote", "origin"]))
     await vi.advanceTimersByTimeAsync(5_000)
     expect(await pending).toBe(PUBLICKEY_REFUSAL)
-    expect(inner.calls).toHaveLength(2)
+    expect(inner.calls).toHaveLength(3)
     expect(announced).toHaveBeenCalledOnce()
+  })
+
+  test("reads core.sshCommand and retries with its identity flags intact", async () => {
+    vi.useFakeTimers()
+    const announced = vi.spyOn(console, "error").mockImplementation(() => {})
+    const inner = scripted([PUBLICKEY_REFUSAL, OK], {
+      code: 0,
+      stdout: "/tmp/fleet-ssh --identity-marker\n",
+      stderr: "",
+    })
+    const pending = withStallRetry(inner).run(req(["ls-remote", "origin"]))
+    await vi.advanceTimersByTimeAsync(5_000)
+    expect((await pending).code).toBe(0)
+    expect(inner.calls.map((call) => call.args.join(" "))).toEqual([
+      "ls-remote origin",
+      "config --get core.sshCommand",
+      "ls-remote origin",
+    ])
+    expect(inner.calls[2]?.env?.GIT_SSH_COMMAND).toBe("/tmp/fleet-ssh --identity-marker -v")
+    expect(announced.mock.calls[0]?.[0]).toContain("/tmp/fleet-ssh --identity-marker -v")
   })
 
   test("a publickey refusal on a write never retries", async () => {
@@ -152,6 +178,21 @@ describe("withStallRetry", () => {
     const inner = scripted([OK])
     await withStallRetry(inner).run(req(["ls-remote", "origin"]))
     expect(inner.calls).toHaveLength(1)
+  })
+})
+
+describe("verboseSshRetryEnvironment", () => {
+  test("preserves Git's command precedence and quotes GIT_SSH as one program", () => {
+    expect(
+      verboseSshRetryEnvironment({ GIT_SSH_COMMAND: "ssh -i chosen", GIT_SSH: "/other" }, "ssh -i config").command,
+    ).toBe("ssh -i chosen -v")
+    expect(verboseSshRetryEnvironment({ GIT_SSH: "/tmp/one two's ssh" }, "ssh -i config").command).toBe(
+      "ssh -i config -v",
+    )
+    expect(verboseSshRetryEnvironment({ GIT_SSH: "/tmp/one two's ssh" }, undefined).command).toBe(
+      "'/tmp/one two'\\''s ssh' -v",
+    )
+    expect(verboseSshRetryEnvironment({}, undefined).command).toBe("ssh -v")
   })
 })
 

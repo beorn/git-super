@@ -185,6 +185,37 @@ export function isExactPublickeyRefusal(result: Pick<GitProcessResult, "code" | 
   )
 }
 
+/** Preserve Git's SSH selection while enabling OpenSSH's offered-key trace. */
+export function verboseSshRetryEnvironment(
+  env: NodeJS.ProcessEnv,
+  coreSshCommand: string | undefined,
+): Readonly<{ env: NodeJS.ProcessEnv; command: string }> {
+  const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`
+  const selected =
+    env.GIT_SSH_COMMAND !== undefined
+      ? env.GIT_SSH_COMMAND
+      : coreSshCommand !== undefined
+        ? coreSshCommand
+        : env.GIT_SSH !== undefined
+          ? quote(env.GIT_SSH)
+          : "ssh"
+  if (selected.trim() === "") throw new Error("git-super: effective SSH command is empty after a publickey refusal")
+  const command = `${selected} -v`
+  return { env: { ...env, GIT_SSH_COMMAND: command }, command }
+}
+
+/** An exit 1 with no output is Git's documented absent config answer. */
+export function coreSshCommandFromConfig(result: GitProcessResult, repo: string): string | undefined {
+  if (result.code === 1 && result.stdout === "" && result.stderr === "" && result.failure === undefined)
+    return undefined
+  if (result.code !== 0 || result.failure !== undefined || result.timedOut || result.stalled || result.signal) {
+    throw new Error(
+      `git-super: cannot read core.sshCommand in ${repo}: ${result.failure ?? result.stderr ?? String(result.code)}`,
+    )
+  }
+  return result.stdout.replace(/\r?\n$/u, "")
+}
+
 function waitForReadRetry(ms: number, signal: AbortSignal | undefined): Promise<boolean> {
   if (signal?.aborted) return Promise.resolve(false)
   return new Promise((resolve) => {
@@ -246,20 +277,23 @@ function withReadRetry(inner: GitProcess, options: StallRetryOptions, environmen
           isExactPublickeyRefusal(result)
         ) {
           retriedPublickey = true
+          const effectiveEnv = { ...environment, ...request.env }
+          const config =
+            effectiveEnv.GIT_SSH_COMMAND === undefined
+              ? coreSshCommandFromConfig(
+                  await inner.run({ ...request, args: ["config", "--get", "core.sshCommand"] }),
+                  request.repo,
+                )
+              : undefined
+          const verbose = verboseSshRetryEnvironment(effectiveEnv, config)
           console.error(
             `git-super: git ${request.args.join(" ")} in ${request.repo}: Permission denied (publickey).; ` +
-              `retry 2/2 after ${String(PUBLICKEY_BACKOFF_MS)}ms with ssh -v`,
+              `retry 2/2 after ${String(PUBLICKEY_BACKOFF_MS)}ms with ${verbose.command}`,
           )
           if (!(await waitForReadRetry(PUBLICKEY_BACKOFF_MS, request.signal))) return result
-          const ssh =
-            request.env?.GIT_SSH_COMMAND ??
-            environment.GIT_SSH_COMMAND ??
-            request.env?.GIT_SSH ??
-            environment.GIT_SSH ??
-            "ssh"
           result = await inner.run({
             ...request,
-            env: { ...request.env, GIT_SSH_COMMAND: `${ssh} -v` },
+            env: { ...request.env, GIT_SSH_COMMAND: verbose.command },
           })
           continue
         }
