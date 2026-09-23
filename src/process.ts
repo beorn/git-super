@@ -1,6 +1,8 @@
 import { cleanGitEnvironment, cleanGitRepositoryEnvironment } from "./git.ts"
-import { realpathSync } from "node:fs"
+import { appendFileSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs"
 import { Blob } from "node:buffer"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 
 export { cleanGitEnvironment } from "./git.ts"
@@ -24,6 +26,7 @@ function spawnGit(
     env: NodeJS.ProcessEnv
     stdin: "inherit" | "ignore" | Blob
     signal?: AbortSignal
+    detached?: boolean
   },
 ) {
   return Bun.spawn([nativeGitExecutable(), ...args], { ...options, stdout: "pipe", stderr: "pipe" })
@@ -70,6 +73,17 @@ export type GitProcessRequest = Readonly<{
   stdin?: string
   signal?: AbortSignal
   timeoutMs?: number
+  /**
+   * Run the command in its own process group, so a signal to the caller's group (a terminal's Ctrl-C) does not reach
+   * it. Its group is appended to the file {@link APPLY_GROUPS_ENV} names, when set, for a backstop to kill (24907).
+   */
+  detached?: boolean
+  /**
+   * Opt-in backstop (24907): the command runs in its own group, SIGTERM still goes to its pid at `timeoutMs`, and at
+   * `backstopMs` SIGKILL goes to its group and to every group a detached descendant recorded in the file
+   * {@link APPLY_GROUPS_ENV} names. Nothing of the command survives it.
+   */
+  backstopMs?: number
 }>
 
 export type GitProcessResult = Readonly<{
@@ -80,7 +94,59 @@ export type GitProcessResult = Readonly<{
   signal?: string | null
   timedOut?: boolean
   stalled?: boolean
+  /** What the backstop killed, when it fired: loud, never a quiet timeout. */
+  backstop?: string
 }>
+
+/**
+ * The FILE a detached command's process group is appended to, one pgid per line (24907). A child cannot change its
+ * parent's environment, so the record is this file: git-super appends to it, the parent's backstop reads it.
+ */
+export const APPLY_GROUPS_ENV = "GIT_SUPER_APPLY_GROUPS"
+
+/** Append a detached child's group to the record, when the caller armed one; a failed write is said, not swallowed. */
+function recordApplyGroup(pid: number): void {
+  const file = process.env[APPLY_GROUPS_ENV]
+  if (file === undefined || file === "") return
+  try {
+    appendFileSync(file, `${String(pid)}\n`)
+  } catch (error) {
+    process.stderr.write(
+      `git-super: could not record process group ${String(pid)} in ${file} (${error instanceof Error ? error.message : String(error)}); ` +
+        "a backstop will not see it\n",
+    )
+  }
+}
+
+/** SIGKILL a command's own group and every group its detached descendants recorded; never throws. */
+function killBackstopGroups(pid: number, groupsFile: string, afterMs: number): string {
+  let recorded: number[] = []
+  let unreadable = ""
+  try {
+    recorded = readFileSync(groupsFile, "utf8")
+      .split("\n")
+      .map((line) => Number(line.trim()))
+      .filter((group) => Number.isSafeInteger(group) && group > 1)
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code !== "ENOENT") unreadable = `; the group record ${groupsFile} was unreadable (${code ?? String(error)})`
+  }
+  const groups = [...new Set([pid, ...recorded])]
+  const failures: string[] = []
+  for (const group of groups) {
+    try {
+      process.kill(-group, "SIGKILL")
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (code !== "ESRCH") failures.push(`${String(group)}: ${code ?? String(error)}`)
+    }
+  }
+  return (
+    `backstop at ${String(afterMs)}ms: SIGKILL to process group(s) ${groups.join(", ")}` +
+    ` (${String(recorded.length)} recorded by the command)${unreadable}` +
+    (failures.length === 0 ? "" : `; kill(s) FAILED: ${failures.join(", ")}`)
+  )
+}
 
 /**
  * Read-only network verbs that are safe to re-run after a STALL.
@@ -229,17 +295,29 @@ export function createLocalGitProcess(
   const runOnce = async (request: GitProcessRequest): Promise<GitProcessResult> => {
     {
       let timedOut = false
+      let backstop: string | undefined
       let child: ReturnType<typeof Bun.spawn>
+      // The backstop's record of the groups this command's detached descendants start (24907).
+      const groupsDir =
+        request.backstopMs === undefined ? undefined : mkdtempSync(join(tmpdir(), "git-super-apply-groups-"))
+      const groupsFile = groupsDir === undefined ? undefined : join(groupsDir, "groups")
       try {
         child = spawnGit(["-C", request.repo, ...request.args], {
-          env: { ...baseEnvironment, ...request.env },
+          env: {
+            ...baseEnvironment,
+            ...request.env,
+            ...(groupsFile === undefined ? {} : { [APPLY_GROUPS_ENV]: groupsFile }),
+          },
           stdin: request.stdin === undefined ? "ignore" : new Blob([request.stdin]),
           ...(request.signal === undefined ? {} : { signal: request.signal }),
+          ...(request.detached === true || groupsFile !== undefined ? { detached: true } : {}),
         })
       } catch (error) {
+        if (groupsDir !== undefined) rmSync(groupsDir, { recursive: true, force: true })
         const failure = error instanceof Error ? error.message : String(error)
         return { code: 1, stdout: "", stderr: failure, failure }
       }
+      if (request.detached === true) recordApplyGroup(child.pid)
       const timer =
         request.timeoutMs === undefined
           ? undefined
@@ -247,17 +325,27 @@ export function createLocalGitProcess(
               timedOut = true
               child.kill()
             }, request.timeoutMs)
+      const backstopTimer =
+        request.backstopMs === undefined || groupsFile === undefined
+          ? undefined
+          : setTimeout(() => {
+              timedOut = true
+              backstop = killBackstopGroups(child.pid, groupsFile, request.backstopMs as number)
+            }, request.backstopMs)
       const [code, stdout, stderr] = await Promise.all([
         child.exited,
         new Response(child.stdout as ReadableStream<Uint8Array>).text(),
         new Response(child.stderr as ReadableStream<Uint8Array>).text(),
       ])
       if (timer !== undefined) clearTimeout(timer)
+      if (backstopTimer !== undefined) clearTimeout(backstopTimer)
+      if (groupsDir !== undefined) rmSync(groupsDir, { recursive: true, force: true })
       return {
         code,
         stdout,
         stderr: stderr.trim(),
         ...(timedOut ? { timedOut: true } : {}),
+        ...(backstop === undefined ? {} : { backstop }),
       }
     }
   }

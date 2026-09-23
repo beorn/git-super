@@ -1,4 +1,4 @@
-import { copyFileSync, mkdtempSync, rmSync } from "node:fs"
+import { chmodSync, copyFileSync, existsSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { isAbsolute, join, resolve } from "node:path"
 import { readCommitGitlinks } from "./commit-graph.ts"
@@ -21,6 +21,11 @@ export type SuperPullOptions = Readonly<{
    * slow pull still holds the phase it was in (24907). The CLI binds it to stderr.
    */
   report?: (message: string) => void
+  /**
+   * Receives the lines a pull always says, progress or not: a signal deferred during the apply (24907). Defaults to
+   * stderr.
+   */
+  warn?: (message: string) => void
 }>
 
 /** Announce that a named phase is starting. */
@@ -52,6 +57,71 @@ function detail(code: string, phase: string, message: string, extra: Partial<Git
 
 async function run(git: GitProcess, repository: string, args: readonly string[], environment?: NodeJS.ProcessEnv) {
   return git.run({ repo: repository, args, ...(environment === undefined ? {} : { env: environment }) })
+}
+
+/** An apply command: in its own process group, so a terminal's Ctrl-C to the caller's group cannot tear it (24907). */
+async function runApply(git: GitProcess, repository: string, args: readonly string[]) {
+  return git.run({ repo: repository, args, detached: true })
+}
+
+/** The signals a pull defers from its first write until every repository is at the target (@cto 73a0e53e). */
+const APPLY_DEFERRED_SIGNALS = ["SIGTERM", "SIGINT", "SIGHUP"] as const
+
+type DeferredSignal = Readonly<{ signal: NodeJS.Signals; phase: string }>
+
+/**
+ * Hold SIGTERM, SIGINT and SIGHUP while the apply runs: the first one is said on one line, naming the signal and the
+ * phase, and nothing stops. Planning, fetch and the lock wait install no handler, so they stay killable.
+ */
+function deferApplySignals(warn: (message: string) => void): Readonly<{
+  at(phase: string): void
+  release(): DeferredSignal | undefined
+}> {
+  let phase = "apply-preflight"
+  let deferred: DeferredSignal | undefined
+  const handlers = APPLY_DEFERRED_SIGNALS.map((signal) => {
+    const handler = () => {
+      if (deferred !== undefined) return
+      deferred = { signal, phase }
+      warn(`git-super pull: deferring ${signal} until the apply completes (phase ${phase})\n`)
+    }
+    process.on(signal, handler)
+    return [signal, handler] as const
+  })
+  return {
+    at(name) {
+      phase = name
+    },
+    release() {
+      for (const [signal, handler] of handlers) process.off(signal, handler)
+      return deferred
+    },
+  }
+}
+
+/**
+ * A scratch hooks directory that runs every executable hook of the root's own except post-merge, each through a
+ * wrapper that execs the real file (hooks that find their siblings from $0 keep working). The root merge runs with it,
+ * and post-merge runs once after the last checkout, on the whole tree (@cto 73a0e53e condition 2).
+ */
+async function hooksWithoutPostMerge(
+  git: GitProcess,
+  root: string,
+): Promise<Readonly<{ dir: string; remove(): void }>> {
+  const hooks = await required(git, root, ["rev-parse", "--path-format=absolute", "--git-path", "hooks"], "apply-hooks")
+  const dir = mkdtempSync(join(tmpdir(), "git-super-hooks-"))
+  if (existsSync(hooks)) {
+    for (const name of readdirSync(hooks)) {
+      if (name === "post-merge") continue
+      const real = join(hooks, name)
+      const stat = statSync(real, { throwIfNoEntry: false })
+      if (stat === undefined || !stat.isFile() || (stat.mode & 0o111) === 0) continue
+      const wrapper = join(dir, name)
+      writeFileSync(wrapper, `#!/bin/sh\nexec '${real.replaceAll("'", "'\\''")}' "$@"\n`)
+      chmodSync(wrapper, 0o755)
+    }
+  }
+  return { dir, remove: () => rmSync(dir, { recursive: true, force: true }) }
 }
 
 async function required(git: GitProcess, repository: string, args: readonly string[], phase: string): Promise<string> {
@@ -517,6 +587,77 @@ function repositoryResult(
 }
 
 /** Fetch, freeze, preflight, recheck under the shared mutation lock, then fast-forward. */
+/**
+ * Move every repository to its target: the root merge (post-merge suppressed), each submodule checkout, then the
+ * root's post-merge hook once, on the whole tree. A hook failure leaves the pull applied, with a detail that says so.
+ */
+async function applyRepositories(
+  git: GitProcess,
+  plan: PullPlan,
+  hooksDir: string,
+  phase: Phase,
+): Promise<GitSuperResult> {
+  const results: GitSuperRepositoryResult[] = []
+  for (const [index, repository] of plan.repositories.entries()) {
+    if (repository.current === repository.target) {
+      results.push(repositoryResult(repository, "unchanged"))
+      continue
+    }
+    phase(index === 0 ? "apply-root" : `apply-submodule ${repository.path}`)
+    const args =
+      index === 0
+        ? [
+            "-c",
+            `core.hooksPath=${hooksDir}`,
+            "-c",
+            "submodule.recurse=false",
+            "merge",
+            "--ff-only",
+            "--no-edit",
+            repository.target,
+          ]
+        : ["-c", "submodule.recurse=false", "checkout", "--detach", repository.target]
+    const applied = await runApply(git, repository.repository, args)
+    if (applied.code !== 0) {
+      const failure = operationError(
+        repository.repository,
+        index === 0 ? "apply-root" : "apply-submodule",
+        args,
+        applied,
+      ).resultDetail
+      results.push(repositoryResult(repository, "failed", failure))
+      for (const remaining of plan.repositories.slice(index + 1)) {
+        results.push(repositoryResult(remaining, "not-run", failure))
+      }
+      return gitSuperResult(results, failure)
+    }
+    results.push(repositoryResult(repository, "updated"))
+  }
+
+  const root = plan.repositories[0]
+  if (root !== undefined && root.current !== root.target) {
+    phase("post-merge-hook")
+    const hook = await runApply(git, root.repository, ["hook", "run", "--ignore-missing", "post-merge", "--", "0"])
+    if (hook.code !== 0 || hook.failure !== undefined || hook.timedOut === true) {
+      const why = hook.timedOut === true ? "timed out" : (hook.failure ?? `exited ${String(hook.code)}`)
+      return gitSuperResult(
+        results,
+        detail(
+          "post-merge-hook-failed",
+          "post-merge-hook",
+          `Every repository is at its target, but the root's post-merge hook ${why}: ${hook.stderr || "<no stderr>"}`,
+          {
+            paths: [root.path],
+            remedy: "The pull is applied. Rerun the hook with `git hook run post-merge -- 0` in the root.",
+          },
+        ),
+      )
+    }
+  }
+  phase("applied")
+  return gitSuperResult(results, plan.detail)
+}
+
 export async function superPull(options: SuperPullOptions): Promise<GitSuperResult> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
@@ -528,7 +669,12 @@ export async function superPull(options: SuperPullOptions): Promise<GitSuperResu
     run: (request) => process.run({ ...request, timeoutMs: request.timeoutMs ?? timeoutMs }),
   }
   const startedAt = Date.now()
-  const phase: Phase = (name) => options.report?.(`git-super pull: ${name} +${Date.now() - startedAt}ms\n`)
+  let deferral: ReturnType<typeof deferApplySignals> | undefined
+  const phase: Phase = (name) => {
+    deferral?.at(name)
+    options.report?.(`git-super pull: ${name} +${Date.now() - startedAt}ms\n`)
+  }
+  const warn = options.warn ?? ((message: string) => globalThis.process.stderr.write(message))
   let plan: PullPlan
   try {
     plan = await planPull(git, options, phase)
@@ -604,35 +750,23 @@ export async function superPull(options: SuperPullOptions): Promise<GitSuperResu
         }
         phase("apply-preflight")
         await proveRepositoryTransitions(git, plan.repositories)
-        const results: GitSuperRepositoryResult[] = []
-        for (const [index, repository] of plan.repositories.entries()) {
-          if (repository.current === repository.target) {
-            results.push(repositoryResult(repository, "unchanged"))
-            continue
-          }
-          phase(index === 0 ? "apply-root" : `apply-submodule ${repository.path}`)
-          const args =
-            index === 0
-              ? ["-c", "submodule.recurse=false", "merge", "--ff-only", "--no-edit", repository.target]
-              : ["-c", "submodule.recurse=false", "checkout", "--detach", repository.target]
-          const applied = await run(git, repository.repository, args)
-          if (applied.code !== 0) {
-            const failure = operationError(
-              repository.repository,
-              index === 0 ? "apply-root" : "apply-submodule",
-              args,
-              applied,
-            ).resultDetail
-            results.push(repositoryResult(repository, "failed", failure))
-            for (const remaining of plan.repositories.slice(index + 1)) {
-              results.push(repositoryResult(remaining, "not-run", failure))
-            }
-            return gitSuperResult(results, failure)
-          }
-          results.push(repositoryResult(repository, "updated"))
+        const root = plan.repositories[0]
+        if (root === undefined) throw new Error("git-super: pull plan contained no root repository")
+        const hooks = await hooksWithoutPostMerge(git, root.repository)
+        // From the first write until every repository is at the target, no signal stops the apply (24907).
+        deferral = deferApplySignals(warn)
+        let applied: GitSuperResult
+        let deferred: DeferredSignal | undefined
+        try {
+          applied = await applyRepositories(git, plan, hooks.dir, phase)
+        } finally {
+          deferred = deferral.release()
+          deferral = undefined
+          hooks.remove()
         }
-        phase("applied")
-        return gitSuperResult(results, plan.detail)
+        if (deferred === undefined) return applied
+        warn(`git-super pull: the apply is complete; exiting for the deferred ${deferred.signal}\n`)
+        return { ...applied, deferredSignal: deferred }
       },
       { holder: "git super pull --ff-only" },
     )
