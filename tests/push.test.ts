@@ -7,7 +7,7 @@ import { runCli } from "../src/cli.ts"
 import { acquireExclusive, createExclusive, type Exclusive } from "../src/exclusive.ts"
 import { createLocalGitProcess, type GitProcess } from "../src/process.ts"
 import { pushRefUpdates, remoteContainsCommit, superPush } from "../src/push.ts"
-import { encodePushIntent, PUSH_INTENT_TRAILER } from "../src/push-intent.ts"
+import { encodePushIntent, PUSH_INTENT_TRAILER, readFrozenPushIntents } from "../src/push-intent.ts"
 import { advanceRepository, canonicalTmpdir as tmpdir, createRepository, git } from "./fixture.ts"
 
 const roots: string[] = []
@@ -1221,6 +1221,80 @@ describe("explicit recursive push mechanics", () => {
     const many = await callsFor(16)
     expect(many - one).toBeLessThan(5)
   }, 30_000)
+
+  test("pushes two annotated tags of one commit with on-demand recursion", async () => {
+    const { repository, remote, source } = pushFixture("annotated-tag-intent-scan")
+    git(repository, "tag", "-a", "v1", source, "-m", "first release")
+    git(repository, "tag", "-a", "v2", source, "-m", "second release")
+    const local = createLocalGitProcess()
+    let peelCalls = 0
+    const counting: GitProcess = {
+      run(request) {
+        if (request.args[0] === "rev-parse" && request.args[1] === "--revs-only") peelCalls++
+        return local.run(request)
+      },
+    }
+
+    const result = await superPush({
+      repo: repository,
+      remote,
+      refspecs: ["refs/tags/v1:refs/tags/v1", "refs/tags/v2:refs/tags/v2"],
+      recurseSubmodules: "on-demand",
+      git: counting,
+    })
+
+    expect(result.state).toBe("updated")
+    expect(peelCalls).toBe(1)
+    expect(git(remote, "rev-parse", "refs/tags/v1")).toBe(git(repository, "rev-parse", "refs/tags/v1"))
+    expect(git(remote, "rev-parse", "refs/tags/v2")).toBe(git(repository, "rev-parse", "refs/tags/v2"))
+  })
+
+  test("reads mixed frozen intents across the 128-commit batch boundary", async () => {
+    const { repository, source } = pushFixture("intent-batch-boundary")
+    const tree = git(repository, "rev-parse", `${source}^{tree}`)
+    const side = git(repository, "commit-tree", tree, "-p", source, "-m", "side")
+    const intent = { version: 1 as const, rootRemote: "https://git-super.test/owned/root.git", children: [] }
+    const trailer = `${PUSH_INTENT_TRAILER}: ${encodePushIntent(intent)}`
+    const sources: string[] = []
+    let head = source
+    for (let index = 0; index < 130; index += 1) {
+      head = git(
+        repository,
+        "commit-tree",
+        tree,
+        "-p",
+        head,
+        "-p",
+        side,
+        "-m",
+        index === 129 ? `merge ${index}\n\n${trailer}` : `merge ${index}`,
+      )
+      sources.push(head)
+    }
+    const local = createLocalGitProcess()
+    let shows = 0
+    const counting: GitProcess = {
+      run(request) {
+        if (request.args[0] === "show") shows++
+        return local.run(request)
+      },
+    }
+
+    const intents = await readFrozenPushIntents(counting, repository, sources)
+    expect(shows).toBe(2)
+    expect([...intents.keys()]).toEqual(sources)
+    expect(intents.get(sources[0]!)).toBeUndefined()
+    expect(intents.get(sources[128]!)).toBeUndefined()
+    expect(intents.get(sources[129]!)).toEqual(intent)
+  }, 30_000)
+
+  test("fails loudly when a frozen-intent batch contains a missing commit", async () => {
+    const { repository, source } = pushFixture("intent-batch-missing")
+    const missing = "0".repeat(40)
+    await expect(readFrozenPushIntents(createLocalGitProcess(), repository, [source, missing])).rejects.toThrow(
+      /Merge intent batch: git show .* failed .*fatal: bad object/su,
+    )
+  })
 
   /**
    * M8.5 frozen recovery must reuse captured destinations after child config changes.

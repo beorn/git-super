@@ -977,8 +977,21 @@ async function frozenChildUpdates(
   const updates: RefUpdate[] = []
   const retention: RefUpdate[] = []
   const publications: RefUpdate[] = []
-  const direct = new Set(rootUpdates.map((update) => update.source).filter((source) => source !== ""))
-  if (direct.size === 0) return { updates: undefined, retention, publications }
+  const sources = [...new Set(rootUpdates.map((update) => update.source).filter((source) => source !== ""))]
+  if (sources.length === 0) return { updates: undefined, retention, publications }
+  // An annotated tag's source is a tag object. The intent belongs to its
+  // commit, and multiple tags may peel to that same commit.
+  const peeled = await required(
+    git,
+    root,
+    ["rev-parse", "--revs-only", ...sources.map((source) => `${source}^{commit}`)],
+    "peel-frozen-push-sources",
+  )
+  const commits = peeled.split("\n")
+  if (commits.length !== sources.length || commits.some((commit) => !/^[0-9a-f]{40}$/u.test(commit))) {
+    throw new Error(`Peel frozen push sources in ${root}: expected ${sources.length} commit OIDs`)
+  }
+  const direct = new Set(commits)
   const advertised = await advertisedCommitTips(git, root, remote)
   const reachable = await required(
     git,
