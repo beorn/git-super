@@ -8,6 +8,7 @@ import {
   type SubmoduleCommitResolution,
   type SubmoduleCompositionExecutionOptions,
   type SubmoduleCompositionOverlap,
+  type SubmoduleResolution,
   type SubmoduleTreeConflict,
 } from "./composition.ts"
 import { ensureCommitObject, pinRef } from "./objects.ts"
@@ -1066,6 +1067,28 @@ const ABSENT_OBJECT = "0".repeat(40)
 /** Carried from the root merge message so the component history names the same change. */
 const CARRIED_TRAILER = /^(?:Change|Merged-By):\s*\S/u
 
+/**
+ * `merge-base --is-ancestor` as a three-valued answer: exit 0 is yes, exit 1
+ * is no, and anything else (128: an object is absent) is the error text,
+ * never a "no". Reading an absent object as "not an ancestor" is how a
+ * fast-forward became "diverged" (25280).
+ */
+async function containsCommit(
+  git: GitProcess,
+  store: string,
+  ancestor: string,
+  descendant: string,
+  timeoutMs: number,
+): Promise<boolean | string> {
+  const probe = await run(git, store, ["merge-base", "--is-ancestor", ancestor, descendant], timeoutMs)
+  const command = `git -C ${store} merge-base --is-ancestor ${ancestor} ${descendant}`
+  if (probe.timedOut) return `${command} timed out after ${timeoutMs}ms`
+  if (probe.failure !== undefined) return `${command} could not run: ${String(probe.failure)}`
+  if (probe.code === 0) return true
+  if (probe.code === 1) return false
+  return `${command} exited ${probe.code}: ${probe.stderr.trim() || "no stderr"}`
+}
+
 async function ensureCompositionCommit(
   git: GitProcess,
   store: string,
@@ -1191,14 +1214,12 @@ async function composeDivergedGitlinks(
     )
     if (!hasCommit) {
       return {
-        failure: composeRefused({
+        failure: componentUnfetched({
           entries,
           evidence: `git -C ${store} fetch origin refs/git-super/pins/${resolution.incomingSha}`,
           head,
-          paths,
-          reasons: [
-            `gitlink ${resolution.path}: diverged; component commit ${resolution.incomingSha} could not be fetched`,
-          ],
+          path: resolution.path,
+          sha: resolution.incomingSha,
           stageEvidence,
           target,
         }),
@@ -1207,18 +1228,66 @@ async function composeDivergedGitlinks(
   }
 
   /**
+   * SETTLE FAST-FORWARDS NOW THAT EVERY INCOMING COMMIT IS PRESENT (25280).
+   * The planner sees only the three stages, and Git hands over a three-stage
+   * gitlink conflict whenever the store lacks one side, even when that side
+   * simply descends from the other. Composing such a pair makes the path gate
+   * read the older side's own changes, which the newer side contains, as an
+   * overlap: queue run q-20260923T145509635Z-1de06624 sent two ag
+   * fast-forwards back as "diverged; files overlap" this way. So incoming is
+   * a pin when base <= current <= incoming, which is Git's own fast-forward
+   * rule. A pair that fails either step stays a composition, and the
+   * composition names the rewind it cannot build on. Git already resolves
+   * "current contains incoming" before this runs, so there is no second pin.
+   */
+  const settledResolutions: SubmoduleResolution[] = []
+  for (const resolution of plan.resolutions) {
+    if (resolution.kind !== "compose") {
+      settledResolutions.push(resolution)
+      continue
+    }
+    const store = storeByOrigin.get(resolution.origin) ?? join(root, resolution.path)
+    const incomingContainsCurrent = await containsCommit(
+      git,
+      store,
+      resolution.currentSha,
+      resolution.incomingSha,
+      timeoutMs,
+    )
+    const currentContainsBase =
+      incomingContainsCurrent === true
+        ? await containsCommit(git, store, resolution.baseSha, resolution.currentSha, timeoutMs)
+        : false
+    if (typeof incomingContainsCurrent === "string" || typeof currentContainsBase === "string") {
+      const detail = typeof incomingContainsCurrent === "string" ? incomingContainsCurrent : currentContainsBase
+      return {
+        failure: composeUnavailable(
+          root,
+          [resolution.path],
+          `decide whether ${resolution.incomingSha} fast-forwards ${resolution.currentSha} from base ${resolution.baseSha}`,
+          String(detail),
+        ),
+      }
+    }
+    if (incomingContainsCurrent && currentContainsBase) {
+      settledResolutions.push({ kind: "pin", path: resolution.path, sha: resolution.incomingSha })
+    } else settledResolutions.push(resolution)
+  }
+  const settled = { ...plan, resolutions: settledResolutions }
+
+  /**
    * NO PATH GATE (24977, @cto e8368e85 constraint 5): "clean" is merge-tree's
    * own answer below, not file disjointness. Both sides' changed files are still
    * counted, because the composition's evidence reports them.
    */
   let overlaps: readonly SubmoduleCompositionOverlap[]
   try {
-    overlaps = await findSubmoduleCompositionOverlaps(plan, options)
+    overlaps = await findSubmoduleCompositionOverlaps(settled, options)
   } catch (error) {
     return { failure: composeUnavailable(root, paths, "enumerate what each side changed", messageOf(error)) }
   }
 
-  const executed = await composeSubmoduleCommits(plan, options)
+  const executed = await composeSubmoduleCommits(settled, options)
   if (executed.status === "refused") {
     const { detail, kind, operation, path } = executed.failure
     if (kind === "unavailable") return { failure: composeUnavailable(root, [path], operation, detail) }
@@ -1472,6 +1541,41 @@ function composeRefused(
     {
       objectIds: [...new Set([head, target, ...entries.map((entry) => entry.oid)])],
       paths,
+      phase: "preflight-merge",
+    },
+  )
+}
+
+/**
+ * The change's component commit (THEIRS) could not be fetched, so nothing about
+ * the two sides is known: not "diverged", which is a claim about history this
+ * merge never read (25280). The code stays gitlink-compose-refused and the
+ * message keeps "could not be fetched", which is how yrd routes it back with
+ * its publish-and-resubmit remedy.
+ */
+function componentUnfetched(
+  refusal: Readonly<{
+    entries: readonly IndexEntry[]
+    evidence: string
+    head: string
+    path: string
+    sha: string
+    stageEvidence: string
+    target: string
+  }>,
+): GitResultDetail {
+  const { entries, evidence, head, path, sha, stageEvidence, target } = refusal
+  return obviousDetail(
+    "gitlink-compose-refused",
+    `Merge ${target} moves ${JSON.stringify(path)} to component commit ${sha} (theirs), which could not be fetched ` +
+      `from the submodule's remote as refs/git-super/pins/${sha}, by its sha, or from the task branch; ` +
+      `no commit was written.${stageEvidence ? ` ${stageEvidence}` : ""}`,
+    evidence,
+    "Publish the component commit (yrd submit pushes it as refs/git-super/pins/<sha>), or repair the fetch the evidence names, then submit again.",
+    "the caller",
+    {
+      objectIds: [...new Set([head, target, sha, ...entries.map((entry) => entry.oid)])],
+      paths: [path],
       phase: "preflight-merge",
     },
   )

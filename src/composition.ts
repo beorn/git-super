@@ -226,14 +226,33 @@ async function composeSubmoduleCommit(
     await requiredGit(context, store, ["cat-file", "-e", `${resolution.currentSha}^{commit}`], operation)
     await requiredGit(context, store, ["cat-file", "-e", `${resolution.incomingSha}^{commit}`], operation)
 
+    // Every object is present (verified above), so a side that does not descend
+    // from the base is a REWIND that side made, not an environment the queue
+    // cannot judge. Merging onto it would silently re-apply what was rewound:
+    // with no overlap gate in front (24977), merge-tree alone would call such a
+    // pair clean. It goes back to its author named, never as "cannot judge".
     operation = "verify the planned merge base"
-    for (const parent of [resolution.currentSha, resolution.incomingSha]) {
+    for (const [side, parent] of [
+      ["main", resolution.currentSha],
+      ["change", resolution.incomingSha],
+    ] as const) {
       if (!(await isAncestor(context, store, resolution.baseSha, parent))) {
+        // Two histories with nothing in common cannot be judged at all (@cto 7645ec3a).
+        const shared = await runGit(context, store, ["merge-base", resolution.baseSha, parent])
+        if (shared.code === 1 && settled(shared)) {
+          return refused(
+            "unavailable",
+            resolution.path,
+            operation,
+            `planned base '${resolution.baseSha}' is not an ancestor of parent '${parent}'`,
+          )
+        }
+        if (!settled(shared) || shared.code !== 0) throw new Error(gitDetail(shared))
         return refused(
-          "unavailable",
+          "conflict",
           resolution.path,
           operation,
-          `planned base '${resolution.baseSha}' is not an ancestor of parent '${parent}'`,
+          `rewound: the ${side} pin ${parent} does not descend from the base ${resolution.baseSha}`,
         )
       }
     }
