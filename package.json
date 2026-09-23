@@ -132,7 +132,8 @@
       "src/submodule-origin.ts",
       "src/worktree.ts"
     ],
-    "format": "esm"
+    "format": "esm",
+    "target": "node20"
   },
   "engines": {
     "bun": ">=1.3.14"
