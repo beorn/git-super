@@ -2793,17 +2793,18 @@ describe("git super merge — each phase reports how long it took (25303 tier 2)
     const fixture = createProductFixture(fixtureRoot)
     const newestAlpha = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 'stepped'\n")
     const candidate = candidateWithRootChange(fixture, "candidate-steps")
-    // The call's first and last git commands (finding the root, publishing the
-    // receipt) are slowed, so time left outside every step at either edge is
-    // far larger than the slack.
+    // The call's first git command (finding the root), its commit, and its last
+    // (publishing the receipt) are slowed, so time left outside every step at
+    // either edge is far larger than the slack.
     const local = createLocalGitProcess()
     const edges: string[] = []
     let calls = 0
     const slowEdges: GitProcess = {
       run: async (request) => {
         const first = calls++ === 0
+        const commit = request.args[0] === "commit"
         const receipt = request.args[0] === "update-ref" && request.args[1]?.startsWith("refs/git-super/receipts/")
-        if (first || receipt === true) {
+        if (first || commit || receipt === true) {
           edges.push(request.args.slice(0, 2).join(" "))
           await new Promise((resolve) => setTimeout(resolve, 150))
         }
@@ -2819,9 +2820,16 @@ describe("git super merge — each phase reports how long it took (25303 tier 2)
     })
     expect(edges).toEqual([
       "rev-parse --show-toplevel",
+      expect.stringMatching(/^commit /u),
       expect.stringMatching(/^update-ref refs\/git-super\/receipts\//u),
     ])
     expect(result.steps?.map((step) => step.name)).toEqual([...SUPER_MERGE_STEPS])
+    // Each slowed command lands on the phase that owns it: finding the root is
+    // preflight's first command, and the commit and its receipt are commit's
+    // first and last, so a boundary moved past either one loses its 150 ms.
+    const ms = (name: string) => result.steps?.find((step) => step.name === name)?.ms ?? 0
+    expect(ms("preflight")).toBeGreaterThanOrEqual(150)
+    expect(ms("commit")).toBeGreaterThanOrEqual(300)
     expectCovers(result.steps, wall)
   })
 
