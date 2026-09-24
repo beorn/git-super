@@ -1,7 +1,7 @@
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
-import { afterEach, describe, expect, test } from "vitest"
+import { afterEach, describe, expect, test, vi } from "vitest"
 
 import { runCli } from "../src/cli.ts"
 import { acquireExclusive, createExclusive, type Exclusive } from "../src/exclusive.ts"
@@ -1592,6 +1592,26 @@ describe("explicit recursive push mechanics", () => {
     expect(stderr.output).toBe("")
   })
 
+  test("CLI push uses the pull progress switch and writes phase/count only when enabled", async () => {
+    const { repository, remote, source } = pushFixture("cli-progress")
+    const stdout = outputSink()
+    const stderr = outputSink()
+    vi.stubEnv("GIT_SUPER_PROGRESS", "1")
+    try {
+      expect(
+        await runCli(
+          ["--repo", repository, "push", "--recurse-submodules=no", remote, `${source}:refs/heads/main`],
+          stdout,
+          stderr,
+        ),
+      ).toBe(0)
+    } finally {
+      vi.unstubAllEnvs()
+    }
+    expect(stderr.output).toMatch(/git-super push: select-root 0\/1 \+\d+ms/u)
+    expect(stderr.output).toMatch(/git-super push: write-remote 0\/1 \+\d+ms/u)
+  })
+
   /**
    * 24901 R9: a mixed root push containing both an unchanged root main and a task
    * branch that introduces or updates a child must leave that child's remote main
@@ -1920,6 +1940,213 @@ describe("a frozen push works only on the children its merge moved (25303, obser
     ])
     for (const commit of unseen) expect(git(shape.root, "cat-file", "-t", commit)).toBe("commit")
   })
+
+  test("uses one object batch when every advertised ref is present", async () => {
+    const shape = twoChildFrozenMerge("present-batch")
+    expect(await shape.pushWithRecord()).toMatchObject({ state: "updated" })
+    const batches = shape.calls.filter(
+      ({ repo, args }) => repo === shape.root && args[0] === "cat-file" && args[1]?.startsWith("--batch-check"),
+    )
+    expect(batches).toHaveLength(1)
+  })
+
+  test("refuses an advertised object still missing after a successful fetch", async () => {
+    const { fixture, repository, remote, source } = pushFixture("missing-after-fetch")
+    git(repository, "remote", "add", "origin", remote)
+    git(repository, "push", "-q", "origin", `${source}:refs/heads/main`)
+    const foreign = join(fixture, "foreign")
+    git(fixture, "clone", "-q", remote, foreign)
+    const missing = advanceRepository(foreign, "foreign.txt", "unseen\n")
+    git(foreign, "push", "-q", "origin", `${missing}:refs/heads/foreign`)
+    const local = createLocalGitProcess()
+    const withoutFetch: GitProcess = {
+      run(request) {
+        if (request.args[0] === "fetch") return Promise.resolve({ code: 0, stdout: "", stderr: "" })
+        return local.run(request)
+      },
+    }
+    await expect(
+      remoteContainsCommit({ repository, remote: "origin", commit: source, git: withoutFetch }),
+    ).rejects.toThrow(new RegExp(`${missing}.*refs/heads/foreign.*origin.*remains missing`, "u"))
+  })
+
+  test("peels a fetched annotated tag in the second batch without rereading present refs", async () => {
+    const { fixture, repository, remote, source } = pushFixture("fetched-tag")
+    git(repository, "remote", "add", "origin", remote)
+    git(repository, "push", "-q", "origin", `${source}:refs/heads/main`)
+    const foreign = join(fixture, "tag-author")
+    git(fixture, "clone", "-q", remote, foreign)
+    git(foreign, "tag", "-a", "release", source, "-m", "release")
+    git(foreign, "push", "-q", "origin", "refs/tags/release")
+    const local = createLocalGitProcess()
+    const batches: string[] = []
+    const counting: GitProcess = {
+      run(request) {
+        if (request.args[0] === "cat-file" && request.args[1]?.startsWith("--batch-check")) {
+          batches.push(request.stdin ?? "")
+        }
+        return local.run(request)
+      },
+    }
+    expect(await remoteContainsCommit({ repository, remote: "origin", commit: source, git: counting })).toBe(true)
+    expect(batches).toHaveLength(2)
+    expect(batches[1]?.trim().split("\n")).toHaveLength(2)
+    expect(batches[1]).toContain(`${git(foreign, "rev-parse", "refs/tags/release")}^{commit}`)
+  })
+
+  test("keeps Git process count bounded as advertised refs grow", async () => {
+    const countFor = async (count: number): Promise<{ calls: number; batches: number }> => {
+      const { repository, remote, source } = pushFixture(`ref-count-${count}`)
+      git(repository, "remote", "add", "origin", remote)
+      git(repository, "push", "-q", "origin", `${source}:refs/heads/main`)
+      for (let index = 1; index < count; index++) git(remote, "update-ref", `refs/heads/tip-${index}`, source)
+      const local = createLocalGitProcess()
+      let calls = 0
+      let batches = 0
+      const counting: GitProcess = {
+        run(request) {
+          calls++
+          if (request.args[0] === "cat-file" && request.args[1]?.startsWith("--batch-check")) batches++
+          return local.run(request)
+        },
+      }
+      expect(await remoteContainsCommit({ repository, remote: "origin", commit: source, git: counting })).toBe(true)
+      return { calls, batches }
+    }
+    const one = await countFor(1)
+    const many = await countFor(64)
+    expect(many.calls - one.calls).toBeLessThan(5)
+    expect(many.batches).toBe(1)
+  }, 30_000)
+
+  test("keeps Git process count bounded as newly reachable merges grow", async () => {
+    const countFor = async (count: number): Promise<number> => {
+      const { repository, remote, source } = pushFixture(`merge-count-${count}`)
+      git(repository, "push", "-q", remote, `${source}:refs/heads/main`)
+      const tree = git(repository, "rev-parse", `${source}^{tree}`)
+      const side = git(repository, "commit-tree", tree, "-p", source, "-m", "side")
+      let head = source
+      for (let index = 0; index < count; index++) {
+        head = git(repository, "commit-tree", tree, "-p", head, "-p", side, "-m", `merge ${index}`)
+      }
+      const local = createLocalGitProcess()
+      let calls = 0
+      const counting: GitProcess = {
+        run(request) {
+          calls++
+          return local.run(request)
+        },
+      }
+      expect(
+        (
+          await superPush({
+            repo: repository,
+            remote,
+            refspecs: [`${head}:refs/heads/main`],
+            recurseSubmodules: "on-demand",
+            git: counting,
+          })
+        ).state,
+      ).toBe("updated")
+      return calls
+    }
+    expect((await countFor(16)) - (await countFor(1))).toBeLessThan(5)
+  }, 30_000)
+
+  test.each(["plan", "recheck"] as const)(
+    "reports phase and count every 10 seconds through %s until first write",
+    async (stage) => {
+      const { repository, remote, source } = pushFixture(`progress-${stage}`)
+      const local = createLocalGitProcess()
+      let release: (() => void) | undefined
+      let reached!: () => void
+      const held = new Promise<void>((resolve) => {
+        reached = resolve
+      })
+      let observations = 0
+      let writes = 0
+      const stalled: GitProcess = {
+        run(request) {
+          if (request.args[0] === "ls-remote" && request.args[1] === "--refs") {
+            observations++
+            if ((stage === "plan" && observations === 1) || (stage === "recheck" && observations === 2)) {
+              reached()
+              return new Promise((resolve) => {
+                release = () => void local.run(request).then(resolve)
+              })
+            }
+          }
+          if (request.args[0] === "push") writes++
+          return local.run(request)
+        },
+      }
+      const reports: string[] = []
+      vi.useFakeTimers()
+      try {
+        const operation = superPush({
+          repo: repository,
+          remote,
+          refspecs: [`${source}:refs/heads/main`],
+          recurseSubmodules: "no",
+          git: stalled,
+          report: (line) => reports.push(line),
+        })
+        await held
+        await vi.advanceTimersByTimeAsync(stage === "plan" ? 25_000 : 10_000)
+        expect(writes).toBe(0)
+        expect(reports.some((line) => /git-super push: .*\d+\/\d+ \+10000ms/u.test(line))).toBe(true)
+        if (stage === "plan") {
+          expect(reports.some((line) => /git-super push: .*\d+\/\d+ \+20000ms/u.test(line))).toBe(true)
+        }
+        release?.()
+        await expect(operation).resolves.toMatchObject({ state: "updated" })
+        const count = reports.length
+        await vi.advanceTimersByTimeAsync(20_000)
+        expect(reports).toHaveLength(count)
+      } finally {
+        release?.()
+        vi.useRealTimers()
+      }
+    },
+    30_000,
+  )
+
+  test("reports a held writer lock until the first remote write", async () => {
+    const { repository, remote, source } = pushFixture("progress-lock")
+    let release: (() => void) | undefined
+    let reached!: () => void
+    const held = new Promise<void>((resolve) => {
+      reached = resolve
+    })
+    const exclusive: Exclusive = {
+      run(operation) {
+        reached()
+        return new Promise((resolve, reject) => {
+          release = () => void operation().then(resolve, reject)
+        })
+      },
+    }
+    const reports: string[] = []
+    vi.useFakeTimers()
+    try {
+      const operation = superPush({
+        repo: repository,
+        remote,
+        refspecs: [`${source}:refs/heads/main`],
+        recurseSubmodules: "no",
+        exclusive,
+        report: (line) => reports.push(line),
+      })
+      await held
+      await vi.advanceTimersByTimeAsync(10_000)
+      expect(reports).toContain("git-super push: wait-writer-lock 0/1 +10000ms\n")
+      release?.()
+      await expect(operation).resolves.toMatchObject({ state: "updated" })
+    } finally {
+      release?.()
+      vi.useRealTimers()
+    }
+  }, 30_000)
 
   test("capture asks the one changed-set rule: an unchanged child whose main diverged freezes no publication", async () => {
     const shape = twoChildFrozenMerge("capture")

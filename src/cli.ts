@@ -432,6 +432,7 @@ async function runInvocation(
           ...(Array.isArray(options.forceWithLease) && options.forceWithLease.length > 0
             ? { forceWithLease: options.forceWithLease as string[] }
             : {}),
+          ...(process.env.GIT_SUPER_PROGRESS === "1" ? { progress: true } : {}),
         },
         json: globals.json === true,
         nul: false,

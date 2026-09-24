@@ -28,7 +28,7 @@ export type StatusParams = Record<string, never>
 export type MergeBaseParams = Omit<SuperIsAncestorOptions, "repo">
 export type MergeParams = Omit<SuperMergeOptions, "repo" | "git" | "exclusive" | "report">
 export type PullParams = Omit<SuperPullOptions, "repo" | "git" | "exclusive" | "report"> & { progress?: boolean }
-export type PushParams = Omit<SuperPushOptions, "repo" | "git" | "exclusive">
+export type PushParams = Omit<SuperPushOptions, "repo" | "git" | "exclusive" | "report"> & { progress?: boolean }
 export type GitlinkWriteParams = Omit<WriteGitlinkOptions, "repo" | "git">
 export type SubmodulePrepareParams = Omit<SuperSubmodulePrepareOptions, "repo" | "git" | "exclusive">
 export type WorktreeRemoveParams = Omit<SuperWorktreeRemoveOptions, "repo" | "report">
@@ -206,9 +206,15 @@ const push = commandNode<CommandContext, PushParams, GitSuperResult>({
       pushOptions: stringArray(input.pushOptions, "pushOptions"),
       forceWithLease: stringArray(input.forceWithLease, "forceWithLease"),
       ...(signed === undefined ? {} : { signed }),
+      ...(input.progress === true ? { progress: true } : {}),
     }
   }),
-  run: (context, input) => superPush({ repo: context.repo, ...input }),
+  run: (context, { progress, ...input }) =>
+    superPush({
+      repo: context.repo,
+      ...input,
+      ...(progress === true && context.report !== undefined ? { report: context.report } : {}),
+    }),
 })
 
 const gitlinkWrite = commandNode<CommandContext, GitlinkWriteParams, GitSuperResult>({

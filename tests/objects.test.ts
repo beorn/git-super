@@ -121,4 +121,21 @@ describe("danglingRefs", () => {
       /git for-each-ref .*failed/u,
     )
   })
+
+  test("the dangling adapter preserves Gitomic's batch failure text", async () => {
+    const oid = "a".repeat(40)
+    const repository = "/missing-object-store"
+    const stub: GitProcess = {
+      run(request) {
+        return Promise.resolve(
+          request.args[0] === "for-each-ref"
+            ? { code: 0, stdout: `${oid} refs/heads/lost\n`, stderr: "" }
+            : { code: 1, stdout: "", stderr: "object database unavailable\n" },
+        )
+      },
+    }
+    await expect(danglingRefs(stub, repository)).rejects.toThrow(
+      `git cat-file --batch-check=%(objectname) %(objecttype) failed (1) in ${repository}: object database unavailable`,
+    )
+  })
 })
