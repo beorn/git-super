@@ -1850,7 +1850,11 @@ describe("explicit recursive push mechanics", () => {
  * (`pinned`), run ahead by a direct push that the new pin contains (`ahead`),
  * or diverged from the pinned history (`diverged`).
  */
-function twoChildFrozenMerge(name: string, childMain: "pinned" | "ahead" | "diverged" = "pinned") {
+function twoChildFrozenMerge(
+  name: string,
+  childMain: "pinned" | "ahead" | "diverged" = "pinned",
+  process?: GitProcess,
+) {
   const fixture = mkdtempSync(join(tmpdir(), `git-super-push-25303-${name}-`))
   roots.push(fixture)
   const hosted = (repo: string) => `https://git-super.test/owned/${repo}.git`
@@ -1891,6 +1895,8 @@ function twoChildFrozenMerge(name: string, childMain: "pinned" | "ahead" | "dive
     git(fixture, "clone", "-q", remotes.child, elsewhere)
     expected = advanceRepository(elsewhere, "child.txt", "diverged\n")
     git(elsewhere, "push", "-q", "origin", `${expected}:refs/heads/main`)
+    // Make the remote's diverged commit readable locally so merge-base answers 1.
+    git(child, "fetch", "-q", remotes.child, "main")
   }
   git(root, "add", "child")
   git(root, "commit", "-q", "-m", "move child only")
@@ -1959,7 +1965,7 @@ function twoChildFrozenMerge(name: string, childMain: "pinned" | "ahead" | "dive
       const observe = isObservation(request.args)
       if (observe) maxObserveInFlight = Math.max(maxObserveInFlight, ++inFlight)
       try {
-        return await local.run(request)
+        return await (process ?? local).run(request)
       } finally {
         if (observe) inFlight -= 1
       }
@@ -2400,6 +2406,32 @@ describe("one frozen merge to main is published by leased pushes alone (25303 it
     expect(result.detail?.objectIds).toEqual([shape.expected, shape.childSource, shape.childSource])
     expect(pushesIn(shape)).toEqual([])
     expect(git(shape.remotes.child, "rev-parse", "refs/heads/main")).toBe(shape.expected)
+  })
+
+  test("a failed child ancestry command is reported as a Git failure before any push", async () => {
+    const local = createLocalGitProcess()
+    const failing: GitProcess = {
+      run: (request) => {
+        if (
+          request.args[0] === "merge-base" &&
+          request.args[1] === "--is-ancestor" &&
+          request.args[2] !== request.args[3]
+        ) {
+          return Promise.resolve({ code: 128, stdout: "", stderr: "fatal: cannot read commit" })
+        }
+        return local.run(request)
+      },
+    }
+    const shape = twoChildFrozenMerge("ancestry-git-failure", "diverged", failing)
+
+    const result = await shape.push()
+
+    expect(result).toMatchObject({
+      state: "failed",
+      detail: { code: "git-failed", phase: "leased-child-fast-forward" },
+    })
+    expect(result.detail?.message).toContain("exit 128")
+    expect(pushesIn(shape)).toEqual([])
   })
 
   test("re-running a landed publication is an identical no-op through the same leased push", async () => {

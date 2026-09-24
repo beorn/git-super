@@ -1982,18 +1982,20 @@ async function leasedFrozenPush(
       // commits lost. ADR-0015's diverged-pin refusal, before any push.
       const args = ["merge-base", "--is-ancestor", expectedDestination.oid, source]
       const ancestry = await git.run({ repo: requirement.repository, args })
-      if (ancestry.code !== 0) {
-        const failure = detail(
-          "diverged-pin",
-          "leased-child-fast-forward",
-          `Merge ${update.source} would move ${row.remote} ${destination} from ${expectedDestination.oid} to ${source} (pin ${row.pin}), which is not a fast-forward${ancestry.code === 1 ? "" : ` (git merge-base exited ${ancestry.code}${ancestry.stderr ? `: ${ancestry.stderr.trim()}` : ""})`}; nothing was pushed.`,
-          {
-            paths: [row.path],
-            objectIds: [expectedDestination.oid, source, row.pin],
-            remedy:
-              "The child main diverged from the pinned history; re-judge the change against the current child main.",
-          },
-        )
+      if (!ancestryAnswerYes(ancestry)) {
+        const failure = ancestryAnswerNo(ancestry)
+          ? detail(
+              "diverged-pin",
+              "leased-child-fast-forward",
+              `Merge ${update.source} would move ${row.remote} ${destination} from ${expectedDestination.oid} to ${source} (pin ${row.pin}), which is not a fast-forward; nothing was pushed.`,
+              {
+                paths: [row.path],
+                objectIds: [expectedDestination.oid, source, row.pin],
+                remedy:
+                  "The child main diverged from the pinned history; re-judge the change against the current child main.",
+              },
+            )
+          : operationError(requirement.repository, args, "leased-child-fast-forward", ancestry).resultDetail
         return gitSuperResult(
           [
             { repository: requirement.repository, state: "failed", detail: failure, refs: [] },
