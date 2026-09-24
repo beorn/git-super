@@ -331,6 +331,7 @@ async function mergeUnderLock(
    */
   let tree: string
   let composed: ReadonlyMap<string, ComposedGitlink> = new Map()
+  let forkComposed: ReadonlyMap<string, ComposedGitlink> = new Map()
   if ("failure" in prospective) {
     const composition =
       prospective.conflict === undefined
@@ -350,6 +351,24 @@ async function mergeUnderLock(
     planned = await planGitlinks(git, root, head, tree, timeoutMs)
   } catch (error) {
     return failed(root, [], resultError(error, "inspect-gitlinks"))
+  }
+  /**
+   * COMPOSE A ONE-SIDED FORK RATHER THAN REFUSING IT (25389). A root-level pin this merge changes, off its own
+   * main without a root conflict, is merged into the component the same way a two-sided one is, onto the tree
+   * the plan ran on, and the plan is read once more so the composed pin renames below. The `composed` map is
+   * the union of both steps.
+   */
+  const forked = await composeForkedGitlinks(git, root, head, target, tree, planned, options.message, timeoutMs)
+  if (forked !== undefined) {
+    if ("failure" in forked) return failed(root, [], forked.failure)
+    tree = forked.tree
+    forkComposed = forked.composed
+    composed = new Map([...composed, ...forked.composed])
+    try {
+      planned = await planGitlinks(git, root, head, tree, timeoutMs)
+    } catch (error) {
+      return failed(root, [], resultError(error, "inspect-gitlinks"))
+    }
   }
   const plans = planned.settlements
   const refusal = plans.find((plan) => plan.state === "left-off-main" && plan.changedByMerge)
@@ -483,6 +502,34 @@ async function mergeUnderLock(
       return mergeApplicationFailure(git, root, head, target, mergeArgs, merged, timeoutMs)
     }
     if (applied !== "settled") return partial(root, undefined, [], applied.detail)
+  }
+  /**
+   * A ONE-SIDED COMPOSITION IS STATED OVER THE NATIVE MERGE (25389). Only one side moved that gitlink, so Git
+   * merges it cleanly to the candidate's own pin; the composition is written into the index the way a raise is.
+   */
+  for (const [path, composition] of forkComposed) {
+    const args = ["update-index", "--cacheinfo", `160000,${composition.sha},${path}`]
+    const written = await run(git, root, args, timeoutMs)
+    if (written.code !== 0) {
+      return partial(
+        root,
+        undefined,
+        [],
+        resultDetailFromGit(
+          "gitlink-compose-unsettled",
+          "settle-composed-gitlink",
+          root,
+          args,
+          written,
+          `The merge composed ${path} at ${composition.sha}, but that composition could not be staged over the merged gitlink.`,
+          `git -C ${root} status --short`,
+          "Inspect and preserve the uncommitted merge before deciding whether a retry is safe.",
+          "the caller",
+          { objectIds: [composition.sha], paths: [path] },
+        ),
+        preparedRows,
+      )
+    }
   }
   const completed: SuperMergeGitlinkResult[] = visiblePlans
     .filter((plan) => plan.state !== "raised")
@@ -1261,20 +1308,167 @@ async function composeDivergedGitlinks(
   } catch (error) {
     return { failure: composeUnavailable(root, paths, "read the declared submodule origins", messageOf(error)) }
   }
-  const plan = planSubmoduleComposition(
-    paths.map((path) => {
-      const origin = declared.get(path)
-      const conflicted: SubmoduleTreeConflict = { path, stages: staged.get(path) ?? [] }
-      return origin === undefined ? conflicted : { ...conflicted, origin }
-    }),
+  const conflicts = paths.map((path) => {
+    const origin = declared.get(path)
+    const conflicted: SubmoduleTreeConflict = { path, stages: staged.get(path) ?? [] }
+    return origin === undefined ? conflicted : { ...conflicted, origin }
+  })
+  return composeGitlinks(
+    git,
+    root,
+    conflicts,
+    conflict.tree,
+    {
+      componentMerge: (path) => `git -C ${join(root, path)} merge-tree --write-tree --name-only <main> <pin>`,
+      entries,
+      head,
+      rootConflict: true,
+      stageEvidence,
+      target,
+    },
+    message,
+    timeoutMs,
   )
+}
+
+/**
+ * Merge a one-sided fork: a ROOT-level gitlink this merge changes to a component commit that neither contains
+ * nor is contained by the fetched component main (25389).
+ *
+ * The root merge is clean here, because only one side moved the gitlink, so there is no root conflict to
+ * compose from. It is the common single-component shape: the branch's component work started from an older
+ * component main, and the component main has moved since. Its three stages are the component's own: 1 is
+ * `merge-base(main, pin)` in the component store, 2 is the fetched main and 3 is the pin. The root base's pin is
+ * main itself in this shape, so it would make the current side empty. Every fork goes into ONE composition,
+ * written onto the tree the plan was computed on.
+ *
+ * `undefined` means no root-level fork was changed by this merge. A nested fork is not composed (the queue settles
+ * root-level gitlinks only) and keeps the caller's refusal. A pin that is an ancestor of main never reaches this,
+ * because the planner raises it.
+ */
+async function composeForkedGitlinks(
+  git: GitProcess,
+  root: string,
+  head: string,
+  target: string,
+  tree: string,
+  planned: GitlinkPlans,
+  message: string | undefined,
+  timeoutMs: number,
+): Promise<ComposedGitlinks | Readonly<{ failure: GitResultDetail }> | undefined> {
+  const reader = { run: (request: GitProcessRequest) => git.run({ timeoutMs, ...request }) }
+  const candidates = planned.settlements.filter((plan) => plan.state === "left-off-main" && plan.changedByMerge)
+  if (candidates.length === 0) return undefined
+  let declared: Map<string, string | undefined>
+  try {
+    declared = new Map((await readCommitSubmodules(reader, root, tree)).map((entry) => [entry.path, entry.url]))
+  } catch (error) {
+    const paths = candidates.map((plan) => plan.path)
+    return { failure: composeUnavailable(root, paths, "read the merged tree's submodules", messageOf(error)) }
+  }
+  const forks = candidates.filter((plan) => declared.has(plan.path))
+  if (forks.length === 0) return undefined
+
+  const conflicts: SubmoduleTreeConflict[] = []
+  const described: string[] = []
+  const merges = new Map<string, string>()
+  for (const fork of forks) {
+    const store = planned.stores.get(fork.path) ?? join(root, fork.path)
+    const baseArgs = ["merge-base", fork.to, fork.from]
+    const base = await run(git, store, baseArgs, timeoutMs)
+    const componentMerge = `git -C ${store} merge-tree --write-tree ${fork.to} ${fork.from}`
+    if (base.code === 1) {
+      return {
+        failure: obviousDetail(
+          "gitlink-off-main",
+          `Merge ${target} would change ${fork.path} to ${fork.from}, which shares no history with fetched submodule main ${fork.to}, so the component cannot be merged.`,
+          `git -C ${store} merge-base ${fork.to} ${fork.from}`,
+          `Rebuild ${fork.path}'s change on its configured submodule branch, then rerun the same git super merge command.`,
+          "the submodule writer",
+          { paths: [fork.path], objectIds: [fork.from, fork.to] },
+        ),
+      }
+    }
+    if (base.code !== 0) {
+      return {
+        failure: composeUnavailable(
+          root,
+          [fork.path],
+          `find the merge base of ${fork.to} and ${fork.from}`,
+          gitFailureText(store, baseArgs, base),
+        ),
+      }
+    }
+    const baseSha = base.stdout.trim()
+    const origin = declared.get(fork.path)
+    const stages = [
+      { stage: 1, mode: "160000", oid: baseSha },
+      { stage: 2, mode: "160000", oid: fork.to },
+      { stage: 3, mode: "160000", oid: fork.from },
+    ]
+    conflicts.push(origin === undefined ? { path: fork.path, stages } : { path: fork.path, origin, stages })
+    merges.set(fork.path, componentMerge)
+    described.push(
+      `Component ${fork.path}: pin ${fork.from} forks from submodule main ${fork.to} at ${baseSha} (${componentMerge}).`,
+    )
+  }
+  return composeGitlinks(
+    git,
+    root,
+    conflicts,
+    tree,
+    {
+      componentMerge: (path) => merges.get(path) ?? `git -C ${join(root, path)} merge-tree --write-tree <main> <pin>`,
+      entries: [],
+      head,
+      rootConflict: false,
+      stageEvidence: described.join(" "),
+      target,
+    },
+    message,
+    timeoutMs,
+  )
+}
+
+/** What a composition's refusals name: the root conflict it came from, or the component merges of a one-sided fork. */
+type CompositionEvidence = Readonly<{
+  /** The command a content refusal names for the component merge at `path`. */
+  componentMerge: (path: string) => string
+  entries: readonly IndexEntry[]
+  head: string
+  /** False for a one-sided fork: the root merge was clean, so no refusal may say it conflicted. */
+  rootConflict: boolean
+  stageEvidence: string
+  target: string
+}>
+
+/**
+ * Compose every diverged gitlink in `conflicts` into one tree: create each component merge commit, state it onto
+ * `onto`, and retain it at the component remote (24951, 25389). The two-sided caller passes the root conflict's
+ * stages and the tree merge-tree wrote; the one-sided caller passes component-level stages and the tree its plan
+ * was computed on.
+ *
+ * `undefined` means the conflicts are not a shape this composes, and the caller's own refusal stands.
+ */
+async function composeGitlinks(
+  git: GitProcess,
+  root: string,
+  conflicts: readonly SubmoduleTreeConflict[],
+  onto: string | undefined,
+  evidence: CompositionEvidence,
+  message: string | undefined,
+  timeoutMs: number,
+): Promise<ComposedGitlinks | Readonly<{ failure: GitResultDetail }> | undefined> {
+  const { entries, head, rootConflict, stageEvidence, target } = evidence
+  const paths = conflicts.map((conflict) => conflict.path)
+  const reader = { run: (request: GitProcessRequest) => git.run({ timeoutMs, ...request }) }
+  const plan = planSubmoduleComposition(conflicts)
   if (plan.status === "refused") return undefined
   if (!plan.resolutions.some((resolution) => resolution.kind === "compose")) return undefined
 
   const storeByOrigin = new Map<string, string>()
-  for (const path of paths) {
-    const origin = declared.get(path)
-    if (origin !== undefined) storeByOrigin.set(origin, join(root, path))
+  for (const conflict of conflicts) {
+    if (conflict.origin !== undefined) storeByOrigin.set(conflict.origin, join(root, conflict.path))
   }
   let options: SubmoduleCompositionExecutionOptions
   try {
@@ -1385,9 +1579,10 @@ async function composeDivergedGitlinks(
     return {
       failure: composeRefused({
         entries,
-        evidence: `git -C ${join(root, path)} merge-tree --write-tree --name-only <main> <pin>`,
+        evidence: evidence.componentMerge(path),
         head,
         paths,
+        rootConflict,
         reasons: [
           `gitlink ${path}: diverged; ${kind === "conflict" ? detail : `Git could not ${operation}: ${detail}`}`,
         ],
@@ -1433,8 +1628,8 @@ async function composeDivergedGitlinks(
    * file in different hunks would come back conflicted although Git had already
    * merged them here.
    */
-  if (conflict.tree === undefined) return undefined
-  const resolvedTree = await resolveComposedTree(git, root, conflict.tree, substituted, timeoutMs)
+  if (onto === undefined) return undefined
+  const resolvedTree = await resolveComposedTree(git, root, onto, substituted, timeoutMs)
   if ("failure" in resolvedTree) return resolvedTree
   if (resolvedTree.tree === undefined) return undefined
 
@@ -1617,15 +1812,19 @@ function composeRefused(
     head: string
     paths: readonly string[]
     reasons: readonly string[]
+    rootConflict: boolean
     stageEvidence: string
     target: string
   }>,
 ): GitResultDetail {
-  const { entries, evidence, head, paths, reasons, stageEvidence, target } = refusal
+  const { entries, evidence, head, paths, reasons, rootConflict, stageEvidence, target } = refusal
   const located = paths.map((path) => JSON.stringify(path)).join(", ")
+  const claim = rootConflict
+    ? `conflicts with current HEAD ${head} at ${located}`
+    : `moves ${located} to a pin off its submodule main`
   return obviousDetail(
     "gitlink-compose-refused",
-    `Merge ${target} conflicts with current HEAD ${head} at ${located}, and the diverged submodule could not be merged: ${reasons.join("; ")}; no commit was written.${stageEvidence ? ` ${stageEvidence}` : ""}`,
+    `Merge ${target} ${claim}, and the diverged submodule could not be merged: ${reasons.join("; ")}; no commit was written.${stageEvidence ? ` ${stageEvidence}` : ""}`,
     evidence,
     "Merge the submodule's own main into the submodule commit, re-record the gitlink, and submit again; a diverged submodule is merged here unless its own merge conflicts.",
     "the caller",
