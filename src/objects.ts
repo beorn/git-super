@@ -28,17 +28,84 @@ function operationError(
   args: readonly string[],
   phase: string,
   result: GitProcessResult,
+  remedy = "Restore access to the named exact commit, then rerun the same graph operation.",
+  style: "graph" | "scan" = "graph",
+  messageOverride?: string,
 ): Error & Readonly<{ resultDetail: GitResultDetail }> {
-  const message = result.timedOut
-    ? `git ${args.join(" ")} timed out in ${repository}`
-    : `git ${args.join(" ")} failed in ${repository} (exit ${result.code})${result.stderr ? `\n${result.stderr}` : ""}`
+  const reason = result.timedOut
+    ? "timed out"
+    : result.failure !== undefined
+      ? `could not run: ${result.failure}`
+      : `failed (exit ${result.code})`
+  const message =
+    messageOverride ??
+    (style === "scan"
+      ? `git ${args.join(" ")} ${reason} in ${repository}${result.stderr ? `\n${result.stderr.trim()}` : ""}`
+      : result.timedOut
+        ? `git ${args.join(" ")} timed out in ${repository}`
+        : `git ${args.join(" ")} failed in ${repository} (exit ${result.code})${result.stderr ? `\n${result.stderr}` : ""}`)
   return Object.assign(new Error(message), {
     resultDetail: {
       code: result.timedOut ? "git-timeout" : "git-failed",
       phase,
       message,
-      remedy: "Restore access to the named exact commit, then rerun the same graph operation.",
+      remedy,
     },
+  })
+}
+
+export type CheckedObject =
+  | Readonly<{ input: string; oid: string; type: string }>
+  | Readonly<{ input: string; missing: true }>
+
+/** The one batch-check process and answer parser for object scans. */
+export async function batchCheckObjects(
+  git: GitProcess,
+  repository: string,
+  names: readonly string[],
+  phase: string,
+  remedy = "Restore access to the named exact commit, then rerun the same graph operation.",
+  timeoutMs?: number,
+  errorStyle: "graph" | "scan" = "graph",
+): Promise<readonly CheckedObject[]> {
+  if (names.length === 0) return []
+  const args = ["cat-file", "--batch-check=%(objectname) %(objecttype)"]
+  const checked = await git.run({
+    repo: repository,
+    args,
+    stdin: `${names.join("\n")}\n`,
+    ...(timeoutMs === undefined ? {} : { timeoutMs }),
+  })
+  if (checked.code !== 0 || checked.timedOut || checked.failure !== undefined || checked.signal) {
+    throw operationError(repository, args, phase, checked, remedy, errorStyle)
+  }
+  const answers = checked.stdout.split(/\r?\n/u).filter(Boolean)
+  if (answers.length !== names.length) {
+    throw operationError(
+      repository,
+      args,
+      phase,
+      {
+        ...checked,
+        code: 1,
+        stderr: `git cat-file --batch-check answered ${answers.length} lines for ${names.length} names`,
+      },
+      remedy,
+      errorStyle,
+      errorStyle === "scan"
+        ? `git cat-file --batch-check answered ${answers.length} lines for ${names.length} refs in ${repository}`
+        : undefined,
+    )
+  }
+  return answers.map((answer, index) => {
+    const input = names[index]
+    if (input === undefined) throw new Error(`Missing input for object answer ${index} in ${repository}`)
+    if (answer === `${input} missing`) return { input, missing: true }
+    const [oid, type, extra] = answer.split(" ")
+    if (extra !== undefined || oid === undefined || type === undefined || !OBJECT_ID.test(oid) || type === "missing") {
+      throw new Error(`Malformed object answer for ${input} in ${repository}: ${answer}`)
+    }
+    return { input, oid, type }
   })
 }
 
@@ -90,17 +157,6 @@ export async function ensureCommitObject(options: EnsureCommitObjectOptions): Pr
   return "fetched"
 }
 
-function scanError(repository: string, args: readonly string[], result: GitProcessResult): Error {
-  const reason = result.timedOut
-    ? "timed out"
-    : result.failure !== undefined
-      ? `could not run: ${result.failure}`
-      : `failed (exit ${result.code})`
-  return new Error(
-    `git ${args.join(" ")} ${reason} in ${repository}${result.stderr ? `\n${result.stderr.trim()}` : ""}`,
-  )
-}
-
 /** One local ref whose object this repository no longer has. */
 export type DanglingRef = Readonly<{ ref: string; oid: string }>
 
@@ -119,7 +175,7 @@ export async function danglingRefs(git: GitProcess, repository: string): Promise
   const listArgs = ["for-each-ref", "--format=%(objectname) %(refname)"] as const
   const listed = await git.run({ repo: repository, args: listArgs, timeoutMs: DEFAULT_GIT_TIMEOUT_MS })
   if (listed.timedOut || listed.failure !== undefined || listed.code !== 0) {
-    throw scanError(repository, listArgs, listed)
+    throw operationError(repository, listArgs, "scan-dangling-refs", listed, undefined, "scan")
   }
   const refs = listed.stdout
     .split("\n")
@@ -129,21 +185,14 @@ export async function danglingRefs(git: GitProcess, repository: string): Promise
       return { oid: line.slice(0, space), ref: line.slice(space + 1) }
     })
   if (refs.length === 0) return []
-  const checkArgs = ["cat-file", "--batch-check=%(objectname) %(objecttype)"] as const
-  const checked = await git.run({
-    repo: repository,
-    args: checkArgs,
-    stdin: `${refs.map(({ oid }) => oid).join("\n")}\n`,
-    timeoutMs: DEFAULT_GIT_TIMEOUT_MS,
-  })
-  if (checked.timedOut || checked.failure !== undefined || checked.code !== 0) {
-    throw scanError(repository, checkArgs, checked)
-  }
-  const answers = checked.stdout.split("\n").filter(Boolean)
-  if (answers.length !== refs.length) {
-    throw new Error(
-      `git cat-file --batch-check answered ${answers.length} lines for ${refs.length} refs in ${repository}`,
-    )
-  }
-  return refs.filter(({ oid }, index) => answers[index] === `${oid} missing`)
+  const answers = await batchCheckObjects(
+    git,
+    repository,
+    refs.map(({ oid }) => oid),
+    "scan-dangling-refs",
+    undefined,
+    DEFAULT_GIT_TIMEOUT_MS,
+    "scan",
+  )
+  return refs.filter((_, index) => answers[index] !== undefined && "missing" in answers[index])
 }

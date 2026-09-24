@@ -10,9 +10,10 @@ import {
 } from "./commit-graph.ts"
 import { createExclusive, type Exclusive } from "./exclusive.ts"
 import { mapInOrder } from "./map-in-order.ts"
-import { ensureCommitObject } from "./objects.ts"
+import { batchCheckObjects, ensureCommitObject, type CheckedObject } from "./objects.ts"
 import {
   readFrozenPushIntent,
+  readFrozenPushIntents,
   encodePushIntent,
   sameHostedOwner,
   sameHostedRepository,
@@ -47,6 +48,8 @@ export type SuperPushOptions = Readonly<{
   timeoutMs?: number
   git?: GitProcess
   exclusive?: Exclusive
+  /** Receives phase/count lines while a push plans and waits to write (25142). The CLI binds it to stderr. */
+  report?: (message: string) => void
 }>
 
 export type PushRefUpdatesOptions = Readonly<{
@@ -96,11 +99,54 @@ type CommitRequirement = Readonly<{
 }>
 
 const DEFAULT_GIT_TIMEOUT_MS = 30_000
+const PUSH_PROGRESS_INTERVAL_MS = 10_000
 const OBJECT_ID = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/u
 /** Remote observations one push plan runs at once (25303: reads concurrent, writes stay ordered). */
 const PLAN_READ_CONCURRENCY = 4
 /** Absent advertised refs fetched per `git fetch`, bounding argv however many are absent. */
 const ADVERTISED_FETCH_BATCH = 256
+
+function createPushProgress(report?: (message: string) => void) {
+  const startedAt = Date.now()
+  let current = "select-root 0/1"
+  let timer: ReturnType<typeof setInterval> | undefined
+  let failure: unknown
+  const cancel = (): void => {
+    if (timer !== undefined) globalThis.clearInterval(timer)
+    timer = undefined
+  }
+  const emit = (): void => {
+    report?.(`git-super push: ${current} +${Date.now() - startedAt}ms\n`)
+  }
+  const check = (): void => {
+    if (failure !== undefined) throw failure
+  }
+  return {
+    phase(name: string): void {
+      check()
+      current = name
+      emit()
+      if (report !== undefined && timer === undefined) {
+        timer = globalThis.setInterval(() => {
+          try {
+            emit()
+          } catch (error) {
+            failure = error
+            cancel()
+          }
+        }, PUSH_PROGRESS_INTERVAL_MS)
+        timer.unref?.()
+      }
+    },
+    beforeWrite(): void {
+      check()
+      current = "write-remote 0/1"
+      emit()
+      cancel()
+    },
+    cancel,
+  }
+}
 
 function detail(code: string, phase: string, message: string, extra: Partial<GitResultDetail> = {}): GitResultDetail {
   return { code, phase, message, ...extra }
@@ -664,7 +710,10 @@ async function applyGroup(
 }
 
 /** Apply exact remote ref updates child-first and root-last using explicit leases. */
-export async function pushRefUpdates(options: PushRefUpdatesOptions): Promise<GitSuperResult> {
+async function runPushRefUpdates(
+  options: PushRefUpdatesOptions,
+  phase?: (name: string) => void,
+): Promise<GitSuperResult> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS
   let root = resolve(options.root)
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
@@ -677,12 +726,15 @@ export async function pushRefUpdates(options: PushRefUpdatesOptions): Promise<Gi
   }
   try {
     root = await discoverRepository(git, root, "discover-root")
+    phase?.(`plan-ref-updates 0/${options.updates.length}`)
     const groups = groupUpdates(await planUpdates(git, options.updates, timeoutMs), root)
+    phase?.(`wait-writer-lock 0/${groups.length}`)
     const exclusive = options.exclusive ?? createExclusive(await lockDirectory(git, root))
     return await exclusive.run(
       async () => {
         const results: GitSuperRepositoryResult[] = []
         for (const [index, group] of groups.entries()) {
+          phase?.(`recheck-ref-updates ${index}/${groups.length}`)
           const result = await applyGroup(git, group, options)
           results.push(result)
           if (result.state === "failed" || result.state === "unknown") {
@@ -707,6 +759,10 @@ export async function pushRefUpdates(options: PushRefUpdatesOptions): Promise<Gi
     const failure = resultError(error, "push")
     return failedResult(root, failure)
   }
+}
+
+export async function pushRefUpdates(options: PushRefUpdatesOptions): Promise<GitSuperResult> {
+  return runPushRefUpdates(options)
 }
 
 function pushInputFailure(repository: string, code: string, message: string, remedy: string): GitSuperResult {
@@ -1027,9 +1083,11 @@ async function frozenChildUpdates(
     ["rev-list", "--min-parents=2", ...direct, "--not", ...advertised],
     "find-new-frozen-merges",
   )
+  const sources = [...new Set([...direct, ...reachable.split(/\r?\n/u).filter(Boolean)])]
+  const intents = await readFrozenPushIntents(git, root, sources)
   let found = false
-  for (const source of new Set([...direct, ...reachable.split(/\r?\n/u).filter(Boolean)])) {
-    const intent = await readFrozenPushIntent(git, root, source)
+  for (const source of sources) {
+    const intent = intents.get(source)
     if (intent === undefined) continue
     const actualRemote = await logicalPushUrl(git, root, remote)
     if (!sameHostedRepository(intent.rootRemote, actualRemote)) {
@@ -1328,39 +1386,8 @@ async function readAdvertisement(
 }
 
 /**
- * `cat-file --batch-check` over many names in ONE process: one answer line per
- * name, in order, so answers pair by position. A run that cannot answer every
- * name throws with git's text; it never shortens into a partial list.
- */
-async function batchCheck(
-  git: GitProcess,
-  repository: string,
-  names: readonly string[],
-  phase: string,
-): Promise<string[]> {
-  if (names.length === 0) return []
-  const args = ["cat-file", "--batch-check=%(objectname)"]
-  const checked = await git.run({ repo: repository, args, stdin: `${names.join("\n")}\n` })
-  if (checked.code !== 0 || checked.timedOut === true || checked.failure !== undefined) {
-    throw operationError(repository, args, phase, checked)
-  }
-  const answers = checked.stdout.split(/\r?\n/u).filter((line) => line !== "")
-  if (answers.length !== names.length) {
-    throw operationError(repository, args, phase, {
-      ...checked,
-      code: checked.code,
-      stderr: `git cat-file --batch-check answered ${answers.length} lines for ${names.length} names`,
-    })
-  }
-  return answers
-}
-
-/**
- * The commits an advertisement names, with every advertised object present
- * locally. Presence and peeling are each ONE batch process however many refs
- * the remote advertises, and the absent ones arrive in one fetch: a root with
- * ~10,900 refs cost ~21,800 spawns and 88 s per merge as one `cat-file -e` and
- * one `rev-parse` per ref (25303, phase A).
+ * Read raw presence and commit peel together in one batch. Only absent refs
+ * need a bounded fetch and a second batch over that subset (25142).
  */
 async function advertisedTips(
   git: GitProcess,
@@ -1368,13 +1395,14 @@ async function advertisedTips(
   remote: string,
   rows: readonly AdvertisedRef[],
 ): Promise<string[]> {
-  const presence = await batchCheck(
-    git,
-    repository,
-    rows.map((row) => row.oid),
-    "inspect-advertised-objects",
-  )
-  const absent = rows.filter((row, index) => presence[index] !== row.oid)
+  const queries = (selected: readonly AdvertisedRef[]): string[] =>
+    selected.flatMap((row) => [row.oid, `${row.oid}^{commit}`])
+  const remedy = "Fetch the named advertised ref and retry the push after its object is available."
+  const first = await batchCheckObjects(git, repository, queries(rows), "inspect-advertised-objects", remedy)
+  const absent = rows.filter((_, index) => {
+    const answer = first[index * 2]
+    return answer !== undefined && "missing" in answer
+  })
   for (let start = 0; start < absent.length; start += ADVERTISED_FETCH_BATCH) {
     await required(
       git,
@@ -1389,15 +1417,42 @@ async function advertisedTips(
       "fetch-submodule-remote-tip",
     )
   }
-  // A ref naming a tree or blob does not peel to a commit and is answered
-  // "missing"; like the per-ref rev-parse before it, it is simply not a tip.
-  const peeled = await batchCheck(
-    git,
-    repository,
-    rows.map((row) => `${row.oid}^{commit}`),
-    "peel-advertised-commits",
-  )
-  return [...new Set(peeled.filter((answer) => OBJECT_ID.test(answer)))]
+  const fetched =
+    absent.length === 0
+      ? []
+      : await batchCheckObjects(git, repository, queries(absent), "inspect-advertised-objects", remedy)
+  const tips = new Set<string>()
+  const collect = (
+    selected: readonly AdvertisedRef[],
+    answers: readonly CheckedObject[],
+    afterFetch: boolean,
+  ): void => {
+    selected.forEach((row, index) => {
+      const raw = answers[index * 2]
+      const peeled = answers[index * 2 + 1]
+      if (raw === undefined || peeled === undefined) {
+        throw new Error(`Missing object answer for ${row.ref} in ${repository}`)
+      }
+      if ("missing" in raw) {
+        if (afterFetch) {
+          throw new Error(`Advertised object ${row.oid} at ${row.ref} from ${remote} remains missing in ${repository}`)
+        }
+        return
+      }
+      if (raw.oid !== row.oid) {
+        throw new Error(`Advertised object ${row.oid} at ${row.ref} changed identity in ${repository}`)
+      }
+      if (!("missing" in peeled)) {
+        if (peeled.type !== "commit") {
+          throw new Error(`Advertised ref ${row.ref} did not peel to a commit in ${repository}`)
+        }
+        tips.add(peeled.oid)
+      }
+    })
+  }
+  collect(rows, first, false)
+  collect(absent, fetched, true)
+  return [...tips]
 }
 
 async function advertisedCommitTips(
@@ -1683,6 +1738,7 @@ async function leasedFrozenPush(
   rootUpdates: readonly RefUpdate[],
   options: SuperPushOptions,
   timeoutMs: number,
+  progress: ReturnType<typeof createPushProgress>,
 ): Promise<GitSuperResult | undefined> {
   const [update, ...others] = rootUpdates
   if (update === undefined || others.length > 0 || update.source === "" || update.destination !== "refs/heads/main") {
@@ -1762,6 +1818,7 @@ async function leasedFrozenPush(
     })
   }
   const exclusive = options.exclusive ?? createExclusive(await lockDirectory(git, root))
+  progress.phase(`wait-writer-lock 0/${children.length + 1}`)
   return exclusive.run(
     async () => {
       const results = await mapInOrder(children, PLAN_READ_CONCURRENCY, (child) => pushLeasedChild(git, child, options))
@@ -1784,17 +1841,20 @@ async function leasedFrozenPush(
         )
       }
       // The root is the commit point, so it goes last, on the ordinary leased path.
-      const pushed = await pushRefUpdates({
-        root,
-        updates: rootUpdates,
-        ...(options.atomic === undefined ? {} : { atomic: options.atomic }),
-        ...(options.verify === undefined ? {} : { verify: options.verify }),
-        ...(options.pushOptions === undefined ? {} : { pushOptions: options.pushOptions }),
-        ...(options.signed === undefined ? {} : { signed: options.signed }),
-        timeoutMs,
-        git,
-        exclusive: { run: (operation) => operation() },
-      })
+      const pushed = await runPushRefUpdates(
+        {
+          root,
+          updates: rootUpdates,
+          ...(options.atomic === undefined ? {} : { atomic: options.atomic }),
+          ...(options.verify === undefined ? {} : { verify: options.verify }),
+          ...(options.pushOptions === undefined ? {} : { pushOptions: options.pushOptions }),
+          ...(options.signed === undefined ? {} : { signed: options.signed }),
+          timeoutMs,
+          git,
+          exclusive: { run: (operation) => operation() },
+        },
+        progress.phase,
+      )
       return prependRepositories(pushed, results)
     },
     { holder: "git super push" },
@@ -1821,13 +1881,19 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
     )
   }
   const process = options.git ?? createLocalGitProcess()
+  const progress = createPushProgress(options.report)
   const git: GitProcess = {
-    run: (request) => process.run({ ...request, timeoutMs: request.timeoutMs ?? timeoutMs }),
+    run: (request) => {
+      if (request.args[0] === "push" && !request.args.includes("--dry-run")) progress.beforeWrite()
+      return process.run({ ...request, timeoutMs: request.timeoutMs ?? timeoutMs })
+    },
   }
   let root: string
   const retained: GitSuperRepositoryResult[] = []
   try {
+    progress.phase("select-root 0/1")
     root = await discoverRepository(git, options.repo, "discover-root")
+    progress.phase("select-root 1/1")
     const remote = options.remote ?? (await configuredPushRemote(git, root))
     const refspecs = options.refspecs ?? []
     const selectedUpdates =
@@ -1837,17 +1903,20 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
     const rootUpdates = applyExplicitLeases(selectedUpdates, options.forceWithLease ?? [])
     const rootSources = rootUpdates.map((update) => update.source).filter((source) => source !== "")
     if (options.recurseSubmodules === "no") {
-      return await pushRefUpdates({
-        root,
-        updates: rootUpdates,
-        ...(options.atomic === undefined ? {} : { atomic: options.atomic }),
-        ...(options.verify === undefined ? {} : { verify: options.verify }),
-        ...(options.pushOptions === undefined ? {} : { pushOptions: options.pushOptions }),
-        ...(options.signed === undefined ? {} : { signed: options.signed }),
-        timeoutMs,
-        git,
-        ...(options.exclusive === undefined ? {} : { exclusive: options.exclusive }),
-      })
+      return await runPushRefUpdates(
+        {
+          root,
+          updates: rootUpdates,
+          ...(options.atomic === undefined ? {} : { atomic: options.atomic }),
+          ...(options.verify === undefined ? {} : { verify: options.verify }),
+          ...(options.pushOptions === undefined ? {} : { pushOptions: options.pushOptions }),
+          ...(options.signed === undefined ? {} : { signed: options.signed }),
+          timeoutMs,
+          git,
+          ...(options.exclusive === undefined ? {} : { exclusive: options.exclusive }),
+        },
+        progress.phase,
+      )
     }
     if (options.recurseSubmodules === "check") {
       const requirements = await collectCommitRequirements(git, root, rootSources)
@@ -1881,22 +1950,27 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
           failure,
         )
       }
-      const pushed = await pushRefUpdates({
-        root,
-        updates: rootUpdates,
-        ...(options.atomic === undefined ? {} : { atomic: options.atomic }),
-        ...(options.verify === undefined ? {} : { verify: options.verify }),
-        ...(options.pushOptions === undefined ? {} : { pushOptions: options.pushOptions }),
-        ...(options.signed === undefined ? {} : { signed: options.signed }),
-        timeoutMs,
-        git,
-        ...(options.exclusive === undefined ? {} : { exclusive: options.exclusive }),
-      })
+      const pushed = await runPushRefUpdates(
+        {
+          root,
+          updates: rootUpdates,
+          ...(options.atomic === undefined ? {} : { atomic: options.atomic }),
+          ...(options.verify === undefined ? {} : { verify: options.verify }),
+          ...(options.pushOptions === undefined ? {} : { pushOptions: options.pushOptions }),
+          ...(options.signed === undefined ? {} : { signed: options.signed }),
+          timeoutMs,
+          git,
+          ...(options.exclusive === undefined ? {} : { exclusive: options.exclusive }),
+        },
+        progress.phase,
+      )
       return prependRepositories(pushed, available)
     }
-    const leased = await leasedFrozenPush(git, root, remote, rootUpdates, options, timeoutMs)
+    progress.phase("scan-frozen-history 0/1")
+    const leased = await leasedFrozenPush(git, root, remote, rootUpdates, options, timeoutMs, progress)
     if (leased !== undefined) return leased
     const frozen = await frozenChildUpdates(git, root, remote, rootUpdates)
+    progress.phase("scan-frozen-history 1/1")
     const childUpdates: RefUpdate[] = frozen.updates ?? []
     if (frozen.updates === undefined) {
       const requirementDestinations = new Map<string, { requirement: CommitRequirement; destinations: Set<string> }>()
@@ -1929,13 +2003,16 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
         [...frozen.retention, ...new Set([...frozen.publications, ...childUpdates]), ...rootUpdates],
         timeoutMs,
       )
-      const result = await pushRefUpdates({
-        root,
-        updates: frozen.retention,
-        timeoutMs,
-        git,
-        ...(options.exclusive === undefined ? {} : { exclusive: options.exclusive }),
-      })
+      const result = await runPushRefUpdates(
+        {
+          root,
+          updates: frozen.retention,
+          timeoutMs,
+          git,
+          ...(options.exclusive === undefined ? {} : { exclusive: options.exclusive }),
+        },
+        progress.phase,
+      )
       retained.push(...result.repositories)
       if (result.state === "failed" || result.state === "unknown") {
         return gitSuperResult(
@@ -1978,20 +2055,25 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
         },
       ])
     }
-    const pushed = await pushRefUpdates({
-      root,
-      updates: [...childUpdates, ...(options.recurseSubmodules === "on-demand" ? rootUpdates : [])],
-      ...(options.atomic === undefined ? {} : { atomic: options.atomic }),
-      ...(options.verify === undefined ? {} : { verify: options.verify }),
-      ...(options.pushOptions === undefined ? {} : { pushOptions: options.pushOptions }),
-      ...(options.signed === undefined ? {} : { signed: options.signed }),
-      timeoutMs,
-      git,
-      ...(options.exclusive === undefined ? {} : { exclusive: options.exclusive }),
-    })
+    const pushed = await runPushRefUpdates(
+      {
+        root,
+        updates: [...childUpdates, ...(options.recurseSubmodules === "on-demand" ? rootUpdates : [])],
+        ...(options.atomic === undefined ? {} : { atomic: options.atomic }),
+        ...(options.verify === undefined ? {} : { verify: options.verify }),
+        ...(options.pushOptions === undefined ? {} : { pushOptions: options.pushOptions }),
+        ...(options.signed === undefined ? {} : { signed: options.signed }),
+        timeoutMs,
+        git,
+        ...(options.exclusive === undefined ? {} : { exclusive: options.exclusive }),
+      },
+      progress.phase,
+    )
     return prependRepositories(pushed, retained)
   } catch (error) {
     const failure = resultError(error, "plan-push")
     return prependRepositories(failedResult(resolve(options.repo), failure), retained)
+  } finally {
+    progress.cancel()
   }
 }
