@@ -9,7 +9,7 @@ import { spawnSync } from "node:child_process"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { describe, expect, it, vi } from "vitest"
-import { acquireExclusive } from "../src/exclusive.ts"
+import { acquireExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS } from "../src/exclusive.ts"
 import {
   createGitWorktreeStore,
   createLocalGitWorktreeStore,
@@ -30,7 +30,12 @@ describe("createGitWorktreeStore", () => {
    * @level l1
    * @consumer Yrd post-merge tree materialization
    */
-  it("waits for a merge holding the writer lock past 30 seconds before adding a worktree", async () => {
+  it("resolves a writer-lock wait of four minutes by default: under yrd's five-minute per-call cap with room for the add", () => {
+    // The inequality against yrd's constant is pinned by the host's test; this is the value it relies on.
+    expect(DEFAULT_MUTATION_LOCK_WAIT_MS).toBe(4 * 60_000)
+  })
+
+  it("waits for a merge holding the writer lock before adding a worktree, up to the configured wait", async () => {
     const root = await mkdtemp(join(tmpdir(), "git-super-worktree-writer-wait-"))
     const repo = join(root, "owner")
     const linked = join(root, "linked")
@@ -46,10 +51,16 @@ describe("createGitWorktreeStore", () => {
       { timeoutMs: 0 },
       "git super merge",
     )
-    const release = Bun.sleep(40_000).then(() => held.release())
+    // A short real hold and a short injected wait prove the same path the default takes, without 40 s of wall time
+    // in a file the host's vendor project runs on every full run (25274, review-adhoc5 c04f5e1e01).
+    const release = Bun.sleep(1_500).then(() => held.release())
     const reports: string[] = []
     try {
-      const store = createLocalGitWorktreeStore({ repo, report: (line: string) => reports.push(line) })
+      const store = createLocalGitWorktreeStore({
+        repo,
+        report: (line: string) => reports.push(line),
+        timeouts: { mutationLock: 15_000 },
+      })
       await store.add({ kind: "detached", path: linked, ref: "HEAD" })
       expect(existsSync(linked)).toBe(true)
       expect(reports).toEqual([
@@ -61,7 +72,7 @@ describe("createGitWorktreeStore", () => {
       await release
       await rm(root, { recursive: true, force: true })
     }
-  }, 75_000)
+  }, 30_000)
 
   it("uses the canonical GitProcess request internally", async () => {
     const repo = await mkdtemp(join(tmpdir(), "git-super-process-port-"))
