@@ -166,6 +166,8 @@ export type SuperMergeOptions = Readonly<{
   timeoutMs?: number
   git?: GitProcess
   exclusive?: Exclusive
+  /** Reports writer-lock contention without writing to stderr from the library. */
+  report?: (line: string) => void
 }>
 
 type GitlinkPlan = Readonly<{
@@ -198,6 +200,9 @@ type CheckoutFailure = Readonly<{
 }>
 
 const DEFAULT_GIT_TIMEOUT_MS = 30_000
+// A Yrd submit twice exhausted the ordinary 30 s lock wait while a queue merge
+// held this same flock for over 53 s. Candidate merges must outwait that holder.
+const DEFAULT_MERGE_LOCK_WAIT_MS = 5 * 60_000
 const OBJECT_ID = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/u
 
 export async function superMerge(options: SuperMergeOptions): Promise<SuperMergeResult> {
@@ -219,7 +224,12 @@ async function mergeWithSteps(options: SuperMergeOptions, steps: StepClock): Pro
   }
 
   try {
-    const exclusive = options.exclusive ?? createExclusive(await lockDirectory(git, root, timeoutMs))
+    const exclusive =
+      options.exclusive ??
+      createExclusive(await lockDirectory(git, root, timeoutMs), {
+        timeoutMs: DEFAULT_MERGE_LOCK_WAIT_MS,
+        onContended: (holder) => options.report?.(`git-super merge: waiting for writer lock held by ${holder}\n`),
+      })
     return await exclusive.run(() => mergeUnderLock(git, root, options, timeoutMs, steps), {
       holder: "git super merge",
     })
