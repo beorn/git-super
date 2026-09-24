@@ -8,6 +8,7 @@
         "@bearly/flock": "0.1.0",
         "@silvery/command": "0.23.2",
         "@silvery/commander": "0.23.2",
+        "gitomic": "github:beorn/gitomic#d4043b305402fa6f1d40ba04acea27175f2f1408",
         "loggily": "^0.10.2",
         "react": "19.2.0",
         "silvery": "0.23.2",
@@ -333,6 +334,8 @@
     "ghostty-web": ["ghostty-web@0.4.0", "", {}, "sha512-0puDBik2qapbD/QQBW9o5ZHfXnZBqZWx/ctBiVtKZ6ZLds4NYb+wZuw1cRLXZk9zYovIQ908z3rvFhexAvc5Hg=="],
 
     "gifenc": ["gifenc@1.0.3", "", {}, "sha512-xdr6AdrfGBcfzncONUOlXMBuc5wJDtOueE3c5rdG0oNgtINLD+f2iFZltrBRZYzACRbKr+mSVU/x98zv2u3jmw=="],
+
+    "gitomic": ["gitomic@github:beorn/gitomic#d4043b3", { "peerDependencies": { "isomorphic-git": "^1.38.7" }, "optionalPeers": ["isomorphic-git"], "bin": { "gitomic": "./src/bin.ts" } }, "beorn-gitomic-d4043b3", "sha512-wg+Vqy8Dv8YwEGQbOAhQwZeLe2WT2LRFoQnnojhtA0YCniB7ASkzxt1ljDR+Q2+/fAnam0uI+rJBwMZ0seV+DQ=="],
 
     "hookable": ["hookable@5.5.3", "", {}, "sha512-Yc+BQe8SvoXH1643Qez1zqLRmbA5rCL+sSmk6TVos0LWVfNIB7PGncdlId77WzLGSIB5KaWgTaNTs2lNVEI6VQ=="],
 
