@@ -249,6 +249,44 @@ function operationError(
   })
 }
 
+function ancestrySettled(result: GitProcessResult): boolean {
+  return (
+    result.failure === undefined &&
+    result.timedOut !== true &&
+    result.stalled !== true &&
+    result.backstop === undefined &&
+    (result.signal === undefined || result.signal === null)
+  )
+}
+
+/** Git's exit 1 from --is-ancestor is a negative answer, not a failed Git invocation. */
+function ancestryAnswerNo(result: GitProcessResult): boolean {
+  return result.code === 1 && ancestrySettled(result)
+}
+
+function ancestryAnswerYes(result: GitProcessResult): boolean {
+  return result.code === 0 && ancestrySettled(result)
+}
+
+function childAncestryRefusal(
+  phase: string,
+  path: string,
+  ancestor: string,
+  descendant: string,
+  remedy: string,
+): Error & Readonly<{ resultDetail: GitResultDetail }> {
+  const message =
+    `Component ${path} proposed publication ${descendant} does not contain required commit ${ancestor}; ` +
+    `the child publication is not a fast-forward. ${remedy}`
+  return Object.assign(new Error(message), {
+    resultDetail: detail("gitlink-publication-non-fast-forward", phase, message, {
+      objectIds: [ancestor, descendant],
+      paths: [path],
+      remedy,
+    }),
+  })
+}
+
 function resultError(error: unknown, phase: string): GitResultDetail {
   if (typeof error === "object" && error !== null && "resultDetail" in error) {
     return (error as { resultDetail: GitResultDetail }).resultDetail
@@ -1051,11 +1089,22 @@ export async function capturePushIntent(
     if (update.expectedDestination.state === "oid") {
       const args = ["merge-base", "--is-ancestor", update.expectedDestination.oid, update.source]
       const ancestry = await git.run({ repo: requirement.repository, args })
-      if (ancestry.code === 1 && !changed.has(requirement.path)) {
+      if (ancestryAnswerNo(ancestry) && !changed.has(requirement.path)) {
         children.push({ ...pin, remote })
         continue
       }
-      if (ancestry.code !== 0) throw operationError(requirement.repository, args, "freeze-child-fast-forward", ancestry)
+      if (ancestryAnswerNo(ancestry)) {
+        throw childAncestryRefusal(
+          "freeze-child-fast-forward",
+          requirement.path,
+          update.expectedDestination.oid,
+          update.source,
+          `Merge the component's main ${update.expectedDestination.oid} into the change's component branch, re-record its gitlink, and submit again.`,
+        )
+      }
+      if (!ancestryAnswerYes(ancestry)) {
+        throw operationError(requirement.repository, args, "freeze-child-fast-forward", ancestry)
+      }
     }
     children.push({
       ...pin,
@@ -1154,7 +1203,18 @@ async function frozenChildUpdates(
       if (row.publication === undefined) continue
       const args = ["merge-base", "--is-ancestor", row.pin, row.publication.source]
       const contains = await git.run({ repo: requirement.repository, args })
-      if (contains.code !== 0) throw operationError(requirement.repository, args, "bind-frozen-publication", contains)
+      if (ancestryAnswerNo(contains)) {
+        throw childAncestryRefusal(
+          "bind-frozen-publication",
+          row.path,
+          row.pin,
+          row.publication.source,
+          "Recompose the merge so its frozen child publication contains the recorded pin, then retry.",
+        )
+      }
+      if (!ancestryAnswerYes(contains)) {
+        throw operationError(requirement.repository, args, "bind-frozen-publication", contains)
+      }
       const update = { repository: requirement.repository, remote: row.remote, ...row.publication }
       publications.push(update)
       if (direct.has(source)) updates.push(update)
@@ -1904,7 +1964,18 @@ async function leasedFrozenPush(
     const { destination, source, expectedDestination } = row.publication
     const bindArgs = ["merge-base", "--is-ancestor", row.pin, source]
     const bound = await git.run({ repo: requirement.repository, args: bindArgs })
-    if (bound.code !== 0) throw operationError(requirement.repository, bindArgs, "bind-frozen-publication", bound)
+    if (ancestryAnswerNo(bound)) {
+      throw childAncestryRefusal(
+        "bind-frozen-publication",
+        row.path,
+        row.pin,
+        source,
+        "Recompose the merge so its frozen child publication contains the recorded pin, then retry.",
+      )
+    }
+    if (!ancestryAnswerYes(bound)) {
+      throw operationError(requirement.repository, bindArgs, "bind-frozen-publication", bound)
+    }
     if (expectedDestination.state === "oid" && expectedDestination.oid !== source) {
       // A lease lets a NON-fast-forward through whenever the remote still holds
       // the expected value, so a diverged main would be overwritten and its
