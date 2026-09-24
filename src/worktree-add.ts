@@ -156,6 +156,7 @@ export type SuperWorktreeAddOptions = Readonly<{
   reference?: string
   env?: NodeJS.ProcessEnv
   log?: ConditionalLogger
+  report?: (line: string) => void
 }>
 
 export type SuperWorktreeAddResult = GitSuperResult &
@@ -229,7 +230,11 @@ export async function superWorktreeAdd(options: SuperWorktreeAddOptions): Promis
   const path = resolve(options.path)
   const reference = options.reference === undefined ? repo : resolve(options.reference)
   const env = options.env
-  const store = createLocalGitWorktreeStore({ repo, ...(env === undefined ? {} : { env }) })
+  const store = createLocalGitWorktreeStore({
+    repo,
+    ...(env === undefined ? {} : { env }),
+    ...(options.report === undefined ? {} : { report: options.report }),
+  })
 
   const failed = (
     state: "failed" | "unknown",

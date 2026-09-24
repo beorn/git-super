@@ -9,6 +9,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, it } from "vitest"
 import { runCli } from "../src/cli.ts"
+import { acquireExclusive } from "../src/exclusive.ts"
 
 const roots: string[] = []
 
@@ -111,6 +112,44 @@ function referenceStoreHas(fixture: SuperFixture, pin: string): boolean {
 }
 
 describe("git super worktree add", () => {
+  /**
+   * @failure The CLI hides the writer-lock holder while Yrd waits to materialize a tree (25274).
+   * @level l1
+   * @consumer Yrd post-merge tree materialization log
+   */
+  it("reports the lock holder through CLI stderr while worktree add waits", async () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-worktree-cli-wait-"))
+    roots.push(root)
+    const repo = join(root, "owner")
+    const linked = join(root, "linked")
+    initRepository(repo, "seed.txt", "seed\n")
+    const held = await acquireExclusive(
+      join(repo, ".git", "yrd-worktree-mutations"),
+      { timeoutMs: 0 },
+      "git super merge",
+    )
+    const stdout = outputSink()
+    const stderr = outputSink()
+    let released = false
+    const release = () => {
+      if (released) return
+      released = true
+      held.release()
+    }
+    try {
+      const invocation = runCli(["--repo", repo, "--json", "worktree", "add", linked, "HEAD"], stdout, stderr)
+      for (let poll = 0; poll < 500 && stderr.output === ""; poll += 1) await Bun.sleep(20)
+      release()
+      expect(await invocation).toBe(0)
+      expect(JSON.parse(stdout.output)).toMatchObject({ state: "updated" })
+      expect(stderr.output).toMatch(
+        /^git-super worktree: waiting for writer lock held by git super merge \(pid:\d+, age \d+ms\)\n$/u,
+      )
+    } finally {
+      release()
+    }
+  }, 30_000)
+
   it("retains complete module stores before removing a clean unlocked populated worktree", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-worktree-remove-"))
     roots.push(fixtureRoot)
