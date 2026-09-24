@@ -7,6 +7,7 @@ import { createLogger, type ConditionalLogger, type LogLevel } from "loggily"
 import { pinRef } from "./objects.ts"
 import { cleanGitRepositoryEnvironment } from "./git.ts"
 import { createLocalGitProcess, type GitProcess } from "./process.ts"
+import { shellQuote } from "./shell-command.ts"
 
 export const SUBMODULE_ALTERNATE_LOCATION = "superproject"
 export const SUBMODULE_ALTERNATE_ERROR_STRATEGY = "info"
@@ -176,10 +177,6 @@ async function submodules(git: SubmoduleGit, repo: string): Promise<Submodule[] 
       return match?.[2] === undefined || match[3] === undefined ? undefined : { name: match[2], path: match[3] }
     })
     .filter((submodule): submodule is Submodule => submodule !== undefined)
-}
-
-function shellQuote(value: string): string {
-  return `'${value.replaceAll("'", `'\\''`)}'`
 }
 
 /**
