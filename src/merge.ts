@@ -16,7 +16,7 @@ import { prepareSubmoduleTreeUnderLock } from "./submodule-prepare.ts"
 import { mapInOrder } from "./map-in-order.ts"
 import { capturePushIntent, discoverRepository, rootPushIdentity } from "./push.ts"
 import { PUSH_INTENT_TRAILER, sameHostedOwner } from "./push-intent.ts"
-import { createExclusive, type Exclusive } from "./exclusive.ts"
+import { createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS, type Exclusive } from "./exclusive.ts"
 import { parseIndexEntries, type IndexEntry } from "./index-entries.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessRequest, type GitProcessResult } from "./process.ts"
 import type { GitResultDetail, GitSuperRepositoryResult, GitSuperResult } from "./result.ts"
@@ -200,9 +200,6 @@ type CheckoutFailure = Readonly<{
 }>
 
 const DEFAULT_GIT_TIMEOUT_MS = 30_000
-// A Yrd submit twice exhausted the ordinary 30 s lock wait while a queue merge
-// held this same flock for over 53 s. Candidate merges must outwait that holder.
-const DEFAULT_MERGE_LOCK_WAIT_MS = 5 * 60_000
 const OBJECT_ID = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/u
 
 export async function superMerge(options: SuperMergeOptions): Promise<SuperMergeResult> {
@@ -227,7 +224,7 @@ async function mergeWithSteps(options: SuperMergeOptions, steps: StepClock): Pro
     const exclusive =
       options.exclusive ??
       createExclusive(await lockDirectory(git, root, timeoutMs), {
-        timeoutMs: DEFAULT_MERGE_LOCK_WAIT_MS,
+        timeoutMs: DEFAULT_MUTATION_LOCK_WAIT_MS,
         onContended: (holder) => options.report?.(`git-super merge: waiting for writer lock held by ${holder}\n`),
       })
     return await exclusive.run(() => mergeUnderLock(git, root, options, timeoutMs, steps), {

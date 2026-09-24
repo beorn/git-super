@@ -32,7 +32,7 @@ export type PushParams = Omit<SuperPushOptions, "repo" | "git" | "exclusive">
 export type GitlinkWriteParams = Omit<WriteGitlinkOptions, "repo" | "git">
 export type SubmodulePrepareParams = Omit<SuperSubmodulePrepareOptions, "repo" | "git" | "exclusive">
 export type WorktreeRemoveParams = Omit<SuperWorktreeRemoveOptions, "repo" | "report">
-export type WorktreeAddParams = Omit<SuperWorktreeAddOptions, "repo" | "env" | "log">
+export type WorktreeAddParams = Omit<SuperWorktreeAddOptions, "repo" | "env" | "log" | "report">
 
 function params<T>(parse: (value: unknown) => T, missing?: (value: unknown) => string[]): ParseParamSchema<T> {
   return { parse, ...(missing === undefined ? {} : { missing }) }
@@ -272,7 +272,12 @@ const worktreeAdd = commandNode<CommandContext, WorktreeAddParams, GitSuperResul
       return ["path", "commit"].filter((name) => typeof input[name] !== "string")
     },
   ),
-  run: (context, input) => superWorktreeAdd({ repo: context.repo, ...input }),
+  run: (context, input) =>
+    superWorktreeAdd({
+      repo: context.repo,
+      ...input,
+      ...(context.report === undefined ? {} : { report: context.report }),
+    }),
 })
 
 const worktreeRemove = commandNode<CommandContext, WorktreeRemoveParams, GitSuperResult>({
