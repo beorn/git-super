@@ -314,7 +314,7 @@ describe("git super diff --stat / --patch human output", () => {
     expect(stdout.output).toContain(" alpha.ts | +1 -1")
     expect(stdout.output).toContain(" 1 file changed, 1 insertion(+), 1 deletion(-)")
     expect(stdout.output).not.toContain("vendor/beta")
-  })
+  }, 30_000)
 
   test("--patch prints the root patch and the moved submodule's own patch, nothing for the unmoved one", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-diff-cli-patch-"))

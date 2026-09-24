@@ -3,7 +3,7 @@
  * the queue has no history, and publish no findings from a changed reading.
  * This executable boundary is absent from the ordinary status/merge corpus.
  */
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs"
 import { join } from "node:path"
 import { afterEach, expect, test } from "vitest"
 import { observe, type ObservationInput, type ObservationResult } from "../src/observe.ts"
