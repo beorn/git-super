@@ -52,6 +52,11 @@ function outputSink(): { output: string; write(value: string): void } {
   }
 }
 
+/** A remote read of one destination: the retired whole-advertisement ls-remote, or its by-name dry-run fetch (25570). */
+function isObservation(args: readonly string[]): boolean {
+  return args[0] === "ls-remote" || (args[0] === "fetch" && args.includes("--dry-run"))
+}
+
 function recursivePushFixture(name: string): Readonly<{
   fixture: string
   root: string
@@ -1203,13 +1208,51 @@ describe("explicit recursive push mechanics", () => {
     expect(git(remote, "rev-parse", "refs/heads/main")).toBe(source)
   })
 
+  // 25570: `ls-remote <remote> <ref>` filters on the client, so each observation carried the remote's whole
+  // advertisement. Observed by name, a destination advertises itself and nothing else, and writes no local ref.
+  test("observes a destination by name: only that ref is advertised, and no local ref is written", async () => {
+    const { fixture, repository, remote, source } = pushFixture("observe-by-name")
+    git(repository, "push", "-q", remote, `${source}:refs/heads/task/seed`)
+    for (let index = 0; index < 30; index++) git(remote, "update-ref", `refs/heads/task/crowd-${index}`, source)
+    const packets = join(fixture, "observe-packets.log")
+    writeFileSync(packets, "")
+    const local = createLocalGitProcess()
+    const observations: string[][] = []
+    const traced: GitProcess = {
+      run(request) {
+        if (request.args[0] === "ls-remote") throw new Error(`observed with ls-remote: ${request.args.join(" ")}`)
+        if (!isObservation(request.args)) return local.run(request)
+        observations.push([...request.args])
+        return local.run({ ...request, env: { ...request.env, GIT_TRACE_PACKET: packets } })
+      },
+    }
+
+    const result = await pushRefUpdates({
+      root: repository,
+      updates: [update(repository, remote, source, { state: "missing" })],
+      git: traced,
+    })
+
+    expect(result).toMatchObject({ state: "updated", partial: false })
+    expect(git(remote, "rev-parse", "refs/heads/main")).toBe(source)
+    expect(observations.length).toBeGreaterThanOrEqual(2)
+    for (const args of observations) expect(args.at(-1)).toMatch(/^\+refs\/heads\/main:refs\/git-super\/observed\//u)
+    const advertised = readFileSync(packets, "utf8")
+      .split("\n")
+      .filter((line) => /packet:.*< [0-9a-f]{40} refs\//u.test(line))
+    // Absent before the write (nothing advertised), present after it (main alone), never a crowd branch.
+    expect(advertised.length).toBeGreaterThanOrEqual(1)
+    expect(advertised.every((line) => line.endsWith(" refs/heads/main"))).toBe(true)
+    expect(git(repository, "for-each-ref", "--format=%(refname)", "refs/git-super/observed")).toBe("")
+  })
+
   test("preserves a successful write as unknown when post-push observation fails", async () => {
     const { repository, remote, source } = pushFixture("post-write-observation")
     const local = createLocalGitProcess()
     let observations = 0
     const unreadableAfterWrite: GitProcess = {
       async run(request) {
-        if (request.args[0] === "ls-remote") {
+        if (isObservation(request.args)) {
           observations += 1
           if (observations === 3) {
             return { code: 128, stdout: "", stderr: "remote disappeared after write" }
@@ -1885,7 +1928,7 @@ function twoChildFrozenMerge(name: string, childMain: "pinned" | "ahead" | "dive
   const recording: GitProcess = {
     run: async (request) => {
       calls.push({ args: [...request.args], repo: request.repo })
-      const observe = request.args[0] === "ls-remote"
+      const observe = isObservation(request.args)
       if (observe) maxObserveInFlight = Math.max(maxObserveInFlight, ++inFlight)
       try {
         return await local.run(request)
@@ -1951,7 +1994,10 @@ describe("a frozen push works only on the children its merge moved (25303, obser
     // The moved child's main is observed once per plan and once after its
     // push, never twice in one plan.
     const childMainReads = shape.calls.filter(
-      ({ args }) => args[0] === "ls-remote" && args.includes(shape.hosted("child")) && args.includes("refs/heads/main"),
+      ({ args }) =>
+        isObservation(args) &&
+        args.includes(shape.hosted("child")) &&
+        args.some((arg) => arg.startsWith("+refs/heads/main:")),
     )
     expect(childMainReads.length).toBe(4)
   })
@@ -2132,7 +2178,7 @@ describe("a frozen push works only on the children its merge moved (25303, obser
       let writes = 0
       const stalled: GitProcess = {
         run(request) {
-          if (request.args[0] === "ls-remote" && request.args[1] === "--refs") {
+          if (isObservation(request.args)) {
             observations++
             if ((stage === "plan" && observations === 1) || (stage === "recheck" && observations === 2)) {
               reached()
@@ -2265,7 +2311,7 @@ describe("one frozen merge to main is published by leased pushes alone (25303 it
 
     expect(await shape.push()).toMatchObject({ state: "updated", partial: false })
 
-    expect(shape.calls.filter(({ args }) => args[0] === "ls-remote")).toEqual([])
+    expect(shape.calls.filter(({ args }) => isObservation(args))).toEqual([])
     const pushes = pushesIn(shape)
     expect(pushes).toHaveLength(1)
     expect(pushes[0]?.args).toEqual(
@@ -2310,7 +2356,7 @@ describe("one frozen merge to main is published by leased pushes alone (25303 it
     expect(await shape.push()).toMatchObject({ state: "updated", partial: false })
 
     expect(git(shape.remotes.child, "rev-parse", "refs/heads/main")).toBe(shape.childSource)
-    expect(shape.calls.filter(({ args }) => args[0] === "ls-remote")).toEqual([])
+    expect(shape.calls.filter(({ args }) => isObservation(args))).toEqual([])
   })
 
   test("(d) a diverged child main is refused BEFORE any push, naming the three commits", async () => {
@@ -2338,7 +2384,7 @@ describe("one frozen merge to main is published by leased pushes alone (25303 it
     const again = await shape.push()
 
     expect(again).toMatchObject({ state: "unchanged", partial: false })
-    expect(shape.calls.filter(({ args }) => args[0] === "ls-remote")).toEqual([])
+    expect(shape.calls.filter(({ args }) => isObservation(args))).toEqual([])
     expect(git(shape.remotes.child, "rev-parse", "refs/heads/main")).toBe(shape.childSource)
   })
 })

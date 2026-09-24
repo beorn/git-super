@@ -277,22 +277,48 @@ function isIdenticalSuccess(source: string, observed: ExpectedDestination): bool
   return source === "" ? observed.state === "missing" : observed.state === "oid" && observed.oid === source
 }
 
+/** Where an observation's dry-run fetch NAMES the destination; a dry run writes no ref, here or anywhere. */
+const OBSERVED_NAMESPACE = "refs/git-super/observed/"
+
+/**
+ * The destination's remote value, read BY NAME (25570).
+ *
+ * `ls-remote <remote> <ref>` filters its pattern on the client, so the remote sent its whole advertisement (11,382
+ * refs on hh-dev's origin) for every observation. A fetch with an exact refspec is the one read that sends the server
+ * an exact ref-prefix; `--dry-run --porcelain` reports the remote tip and writes nothing, so no local ref can go stale
+ * and later read as the remote's. Absent is git's "couldn't find remote ref" under LC_ALL=C; any other failure is loud.
+ */
 async function observeDestination(
   git: GitProcess,
   update: Pick<PlannedUpdate, "repository" | "remote" | "destination">,
   phase: string,
 ): Promise<ExpectedDestination> {
-  const output = await required(
-    git,
-    update.repository,
-    ["ls-remote", "--refs", update.remote, update.destination],
-    phase,
-  )
-  if (output === "") return { state: "missing" }
-  const rows = output.split(/\r?\n/u).filter((row) => row !== "")
+  const named = `${OBSERVED_NAMESPACE}${update.destination.replace(/^refs\//u, "")}`
+  const args = [
+    "fetch",
+    "--dry-run",
+    "--verbose",
+    "--porcelain",
+    "--no-tags",
+    "--no-recurse-submodules",
+    "--no-write-fetch-head",
+    // No opportunistic remote-tracking row: the one refspec is the one answer.
+    "--refmap=",
+    update.remote,
+    `+${update.destination}:${named}`,
+  ]
+  const observed = await git.run({ repo: update.repository, args, env: { LC_ALL: "C" } })
+  if (observed.code !== 0 || observed.failure !== undefined || observed.timedOut === true) {
+    if (observed.timedOut !== true && observed.stderr.includes(`couldn't find remote ref ${update.destination}`)) {
+      return { state: "missing" }
+    }
+    throw operationError(update.repository, args, phase, observed)
+  }
+  // `<flag> <old> <new> <local ref>`, one line per refspec.
+  const rows = observed.stdout.split(/\r?\n/u).filter((row) => row !== "")
   const objectIds = rows.flatMap((row) => {
-    const [oid, destination] = row.split(/\s+/u, 2)
-    return destination === update.destination && oid !== undefined && OBJECT_ID.test(oid) ? [oid] : []
+    const [, , oid, local] = row.split(" ")
+    return local === named && oid !== undefined && OBJECT_ID.test(oid) ? [oid] : []
   })
   if (rows.length !== 1 || objectIds.length !== 1 || objectIds[0] === undefined) {
     throw Object.assign(new Error(`remote destination ${update.destination} did not resolve unambiguously`), {
