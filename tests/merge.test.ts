@@ -223,6 +223,69 @@ describe("git super merge", () => {
     })
   })
 
+  /**
+   * @failure Submit calls an ordinary non-ancestor answer git-failed after composing against a root pin behind component main (25591).
+   * @level l1
+   * @consumer Yrd submit candidate verification
+   */
+  it("refuses a composition behind component main with both commits and a cure", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-component-main-ahead-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const alphaCheckout = join(fixture.product, "packages/alpha")
+    const rootPin = advanceRepository(fixture.alpha, "root-side.ts", "export const root = 1\n")
+    git(fixture.alpha, "switch", "-q", "-c", "change-side", fixture.alphaBase)
+    const changePin = advanceRepository(fixture.alpha, "change-side.ts", "export const change = 1\n")
+    git(fixture.alpha, "switch", "-q", "main")
+    git(alphaCheckout, "fetch", "-q", "origin")
+
+    git(fixture.product, "switch", "-q", "-c", "candidate-old-component")
+    git(alphaCheckout, "checkout", "-q", changePin)
+    git(fixture.product, "add", "packages/alpha")
+    git(fixture.product, "commit", "-q", "-m", "pin change side")
+    const candidate = git(fixture.product, "rev-parse", "HEAD")
+    git(fixture.product, "switch", "-q", "main")
+    git(alphaCheckout, "checkout", "-q", rootPin)
+    git(fixture.product, "add", "packages/alpha")
+    git(fixture.product, "commit", "-q", "-m", "pin root side")
+    const rootHead = git(fixture.product, "rev-parse", "HEAD")
+    git(fixture.alpha, "switch", "-q", "-c", "pending-main")
+    const componentMain = advanceRepository(fixture.alpha, "later-main.ts", "export const later = 1\n")
+    git(fixture.alpha, "switch", "-q", "main")
+    const local = createLocalGitProcess()
+    let advanced = false
+    const racing: GitProcess = {
+      run: async (request) => {
+        if (
+          !advanced &&
+          request.repo === alphaCheckout &&
+          request.args[0] === "fetch" &&
+          request.args.includes("--dry-run")
+        ) {
+          git(fixture.alpha, "merge", "-q", "--ff-only", "pending-main")
+          advanced = true
+        }
+        return local.run(request)
+      },
+    }
+
+    const result = await superMerge({ repo: fixture.product, commit: candidate, git: racing })
+
+    expect(advanced).toBe(true)
+    expect(result).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: { code: "gitlink-publication-non-fast-forward" },
+    })
+    const composed = result.detail?.objectIds?.[1] ?? ""
+    expect(composed).toMatch(/^[0-9a-f]{40}$/u)
+    expect(git(alphaCheckout, "cat-file", "-p", composed)).toContain(`parent ${rootPin}`)
+    expect(result.detail?.message).toContain(componentMain)
+    expect(result.detail?.message).toContain(composed)
+    expect(result.detail?.message).toContain("Merge the component's main")
+    expect(git(fixture.product, "rev-parse", "HEAD")).toBe(rootHead)
+  })
+
   it("reports untouched off-main pins without changing them", async () => {
     const leftRoot = mkdtempSync(join(tmpdir(), "git-super-merge-left-off-main-"))
     roots.push(leftRoot)
