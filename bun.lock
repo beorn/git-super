@@ -8,7 +8,7 @@
         "@bearly/flock": "0.1.0",
         "@silvery/command": "0.23.2",
         "@silvery/commander": "0.23.2",
-        "gitomic": "^0.3.0",
+        "gitomic": "^0.4.0",
         "loggily": "^0.10.2",
         "react": "19.2.0",
         "silvery": "0.23.2",
@@ -335,7 +335,7 @@
 
     "gifenc": ["gifenc@1.0.3", "", {}, "sha512-xdr6AdrfGBcfzncONUOlXMBuc5wJDtOueE3c5rdG0oNgtINLD+f2iFZltrBRZYzACRbKr+mSVU/x98zv2u3jmw=="],
 
-    "gitomic": ["gitomic@0.3.0", "", { "peerDependencies": { "isomorphic-git": "^1.38.7" }, "optionalPeers": ["isomorphic-git"], "bin": { "gitomic": "dist/bin.js" } }, "sha512-QG1yUSd2CnOY/gaa0WDIdsAfgy5K2G3MKJlL8vhxuPG+6I2DkfPfxIrJwIxEJJIOfTwPIzjry+6OKUimVn+Jmg=="],
+    "gitomic": ["gitomic@0.4.0", "", { "dependencies": { "@bearly/flock": "^0.1.1" }, "peerDependencies": { "isomorphic-git": "^1.38.7" }, "optionalPeers": ["isomorphic-git"], "bin": { "gitomic": "dist/bin.js" } }, "sha512-0CTr4tFftYFM8OQhRS1tXhhkkRHHH6wTAyGyiwKrMflPaGOIkpkwxHndG6VpP9qVion+ORKidm4FjnyL2qHeDg=="],
 
     "hookable": ["hookable@5.5.3", "", {}, "sha512-Yc+BQe8SvoXH1643Qez1zqLRmbA5rCL+sSmk6TVos0LWVfNIB7PGncdlId77WzLGSIB5KaWgTaNTs2lNVEI6VQ=="],
 
@@ -466,6 +466,8 @@
     "why-is-node-running": ["why-is-node-running@2.3.0", "", { "dependencies": { "siginfo": "^2.0.0", "stackback": "0.0.2" }, "bin": { "why-is-node-running": "cli.js" } }, "sha512-hUrmaWBdVDcxvYqnyh09zunKzROWjbZTiNy8dBEjkS7ehEDQibXJ7XvlmtbwuTclUiIyN+CyXQD4Vmko8fNm8w=="],
 
     "zod": ["zod@4.4.3", "", {}, "sha512-ytENFjIJFl2UwYglde2jchW2Hwm4GJFLDiSXWdTrJQBIN9Fcyp7n4DhxJEiWNAJMV1/BqWfW/kkg71UDcHJyTQ=="],
+
+    "gitomic/@bearly/flock": ["@bearly/flock@0.1.1", "", {}, "sha512-YT4E+eanXhIDIHpHqi971KX36IjcfakkAHsSo81B8Fb8mVNwyIKeb6tXTHoOgHJr/p6fjy59iu4QWeqdu9BQbA=="],
 
     "playwright/fsevents": ["fsevents@2.3.2", "", { "os": "darwin" }, "sha512-xiqMQR4xAeHTuB9uWm+fFRcIOgKBMiOBP+eXiyT7jsgVCq1bkVygt00oASowB7EdtpOHaaPgKt812P9ab+DDKA=="],
 
