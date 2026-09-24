@@ -2,17 +2,18 @@ import { rm } from "node:fs/promises"
 import { isAbsolute, join, resolve } from "node:path"
 import { readCommitSubmodules, resolveSubmoduleBranch, type CommitSubmodule } from "./commit-graph.ts"
 import {
-  CHANGED_PATH_FILTER,
   composeSubmoduleCommits,
   findSubmoduleCompositionOverlaps,
   planSubmoduleComposition,
   type SubmoduleCommitResolution,
   type SubmoduleCompositionExecutionOptions,
   type SubmoduleCompositionOverlap,
+  type SubmoduleResolution,
   type SubmoduleTreeConflict,
 } from "./composition.ts"
 import { ensureCommitObject, pinRef } from "./objects.ts"
 import { prepareSubmoduleTreeUnderLock } from "./submodule-prepare.ts"
+import { mapInOrder } from "./map-in-order.ts"
 import { capturePushIntent, discoverRepository, rootPushIdentity } from "./push.ts"
 import { PUSH_INTENT_TRAILER, sameHostedOwner } from "./push-intent.ts"
 import { createExclusive, type Exclusive } from "./exclusive.ts"
@@ -103,10 +104,50 @@ export type SuperMergeDescentResult = Readonly<{
   children: readonly SuperMergeDescentChildResult[]
 }>
 
+/**
+ * The merge's phases, in the order they run. They never overlap, and together
+ * they cover the whole `superMerge` call, so the `ms` of the steps a result
+ * carries sum to the call's wall time. The list is closed: a new phase is a new
+ * name here, never time left out of every step.
+ */
+export const SUPER_MERGE_STEPS = [
+  /**
+   * Discovering the root, taking the worktree lock (including any wait for it),
+   * the clean-worktree status, HEAD and target resolution, and the proof that a
+   * merge is needed.
+   */
+  "preflight",
+  /** The prospective `merge-tree`, plus composing any diverged gitlinks it conflicts on. */
+  "merge-tree",
+  /** Classifying every gitlink against its submodule main: child-main fetches and the nested descent. */
+  "plan",
+  /** The Settled trailers and the frozen `Git-Super-Push:` publication inputs. */
+  "capture",
+  /** Preparing affected submodule checkouts and proving the worktree clean. */
+  "checkouts",
+  /** The native no-ff merge and the proved gitlink raises. */
+  "merge",
+  /** Checking affected submodules out at their staged pins. */
+  "settle",
+  /** The concluding commit, its hooks, and the root receipt. */
+  "commit",
+] as const
+
+export type SuperMergeStepName = (typeof SUPER_MERGE_STEPS)[number]
+
+/** How long one phase of the merge took. */
+export type SuperMergeStepResult = Readonly<{ name: SuperMergeStepName; ms: number }>
+
 export type SuperMergeResult = GitSuperResult &
   Readonly<{
     commit?: string
     gitlinks: readonly SuperMergeGitlinkResult[]
+    /**
+     * Additive timing evidence: one row per phase that ran, in the order it
+     * ran. A merge that stops early ends on the phase that stopped it. Optional
+     * because an older git-super does not write it; this one always does.
+     */
+    steps?: readonly SuperMergeStepResult[]
     /** Additive recovery evidence for submodule checkouts touched by a merge. */
     checkouts?: readonly SuperMergeCheckoutResult[]
     /**
@@ -165,6 +206,13 @@ const DEFAULT_MERGE_LOCK_WAIT_MS = 5 * 60_000
 const OBJECT_ID = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/u
 
 export async function superMerge(options: SuperMergeOptions): Promise<SuperMergeResult> {
+  const steps = createStepClock()
+  steps.begin("preflight")
+  const result = await mergeWithSteps(options, steps)
+  return { ...result, steps: steps.finish() }
+}
+
+async function mergeWithSteps(options: SuperMergeOptions, steps: StepClock): Promise<SuperMergeResult> {
   const git = options.git ?? createLocalGitProcess()
   const timeoutMs = options.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS
   const fallbackRoot = resolve(options.repo)
@@ -182,11 +230,39 @@ export async function superMerge(options: SuperMergeOptions): Promise<SuperMerge
         timeoutMs: DEFAULT_MERGE_LOCK_WAIT_MS,
         onContended: (holder) => options.report?.(`git-super merge: waiting for writer lock held by ${holder}\n`),
       })
-    return await exclusive.run(() => mergeUnderLock(git, root, options, timeoutMs), {
+    return await exclusive.run(() => mergeUnderLock(git, root, options, timeoutMs, steps), {
       holder: "git super merge",
     })
   } catch (error) {
     return failed(root, [], resultError(error, "merge"))
+  }
+}
+
+type StepClock = Readonly<{
+  /** Close the phase that is running, if any, and start `name`. */
+  begin(name: SuperMergeStepName): void
+  /** Close the phase that is running and return every phase in order. */
+  finish(): SuperMergeStepResult[]
+}>
+
+function createStepClock(): StepClock {
+  const now = () => performance.now()
+  const done: SuperMergeStepResult[] = []
+  let running: { name: SuperMergeStepName; start: number } | undefined
+  const close = () => {
+    if (running === undefined) return
+    done.push({ name: running.name, ms: Math.max(0, Math.round(now() - running.start)) })
+    running = undefined
+  }
+  return {
+    begin(name) {
+      close()
+      running = { name, start: now() }
+    },
+    finish() {
+      close()
+      return [...done]
+    },
   }
 }
 
@@ -195,6 +271,7 @@ async function mergeUnderLock(
   root: string,
   options: SuperMergeOptions,
   timeoutMs: number,
+  steps: StepClock,
 ): Promise<SuperMergeResult> {
   const statusArgs = ["status", "--porcelain=v1", "-z", "--untracked-files=all"]
   const status = await run(git, root, statusArgs, timeoutMs)
@@ -243,6 +320,7 @@ async function mergeUnderLock(
       ),
     )
   }
+  steps.begin("merge-tree")
   const prospective = await prospectiveTree(git, root, head, target, timeoutMs)
   /**
    * COMPOSE A DIVERGED GITLINK RATHER THAN BOUNCING IT (24951).
@@ -269,6 +347,7 @@ async function mergeUnderLock(
     tree = prospective.tree
   }
 
+  steps.begin("plan")
   let planned: GitlinkPlans
   try {
     planned = await planGitlinks(git, root, head, tree, timeoutMs)
@@ -305,6 +384,7 @@ async function mergeUnderLock(
     return { ...plan, composition: composition.evidence, state: "merged" }
   })
 
+  steps.begin("capture")
   const requestedMessage = options.message ?? `Merge ${target.slice(0, 12)} into ${head.slice(0, 12)}`
   const trailers = visiblePlans.map((plan) =>
     plan.state === "raised"
@@ -360,6 +440,7 @@ async function mergeUnderLock(
     settledMessage = trailerResult.stdout
   }
 
+  steps.begin("checkouts")
   const prepared = await prepareSubmoduleCheckouts(git, root, planned.checkouts, timeoutMs)
   if ("failure" in prepared) return failed(root, [], prepared.failure, prepared.rows)
   const preparedCheckouts = prepared.checkouts
@@ -374,6 +455,7 @@ async function mergeUnderLock(
   )
   if (statusFailure !== undefined) return failed(root, [], statusFailure, preparedRows)
 
+  steps.begin("merge")
   // Interim for alternate-backed worktree modules: Git 2.55 can treat a split
   // commit-graph read failure as a submodule conflict. Keep this on both the
   // preflight and application paths until the minimal reproduction below no
@@ -438,6 +520,7 @@ async function mergeUnderLock(
     completed.push({ ...raise })
   }
 
+  steps.begin("settle")
   const settledCheckouts = await settleSubmoduleCheckouts(git, root, preparedCheckouts, timeoutMs)
   if (settledCheckouts.failure !== undefined) {
     const restored = await restoreSubmoduleCheckouts(git, root, preparedCheckouts, settledCheckouts.rows, timeoutMs)
@@ -474,6 +557,7 @@ async function mergeUnderLock(
     )
   }
 
+  steps.begin("commit")
   const commitArgs = ["commit", ...(options.noVerify === true ? ["--no-verify"] : []), "-F", "-"]
   const committed = await run(git, root, commitArgs, timeoutMs, settledMessage)
   if (committed.code !== 0) {
@@ -1076,6 +1160,28 @@ const ABSENT_OBJECT = "0".repeat(40)
 /** Carried from the root merge message so the component history names the same change. */
 const CARRIED_TRAILER = /^(?:Change|Merged-By):\s*\S/u
 
+/**
+ * `merge-base --is-ancestor` as a three-valued answer: exit 0 is yes, exit 1
+ * is no, and anything else (128: an object is absent) is the error text,
+ * never a "no". Reading an absent object as "not an ancestor" is how a
+ * fast-forward became "diverged" (25280).
+ */
+async function containsCommit(
+  git: GitProcess,
+  store: string,
+  ancestor: string,
+  descendant: string,
+  timeoutMs: number,
+): Promise<boolean | string> {
+  const probe = await run(git, store, ["merge-base", "--is-ancestor", ancestor, descendant], timeoutMs)
+  const command = `git -C ${store} merge-base --is-ancestor ${ancestor} ${descendant}`
+  if (probe.timedOut) return `${command} timed out after ${timeoutMs}ms`
+  if (probe.failure !== undefined) return `${command} could not run: ${String(probe.failure)}`
+  if (probe.code === 0) return true
+  if (probe.code === 1) return false
+  return `${command} exited ${probe.code}: ${probe.stderr.trim() || "no stderr"}`
+}
+
 async function ensureCompositionCommit(
   git: GitProcess,
   store: string,
@@ -1201,14 +1307,12 @@ async function composeDivergedGitlinks(
     )
     if (!hasCommit) {
       return {
-        failure: composeRefused({
+        failure: componentUnfetched({
           entries,
           evidence: `git -C ${store} fetch origin refs/git-super/pins/${resolution.incomingSha}`,
           head,
-          paths,
-          reasons: [
-            `gitlink ${resolution.path}: diverged; component commit ${resolution.incomingSha} could not be fetched`,
-          ],
+          path: resolution.path,
+          sha: resolution.incomingSha,
           stageEvidence,
           target,
         }),
@@ -1217,40 +1321,66 @@ async function composeDivergedGitlinks(
   }
 
   /**
-   * THE PATH GATE RUNS FIRST, BEFORE ANY merge-tree. Git's own test is
-   * line-level and would merge two sides that edited the same file in different
-   * places; the ruled predicate is stricter and, more to the point, legible —
-   * a refusal can name the files instead of a hunk.
+   * SETTLE FAST-FORWARDS NOW THAT EVERY INCOMING COMMIT IS PRESENT (25280).
+   * The planner sees only the three stages, and Git hands over a three-stage
+   * gitlink conflict whenever the store lacks one side, even when that side
+   * simply descends from the other. Composing such a pair makes the path gate
+   * read the older side's own changes, which the newer side contains, as an
+   * overlap: queue run q-20260923T145509635Z-1de06624 sent two ag
+   * fast-forwards back as "diverged; files overlap" this way. So incoming is
+   * a pin when base <= current <= incoming, which is Git's own fast-forward
+   * rule. A pair that fails either step stays a composition, and the
+   * composition names the rewind it cannot build on. Git already resolves
+   * "current contains incoming" before this runs, so there is no second pin.
+   */
+  const settledResolutions: SubmoduleResolution[] = []
+  for (const resolution of plan.resolutions) {
+    if (resolution.kind !== "compose") {
+      settledResolutions.push(resolution)
+      continue
+    }
+    const store = storeByOrigin.get(resolution.origin) ?? join(root, resolution.path)
+    const incomingContainsCurrent = await containsCommit(
+      git,
+      store,
+      resolution.currentSha,
+      resolution.incomingSha,
+      timeoutMs,
+    )
+    const currentContainsBase =
+      incomingContainsCurrent === true
+        ? await containsCommit(git, store, resolution.baseSha, resolution.currentSha, timeoutMs)
+        : false
+    if (typeof incomingContainsCurrent === "string" || typeof currentContainsBase === "string") {
+      const detail = typeof incomingContainsCurrent === "string" ? incomingContainsCurrent : currentContainsBase
+      return {
+        failure: composeUnavailable(
+          root,
+          [resolution.path],
+          `decide whether ${resolution.incomingSha} fast-forwards ${resolution.currentSha} from base ${resolution.baseSha}`,
+          String(detail),
+        ),
+      }
+    }
+    if (incomingContainsCurrent && currentContainsBase) {
+      settledResolutions.push({ kind: "pin", path: resolution.path, sha: resolution.incomingSha })
+    } else settledResolutions.push(resolution)
+  }
+  const settled = { ...plan, resolutions: settledResolutions }
+
+  /**
+   * NO PATH GATE (24977, @cto e8368e85 constraint 5): "clean" is merge-tree's
+   * own answer below, not file disjointness. Both sides' changed files are still
+   * counted, because the composition's evidence reports them.
    */
   let overlaps: readonly SubmoduleCompositionOverlap[]
   try {
-    overlaps = await findSubmoduleCompositionOverlaps(plan, options)
+    overlaps = await findSubmoduleCompositionOverlaps(settled, options)
   } catch (error) {
     return { failure: composeUnavailable(root, paths, "enumerate what each side changed", messageOf(error)) }
   }
-  const overlapping = overlaps.filter((overlap) => overlap.files.length > 0)
-  if (overlapping.length > 0) {
-    const first = overlapping[0]?.path ?? paths[0] ?? ""
-    return {
-      failure: composeRefused({
-        entries,
-        // The command a person runs to see what this refused, built from the
-        // SAME constant the gate ran with: an evidence line that drifts from
-        // the predicate sends the reader to a different answer than the one
-        // that refused them.
-        evidence: `git -C ${join(root, first)} diff --name-only --no-renames --diff-filter=${CHANGED_PATH_FILTER} <base> <side>`,
-        head,
-        paths,
-        reasons: overlapping.map(
-          (overlap) => `gitlink ${overlap.path}: diverged; files overlap: ${overlap.files.join(", ")}`,
-        ),
-        stageEvidence,
-        target,
-      }),
-    }
-  }
 
-  const executed = await composeSubmoduleCommits(plan, options)
+  const executed = await composeSubmoduleCommits(settled, options)
   if (executed.status === "refused") {
     const { detail, kind, operation, path } = executed.failure
     if (kind === "unavailable") return { failure: composeUnavailable(root, [path], operation, detail) }
@@ -1260,7 +1390,9 @@ async function composeDivergedGitlinks(
         evidence: `git -C ${join(root, path)} merge-tree --write-tree --name-only <main> <pin>`,
         head,
         paths,
-        reasons: [`gitlink ${path}: diverged; Git could not ${operation}: ${detail}`],
+        reasons: [
+          `gitlink ${path}: diverged; ${kind === "conflict" ? detail : `Git could not ${operation}: ${detail}`}`,
+        ],
         stageEvidence,
         target,
       }),
@@ -1497,11 +1629,46 @@ function composeRefused(
     "gitlink-compose-refused",
     `Merge ${target} conflicts with current HEAD ${head} at ${located}, and the diverged submodule could not be merged: ${reasons.join("; ")}; no commit was written.${stageEvidence ? ` ${stageEvidence}` : ""}`,
     evidence,
-    "Merge the submodule's own main into the submodule commit, re-record the gitlink, and submit again; a diverged submodule is merged here only where the two sides changed different files.",
+    "Merge the submodule's own main into the submodule commit, re-record the gitlink, and submit again; a diverged submodule is merged here unless its own merge conflicts.",
     "the caller",
     {
       objectIds: [...new Set([head, target, ...entries.map((entry) => entry.oid)])],
       paths,
+      phase: "preflight-merge",
+    },
+  )
+}
+
+/**
+ * The change's component commit (THEIRS) could not be fetched, so nothing about
+ * the two sides is known: not "diverged", which is a claim about history this
+ * merge never read (25280). The code stays gitlink-compose-refused and the
+ * message keeps "could not be fetched", which is how yrd routes it back with
+ * its publish-and-resubmit remedy.
+ */
+function componentUnfetched(
+  refusal: Readonly<{
+    entries: readonly IndexEntry[]
+    evidence: string
+    head: string
+    path: string
+    sha: string
+    stageEvidence: string
+    target: string
+  }>,
+): GitResultDetail {
+  const { entries, evidence, head, path, sha, stageEvidence, target } = refusal
+  return obviousDetail(
+    "gitlink-compose-refused",
+    `Merge ${target} moves ${JSON.stringify(path)} to component commit ${sha} (theirs), which could not be fetched ` +
+      `from the submodule's remote as refs/git-super/pins/${sha}, by its sha, or from the task branch; ` +
+      `no commit was written.${stageEvidence ? ` ${stageEvidence}` : ""}`,
+    evidence,
+    "Publish the component commit (yrd submit pushes it as refs/git-super/pins/<sha>), or repair the fetch the evidence names, then submit again.",
+    "the caller",
+    {
+      objectIds: [...new Set([head, target, sha, ...entries.map((entry) => entry.oid)])],
+      paths: [path],
       phase: "preflight-merge",
     },
   )
@@ -1685,7 +1852,31 @@ async function planGitlinks(
             (entry) => [entry.path, entry.target] as const,
           ),
     )
-    for (const entry of await readCommitSubmodules(git, repository, commit)) {
+    const entries = await readCommitSubmodules(git, repository, commit)
+    // THE ROOT'S CHILD MAINS ARE FETCHED TOGETHER, AT MOST FOUR AT A TIME (25303 f2).
+    // One sequential fetch per owned child cost 4-6 s per compose on the garage
+    // (15 children, twice per merge). Each child fetches into its own store, so
+    // the fetches cannot interfere. Every outcome is kept and consumed below in
+    // entry order, so a failed fetch throws at the same child it always did.
+    // Nested rungs are rare (one Ahead parent) and keep the sequential fetch.
+    const prefetched = new Map<string, { ok: true; main: string } | { ok: false; error: unknown }>()
+    if (!nested) {
+      const owned = entries.filter((entry) => entry.url !== undefined && sameHostedOwner(rootRemote, entry.url))
+      const outcomes = await mapInOrder(owned, MAIN_FETCH_CONCURRENCY, (entry) =>
+        fetchSubmoduleMain(
+          git,
+          repository,
+          stores.get(entry.path) ?? join(repository, entry.path),
+          entry,
+          timeoutMs,
+        ).then(
+          (main) => ({ ok: true as const, main }),
+          (error: unknown) => ({ ok: false as const, error }),
+        ),
+      )
+      owned.forEach((entry, index) => prefetched.set(entry.path, outcomes[index] as (typeof outcomes)[number]))
+    }
+    for (const entry of entries) {
       const path = nested ? `${prefix}/${entry.path}` : entry.path
       const submodule = nested
         ? await discoverRepository(git, join(repository, entry.path), "discover-nested-submodule", true)
@@ -1717,7 +1908,9 @@ async function planGitlinks(
       }
       // The superproject is the PARENT, not the root: `submodule.<name>.branch`
       // for a nested gitlink is declared in its parent component, not in km.
-      const main = await fetchSubmoduleMain(git, repository, submodule, entry, timeoutMs)
+      const fetched = prefetched.get(entry.path)
+      if (fetched?.ok === false) throw fetched.error
+      const main = fetched?.main ?? (await fetchSubmoduleMain(git, repository, submodule, entry, timeoutMs))
       if (entry.target === main) {
         // EQUAL to its own main, and still checked for a lowering (@cto N1).
         // A nested pin equal to its own main can fail to descend from what the
@@ -1870,6 +2063,9 @@ async function mergeApplicationFailure(
   const commit = observed.code === 0 && observed.stdout.trim() !== head ? observed.stdout.trim() : undefined
   return changed ? partial(root, commit, [], detail) : failed(root, [], detail)
 }
+
+/** At most this many child mains are fetched at once; the cap push's plan reads use. */
+const MAIN_FETCH_CONCURRENCY = 4
 
 async function fetchSubmoduleMain(
   git: GitProcess,
