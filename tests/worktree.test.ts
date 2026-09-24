@@ -8,7 +8,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { spawnSync } from "node:child_process"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 import { acquireExclusive } from "../src/exclusive.ts"
 import {
   createGitWorktreeStore,
@@ -25,6 +25,44 @@ function git(repo: string, args: readonly string[]): string {
 }
 
 describe("createGitWorktreeStore", () => {
+  /**
+   * @failure Tree materialization gives up after 30 s while a queue merge still holds the shared writer lock (25274).
+   * @level l1
+   * @consumer Yrd post-merge tree materialization
+   */
+  it("waits for a merge holding the writer lock past 30 seconds before adding a worktree", async () => {
+    const root = await mkdtemp(join(tmpdir(), "git-super-worktree-writer-wait-"))
+    const repo = join(root, "owner")
+    const linked = join(root, "linked")
+    git(root, ["init", "-q", "-b", "main", repo])
+    git(repo, ["config", "user.email", "test@example.com"])
+    git(repo, ["config", "user.name", "Test"])
+    await writeFile(join(repo, "seed.txt"), "seed\n")
+    git(repo, ["add", "seed.txt"])
+    git(repo, ["commit", "-q", "-m", "seed"])
+
+    const held = await acquireExclusive(
+      join(repo, ".git", "yrd-worktree-mutations"),
+      { timeoutMs: 0 },
+      "git super merge",
+    )
+    const release = Bun.sleep(40_000).then(() => held.release())
+    const reports: string[] = []
+    try {
+      const store = createLocalGitWorktreeStore({ repo, report: (line: string) => reports.push(line) })
+      await store.add({ kind: "detached", path: linked, ref: "HEAD" })
+      expect(existsSync(linked)).toBe(true)
+      expect(reports).toEqual([
+        expect.stringMatching(
+          /^git-super worktree: waiting for writer lock held by git super merge \(pid:\d+, age \d+ms\)\n$/u,
+        ),
+      ])
+    } finally {
+      await release
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 75_000)
+
   it("uses the canonical GitProcess request internally", async () => {
     const repo = await mkdtemp(join(tmpdir(), "git-super-process-port-"))
     const requests: GitProcessRequest[] = []
@@ -72,14 +110,19 @@ describe("createGitWorktreeStore", () => {
       },
     })
 
+    const stderr = vi.spyOn(process.stderr, "write")
     try {
-      await expect(store.ready()).rejects.toThrow(/holder=outer mutation.*operation=worktree configuration repair/iu)
+      await expect(store.ready()).rejects.toThrow(
+        /timeout=0ms; holder=outer mutation.*operation=worktree configuration repair/iu,
+      )
+      expect(stderr).not.toHaveBeenCalled()
       expect(requests.map(({ args }) => args)).toEqual([
         ["config", "--local", "--get", "--type=bool", "extensions.worktreeConfig"],
         ["config", "--local", "--get", "--type=bool", "core.bare"],
         ["rev-parse", "--path-format=absolute", "--git-common-dir"],
       ])
     } finally {
+      stderr.mockRestore()
       held.release()
       await rm(repo, { recursive: true, force: true })
     }

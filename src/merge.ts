@@ -16,7 +16,7 @@ import { prepareSubmoduleTreeUnderLock } from "./submodule-prepare.ts"
 import { mapInOrder } from "./map-in-order.ts"
 import { capturePushIntent, discoverRepository, rootPushIdentity } from "./push.ts"
 import { PUSH_INTENT_TRAILER, sameHostedOwner } from "./push-intent.ts"
-import { createExclusive, type Exclusive } from "./exclusive.ts"
+import { createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS, type Exclusive } from "./exclusive.ts"
 import { parseIndexEntries, type IndexEntry } from "./index-entries.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessRequest, type GitProcessResult } from "./process.ts"
 import type { GitResultDetail, GitSuperRepositoryResult, GitSuperResult } from "./result.ts"
@@ -166,6 +166,8 @@ export type SuperMergeOptions = Readonly<{
   timeoutMs?: number
   git?: GitProcess
   exclusive?: Exclusive
+  /** Reports writer-lock contention without writing to stderr from the library. */
+  report?: (line: string) => void
 }>
 
 type GitlinkPlan = Readonly<{
@@ -219,7 +221,12 @@ async function mergeWithSteps(options: SuperMergeOptions, steps: StepClock): Pro
   }
 
   try {
-    const exclusive = options.exclusive ?? createExclusive(await lockDirectory(git, root, timeoutMs))
+    const exclusive =
+      options.exclusive ??
+      createExclusive(await lockDirectory(git, root, timeoutMs), {
+        timeoutMs: DEFAULT_MUTATION_LOCK_WAIT_MS,
+        onContended: (holder) => options.report?.(`git-super merge: waiting for writer lock held by ${holder}\n`),
+      })
     return await exclusive.run(() => mergeUnderLock(git, root, options, timeoutMs, steps), {
       holder: "git super merge",
     })
