@@ -1,4 +1,5 @@
 import type { CommandNode } from "@silvery/command"
+import { constants as osConstants } from "node:os"
 import {
   type commands,
   type CommandContext,
@@ -623,6 +624,9 @@ async function runInvocation(
     )
     return merge.partial ? 2 : 1
   }
+  // A pull that held a signal during its apply exits for it now that its result is written (24907, 128+signal).
+  const deferred = captured.node === commands.pull ? (result as GitSuperResult).deferredSignal : undefined
+  if (deferred !== undefined) return 128 + (osConstants.signals[deferred.signal] ?? 15)
   if (
     captured.node === commands.pull ||
     captured.node === commands.push ||

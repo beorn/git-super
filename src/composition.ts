@@ -226,14 +226,33 @@ async function composeSubmoduleCommit(
     await requiredGit(context, store, ["cat-file", "-e", `${resolution.currentSha}^{commit}`], operation)
     await requiredGit(context, store, ["cat-file", "-e", `${resolution.incomingSha}^{commit}`], operation)
 
+    // Every object is present (verified above), so a side that does not descend
+    // from the base is a REWIND that side made, not an environment the queue
+    // cannot judge. Merging onto it would silently re-apply what was rewound:
+    // with no overlap gate in front (24977), merge-tree alone would call such a
+    // pair clean. It goes back to its author named, never as "cannot judge".
     operation = "verify the planned merge base"
-    for (const parent of [resolution.currentSha, resolution.incomingSha]) {
+    for (const [side, parent] of [
+      ["main", resolution.currentSha],
+      ["change", resolution.incomingSha],
+    ] as const) {
       if (!(await isAncestor(context, store, resolution.baseSha, parent))) {
+        // Two histories with nothing in common cannot be judged at all (@cto 7645ec3a).
+        const shared = await runGit(context, store, ["merge-base", resolution.baseSha, parent])
+        if (shared.code === 1 && settled(shared)) {
+          return refused(
+            "unavailable",
+            resolution.path,
+            operation,
+            `planned base '${resolution.baseSha}' is not an ancestor of parent '${parent}'`,
+          )
+        }
+        if (!settled(shared) || shared.code !== 0) throw new Error(gitDetail(shared))
         return refused(
-          "unavailable",
+          "conflict",
           resolution.path,
           operation,
-          `planned base '${resolution.baseSha}' is not an ancestor of parent '${parent}'`,
+          `rewound: the ${side} pin ${parent} does not descend from the base ${resolution.baseSha}`,
         )
       }
     }
@@ -255,7 +274,7 @@ async function composeSubmoduleCommit(
       resolution.incomingSha,
     ])
     if (merged.code === 1 && settled(merged)) {
-      return refused("conflict", resolution.path, operation, gitDetail(merged))
+      return refused("conflict", resolution.path, operation, conflictDetail(merged.stdout))
     }
     if (!settled(merged) || merged.code !== 0) throw new Error(gitDetail(merged))
     const tree = objectId(merged.stdout.split(/\r?\n/u)[0] ?? "", operation)
@@ -430,6 +449,19 @@ async function commitTime(context: GitContext, store: string, sha: string): Prom
   const timestamp = Number(output)
   if (!Number.isSafeInteger(timestamp)) throw new Error(`parent '${sha}' commit time is outside the safe range`)
   return timestamp
+}
+
+/**
+ * `merge-tree --write-tree --name-only` on a conflict prints the tree, then one
+ * conflicted path per line, then a blank line and Git's messages. The paths are
+ * the whole refusal: 24977 bounces a change only on these, so they are what the
+ * submitter is told.
+ */
+function conflictDetail(stdout: string): string {
+  const [, ...rest] = stdout.split(/\r?\n/u)
+  const end = rest.indexOf("")
+  const paths = [...new Set(end === -1 ? rest : rest.slice(0, end))].filter(Boolean)
+  return paths.length === 0 ? `content conflict: ${stdout.trim()}` : `content conflict in: ${paths.join(", ")}`
 }
 
 function refused(

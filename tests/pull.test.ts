@@ -263,6 +263,8 @@ describe("git super pull --ff-only", () => {
       "apply-root",
       "apply-submodule packages/alpha",
       "apply-submodule vendor/beta",
+      // The root's post-merge hook runs once, after the last checkout (24907).
+      "post-merge-hook",
       "applied",
     ])
     const elapsed = lines.map((line) => Number(/\+(\d+)ms$/u.exec(line)?.[1]))
@@ -1044,7 +1046,17 @@ describe("git super pull --ff-only", () => {
     expect(git(alphaCheckout, "rev-parse", "HEAD")).toBe(alphaBefore)
     expect(git(betaCheckout, "rev-parse", "HEAD")).toBe(betaBefore)
     expect(writeCommands).toEqual([
-      ["-c", "submodule.recurse=false", "merge", "--ff-only", "--no-edit", target],
+      [
+        "-c",
+        // The root merge runs every hook but post-merge (24907).
+        expect.stringMatching(/^core\.hooksPath=.*git-super-hooks-/u),
+        "-c",
+        "submodule.recurse=false",
+        "merge",
+        "--ff-only",
+        "--no-edit",
+        target,
+      ],
       ["-c", "submodule.recurse=false", "checkout", "--detach", expect.any(String)],
     ])
     expect(result).toMatchObject({

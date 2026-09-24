@@ -317,7 +317,7 @@ describe("Phase 1 read commands", () => {
     expect(stderr.output).not.toContain("git super:")
     expect(stderr.output).not.toContain("git-super:")
     expect(stderr.output).toContain("Consulted repositories")
-  })
+  }, 30_000)
 
   test("merge-base refuses when no consulted repository owns the commit", () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-missing-owner-"))

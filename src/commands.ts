@@ -138,6 +138,8 @@ const pull = commandNode<CommandContext, PullParams, GitSuperResult>({
       repo: context.repo,
       ...input,
       ...(progress === true && context.report !== undefined ? { report: context.report } : {}),
+      // A signal deferred during the apply is said whether or not progress is on (24907).
+      ...(context.report === undefined ? {} : { warn: context.report }),
     }),
 })
 

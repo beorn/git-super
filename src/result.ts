@@ -66,6 +66,11 @@ export type GitSuperResult = Readonly<{
   partial: boolean
   detail?: GitResultDetail
   repositories: readonly GitSuperRepositoryResult[]
+  /**
+   * A signal a pull held during its apply (24907): the process exits 128+signal once the result is written, and the
+   * phase names where it arrived. Absent when no signal came.
+   */
+  deferredSignal?: Readonly<{ signal: NodeJS.Signals; phase: string }>
 }>
 
 /** Aggregate repository outcomes without hiding a successful write behind a later failure. */

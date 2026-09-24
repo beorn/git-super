@@ -4,6 +4,8 @@ Git commands that treat a superproject and its submodule interiors as one produc
 
 Ordinary Git plumbing stops at a gitlink. `git diff --name-only A..B` reports `vendor/tool`; it does not report `vendor/tool/src/index.ts`. `git merge-base --is-ancestor <sha> <ref>` returns a false negative when the SHA belongs to a submodule and the ref is a superproject commit. `git-super` asks each question in the repository that owns the answer, prefixes inner paths, and names every repository it consulted.
 
+> Install from npm; a git install resolves the TypeScript source and runs only under Bun.
+
 ## Why it exists
 
 **The dangerous failure is not an error — it is a check that passes because it never looked.**
@@ -74,16 +76,16 @@ Human output puts the resulting merge commit on stdout and settlement evidence o
 
 Its additive `steps` rows time the merge's phases as `{ "name", "ms" }`, in the order they ran. The names form a closed list, and the phases run one after another without overlapping, covering the whole call, so their `ms` add up to its wall time:
 
-| name | covers |
-|---|---|
-| `preflight` | finding the root, taking the worktree lock (including any wait for it), the clean-worktree check, and resolving HEAD and the target |
-| `merge-tree` | the prospective merge tree, plus composing any diverged gitlinks it conflicts on |
-| `plan` | classifying every gitlink against its submodule main: child-main fetches and the nested descent |
-| `capture` | the `Settled:` trailers and the frozen push intent |
-| `checkouts` | preparing affected submodule checkouts and proving the worktree clean |
-| `merge` | the native no-ff merge and the gitlink raises |
-| `settle` | checking affected submodules out at their staged pins |
-| `commit` | the concluding commit, its hooks, and the root receipt |
+| name         | covers                                                                                                                              |
+| ------------ | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `preflight`  | finding the root, taking the worktree lock (including any wait for it), the clean-worktree check, and resolving HEAD and the target |
+| `merge-tree` | the prospective merge tree, plus composing any diverged gitlinks it conflicts on                                                    |
+| `plan`       | classifying every gitlink against its submodule main: child-main fetches and the nested descent                                     |
+| `capture`    | the `Settled:` trailers and the frozen push intent                                                                                  |
+| `checkouts`  | preparing affected submodule checkouts and proving the worktree clean                                                               |
+| `merge`      | the native no-ff merge and the gitlink raises                                                                                       |
+| `settle`     | checking affected submodules out at their staged pins                                                                               |
+| `commit`     | the concluding commit, its hooks, and the root receipt                                                                              |
 
 A merge that stops early ends its `steps` on the phase that stopped it. A new phase is added to this list, never left outside every step. Consumers should record an unfamiliar name as given rather than drop it.
 
