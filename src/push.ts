@@ -100,7 +100,7 @@ type CommitRequirement = Readonly<{
 }>
 
 const DEFAULT_GIT_TIMEOUT_MS = 30_000
-const PUSH_PROGRESS_INTERVAL_MS = 10_000
+const PUSH_PROGRESS_INTERVAL_MS = 9_000
 const OBJECT_ID = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/u
 /** Remote observations one push plan runs at once (25303: reads concurrent, writes stay ordered). */
 const PLAN_READ_CONCURRENCY = 4

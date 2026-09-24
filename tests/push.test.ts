@@ -2054,7 +2054,7 @@ describe("a frozen push works only on the children its merge moved (25303, obser
   }, 30_000)
 
   test.each(["plan", "recheck"] as const)(
-    "reports phase and count every 10 seconds through %s until first write",
+    "reports phase and count within 10 seconds through %s until first write",
     async (stage) => {
       const { repository, remote, source } = pushFixture(`progress-${stage}`)
       const local = createLocalGitProcess()
@@ -2094,9 +2094,9 @@ describe("a frozen push works only on the children its merge moved (25303, obser
         await held
         await vi.advanceTimersByTimeAsync(stage === "plan" ? 25_000 : 10_000)
         expect(writes).toBe(0)
-        expect(reports.some((line) => /git-super push: .*\d+\/\d+ \+10000ms/u.test(line))).toBe(true)
+        expect(reports.some((line) => /git-super push: .*\d+\/\d+ \+9000ms/u.test(line))).toBe(true)
         if (stage === "plan") {
-          expect(reports.some((line) => /git-super push: .*\d+\/\d+ \+20000ms/u.test(line))).toBe(true)
+          expect(reports.some((line) => /git-super push: .*\d+\/\d+ \+18000ms/u.test(line))).toBe(true)
         }
         release?.()
         await expect(operation).resolves.toMatchObject({ state: "updated" })
@@ -2111,7 +2111,7 @@ describe("a frozen push works only on the children its merge moved (25303, obser
     30_000,
   )
 
-  test("reports a held writer lock until the first remote write", async () => {
+  test("reports a held writer lock within ten seconds despite timer jitter", async () => {
     const { repository, remote, source } = pushFixture("progress-lock")
     let release: (() => void) | undefined
     let reached!: () => void
@@ -2128,6 +2128,11 @@ describe("a frozen push works only on the children its merge moved (25303, obser
     }
     const reports: string[] = []
     vi.useFakeTimers()
+    // A nominal 10s interval fires late under load; the heartbeat needs room for that delay.
+    const originalSetInterval = globalThis.setInterval
+    const jitteredInterval = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation((callback, delay, ...args) => originalSetInterval(callback, Number(delay) + 500, ...args))
     try {
       const operation = superPush({
         repo: repository,
@@ -2139,11 +2144,12 @@ describe("a frozen push works only on the children its merge moved (25303, obser
       })
       await held
       await vi.advanceTimersByTimeAsync(10_000)
-      expect(reports).toContain("git-super push: wait-writer-lock 0/1 +10000ms\n")
+      expect(reports).toContain("git-super push: wait-writer-lock 0/1 +9500ms\n")
       release?.()
       await expect(operation).resolves.toMatchObject({ state: "updated" })
     } finally {
       release?.()
+      jitteredInterval.mockRestore()
       vi.useRealTimers()
     }
   }, 30_000)
