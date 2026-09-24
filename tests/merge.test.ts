@@ -2796,6 +2796,8 @@ describe("git super merge — a one-sided fork the merge composes (25389)", () =
     expect(result.detail?.message).toContain("packages/alpha")
     expect(result.detail?.message).toContain("shared.ts")
     expect(result.detail?.message).toContain(`forks from submodule main ${fork.main} at ${fork.base}`)
+    expect(result.detail?.message).toContain('moves "packages/alpha" to a pin off its submodule main')
+    expect(result.detail?.message).not.toContain("conflicts with current HEAD")
     expect(result.detail?.message).not.toContain("stage")
     expect(result.detail?.evidence).toContain(`merge-tree --write-tree ${fork.main} ${fork.theirs}`)
     expect(retainedPins(fixture.alpha)).toEqual([])
