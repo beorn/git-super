@@ -160,7 +160,7 @@ describe("git super merge", () => {
     expect(git(fixture.alpha, "rev-parse", "main")).toBe(fixture.alphaBase)
   })
 
-  it("refuses moved off-main pins before changing the checkout", async () => {
+  it("refuses a moved off-main pin whose component merge conflicts before changing the checkout (25389)", async () => {
     const refusedRoot = mkdtempSync(join(tmpdir(), "git-super-merge-refused-"))
     roots.push(refusedRoot)
     const refused = createProductFixture(refusedRoot)
@@ -189,13 +189,14 @@ describe("git super merge", () => {
 
     expect(refusedCode).toBe(1)
     expect(refusedStdout.output).toBe("")
-    expect(refusedStderr.output).toContain("gitlink-off-main")
+    expect(refusedStderr.output).toContain("gitlink-compose-refused")
     expect(refusedStderr.output).toContain("packages/alpha")
+    expect(refusedStderr.output).toContain("alpha.ts")
     expect(refusedStderr.output).toContain(unpublished)
     expect(refusedStderr.output).toContain(refusedMain)
     expect(refusedStderr.output).toContain("evidence:")
     expect(refusedStderr.output).toContain("next:")
-    expect(refusedStderr.output).toContain("owner: the submodule writer")
+    expect(refusedStderr.output).toContain("owner: the caller")
     expect(git(refused.product, "rev-parse", "HEAD")).toBe(refusedHeadBefore)
     expect(git(refused.product, "status", "--porcelain=v1")).toBe(refusedStatusBefore)
 
@@ -213,11 +214,11 @@ describe("git super merge", () => {
       state: "failed",
       partial: false,
       detail: {
-        code: "gitlink-off-main",
+        code: "gitlink-compose-refused",
         subject: expect.stringContaining("packages/alpha"),
-        evidence: expect.stringContaining("merge-base --is-ancestor"),
-        next: expect.stringContaining("Rebase"),
-        owner: "the submodule writer",
+        evidence: expect.stringContaining(`merge-tree --write-tree ${refusedMain} ${unpublished}`),
+        next: expect.stringContaining("Merge the submodule's own main"),
+        owner: "the caller",
       },
     })
   })
@@ -1956,7 +1957,8 @@ describe("git super merge — the nested gitlink chain (24454 row 4)", () => {
     const fixture = createNestedProductFixture(root)
     const moved = advanceNestedThroughAlpha(fixture, "candidate-diverged", "export const leaf = 'unpublished'\n")
     // The nested main moves to a COMPETING commit, so the candidate's nested pin
-    // is neither behind it nor ahead of it. This is D1, one level down.
+    // is neither behind it nor ahead of it. This is D1, one level down, and it
+    // stays refused: the one-sided composition takes root-level plans only (25389).
     const competingLeaf = advanceRepository(fixture.leaf, "leaf.ts", "export const leaf = 'competing'\n")
     const headBefore = git(fixture.product, "rev-parse", "HEAD")
     const statusBefore = git(fixture.product, "status", "--porcelain=v1")
@@ -2681,6 +2683,231 @@ describe("git super merge — a diverged gitlink the merge composes", () => {
   })
 })
 
+describe("git super merge — a one-sided fork the merge composes (25389)", () => {
+  /**
+   * Fork one component the way a single-component change does: root main pins the component base, the
+   * candidate pins `theirs` built on that base, and the component main has since moved to `main`. Only the
+   * candidate moves the gitlink, so the ROOT merge is clean and has no conflict to compose from.
+   */
+  function forkComponent(
+    fixture: ProductFixture,
+    component: "alpha" | "beta",
+    main: readonly (readonly [string, string])[],
+    theirs: readonly (readonly [string, string])[],
+  ): Readonly<{ base: string; main: string; path: string; theirs: string }> {
+    const origin = component === "alpha" ? fixture.alpha : fixture.beta
+    const base = component === "alpha" ? fixture.alphaBase : fixture.betaBase
+    const path = component === "alpha" ? "packages/alpha" : "vendor/beta"
+    let mainSha = base
+    for (const [file, content] of main) mainSha = advanceRepository(origin, file, content)
+    git(origin, "switch", "-q", "-c", "submodule-theirs", base)
+    let theirsSha = base
+    for (const [file, content] of theirs) theirsSha = advanceRepository(origin, file, content)
+    git(origin, "switch", "-q", "main")
+    git(join(fixture.product, path), "fetch", "-q", "origin")
+    return { base, main: mainSha, path, theirs: theirsSha }
+  }
+
+  /** Commit a candidate branch pinning each fork's `theirs`, then return the checkout to root main's pins. */
+  function candidatePinning(
+    fixture: ProductFixture,
+    name: string,
+    forks: readonly { path: string; theirs: string; base: string }[],
+  ): string {
+    git(fixture.product, "switch", "-q", "-c", name)
+    for (const fork of forks) git(join(fixture.product, fork.path), "checkout", "-q", fork.theirs)
+    git(fixture.product, "add", ...forks.map((fork) => fork.path))
+    git(fixture.product, "commit", "-q", "-m", `pin ${forks.map((fork) => fork.path).join(" and ")}`)
+    const candidate = git(fixture.product, "rev-parse", "HEAD")
+    git(fixture.product, "switch", "-q", "main")
+    for (const fork of forks) git(join(fixture.product, fork.path), "checkout", "-q", fork.base)
+    return candidate
+  }
+
+  function retainedPins(repository: string): string[] {
+    return git(repository, "for-each-ref", "--format=%(refname)", "refs/git-super/pins").split("\n").filter(Boolean)
+  }
+
+  /**
+   * @failure A clean forked component pin is refused as gitlink-off-main, so its author re-cuts by hand (25389).
+   * @level l1
+   * @consumer Yrd submit and the queue round, which both call git super merge
+   */
+  it("merges the component when only the candidate moved its gitlink and the component main moved on", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-fork-clean-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const fork = forkComponent(
+      fixture,
+      "alpha",
+      [["main-side.ts", "export const main = 1\n"]],
+      [["change-side.ts", "export const change = 1\n"]],
+    )
+    const candidate = candidatePinning(fixture, "candidate-fork", [fork])
+    // THE SHAPE: the root merge alone is clean. Without that, this is the two-sided case.
+    expect(git(fixture.product, "merge-tree", "--write-tree", "HEAD", candidate)).toMatch(/^[0-9a-f]{40}$/u)
+
+    const result = await superMerge({ repo: fixture.product, commit: candidate })
+
+    expect(result).toMatchObject({ state: "updated", partial: false })
+    const settled = result.gitlinks.find((row) => row.path === "packages/alpha")
+    expect(settled).toMatchObject({ state: "merged", to: fork.main })
+    const composed = settled?.from ?? ""
+    expect(composed).toMatch(/^[0-9a-f]{40}$/u)
+    // The component main is the FIRST parent and the pin the second, as in the two-sided composition.
+    expect(git(join(fixture.product, "packages/alpha"), "cat-file", "-p", composed).split("\n").slice(1, 3)).toEqual([
+      `parent ${fork.main}`,
+      `parent ${fork.theirs}`,
+    ])
+    expect(settled).toMatchObject({
+      composition: { base: fork.base, parent: fork.main, pin: fork.theirs, files: { parent: 1, pin: 1 } },
+    })
+    expect(git(fixture.product, "ls-tree", "HEAD", "--", "packages/alpha")).toBe(
+      `160000 commit ${composed}\tpackages/alpha`,
+    )
+    expect(git(fixture.product, "log", "-1", "--format=%B", "HEAD")).toContain(
+      `Settled: packages/alpha@${composed} merged submodule-main@${fork.main}`,
+    )
+    expect(retainedPins(fixture.alpha)).toEqual([`refs/git-super/pins/${composed}`])
+    expect(git(fixture.alpha, "rev-parse", "refs/heads/main")).toBe(fork.main)
+    expect(git(fixture.product, "status", "--porcelain=v1")).toBe("")
+  })
+
+  it("refuses a fork whose component merge conflicts, naming the file and the component merge, never a root stage", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-fork-conflict-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const fork = forkComponent(
+      fixture,
+      "alpha",
+      [["shared.ts", "export const shared = 'main'\n"]],
+      [["shared.ts", "export const shared = 'change'\n"]],
+    )
+    const candidate = candidatePinning(fixture, "candidate-fork-conflict", [fork])
+    const headBefore = git(fixture.product, "rev-parse", "HEAD")
+
+    const result = await superMerge({ repo: fixture.product, commit: candidate })
+
+    expect(result).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: { code: "gitlink-compose-refused", owner: "the caller" },
+    })
+    expect(result.detail?.message).toContain("packages/alpha")
+    expect(result.detail?.message).toContain("shared.ts")
+    expect(result.detail?.message).toContain(`forks from submodule main ${fork.main} at ${fork.base}`)
+    expect(result.detail?.message).toContain('moves "packages/alpha" to a pin off its submodule main')
+    expect(result.detail?.message).not.toContain("conflicts with current HEAD")
+    expect(result.detail?.message).not.toContain("stage")
+    expect(result.detail?.evidence).toContain(`merge-tree --write-tree ${fork.main} ${fork.theirs}`)
+    expect(retainedPins(fixture.alpha)).toEqual([])
+    expect(git(fixture.product, "rev-parse", "HEAD")).toBe(headBefore)
+  })
+
+  it("refuses a fork that shares no history with its component main as gitlink-off-main, naming both commits", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-fork-disjoint-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const main = advanceRepository(fixture.alpha, "main-side.ts", "export const main = 1\n")
+    git(fixture.alpha, "checkout", "-q", "--orphan", "submodule-orphan")
+    git(fixture.alpha, "rm", "-rq", "--cached", ".")
+    rmSync(join(fixture.alpha, "alpha.ts"), { force: true })
+    rmSync(join(fixture.alpha, "main-side.ts"), { force: true })
+    writeFileSync(join(fixture.alpha, "orphan.ts"), "export const orphan = 1\n")
+    git(fixture.alpha, "add", "orphan.ts")
+    git(fixture.alpha, "commit", "-q", "-m", "an unrelated history")
+    const orphan = git(fixture.alpha, "rev-parse", "HEAD")
+    git(fixture.alpha, "checkout", "-q", "-f", "main")
+    git(join(fixture.product, "packages/alpha"), "fetch", "-q", "origin")
+    const candidate = candidatePinning(fixture, "candidate-fork-orphan", [
+      { base: fixture.alphaBase, path: "packages/alpha", theirs: orphan },
+    ])
+    const headBefore = git(fixture.product, "rev-parse", "HEAD")
+
+    const result = await superMerge({ repo: fixture.product, commit: candidate })
+
+    expect(result).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: { code: "gitlink-off-main", owner: "the submodule writer" },
+    })
+    expect(result.detail?.message).toContain("shares no history")
+    expect(result.detail?.message).toContain(orphan)
+    expect(result.detail?.message).toContain(main)
+    expect(result.detail?.evidence).toContain(`merge-base ${main} ${orphan}`)
+    expect(retainedPins(fixture.alpha)).toEqual([])
+    expect(git(fixture.product, "rev-parse", "HEAD")).toBe(headBefore)
+  })
+
+  it("composes several forked components in one merge", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-fork-several-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const alpha = forkComponent(fixture, "alpha", [["a-main.ts", "1\n"]], [["a-change.ts", "1\n"]])
+    const beta = forkComponent(fixture, "beta", [["b-main.ts", "1\n"]], [["b-change.ts", "1\n"]])
+    const candidate = candidatePinning(fixture, "candidate-fork-several", [alpha, beta])
+
+    const result = await superMerge({ repo: fixture.product, commit: candidate })
+
+    expect(result).toMatchObject({ state: "updated", partial: false })
+    for (const fork of [alpha, beta]) {
+      const settled = result.gitlinks.find((row) => row.path === fork.path)
+      expect(settled, fork.path).toMatchObject({
+        state: "merged",
+        to: fork.main,
+        composition: { base: fork.base, parent: fork.main, pin: fork.theirs },
+      })
+      expect(git(fixture.product, "ls-tree", "HEAD", "--", fork.path)).toBe(
+        `160000 commit ${settled?.from ?? ""}\t${fork.path}`,
+      )
+    }
+    expect(retainedPins(fixture.alpha)).toHaveLength(1)
+    expect(retainedPins(fixture.beta)).toHaveLength(1)
+  })
+
+  /**
+   * THE MIXED CASE (@cto 25389 ruling 3). The root merge conflicts on alpha, which the two-sided path composes;
+   * beta is a one-sided fork that only shows up in the plan computed on THAT composed tree. The one-sided call
+   * composes onto it, and both compositions are reported.
+   */
+  it("composes a one-sided fork onto the tree a two-sided composition wrote, reporting both", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-fork-mixed-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const alphaOurs = advanceRepository(fixture.alpha, "a-main.ts", "1\n")
+    git(fixture.alpha, "switch", "-q", "-c", "submodule-theirs", fixture.alphaBase)
+    const alphaTheirs = advanceRepository(fixture.alpha, "a-change.ts", "1\n")
+    git(fixture.alpha, "switch", "-q", "main")
+    git(join(fixture.product, "packages/alpha"), "fetch", "-q", "origin")
+    const beta = forkComponent(fixture, "beta", [["b-main.ts", "1\n"]], [["b-change.ts", "1\n"]])
+    const candidate = candidatePinning(fixture, "candidate-fork-mixed", [
+      { base: fixture.alphaBase, path: "packages/alpha", theirs: alphaTheirs },
+      beta,
+    ])
+    // Root main moves alpha to its own main, so alpha conflicts at the root and beta does not.
+    git(join(fixture.product, "packages/alpha"), "checkout", "-q", alphaOurs)
+    git(fixture.product, "add", "packages/alpha")
+    git(fixture.product, "commit", "-q", "-m", "pin alpha main")
+
+    const result = await superMerge({ repo: fixture.product, commit: candidate })
+
+    expect(result).toMatchObject({ state: "updated", partial: false })
+    expect(result.gitlinks.find((row) => row.path === "packages/alpha")).toMatchObject({
+      state: "merged",
+      composition: { parent: alphaOurs, pin: alphaTheirs },
+    })
+    const betaRow = result.gitlinks.find((row) => row.path === "vendor/beta")
+    expect(betaRow).toMatchObject({
+      state: "merged",
+      composition: { base: beta.base, parent: beta.main, pin: beta.theirs },
+    })
+    expect(git(fixture.product, "ls-tree", "HEAD", "--", "vendor/beta")).toBe(
+      `160000 commit ${betaRow?.from ?? ""}\tvendor/beta`,
+    )
+    expect(git(fixture.product, "status", "--porcelain=v1")).toBe("")
+  })
+})
+
 describe("git super merge — the root's child mains are fetched together (25303 f2)", () => {
   /** The descent's own read of one child's main: `fetch --no-tags origin +refs/heads/<branch>:...`. */
   const isMainFetch = (args: readonly string[]): boolean =>
@@ -2876,7 +3103,8 @@ describe("git super merge — each phase reports how long it took (25303 tier 2)
 
     const { result, wall } = await timedMerge({ repo: fixture.product, commit: candidate })
 
-    expect(result).toMatchObject({ state: "failed", detail: { code: "gitlink-off-main" } })
+    // A one-sided fork that conflicts in alpha.ts: refused while planning, where its composition runs (25389).
+    expect(result).toMatchObject({ state: "failed", detail: { code: "gitlink-compose-refused" } })
     expect(result.steps?.map((step) => step.name)).toEqual(["preflight", "merge-tree", "plan"])
     expectCovers(result.steps, wall)
 
