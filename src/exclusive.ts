@@ -17,8 +17,13 @@ export type ExclusiveOptions = Readonly<{
 export type WriterLock = Readonly<{ release(): void }>
 
 // A queue merge held this lock for over 53 s and made submit fail at 30 s;
-// post-merge test 825324 also lost a worktree add after 30,006 ms.
-export const DEFAULT_MUTATION_LOCK_WAIT_MS = 5 * 60_000
+// post-merge test 825324 also lost a worktree add after 30,006 ms. The wait is
+// strictly less than a caller's per-call cap minus the work after acquiring:
+// yrd bounds one root-v1 git call at 5 minutes, and a wait equal to that cap
+// IS the cap — yrd would kill `git super worktree add` still waiting or mid-add
+// after taking the lock, leaving a half-added worktree (25274, @cto 297a8976).
+// The inequality is pinned against yrd's constant by the host's test.
+export const DEFAULT_MUTATION_LOCK_WAIT_MS = 4 * 60_000
 
 /**
  * Acquire the repository-scoped writer lock used by both the former Yrd store
