@@ -360,6 +360,71 @@ describe("explicit recursive push mechanics", () => {
     expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(fixture.childBefore)
   })
 
+  // 25570: the child remote advertises every task branch it holds (8,584 heads on hh-dev's origin), so check asks
+  // for the ONE commit by SHA instead of listing and fetching every advertised tip. A commit reachable only under a
+  // task branch, and not its tip, is the case a tips-only server would wrongly call unavailable.
+  test("check asks each child remote for the one commit by SHA, in a throwaway repository it removes", async () => {
+    const fixture = recursivePushFixture("check-by-sha")
+    const beyond = advanceRepository(fixture.child, "child.txt", "three\n")
+    git(fixture.child, "push", "-q", "origin", `${beyond}:refs/heads/task/beyond`)
+    for (let index = 0; index < 20; index++) {
+      git(fixture.childRemote, "update-ref", `refs/heads/task/crowd-${index}`, fixture.childBefore)
+    }
+    const local = createLocalGitProcess()
+    const requests: { repo: string; args: readonly string[] }[] = []
+    const recording: GitProcess = {
+      run(request) {
+        requests.push({ repo: request.repo, args: request.args })
+        return local.run(request)
+      },
+    }
+
+    const result = await superPush({
+      repo: fixture.root,
+      recurseSubmodules: "check",
+      remote: "origin",
+      refspecs: ["HEAD:refs/heads/main"],
+      git: recording,
+    })
+
+    expect(result).toMatchObject({ state: "updated", partial: false })
+    expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(fixture.rootSource)
+    // The root push still observes its own destination; the child is asked nothing but the one commit.
+    expect(requests.filter(({ repo, args }) => repo === fixture.child && args[0] === "ls-remote")).toEqual([])
+    const asked = requests.filter(({ repo, args }) => repo !== fixture.root && args[0] === "fetch")
+    expect(asked.map(({ args }) => args.at(-1))).toEqual([fixture.childSource])
+    expect(asked[0]?.args).toEqual(expect.arrayContaining(["--depth=1", "--filter=tree:0", "--no-tags"]))
+    expect(asked[0]?.repo).not.toBe(fixture.child)
+    expect(existsSync(asked[0]?.repo ?? fixture.child)).toBe(false)
+  })
+
+  test("check fails loud, and still removes its throwaway repository, when a child remote cannot answer", async () => {
+    const fixture = recursivePushFixture("check-unreachable")
+    git(fixture.child, "remote", "set-url", "origin", join(fixture.fixture, "no-such-remote.git"))
+    const local = createLocalGitProcess()
+    const probes: string[] = []
+    const recording: GitProcess = {
+      run(request) {
+        if (request.args[0] === "fetch") probes.push(request.repo)
+        return local.run(request)
+      },
+    }
+
+    const result = await superPush({
+      repo: fixture.root,
+      recurseSubmodules: "check",
+      remote: "origin",
+      refspecs: ["HEAD:refs/heads/main"],
+      git: recording,
+    })
+
+    expect(result).toMatchObject({ state: "failed", detail: { code: "submodule-availability-unknown" } })
+    expect(result.detail?.message).toContain("no-such-remote.git")
+    expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(fixture.rootBefore)
+    expect(probes).toHaveLength(1)
+    expect(existsSync(probes[0] ?? fixture.child)).toBe(false)
+  })
+
   test("does not turn a missing initialized child checkout into an empty recursive graph", async () => {
     const fixture = recursivePushFixture("missing-child")
     rmSync(fixture.child, { recursive: true, force: true })

@@ -1,4 +1,6 @@
 import { isAbsolute, join, resolve } from "node:path"
+import { mkdtempSync, rmSync } from "node:fs"
+import { tmpdir } from "node:os"
 import { batchCheck, type BatchCheckResult, type GitResult } from "gitomic"
 
 import {
@@ -1545,6 +1547,49 @@ export async function remoteContainsCommit(options: RemoteCommitAvailabilityOpti
   return commitAvailableOnRemote(git, repository, options.remote, options.commit, options.refPrefixes)
 }
 
+/** The remote's own refusal of a want it will not serve: upload-pack's text, stable under LC_ALL=C. */
+const NOT_SERVED = "upload-pack: not our ref"
+
+/**
+ * Whether `remote` serves `commit`, asked with ONE fetch of that commit by SHA (25570).
+ *
+ * Listing the remote to find a tip that contains the commit carried its whole advertisement, 8,584 heads on
+ * hh-dev's origin, then fetched every tip missing here. Asking for the commit advertises no refs at all.
+ *
+ * ASSUMPTION: the remote serves any commit reachable from one of its refs, tip or not, as GitHub does (measured
+ * 2026-09-24, main~3 of hh-dev, receipt /hh/var/@dev10/25570/check-mode-filter-probe.txt). A server serving only
+ * advertised tips would answer "not our ref" for a reachable non-tip commit, and this would call it unavailable.
+ *
+ * The ask runs in a throwaway repository, never the child's store: a fetch whose wanted object is already local
+ * never contacts the remote, and the child always holds the commit it pins. `--depth=1 --filter=tree:0` transfers
+ * that one commit object (88 objects under blob:none on hh-dev, 1 under tree:0). "not our ref" is the one answer
+ * that means unavailable; every other failure is loud, never read as unavailable.
+ */
+async function remoteServesCommit(
+  git: GitProcess,
+  repository: string,
+  remote: string,
+  commit: string,
+): Promise<boolean> {
+  const declared = (await required(git, repository, ["remote", "get-url", remote], "resolve-submodule-remote")).trim()
+  // A scp-like or scheme URL passes as written; a bare path is the remote's store, relative to its repository.
+  const url =
+    declared.includes("://") || /^[^/]+:/u.test(declared) || isAbsolute(declared)
+      ? declared
+      : resolve(repository, declared)
+  const scratch = mkdtempSync(join(tmpdir(), "git-super-serves-"))
+  try {
+    await required(git, scratch, ["init", "--quiet"], "prepare-availability-probe")
+    const args = ["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--depth=1", "--filter=tree:0", url, commit]
+    const asked = await git.run({ repo: scratch, args, env: { LC_ALL: "C" } })
+    if (asked.code === 0 && asked.failure === undefined && asked.timedOut !== true) return true
+    if (asked.timedOut !== true && asked.stderr.includes(`${NOT_SERVED} ${commit}`)) return false
+    throw operationError(repository, args, "check-remote-availability", asked)
+  } finally {
+    rmSync(scratch, { recursive: true, force: true })
+  }
+}
+
 async function commitAvailableOnAnyRemote(git: GitProcess, requirement: CommitRequirement): Promise<boolean> {
   const listed = await required(git, requirement.repository, ["remote"], "list-submodule-remotes")
   const remotes = listed.split(/\r?\n/u).filter((remote) => remote !== "")
@@ -1561,7 +1606,7 @@ async function commitAvailableOnAnyRemote(git: GitProcess, requirement: CommitRe
   const failures: string[] = []
   for (const remote of remotes) {
     try {
-      if (await commitAvailableOnRemote(git, requirement.repository, remote, requirement.target)) return true
+      if (await remoteServesCommit(git, requirement.repository, remote, requirement.target)) return true
     } catch (error) {
       failures.push(`${remote}: ${error instanceof Error ? error.message : String(error)}`)
     }
