@@ -24,6 +24,7 @@
     "./objects": "./src/objects.ts",
     "./process": "./src/process.ts",
     "./pull": "./src/pull.ts",
+    "./push-intent": "./src/push-intent.ts",
     "./push": "./src/push.ts",
     "./result": "./src/result.ts",
     "./submodules": "./src/submodules.ts",

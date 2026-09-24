@@ -230,7 +230,13 @@ export async function readFrozenPushIntents(
   return intents
 }
 
-/** One owner reads and binds the trailer to the actual containing merge. */
+/**
+ * The frozen push intent a checked merge carries, read from that candidate commit: for each child it publishes, the
+ * remote, the destination ref and the expected destination oid the publication will lease on. One owner reads and
+ * binds the trailer to the actual containing merge. A candidate without one returns undefined. Exported as
+ * `git-super/push-intent` so a caller that must know the lease before publishing (yrd's reuse of a compose, 25570)
+ * reads this decoder and never a second one (@cto 298075b8).
+ */
 export async function readFrozenPushIntent(
   git: GitProcess,
   root: string,
