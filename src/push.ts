@@ -1,6 +1,4 @@
 import { isAbsolute, join, resolve } from "node:path"
-import { mkdtempSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
 import { batchCheck, type BatchCheckResult, type GitResult } from "gitomic"
 
 import {
@@ -314,10 +312,11 @@ async function observeDestination(
     }
     throw operationError(update.repository, args, phase, observed)
   }
-  // `<flag> <old> <new> <local ref>`, one line per refspec.
+  // `<flag> <old> <new> <local ref>`, one line per refspec. The flag is one character and may itself be a
+  // space (a fast-forward), so the fields start at column 2, as Gitomic reads them.
   const rows = observed.stdout.split(/\r?\n/u).filter((row) => row !== "")
   const objectIds = rows.flatMap((row) => {
-    const [, , oid, local] = row.split(" ")
+    const [, oid, local] = row.slice(2).split(" ")
     return local === named && oid !== undefined && OBJECT_ID.test(oid) ? [oid] : []
   })
   if (rows.length !== 1 || objectIds.length !== 1 || objectIds[0] === undefined) {
@@ -1573,50 +1572,67 @@ export async function remoteContainsCommit(options: RemoteCommitAvailabilityOpti
   return commitAvailableOnRemote(git, repository, options.remote, options.commit, options.refPrefixes)
 }
 
-/** The remote's own refusal of a want it will not serve: upload-pack's text, stable under LC_ALL=C. */
-const NOT_SERVED = "upload-pack: not our ref"
+/** What check mode learned about one remote: reached, or not reached after reading these refs by name. */
+type Reach = Readonly<{ reached: boolean; read: readonly string[] }>
 
 /**
- * Whether `remote` serves `commit`, asked with ONE fetch of that commit by SHA (25570).
+ * Whether a ref on `remote` REACHES `commit`, asked one exact ref at a time, first hit wins (25570, @cto dc89c537).
  *
- * Listing the remote to find a tip that contains the commit carried its whole advertisement, 8,584 heads on
- * hh-dev's origin, then fetched every tip missing here. Asking for the commit advertises no refs at all.
- *
- * ASSUMPTION: the remote serves any commit reachable from one of its refs, tip or not, as GitHub does (measured
- * 2026-09-24, main~3 of hh-dev, receipt /hh/var/@dev10/25570/check-mode-filter-probe.txt). A server serving only
- * advertised tips would answer "not our ref" for a reachable non-tip commit, and this would call it unavailable.
- *
- * The ask runs in a throwaway repository, never the child's store: a fetch whose wanted object is already local
- * never contacts the remote, and the child always holds the commit it pins. `--depth=1 --filter=tree:0` transfers
- * that one commit object (88 objects under blob:none on hh-dev, 1 under tree:0). "not our ref" is the one answer
- * that means unavailable; every other failure is loud, never read as unavailable.
+ * Held is not reachable: a server serves any object it still holds, and an object no ref reaches is pruned later,
+ * so a stale gitlink after a force-pushed child branch would pass a fetch by SHA today and dangle tomorrow.
+ * Reachability implies held, so nothing else is asked. The refs, in order: every local branch of the child that
+ * contains the commit, by its remote name (the ordinary pre-queue state, a seat's task branch pushed as itself);
+ * then git-super's retention ref for the commit; then the child's main. Each is read by name (observeDestination:
+ * one ref advertised, its objects fetched, nothing written), and ancestry is decided locally. Listing the remote
+ * instead carried its whole advertisement, 8,584 heads on hh-dev's origin, per moved submodule.
  */
-async function remoteServesCommit(
-  git: GitProcess,
-  repository: string,
-  remote: string,
-  commit: string,
-): Promise<boolean> {
-  const declared = (await required(git, repository, ["remote", "get-url", remote], "resolve-submodule-remote")).trim()
-  // A scp-like or scheme URL passes as written; a bare path is the remote's store, relative to its repository.
-  const url =
-    declared.includes("://") || /^[^/]+:/u.test(declared) || isAbsolute(declared)
-      ? declared
-      : resolve(repository, declared)
-  const scratch = mkdtempSync(join(tmpdir(), "git-super-serves-"))
-  try {
-    await required(git, scratch, ["init", "--quiet"], "prepare-availability-probe")
-    const args = ["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--depth=1", "--filter=tree:0", url, commit]
-    const asked = await git.run({ repo: scratch, args, env: { LC_ALL: "C" } })
-    if (asked.code === 0 && asked.failure === undefined && asked.timedOut !== true) return true
-    if (asked.timedOut !== true && asked.stderr.includes(`${NOT_SERVED} ${commit}`)) return false
-    throw operationError(repository, args, "check-remote-availability", asked)
-  } finally {
-    rmSync(scratch, { recursive: true, force: true })
+async function remoteReachesCommit(git: GitProcess, requirement: CommitRequirement, remote: string): Promise<Reach> {
+  const { repository, target: commit } = requirement
+  const local = await required(
+    git,
+    repository,
+    [
+      "for-each-ref",
+      "--contains",
+      commit,
+      "--format=%(refname)%00%(upstream:remotename)%00%(upstream:remoteref)",
+      "refs/heads/",
+    ],
+    "list-branches-containing-pin",
+  )
+  const branches = local
+    .split(/\r?\n/u)
+    .filter((row) => row !== "")
+    .map((row) => {
+      const [name = "", upstreamRemote = "", upstreamRef = ""] = row.split("\0")
+      return upstreamRemote === remote && upstreamRef.startsWith("refs/heads/") ? upstreamRef : name
+    })
+  const read: string[] = []
+  const reaches = async (ref: string): Promise<boolean> => {
+    if (read.includes(ref)) return false
+    read.push(ref)
+    const observed = await observeDestination(
+      git,
+      { repository, remote, destination: ref },
+      "check-remote-availability",
+    )
+    if (observed.state === "missing") return false
+    const args = ["merge-base", "--is-ancestor", commit, observed.oid]
+    const contains = await git.run({ repo: repository, args })
+    if (contains.code !== 0 && contains.code !== 1) {
+      throw operationError(repository, args, "check-remote-availability", contains)
+    }
+    return contains.code === 0
   }
+  for (const ref of [...branches, `refs/git-super/pins/${commit}`]) {
+    if (await reaches(ref)) return { reached: true, read }
+  }
+  // Resolved last: an unconfigured branch is asked of the remote's HEAD, which a hit above never pays for.
+  const main = await resolveSubmoduleBranch(git, requirement.superproject, repository, requirement.entry, remote)
+  return { reached: await reaches(`refs/heads/${main}`), read }
 }
 
-async function commitAvailableOnAnyRemote(git: GitProcess, requirement: CommitRequirement): Promise<boolean> {
+async function commitAvailableOnAnyRemote(git: GitProcess, requirement: CommitRequirement): Promise<Reach> {
   const listed = await required(git, requirement.repository, ["remote"], "list-submodule-remotes")
   const remotes = listed.split(/\r?\n/u).filter((remote) => remote !== "")
   if (remotes.length === 0) {
@@ -1630,9 +1646,12 @@ async function commitAvailableOnAnyRemote(git: GitProcess, requirement: CommitRe
     })
   }
   const failures: string[] = []
+  const read: string[] = []
   for (const remote of remotes) {
     try {
-      if (await remoteServesCommit(git, requirement.repository, remote, requirement.target)) return true
+      const reach = await remoteReachesCommit(git, requirement, remote)
+      if (reach.reached) return reach
+      read.push(...reach.read.map((ref) => `${remote} ${ref}`))
     } catch (error) {
       failures.push(`${remote}: ${error instanceof Error ? error.message : String(error)}`)
     }
@@ -1651,7 +1670,7 @@ async function commitAvailableOnAnyRemote(git: GitProcess, requirement: CommitRe
       ),
     })
   }
-  return false
+  return { reached: false, read }
 }
 
 /**
@@ -2026,18 +2045,20 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
       const requirements = await collectCommitRequirements(git, root, rootSources)
       const available: GitSuperRepositoryResult[] = []
       for (const requirement of requirements) {
-        if (await commitAvailableOnAnyRemote(git, requirement)) {
+        const reach = await commitAvailableOnAnyRemote(git, requirement)
+        if (reach.reached) {
           available.push(availabilityResult(requirement, "unchanged"))
           continue
         }
         const failure = detail(
           "submodule-commit-unavailable",
           "check-submodule-availability",
-          `Commit ${requirement.target} from ${requirement.path} is not reachable from any configured submodule remote.`,
+          `Commit ${requirement.target} from ${requirement.path} is not reachable from any configured submodule remote; read by name: ${reach.read.join(", ")}.`,
           {
             paths: [requirement.path],
             objectIds: [requirement.target],
-            remedy: "Publish the exact child commit to at least one configured child remote, then rerun check mode.",
+            remedy:
+              "Push the child branch that holds the commit (a branch reaching it, not only the object), or run the push with --recurse-submodules=on-demand, then rerun check mode.",
           },
         )
         return gitSuperResult(
