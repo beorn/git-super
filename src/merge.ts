@@ -1324,10 +1324,11 @@ async function composeDivergedGitlinks(
    * SETTLE FAST-FORWARDS NOW THAT EVERY INCOMING COMMIT IS PRESENT (25280).
    * The planner sees only the three stages, and Git hands over a three-stage
    * gitlink conflict whenever the store lacks one side, even when that side
-   * simply descends from the other. Composing such a pair makes the path gate
-   * read the older side's own changes, which the newer side contains, as an
-   * overlap: queue run q-20260923T145509635Z-1de06624 sent two ag
-   * fast-forwards back as "diverged; files overlap" this way. So incoming is
+   * simply descends from the other. Composing such a pair builds a merge
+   * commit where a fast-forward is the answer; while the path gate stood (it
+   * went in 24977), it also read the older side's own changes as an overlap:
+   * queue run q-20260923T145509635Z-1de06624 sent two ag fast-forwards back as
+   * "diverged; files overlap" this way. So incoming is
    * a pin when base <= current <= incoming, which is Git's own fast-forward
    * rule. A pair that fails either step stays a composition, and the
    * composition names the rewind it cannot build on. Git already resolves
