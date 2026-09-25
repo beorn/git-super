@@ -1044,6 +1044,16 @@ async function logicalPushUrl(git: GitProcess, repository: string, remote: strin
   throw new Error(`Frozen push remote ${remote} has no declared URL in ${repository}`)
 }
 
+/**
+ * A child main the caller already read from its remote, by the child's path from the root (25570).
+ *
+ * The merge reads every owned child's main to plan its gitlinks, seconds before it freezes the push. Reading each
+ * one again to freeze doubled the merge's SSH logins (32 for 15 children, measured with trace2). A reused read also
+ * makes the lease the exact main the merge was composed against; a main that moves in between fails that lease at
+ * publication, as a moved main already does.
+ */
+export type ObservedMains = ReadonlyMap<string, Readonly<{ remote: string; destination: string; oid: string }>>
+
 /** Freeze the existing recursive planner's inputs before the merge is committed or checked. */
 export async function capturePushIntent(
   git: GitProcess,
@@ -1053,6 +1063,7 @@ export async function capturePushIntent(
   rootPins: ReadonlyMap<string, string>,
   timeoutMs: number,
   rootStores?: ReadonlyMap<string, string>,
+  observedMains?: ObservedMains,
 ): Promise<string | undefined> {
   const requirements = await collectCommitRequirements(git, root, [tree], rootPins, undefined, rootStores)
   if (requirements.length === 0) return undefined
@@ -1079,7 +1090,7 @@ export async function capturePushIntent(
       children.push(pin)
       continue
     }
-    const update = await childUpdate(git, requirement, timeoutMs, ["refs/heads/main"])
+    const update = await childUpdate(git, requirement, timeoutMs, ["refs/heads/main"], observedMains)
     const remote = await logicalPushUrl(git, requirement.repository, update.remote)
     if (!sameHostedOwner(rootRemote, remote)) {
       children.push({ ...pin, remote })
@@ -1743,6 +1754,7 @@ async function childUpdate(
   requirement: CommitRequirement,
   timeoutMs: number,
   rootDestinations: readonly string[],
+  observedMains?: ObservedMains,
 ): Promise<RefUpdate> {
   const remote = await configuredPushRemote(git, requirement.repository)
   const rootTargetsMain = rootDestinations.some((destination) => destination === "refs/heads/main")
@@ -1756,19 +1768,21 @@ async function childUpdate(
       expectedDestination: { state: "missing" },
     }
   }
-  const branch = await resolveSubmoduleBranch(
-    git,
-    requirement.superproject,
-    requirement.repository,
-    requirement.entry,
-    remote,
-  )
-  const destination = `refs/heads/${branch}`
-  const observed = await observeDestination(
-    git,
-    { repository: requirement.repository, remote, destination },
-    "observe-submodule-destination",
-  )
+  // A read from this same remote already resolved the branch (through resolveSubmoduleBranch, from the same
+  // parent and entry) and named its commit; a read from any other remote stands in for nothing.
+  const known = observedMains?.get(requirement.path)
+  const reused = known?.remote === remote ? known : undefined
+  const destination =
+    reused?.destination ??
+    `refs/heads/${await resolveSubmoduleBranch(git, requirement.superproject, requirement.repository, requirement.entry, remote)}`
+  const observed: ExpectedDestination =
+    reused === undefined
+      ? await observeDestination(
+          git,
+          { repository: requirement.repository, remote, destination },
+          "observe-submodule-destination",
+        )
+      : { state: "oid", oid: reused.oid }
   let source = requirement.target
   if (observed.state === "oid") {
     await ensureCommitObject({ repository: requirement.repository, remote, commit: observed.oid, timeoutMs, git })

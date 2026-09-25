@@ -4,7 +4,7 @@
  * @consumer Yrd settled candidate preparation and landing
  */
 import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
-import { join } from "node:path"
+import { join, relative } from "node:path"
 import { afterEach, describe, expect, it } from "vitest"
 import { runCli } from "../src/cli.ts"
 import { acquireExclusive } from "../src/exclusive.ts"
@@ -224,11 +224,12 @@ describe("git super merge", () => {
   })
 
   /**
-   * @failure Submit calls an ordinary non-ancestor answer git-failed after composing against a root pin behind component main (25591).
+   * @failure A component main that moves between the plan's read and the freeze is leased at a commit the merge never
+   * composed against, or its non-ancestor answer is reported as git-failed (25591, 25570).
    * @level l1
-   * @consumer Yrd submit candidate verification
+   * @consumer Yrd submit candidate verification and the round's leased publication
    */
-  it("refuses a composition behind component main with both commits and a cure", async () => {
+  it("leases a component main that moves mid-merge at the plan's own read, which publication's lease then refuses", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-component-main-ahead-"))
     roots.push(fixtureRoot)
     const fixture = createProductFixture(fixtureRoot)
@@ -256,34 +257,32 @@ describe("git super merge", () => {
     let advanced = false
     const racing: GitProcess = {
       run: async (request) => {
-        if (
-          !advanced &&
-          request.repo === alphaCheckout &&
-          request.args[0] === "fetch" &&
-          request.args.includes("--dry-run")
-        ) {
+        const result = await local.run(request)
+        // The component's main moves the moment after the plan has read it.
+        if (!advanced && request.repo === alphaCheckout && request.args[0] === "fetch") {
           git(fixture.alpha, "merge", "-q", "--ff-only", "pending-main")
           advanced = true
         }
-        return local.run(request)
+        return result
       },
     }
 
     const result = await superMerge({ repo: fixture.product, commit: candidate, git: racing })
 
     expect(advanced).toBe(true)
-    expect(result).toMatchObject({
-      state: "failed",
-      partial: false,
-      detail: { code: "gitlink-publication-non-fast-forward" },
-    })
-    const composed = result.detail?.objectIds?.[1] ?? ""
-    expect(composed).toMatch(/^[0-9a-f]{40}$/u)
+    expect(result).toMatchObject({ state: "updated", partial: false })
+    const merge = git(fixture.product, "rev-parse", "HEAD")
+    expect(merge).not.toBe(rootHead)
+    const composed = git(fixture.product, "rev-parse", "HEAD:packages/alpha")
     expect(git(alphaCheckout, "cat-file", "-p", composed)).toContain(`parent ${rootPin}`)
-    expect(result.detail?.message).toContain(componentMain)
-    expect(result.detail?.message).toContain(composed)
-    expect(result.detail?.message).toContain("Merge the component's main")
-    expect(git(fixture.product, "rev-parse", "HEAD")).toBe(rootHead)
+    const encoded = git(fixture.product, "show", "-s", `--format=%(trailers:key=${PUSH_INTENT_TRAILER},valueonly)`, merge)
+    // The lease is the main the merge composed against, not the one that moved after: publication refuses it
+    // (push.test "(b) a child main moved after capture is refused at the push").
+    expect(decodePushIntent(encoded).children.find((row) => row.path === "packages/alpha")?.publication).toMatchObject({
+      source: composed,
+      expectedDestination: { state: "oid", oid: rootPin },
+    })
+    expect(componentMain).not.toBe(rootPin)
   })
 
   it("reports untouched off-main pins without changing them", async () => {
@@ -3066,6 +3065,39 @@ describe("git super merge — the root's child mains are fetched together (25303
     expect(result).toMatchObject({ state: "failed", detail: { code: "submodule-main-unreadable" } })
     expect(result.detail?.paths).toEqual(["packages/alpha"])
     expect(git(fixture.product, "rev-parse", "HEAD")).toBe(headBefore)
+  })
+})
+
+/**
+ * @failure A merge reads each owned child's main twice, once to plan and once to freeze its push, doubling its SSH logins.
+ * @level l1
+ * @consumer Yrd's compose, whose rounds GitHub throttles by SSH login (@i/10-yrd/25570)
+ */
+describe("git super merge — each child main is read from its remote once (25570)", () => {
+  /** Any read of a remote's refs: the plan's fetch, the freeze's dry-run fetch, a branch lookup. */
+  const isRemoteRead = (args: readonly string[]): boolean =>
+    args[0] === "ls-remote" || (args[0] === "fetch" && args.some((arg) => arg.startsWith("+refs/heads/")))
+
+  it("freezes the push from the plan's own reads, one remote read per child", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-25570-once-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const candidate = candidateWithRootChange(fixture, "candidate-once")
+    // Declared, as every hh root child is, so the plan's one read per child is its fetch.
+    for (const path of ["packages/alpha", "vendor/beta"]) git(fixture.product, "config", `submodule.${path}.branch`, "main")
+    const local = createLocalGitProcess()
+    const reads: string[] = []
+    const recording: GitProcess = {
+      run: (request) => {
+        if (isRemoteRead(request.args)) reads.push(relative(fixture.product, request.repo))
+        return local.run(request)
+      },
+    }
+
+    const result = await superMerge({ repo: fixture.product, commit: candidate, git: recording })
+
+    expect(result).toMatchObject({ state: "updated" })
+    expect(reads.sort()).toEqual(["packages/alpha", "vendor/beta"])
   })
 })
 

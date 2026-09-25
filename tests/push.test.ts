@@ -2325,6 +2325,76 @@ describe("a frozen push works only on the children its merge moved (25303, obser
     })
   })
 
+  test("capture reuses a main the merge already read: no child main is observed again, and the lease is that read (25570)", async () => {
+    const shape = twoChildFrozenMerge("capture-reuses")
+    const tree = git(shape.root, "rev-parse", `${shape.merge}^{tree}`)
+    // The remote moves after the merge read it; the freeze must lease what the merge was composed against.
+    shape.moveMain("child")
+    const calls: string[][] = []
+    const local = createLocalGitProcess()
+    const recording: GitProcess = {
+      run: (request) => {
+        calls.push([...request.args])
+        return local.run(request)
+      },
+    }
+    const read = (path: "child" | "other") => ({ remote: "origin", destination: "refs/heads/main", oid: shape.before[path] })
+
+    const encoded = await capturePushIntent(
+      recording,
+      shape.root,
+      shape.rootBefore,
+      tree,
+      new Map(),
+      30_000,
+      undefined,
+      new Map([
+        ["child", read("child")],
+        ["other", read("other")],
+      ]),
+    )
+
+    expect(calls.filter(isObservation)).toEqual([])
+    expect(decodePushIntent(encoded ?? "").children.find((row) => row.path === "child")?.publication).toEqual({
+      destination: "refs/heads/main",
+      source: shape.childSource,
+      expectedDestination: { state: "oid", oid: shape.before.child },
+    })
+  })
+
+  test("capture observes a child whose earlier read came from another remote (25570 control)", async () => {
+    const shape = twoChildFrozenMerge("capture-other-branch")
+    const tree = git(shape.root, "rev-parse", `${shape.merge}^{tree}`)
+    const moved = shape.moveMain("child")
+    const calls: string[][] = []
+    const local = createLocalGitProcess()
+    const recording: GitProcess = {
+      run: (request) => {
+        calls.push([...request.args])
+        return local.run(request)
+      },
+    }
+
+    const capture = capturePushIntent(
+      recording,
+      shape.root,
+      shape.rootBefore,
+      tree,
+      new Map(),
+      30_000,
+      undefined,
+      new Map([["child", { remote: "upstream", destination: "refs/heads/main", oid: shape.before.child }]]),
+    )
+
+    // Observed, not reused: the freeze sees the moved main and refuses the child that no longer fast-forwards, as a
+    // refusal with a cure rather than a git failure (25591).
+    await expect(capture).rejects.toMatchObject({
+      message: expect.stringContaining(`does not contain required commit ${moved}`),
+      resultDetail: { code: "gitlink-publication-non-fast-forward" },
+    })
+    expect(calls.filter(isObservation).length).toBeGreaterThan(0)
+  })
+
   test("observes a plan's destinations concurrently, at most four at a time", async () => {
     const shape = twoChildFrozenMerge("concurrent")
 

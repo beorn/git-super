@@ -14,7 +14,7 @@ import {
 import { ensureCommitObject, pinRef } from "./objects.ts"
 import { prepareSubmoduleTreeUnderLock } from "./submodule-prepare.ts"
 import { mapInOrder } from "./map-in-order.ts"
-import { capturePushIntent, discoverRepository, rootPushIdentity } from "./push.ts"
+import { capturePushIntent, discoverRepository, type ObservedMains, rootPushIdentity } from "./push.ts"
 import { PUSH_INTENT_TRAILER, sameHostedOwner } from "./push-intent.ts"
 import { createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS, type Exclusive } from "./exclusive.ts"
 import { parseIndexEntries, type IndexEntry } from "./index-entries.ts"
@@ -183,6 +183,8 @@ type GitlinkPlans = Readonly<{
   stores: ReadonlyMap<string, string>
   checkouts: readonly GitlinkCheckoutPlan[]
   descents: readonly SuperMergeDescentResult[]
+  /** Every child main the plan read from its remote, which the push freeze reuses rather than reads again. */
+  mains: ObservedMains
 }>
 
 type GitlinkCheckoutPlan = Readonly<{
@@ -433,6 +435,7 @@ async function mergeUnderLock(
       new Map(visiblePlans.filter((plan) => plan.state === "raised").map((plan) => [plan.path, plan.to])),
       timeoutMs,
       planned.stores,
+      planned.mains,
     )
     if (frozen !== undefined) trailers.push(`${PUSH_INTENT_TRAILER}: ${frozen}`)
   } catch (error) {
@@ -1922,11 +1925,12 @@ async function planGitlinks(
   const descents: SuperMergeDescentResult[] = []
   const checkouts = new Map<string, GitlinkCheckoutPlan>()
   const stores = new Map<string, string>()
+  const mains = new Map<string, { remote: string; destination: string; oid: string }>()
   const visiting = new Set<string>()
   const completed = new Set<string>()
 
   const rootMerged = await readCommitSubmodules(git, root, tree)
-  if (rootMerged.length === 0) return { settlements: plans, checkouts: [], stores, descents: [] }
+  if (rootMerged.length === 0) return { settlements: plans, checkouts: [], stores, descents: [], mains }
   const rootRemote = await rootPushIdentity(git, root)
   const rootBefore = new Map((await readCommitSubmodules(git, root, head)).map((entry) => [entry.path, entry.target]))
   const added = new Set(rootMerged.filter((entry) => !rootBefore.has(entry.path)).map((entry) => entry.path))
@@ -2070,7 +2074,7 @@ async function planGitlinks(
     // the fetches cannot interfere. Every outcome is kept and consumed below in
     // entry order, so a failed fetch throws at the same child it always did.
     // Nested rungs are rare (one Ahead parent) and keep the sequential fetch.
-    const prefetched = new Map<string, { ok: true; main: string } | { ok: false; error: unknown }>()
+    const prefetched = new Map<string, { ok: true; main: SubmoduleMain } | { ok: false; error: unknown }>()
     if (!nested) {
       const owned = entries.filter((entry) => entry.url !== undefined && sameHostedOwner(rootRemote, entry.url))
       const outcomes = await mapInOrder(owned, MAIN_FETCH_CONCURRENCY, (entry) =>
@@ -2121,7 +2125,9 @@ async function planGitlinks(
       // for a nested gitlink is declared in its parent component, not in km.
       const fetched = prefetched.get(entry.path)
       if (fetched?.ok === false) throw fetched.error
-      const main = fetched?.main ?? (await fetchSubmoduleMain(git, repository, submodule, entry, timeoutMs))
+      const read = fetched?.main ?? (await fetchSubmoduleMain(git, repository, submodule, entry, timeoutMs))
+      mains.set(path, read)
+      const main = read.oid
       if (entry.target === main) {
         // EQUAL to its own main, and still checked for a lowering (@cto N1).
         // A nested pin equal to its own main can fail to descend from what the
@@ -2239,7 +2245,7 @@ async function planGitlinks(
   }
 
   await walk(root, "", head, tree, undefined)
-  return { settlements: plans, checkouts: [...checkouts.values()], stores, descents }
+  return { settlements: plans, checkouts: [...checkouts.values()], stores, descents, mains }
 }
 
 async function mergeApplicationFailure(
@@ -2278,13 +2284,16 @@ async function mergeApplicationFailure(
 /** At most this many child mains are fetched at once; the cap push's plan reads use. */
 const MAIN_FETCH_CONCURRENCY = 4
 
+/** A child main as read from its remote: which remote, which branch, and the commit it named. */
+type SubmoduleMain = Readonly<{ remote: string; destination: string; oid: string }>
+
 async function fetchSubmoduleMain(
   git: GitProcess,
   superproject: string,
   submodule: string,
   entry: CommitSubmodule,
   timeoutMs: number,
-): Promise<string> {
+): Promise<SubmoduleMain> {
   const branch = await resolveSubmoduleBranch(
     { run: (request) => git.run({ ...request, timeoutMs }) },
     superproject,
@@ -2299,7 +2308,7 @@ async function fetchSubmoduleMain(
   const resolveArgs = ["rev-parse", `refs/remotes/origin/${branch}^{commit}`]
   const resolved = await run(git, submodule, resolveArgs, timeoutMs)
   if (resolved.code !== 0) throw submoduleMainError(submodule, path, pin, resolveArgs, resolved)
-  return resolved.stdout.trim()
+  return { remote: "origin", destination: `refs/heads/${branch}`, oid: resolved.stdout.trim() }
 }
 
 function submoduleMainError(
