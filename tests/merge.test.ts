@@ -5,7 +5,7 @@
  */
 import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { join, relative } from "node:path"
-import { afterEach, describe, expect, it } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
 import { runCli } from "../src/cli.ts"
 import { acquireExclusive } from "../src/exclusive.ts"
 import { superPush } from "../src/push.ts"
@@ -127,9 +127,11 @@ describe("git super merge", () => {
       const stderr = outputSink()
       expect(await runCli(["--repo", fixture.product, "--json", "merge", candidate], stdout, stderr)).toBe(0)
       expect(JSON.parse(stdout.output)).toMatchObject({ state: "updated", partial: false })
-      expect(stderr.output).toMatch(
-        /^git-super merge: waiting for writer lock held by git super merge \(pid:\d+, age \d+ms\)\n$/u,
+      const reports = stderr.output.match(
+        /git-super merge: waiting for writer lock held by git super merge \(pid:\d+, age \d+ms\)\n/gu,
       )
+      expect(reports?.length).toBeGreaterThanOrEqual(4)
+      expect(reports?.join("")).toBe(stderr.output)
       const ordinaryResult = await ordinaryWait
       expect(ordinaryResult).toBeInstanceOf(Error)
       expect((ordinaryResult as Error).message).toMatch(/timeout=30000ms; holder=git super merge/u)
@@ -137,6 +139,45 @@ describe("git super merge", () => {
       await release
     }
   }, 75_000)
+
+  /**
+   * @failure Merge's lock call site silently reverts to a 30 s wait despite the shared four-minute policy (25274).
+   * @level l1
+   * @consumer Yrd submit candidate verification
+   */
+  it("wires the shared mutation wait through merge after 30 seconds virtual", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-writer-virtual-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const candidate = candidateWithRootChange(fixture, "candidate-writer-virtual")
+    const dir = join(fixture.product, ".git", "yrd-worktree-mutations")
+    const held = await acquireExclusive(dir, { timeoutMs: 0 }, "queue merge")
+    const reports: string[] = []
+    let released = false
+    const release = () => {
+      if (released) return
+      released = true
+      held.release()
+    }
+    const releaseSoon = Bun.sleep(1_500).then(release)
+    vi.useFakeTimers({ toFake: ["Date"] })
+    let running: ReturnType<typeof superMerge> | undefined
+    try {
+      const startedAt = Date.now()
+      running = superMerge({ repo: fixture.product, commit: candidate, report: (line) => reports.push(line) })
+      for (let poll = 0; poll < 100 && reports.length === 0; poll += 1) await Bun.sleep(10)
+      expect(reports).toHaveLength(1)
+      vi.setSystemTime(startedAt + 31_000)
+      const result = await running
+      expect(result).toMatchObject({ state: "updated", partial: false })
+      expect(reports[0]).toMatch(/^git-super merge: waiting for writer lock held by queue merge /u)
+    } finally {
+      await releaseSoon
+      release()
+      if (running !== undefined) await Promise.allSettled([running])
+      vi.useRealTimers()
+    }
+  }, 30_000)
 
   /**
    * @failure Merge settlement reads main although Git config selects another submodule branch.
@@ -275,7 +316,13 @@ describe("git super merge", () => {
     expect(merge).not.toBe(rootHead)
     const composed = git(fixture.product, "rev-parse", "HEAD:packages/alpha")
     expect(git(alphaCheckout, "cat-file", "-p", composed)).toContain(`parent ${rootPin}`)
-    const encoded = git(fixture.product, "show", "-s", `--format=%(trailers:key=${PUSH_INTENT_TRAILER},valueonly)`, merge)
+    const encoded = git(
+      fixture.product,
+      "show",
+      "-s",
+      `--format=%(trailers:key=${PUSH_INTENT_TRAILER},valueonly)`,
+      merge,
+    )
     // The lease is the main the merge composed against, not the one that moved after: publication refuses it
     // (push.test "(b) a child main moved after capture is refused at the push").
     expect(decodePushIntent(encoded).children.find((row) => row.path === "packages/alpha")?.publication).toMatchObject({
@@ -3084,7 +3131,8 @@ describe("git super merge — each child main is read from its remote once (2557
     const fixture = createProductFixture(fixtureRoot)
     const candidate = candidateWithRootChange(fixture, "candidate-once")
     // Declared, as every hh root child is, so the plan's one read per child is its fetch.
-    for (const path of ["packages/alpha", "vendor/beta"]) git(fixture.product, "config", `submodule.${path}.branch`, "main")
+    for (const path of ["packages/alpha", "vendor/beta"])
+      git(fixture.product, "config", `submodule.${path}.branch`, "main")
     const local = createLocalGitProcess()
     const reads: string[] = []
     const recording: GitProcess = {
