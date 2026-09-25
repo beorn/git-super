@@ -12,6 +12,7 @@ import {
 import { createExclusive, type Exclusive } from "./exclusive.ts"
 import { mapInOrder } from "./map-in-order.ts"
 import { ensureCommitObject } from "./objects.ts"
+import { createProgressReporter } from "./progress.ts"
 import {
   readFrozenPushIntent,
   readFrozenPushIntents,
@@ -100,7 +101,6 @@ type CommitRequirement = Readonly<{
 }>
 
 const DEFAULT_GIT_TIMEOUT_MS = 30_000
-const PUSH_PROGRESS_INTERVAL_MS = 9_000
 const OBJECT_ID = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/u
 /** Remote observations one push plan runs at once (25303: reads concurrent, writes stay ordered). */
 const PLAN_READ_CONCURRENCY = 4
@@ -108,44 +108,14 @@ const PLAN_READ_CONCURRENCY = 4
 const ADVERTISED_FETCH_BATCH = 256
 
 function createPushProgress(report?: (message: string) => void) {
-  const startedAt = Date.now()
-  let current = "select-root 0/1"
-  let timer: ReturnType<typeof setInterval> | undefined
-  let failure: unknown
-  const cancel = (): void => {
-    if (timer !== undefined) globalThis.clearInterval(timer)
-    timer = undefined
-  }
-  const emit = (): void => {
-    report?.(`git-super push: ${current} +${Date.now() - startedAt}ms\n`)
-  }
-  const check = (): void => {
-    if (failure !== undefined) throw failure
-  }
+  const progress = createProgressReporter(report, (phase, ms) => `git-super push: ${phase} +${ms}ms\n`)
   return {
-    phase(name: string): void {
-      check()
-      current = name
-      emit()
-      if (report !== undefined && timer === undefined) {
-        timer = globalThis.setInterval(() => {
-          try {
-            emit()
-          } catch (error) {
-            failure = error
-            cancel()
-          }
-        }, PUSH_PROGRESS_INTERVAL_MS)
-        timer.unref?.()
-      }
-    },
+    phase: progress.phase,
     beforeWrite(): void {
-      check()
-      current = "write-remote 0/1"
-      emit()
-      cancel()
+      progress.phase("write-remote 0/1")
+      progress.cancel()
     },
-    cancel,
+    cancel: progress.cancel,
   }
 }
 
