@@ -873,7 +873,26 @@ describe("git super merge", () => {
     expect(git(fixture.product, "rev-parse", "MERGE_HEAD")).toBe(candidate)
     expect(git(fixture.product, "ls-files", "--stage", "--", "packages/alpha")).toContain(newestAlpha)
     expect(git(fixture.product, "ls-files", "--stage", "--", "vendor/beta")).toContain(newestBeta)
+    // The recovery names each staged pin that differs from HEAD, and where to move it (25807 row 2).
+    expect(result.detail?.next).toContain(`packages/alpha to ${newestAlpha}`)
+    expect(result.detail?.next).toContain(`vendor/beta to ${newestBeta}`)
   })
+
+  it("gives the concluding commit the merge's commit budget rather than one plumbing call's, so a slow hook completes", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-slow-hook-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
+    const candidate = candidateWithRootChange(fixture, "candidate-slow-hook")
+    const hook = join(fixture.product, ".git", "hooks", "pre-commit")
+    writeFileSync(hook, "#!/bin/sh\nsleep 7\n")
+    chmodSync(hook, 0o755)
+
+    const result = await superMerge({ repo: fixture.product, commit: candidate, timeoutMs: 5_000 })
+
+    expect(result).toMatchObject({ state: "updated", partial: false })
+    expect(git(fixture.product, "rev-parse", "HEAD")).toBe(result.commit)
+  }, 60_000)
 
   it("preserves the observed merge when commit writes HEAD but reports failure", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-commit-reported-failure-"))

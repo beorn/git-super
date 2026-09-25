@@ -200,6 +200,12 @@ type CheckoutFailure = Readonly<{
 }>
 
 const DEFAULT_GIT_TIMEOUT_MS = 30_000
+/**
+ * The concluding commit runs the repository's hooks, which are the repository's code and not one plumbing call:
+ * bounded by a plumbing call's timeout, a slow pre-commit hook killed a finished merge and left it staged for a
+ * person to recover (25807 row 2). It waits up to the merge's budget, the fleet's ten-minute ceiling.
+ */
+const COMMIT_BUDGET_MS = 10 * 60_000
 const OBJECT_ID = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/u
 
 export async function superMerge(options: SuperMergeOptions): Promise<SuperMergeResult> {
@@ -603,7 +609,7 @@ async function mergeUnderLock(
 
   steps.begin("commit")
   const commitArgs = ["commit", ...(options.noVerify === true ? ["--no-verify"] : []), "-F", "-"]
-  const committed = await run(git, root, commitArgs, timeoutMs, settledMessage)
+  const committed = await run(git, root, commitArgs, Math.max(timeoutMs, COMMIT_BUDGET_MS), settledMessage)
   if (committed.code !== 0) {
     const observedHead = await run(git, root, ["rev-parse", "HEAD^{commit}"], timeoutMs)
     if (observedHead.code !== 0) {
@@ -662,7 +668,7 @@ async function mergeUnderLock(
             committed,
             `The prospective merge of ${target} and its Settled report remain staged, the concluding commit was not written, and every submodule checkout was restored to its recorded pin.`,
             evidence,
-            "Inspect the preserved root merge and named Git failure; move each submodule to its staged index pin before retrying the commit.",
+            `Inspect the preserved root merge and named Git failure; ${stagedPinMoves(restored.rows)} before retrying the commit.`,
             "the caller",
           )
         : rollbackFailureDetail(root, "the rejected settled merge commit", undefined, restored.failure, restored.rows),
@@ -1000,6 +1006,14 @@ async function restoreSubmoduleCheckouts(
     rows[index] = { ...plan, checkout, state: "restored" }
   }
   return { rows, ...(failure === undefined ? {} : { failure }) }
+}
+
+/** The staged pins that differ from HEAD, by name, so a recovery says which submodule goes where (25807 row 2). */
+function stagedPinMoves(rows: readonly SuperMergeCheckoutResult[]): string {
+  const moves = rows.filter((row) => row.index !== row.recorded).map((row) => `${row.path} to ${row.index}`)
+  return moves.length === 0
+    ? "no staged pin differs from HEAD"
+    : `move ${moves.join(", ")} (the staged pins that differ from HEAD)`
 }
 
 function formatCheckoutEvidence(rows: readonly SuperMergeCheckoutResult[]): string {
