@@ -2338,7 +2338,11 @@ describe("a frozen push works only on the children its merge moved (25303, obser
         return local.run(request)
       },
     }
-    const read = (path: "child" | "other") => ({ remote: "origin", destination: "refs/heads/main", oid: shape.before[path] })
+    const read = (path: "child" | "other") => ({
+      remote: "origin",
+      destination: "refs/heads/main",
+      oid: shape.before[path],
+    })
 
     const encoded = await capturePushIntent(
       recording,

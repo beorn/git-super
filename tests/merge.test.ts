@@ -275,7 +275,13 @@ describe("git super merge", () => {
     expect(merge).not.toBe(rootHead)
     const composed = git(fixture.product, "rev-parse", "HEAD:packages/alpha")
     expect(git(alphaCheckout, "cat-file", "-p", composed)).toContain(`parent ${rootPin}`)
-    const encoded = git(fixture.product, "show", "-s", `--format=%(trailers:key=${PUSH_INTENT_TRAILER},valueonly)`, merge)
+    const encoded = git(
+      fixture.product,
+      "show",
+      "-s",
+      `--format=%(trailers:key=${PUSH_INTENT_TRAILER},valueonly)`,
+      merge,
+    )
     // The lease is the main the merge composed against, not the one that moved after: publication refuses it
     // (push.test "(b) a child main moved after capture is refused at the push").
     expect(decodePushIntent(encoded).children.find((row) => row.path === "packages/alpha")?.publication).toMatchObject({
@@ -3084,7 +3090,8 @@ describe("git super merge — each child main is read from its remote once (2557
     const fixture = createProductFixture(fixtureRoot)
     const candidate = candidateWithRootChange(fixture, "candidate-once")
     // Declared, as every hh root child is, so the plan's one read per child is its fetch.
-    for (const path of ["packages/alpha", "vendor/beta"]) git(fixture.product, "config", `submodule.${path}.branch`, "main")
+    for (const path of ["packages/alpha", "vendor/beta"])
+      git(fixture.product, "config", `submodule.${path}.branch`, "main")
     const local = createLocalGitProcess()
     const reads: string[] = []
     const recording: GitProcess = {
