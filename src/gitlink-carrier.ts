@@ -76,8 +76,9 @@ export async function composeGitlinkCarrier(options: ComposeGitlinkCarrierOption
     try {
       rmSync(scratch, { recursive: true })
     } catch (cleanup) {
-      if (failure !== undefined)
-        {throw new AggregateError([failure, cleanup], `git-super carrier failed and could not clean ${scratch}`)}
+      if (failure !== undefined) {
+        throw new AggregateError([failure, cleanup], `git-super carrier failed and could not clean ${scratch}`)
+      }
       throw new Error(`git-super carrier left temporary index at ${scratch}`, { cause: cleanup })
     }
   }
