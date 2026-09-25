@@ -3131,8 +3131,9 @@ describe("git super merge — each child main is read from its remote once (2557
     const fixture = createProductFixture(fixtureRoot)
     const candidate = candidateWithRootChange(fixture, "candidate-once")
     // Declared, as every hh root child is, so the plan's one read per child is its fetch.
-    for (const path of ["packages/alpha", "vendor/beta"])
+    for (const path of ["packages/alpha", "vendor/beta"]) {
       git(fixture.product, "config", `submodule.${path}.branch`, "main")
+    }
     const local = createLocalGitProcess()
     const reads: string[] = []
     const recording: GitProcess = {
@@ -3164,8 +3165,9 @@ describe("git super merge — no-fetch bypasses remote reads of child mains (256
     roots.push(fixtureRoot)
     const fixture = createProductFixture(fixtureRoot)
     const candidate = candidateWithRootChange(fixture, "candidate-nofetch")
-    for (const path of ["packages/alpha", "vendor/beta"])
+    for (const path of ["packages/alpha", "vendor/beta"]) {
       git(fixture.product, "config", `submodule.${path}.branch`, "main")
+    }
     const local = createLocalGitProcess()
     const reads: string[] = []
     const recording: GitProcess = {
@@ -3186,16 +3188,18 @@ describe("git super merge — no-fetch bypasses remote reads of child mains (256
     roots.push(fixtureRoot)
     const fixture = createProductFixture(fixtureRoot)
     const candidate = candidateWithRootChange(fixture, "candidate-alt")
-    for (const path of ["packages/alpha", "vendor/beta"])
+    for (const path of ["packages/alpha", "vendor/beta"]) {
       git(fixture.product, "config", `submodule.${path}.branch`, "main")
+    }
 
     // Delete tracking refs in packages/alpha and vendor/beta
     for (const path of ["packages/alpha", "vendor/beta"]) {
       const sub = join(fixture.product, path)
       const subGitdir = git(sub, "rev-parse", "--git-dir")
       const resolvedGitdir = isAbsolute(subGitdir) ? subGitdir : join(sub, subGitdir)
-      // Point submodule alternates to the upstream store where refs/heads/main exists
+      // Point submodule alternates to the upstream store where refs/remotes/origin/main exists
       const upstreamStore = fixture[path === "packages/alpha" ? "alpha" : "beta"]
+      git(upstreamStore, "update-ref", "refs/remotes/origin/main", git(upstreamStore, "rev-parse", "refs/heads/main"))
       const altFile = join(resolvedGitdir, "objects", "info", "alternates")
       mkdirSync(dirname(altFile), { recursive: true })
       writeFileSync(altFile, `${join(upstreamStore, ".git", "objects")}\n`)
@@ -3215,10 +3219,14 @@ describe("git super merge — no-fetch bypasses remote reads of child mains (256
 
     expect(result).toMatchObject({ state: "updated" })
     expect(reads).toEqual([])
-    // And tracking ref was populated
+    // Tracking ref was NOT written into the checkout (writing no tracking ref at all)
     for (const path of ["packages/alpha", "vendor/beta"]) {
       const sub = join(fixture.product, path)
-      expect(git(sub, "rev-parse", "refs/remotes/origin/main")).toBeTruthy()
+      expect(() => git(sub, "rev-parse", "--verify", "refs/remotes/origin/main")).toThrow()
+    }
+    // Result names the alternate store
+    for (const gitlink of result.gitlinks) {
+      expect(gitlink.store).toBeDefined()
     }
   })
 
@@ -3227,8 +3235,10 @@ describe("git super merge — no-fetch bypasses remote reads of child mains (256
     roots.push(fixtureRoot)
     const fixture = createProductFixture(fixtureRoot)
     const candidate = candidateWithRootChange(fixture, "candidate-missing")
+    // Delete local tracking refs in child clones; branch "main" exists on remote
     for (const path of ["packages/alpha", "vendor/beta"]) {
-      git(fixture.product, "config", `submodule.${path}.branch`, "nonexistent-branch")
+      const sub = join(fixture.product, path)
+      git(sub, "update-ref", "-d", "refs/remotes/origin/main")
     }
 
     const result = await superMerge({ repo: fixture.product, commit: candidate, noFetch: true })

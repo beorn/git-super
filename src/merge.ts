@@ -56,6 +56,8 @@ export type SuperMergeGitlinkResult = Readonly<{
   state: "raised" | "kept-ahead" | "kept-behind" | "as-written" | "left-off-main" | "merged" | "not-run"
   /** Present on a `merged` row and on no other. */
   composition?: SuperMergeCompositionResult
+  /** Present when child main was resolved from a local alternate/store rather than fetched. */
+  store?: string
 }>
 
 export type SuperMergeCheckoutResult = Readonly<{
@@ -183,6 +185,7 @@ type GitlinkPlan = Readonly<{
   to: string
   state: "raised" | "kept-ahead" | "kept-behind" | "as-written" | "left-off-main"
   changedByMerge: boolean
+  store?: string
 }>
 
 type GitlinkPlans = Readonly<{
@@ -2213,12 +2216,26 @@ async function planGitlinks(
         // -- and only checked for going backwards.
         if (!nested) {
           settleCheckout(main)
-          plans.push({ path, from: entry.target, to: main, state: "raised", changedByMerge })
+          plans.push({
+            path,
+            from: entry.target,
+            to: main,
+            state: "raised",
+            changedByMerge,
+            ...(read.store === undefined ? {} : { store: read.store }),
+          })
           continue
         }
         if (parentMainPins !== undefined) await refuseNestedLowering(submodule, path, entry, prefix, parentMainPins)
         recordDescent("kept-behind")
-        plans.push({ path, from: entry.target, to: main, state: "kept-behind", changedByMerge })
+        plans.push({
+          path,
+          from: entry.target,
+          to: main,
+          state: "kept-behind",
+          changedByMerge,
+          ...(read.store === undefined ? {} : { store: read.store }),
+        })
         continue
       }
       if (ancestry.code === 1) {
@@ -2235,7 +2252,14 @@ async function planGitlinks(
         }
         if (changedByMerge) settleCheckout(entry.target)
         recordDescent(state)
-        plans.push({ path, from: entry.target, to: main, state, changedByMerge })
+        plans.push({
+          path,
+          from: entry.target,
+          to: main,
+          state,
+          changedByMerge,
+          ...(read.store === undefined ? {} : { store: read.store }),
+        })
         if (state === "kept-ahead") {
           const mainPins = new Map(
             (await readCommitSubmodules(git, submodule, main)).map((child) => [child.path, child.target] as const),
@@ -2304,7 +2328,9 @@ async function mergeApplicationFailure(
 const MAIN_FETCH_CONCURRENCY = 4
 
 /** A child main as read from its remote: which remote, which branch, and the commit it named. */
-type SubmoduleMain = Readonly<{ remote: string; destination: string; oid: string }>
+type SubmoduleMain = Readonly<{ remote: string; destination: string; oid: string; store?: string }>
+
+type AlternateResolution = Readonly<{ oid: string; store: string }>
 
 async function resolveSubmoduleMainFromAlternates(
   git: GitProcess,
@@ -2313,66 +2339,57 @@ async function resolveSubmoduleMainFromAlternates(
   entry: CommitSubmodule,
   branch: string,
   timeoutMs: number,
-): Promise<string | undefined> {
+): Promise<AlternateResolution | undefined> {
   const candidateDirs: string[] = []
 
-  // 1. Alternates from submodule itself
-  const subGitdirRes = await run(git, submodule, ["rev-parse", "--git-dir"], timeoutMs)
-  if (subGitdirRes.code === 0 && subGitdirRes.stdout.trim().length > 0) {
-    const rawSubGitdir = subGitdirRes.stdout.trim()
-    const subGitdir = isAbsolute(rawSubGitdir) ? rawSubGitdir : resolve(submodule, rawSubGitdir)
-    const altFile = join(subGitdir, "objects", "info", "alternates")
-    if (existsSync(altFile)) {
-      try {
-        const lines = readFileSync(altFile, "utf8")
-          .split("\n")
-          .map((line) => line.trim())
-          .filter((line) => line.length > 0 && !line.startsWith("#"))
-        for (const line of lines) {
-          const resolvedObjDir = isAbsolute(line) ? line : resolve(subGitdir, "objects", line)
-          candidateDirs.push(dirname(resolvedObjDir))
-        }
-      } catch {
-        // ignore read failure
-      }
-    }
-  }
-
-  // 2. Alternates from superproject
+  // 1. Alternates from superproject (the authoritative reference store, e.g. /hh/dev)
   const superGitdirRes = await run(git, superproject, ["rev-parse", "--git-dir"], timeoutMs)
   if (superGitdirRes.code === 0 && superGitdirRes.stdout.trim().length > 0) {
     const rawSuperGitdir = superGitdirRes.stdout.trim()
     const superGitdir = isAbsolute(rawSuperGitdir) ? rawSuperGitdir : resolve(superproject, rawSuperGitdir)
     const altFile = join(superGitdir, "objects", "info", "alternates")
     if (existsSync(altFile)) {
-      try {
-        const lines = readFileSync(altFile, "utf8")
-          .split("\n")
-          .map((line) => line.trim())
-          .filter((line) => line.length > 0 && !line.startsWith("#"))
-        for (const line of lines) {
-          const resolvedObjDir = isAbsolute(line) ? line : resolve(superGitdir, "objects", line)
-          const refSuperGitDir = dirname(resolvedObjDir)
-          const refSuperRoot = dirname(refSuperGitDir)
-          candidateDirs.push(join(refSuperRoot, entry.path))
-          candidateDirs.push(join(refSuperGitDir, "modules", entry.path))
-        }
-      } catch {
-        // ignore read failure
+      const lines = readFileSync(altFile, "utf8")
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0 && !line.startsWith("#"))
+      for (const line of lines) {
+        const resolvedObjDir = isAbsolute(line) ? line : resolve(superGitdir, "objects", line)
+        const refSuperGitDir = dirname(resolvedObjDir)
+        const refSuperRoot = dirname(refSuperGitDir)
+        candidateDirs.push(join(refSuperRoot, entry.path))
+        candidateDirs.push(join(refSuperGitDir, "modules", entry.path))
       }
     }
   }
 
+  // 2. Alternates from submodule itself
+  const subGitdirRes = await run(git, submodule, ["rev-parse", "--git-dir"], timeoutMs)
+  if (subGitdirRes.code === 0 && subGitdirRes.stdout.trim().length > 0) {
+    const rawSubGitdir = subGitdirRes.stdout.trim()
+    const subGitdir = isAbsolute(rawSubGitdir) ? rawSubGitdir : resolve(submodule, rawSubGitdir)
+    const altFile = join(subGitdir, "objects", "info", "alternates")
+    if (existsSync(altFile)) {
+      const lines = readFileSync(altFile, "utf8")
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0 && !line.startsWith("#"))
+      for (const line of lines) {
+        const resolvedObjDir = isAbsolute(line) ? line : resolve(subGitdir, "objects", line)
+        candidateDirs.push(dirname(resolvedObjDir))
+      }
+    }
+  }
+
+  const ref = `refs/remotes/origin/${branch}`
   for (const dir of candidateDirs) {
     if (!existsSync(dir)) continue
-    for (const ref of [`refs/remotes/origin/${branch}`, `refs/heads/${branch}`]) {
-      const res = await run(git, dir, ["rev-parse", "--verify", `${ref}^{commit}`], timeoutMs)
-      if (res.code === 0 && res.stdout.trim().length > 0) {
-        const oid = res.stdout.trim()
-        const cat = await run(git, submodule, ["cat-file", "-e", `${oid}^{commit}`], timeoutMs)
-        if (cat.code === 0) {
-          return oid
-        }
+    const res = await run(git, dir, ["rev-parse", "--verify", `${ref}^{commit}`], timeoutMs)
+    if (res.code === 0 && res.stdout.trim().length > 0) {
+      const oid = res.stdout.trim()
+      const cat = await run(git, submodule, ["cat-file", "-e", `${oid}^{commit}`], timeoutMs)
+      if (cat.code === 0) {
+        return { oid, store: dir }
       }
     }
   }
@@ -2402,22 +2419,21 @@ async function fetchSubmoduleMain(
   }
   const resolveArgs = ["rev-parse", `refs/remotes/origin/${branch}^{commit}`]
   let resolved = await run(git, submodule, resolveArgs, timeoutMs)
+  let resolvedStore: string | undefined
   if (resolved.code !== 0 && noFetch) {
-    const alternateOid = await resolveSubmoduleMainFromAlternates(
-      git,
-      superproject,
-      submodule,
-      entry,
-      branch,
-      timeoutMs,
-    )
-    if (alternateOid !== undefined) {
-      await run(git, submodule, ["update-ref", `refs/remotes/origin/${branch}`, alternateOid], timeoutMs)
-      resolved = { code: 0, stdout: `${alternateOid}\n`, stderr: "" }
+    const alternate = await resolveSubmoduleMainFromAlternates(git, superproject, submodule, entry, branch, timeoutMs)
+    if (alternate !== undefined) {
+      resolved = { code: 0, stdout: `${alternate.oid}\n`, stderr: "" }
+      resolvedStore = alternate.store
     }
   }
   if (resolved.code !== 0) throw submoduleMainError(submodule, path, pin, resolveArgs, resolved)
-  return { remote: "origin", destination: `refs/heads/${branch}`, oid: resolved.stdout.trim() }
+  return {
+    remote: "origin",
+    destination: `refs/heads/${branch}`,
+    oid: resolved.stdout.trim(),
+    ...(resolvedStore === undefined ? {} : { store: resolvedStore }),
+  }
 }
 
 function submoduleMainError(
