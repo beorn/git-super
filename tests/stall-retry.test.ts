@@ -11,7 +11,7 @@
  * which is why the queue landed nothing for hours and why no queue-specific bug
  * was ever needed to explain it. These tests pin the policy that fixes it.
  */
-import { afterEach, describe, expect, test, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest"
 import type { GitProcess, GitProcessRequest, GitProcessResult } from "../src/process.ts"
 import {
   coreSshCommandFromConfig,
@@ -54,9 +54,16 @@ const PUBLICKEY_REFUSAL: GitProcessResult = {
 
 const req = (args: readonly string[]): GitProcessRequest => ({ repo: "/tmp/repo", args, timeoutMs: 1000 })
 
+// withStallRetry reads core.sshCommand only when GIT_SSH_COMMAND is unset, and every hh seat exports
+// GIT_SSH_COMMAND=hh-git-ssh (25616). Rows that set it pass it on the request, so the ambient one is removed.
+beforeEach(() => {
+  vi.stubEnv("GIT_SSH_COMMAND", undefined)
+})
+
 afterEach(() => {
   vi.useRealTimers()
   vi.restoreAllMocks()
+  vi.unstubAllEnvs()
 })
 
 describe("withStallRetry", () => {
