@@ -1,5 +1,6 @@
+import { existsSync, readFileSync } from "node:fs"
 import { rm } from "node:fs/promises"
-import { isAbsolute, join, resolve } from "node:path"
+import { dirname, isAbsolute, join, resolve } from "node:path"
 import { readCommitSubmodules, resolveSubmoduleBranch, type CommitSubmodule } from "./commit-graph.ts"
 import {
   composeSubmoduleCommits,
@@ -169,6 +170,11 @@ export type SuperMergeOptions = Readonly<{
   exclusive?: Exclusive
   /** Reports writer-lock contention without writing to stderr from the library. */
   report?: (line: string) => void
+  /**
+   * Emergency / submit preflight: bypass remote network fetches of child mains,
+   * reading local tracking refs or reference stores.
+   */
+  noFetch?: boolean
 }>
 
 type GitlinkPlan = Readonly<{
@@ -367,7 +373,7 @@ async function mergeUnderLock(
   steps.begin("plan")
   let planned: GitlinkPlans
   try {
-    planned = await planGitlinks(git, root, head, tree, timeoutMs)
+    planned = await planGitlinks(git, root, head, tree, timeoutMs, options.noFetch)
   } catch (error) {
     return failed(root, [], resultError(error, "inspect-gitlinks"))
   }
@@ -384,7 +390,7 @@ async function mergeUnderLock(
     forkComposed = forked.composed
     composed = new Map([...composed, ...forked.composed])
     try {
-      planned = await planGitlinks(git, root, head, tree, timeoutMs)
+      planned = await planGitlinks(git, root, head, tree, timeoutMs, options.noFetch)
     } catch (error) {
       return failed(root, [], resultError(error, "inspect-gitlinks"))
     }
@@ -1931,6 +1937,7 @@ async function planGitlinks(
   head: string,
   tree: string,
   timeoutMs: number,
+  noFetch?: boolean,
 ): Promise<GitlinkPlans> {
   const plans: GitlinkPlan[] = []
   const descents: SuperMergeDescentResult[] = []
@@ -2095,6 +2102,7 @@ async function planGitlinks(
           stores.get(entry.path) ?? join(repository, entry.path),
           entry,
           timeoutMs,
+          noFetch,
         ).then(
           (main) => ({ ok: true as const, main }),
           (error: unknown) => ({ ok: false as const, error }),
@@ -2136,7 +2144,7 @@ async function planGitlinks(
       // for a nested gitlink is declared in its parent component, not in km.
       const fetched = prefetched.get(entry.path)
       if (fetched?.ok === false) throw fetched.error
-      const read = fetched?.main ?? (await fetchSubmoduleMain(git, repository, submodule, entry, timeoutMs))
+      const read = fetched?.main ?? (await fetchSubmoduleMain(git, repository, submodule, entry, timeoutMs, noFetch))
       mains.set(path, read)
       const main = read.oid
       if (entry.target === main) {
@@ -2298,12 +2306,86 @@ const MAIN_FETCH_CONCURRENCY = 4
 /** A child main as read from its remote: which remote, which branch, and the commit it named. */
 type SubmoduleMain = Readonly<{ remote: string; destination: string; oid: string }>
 
+async function resolveSubmoduleMainFromAlternates(
+  git: GitProcess,
+  superproject: string,
+  submodule: string,
+  entry: CommitSubmodule,
+  branch: string,
+  timeoutMs: number,
+): Promise<string | undefined> {
+  const candidateDirs: string[] = []
+
+  // 1. Alternates from submodule itself
+  const subGitdirRes = await run(git, submodule, ["rev-parse", "--git-dir"], timeoutMs)
+  if (subGitdirRes.code === 0 && subGitdirRes.stdout.trim().length > 0) {
+    const rawSubGitdir = subGitdirRes.stdout.trim()
+    const subGitdir = isAbsolute(rawSubGitdir) ? rawSubGitdir : resolve(submodule, rawSubGitdir)
+    const altFile = join(subGitdir, "objects", "info", "alternates")
+    if (existsSync(altFile)) {
+      try {
+        const lines = readFileSync(altFile, "utf8")
+          .split("\n")
+          .map((line) => line.trim())
+          .filter((line) => line.length > 0 && !line.startsWith("#"))
+        for (const line of lines) {
+          const resolvedObjDir = isAbsolute(line) ? line : resolve(subGitdir, "objects", line)
+          candidateDirs.push(dirname(resolvedObjDir))
+        }
+      } catch {
+        // ignore read failure
+      }
+    }
+  }
+
+  // 2. Alternates from superproject
+  const superGitdirRes = await run(git, superproject, ["rev-parse", "--git-dir"], timeoutMs)
+  if (superGitdirRes.code === 0 && superGitdirRes.stdout.trim().length > 0) {
+    const rawSuperGitdir = superGitdirRes.stdout.trim()
+    const superGitdir = isAbsolute(rawSuperGitdir) ? rawSuperGitdir : resolve(superproject, rawSuperGitdir)
+    const altFile = join(superGitdir, "objects", "info", "alternates")
+    if (existsSync(altFile)) {
+      try {
+        const lines = readFileSync(altFile, "utf8")
+          .split("\n")
+          .map((line) => line.trim())
+          .filter((line) => line.length > 0 && !line.startsWith("#"))
+        for (const line of lines) {
+          const resolvedObjDir = isAbsolute(line) ? line : resolve(superGitdir, "objects", line)
+          const refSuperGitDir = dirname(resolvedObjDir)
+          const refSuperRoot = dirname(refSuperGitDir)
+          candidateDirs.push(join(refSuperRoot, entry.path))
+          candidateDirs.push(join(refSuperGitDir, "modules", entry.path))
+        }
+      } catch {
+        // ignore read failure
+      }
+    }
+  }
+
+  for (const dir of candidateDirs) {
+    if (!existsSync(dir)) continue
+    for (const ref of [`refs/remotes/origin/${branch}`, `refs/heads/${branch}`]) {
+      const res = await run(git, dir, ["rev-parse", "--verify", `${ref}^{commit}`], timeoutMs)
+      if (res.code === 0 && res.stdout.trim().length > 0) {
+        const oid = res.stdout.trim()
+        const cat = await run(git, submodule, ["cat-file", "-e", `${oid}^{commit}`], timeoutMs)
+        if (cat.code === 0) {
+          return oid
+        }
+      }
+    }
+  }
+  return undefined
+}
+
 async function fetchSubmoduleMain(
   git: GitProcess,
   superproject: string,
   submodule: string,
   entry: CommitSubmodule,
   timeoutMs: number,
+  noFetch?: boolean,
 ): Promise<SubmoduleMain> {
   const branch = await resolveSubmoduleBranch(
     { run: (request) => git.run({ ...request, timeoutMs }) },
@@ -2313,11 +2395,27 @@ async function fetchSubmoduleMain(
     "origin",
   )
   const { path, target: pin } = entry
-  const fetchArgs = ["fetch", "--no-tags", "origin", `+refs/heads/${branch}:refs/remotes/origin/${branch}`]
-  const fetched = await run(git, submodule, fetchArgs, timeoutMs)
-  if (fetched.code !== 0) throw submoduleMainError(submodule, path, pin, fetchArgs, fetched)
+  if (!noFetch) {
+    const fetchArgs = ["fetch", "--no-tags", "origin", `+refs/heads/${branch}:refs/remotes/origin/${branch}`]
+    const fetched = await run(git, submodule, fetchArgs, timeoutMs)
+    if (fetched.code !== 0) throw submoduleMainError(submodule, path, pin, fetchArgs, fetched)
+  }
   const resolveArgs = ["rev-parse", `refs/remotes/origin/${branch}^{commit}`]
-  const resolved = await run(git, submodule, resolveArgs, timeoutMs)
+  let resolved = await run(git, submodule, resolveArgs, timeoutMs)
+  if (resolved.code !== 0 && noFetch) {
+    const alternateOid = await resolveSubmoduleMainFromAlternates(
+      git,
+      superproject,
+      submodule,
+      entry,
+      branch,
+      timeoutMs,
+    )
+    if (alternateOid !== undefined) {
+      await run(git, submodule, ["update-ref", `refs/remotes/origin/${branch}`, alternateOid], timeoutMs)
+      resolved = { code: 0, stdout: `${alternateOid}\n`, stderr: "" }
+    }
+  }
   if (resolved.code !== 0) throw submoduleMainError(submodule, path, pin, resolveArgs, resolved)
   return { remote: "origin", destination: `refs/heads/${branch}`, oid: resolved.stdout.trim() }
 }

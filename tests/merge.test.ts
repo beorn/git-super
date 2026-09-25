@@ -3,8 +3,8 @@
  * @level l1
  * @consumer Yrd settled candidate preparation and landing
  */
-import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
-import { join, relative } from "node:path"
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { dirname, isAbsolute, join, relative } from "node:path"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { runCli } from "../src/cli.ts"
 import { acquireExclusive } from "../src/exclusive.ts"
@@ -3146,6 +3146,94 @@ describe("git super merge — each child main is read from its remote once (2557
 
     expect(result).toMatchObject({ state: "updated" })
     expect(reads.sort()).toEqual(["packages/alpha", "vendor/beta"])
+  })
+})
+
+/**
+ * @failure Submit makes per-component remote network fetches during preflight composition checks,
+ *          bursting SSH logins over the host ceiling (@i/14-substrate/25626).
+ * @level l1
+ * @consumer Yrd submit preflight inspection and offline/no-fetch merges
+ */
+describe("git super merge — no-fetch bypasses remote reads of child mains (25626)", () => {
+  const isRemoteRead = (args: readonly string[]): boolean =>
+    args[0] === "ls-remote" || (args[0] === "fetch" && args.some((arg) => arg.startsWith("+refs/heads/")))
+
+  it("performs zero remote fetches when noFetch is true and tracking refs exist locally", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-25626-nofetch-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const candidate = candidateWithRootChange(fixture, "candidate-nofetch")
+    for (const path of ["packages/alpha", "vendor/beta"])
+      git(fixture.product, "config", `submodule.${path}.branch`, "main")
+    const local = createLocalGitProcess()
+    const reads: string[] = []
+    const recording: GitProcess = {
+      run: (request) => {
+        if (isRemoteRead(request.args)) reads.push(relative(fixture.product, request.repo))
+        return local.run(request)
+      },
+    }
+
+    const result = await superMerge({ repo: fixture.product, commit: candidate, noFetch: true, git: recording })
+
+    expect(result).toMatchObject({ state: "updated" })
+    expect(reads).toEqual([])
+  })
+
+  it("resolves tracking refs from alternates when child clone has no local tracking ref", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-25626-alternates-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const candidate = candidateWithRootChange(fixture, "candidate-alt")
+    for (const path of ["packages/alpha", "vendor/beta"])
+      git(fixture.product, "config", `submodule.${path}.branch`, "main")
+
+    // Delete tracking refs in packages/alpha and vendor/beta
+    for (const path of ["packages/alpha", "vendor/beta"]) {
+      const sub = join(fixture.product, path)
+      const subGitdir = git(sub, "rev-parse", "--git-dir")
+      const resolvedGitdir = isAbsolute(subGitdir) ? subGitdir : join(sub, subGitdir)
+      // Point submodule alternates to the upstream store where refs/heads/main exists
+      const upstreamStore = fixture[path === "packages/alpha" ? "alpha" : "beta"]
+      const altFile = join(resolvedGitdir, "objects", "info", "alternates")
+      mkdirSync(dirname(altFile), { recursive: true })
+      writeFileSync(altFile, `${join(upstreamStore, ".git", "objects")}\n`)
+      git(sub, "update-ref", "-d", "refs/remotes/origin/main")
+    }
+
+    const local = createLocalGitProcess()
+    const reads: string[] = []
+    const recording: GitProcess = {
+      run: (request) => {
+        if (isRemoteRead(request.args)) reads.push(relative(fixture.product, request.repo))
+        return local.run(request)
+      },
+    }
+
+    const result = await superMerge({ repo: fixture.product, commit: candidate, noFetch: true, git: recording })
+
+    expect(result).toMatchObject({ state: "updated" })
+    expect(reads).toEqual([])
+    // And tracking ref was populated
+    for (const path of ["packages/alpha", "vendor/beta"]) {
+      const sub = join(fixture.product, path)
+      expect(git(sub, "rev-parse", "refs/remotes/origin/main")).toBeTruthy()
+    }
+  })
+
+  it("fails loud when tracking ref is missing and cannot be resolved locally", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-25626-missing-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const candidate = candidateWithRootChange(fixture, "candidate-missing")
+    for (const path of ["packages/alpha", "vendor/beta"]) {
+      git(fixture.product, "config", `submodule.${path}.branch`, "nonexistent-branch")
+    }
+
+    const result = await superMerge({ repo: fixture.product, commit: candidate, noFetch: true })
+
+    expect(result).toMatchObject({ state: "failed", detail: { code: "submodule-main-unreadable" } })
   })
 })
 

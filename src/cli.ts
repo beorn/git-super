@@ -121,6 +121,7 @@ function inputObjects(command: string, args: readonly string[]): readonly { argu
           "-q",
           "--atomic",
           "--no-verify",
+          "--no-fetch",
           "--is-ancestor",
           "--cached",
           "--staged",
@@ -351,6 +352,7 @@ async function runInvocation(
     .description(commands.merge.description ?? commands.merge.title)
     .option("-m, --message <message>", "merge commit message")
     .option("--no-verify", "emergency only: bypass ordinary merge and commit hooks")
+    .option("--no-fetch", "bypass child-main remote network fetches; read local tracking refs")
     .argument("<commit>", "commit to merge into the current branch")
     .action((commit, options, command) => {
       const globals = command.optsWithGlobals() as { repo: string; json?: boolean }
@@ -360,6 +362,7 @@ async function runInvocation(
           commit,
           ...(typeof options.message === "string" ? { message: options.message } : {}),
           ...(options.verify === false ? { noVerify: true } : {}),
+          ...(options.fetch === false ? { noFetch: true } : {}),
         },
         json: globals.json === true,
         nul: false,

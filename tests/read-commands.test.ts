@@ -452,4 +452,12 @@ describe("Phase 1 read commands", () => {
       submodules: [],
     })
   })
+
+  test("merge --help advertises --no-fetch option", async () => {
+    const stdout = outputSink()
+    const stderr = outputSink()
+    expect(await runCli(["merge", "--help"], stdout, stderr)).toBe(0)
+    expect(stdout.output).toContain("--no-fetch")
+    expect(stderr.output).toBe("")
+  })
 })
