@@ -21,6 +21,7 @@
     "./commit-graph": "./src/commit-graph.ts",
     "./exclusive": "./src/exclusive.ts",
     "./gitlink": "./src/gitlink.ts",
+    "./gitlink-carrier": "./src/gitlink-carrier.ts",
     "./objects": "./src/objects.ts",
     "./process": "./src/process.ts",
     "./pull": "./src/pull.ts",
@@ -53,6 +54,10 @@
       "./gitlink": {
         "types": "./dist/gitlink.d.ts",
         "import": "./dist/gitlink.js"
+      },
+      "./gitlink-carrier": {
+        "types": "./dist/gitlink-carrier.d.ts",
+        "import": "./dist/gitlink-carrier.js"
       },
       "./objects": {
         "types": "./dist/objects.d.ts",

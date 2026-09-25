@@ -11,6 +11,7 @@ import { afterEach, describe, expect, test } from "vitest"
 import { runCli } from "../src/cli.ts"
 import { acquireExclusive } from "../src/exclusive.ts"
 import { writeGitlink } from "../src/gitlink.ts"
+import { composeGitlinkCarrier } from "../src/gitlink-carrier.ts"
 import { createLocalGitProcess, type GitProcess } from "../src/process.ts"
 import { advanceRepository, canonicalTmpdir as tmpdir, createProductFixture, git, injectionProbe } from "./fixture.ts"
 
@@ -48,6 +49,41 @@ function fetchWithoutCheckout(repository: string, path: string, commit: string):
 }
 
 describe("policy-free gitlink writes", () => {
+  test("builds a two-pin carrier on an exact parent without touching the caller index or checkout", async () => {
+    const product = fixture("carrier-exact-tree")
+    const alphaNext = advanceRepository(product.alpha, "alpha.ts", "export const alpha = 8\n")
+    const betaNext = advanceRepository(product.beta, "beta.ts", "export const beta = 8\n")
+    fetchWithoutCheckout(product.product, "packages/alpha", alphaNext)
+    fetchWithoutCheckout(product.product, "vendor/beta", betaNext)
+    const indexBefore = git(product.product, "ls-files", "--stage")
+    const statusBefore = git(product.product, "status", "--porcelain")
+
+    const carrier = await composeGitlinkCarrier({
+      repo: product.product,
+      base: product.productBase,
+      pins: [
+        { path: "packages/alpha", commit: alphaNext },
+        { path: "vendor/beta", commit: betaNext },
+      ],
+      message: "carry two pins\n\nRefs: 25804\n",
+    })
+
+    expect(git(product.product, "rev-list", "--parents", "-n", "1", carrier.commit)).toBe(
+      `${carrier.commit} ${product.productBase}`,
+    )
+    expect(git(product.product, "ls-tree", carrier.commit, "packages/alpha")).toBe(
+      `160000 commit ${alphaNext}\tpackages/alpha`,
+    )
+    expect(git(product.product, "ls-tree", carrier.commit, "vendor/beta")).toBe(
+      `160000 commit ${betaNext}\tvendor/beta`,
+    )
+    expect(git(product.product, "diff-tree", "--no-commit-id", "--name-only", "-r", carrier.commit)).toBe(
+      "packages/alpha\nvendor/beta",
+    )
+    expect(git(product.product, "ls-files", "--stage")).toBe(indexBefore)
+    expect(git(product.product, "status", "--porcelain")).toBe(statusBefore)
+  })
+
   test("keeps malformed index records visible without changing the established error prefix", async () => {
     const product = fixture("malformed-index-record")
     const path = "packages/alpha"
