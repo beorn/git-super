@@ -3187,7 +3187,6 @@ describe("git super merge — no-fetch bypasses remote reads of child mains (256
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-25626-alternates-"))
     roots.push(fixtureRoot)
     const fixture = createProductFixture(fixtureRoot)
-    const candidate = candidateWithRootChange(fixture, "candidate-alt")
     for (const path of ["packages/alpha", "vendor/beta"]) {
       git(fixture.product, "config", `submodule.${path}.branch`, "main")
     }
@@ -3205,6 +3204,19 @@ describe("git super merge — no-fetch bypasses remote reads of child mains (256
       writeFileSync(altFile, `${join(upstreamStore, ".git", "objects")}\n`)
       git(sub, "update-ref", "-d", "refs/remotes/origin/main")
     }
+
+    // Advance packages/alpha in candidate so result.gitlinks is populated and store is asserted
+    const alphaSub = join(fixture.product, "packages/alpha")
+    writeFileSync(join(alphaSub, "alpha-change.txt"), "alpha change\n")
+    git(alphaSub, "add", "alpha-change.txt")
+    git(alphaSub, "commit", "-q", "-m", "advance alpha")
+
+    git(fixture.product, "switch", "-q", "-c", "candidate-alt")
+    git(fixture.product, "add", "packages/alpha")
+    git(fixture.product, "commit", "-q", "-m", "candidate: move packages/alpha gitlink")
+    const candidate = git(fixture.product, "rev-parse", "HEAD")
+    git(fixture.product, "switch", "-q", "main")
+    git(alphaSub, "checkout", "-q", "HEAD~1")
 
     const local = createLocalGitProcess()
     const reads: string[] = []
@@ -3225,9 +3237,146 @@ describe("git super merge — no-fetch bypasses remote reads of child mains (256
       expect(() => git(sub, "rev-parse", "--verify", "refs/remotes/origin/main")).toThrow()
     }
     // Result names the alternate store
+    expect(result.gitlinks.length).toBeGreaterThan(0)
     for (const gitlink of result.gitlinks) {
       expect(gitlink.store).toBeDefined()
     }
+  })
+
+  it("fails loud with submodule-main-unreadable when alternate holds only refs/heads/main", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-heads-only-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const candidate = candidateWithRootChange(fixture, "candidate-heads-only")
+    for (const path of ["packages/alpha", "vendor/beta"]) {
+      git(fixture.product, "config", `submodule.${path}.branch`, "main")
+    }
+    for (const path of ["packages/alpha", "vendor/beta"]) {
+      const sub = join(fixture.product, path)
+      const subGitdir = git(sub, "rev-parse", "--git-dir")
+      const resolvedGitdir = isAbsolute(subGitdir) ? subGitdir : join(sub, subGitdir)
+      const upstreamStore = fixture[path === "packages/alpha" ? "alpha" : "beta"]
+      const altFile = join(resolvedGitdir, "objects", "info", "alternates")
+      mkdirSync(dirname(altFile), { recursive: true })
+      writeFileSync(altFile, `${join(upstreamStore, ".git", "objects")}\n`)
+      git(sub, "update-ref", "-d", "refs/remotes/origin/main")
+    }
+    const result = await superMerge({ repo: fixture.product, commit: candidate, noFetch: true })
+    expect(result).toMatchObject({ state: "failed", detail: { code: "submodule-main-unreadable" } })
+    for (const path of ["packages/alpha", "vendor/beta"]) {
+      const sub = join(fixture.product, path)
+      expect(() => git(sub, "rev-parse", "--verify", "refs/remotes/origin/main")).toThrow()
+    }
+  })
+
+  it("prefers superproject alternates over submodule alternates", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-alt-order-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const sub = join(fixture.product, "packages/alpha")
+
+    const commitBase = git(sub, "rev-parse", "HEAD")
+
+    // commitSub (ancestor)
+    writeFileSync(join(sub, "sub.txt"), "sub\n")
+    git(sub, "add", "sub.txt")
+    git(sub, "commit", "-q", "-m", "sub commit")
+    const commitSub = git(sub, "rev-parse", "HEAD")
+
+    // commitSuper (middle)
+    writeFileSync(join(sub, "super.txt"), "super\n")
+    git(sub, "add", "super.txt")
+    git(sub, "commit", "-q", "-m", "super commit")
+    const commitSuper = git(sub, "rev-parse", "HEAD")
+
+    // commitTarget (child/ahead)
+    writeFileSync(join(sub, "target.txt"), "target\n")
+    git(sub, "add", "target.txt")
+    git(sub, "commit", "-q", "-m", "target commit")
+    const commitTarget = git(sub, "rev-parse", "HEAD")
+
+    git(sub, "checkout", "-q", commitBase)
+    git(sub, "update-ref", "-d", "refs/remotes/origin/main")
+
+    const subGitdir = git(sub, "rev-parse", "--git-dir")
+    const resolvedSubGitdir = isAbsolute(subGitdir) ? subGitdir : join(sub, subGitdir)
+
+    // Set up superproject alternate
+    const superStoreRoot = mkdtempSync(join(tmpdir(), "super-store-"))
+    roots.push(superStoreRoot)
+    mkdirSync(join(superStoreRoot, ".git", "objects"), { recursive: true })
+    const superAlt = join(fixture.product, ".git", "objects", "info", "alternates")
+    mkdirSync(dirname(superAlt), { recursive: true })
+    writeFileSync(superAlt, `${join(superStoreRoot, ".git", "objects")}\n`)
+
+    const superStoreAlpha = join(superStoreRoot, "packages/alpha")
+    mkdirSync(superStoreAlpha, { recursive: true })
+    git(superStoreAlpha, "init", "-q")
+    const altSuperAlpha = join(superStoreAlpha, ".git", "objects", "info", "alternates")
+    mkdirSync(dirname(altSuperAlpha), { recursive: true })
+    writeFileSync(altSuperAlpha, `${join(resolvedSubGitdir, "objects")}\n`)
+    git(superStoreAlpha, "update-ref", "refs/remotes/origin/main", commitSuper)
+
+    // Set up submodule alternate
+    const storeSub = mkdtempSync(join(tmpdir(), "sub-store-"))
+    roots.push(storeSub)
+    git(storeSub, "init", "-q")
+    const altStoreSub = join(storeSub, ".git", "objects", "info", "alternates")
+    mkdirSync(dirname(altStoreSub), { recursive: true })
+    writeFileSync(altStoreSub, `${join(resolvedSubGitdir, "objects")}\n`)
+    git(storeSub, "update-ref", "refs/remotes/origin/main", commitSub)
+
+    const subAlt = join(resolvedSubGitdir, "objects", "info", "alternates")
+    mkdirSync(dirname(subAlt), { recursive: true })
+    writeFileSync(subAlt, `${join(storeSub, ".git", "objects")}\n`)
+
+    // Create candidate moving packages/alpha to commitTarget
+    git(fixture.product, "switch", "-q", "-c", "candidate-order")
+    git(sub, "checkout", "-q", commitTarget)
+    git(fixture.product, "add", "packages/alpha")
+    git(fixture.product, "commit", "-q", "-m", "move alpha to target")
+    const candidate = git(fixture.product, "rev-parse", "HEAD")
+    git(fixture.product, "switch", "-q", "main")
+    git(sub, "checkout", "-q", commitBase)
+
+    for (const path of ["packages/alpha", "vendor/beta"]) {
+      git(fixture.product, "config", `submodule.${path}.branch`, "main")
+    }
+
+    const result = await superMerge({ repo: fixture.product, commit: candidate, noFetch: true })
+    expect(result).toMatchObject({ state: "updated" })
+    const alphaLink = result.gitlinks?.find((g) => g.path === "packages/alpha")
+    expect(alphaLink?.store).toBe(superStoreAlpha)
+    expect(alphaLink?.store).not.toBe(join(storeSub, ".git"))
+  })
+
+  it("fails loud when alternates file cannot be read", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-alternates-unreadable-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const candidate = candidateWithRootChange(fixture, "candidate-unreadable-alt")
+    for (const path of ["packages/alpha", "vendor/beta"]) {
+      git(fixture.product, "config", `submodule.${path}.branch`, "main")
+    }
+
+    // Delete tracking ref in packages/alpha so alternates are consulted
+    const sub = join(fixture.product, "packages/alpha")
+    git(sub, "update-ref", "-d", "refs/remotes/origin/main")
+
+    // Make alternates a directory so readFileSync throws EISDIR
+    const subGitdir = git(sub, "rev-parse", "--git-dir")
+    const resolvedSubGitdir = isAbsolute(subGitdir) ? subGitdir : join(sub, subGitdir)
+    const altFile = join(resolvedSubGitdir, "objects", "info", "alternates")
+    mkdirSync(altFile, { recursive: true })
+
+    const result = await superMerge({ repo: fixture.product, commit: candidate, noFetch: true })
+    expect(result).toMatchObject({
+      state: "failed",
+      detail: {
+        code: "unexpected-error",
+        subject: expect.stringContaining("EISDIR"),
+      },
+    })
   })
 
   it("fails loud when tracking ref is missing and cannot be resolved locally", async () => {
