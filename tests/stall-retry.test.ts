@@ -141,6 +141,20 @@ describe("withStallRetry", () => {
     },
   )
 
+  // The path every hh seat takes (review2 on ca20420d70): the seat's own GIT_SSH_COMMAND survives the
+  // beforeEach stub here, is kept with -v for the retry, and no core.sshCommand lookup runs.
+  test("a seat's ambient GIT_SSH_COMMAND is kept for the publickey retry, with no core.sshCommand lookup", async () => {
+    vi.useFakeTimers()
+    vi.spyOn(console, "error").mockImplementation(() => {})
+    vi.stubEnv("GIT_SSH_COMMAND", "hh-git-ssh")
+    const inner = scripted([PUBLICKEY_REFUSAL, OK])
+    const pending = withStallRetry(inner).run(req(["fetch", "origin"]))
+    await vi.advanceTimersByTimeAsync(5_000)
+    expect((await pending).code).toBe(0)
+    expect(inner.calls.map((call) => call.args.join(" "))).toEqual(["fetch origin", "fetch origin"])
+    expect(inner.calls[1]?.env?.GIT_SSH_COMMAND).toBe("hh-git-ssh -v")
+  })
+
   test("a second publickey refusal remains a failure after exactly one announced retry", async () => {
     vi.useFakeTimers()
     const announced = vi.spyOn(console, "error").mockImplementation(() => {})
