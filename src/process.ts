@@ -185,6 +185,27 @@ export function isExactPublickeyRefusal(result: Pick<GitProcessResult, "code" | 
   )
 }
 
+/**
+ * The lines a read prints when its SSH session drops mid-read, and nothing else (measured 2026-09-25). A
+ * client of a shared ControlMaster connection prints only Git's own fatal lines when the master dies; a
+ * direct connection names the close first. A refusal always adds a line of its own (publickey, repository not found,
+ * `ssh: connect ...`), so it never matches, and an unknown line means no retry: today's behaviour, never a wrong one.
+ */
+const SSH_SESSION_DROP_LINES: readonly RegExp[] = [
+  /^Connection to \S+ closed by remote host\.$/u,
+  /^fatal: Could not read from remote repository\.$/u,
+  /^Please make sure you have the correct access rights$/u,
+  /^and the repository exists\.$/u,
+  /^fatal: expected flush after ref listing$/u,
+]
+
+/** An exit 128 whose every non-empty stderr line is a measured session-drop line. */
+export function isSshSessionDrop(result: Pick<GitProcessResult, "code" | "stderr">): boolean {
+  if (result.code !== 128) return false
+  const lines = result.stderr.split(/\r?\n/u).filter((line) => line.trim() !== "")
+  return lines.length > 0 && lines.every((line) => SSH_SESSION_DROP_LINES.some((drop) => drop.test(line)))
+}
+
 /** Preserve Git's SSH selection while enabling OpenSSH's offered-key trace. */
 export function verboseSshRetryEnvironment(
   env: NodeJS.ProcessEnv,
@@ -263,7 +284,7 @@ function withReadRetry(inner: GitProcess, options: StallRetryOptions, environmen
       if (!isRetryableRead(request.args)) return inner.run(request)
       let result = await inner.run(request)
       let stallAttempt = 1
-      let retriedPublickey = false
+      let retriedSsh = false
       while (true) {
         if (result.timedOut === true && stallAttempt < attempts) {
           stallAttempt += 1
@@ -278,17 +299,32 @@ function withReadRetry(inner: GitProcess, options: StallRetryOptions, environmen
           result = await inner.run(request)
           continue
         }
+        // One announced SSH retry per read, for either predicate (25282, 25616): the announcement names which matched.
+        const ssh = isExactPublickeyRefusal(result)
+          ? "Permission denied (publickey)."
+          : isSshSessionDrop(result)
+            ? "SSH session dropped"
+            : undefined
         if (
           attempts > 1 &&
-          !retriedPublickey &&
+          !retriedSsh &&
           result.failure === undefined &&
           (result.signal === undefined || result.signal === null) &&
           result.timedOut !== true &&
           result.stalled !== true &&
-          isExactPublickeyRefusal(result)
+          ssh !== undefined
         ) {
-          retriedPublickey = true
+          retriedSsh = true
           if (request.signal?.aborted) return result
+          if (ssh === "SSH session dropped") {
+            console.error(
+              `git-super: git ${request.args.join(" ")} in ${request.repo}: ${ssh}; ` +
+                `retry 2/2 after ${String(PUBLICKEY_BACKOFF_MS)}ms`,
+            )
+            if (!(await waitForReadRetry(PUBLICKEY_BACKOFF_MS, request.signal))) return result
+            result = await inner.run(request)
+            continue
+          }
           const effectiveEnv = { ...environment, ...request.env }
           let verbose: ReturnType<typeof verboseSshRetryEnvironment>
           try {

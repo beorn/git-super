@@ -17,6 +17,7 @@ import {
   coreSshCommandFromConfig,
   isExactPublickeyRefusal,
   isRetryableRead,
+  isSshSessionDrop,
   verboseSshRetryEnvironment,
   withStallRetry,
 } from "../src/process.ts"
@@ -269,5 +270,113 @@ describe("isExactPublickeyRefusal", () => {
     expect(isExactPublickeyRefusal({ code: 0, stderr: PUBLICKEY_REFUSAL.stderr })).toBe(false)
     expect(isExactPublickeyRefusal(REAL_FAILURE)).toBe(false)
     expect(isExactPublickeyRefusal({ code: 128, stderr: "fatal: Permission denied (publickey). maybe" })).toBe(false)
+  })
+})
+
+// 25616 row 2 (measured 2026-09-25): a read whose SSH session drops mid-read. A client of a shared ControlMaster
+// connection prints only Git's own fatal lines; a direct connection names the close first.
+const DROP_ADVICE = "\n\nPlease make sure you have the correct access rights\nand the repository exists.\n"
+const MUX_DROP: GitProcessResult = {
+  code: 128,
+  stdout: "",
+  stderr: `fatal: Could not read from remote repository.${DROP_ADVICE}`,
+}
+const MUX_DROP_MID_LISTING: GitProcessResult = {
+  code: 128,
+  stdout: "",
+  stderr: "fatal: expected flush after ref listing\n",
+}
+const MUX_SELF_HEAL =
+  "mux_client_request_session: session request failed: Session open refused by peer\n" +
+  "ControlSocket /run/user/3001/hh-ssh/3f60e39f78041c85907e381d201d2a12511f0172 already exists, disabling multiplexing\n"
+// The yrd evidence holds 440 of these (newlines flattened there): every real drop sample is this shape.
+const DIRECT_DROP: GitProcessResult = {
+  code: 128,
+  stdout: "",
+  stderr: `Connection to github.com closed by remote host.\nfatal: Could not read from remote repository.${DROP_ADVICE}`,
+}
+
+describe("a dropped SSH session is retried once (25616 row 2)", () => {
+  test.each([
+    ["a shared master's client", MUX_DROP],
+    ["a shared master's client mid-listing", MUX_DROP_MID_LISTING],
+    ["a direct connection", DIRECT_DROP],
+  ] as const)("announces one retry of a read whose session dropped: %s", async (_name, drop) => {
+    vi.useFakeTimers()
+    const announced = vi.spyOn(console, "error").mockImplementation(() => {})
+    const inner = scripted([drop, OK])
+    const request = req(["ls-remote", "origin"])
+    const pending = withStallRetry(inner).run(request)
+    await vi.advanceTimersByTimeAsync(5_000)
+    expect((await pending).code).toBe(0)
+    expect(inner.calls).toEqual([request, request])
+    expect(announced).toHaveBeenCalledOnce()
+    expect(announced).toHaveBeenCalledWith(expect.stringContaining("SSH session dropped; retry 2/2 after 3000ms"))
+  })
+
+  test("a second drop remains a failure after exactly one announced retry", async () => {
+    vi.useFakeTimers()
+    const announced = vi.spyOn(console, "error").mockImplementation(() => {})
+    const inner = scripted([MUX_DROP, MUX_DROP, OK])
+    const pending = withStallRetry(inner).run(req(["fetch", "origin"]))
+    await vi.advanceTimersByTimeAsync(5_000)
+    expect(await pending).toBe(MUX_DROP)
+    expect(inner.calls).toHaveLength(2)
+    expect(announced).toHaveBeenCalledOnce()
+  })
+
+  test("a dropped write never retries, and attempts: 1 disables the retry", async () => {
+    const write = scripted([MUX_DROP, OK])
+    expect(await withStallRetry(write).run(req(["push", "origin", "main"]))).toBe(MUX_DROP)
+    expect(write.calls).toHaveLength(1)
+    const single = scripted([MUX_DROP, OK])
+    expect(await withStallRetry(single, { attempts: 1 }).run(req(["fetch", "origin"]))).toBe(MUX_DROP)
+    expect(single.calls).toHaveLength(1)
+  })
+})
+
+describe("isSshSessionDrop", () => {
+  test("accepts an exit 128 whose every line is a measured drop line", () => {
+    expect([MUX_DROP, MUX_DROP_MID_LISTING, DIRECT_DROP].map(isSshSessionDrop)).toEqual([true, true, true])
+  })
+
+  // A refusal always prints a line of its own, so it is Git or the remote ANSWERING, and re-asking would hide it.
+  test.each([
+    ["the publickey refusal", PUBLICKEY_REFUSAL],
+    [
+      "a missing repository",
+      {
+        code: 128,
+        stderr: `ERROR: Repository not found.\nfatal: Could not read from remote repository.${DROP_ADVICE}`,
+      },
+    ],
+    // The yrd evidence's six real refusals of this shape.
+    [
+      "a refused connection",
+      {
+        code: 128,
+        stderr: `ssh: connect to host github.com port 22: Connection refused\nfatal: Could not read from remote repository.${DROP_ADVICE}`,
+      },
+    ],
+    [
+      "a drop with one unknown line",
+      { code: 128, stderr: `${DIRECT_DROP.stderr}fatal: the remote end hung up unexpectedly\n` },
+    ],
+    // Over ten sessions a master refuses the next one and ssh opens its own login; that call succeeds, so it is no drop.
+    ["the mux self-heal that succeeded", { code: 0, stderr: MUX_SELF_HEAL }],
+    ["the mux self-heal lines beside a drop", { code: 128, stderr: `${MUX_SELF_HEAL}${MUX_DROP.stderr}` }],
+    [
+      "an ssh wrapper's own refusal",
+      {
+        code: 128,
+        stderr: `git-ssh-wrapper: XDG_RUNTIME_DIR is unset\nfatal: Could not read from remote repository.${DROP_ADVICE}`,
+      },
+    ],
+    ["a local failure", REAL_FAILURE],
+    ["a success", { code: 0, stderr: MUX_DROP.stderr }],
+    ["another exit code", { code: 1, stderr: MUX_DROP.stderr }],
+    ["an empty stderr", { code: 128, stderr: "\n" }],
+  ] as const)("rejects %s", (_name, result) => {
+    expect(isSshSessionDrop(result)).toBe(false)
   })
 })
