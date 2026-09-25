@@ -2332,8 +2332,9 @@ async function resolveSubmoduleMainFromAlternates(
           const resolvedObjDir = isAbsolute(line) ? line : resolve(subGitdir, "objects", line)
           candidateDirs.push(dirname(resolvedObjDir))
         }
-      } catch {
-        // ignore read failure
+      } catch (error) {
+        // An alternates file that exists but cannot be read drops one candidate source; say which.
+        console.error(`git-super: cannot read ${altFile}: ${String(error)}; its alternates are not searched`)
       }
     }
   }
@@ -2357,8 +2358,8 @@ async function resolveSubmoduleMainFromAlternates(
           candidateDirs.push(join(refSuperRoot, entry.path))
           candidateDirs.push(join(refSuperGitDir, "modules", entry.path))
         }
-      } catch {
-        // ignore read failure
+      } catch (error) {
+        console.error(`git-super: cannot read ${altFile}: ${String(error)}; its alternates are not searched`)
       }
     }
   }
