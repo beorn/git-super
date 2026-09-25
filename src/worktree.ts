@@ -7,6 +7,7 @@ import { createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS } from "./exclusive.ts"
 import { retainWorktreeModules, type WorktreeRetention } from "./worktree-removal.ts"
 import { cleanGitEnvironment } from "./git.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
+import { createProgressReporter } from "./progress.ts"
 import { materializeSubmodulesWithProcess } from "./submodules.ts"
 
 export type GitResult = Readonly<{ code: number; stdout: string; stderr: string }>
@@ -283,25 +284,46 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
     throw new Error("git-super: Git worktree capability requires one injected GitProcess")
   }
   const git = createGit(options.gitProcess, options.env ?? process.env, timeouts.operation, options.signal)
-  let mutations: Promise<ReturnType<typeof createExclusive>> | undefined
-  const mutationLock = (): Promise<ReturnType<typeof createExclusive>> => {
+  const runWithMutationLock = async <Result>(
+    dir: string,
+    holder: string,
+    operation: () => Promise<Result>,
+  ): Promise<Result> => {
+    const progress = createProgressReporter(
+      options.report,
+      (owner) => `git-super worktree: waiting for writer lock held by ${owner}\n`,
+    )
+    try {
+      return await createExclusive(dir, {
+        timeoutMs: timeouts.mutationLock,
+        onContended: progress.phase,
+      }).run(
+        () => {
+          progress.cancel()
+          return operation()
+        },
+        { holder },
+      )
+    } finally {
+      progress.cancel()
+    }
+  }
+  let mutations: Promise<string> | undefined
+  const mutationLock = (): Promise<string> => {
     mutations ??= (async () => {
       const needsConfigHealing = await poisonedWorktreeConfigNeedsHealing(git, repo)
       const commonDir = (await git.run(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"])).stdout.trim()
       if (commonDir === "") throw new Error("git rev-parse returned an empty common directory")
-      const lock = createExclusive(join(commonDir, "yrd-worktree-mutations"), {
-        timeoutMs: timeouts.mutationLock,
-        onContended: (holder) => options.report?.(`git-super worktree: waiting for writer lock held by ${holder}\n`),
-      })
+      const dir = join(commonDir, "yrd-worktree-mutations")
       if (needsConfigHealing) {
-        await lock.run(() => healPoisonedWorktreeConfig(git, repo), { holder: "worktree configuration repair" })
+        await runWithMutationLock(dir, "worktree configuration repair", () => healPoisonedWorktreeConfig(git, repo))
       }
-      return lock
+      return dir
     })()
     return mutations
   }
   const mutate = async <Result>(holder: string, operation: () => Promise<Result>): Promise<Result> =>
-    (await mutationLock()).run(operation, { holder })
+    runWithMutationLock(await mutationLock(), holder, operation)
 
   return Object.freeze({
     repo,

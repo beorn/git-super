@@ -35,7 +35,7 @@ describe("createGitWorktreeStore", () => {
     expect(DEFAULT_MUTATION_LOCK_WAIT_MS).toBe(4 * 60_000)
   })
 
-  it("waits for a merge holding the writer lock before adding a worktree, up to the configured wait", async () => {
+  it("waits for a merge holding the writer lock before adding a worktree, using the shared default wait", async () => {
     const root = await mkdtemp(join(tmpdir(), "git-super-worktree-writer-wait-"))
     const repo = join(root, "owner")
     const linked = join(root, "linked")
@@ -51,26 +51,37 @@ describe("createGitWorktreeStore", () => {
       { timeoutMs: 0 },
       "git super merge",
     )
-    // A short real hold and a short injected wait prove the same path the default takes, without 40 s of wall time
-    // in a file the host's vendor project runs on every full run (25274, review-adhoc5 c04f5e1e01).
+    // The lock remains real; advance only the reporter's clock past 30 seconds.
+    // The old assertion saw its first line but missed a silent long wait (25274 slice 2).
     const release = Bun.sleep(1_500).then(() => held.release())
     const reports: string[] = []
+    let operation: Promise<void> | undefined
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] })
     try {
       const store = createLocalGitWorktreeStore({
         repo,
         report: (line: string) => reports.push(line),
-        timeouts: { mutationLock: 15_000 },
       })
-      await store.add({ kind: "detached", path: linked, ref: "HEAD" })
+      operation = store.add({ kind: "detached", path: linked, ref: "HEAD" })
+      for (let poll = 0; poll < 100 && reports.length === 0; poll += 1) await Bun.sleep(10)
+      expect(reports).toHaveLength(1)
+      await vi.advanceTimersByTimeAsync(31_000)
+      expect(reports.length).toBeGreaterThanOrEqual(4)
+      await operation
       expect(existsSync(linked)).toBe(true)
-      expect(reports).toEqual([
-        expect.stringMatching(
+      for (const line of reports) {
+        expect(line).toMatch(
           /^git-super worktree: waiting for writer lock held by git super merge \(pid:\d+, age \d+ms\)\n$/u,
-        ),
-      ])
+        )
+      }
     } finally {
-      await release
-      await rm(root, { recursive: true, force: true })
+      try {
+        await release
+        if (operation !== undefined) await Promise.allSettled([operation])
+      } finally {
+        vi.useRealTimers()
+        await rm(root, { recursive: true, force: true })
+      }
     }
   }, 30_000)
 

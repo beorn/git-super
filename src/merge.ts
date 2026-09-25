@@ -19,6 +19,7 @@ import { PUSH_INTENT_TRAILER, sameHostedOwner } from "./push-intent.ts"
 import { createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS, type Exclusive } from "./exclusive.ts"
 import { parseIndexEntries, type IndexEntry } from "./index-entries.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessRequest, type GitProcessResult } from "./process.ts"
+import { createProgressReporter } from "./progress.ts"
 import type { GitResultDetail, GitSuperRepositoryResult, GitSuperResult } from "./result.ts"
 
 /**
@@ -228,18 +229,28 @@ async function mergeWithSteps(options: SuperMergeOptions, steps: StepClock): Pro
     return failed(fallbackRoot, [], resultError(error, "discover-root"))
   }
 
+  const progress = createProgressReporter(
+    options.report,
+    (holder) => `git-super merge: waiting for writer lock held by ${holder}\n`,
+  )
   try {
     const exclusive =
       options.exclusive ??
       createExclusive(await lockDirectory(git, root, timeoutMs), {
         timeoutMs: DEFAULT_MUTATION_LOCK_WAIT_MS,
-        onContended: (holder) => options.report?.(`git-super merge: waiting for writer lock held by ${holder}\n`),
+        onContended: progress.phase,
       })
-    return await exclusive.run(() => mergeUnderLock(git, root, options, timeoutMs, steps), {
-      holder: "git super merge",
-    })
+    return await exclusive.run(
+      () => {
+        progress.cancel()
+        return mergeUnderLock(git, root, options, timeoutMs, steps)
+      },
+      { holder: "git super merge" },
+    )
   } catch (error) {
     return failed(root, [], resultError(error, "merge"))
+  } finally {
+    progress.cancel()
   }
 }
 
