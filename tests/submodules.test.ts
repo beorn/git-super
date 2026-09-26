@@ -1166,6 +1166,100 @@ describe("materializeSubmodules", () => {
     expect(git(candidateDependency, ["cat-file", "-e", "HEAD^{commit}"])).toBe("")
   })
 
+  it("keeps every store one hop from its lineage when worktrees borrow from worktrees (hh 25976)", async () => {
+    // Each worktree borrowing from the one before chained one alternates line per generation; git follows
+    // alternates only five deep ("ignoring alternate object stores, nesting too deep"), so the 9-deep yrd env
+    // chain of 2026-09-26 cloned with "bad object .alternate" and no env or submit could be made from it.
+    const root = await mkdtemp(join(tmpdir(), "git-super-borrow-lineage-"))
+    roots.push(root)
+    const dependency = join(root, "dependency")
+    const owner = join(root, "owner")
+    git(root, ["init", "-q", "-b", "main", dependency])
+    git(dependency, ["config", "user.name", "Git Super Test"])
+    git(dependency, ["config", "user.email", "git-super@example.invalid"])
+    writeFileSync(join(dependency, "dependency.txt"), "dependency\n")
+    git(dependency, ["add", "dependency.txt"])
+    git(dependency, ["commit", "-qm", "dependency"])
+    git(root, ["init", "-q", "-b", "main", owner])
+    git(owner, ["config", "user.name", "Git Super Test"])
+    git(owner, ["config", "user.email", "git-super@example.invalid"])
+    git(owner, ["config", "protocol.file.allow", "always"])
+    writeFileSync(join(owner, "README.md"), "owner\n")
+    git(owner, ["add", "README.md"])
+    git(owner, ["commit", "-qm", "owner"])
+    git(owner, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", dependency, "vendor/dependency"])
+    git(owner, ["commit", "-qam", "add dependency"])
+
+    // Generation 0 holds a commit no other store has, as a seat's env holds its unpublished component commits.
+    const first = join(root, "generation-0")
+    git(owner, ["worktree", "add", "-q", "--detach", first, "HEAD"])
+    git(first, ["-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive"])
+    writeFileSync(join(first, "vendor/dependency", "dependency.txt"), "private generation-0 commit\n")
+    git(join(first, "vendor/dependency"), ["commit", "-qam", "private generation-0 commit"])
+    const privatePin = git(join(first, "vendor/dependency"), ["rev-parse", "HEAD"]).trim()
+
+    const previousGitAllowProtocol = process.env.GIT_ALLOW_PROTOCOL
+    process.env.GIT_ALLOW_PROTOCOL = "file"
+    let reference = first
+    try {
+      for (let generation = 1; generation <= 8; generation++) {
+        const next = join(root, `generation-${generation}`)
+        git(owner, ["worktree", "add", "-q", "--detach", next, "HEAD"])
+        const materialized = await materializeSubmodulesWithProcess(createLocalGitProcess(), {
+          worktree: next,
+          referenceWorktree: reference,
+        })
+        expect(materialized, `generation ${generation}: ${materialized.stderr}`).toMatchObject({
+          code: 0,
+          borrowed: 1,
+          remoteFallbacks: 0,
+        })
+        reference = next
+      }
+    } finally {
+      if (previousGitAllowProtocol === undefined) delete process.env.GIT_ALLOW_PROTOCOL
+      else process.env.GIT_ALLOW_PROTOCOL = previousGitAllowProtocol
+    }
+
+    const last = join(reference, "vendor/dependency")
+    expect(
+      spawnSync("git", ["-C", last, "cat-file", "-e", `${privatePin}^{commit}`], { encoding: "utf8" }).status,
+      "generation 8 reads generation 0's private commit",
+    ).toBe(0)
+    const alternates = readFileSync(
+      git(last, ["rev-parse", "--path-format=absolute", "--git-path", "objects/info/alternates"]).trim(),
+      "utf8",
+    )
+      .trim()
+      .split("\n")
+    const firstObjects = join(
+      git(join(first, "vendor/dependency"), ["rev-parse", "--path-format=absolute", "--git-dir"]).trim(),
+      "objects",
+    )
+    expect(alternates, "the first generation's store is listed directly, one hop away").toContain(firstObjects)
+    expect(new Set(alternates).size, "no store is listed twice").toBe(alternates.length)
+
+    // A warm update of the same worktree lists nothing again: the file does not grow on every open.
+    process.env.GIT_ALLOW_PROTOCOL = "file"
+    try {
+      const again = await materializeSubmodulesWithProcess(createLocalGitProcess(), {
+        worktree: reference,
+        referenceWorktree: join(root, "generation-7"),
+      })
+      expect(again, again.stderr).toMatchObject({ code: 0 })
+    } finally {
+      if (previousGitAllowProtocol === undefined) delete process.env.GIT_ALLOW_PROTOCOL
+      else process.env.GIT_ALLOW_PROTOCOL = previousGitAllowProtocol
+    }
+    const warm = readFileSync(
+      git(last, ["rev-parse", "--path-format=absolute", "--git-path", "objects/info/alternates"]).trim(),
+      "utf8",
+    )
+      .trim()
+      .split("\n")
+    expect(warm).toEqual(alternates)
+  })
+
   it("refuses an explicit reference whose primary worktree cannot be proven", async () => {
     const result = await materializeSubmodules(
       {

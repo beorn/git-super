@@ -408,12 +408,15 @@ async function anchorDurableAlternates(
     }
   }
   const target = canonical(durableObjects)
-  const anchored = content.split(/\r?\n/u).some((line) => {
-    const entry = line.trim()
-    if (entry === "" || entry.startsWith("#")) return false
-    return canonical(isAbsolute(entry) ? entry : resolve(ownObjects, entry)) === target
-  })
-  if (anchored) return success()
+  const listed = alternateEntries(content, ownObjects)
+  // The borrow's own lineage, one hop away (hh 25976): a store borrowed from a store that borrowed from another
+  // chains one line per generation, and git follows alternates only five deep, so a worktree made from a worktree
+  // made from a worktree lost its objects ("bad object .alternate"). Every store the borrow reaches is listed
+  // directly, after the existing lines, so the depth stays one however long the lineage grows.
+  const missing = [...(await alternatesLineage(listed)), target].filter(
+    (entry, index, all) => !listed.includes(entry) && all.indexOf(entry) === index,
+  )
+  if (missing.length === 0) return success()
   if (!existsSync(durableObjects)) {
     log?.warn?.("durable module store does not exist yet; anchoring its line for when it does", {
       checkout,
@@ -422,7 +425,11 @@ async function anchorDurableAlternates(
   }
   try {
     await mkdir(join(ownObjects, "info"), { recursive: true })
-    await appendFile(alternatesFile, `${content === "" || content.endsWith("\n") ? "" : "\n"}${target}\n`, "utf8")
+    await appendFile(
+      alternatesFile,
+      `${content === "" || content.endsWith("\n") ? "" : "\n"}${missing.join("\n")}\n`,
+      "utf8",
+    )
   } catch (error) {
     return {
       code: 1,
@@ -430,8 +437,44 @@ async function anchorDurableAlternates(
       stderr: `git-super: cannot append the durable module store line to '${alternatesFile}': ${String(error)}`,
     }
   }
-  log?.debug?.("anchored the durable module store line", { checkout, durable: target })
+  log?.debug?.("anchored the durable module store line", { checkout, durable: target, lineage: missing.length - 1 })
   return success()
+}
+
+/** The canonical object directories an alternates file names, relative lines resolved against its own store. */
+function alternateEntries(content: string, objects: string): string[] {
+  return content
+    .split(/\r?\n/u)
+    .map((line) => line.trim())
+    .filter((entry) => entry !== "" && !entry.startsWith("#"))
+    .map((entry) => canonical(isAbsolute(entry) ? entry : resolve(objects, entry)))
+}
+
+/**
+ * Every existing object directory reachable through the alternates of `stores`, transitively, in breadth-first
+ * order and without `stores` themselves. A directory that no longer exists (its worktree was recycled) ends that
+ * branch: git skips it too.
+ */
+async function alternatesLineage(stores: readonly string[]): Promise<string[]> {
+  const seen = new Set(stores)
+  const lineage: string[] = []
+  const queue = [...stores]
+  for (let store = queue.shift(); store !== undefined; store = queue.shift()) {
+    let content: string
+    try {
+      content = await readFile(join(store, "info", "alternates"), "utf8")
+    } catch {
+      // silent-fallback-allow: a store with no alternates file borrows nothing; it ends its branch of the lineage
+      continue
+    }
+    for (const entry of alternateEntries(content, store)) {
+      if (seen.has(entry) || !existsSync(entry)) continue
+      seen.add(entry)
+      lineage.push(entry)
+      queue.push(entry)
+    }
+  }
+  return lineage
 }
 
 /**
