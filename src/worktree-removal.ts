@@ -120,10 +120,9 @@ export function rehomeBorrowers(commonDir: string, lenderGitDir: string, lenderM
               ? `timed out after ${timeoutMs / 1000}s bound`
               : undefined
           const detail =
-            timeoutDetail ?? (repacked.error?.message || repacked.stderr || repacked.stdout || `exit ${String(repacked.status)}`)
-          throw new Error(
-            `git repack -a -d failed for submodule ${subRel} in borrower ${borrowerIdentity}: ${detail}`,
-          )
+            timeoutDetail ??
+            (repacked.error?.message || repacked.stderr || repacked.stdout || `exit ${String(repacked.status)}`)
+          throw new Error(`git repack -a -d failed for submodule ${subRel} in borrower ${borrowerIdentity}: ${detail}`)
         }
 
         const updated = lines.filter((line) => {
