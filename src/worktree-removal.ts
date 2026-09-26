@@ -47,10 +47,10 @@ function toCanonical(path: string): string {
 
 /**
  * Any live worktree in the superproject whose submodule alternates point into `lenderModules`
- * has its objects re-homed to the durable store (`common/modules`) and its alternates updated
- * before `lenderModules` is destroyed, preventing dangling alternates.
+ * is dissociated using git repack -a -d while alternates still resolve, and its alternates are updated
+ * before `lenderModules` is destroyed, preventing dangling alternates and silent object loss (hh 25908).
  *
- * If re-homing fails, throws before removing anything, naming the borrowers (hh 25908).
+ * If dissociation fails, throws before removing anything, naming the borrowers.
  */
 export function rehomeBorrowers(commonDir: string, lenderGitDir: string, lenderModules: string): readonly string[] {
   if (!existsSync(lenderModules)) return []
@@ -107,42 +107,27 @@ export function rehomeBorrowers(commonDir: string, lenderGitDir: string, lenderM
 
         rehomedBorrowers.add(borrowerIdentity)
 
-        const subRel = relative(candidateModules, dirname(objectsDir))
-        const lenderSubObjects = join(lenderModules, subRel, "objects")
-        const durableSubObjects = join(commonDir, "modules", subRel, "objects")
-
-        if (existsSync(lenderSubObjects)) {
-          mkdirSync(join(durableSubObjects, "pack"), { recursive: true })
-          mkdirSync(join(durableSubObjects, "info"), { recursive: true })
-          for (const item of readdirSync(lenderSubObjects, { withFileTypes: true })) {
-            if (item.isDirectory() && /^[0-9a-f]{2}$/iu.test(item.name)) {
-              const destDir = join(durableSubObjects, item.name)
-              mkdirSync(destDir, { recursive: true })
-              for (const obj of readdirSync(join(lenderSubObjects, item.name))) {
-                const destObj = join(destDir, obj)
-                if (!existsSync(destObj)) {
-                  cpSync(join(lenderSubObjects, item.name, obj), destObj)
-                }
-              }
-            } else if (item.isFile() && item.name.startsWith("pack-")) {
-              const destPack = join(durableSubObjects, "pack", item.name)
-              if (!existsSync(destPack)) {
-                cpSync(join(lenderSubObjects, "pack", item.name), destPack)
-              }
-            }
-          }
+        const subGitDir = dirname(objectsDir)
+        const subRel = relative(candidateModules, subGitDir)
+        const repacked = spawnSync("git", ["--git-dir", subGitDir, "repack", "-a", "-d"], {
+          encoding: "utf8",
+          timeout: 120_000,
+        })
+        if (repacked.error || repacked.status !== 0) {
+          throw new Error(
+            `git repack -a -d failed for submodule ${subRel} in borrower ${borrowerIdentity}: ${
+              repacked.error?.message || repacked.stderr || repacked.stdout || `exit ${String(repacked.status)}`
+            }`,
+          )
         }
 
-        const durableCanon = toCanonical(durableSubObjects)
-        const updated = lines
-          .map((l) => toCanonical(isAbsolute(l) ? l : resolve(objectsDir, l)))
-          .filter((l) => !within(lenderModules, l))
-        if (!updated.includes(durableCanon) && existsSync(durableSubObjects)) {
-          updated.push(durableCanon)
-        }
+        const updated = lines.filter((line) => {
+          const abs = isAbsolute(line) ? line : resolve(objectsDir, line)
+          return !within(lenderModules, toCanonical(abs))
+        })
 
         const staged = `${alternatesPath}.rehome-${process.pid}`
-        writeFileSync(staged, `${updated.join("\n")}\n`, "utf8")
+        writeFileSync(staged, updated.length > 0 ? `${updated.join("\n")}\n` : "", "utf8")
         renameSync(staged, alternatesPath)
       }
     } catch (error) {

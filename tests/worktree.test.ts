@@ -280,4 +280,86 @@ describe("createGitWorktreeStore", () => {
       await rm(root, { recursive: true, force: true })
     }
   })
+
+  it("dissociates borrower with repack -a -d when lender is packed with a unique commit (25908 cure)", async () => {
+    const root = await mkdtemp(join(tmpdir(), "git-super-repack-"))
+    const subRemote = join(root, "sub-remote.git")
+    const repo = join(root, "owner")
+    const lender = join(root, "lender")
+    const borrower = join(root, "borrower")
+    const retainedDir = join(root, "retained")
+
+    git(root, ["init", "-q", "--bare", "-b", "main", subRemote])
+    const subWork = join(root, "sub-work")
+    git(root, ["clone", "-q", subRemote, subWork])
+    git(subWork, ["config", "user.email", "test@example.com"])
+    git(subWork, ["config", "user.name", "Test"])
+    await writeFile(join(subWork, "sub.txt"), "sub content\n")
+    git(subWork, ["add", "sub.txt"])
+    git(subWork, ["commit", "-q", "-m", "init sub"])
+    git(subWork, ["push", "-q", "origin", "main"])
+
+    git(root, ["init", "-q", "-b", "main", repo])
+    git(repo, ["config", "user.email", "test@example.com"])
+    git(repo, ["config", "user.name", "Test"])
+    await writeFile(join(repo, "root.txt"), "root\n")
+    git(repo, ["add", "root.txt"])
+    git(repo, ["commit", "-q", "-m", "init root"])
+    git(repo, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", subRemote, "vendor/sub"])
+    git(repo, ["commit", "-q", "-m", "add submodule"])
+
+    try {
+      const store = createLocalGitWorktreeStore({ repo })
+      await store.add({ kind: "detached", path: lender, ref: "HEAD" })
+      await store.materializeSubmodules(lender)
+
+      const lenderSub = join(lender, "vendor/sub")
+      git(lenderSub, ["config", "user.email", "test@example.com"])
+      git(lenderSub, ["config", "user.name", "Test"])
+      await writeFile(join(lenderSub, "lender-private.txt"), "lender only\n")
+      git(lenderSub, ["add", "lender-private.txt"])
+      git(lenderSub, ["commit", "-q", "-m", "lender only commit"])
+      const lenderCommit = git(lenderSub, ["rev-parse", "HEAD"]).trim()
+
+      git(lender, ["add", "vendor/sub"])
+      git(lender, ["commit", "-q", "-m", "update sub in lender"])
+
+      git(lenderSub, ["repack", "-a", "-d"])
+
+      await store.add({ kind: "detached", path: borrower, ref: "HEAD" })
+      const borrowerSub = join(borrower, "vendor/sub")
+      const lenderSubAdmin = join(repo, ".git", "worktrees", "lender", "modules", "vendor/sub")
+      const borrowerSubAdmin = join(repo, ".git", "worktrees", "borrower", "modules", "vendor/sub")
+      const durableSubObjects = join(repo, ".git", "modules", "vendor/sub", "objects")
+      const lenderSubObjects = join(lenderSubAdmin, "objects")
+
+      await store.materializeSubmodules(borrower)
+      const altFile = join(borrowerSubAdmin, "objects", "info", "alternates")
+      await writeFile(altFile, `${lenderSubObjects}\n${durableSubObjects}\n`, "utf8")
+
+      git(borrowerSub, ["update-ref", "refs/heads/main", lenderCommit])
+      git(borrowerSub, ["symbolic-ref", "HEAD", "refs/heads/main"])
+
+      expect(git(borrowerSub, ["cat-file", "-t", lenderCommit]).trim()).toBe("commit")
+
+      await store.remove(lender, {
+        retention: {
+          root: retainedDir,
+          report: () => {},
+        },
+      })
+      expect(existsSync(lender)).toBe(false)
+      expect(existsSync(lenderSubAdmin)).toBe(false)
+
+      const fsck = spawnSync("git", ["-C", borrowerSub, "fsck", "--full"], { encoding: "utf8" })
+      expect(fsck.status).toBe(0)
+      expect(fsck.stderr).toBe("")
+
+      const readCommit = spawnSync("git", ["-C", borrowerSub, "cat-file", "-t", lenderCommit], { encoding: "utf8" })
+      expect(readCommit.status).toBe(0)
+      expect(readCommit.stdout.trim()).toBe("commit")
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
 })
