@@ -416,7 +416,7 @@ async function anchorDurableAlternates(
   // reached through a chain, and git prints no "nesting too deep" (review2 cf994b3d). The existing lines follow in
   // their own order, then the durable line; nothing is dropped, and a file already in this shape is not written.
   // The durable store borrows from nothing, so it stays last, where its line always was.
-  const lineage = (await alternatesLineage(listed)).filter((entry) => entry !== target)
+  const lineage = (await alternatesLineage(listed, canonical(ownObjects))).filter((entry) => entry !== target)
   const desired = [...lineage, ...listed, target].filter((entry, index, all) => all.indexOf(entry) === index)
   if (desired.length === listed.length && desired.every((entry, index) => entry === listed[index])) return success()
   if (!existsSync(durableObjects)) {
@@ -451,13 +451,15 @@ function alternateEntries(content: string, objects: string): string[] {
 }
 
 /**
- * Every existing object directory reachable through the alternates of `stores`, transitively and without `stores`
- * themselves, each AFTER the directories it borrows from (post-order), so git reading them in this order finds every
+ * Every existing object directory reachable through the alternates of `stores`, transitively and without `own`,
+ * each AFTER the directories it borrows from (post-order), so git reading them in this order finds every
  * borrow already registered. A directory that no longer exists (its worktree was recycled) ends that branch: git
  * skips it too.
  */
-async function alternatesLineage(stores: readonly string[]): Promise<string[]> {
-  const seen = new Set(stores)
+async function alternatesLineage(stores: readonly string[], own: string): Promise<string[]> {
+  // Seeded with the own store only: a listed ancestor must still be placed ahead of the store that borrows from it,
+  // or a file an earlier release wrote ancestor-last reads as complete and is never healed (review2 f11cfb14).
+  const seen = new Set([own])
   const lineage: string[] = []
   const visit = async (store: string): Promise<void> => {
     let content: string

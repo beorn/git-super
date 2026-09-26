@@ -1268,6 +1268,47 @@ describe("materializeSubmodules", () => {
       .trim()
       .split("\n")
     expect(warm).toEqual(alternates)
+
+    // Post-order is the property that silences git: every listed store comes after every store it borrows from,
+    // the durable line excepted (it borrows from nothing and stays last). Pre-order would pass every check above.
+    const durable = warm.at(-1)!
+    for (const [index, store] of warm.entries()) {
+      if (store === durable) continue
+      const own = spawnSync("cat", [join(store, "info", "alternates")], { encoding: "utf8" }).stdout
+      for (const borrowed of own
+        .trim()
+        .split("\n")
+        .filter((line) => line !== "" && line !== durable)) {
+        expect(warm.indexOf(borrowed), `${store.replace(root, "")} borrows ${borrowed.replace(root, "")}`).toBeLessThan(
+          index,
+        )
+      }
+    }
+
+    // A store the previous release wrote lists its ancestors AFTER its borrow; a warm update heals that order
+    // (review2 f11cfb14: 163 such stores in 13 live worktrees kept the noise because nothing was "missing").
+    const file = git(last, ["rev-parse", "--path-format=absolute", "--git-path", "objects/info/alternates"]).trim()
+    const borrow = join(
+      git(join(root, "generation-7", "vendor/dependency"), ["rev-parse", "--path-format=absolute", "--git-dir"]).trim(),
+      "objects",
+    )
+    const oldOrder = [borrow, ...warm.filter((store) => store !== borrow && store !== durable).reverse(), durable]
+    writeFileSync(file, `${oldOrder.join("\n")}\n`)
+    process.env.GIT_ALLOW_PROTOCOL = "file"
+    try {
+      const healed = await materializeSubmodulesWithProcess(createLocalGitProcess(), {
+        worktree: reference,
+        referenceWorktree: join(root, "generation-7"),
+      })
+      expect(healed, healed.stderr).toMatchObject({ code: 0 })
+    } finally {
+      if (previousGitAllowProtocol === undefined) delete process.env.GIT_ALLOW_PROTOCOL
+      else process.env.GIT_ALLOW_PROTOCOL = previousGitAllowProtocol
+    }
+    expect(readFileSync(file, "utf8").trim().split("\n"), "the old order is rewritten ancestors-first").toEqual(warm)
+    expect(spawnSync("git", ["-C", last, "status", "--short"], { encoding: "utf8" }).stderr).not.toContain(
+      "nesting too deep",
+    )
   })
 
   it("refuses an explicit reference whose primary worktree cannot be proven", async () => {
