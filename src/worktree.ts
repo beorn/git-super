@@ -1,10 +1,10 @@
-import { existsSync } from "node:fs"
+import { existsSync, realpathSync } from "node:fs"
 import { spawnSync } from "node:child_process"
 import { appendFile } from "node:fs/promises"
 import { isAbsolute, join, relative, resolve, sep } from "node:path"
 import { fileURLToPath } from "node:url"
 import { createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS } from "./exclusive.ts"
-import { retainWorktreeModules, type WorktreeRetention } from "./worktree-removal.ts"
+import { rehomeBorrowers, retainWorktreeModules, type WorktreeRetention } from "./worktree-removal.ts"
 import { cleanGitEnvironment } from "./git.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
 import { createProgressReporter } from "./progress.ts"
@@ -408,7 +408,12 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
           await retainWorktreeModules(git, repo, path, removeOptions.retention, (repository, target) =>
             inspectWorktree(git, repository, target),
           )
-        } else if (removeOptions.unlock === true) await unlockWorktree(git, repo, path)
+        } else {
+          if (removeOptions.unlock === true) await unlockWorktree(git, repo, path)
+          const gitDir = realpathSync(await git.text(path, ["rev-parse", "--absolute-git-dir"]))
+          const common = realpathSync(await git.text(path, ["rev-parse", "--path-format=absolute", "--git-common-dir"]))
+          rehomeBorrowers(common, gitDir, join(gitDir, "modules"))
+        }
         await git.run(repo, ["worktree", "remove", "--force", path], false, timeouts.cleanup)
         if (existsSync(path) || (await inspectWorktree(git, repo, path)).registered) {
           throw new Error(`git reported success but did not fully remove worktree '${path}'`)

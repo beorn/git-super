@@ -7,10 +7,11 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
+  renameSync,
   writeFileSync,
 } from "node:fs"
 import { spawnSync } from "node:child_process"
-import { basename, isAbsolute, join, relative, resolve, sep } from "node:path"
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { superStatus } from "./status.ts"
 import type { Git, WorktreeInspection } from "./worktree.ts"
 
@@ -23,6 +24,7 @@ export type WorktreeRemovalProof = Readonly<{
   manifest: string
   createdAt: string
   retainUntil: string
+  rehomedBorrowers?: readonly string[]
 }>
 
 export type WorktreeRetention = Readonly<{
@@ -33,6 +35,125 @@ export type WorktreeRetention = Readonly<{
 function within(parent: string, path: string): boolean {
   const part = relative(parent, path)
   return part === "" || (part !== ".." && !part.startsWith(`..${sep}`) && !isAbsolute(part))
+}
+
+function toCanonical(path: string): string {
+  try {
+    return realpathSync(path)
+  } catch {
+    return resolve(path)
+  }
+}
+
+/**
+ * Any live worktree in the superproject whose submodule alternates point into `lenderModules`
+ * has its objects re-homed to the durable store (`common/modules`) and its alternates updated
+ * before `lenderModules` is destroyed, preventing dangling alternates.
+ *
+ * If re-homing fails, throws before removing anything, naming the borrowers (hh 25908).
+ */
+export function rehomeBorrowers(commonDir: string, lenderGitDir: string, lenderModules: string): readonly string[] {
+  if (!existsSync(lenderModules)) return []
+
+  const worktreesDir = join(commonDir, "worktrees")
+  const candidates: Array<{ adminDir: string; name: string }> = []
+  if (existsSync(worktreesDir)) {
+    for (const entry of readdirSync(worktreesDir, { withFileTypes: true })) {
+      if (entry.isDirectory()) {
+        const adminDir = join(worktreesDir, entry.name)
+        if (toCanonical(adminDir) !== toCanonical(lenderGitDir)) {
+          candidates.push({ adminDir, name: entry.name })
+        }
+      }
+    }
+  }
+  if (toCanonical(commonDir) !== toCanonical(lenderGitDir)) {
+    candidates.push({ adminDir: commonDir, name: "primary" })
+  }
+
+  const rehomedBorrowers = new Set<string>()
+
+  for (const candidate of candidates) {
+    const candidateModules = join(candidate.adminDir, "modules")
+    if (!existsSync(candidateModules)) continue
+
+    let borrowerIdentity = candidate.name
+    try {
+      const gitdirFile = join(candidate.adminDir, "gitdir")
+      if (existsSync(gitdirFile)) {
+        const text = readFileSync(gitdirFile, "utf8").trim()
+        borrowerIdentity = dirname(text.replace(/^gitdir:\s*/u, ""))
+      }
+    } catch {
+      // Keep candidate name
+    }
+
+    try {
+      for (const entry of readdirSync(candidateModules, { recursive: true, withFileTypes: true })) {
+        if (!entry.isFile() || entry.name !== "alternates") continue
+        const alternatesPath = join(entry.parentPath, entry.name)
+        const objectsDir = dirname(entry.parentPath)
+        const content = readFileSync(alternatesPath, "utf8")
+        const lines = content
+          .split(/\r?\n/u)
+          .map((l) => l.trim())
+          .filter((l) => l !== "" && !l.startsWith("#"))
+
+        const hasLender = lines.some((line) => {
+          const abs = isAbsolute(line) ? line : resolve(objectsDir, line)
+          return within(lenderModules, toCanonical(abs))
+        })
+        if (!hasLender) continue
+
+        rehomedBorrowers.add(borrowerIdentity)
+
+        const subRel = relative(candidateModules, dirname(objectsDir))
+        const lenderSubObjects = join(lenderModules, subRel, "objects")
+        const durableSubObjects = join(commonDir, "modules", subRel, "objects")
+
+        if (existsSync(lenderSubObjects)) {
+          mkdirSync(join(durableSubObjects, "pack"), { recursive: true })
+          mkdirSync(join(durableSubObjects, "info"), { recursive: true })
+          for (const item of readdirSync(lenderSubObjects, { withFileTypes: true })) {
+            if (item.isDirectory() && /^[0-9a-f]{2}$/iu.test(item.name)) {
+              const destDir = join(durableSubObjects, item.name)
+              mkdirSync(destDir, { recursive: true })
+              for (const obj of readdirSync(join(lenderSubObjects, item.name))) {
+                const destObj = join(destDir, obj)
+                if (!existsSync(destObj)) {
+                  cpSync(join(lenderSubObjects, item.name, obj), destObj)
+                }
+              }
+            } else if (item.isFile() && item.name.startsWith("pack-")) {
+              const destPack = join(durableSubObjects, "pack", item.name)
+              if (!existsSync(destPack)) {
+                cpSync(join(lenderSubObjects, "pack", item.name), destPack)
+              }
+            }
+          }
+        }
+
+        const durableCanon = toCanonical(durableSubObjects)
+        const updated = lines
+          .map((l) => toCanonical(isAbsolute(l) ? l : resolve(objectsDir, l)))
+          .filter((l) => !within(lenderModules, l))
+        if (!updated.includes(durableCanon) && existsSync(durableSubObjects)) {
+          updated.push(durableCanon)
+        }
+
+        const staged = `${alternatesPath}.rehome-${process.pid}`
+        writeFileSync(staged, `${updated.join("\n")}\n`, "utf8")
+        renameSync(staged, alternatesPath)
+      }
+    } catch (error) {
+      throw new Error(
+        `worktree ${lenderGitDir} could not be removed: borrower ${borrowerIdentity} borrows submodule objects from it and could not be re-homed: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
+      )
+    }
+  }
+
+  return [...rehomedBorrowers]
 }
 
 /** The existing status walker owns repository discovery; every native status is exact, including gitlink changes. */
@@ -159,6 +280,7 @@ export async function retainWorktreeModules(
       )
     }
   }
+  const rehomedBorrowers = rehomeBorrowers(common, gitDir, modules)
   const after = await cleanSnapshot(git, path, inspect)
   if (JSON.stringify(after) !== JSON.stringify(before)) {
     throw new Error(`worktree ${path} changed during retention; preserved, retry after its writer stops`)
@@ -172,6 +294,7 @@ export async function retainWorktreeModules(
     manifest: join(retainedRoot, "manifest.json"),
     createdAt: new Date().toISOString(),
     retainUntil: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+    ...(rehomedBorrowers.length === 0 ? {} : { rehomedBorrowers }),
   }
   writeFileSync(proof.manifest, `${JSON.stringify({ ...proof, files: hashes }, null, 2)}\n`, { flag: "wx" })
   retention.report(proof)
