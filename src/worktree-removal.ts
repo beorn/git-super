@@ -95,7 +95,8 @@ export function rehomeBorrowers(
         borrowerIdentity = dirname(text.replace(/^gitdir:\s*/u, ""))
       }
     } catch {
-      // silent-fallback-allow: reading worktree gitdir pointer is best-effort; defaults to candidate name
+      // silent-fallback-allow: this only labels the borrower. An unreadable gitdir pointer leaves borrowerIdentity at
+      // the candidate name, which names the re-homed borrower in the report and decides no removal (26031, @cto 4cec3231)
     }
 
     try {
