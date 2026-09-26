@@ -16,6 +16,7 @@ import {
   runLocalGitWorktreeMutationSync,
   type GitWorktreeStoreOptions,
 } from "../src/worktree.ts"
+import { rehomeBorrowers } from "../src/worktree-removal.ts"
 import type { GitProcessRequest } from "../src/process.ts"
 
 function git(repo: string, args: readonly string[]): string {
@@ -358,6 +359,38 @@ describe("createGitWorktreeStore", () => {
       const readCommit = spawnSync("git", ["-C", borrowerSub, "cat-file", "-t", lenderCommit], { encoding: "utf8" })
       expect(readCommit.status).toBe(0)
       expect(readCommit.stdout.trim()).toBe("commit")
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it("reports the timeout bound in seconds when repack times out (25908 P4)", async () => {
+    const root = await mkdtemp(join(tmpdir(), "git-super-repack-timeout-"))
+    try {
+      const lenderModules = join(root, "lender/modules")
+      const borrowerModules = join(root, "worktrees/borrower/modules/sub/objects/info")
+      const { mkdir } = await import("node:fs/promises")
+      await mkdir(borrowerModules, { recursive: true })
+      await mkdir(lenderModules, { recursive: true })
+      await writeFile(
+        join(borrowerModules, "alternates"),
+        `${join(lenderModules, "sub/objects")}\n`,
+        "utf8",
+      )
+
+      const fakeSpawn = (() => ({
+        error: Object.assign(new Error("spawnSync git ETIMEDOUT"), { code: "ETIMEDOUT" }),
+        status: null,
+        signal: null,
+        output: [],
+        pid: 1234,
+        stdout: "",
+        stderr: "",
+      })) as unknown as typeof spawnSync
+
+      expect(() => rehomeBorrowers(root, join(root, "lender"), lenderModules, { spawn: fakeSpawn })).toThrow(
+        /timed out after 120s bound/,
+      )
     } finally {
       await rm(root, { recursive: true, force: true })
     }
