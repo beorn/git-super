@@ -95,7 +95,7 @@ export function rehomeBorrowers(
         borrowerIdentity = dirname(text.replace(/^gitdir:\s*/u, ""))
       }
     } catch {
-      // Keep candidate name
+      // silent-fallback-allow: reading worktree gitdir pointer is best-effort; defaults to candidate name
     }
 
     try {
