@@ -16,7 +16,12 @@ const MAX_CONCURRENT_SUBMODULE_UPDATES = 20
 export type SubmoduleGitResult = Readonly<{ code: number; stdout: string; stderr: string }>
 
 export type SubmoduleGit = Readonly<{
-  run(repo: string, args: readonly string[], allowFailure?: boolean): Promise<SubmoduleGitResult>
+  run(
+    repo: string,
+    args: readonly string[],
+    allowFailure?: boolean,
+    options?: Readonly<{ stdin?: string }>,
+  ): Promise<SubmoduleGitResult>
   mutateConfig?(repo: string, args: readonly string[]): Promise<SubmoduleGitResult>
 }>
 
@@ -453,7 +458,7 @@ async function anchorDurableAlternates(
  * After a borrowed --init clone, this sets the submodule's refs/remotes/origin/* from
  * borrowFrom's refs/remotes/origin/*, never from its refs/heads/*.
  */
-async function syncOriginTrackingRefs(
+export async function syncOriginTrackingRefs(
   git: SubmoduleGit,
   submoduleDir: string,
   borrowFrom: string,
@@ -466,13 +471,6 @@ async function syncOriginTrackingRefs(
   )
   if (borrowRefs.code !== 0) return borrowRefs
 
-  const currentRefs = await git.run(
-    submoduleDir,
-    ["for-each-ref", "--format=%(refname) %(objectname)", "refs/remotes/origin/"],
-    true,
-  )
-  if (currentRefs.code !== 0) return currentRefs
-
   const targetRefs = new Map<string, string>()
   for (const line of borrowRefs.stdout.split(/\r?\n/u)) {
     const trimmed = line.trim()
@@ -482,6 +480,16 @@ async function syncOriginTrackingRefs(
       targetRefs.set(refname, sha)
     }
   }
+
+  // P4: A reference store with zero origin refs leaves the env's tracking refs alone.
+  if (targetRefs.size === 0) return success()
+
+  const currentRefs = await git.run(
+    submoduleDir,
+    ["for-each-ref", "--format=%(refname) %(objectname)", "refs/remotes/origin/"],
+    true,
+  )
+  if (currentRefs.code !== 0) return currentRefs
 
   const existingRefs = new Set<string>()
   for (const line of currentRefs.stdout.split(/\r?\n/u)) {
@@ -493,23 +501,31 @@ async function syncOriginTrackingRefs(
     }
   }
 
-  if (targetRefs.size === 0 && existingRefs.size === 0) return success()
-
+  const commands: string[] = ["start"]
   for (const ref of existingRefs) {
     if (!targetRefs.has(ref)) {
-      const del = await git.run(submoduleDir, ["update-ref", "-d", ref], true)
-      if (del.code !== 0) return del
+      commands.push(`delete ${ref}`)
     }
   }
 
   for (const [ref, sha] of targetRefs.entries()) {
-    const upd = await git.run(submoduleDir, ["update-ref", ref, sha], true)
-    if (upd.code !== 0) return upd
+    commands.push(`update ${ref} ${sha}`)
   }
+  commands.push("commit\n")
+
+  const batch = await git.run(submoduleDir, ["update-ref", "--stdin"], true, {
+    stdin: commands.join("\n"),
+  })
+  if (batch.code !== 0) return batch
 
   const symHead = await git.run(borrowFrom, ["symbolic-ref", "refs/remotes/origin/HEAD"], true)
   if (symHead.code === 0 && symHead.stdout.trim() !== "") {
-    await git.run(submoduleDir, ["symbolic-ref", "refs/remotes/origin/HEAD", symHead.stdout.trim()], true)
+    const symResult = await git.run(
+      submoduleDir,
+      ["symbolic-ref", "refs/remotes/origin/HEAD", symHead.stdout.trim()],
+      true,
+    )
+    if (symResult.code !== 0) return symResult
   }
 
   log?.debug?.("synchronized origin tracking refs from reference store", {
@@ -1103,8 +1119,12 @@ export async function materializeSubmodules(
 }
 
 function adaptGitProcess(process: GitProcess): SubmoduleGit {
-  const run: SubmoduleGit["run"] = async (repo, args) => {
-    const result = await process.run({ repo, args })
+  const run: SubmoduleGit["run"] = async (repo, args, _allowFailure, options) => {
+    const result = await process.run({
+      repo,
+      args,
+      ...(options?.stdin === undefined ? {} : { stdin: options.stdin }),
+    })
     return { code: result.code, stdout: result.stdout, stderr: result.stderr }
   }
   const mutateConfig: NonNullable<SubmoduleGit["mutateConfig"]> = async (repo, args) => {

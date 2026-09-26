@@ -15,6 +15,7 @@ import {
   materializeSubmodulesWithProcess,
   materializeSubmodulesFromLocalWorktree,
   materializeSubmodulesFromLocalWorktreeParallel,
+  syncOriginTrackingRefs,
   type SubmoduleGit,
   type SubmoduleGitResult,
 } from "../src/submodules.ts"
@@ -1676,5 +1677,107 @@ describe("materializeSubmodules", () => {
       if (previousGitAllowProtocol === undefined) delete process.env.GIT_ALLOW_PROTOCOL
       else process.env.GIT_ALLOW_PROTOCOL = previousGitAllowProtocol
     }
+  })
+
+  it("batches origin tracking ref sync into one update-ref --stdin transaction and counts spawns", async () => {
+    const borrowFrom = "/borrow"
+    const submoduleDir = "/submodule"
+    const borrowRefsOutput =
+      Array.from(
+        { length: 50 },
+        (_, i) => `refs/remotes/origin/branch-${i} ${"a".repeat(38)}${i.toString(16).padStart(2, "0")}`,
+      ).join("\n") + "\n"
+    const currentRefsOutput = "refs/remotes/origin/old-branch 1111111111111111111111111111111111111111\n"
+
+    const runCalls: Array<{
+      repo: string
+      args: readonly string[]
+      options?: Readonly<{ stdin?: string }> | undefined
+    }> = []
+    const git: SubmoduleGit = {
+      async run(repo, args, _allowFailure, options) {
+        runCalls.push({ repo, args, options })
+        if (repo === borrowFrom && args[0] === "for-each-ref") {
+          return { ...success(), stdout: borrowRefsOutput }
+        }
+        if (repo === submoduleDir && args[0] === "for-each-ref") {
+          return { ...success(), stdout: currentRefsOutput }
+        }
+        if (args[0] === "symbolic-ref") {
+          return { ...success(), stdout: "refs/remotes/origin/main\n" }
+        }
+        return success()
+      },
+    }
+
+    const result = await syncOriginTrackingRefs(git, submoduleDir, borrowFrom)
+    expect(result.code).toBe(0)
+
+    const updateRefCalls = runCalls.filter((c) => c.args[0] === "update-ref")
+    // Exactly one update-ref spawn was made across all 50 target refs and 1 deleted ref
+    expect(updateRefCalls).toHaveLength(1)
+    const firstCall = updateRefCalls[0]
+    expect(firstCall).toBeDefined()
+    expect(firstCall?.args).toEqual(["update-ref", "--stdin"])
+    expect(firstCall?.repo).toBe(submoduleDir)
+    const stdin = firstCall?.options?.stdin ?? ""
+    expect(stdin).toContain("start\n")
+    expect(stdin).toContain("delete refs/remotes/origin/old-branch\n")
+    for (let i = 0; i < 50; i++) {
+      expect(stdin).toContain(
+        `update refs/remotes/origin/branch-${i} ${"a".repeat(38)}${i.toString(16).padStart(2, "0")}\n`,
+      )
+    }
+    expect(stdin).toContain("commit\n")
+  })
+
+  it("leaves environment tracking refs untouched when reference store has zero origin refs (P4)", async () => {
+    const borrowFrom = "/borrow"
+    const submoduleDir = "/submodule"
+    const runCalls: Array<{ repo: string; args: readonly string[] }> = []
+    const git: SubmoduleGit = {
+      async run(repo, args) {
+        runCalls.push({ repo, args })
+        if (repo === borrowFrom && args[0] === "for-each-ref") {
+          return { ...success(), stdout: "" }
+        }
+        return success()
+      },
+    }
+
+    const result = await syncOriginTrackingRefs(git, submoduleDir, borrowFrom)
+    expect(result.code).toBe(0)
+
+    // No update-ref calls are made when reference store has no origin refs
+    const updateRefCalls = runCalls.filter((c) => c.args[0] === "update-ref")
+    expect(updateRefCalls).toHaveLength(0)
+    // submoduleDir refs are not even queried or deleted
+    expect(runCalls.some((c) => c.repo === submoduleDir && c.args[0] === "for-each-ref")).toBe(false)
+  })
+
+  it("fails loud when writing origin/HEAD symbolic-ref fails (P4)", async () => {
+    const borrowFrom = "/borrow"
+    const submoduleDir = "/submodule"
+    const git: SubmoduleGit = {
+      async run(repo, args) {
+        if (repo === borrowFrom && args[0] === "for-each-ref") {
+          return { ...success(), stdout: "refs/remotes/origin/main aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n" }
+        }
+        if (repo === submoduleDir && args[0] === "for-each-ref") {
+          return { ...success(), stdout: "" }
+        }
+        if (repo === borrowFrom && args[0] === "symbolic-ref") {
+          return { ...success(), stdout: "refs/remotes/origin/main\n" }
+        }
+        if (repo === submoduleDir && args[0] === "symbolic-ref") {
+          return { code: 128, stdout: "", stderr: "fatal: could not update refs/remotes/origin/HEAD" }
+        }
+        return success()
+      },
+    }
+
+    const result = await syncOriginTrackingRefs(git, submoduleDir, borrowFrom)
+    expect(result.code).toBe(128)
+    expect(result.stderr).toContain("could not update refs/remotes/origin/HEAD")
   })
 })
