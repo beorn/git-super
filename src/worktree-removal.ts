@@ -109,15 +109,20 @@ export function rehomeBorrowers(commonDir: string, lenderGitDir: string, lenderM
 
         const subGitDir = dirname(objectsDir)
         const subRel = relative(candidateModules, subGitDir)
+        const timeoutMs = 120_000
         const repacked = spawnSync("git", ["--git-dir", subGitDir, "repack", "-a", "-d"], {
           encoding: "utf8",
-          timeout: 120_000,
+          timeout: timeoutMs,
         })
         if (repacked.error || repacked.status !== 0) {
+          const timeoutDetail =
+            (repacked.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT"
+              ? `timed out after ${timeoutMs / 1000}s bound`
+              : undefined
+          const detail =
+            timeoutDetail ?? (repacked.error?.message || repacked.stderr || repacked.stdout || `exit ${String(repacked.status)}`)
           throw new Error(
-            `git repack -a -d failed for submodule ${subRel} in borrower ${borrowerIdentity}: ${
-              repacked.error?.message || repacked.stderr || repacked.stdout || `exit ${String(repacked.status)}`
-            }`,
+            `git repack -a -d failed for submodule ${subRel} in borrower ${borrowerIdentity}: ${detail}`,
           )
         }
 
