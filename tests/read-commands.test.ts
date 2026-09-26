@@ -460,4 +460,30 @@ describe("Phase 1 read commands", () => {
     expect(stdout.output).toContain("--no-fetch")
     expect(stderr.output).toBe("")
   })
+
+  test("commands.merge params accepts and preserves noFetch (25626 Arm A4)", () => {
+    const invocation = resolveInvocation(commands.merge, { repo: "." }, { commit: "abc", noFetch: true })
+    expect(invocation.state).toBe("ready")
+    if (invocation.state === "ready") {
+      expect(invocation.params.noFetch).toBe(true)
+    }
+  })
+
+  test("runCli forwards --no-fetch to commands.merge as noFetch: true (25626 Arm A3)", async () => {
+    let capturedInput: unknown
+    const originalRun = commands.merge.run
+    try {
+      commands.merge.run = async (_context, input) => {
+        capturedInput = input
+        return { state: "updated", partial: false, gitlinks: [], repositories: [] }
+      }
+      const stdout = outputSink()
+      const stderr = outputSink()
+      const code = await runCli(["--repo", ".", "--json", "merge", "--no-fetch", "HEAD"], stdout, stderr)
+      expect(code).toBe(0)
+      expect(capturedInput).toMatchObject({ noFetch: true })
+    } finally {
+      commands.merge.run = originalRun
+    }
+  })
 })

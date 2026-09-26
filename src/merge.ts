@@ -2105,7 +2105,7 @@ async function planGitlinks(
           stores.get(entry.path) ?? join(repository, entry.path),
           entry,
           timeoutMs,
-          noFetch,
+          noFetch && before.get(entry.path) === entry.target,
         ).then(
           (main) => ({ ok: true as const, main }),
           (error: unknown) => ({ ok: false as const, error }),
@@ -2147,7 +2147,9 @@ async function planGitlinks(
       // for a nested gitlink is declared in its parent component, not in km.
       const fetched = prefetched.get(entry.path)
       if (fetched?.ok === false) throw fetched.error
-      const read = fetched?.main ?? (await fetchSubmoduleMain(git, repository, submodule, entry, timeoutMs, noFetch))
+      const read =
+        fetched?.main ??
+        (await fetchSubmoduleMain(git, repository, submodule, entry, timeoutMs, noFetch && !changedByMerge))
       mains.set(path, read)
       const main = read.oid
       if (entry.target === main) {

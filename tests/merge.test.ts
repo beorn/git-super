@@ -3205,18 +3205,15 @@ describe("git super merge — no-fetch bypasses remote reads of child mains (256
       git(sub, "update-ref", "-d", "refs/remotes/origin/main")
     }
 
-    // Advance packages/alpha in candidate so result.gitlinks is populated and store is asserted
-    const alphaSub = join(fixture.product, "packages/alpha")
-    writeFileSync(join(alphaSub, "alpha-change.txt"), "alpha change\n")
-    git(alphaSub, "add", "alpha-change.txt")
-    git(alphaSub, "commit", "-q", "-m", "advance alpha")
+    // Advance upstreamStore for packages/alpha so it is raised by merge and its alternate store asserted
+    const upstreamAlpha = fixture.alpha
+    writeFileSync(join(upstreamAlpha, "alpha-new.txt"), "alpha new\n")
+    git(upstreamAlpha, "add", "alpha-new.txt")
+    git(upstreamAlpha, "commit", "-q", "-m", "advance upstream alpha")
+    const newAlphaMain = git(upstreamAlpha, "rev-parse", "HEAD")
+    git(upstreamAlpha, "update-ref", "refs/remotes/origin/main", newAlphaMain)
 
-    git(fixture.product, "switch", "-q", "-c", "candidate-alt")
-    git(fixture.product, "add", "packages/alpha")
-    git(fixture.product, "commit", "-q", "-m", "candidate: move packages/alpha gitlink")
-    const candidate = git(fixture.product, "rev-parse", "HEAD")
-    git(fixture.product, "switch", "-q", "main")
-    git(alphaSub, "checkout", "-q", "HEAD~1")
+    const candidate = candidateWithRootChange(fixture, "candidate-alt")
 
     const local = createLocalGitProcess()
     const reads: string[] = []
@@ -3289,12 +3286,6 @@ describe("git super merge — no-fetch bypasses remote reads of child mains (256
     git(sub, "commit", "-q", "-m", "super commit")
     const commitSuper = git(sub, "rev-parse", "HEAD")
 
-    // commitTarget (child/ahead)
-    writeFileSync(join(sub, "target.txt"), "target\n")
-    git(sub, "add", "target.txt")
-    git(sub, "commit", "-q", "-m", "target commit")
-    const commitTarget = git(sub, "rev-parse", "HEAD")
-
     git(sub, "checkout", "-q", commitBase)
     git(sub, "update-ref", "-d", "refs/remotes/origin/main")
 
@@ -3330,14 +3321,7 @@ describe("git super merge — no-fetch bypasses remote reads of child mains (256
     mkdirSync(dirname(subAlt), { recursive: true })
     writeFileSync(subAlt, `${join(storeSub, ".git", "objects")}\n`)
 
-    // Create candidate moving packages/alpha to commitTarget
-    git(fixture.product, "switch", "-q", "-c", "candidate-order")
-    git(sub, "checkout", "-q", commitTarget)
-    git(fixture.product, "add", "packages/alpha")
-    git(fixture.product, "commit", "-q", "-m", "move alpha to target")
-    const candidate = git(fixture.product, "rev-parse", "HEAD")
-    git(fixture.product, "switch", "-q", "main")
-    git(sub, "checkout", "-q", commitBase)
+    const candidate = candidateWithRootChange(fixture, "candidate-order")
 
     for (const path of ["packages/alpha", "vendor/beta"]) {
       git(fixture.product, "config", `submodule.${path}.branch`, "main")
@@ -3393,6 +3377,91 @@ describe("git super merge — no-fetch bypasses remote reads of child mains (256
     const result = await superMerge({ repo: fixture.product, commit: candidate, noFetch: true })
 
     expect(result).toMatchObject({ state: "failed", detail: { code: "submodule-main-unreadable" } })
+  })
+
+  it("fetches child main only for submodules whose gitlinks are moved by the candidate (25626 Cure a)", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-25626-moved-fetch-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    for (const path of ["packages/alpha", "vendor/beta"]) {
+      git(fixture.product, "config", `submodule.${path}.branch`, "main")
+    }
+
+    // Move packages/alpha gitlink in candidate, but leave vendor/beta unmoved
+    const alphaSub = join(fixture.product, "packages/alpha")
+    writeFileSync(join(alphaSub, "alpha-change.txt"), "alpha change\n")
+    git(alphaSub, "add", "alpha-change.txt")
+    git(alphaSub, "commit", "-q", "-m", "advance alpha")
+
+    git(fixture.product, "switch", "-q", "-c", "candidate-moved-alpha")
+    git(fixture.product, "add", "packages/alpha")
+    git(fixture.product, "commit", "-q", "-m", "candidate: move packages/alpha gitlink")
+    const candidate = git(fixture.product, "rev-parse", "HEAD")
+    git(fixture.product, "switch", "-q", "main")
+    git(alphaSub, "checkout", "-q", "HEAD~1")
+
+    const local = createLocalGitProcess()
+    const reads: string[] = []
+    const recording: GitProcess = {
+      run: (request) => {
+        if (isRemoteRead(request.args)) reads.push(relative(fixture.product, request.repo))
+        return local.run(request)
+      },
+    }
+
+    const result = await superMerge({ repo: fixture.product, commit: candidate, noFetch: true, git: recording })
+
+    expect(result).toMatchObject({ state: "updated" })
+    // Only packages/alpha was moved, so only packages/alpha was fetched; vendor/beta was bypassed!
+    expect(reads).toEqual(["packages/alpha"])
+  })
+
+  it("Probe R4: refuses at head with gitlink-compose-refused when candidate moves pin that conflicts with upstream child main under noFetch (25626 P3)", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-25626-probe-r4-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    for (const path of ["packages/alpha", "vendor/beta"]) {
+      git(fixture.product, "config", `submodule.${path}.branch`, "main")
+    }
+
+    // Upstream alpha moves forward on remote origin (fixture.alpha) with a change to alpha.ts
+    const upstreamAlpha = fixture.alpha
+    writeFileSync(join(upstreamAlpha, "alpha.ts"), "export const alpha = 'upstream main'\n")
+    git(upstreamAlpha, "add", "alpha.ts")
+    git(upstreamAlpha, "commit", "-q", "-m", "upstream moves alpha.ts")
+    const upstreamMain = git(upstreamAlpha, "rev-parse", "HEAD")
+    git(upstreamAlpha, "update-ref", "refs/heads/main", upstreamMain)
+
+    // The child clone in fixture.product has stale refs/remotes/origin/main (still at alphaBase)
+    const alphaSub = join(fixture.product, "packages/alpha")
+    expect(git(alphaSub, "rev-parse", "refs/remotes/origin/main")).not.toBe(upstreamMain)
+
+    // Candidate branch creates a commit on alpha that conflicts on alpha.ts
+    git(alphaSub, "checkout", "-q", "-b", "candidate-feature")
+    writeFileSync(join(alphaSub, "alpha.ts"), "export const alpha = 'candidate conflict'\n")
+    git(alphaSub, "add", "alpha.ts")
+    git(alphaSub, "commit", "-q", "-m", "candidate conflicting change")
+    const _candidatePin = git(alphaSub, "rev-parse", "HEAD")
+
+    // Record candidatePin in candidate commit on product
+    git(fixture.product, "switch", "-q", "-c", "candidate-r4")
+    git(fixture.product, "add", "packages/alpha")
+    git(fixture.product, "commit", "-q", "-m", "candidate: move alpha to conflicting pin")
+    const candidate = git(fixture.product, "rev-parse", "HEAD")
+    git(fixture.product, "switch", "-q", "main")
+    git(alphaSub, "checkout", "-q", "main")
+
+    // Under noFetch: true, Cure (a) fetches packages/alpha because its gitlink is moved,
+    // sees that candidatePin conflicts with upstream main, and fails with gitlink-compose-refused
+    const result = await superMerge({ repo: fixture.product, commit: candidate, noFetch: true })
+
+    expect(result).toMatchObject({
+      state: "failed",
+      detail: {
+        code: "gitlink-compose-refused",
+        phase: "preflight-merge",
+      },
+    })
   })
 })
 
