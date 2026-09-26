@@ -1238,6 +1238,16 @@ describe("materializeSubmodules", () => {
     )
     expect(alternates, "the first generation's store is listed directly, one hop away").toContain(firstObjects)
     expect(new Set(alternates).size, "no store is listed twice").toBe(alternates.length)
+    // Reachable is not enough: git walks the file in order, so an ancestor registered only after the reference
+    // line's own chain was followed still printed "nesting too deep" on every command (review2 cf994b3d).
+    for (const args of [
+      ["cat-file", "-e", `${privatePin}^{commit}`],
+      ["status", "--short"],
+      ["fsck", "--connectivity-only"],
+    ]) {
+      const read = spawnSync("git", ["-C", last, ...args], { encoding: "utf8" })
+      expect(read.stderr, `git ${args[0]} in generation 8`).not.toContain("nesting too deep")
+    }
 
     // A warm update of the same worktree lists nothing again: the file does not grow on every open.
     process.env.GIT_ALLOW_PROTOCOL = "file"

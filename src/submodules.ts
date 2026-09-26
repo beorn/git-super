@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process"
 import { existsSync, realpathSync } from "node:fs"
-import { appendFile, mkdir, readFile } from "node:fs/promises"
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises"
 import { isAbsolute, join, resolve } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 import { createLogger, type ConditionalLogger, type LogLevel } from "loggily"
@@ -369,8 +369,8 @@ async function warmReference(git: SubmoduleGit, reference: string, sha: string):
  * borrow survivable, and because this runs after EVERY update — warm no-ops
  * included — it also heals stores emitted before the anchor existed.
  *
- * Never rewrites or reorders existing lines: a borrow stays as the optional,
- * additive first line. Skips only a store that already IS the durable one.
+ * Never drops an existing line and keeps their order; the borrow's own lineage
+ * is written before them (see below). Skips only a store that already IS the durable one.
  * A durable store that does not exist yet is announced and still anchored —
  * a dangling alternates line is harmless to git, and it becomes load-bearing
  * the moment the primary checkout materializes that submodule.
@@ -411,33 +411,33 @@ async function anchorDurableAlternates(
   const listed = alternateEntries(content, ownObjects)
   // The borrow's own lineage, one hop away (hh 25976): a store borrowed from a store that borrowed from another
   // chains one line per generation, and git follows alternates only five deep, so a worktree made from a worktree
-  // made from a worktree lost its objects ("bad object .alternate"). Every store the borrow reaches is listed
-  // directly, after the existing lines, so the depth stays one however long the lineage grows.
-  const missing = [...(await alternatesLineage(listed)), target].filter(
-    (entry, index, all) => !listed.includes(entry) && all.indexOf(entry) === index,
-  )
-  if (missing.length === 0) return success()
+  // made from a worktree lost its objects ("bad object .alternate"). Git registers stores in file order and skips
+  // one it already has, so the lineage goes FIRST, each store after the stores it borrows from: no store is ever
+  // reached through a chain, and git prints no "nesting too deep" (review2 cf994b3d). The existing lines follow in
+  // their own order, then the durable line; nothing is dropped, and a file already in this shape is not written.
+  // The durable store borrows from nothing, so it stays last, where its line always was.
+  const lineage = (await alternatesLineage(listed)).filter((entry) => entry !== target)
+  const desired = [...lineage, ...listed, target].filter((entry, index, all) => all.indexOf(entry) === index)
+  if (desired.length === listed.length && desired.every((entry, index) => entry === listed[index])) return success()
   if (!existsSync(durableObjects)) {
     log?.warn?.("durable module store does not exist yet; anchoring its line for when it does", {
       checkout,
       durableObjects,
     })
   }
+  const staged = `${alternatesFile}.git-super-${process.pid}`
   try {
     await mkdir(join(ownObjects, "info"), { recursive: true })
-    await appendFile(
-      alternatesFile,
-      `${content === "" || content.endsWith("\n") ? "" : "\n"}${missing.join("\n")}\n`,
-      "utf8",
-    )
+    await writeFile(staged, `${desired.join("\n")}\n`, "utf8")
+    await rename(staged, alternatesFile)
   } catch (error) {
     return {
       code: 1,
       stdout: "",
-      stderr: `git-super: cannot append the durable module store line to '${alternatesFile}': ${String(error)}`,
+      stderr: `git-super: cannot write the durable module store line to '${alternatesFile}': ${String(error)}`,
     }
   }
-  log?.debug?.("anchored the durable module store line", { checkout, durable: target, lineage: missing.length - 1 })
+  log?.debug?.("anchored the durable module store line", { checkout, durable: target, lineage: lineage.length })
   return success()
 }
 
@@ -451,29 +451,30 @@ function alternateEntries(content: string, objects: string): string[] {
 }
 
 /**
- * Every existing object directory reachable through the alternates of `stores`, transitively, in breadth-first
- * order and without `stores` themselves. A directory that no longer exists (its worktree was recycled) ends that
- * branch: git skips it too.
+ * Every existing object directory reachable through the alternates of `stores`, transitively and without `stores`
+ * themselves, each AFTER the directories it borrows from (post-order), so git reading them in this order finds every
+ * borrow already registered. A directory that no longer exists (its worktree was recycled) ends that branch: git
+ * skips it too.
  */
 async function alternatesLineage(stores: readonly string[]): Promise<string[]> {
   const seen = new Set(stores)
   const lineage: string[] = []
-  const queue = [...stores]
-  for (let store = queue.shift(); store !== undefined; store = queue.shift()) {
+  const visit = async (store: string): Promise<void> => {
     let content: string
     try {
       content = await readFile(join(store, "info", "alternates"), "utf8")
     } catch {
       // silent-fallback-allow: a store with no alternates file borrows nothing; it ends its branch of the lineage
-      continue
+      return
     }
     for (const entry of alternateEntries(content, store)) {
       if (seen.has(entry) || !existsSync(entry)) continue
       seen.add(entry)
+      await visit(entry)
       lineage.push(entry)
-      queue.push(entry)
     }
   }
+  for (const store of stores) await visit(store)
   return lineage
 }
 
