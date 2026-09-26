@@ -52,7 +52,17 @@ function toCanonical(path: string): string {
  *
  * If dissociation fails, throws before removing anything, naming the borrowers.
  */
-export function rehomeBorrowers(commonDir: string, lenderGitDir: string, lenderModules: string): readonly string[] {
+export interface RehomeBorrowersOptions {
+  readonly repackTimeoutMs?: number
+  readonly spawn?: typeof spawnSync
+}
+
+export function rehomeBorrowers(
+  commonDir: string,
+  lenderGitDir: string,
+  lenderModules: string,
+  options?: RehomeBorrowersOptions,
+): readonly string[] {
   if (!existsSync(lenderModules)) return []
 
   const worktreesDir = join(commonDir, "worktrees")
@@ -109,8 +119,9 @@ export function rehomeBorrowers(commonDir: string, lenderGitDir: string, lenderM
 
         const subGitDir = dirname(objectsDir)
         const subRel = relative(candidateModules, subGitDir)
-        const timeoutMs = 120_000
-        const repacked = spawnSync("git", ["--git-dir", subGitDir, "repack", "-a", "-d"], {
+        const timeoutMs = options?.repackTimeoutMs ?? 120_000
+        const runSpawn = options?.spawn ?? spawnSync
+        const repacked = runSpawn("git", ["--git-dir", subGitDir, "repack", "-a", "-d"], {
           encoding: "utf8",
           timeout: timeoutMs,
         })
