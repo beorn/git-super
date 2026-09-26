@@ -372,11 +372,7 @@ describe("createGitWorktreeStore", () => {
       const { mkdir } = await import("node:fs/promises")
       await mkdir(borrowerModules, { recursive: true })
       await mkdir(lenderModules, { recursive: true })
-      await writeFile(
-        join(borrowerModules, "alternates"),
-        `${join(lenderModules, "sub/objects")}\n`,
-        "utf8",
-      )
+      await writeFile(join(borrowerModules, "alternates"), `${join(lenderModules, "sub/objects")}\n`, "utf8")
 
       const fakeSpawn = (() => ({
         error: Object.assign(new Error("spawnSync git ETIMEDOUT"), { code: "ETIMEDOUT" }),
