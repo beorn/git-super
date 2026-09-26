@@ -352,7 +352,10 @@ async function runInvocation(
     .description(commands.merge.description ?? commands.merge.title)
     .option("-m, --message <message>", "merge commit message")
     .option("--no-verify", "emergency only: bypass ordinary merge and commit hooks")
-    .option("--no-fetch", "bypass child-main remote network fetches; read local tracking refs")
+    .option(
+      "--no-fetch",
+      "fetches only the child mains of gitlinks the candidate moves; read local tracking refs for unmoved gitlinks",
+    )
     .argument("<commit>", "commit to merge into the current branch")
     .action((commit, options, command) => {
       const globals = command.optsWithGlobals() as { repo: string; json?: boolean }

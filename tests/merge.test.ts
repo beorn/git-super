@@ -3463,6 +3463,44 @@ describe("git super merge — no-fetch bypasses remote reads of child mains (256
       },
     })
   })
+
+  it("Probe R4 (nested): fetches nested child main when candidate moves nested gitlink onto a conflict under noFetch (25626 Arm G2)", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-25626-nested-g2-"))
+    roots.push(fixtureRoot)
+    const fixture = createNestedProductFixture(fixtureRoot)
+    for (const path of ["packages/alpha", "vendor/beta"]) {
+      git(fixture.product, "config", `submodule.${path}.branch`, "main")
+    }
+    git(fixture.alpha, "config", "submodule.apps/maddoc.branch", "main")
+
+    // Upstream leaf moves forward on remote origin (fixture.leaf)
+    const upstreamLeaf = advanceRepository(fixture.leaf, "leaf.ts", "export const leaf = 'upstream main'\n")
+
+    // Local checkout in fixture.product/packages/alpha/apps/maddoc still has stale tracking ref
+    const alphaCheckout = join(fixture.product, "packages/alpha")
+    const leafCheckout = join(alphaCheckout, "apps/maddoc")
+    expect(git(leafCheckout, "rev-parse", "refs/remotes/origin/main")).not.toBe(upstreamLeaf)
+
+    // Candidate branch moves nested maddoc through Ahead alpha to a conflicting commit
+    const moved = advanceNestedThroughAlpha(
+      fixture,
+      "candidate-nested-conflict",
+      "export const leaf = 'candidate conflict'\n",
+    )
+
+    // Under noFetch: true, the candidate moved the nested gitlink (changedByMerge: true),
+    // so fetchSubmoduleMain at line 2152 fetches the moved leaf's main from origin, detects
+    // the off-main / diverged pin, and fails with gitlink-off-main.
+    // Under Arm G2 (reverting line 2152 to plain noFetch), it reads stale local tracking ref and fails to refuse.
+    const result = await superMerge({ repo: fixture.product, commit: moved.candidate, noFetch: true })
+
+    expect(result).toMatchObject({
+      state: "failed",
+      detail: {
+        code: "gitlink-off-main",
+      },
+    })
+  })
 })
 
 /**
