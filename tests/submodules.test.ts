@@ -2,6 +2,7 @@
  * @failure Worktree consumers can fall back to divergent submodule materializers or serialize sibling clones.
  * @level l1
  * @consumer Yrd, Bearly, and hh worktree adapters
+ * @testonly syncOriginTrackingRefs: unit test for tracking ref sync across borrowed submodules
  */
 import { existsSync, readFileSync, writeFileSync } from "node:fs"
 import { mkdir, mkdtemp, rm } from "node:fs/promises"

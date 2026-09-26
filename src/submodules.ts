@@ -457,6 +457,8 @@ async function anchorDurableAlternates(
  *
  * After a borrowed --init clone, this sets the submodule's refs/remotes/origin/* from
  * borrowFrom's refs/remotes/origin/*, never from its refs/heads/*.
+ *
+ * @testonly Exported for tests; production callers go through materializeSubmodules.
  */
 export async function syncOriginTrackingRefs(
   git: SubmoduleGit,
