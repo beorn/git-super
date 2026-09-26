@@ -1532,4 +1532,149 @@ describe("materializeSubmodules", () => {
     expect(result.code).not.toBe(0)
     expect(result.stderr).toContain("durable")
   })
+
+  it("preserves component origin/main after root fast-forward without reverting to stale reference heads/main", async () => {
+    const root = await mkdtemp(join(tmpdir(), "git-super-preserve-origin-main-"))
+    roots.push(root)
+    const depRemote = join(root, "dep-remote.git")
+    git(root, ["init", "-q", "--bare", "--initial-branch=main", depRemote])
+
+    const depWork = join(root, "dep-work")
+    git(root, ["clone", "-q", depRemote, depWork])
+    git(depWork, ["config", "user.name", "Git Super Test"])
+    git(depWork, ["config", "user.email", "git-super@example.invalid"])
+    writeFileSync(join(depWork, "file.txt"), "v1\n")
+    git(depWork, ["add", "file.txt"])
+    git(depWork, ["commit", "-qm", "v1"])
+    git(depWork, ["push", "-q", "origin", "main"])
+    const cRemote = git(depWork, ["rev-parse", "HEAD"]).trim()
+
+    const owner = join(root, "owner")
+    git(root, ["init", "-q", "-b", "main", owner])
+    git(owner, ["config", "user.name", "Git Super Test"])
+    git(owner, ["config", "user.email", "git-super@example.invalid"])
+    git(owner, ["config", "protocol.file.allow", "always"])
+    writeFileSync(join(owner, "README.md"), "owner\n")
+    git(owner, ["add", "README.md"])
+    git(owner, ["commit", "-qm", "init owner"])
+    git(owner, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", depRemote, "vendor/dep"])
+    git(owner, ["commit", "-qm", "add dep"])
+    git(owner, ["submodule", "update", "--init"])
+
+    // Corrupt owner reference store: stale local branch main, but origin/main has cRemote
+    const ownerDep = join(owner, "vendor/dep")
+    git(ownerDep, ["checkout", "-q", "-b", "stale-branch"])
+    writeFileSync(join(ownerDep, "file.txt"), "stale\n")
+    git(ownerDep, ["commit", "-qam", "stale commit"])
+    const cStale = git(ownerDep, ["rev-parse", "HEAD"]).trim()
+    git(ownerDep, ["update-ref", "refs/heads/main", cStale])
+    git(ownerDep, ["checkout", "-q", "--detach", cRemote])
+
+    // Candidate environment: existing checkout with submodule already materialized
+    const candidate = join(root, "candidate")
+    git(owner, ["worktree", "add", "-q", "--detach", candidate, "HEAD"])
+    const previousGitAllowProtocol = process.env.GIT_ALLOW_PROTOCOL
+    process.env.GIT_ALLOW_PROTOCOL = "file"
+    try {
+      const initResult = await materializeSubmodulesWithProcess(createLocalGitProcess(), {
+        worktree: candidate,
+        referenceWorktree: owner,
+      })
+      expect(initResult.code).toBe(0)
+
+      // Ensure candidate submodule origin/main starts at cRemote
+      const candidateDep = join(candidate, "vendor/dep")
+      git(candidateDep, ["update-ref", "refs/remotes/origin/main", cRemote])
+
+      // Advance upstream component to cRemote2, and advance owner gitlink
+      writeFileSync(join(depWork, "file.txt"), "v2\n")
+      git(depWork, ["commit", "-qam", "v2"])
+      git(depWork, ["push", "-q", "origin", "main"])
+      const cRemote2 = git(depWork, ["rev-parse", "HEAD"]).trim()
+
+      git(ownerDep, ["fetch", "-q", "origin", "main"])
+      git(ownerDep, ["checkout", "-q", "--detach", cRemote2])
+      git(owner, ["add", "vendor/dep"])
+      git(owner, ["commit", "-qm", "advance dep to v2"])
+
+      // Fast-forward candidate root
+      git(candidate, ["merge", "--ff-only", git(owner, ["rev-parse", "HEAD"]).trim()])
+
+      // Fast-forward triggers materializeSubmodules
+      const rematerialized = await materializeSubmodulesWithProcess(createLocalGitProcess(), {
+        worktree: candidate,
+        referenceWorktree: owner,
+      })
+      expect(rematerialized.code).toBe(0)
+
+      const candidateOriginMain = git(candidateDep, ["rev-parse", "refs/remotes/origin/main"]).trim()
+      // Condition 2: assert component origin/main equals remote, and name the stale value it would have had
+      expect(candidateOriginMain).toBe(cRemote)
+      expect(candidateOriginMain).not.toBe(cStale)
+    } finally {
+      if (previousGitAllowProtocol === undefined) delete process.env.GIT_ALLOW_PROTOCOL
+      else process.env.GIT_ALLOW_PROTOCOL = previousGitAllowProtocol
+    }
+  })
+
+  it("initializes component origin/main from reference origin tracking refs on fresh borrowed clone", async () => {
+    const root = await mkdtemp(join(tmpdir(), "git-super-init-origin-main-"))
+    roots.push(root)
+    const depRemote = join(root, "dep-remote.git")
+    git(root, ["init", "-q", "--bare", "--initial-branch=main", depRemote])
+
+    const depWork = join(root, "dep-work")
+    git(root, ["clone", "-q", depRemote, depWork])
+    git(depWork, ["config", "user.name", "Git Super Test"])
+    git(depWork, ["config", "user.email", "git-super@example.invalid"])
+    writeFileSync(join(depWork, "file.txt"), "v1\n")
+    git(depWork, ["add", "file.txt"])
+    git(depWork, ["commit", "-qm", "v1"])
+    git(depWork, ["push", "-q", "origin", "main"])
+    const cRemote = git(depWork, ["rev-parse", "HEAD"]).trim()
+
+    const owner = join(root, "owner")
+    git(root, ["init", "-q", "-b", "main", owner])
+    git(owner, ["config", "user.name", "Git Super Test"])
+    git(owner, ["config", "user.email", "git-super@example.invalid"])
+    git(owner, ["config", "protocol.file.allow", "always"])
+    writeFileSync(join(owner, "README.md"), "owner\n")
+    git(owner, ["add", "README.md"])
+    git(owner, ["commit", "-qm", "init owner"])
+    git(owner, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", depRemote, "vendor/dep"])
+    git(owner, ["commit", "-qm", "add dep"])
+    git(owner, ["submodule", "update", "--init"])
+
+    // Corrupt owner reference store: stale local branch main, but origin/main has cRemote
+    const ownerDep = join(owner, "vendor/dep")
+    git(ownerDep, ["checkout", "-q", "-b", "stale-branch"])
+    writeFileSync(join(ownerDep, "file.txt"), "stale\n")
+    git(ownerDep, ["commit", "-qam", "stale commit"])
+    const cStale = git(ownerDep, ["rev-parse", "HEAD"]).trim()
+    git(ownerDep, ["update-ref", "refs/heads/main", cStale])
+    git(ownerDep, ["checkout", "-q", "--detach", cRemote])
+
+    // Candidate environment: fresh uninitialized worktree
+    const candidate = join(root, "candidate")
+    git(owner, ["worktree", "add", "-q", "--detach", candidate, "HEAD"])
+
+    const previousGitAllowProtocol = process.env.GIT_ALLOW_PROTOCOL
+    process.env.GIT_ALLOW_PROTOCOL = "file"
+    try {
+      const materialized = await materializeSubmodulesWithProcess(createLocalGitProcess(), {
+        worktree: candidate,
+        referenceWorktree: owner,
+      })
+      expect(materialized.code).toBe(0)
+
+      const candidateDep = join(candidate, "vendor/dep")
+      const candidateOriginMain = git(candidateDep, ["rev-parse", "refs/remotes/origin/main"]).trim()
+      // Condition 2: assert component origin/main equals remote, and name the stale value it would have had
+      expect(candidateOriginMain).toBe(cRemote)
+      expect(candidateOriginMain).not.toBe(cStale)
+    } finally {
+      if (previousGitAllowProtocol === undefined) delete process.env.GIT_ALLOW_PROTOCOL
+      else process.env.GIT_ALLOW_PROTOCOL = previousGitAllowProtocol
+    }
+  })
 })

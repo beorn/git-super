@@ -441,6 +441,85 @@ async function anchorDurableAlternates(
   return success()
 }
 
+/**
+ * Synchronize a freshly-cloned borrowed submodule's remote tracking refs (`refs/remotes/origin/*`)
+ * from the reference store's `refs/remotes/origin/*`.
+ *
+ * When git clones a submodule via `insteadOf` pointing to a local reference store,
+ * Git's initial clone maps the reference store's local branches (`refs/heads/*`) to the
+ * submodule's `refs/remotes/origin/*`. If the reference store's local heads are stale or
+ * divergent from remote, the new environment receives stale tracking refs.
+ *
+ * After a borrowed --init clone, this sets the submodule's refs/remotes/origin/* from
+ * borrowFrom's refs/remotes/origin/*, never from its refs/heads/*.
+ */
+async function syncOriginTrackingRefs(
+  git: SubmoduleGit,
+  submoduleDir: string,
+  borrowFrom: string,
+  log?: ConditionalLogger,
+): Promise<SubmoduleGitResult> {
+  const borrowRefs = await git.run(
+    borrowFrom,
+    ["for-each-ref", "--format=%(refname) %(objectname)", "refs/remotes/origin/"],
+    true,
+  )
+  if (borrowRefs.code !== 0) return borrowRefs
+
+  const currentRefs = await git.run(
+    submoduleDir,
+    ["for-each-ref", "--format=%(refname) %(objectname)", "refs/remotes/origin/"],
+    true,
+  )
+  if (currentRefs.code !== 0) return currentRefs
+
+  const targetRefs = new Map<string, string>()
+  for (const line of borrowRefs.stdout.split(/\r?\n/u)) {
+    const trimmed = line.trim()
+    if (trimmed === "") continue
+    const [refname, sha] = trimmed.split(" ")
+    if (refname && sha && !refname.endsWith("/HEAD")) {
+      targetRefs.set(refname, sha)
+    }
+  }
+
+  const existingRefs = new Set<string>()
+  for (const line of currentRefs.stdout.split(/\r?\n/u)) {
+    const trimmed = line.trim()
+    if (trimmed === "") continue
+    const [refname] = trimmed.split(" ")
+    if (refname && !refname.endsWith("/HEAD")) {
+      existingRefs.add(refname)
+    }
+  }
+
+  if (targetRefs.size === 0 && existingRefs.size === 0) return success()
+
+  for (const ref of existingRefs) {
+    if (!targetRefs.has(ref)) {
+      const del = await git.run(submoduleDir, ["update-ref", "-d", ref], true)
+      if (del.code !== 0) return del
+    }
+  }
+
+  for (const [ref, sha] of targetRefs.entries()) {
+    const upd = await git.run(submoduleDir, ["update-ref", ref, sha], true)
+    if (upd.code !== 0) return upd
+  }
+
+  const symHead = await git.run(borrowFrom, ["symbolic-ref", "refs/remotes/origin/HEAD"], true)
+  if (symHead.code === 0 && symHead.stdout.trim() !== "") {
+    await git.run(submoduleDir, ["symbolic-ref", "refs/remotes/origin/HEAD", symHead.stdout.trim()], true)
+  }
+
+  log?.debug?.("synchronized origin tracking refs from reference store", {
+    submoduleDir,
+    borrowFrom,
+    syncedRefs: targetRefs.size,
+  })
+  return success()
+}
+
 /** The canonical object directories an alternates file names, relative lines resolved against its own store. */
 function alternateEntries(content: string, objects: string): string[] {
   return content
@@ -817,6 +896,7 @@ export async function materializeSubmodules(
         "submodule",
         "update",
         "--init",
+        ...(borrowFrom !== undefined ? ["--no-fetch"] : []),
         ...(options.force ? ["--force"] : []),
         ...(borrowFrom === undefined ? [] : ["--reference", borrowFrom]),
         "--",
@@ -961,6 +1041,8 @@ export async function materializeSubmodules(
       path,
     }: Readonly<{ args: readonly string[]; name: string; nestedReference: string | undefined; path: string }>) => {
       const source = nestedReference === undefined ? "remote" : "local"
+      const submoduleDir = join(worktree, path)
+      const freshClone = !existsSync(join(submoduleDir, ".git"))
       // The span closes over the `git.run` ALONE. Letting it wrap the recursive
       // walk below would bill every nested submodule to its parent, so the one
       // submodule at the root of a deep tree would appear to be the slow one
@@ -974,12 +1056,16 @@ export async function materializeSubmodules(
         return result
       })()
       if (updated.code !== 0) return updated
+      if (freshClone && nestedReference !== undefined) {
+        const synced = await syncOriginTrackingRefs(git, submoduleDir, nestedReference, log)
+        if (synced.code !== 0) return synced
+      }
       const level = await durableLevel()
       if (typeof level !== "string") return level
       const durableGitDir = join(level, "modules", name)
-      const anchored = await anchorDurableAlternates(git, join(worktree, path), durableGitDir, log)
+      const anchored = await anchorDurableAlternates(git, submoduleDir, durableGitDir, log)
       if (anchored.code !== 0) return anchored
-      return walk(join(worktree, path), nestedReference, () => Promise.resolve(durableGitDir), undefined, depth + 1)
+      return walk(submoduleDir, nestedReference, () => Promise.resolve(durableGitDir), undefined, depth + 1)
     }
     for (let start = 0; start < local.length; start += MAX_CONCURRENT_SUBMODULE_UPDATES) {
       const results = await Promise.all(local.slice(start, start + MAX_CONCURRENT_SUBMODULE_UPDATES).map(update))
