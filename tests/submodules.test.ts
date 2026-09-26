@@ -1285,15 +1285,24 @@ describe("materializeSubmodules", () => {
       }
     }
 
-    // A store the previous release wrote lists its ancestors AFTER its borrow; a warm update heals that order
+    // Stores the previous release wrote list their ancestors AFTER their borrow; a warm update heals that order
     // (review2 f11cfb14: 163 such stores in 13 live worktrees kept the noise because nothing was "missing").
+    // Every generation is rewritten the old way, not only the last: only then does post-order differ from
+    // pre-order (review2 c2bb8107), so this also pins the walk's order.
+    const storeOf = (generation: number): string =>
+      join(
+        git(join(root, `generation-${generation}`, "vendor/dependency"), [
+          "rev-parse",
+          "--path-format=absolute",
+          "--git-dir",
+        ]).trim(),
+        "objects",
+      )
+    for (let generation = 1; generation <= 8; generation++) {
+      const ancestors = Array.from({ length: generation }, (_, back) => storeOf(generation - 1 - back))
+      writeFileSync(join(storeOf(generation), "info", "alternates"), `${[...ancestors, durable].join("\n")}\n`)
+    }
     const file = git(last, ["rev-parse", "--path-format=absolute", "--git-path", "objects/info/alternates"]).trim()
-    const borrow = join(
-      git(join(root, "generation-7", "vendor/dependency"), ["rev-parse", "--path-format=absolute", "--git-dir"]).trim(),
-      "objects",
-    )
-    const oldOrder = [borrow, ...warm.filter((store) => store !== borrow && store !== durable).reverse(), durable]
-    writeFileSync(file, `${oldOrder.join("\n")}\n`)
     process.env.GIT_ALLOW_PROTOCOL = "file"
     try {
       const healed = await materializeSubmodulesWithProcess(createLocalGitProcess(), {
