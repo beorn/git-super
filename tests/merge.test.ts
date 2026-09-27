@@ -1292,6 +1292,19 @@ describe("git super merge", () => {
       const detailed = await superMerge({ repo: repository, commit: candidate })
       expect(detailed.detail?.paths).toEqual([sharedPath])
       expect(detailed.detail?.objectIds).toEqual([headBefore, candidate])
+      const base = git(repository, "merge-base", headBefore, candidate)
+      for (const [stage, commit] of [
+        ["base", base],
+        ["ours", headBefore],
+        ["theirs", candidate],
+      ] as const) {
+        expect(detailed.detail?.message).toContain(
+          `${stage}=${git(repository, "rev-parse", `${commit}:${sharedPath}`)}`,
+        )
+      }
+      expect(detailed.detail?.message).toContain("preflight left HEAD, index, and worktree unchanged")
+      expect(detailed.detail?.next).toContain(`Start a fresh branch at ${candidate}`)
+      expect(git(repository, "ls-files", "-u")).toBe("")
       const local = createLocalGitProcess()
       const probe = injectionProbe()
       const mergeTreeStderr = "verbatim merge-tree conflict hint"
@@ -1314,6 +1327,17 @@ describe("git super merge", () => {
       expect(detailedWithStderr.detail?.message).toContain(mergeTreeStderr)
       expect(git(repository, "rev-parse", "HEAD")).toBe(headBefore)
       expect(git(repository, "status", "--porcelain=v1")).toBe(statusBefore)
+
+      // The named recovery starts at the target and reapplies our intended
+      // file content; merging that fresh carrier must succeed without an
+      // in-place conflict state from the refused preflight.
+      git(repository, "switch", "-q", "-c", "fresh-carrier", candidate)
+      writeFileSync(join(repository, sharedPath), "main\n")
+      git(repository, "commit", "-q", "-am", "reapply intended change")
+      const freshCarrier = git(repository, "rev-parse", "HEAD")
+      git(repository, "switch", "-q", "main")
+      expect(await superMerge({ repo: repository, commit: freshCarrier })).toMatchObject({ state: "updated" })
+      expect(git(repository, "show", `HEAD:${sharedPath}`)).toBe("main")
     },
   )
 

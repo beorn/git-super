@@ -1177,7 +1177,7 @@ async function prospectiveTree(
     const paths = [...new Set(entries.map((entry) => entry.path))]
     const gitlinks = entries.filter((entry) => entry.mode === "160000")
     const stagesByPath = new Map<string, string[]>()
-    for (const entry of gitlinks) {
+    for (const entry of entries) {
       const labels = stagesByPath.get(entry.path) ?? []
       const label = entry.stage === 1 ? "base" : entry.stage === 2 ? "ours" : "theirs"
       labels.push(`${label}=${entry.oid}`)
@@ -1203,9 +1203,9 @@ async function prospectiveTree(
         root,
         args,
         result,
-        `Merge ${target} conflicts with current HEAD ${head}${location}; no commit was written.${stageEvidence ? ` ${stageEvidence}` : ""}`,
+        `Merge ${target} conflicts with current HEAD ${head}${location}; the non-mutating preflight left HEAD, index, and worktree unchanged.${stageEvidence ? ` ${stageEvidence}` : ""}`,
         `git -C ${root} ${args.join(" ")}`,
-        "Resolve the named conflict on the submitted branch, then rerun the same git super merge command.",
+        `Start a fresh branch at ${target}, reapply the intended changes from ${head}, commit, then submit or merge that fresh branch. There are no in-place conflict markers or unmerged index stages to resolve.`,
         "the caller",
         { paths, objectIds: [...new Set([head, target, ...gitlinks.map((entry) => entry.oid)])] },
       ),
