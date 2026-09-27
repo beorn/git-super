@@ -1,12 +1,12 @@
 import { afterEach, describe, expect, test } from "vitest"
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { flattenCommandNodes, resolveInvocation } from "@silvery/command"
 import { commands } from "../src/commands.ts"
 import { runCli } from "../src/cli.ts"
 import { superIsAncestor } from "../src/merge-base.ts"
-import { superStatus } from "../src/status.ts"
+import { superStatus, type SuperStatusResult } from "../src/status.ts"
 import {
   addNestedAlphaSubmodule,
   advanceRepository,
@@ -179,6 +179,48 @@ describe("Phase 1 read commands", () => {
     git(fixture.product, "add", "packages/alpha")
 
     expect(superStatus({ repo: fixture.product }).records).toEqual(["M  packages/alpha/alpha.ts"])
+  })
+
+  test("status --index-file judges only the root temporary index and reports its source", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-status-index-file-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const alphaHead = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 4\n")
+    const alphaCheckout = join(fixture.product, "packages/alpha")
+    git(alphaCheckout, "fetch", "-q", "origin")
+    git(alphaCheckout, "checkout", "-q", alphaHead)
+    writeFileSync(join(alphaCheckout, "alpha.ts"), "export const alpha = 5\n")
+    git(alphaCheckout, "add", "alpha.ts")
+
+    const indexFile = join(fixtureRoot, "commit-index")
+    copyFileSync(join(fixture.product, ".git", "index"), indexFile)
+    const staged = Bun.spawnSync(
+      ["git", "-C", fixture.product, "update-index", "--cacheinfo", `160000,${alphaHead},packages/alpha`],
+      { env: { ...process.env, GIT_INDEX_FILE: indexFile }, stdout: "pipe", stderr: "pipe" },
+    )
+    expect(staged.exitCode, staged.stderr.toString()).toBe(0)
+
+    const plain = superStatus({ repo: fixture.product })
+    expect(plain.consultedRepositories.find(({ path }) => path === "packages/alpha")?.from).toBe(fixture.alphaBase)
+    const selected = superStatus({ repo: fixture.product, indexFile })
+    expect(selected.consultedRepositories[0]).toMatchObject({ path: ".", indexFile })
+    expect(selected.consultedRepositories.find(({ path }) => path === "packages/alpha")).toMatchObject({
+      from: alphaHead,
+      to: alphaHead,
+    })
+    expect(selected.records).toContain("M  packages/alpha/alpha.ts")
+
+    const stdout = outputSink()
+    const stderr = outputSink()
+    expect(
+      await runCli(["--repo", fixture.product, "--json", "status", "--index-file", indexFile], stdout, stderr),
+    ).toBe(0)
+    const cliResult = JSON.parse(stdout.output) as SuperStatusResult
+    expect(cliResult.consultedRepositories[0]).toMatchObject({ path: ".", indexFile })
+
+    for (const invalid of ["relative-index", join(fixtureRoot, "missing-index")]) {
+      expect(() => superStatus({ repo: fixture.product, indexFile: invalid })).toThrow(invalid)
+    }
   })
 
   test("still answers in the superproject for a commit the superproject's own refs reach", () => {

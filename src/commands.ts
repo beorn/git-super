@@ -24,7 +24,7 @@ import { superWorktreeRemove, type SuperWorktreeRemoveOptions } from "./worktree
 
 export type CommandContext = Readonly<{ repo: string; report?: (message: string) => void }>
 export type DiffParams = Omit<SuperDiffOptions, "repo">
-export type StatusParams = Record<string, never>
+export type StatusParams = Readonly<{ indexFile?: string }>
 export type MergeBaseParams = Omit<SuperIsAncestorOptions, "repo">
 export type MergeParams = Omit<SuperMergeOptions, "repo" | "git" | "exclusive" | "report">
 export type PullParams = Omit<SuperPullOptions, "repo" | "git" | "exclusive" | "report"> & { progress?: boolean }
@@ -72,8 +72,14 @@ const diff = commandNode<CommandContext, DiffParams, SuperDiffResult>({
 const status = commandNode<CommandContext, StatusParams, SuperStatusResult>({
   title: "Status across a superproject",
   description: "Emit porcelain status with paths prefixed by their owning repository.",
-  params: params(() => ({})),
-  run: (context) => superStatus({ repo: context.repo }),
+  params: params((value) => {
+    const input = record(value)
+    if (input.indexFile !== undefined && typeof input.indexFile !== "string") {
+      throw new Error("indexFile must be a string")
+    }
+    return input.indexFile === undefined ? {} : { indexFile: input.indexFile as string }
+  }),
+  run: (context, input) => superStatus({ repo: context.repo, ...input }),
 })
 
 const mergeBase = commandNode<CommandContext, MergeBaseParams, SuperIsAncestorResult>({

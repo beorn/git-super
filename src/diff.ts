@@ -6,6 +6,8 @@ const ZERO_OID = "0".repeat(40)
 export type ConsultedRepository = Readonly<{
   path: string
   root: string
+  /** Explicit root index consulted by status when a hook uses a temporary commit index. */
+  indexFile?: string
   from?: string
   to?: string
 }>
