@@ -67,6 +67,22 @@ afterEach(() => {
 })
 
 describe("withStallRetry", () => {
+  // 25677: the existing retry rows prove a retry happens, but cannot detect a fixed wait replacing shared jitter.
+  test("paces a stalled read within its 250 ms cap across a low jitter draw", async () => {
+    vi.useFakeTimers()
+    vi.spyOn(Math, "random").mockReturnValue(0.1)
+    const announced = vi.spyOn(console, "error").mockImplementation(() => {})
+    const inner = scripted([STALL, OK])
+    const pending = withStallRetry(inner).run(req(["fetch", "origin"]))
+    await vi.advanceTimersByTimeAsync(25)
+    expect(inner.calls).toHaveLength(1)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(inner.calls).toHaveLength(2)
+    expect((await pending).code).toBe(0)
+    expect(announced).toHaveBeenCalledOnce()
+    expect(announced).toHaveBeenCalledWith(expect.stringContaining("retry 2/3 after 26ms"))
+  })
+
   test("retries a stalled ls-remote and returns the eventual success", async () => {
     const announced = vi.spyOn(console, "error").mockImplementation(() => {})
     const inner = scripted([STALL, OK])
@@ -126,18 +142,22 @@ describe("withStallRetry", () => {
     "announces one publickey retry for %s and captures the offered key",
     async (verb) => {
       vi.useFakeTimers()
+      vi.spyOn(Math, "random").mockReturnValue(0.1)
       const announced = vi.spyOn(console, "error").mockImplementation(() => {})
       const inner = scripted([PUBLICKEY_REFUSAL, OK])
       const original = req([verb, "origin"])
       const request = { ...original, env: { GIT_SSH_COMMAND: "ssh -i /tmp/fleet-key -o IdentitiesOnly=yes" } }
       const pending = withStallRetry(inner).run(request)
-      await vi.advanceTimersByTimeAsync(5_000)
+      await vi.advanceTimersByTimeAsync(300)
+      expect(inner.calls).toHaveLength(1)
+      await vi.advanceTimersByTimeAsync(1)
       expect((await pending).code).toBe(0)
       expect(inner.calls).toHaveLength(2)
       expect(inner.calls[0]).toEqual(request)
       expect(inner.calls[1]?.env?.GIT_SSH_COMMAND).toBe("ssh -i /tmp/fleet-key -o IdentitiesOnly=yes -v")
       expect(announced).toHaveBeenCalledOnce()
       expect(announced).toHaveBeenCalledWith(expect.stringContaining("Permission denied (publickey)."))
+      expect(announced).toHaveBeenCalledWith(expect.stringContaining("retry 2/2 after 301ms"))
     },
   )
 
@@ -168,6 +188,7 @@ describe("withStallRetry", () => {
 
   test("an abort during publickey backoff returns the first refusal without a second read", async () => {
     vi.useFakeTimers()
+    vi.spyOn(Math, "random").mockReturnValue(0.5)
     vi.spyOn(console, "error").mockImplementation(() => {})
     const controller = new AbortController()
     const inner = scripted([PUBLICKEY_REFUSAL, OK])
@@ -324,15 +345,18 @@ describe("a dropped SSH session is retried once (25616 row 2)", () => {
     ["a direct connection", DIRECT_DROP],
   ] as const)("announces one retry of a read whose session dropped: %s", async (_name, drop) => {
     vi.useFakeTimers()
+    vi.spyOn(Math, "random").mockReturnValue(0.1)
     const announced = vi.spyOn(console, "error").mockImplementation(() => {})
     const inner = scripted([drop, OK])
     const request = req(["ls-remote", "origin"])
     const pending = withStallRetry(inner).run(request)
-    await vi.advanceTimersByTimeAsync(5_000)
+    await vi.advanceTimersByTimeAsync(300)
+    expect(inner.calls).toHaveLength(1)
+    await vi.advanceTimersByTimeAsync(1)
     expect((await pending).code).toBe(0)
     expect(inner.calls).toEqual([request, request])
     expect(announced).toHaveBeenCalledOnce()
-    expect(announced).toHaveBeenCalledWith(expect.stringContaining("SSH session dropped; retry 2/2 after 3000ms"))
+    expect(announced).toHaveBeenCalledWith(expect.stringContaining("SSH session dropped; retry 2/2 after 301ms"))
   })
 
   test("a second drop remains a failure after exactly one announced retry", async () => {

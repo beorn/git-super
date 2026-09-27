@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs"
 import { mkdir } from "node:fs/promises"
 import { join } from "node:path"
 import { tryAcquireFlock } from "@bearly/flock"
+import { fullJitter } from "@bearly/pacing"
 
 export type Exclusive = Readonly<{
   run<Result>(operation: () => Promise<Result>, options?: Readonly<{ holder?: string }>): Promise<Result>
@@ -58,7 +59,6 @@ export async function acquireExclusive(
   const pollMs = Math.max(1, options.pollIntervalMs ?? 10)
   const startedAt = Date.now()
   const deadline = startedAt + timeoutMs
-  const backoff = (): Promise<void> => Bun.sleep(1 + Math.floor(Math.random() * pollMs))
 
   let contended = false
   while (true) {
@@ -76,7 +76,7 @@ export async function acquireExclusive(
       options.onContended?.(`${held.holder} (${held.owner}, age ${held.age})`)
     }
     if (now >= deadline) throw busy(path, now, now - startedAt, timeoutMs, holder)
-    await backoff()
+    await Bun.sleep(1 + Math.floor(fullJitter(pollMs, pollMs, 0)))
   }
 }
 

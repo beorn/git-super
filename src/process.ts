@@ -4,6 +4,7 @@ import { Blob } from "node:buffer"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
+import { fullJitter } from "@bearly/pacing"
 
 export { cleanGitEnvironment } from "./git.ts"
 
@@ -288,14 +289,15 @@ function withReadRetry(inner: GitProcess, options: StallRetryOptions, environmen
       while (true) {
         if (result.timedOut === true && stallAttempt < attempts) {
           stallAttempt += 1
+          const delayMs = 1 + Math.floor(fullJitter(STALL_BACKOFF_MS, STALL_BACKOFF_MS, 0))
           // NO SILENT ERRORS: a retry nobody can see turns a measurable stall
           // rate into an invisible one, and this defect cost an evening precisely
           // because the stalls were being read as something else.
           console.error(
             `git-super: ${request.args[0] ?? "git"} stalled after ${String(request.timeoutMs)}ms in ${request.repo}; ` +
-              `retry ${String(stallAttempt)}/${String(attempts)}`,
+              `retry ${String(stallAttempt)}/${String(attempts)} after ${String(delayMs)}ms`,
           )
-          if (!(await waitForReadRetry(STALL_BACKOFF_MS, request.signal))) return result
+          if (!(await waitForReadRetry(delayMs, request.signal))) return result
           result = await inner.run(request)
           continue
         }
@@ -317,11 +319,12 @@ function withReadRetry(inner: GitProcess, options: StallRetryOptions, environmen
           retriedSsh = true
           if (request.signal?.aborted) return result
           if (ssh === "SSH session dropped") {
+            const delayMs = 1 + Math.floor(fullJitter(PUBLICKEY_BACKOFF_MS, PUBLICKEY_BACKOFF_MS, 0))
             console.error(
               `git-super: git ${request.args.join(" ")} in ${request.repo}: ${ssh}; ` +
-                `retry 2/2 after ${String(PUBLICKEY_BACKOFF_MS)}ms`,
+                `retry 2/2 after ${String(delayMs)}ms`,
             )
-            if (!(await waitForReadRetry(PUBLICKEY_BACKOFF_MS, request.signal))) return result
+            if (!(await waitForReadRetry(delayMs, request.signal))) return result
             result = await inner.run(request)
             continue
           }
@@ -343,11 +346,12 @@ function withReadRetry(inner: GitProcess, options: StallRetryOptions, environmen
             )
             return result
           }
+          const delayMs = 1 + Math.floor(fullJitter(PUBLICKEY_BACKOFF_MS, PUBLICKEY_BACKOFF_MS, 0))
           console.error(
             `git-super: git ${request.args.join(" ")} in ${request.repo}: Permission denied (publickey).; ` +
-              `retry 2/2 after ${String(PUBLICKEY_BACKOFF_MS)}ms with ${verbose.command}`,
+              `retry 2/2 after ${String(delayMs)}ms with ${verbose.command}`,
           )
-          if (!(await waitForReadRetry(PUBLICKEY_BACKOFF_MS, request.signal))) return result
+          if (!(await waitForReadRetry(delayMs, request.signal))) return result
           result = await inner.run({
             ...request,
             env: { ...request.env, GIT_SSH_COMMAND: verbose.command },

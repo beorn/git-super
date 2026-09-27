@@ -12,6 +12,32 @@ import { describe, expect, test, vi } from "vitest"
 import { acquireExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS } from "../src/exclusive.ts"
 
 describe("exclusive writer policy", () => {
+  // 25677: a contended writer must use a positive shared-jitter delay without exceeding its poll cap.
+  test("keeps a contended poll within its delay cap", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "git-super-exclusive-"))
+    const first = await acquireExclusive(dir, { timeoutMs: 0 }, "holder")
+    const delays: number[] = []
+    let released = false
+    vi.spyOn(Math, "random").mockReturnValue(0.999)
+    vi.spyOn(Bun, "sleep").mockImplementation(async (ms) => {
+      if (typeof ms !== "number") throw new TypeError("git-super poll delay must be a number of milliseconds")
+      delays.push(ms)
+      first.release()
+      released = true
+    })
+    try {
+      const second = await acquireExclusive(dir, { timeoutMs: 100, pollIntervalMs: 10 }, "contender")
+      second.release()
+      expect(delays).toHaveLength(1)
+      expect(delays[0]).toBeGreaterThan(0)
+      expect(delays[0]).toBeLessThanOrEqual(10)
+    } finally {
+      if (!released) first.release()
+      vi.restoreAllMocks()
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
   /**
    * @failure The shared wait stops at the old 30 s bound while a real holder is still present (25274).
    * @level l1
