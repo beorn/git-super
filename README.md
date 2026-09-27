@@ -23,6 +23,7 @@ git super --repo /work/product diff --name-only <range>
 git super --repo /work/product diff --stat <range>
 git super --repo /work/product diff --patch <range>
 git super --repo /work/product status --porcelain
+git super --repo /work/product --json status --index-file /absolute/path/to/commit-index
 git super --repo /work/product merge-base --is-ancestor <sha> <superproject-ref>
 git super --repo /work/product merge <commit> [-m <message>] [--no-verify]
 git super --repo /work/product gitlink write <path> <commit>
@@ -33,7 +34,7 @@ git super --repo /work/product worktree add <path> <commit> [--reference <path>]
 git super --repo /work/product --json worktree remove <path> --retain <directory>
 ```
 
-Use `--repo` to name the superproject explicitly for enriched operations. `diff` accepts `--diff-filter`, `--cached`, and `-z`. `status` includes tracked and untracked changes in checked-out submodules. `merge-base --is-ancestor` discovers which repository owns the first commit and compares it with that repository's pin in the selected superproject ref.
+Use `--repo` to name the superproject explicitly for enriched operations. `diff` accepts `--diff-filter`, `--cached`, and `-z`. `status` includes tracked and untracked changes in checked-out submodules. In hook context, `status --index-file <absolute path>` reads the index Git will commit for the root repository only; nested submodules use their own indexes. The JSON root `consultedRepositories` row names the selected index file. A relative or missing index file is refused. `merge-base --is-ancestor` discovers which repository owns the first commit and compares it with that repository's pin in the selected superproject ref.
 
 Normal path or porcelain output stays on stdout. A rendered report of the repositories consulted goes to stderr, so existing pipelines stay composable. `--json` puts the result and the consulted repositories together on stdout.
 

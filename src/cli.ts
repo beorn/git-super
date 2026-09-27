@@ -566,9 +566,15 @@ async function runInvocation(
     .description(commands.status.description ?? commands.status.title)
     .option("--porcelain", "emit stable machine-readable status")
     .option("-z, --null", "terminate records with NUL instead of newline")
+    .option("--index-file <absolute-path>", "hook context: the index git will commit (root repository only)")
     .action((options, command) => {
       const globals = command.optsWithGlobals() as { repo: string; json?: boolean }
-      captured = { node: commands.status, params: {}, json: globals.json === true, nul: options.null === true }
+      captured = {
+        node: commands.status,
+        params: options.indexFile === undefined ? {} : { indexFile: options.indexFile },
+        json: globals.json === true,
+        nul: options.null === true,
+      }
     })
 
   program

@@ -1,8 +1,9 @@
-import { join, posix } from "node:path"
+import { statSync } from "node:fs"
+import { isAbsolute, join, posix } from "node:path"
 import { recursiveNameStatusDiff, type ConsultedRepository } from "./diff.ts"
 import { repositoryRoot, runGit } from "./git.ts"
 
-export type SuperStatusOptions = Readonly<{ repo: string }>
+export type SuperStatusOptions = Readonly<{ repo: string; indexFile?: string }>
 
 export type SuperStatusResult = Readonly<{
   records: readonly string[]
@@ -15,8 +16,8 @@ function nulFields(value: string): string[] {
   return value.split("\0").filter(Boolean)
 }
 
-function indexGitlinks(root: string): Gitlink[] {
-  const fields = nulFields(runGit(root, ["ls-files", "--stage", "-z"]))
+function indexGitlinks(root: string, indexFile?: string): Gitlink[] {
+  const fields = nulFields(runGit(root, ["ls-files", "--stage", "-z"], indexFile))
   return fields
     .map((field) => {
       const match = /^160000 ([0-9a-f]{40}) 0\t(.+)$/u.exec(field)
@@ -63,11 +64,16 @@ function diffRecords(root: string, from: string, to: string, column: "index" | "
   })
 }
 
-function statusRepository(root: string, prefix: string, consulted: ConsultedRepository): SuperStatusResult {
-  const gitlinks = indexGitlinks(root)
+function statusRepository(
+  root: string,
+  prefix: string,
+  consulted: ConsultedRepository,
+  indexFile?: string,
+): SuperStatusResult {
+  const gitlinks = indexGitlinks(root, indexFile)
   const gitlinkPaths = new Set(gitlinks.map(({ path }) => path))
   const rootRecords = parsePorcelain(
-    runGit(root, ["-c", "status.renames=false", "status", "--porcelain=v1", "-z", "--untracked-files=all"]),
+    runGit(root, ["-c", "status.renames=false", "status", "--porcelain=v1", "-z", "--untracked-files=all"], indexFile),
   )
     .filter((record) => !gitlinkPaths.has(record.slice(3)))
     .map((record) => prefixPorcelain(record, prefix))
@@ -104,5 +110,14 @@ function statusRepository(root: string, prefix: string, consulted: ConsultedRepo
 
 export function superStatus(options: SuperStatusOptions): SuperStatusResult {
   const root = repositoryRoot(options.repo)
-  return statusRepository(root, "", { path: ".", root })
+  const indexFile = options.indexFile
+  if (indexFile !== undefined) {
+    if (!isAbsolute(indexFile)) throw new Error(`git super status: --index-file must be absolute: ${indexFile}`)
+    try {
+      if (!statSync(indexFile).isFile()) throw new Error("not a file")
+    } catch (error) {
+      throw new Error(`git super status: --index-file is not a readable file: ${indexFile}`, { cause: error })
+    }
+  }
+  return statusRepository(root, "", { path: ".", root, ...(indexFile === undefined ? {} : { indexFile }) }, indexFile)
 }
