@@ -1918,4 +1918,154 @@ describe("materializeSubmodules", () => {
     expect(result.stderr).toContain(expectedSha)
     expect(result.stderr).toContain(staleSha)
   })
+
+  it("accepts a locally held unpublished component pin after merge from origin/main and syncs other components (hh 26228)", async () => {
+    const root = await mkdtemp(join(tmpdir(), "git-super-locally-held-pin-"))
+    roots.push(root)
+    const depARemote = join(root, "dep-a-remote.git")
+    const depBRemote = join(root, "dep-b-remote.git")
+    git(root, ["init", "-q", "--bare", "--initial-branch=main", depARemote])
+    git(root, ["init", "-q", "--bare", "--initial-branch=main", depBRemote])
+
+    const depAWork = join(root, "dep-a-work")
+    git(root, ["clone", "-q", depARemote, depAWork])
+    git(depAWork, ["config", "user.name", "Git Super Test"])
+    git(depAWork, ["config", "user.email", "git-super@example.invalid"])
+    writeFileSync(join(depAWork, "file.txt"), "a1\n")
+    git(depAWork, ["add", "file.txt"])
+    git(depAWork, ["commit", "-qm", "a1"])
+    git(depAWork, ["push", "-q", "origin", "main"])
+
+    const depBWork = join(root, "dep-b-work")
+    git(root, ["clone", "-q", depBRemote, depBWork])
+    git(depBWork, ["config", "user.name", "Git Super Test"])
+    git(depBWork, ["config", "user.email", "git-super@example.invalid"])
+    writeFileSync(join(depBWork, "file.txt"), "b1\n")
+    git(depBWork, ["add", "file.txt"])
+    git(depBWork, ["commit", "-qm", "b1"])
+    git(depBWork, ["push", "-q", "origin", "main"])
+
+    // Setup primary owner repo
+    const owner = join(root, "owner")
+    git(root, ["init", "-q", "-b", "main", owner])
+    git(owner, ["config", "user.name", "Git Super Test"])
+    git(owner, ["config", "user.email", "git-super@example.invalid"])
+    git(owner, ["config", "protocol.file.allow", "always"])
+    writeFileSync(join(owner, "README.md"), "owner\n")
+    git(owner, ["add", "README.md"])
+    git(owner, ["commit", "-qm", "init owner"])
+    git(owner, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", depARemote, "vendor/depA"])
+    git(owner, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", depBRemote, "vendor/depB"])
+    git(owner, ["commit", "-qm", "add depA and depB"])
+    git(owner, ["submodule", "update", "--init"])
+
+    // Candidate worktree from owner
+    const candidate = join(root, "candidate")
+    git(owner, ["worktree", "add", "-q", "-b", "task/dev-work", candidate, "HEAD"])
+    const previousGitAllowProtocol = process.env.GIT_ALLOW_PROTOCOL
+    process.env.GIT_ALLOW_PROTOCOL = "file"
+    try {
+      const initResult = await materializeSubmodulesWithProcess(createLocalGitProcess(), {
+        worktree: candidate,
+        referenceWorktree: owner,
+      })
+      expect(initResult.code).toBe(0)
+
+      // Plant an unpublished commit in candidate's depA
+      const candidateDepA = join(candidate, "vendor/depA")
+      writeFileSync(join(candidateDepA, "unpub.txt"), "unpublished local work\n")
+      git(candidateDepA, ["add", "unpub.txt"])
+      git(candidateDepA, ["commit", "-qm", "unpublished depA commit"])
+      const unpubA = git(candidateDepA, ["rev-parse", "HEAD"]).trim()
+
+      // Record this unpub gitlink in candidate's superproject
+      git(candidate, ["add", "vendor/depA"])
+      git(candidate, ["commit", "-qm", "worktree commit advancing depA gitlink"])
+
+      // Advance depB in upstream remote and owner
+      writeFileSync(join(depBWork, "file.txt"), "b2\n")
+      git(depBWork, ["commit", "-qam", "b2"])
+      git(depBWork, ["push", "-q", "origin", "main"])
+      const depBNew = git(depBWork, ["rev-parse", "HEAD"]).trim()
+
+      const ownerDepB = join(owner, "vendor/depB")
+      git(ownerDepB, ["fetch", "-q", "origin", "main"])
+      git(ownerDepB, ["checkout", "-q", depBNew])
+      git(owner, ["add", "vendor/depB"])
+      git(owner, ["commit", "-qm", "advance depB to b2"])
+
+      // Merge owner into candidate (like merging origin/main)
+      git(candidate, ["merge", "-qm", "merge origin/main", "main"])
+
+      // Verify setup condition:
+      // candidate depA checkout holds unpubA, but owner depA does NOT and depARemote does NOT
+      expect(git(candidateDepA, ["rev-parse", "HEAD"]).trim()).toBe(unpubA)
+      expect(git(owner, ["ls-tree", "HEAD", "vendor/depA"])).not.toContain(unpubA)
+
+      // Run materialization (post-merge sync)
+      const syncResult = await materializeSubmodulesWithProcess(createLocalGitProcess(), {
+        worktree: candidate,
+        referenceWorktree: owner,
+      })
+
+      // Must succeed: accepts depA's locally held pin and syncs depB to depBNew
+      expect(syncResult.code).toBe(0)
+      expect(git(candidateDepA, ["rev-parse", "HEAD"]).trim()).toBe(unpubA)
+      const candidateDepB = join(candidate, "vendor/depB")
+      expect(git(candidateDepB, ["rev-parse", "HEAD"]).trim()).toBe(depBNew)
+    } finally {
+      if (previousGitAllowProtocol === undefined) delete process.env.GIT_ALLOW_PROTOCOL
+      else process.env.GIT_ALLOW_PROTOCOL = previousGitAllowProtocol
+    }
+  })
+
+  it("refusal names where it looked and names submitting the component change when pin is missing everywhere (hh 26228)", async () => {
+    const worktree = "/candidate"
+    const referenceWorktree = await mkdtemp(join(tmpdir(), "git-super-missing-everywhere-"))
+    roots.push(referenceWorktree)
+    await mkdir(join(referenceWorktree, "vendor/dep"), { recursive: true })
+    const missingSha = "e".repeat(40)
+    const commands: Array<Readonly<{ repo: string; args: readonly string[] }>> = []
+
+    const git: SubmoduleGit = {
+      async run(repo, args) {
+        commands.push({ repo, args })
+        if (args[0] === "cat-file" && args.at(-1) === "HEAD:.gitmodules") {
+          return repo === worktree ? success() : { ...success(), code: 1 }
+        }
+        if (args[0] === "config" && args[1] === "--blob") {
+          return { ...success(), stdout: "submodule.dep.path vendor/dep" }
+        }
+        if (args[0] === "ls-tree") {
+          return { ...success(), stdout: `160000 commit ${missingSha}\tvendor/dep\n` }
+        }
+        if (args[0] === "config" && args[1] === "--get-regexp") return { ...success(), code: 1 }
+        if (args[0] === "config" && args[1] === "--get") {
+          return { ...success(), stdout: "https://example.invalid/dep.git\n" }
+        }
+        // cat-file -e fails both in worktree and in reference
+        if (args[0] === "cat-file" && args[1] === "-e") return { ...success(), code: 1 }
+        // fetch from origin fails (origin does not have this commit)
+        if (args[0] === "fetch") return { code: 128, stdout: "", stderr: `fatal: couldn't find remote ref ${missingSha}\n` }
+        return success()
+      },
+    }
+
+    const refused = await materializeSubmodules(
+      withReferenceStores(withPrimaryWorktree(git, referenceWorktree)),
+      { worktree, referenceWorktree },
+    )
+
+    expect(refused.code).toBe(1)
+    // Refusal names where it looked:
+    // the worktree component store, the shared reference, origin
+    expect(refused.stderr).toMatch(/worktree component store/i)
+    expect(refused.stderr).toMatch(/shared reference/i)
+    expect(refused.stderr).toMatch(/origin/i)
+    // Does NOT prescribe fetching from origin a SHA that origin cannot have
+    expect(refused.stderr).not.toContain(`fetch --no-tags origin ${missingSha}`)
+    // The cure names submitting the component change or fetching from the worktree that holds it
+    expect(refused.stderr).toMatch(/submitting the component change/i)
+    expect(refused.stderr).toMatch(/fetching from the worktree that holds it/i)
+  })
 })
