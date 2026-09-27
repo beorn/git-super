@@ -520,6 +520,31 @@ export async function syncOriginTrackingRefs(
   })
   if (batch.code !== 0) return batch
 
+  // Read back one ref from targetRefs to verify that the batch was actually applied.
+  // This guards against an adapter dropping stdin and silently writing no refs.
+  const mainSha = targetRefs.get("refs/remotes/origin/main")
+  const firstEntry = targetRefs.entries().next().value
+  const [verifyRef, expectedSha] =
+    mainSha !== undefined ? ["refs/remotes/origin/main", mainSha] : firstEntry !== undefined ? firstEntry : ["", ""]
+
+  if (verifyRef !== "" && expectedSha !== "") {
+    const readBack = await git.run(submoduleDir, ["rev-parse", "--verify", verifyRef], true)
+    if (readBack.code !== 0) {
+      return {
+        code: readBack.code,
+        stdout: readBack.stdout,
+        stderr: `origin tracking ref verification failed: ${verifyRef} (${expectedSha}) was not written: ${readBack.stderr.trim()}`,
+      }
+    }
+    if (readBack.stdout.trim() !== expectedSha) {
+      return {
+        code: 1,
+        stdout: readBack.stdout,
+        stderr: `origin tracking ref verification mismatch: expected ${verifyRef} to be ${expectedSha}, got ${readBack.stdout.trim()}`,
+      }
+    }
+  }
+
   const symHead = await git.run(borrowFrom, ["symbolic-ref", "refs/remotes/origin/HEAD"], true)
   if (symHead.code === 0 && symHead.stdout.trim() !== "") {
     const symResult = await git.run(

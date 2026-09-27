@@ -1707,6 +1707,9 @@ describe("materializeSubmodules", () => {
         if (args[0] === "symbolic-ref") {
           return { ...success(), stdout: "refs/remotes/origin/main\n" }
         }
+        if (repo === submoduleDir && args[0] === "rev-parse") {
+          return { ...success(), stdout: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa00\n" }
+        }
         return success()
       },
     }
@@ -1773,6 +1776,9 @@ describe("materializeSubmodules", () => {
         if (repo === submoduleDir && args[0] === "symbolic-ref") {
           return { code: 128, stdout: "", stderr: "fatal: could not update refs/remotes/origin/HEAD" }
         }
+        if (repo === submoduleDir && args[0] === "rev-parse") {
+          return { ...success(), stdout: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n" }
+        }
         return success()
       },
     }
@@ -1780,5 +1786,83 @@ describe("materializeSubmodules", () => {
     const result = await syncOriginTrackingRefs(git, submoduleDir, borrowFrom)
     expect(result.code).toBe(128)
     expect(result.stderr).toContain("could not update refs/remotes/origin/HEAD")
+  })
+
+  it("fails loud when an adapter drops stdin during batched update-ref and ref readback mismatches (P4)", async () => {
+    const borrowFrom = "/borrow"
+    const submoduleDir = "/submodule"
+    const targetRef = "refs/remotes/origin/main"
+    const expectedSha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    const runCalls: Array<{
+      repo: string
+      args: readonly string[]
+      options?: Readonly<{ stdin?: string }> | undefined
+    }> = []
+
+    // Adapter that drops options.stdin (simulating an adapter that doesn't forward stdin to git)
+    const storedRefs = new Map<string, string>()
+    const git: SubmoduleGit = {
+      async run(repo, args, _allowFailure, options) {
+        runCalls.push({ repo, args, options })
+        if (repo === borrowFrom && args[0] === "for-each-ref") {
+          return { ...success(), stdout: `${targetRef} ${expectedSha}\n` }
+        }
+        if (repo === submoduleDir && args[0] === "for-each-ref") {
+          return { ...success(), stdout: "" }
+        }
+        if (args[0] === "update-ref") {
+          // Bug simulation: adapter drops options?.stdin, so nothing is updated into storedRefs
+          return success()
+        }
+        if (repo === submoduleDir && args[0] === "rev-parse") {
+          const ref = args[args.length - 1] ?? ""
+          const sha = storedRefs.get(ref)
+          if (!sha) {
+            return { code: 128, stdout: "", stderr: "fatal: Needed a single revision" }
+          }
+          return { ...success(), stdout: `${sha}\n` }
+        }
+        return success()
+      },
+    }
+
+    const result = await syncOriginTrackingRefs(git, submoduleDir, borrowFrom)
+    expect(result.code).toBe(128)
+    expect(result.stderr).toContain("origin tracking ref verification failed")
+    expect(result.stderr).toContain(targetRef)
+    expect(runCalls.some((c) => c.repo === submoduleDir && c.args[0] === "rev-parse")).toBe(true)
+  })
+
+  it("fails loud when readback ref SHA mismatches expected SHA after batched update-ref (P4)", async () => {
+    const borrowFrom = "/borrow"
+    const submoduleDir = "/submodule"
+    const targetRef = "refs/remotes/origin/main"
+    const expectedSha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    const staleSha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+    const git: SubmoduleGit = {
+      async run(repo, args) {
+        if (repo === borrowFrom && args[0] === "for-each-ref") {
+          return { ...success(), stdout: `${targetRef} ${expectedSha}\n` }
+        }
+        if (repo === submoduleDir && args[0] === "for-each-ref") {
+          return { ...success(), stdout: "" }
+        }
+        if (args[0] === "update-ref") {
+          return success()
+        }
+        if (repo === submoduleDir && args[0] === "rev-parse") {
+          return { ...success(), stdout: `${staleSha}\n` }
+        }
+        return success()
+      },
+    }
+
+    const result = await syncOriginTrackingRefs(git, submoduleDir, borrowFrom)
+    expect(result.code).toBe(1)
+    expect(result.stderr).toContain("origin tracking ref verification mismatch")
+    expect(result.stderr).toContain(targetRef)
+    expect(result.stderr).toContain(expectedSha)
+    expect(result.stderr).toContain(staleSha)
   })
 })
