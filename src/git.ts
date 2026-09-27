@@ -67,3 +67,13 @@ export function runGit(cwd: string, args: readonly string[], indexFile?: string)
 export function repositoryRoot(path: string): string {
   return runGit(path, ["rev-parse", "--show-toplevel"]).trim()
 }
+
+/** Classify successful Git discovery answers, shared by synchronous and asynchronous callers.
+ * Ask Git whether discovery walked up; physical and lexical paths differ under symlinked parents.
+ */
+export function probeRepository(
+  discovered: string,
+  prefix: string,
+): Readonly<{ kind: "repository"; root: string } | { kind: "absent"; discovered: string }> {
+  return prefix.trim() === "" ? { kind: "repository", root: discovered } : { kind: "absent", discovered }
+}

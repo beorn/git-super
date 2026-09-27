@@ -10,6 +10,7 @@ import {
   type CommitSubmodule,
 } from "./commit-graph.ts"
 import { createExclusive, type Exclusive } from "./exclusive.ts"
+import { probeRepository } from "./git.ts"
 import { mapInOrder } from "./map-in-order.ts"
 import { ensureCommitObject } from "./objects.ts"
 import { createProgressReporter } from "./progress.ts"
@@ -167,7 +168,7 @@ export async function discoverRepository(git: GitProcess, path: string, phase: s
       const prefixArgs = ["rev-parse", "--show-prefix"]
       const prefix = await git.run({ repo: path, args: prefixArgs })
       if (prefix.code !== 0) throw operationError(path, prefixArgs, phase, prefix)
-      if (prefix.stdout.trim() !== "") {
+      if (probeRepository(discovered, prefix.stdout).kind === "absent") {
         // NOTE the distinction this rests on: an EMPTY working tree that still
         // carries its own `.git` is that gitlink's repository and passes here.
         // The queue's own clone holds `km/apps/maddoc` in exactly that shape.

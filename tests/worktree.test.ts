@@ -4,7 +4,7 @@
  * @consumer Yrd worktree and deployment stores
  */
 import { existsSync } from "node:fs"
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises"
 import { spawnSync } from "node:child_process"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -18,6 +18,10 @@ import {
 } from "../src/worktree.ts"
 import { rehomeBorrowers } from "../src/worktree-removal.ts"
 import type { GitProcessRequest } from "../src/process.ts"
+import { canonicalTmpdir, createProductFixture } from "./fixture.ts"
+import { runCli } from "../src/cli.ts"
+import { discoverRepository } from "../src/push.ts"
+import { createLocalGitProcess } from "../src/process.ts"
 
 function git(repo: string, args: readonly string[]): string {
   const result = spawnSync("git", ["-C", repo, ...args], { encoding: "utf8" })
@@ -26,6 +30,90 @@ function git(repo: string, args: readonly string[]): string {
 }
 
 describe("createGitWorktreeStore", () => {
+  /**
+   * @failure Empty submodules are mistaken for the parent repo, blocking safe removal; hidden files or staged pins must not be discarded (26264).
+   * @level l1
+   * @consumer git-super status and worktree removal
+   * @testonly none
+   */
+  it("reports never-checked-out submodules and removes only clean worktrees", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-uninitialized-"))
+    try {
+      const fixture = createProductFixture(root)
+      const alias = join(root, "aliased-product")
+      await symlink(fixture.product, alias, "dir")
+      // The shared guard must accept a checkout below a symlinked parent.
+      expect(await discoverRepository(createLocalGitProcess(), join(alias, "packages/alpha"), "test", true)).toBe(
+        join(fixture.product, "packages/alpha"),
+      )
+      const store = createLocalGitWorktreeStore({ repo: fixture.product })
+      const linked = join(root, "clean")
+      await store.add({ kind: "detached", path: linked, ref: "HEAD" })
+      // Native add leaves gitlinks as empty directories. Never initialize them.
+      expect(git(linked, ["submodule", "status"])).toContain(`-${fixture.alphaBase} packages/alpha`)
+      const out = {
+        output: "",
+        write(value: string) {
+          this.output += value
+        },
+      }
+      const err = {
+        output: "",
+        write(value: string) {
+          this.output += value
+        },
+      }
+      expect(await runCli(["--repo", linked, "--json", "status"], out, err), err.output).toBe(0)
+      expect(JSON.parse(out.output)).toMatchObject({
+        records: [],
+        uninitializedSubmodules: ["packages/alpha", "vendor/beta"],
+        consultedRepositories: [{ path: ".", root: linked }],
+      })
+      out.output = ""
+      err.output = ""
+      expect(await runCli(["--repo", linked, "status"], out, err)).toBe(0)
+      expect(out.output).toBe("")
+      expect(err.output).toContain("packages/alpha: not checked out")
+      expect(err.output).toContain("vendor/beta: not checked out")
+      await store.remove(linked, { retention: { root: join(root, "retained"), report: () => {} } })
+      expect(existsSync(linked)).toBe(false)
+      expect(git(fixture.product, ["worktree", "list", "--porcelain"])).not.toContain(linked)
+
+      for (const dirt of ["root", "staged-pin", "uninitialized-payload"]) {
+        const dirty = join(root, dirt)
+        await store.add({ kind: "detached", path: dirty, ref: "HEAD" })
+        if (dirt === "root") await writeFile(join(dirty, "untracked.txt"), "keep me\n")
+        else if (dirt === "staged-pin") {
+          git(dirty, ["update-index", "--cacheinfo", `160000,${fixture.betaBase},packages/alpha`])
+          out.output = ""
+          err.output = ""
+          expect(await runCli(["--repo", dirty, "--json", "status"], out, err), err.output).toBe(0)
+          expect(JSON.parse(out.output)).toMatchObject({
+            records: ["M  packages/alpha"],
+            uninitializedSubmodules: ["packages/alpha", "vendor/beta"],
+          })
+        } else {
+          // Git can hide ignored files in an uninitialized gitlink directory.
+          await writeFile(join(dirty, "packages/alpha", ".gitignore"), "*\n")
+          await writeFile(join(dirty, "packages/alpha", "private.txt"), "keep me\n")
+        }
+        await expect(
+          store.remove(dirty, {
+            retention: { root: join(root, "retained"), report: () => {} },
+          }),
+          dirt,
+        ).rejects.toThrow(/dirty|not empty/u)
+        expect(existsSync(dirty)).toBe(true)
+        expect(git(fixture.product, ["worktree", "list", "--porcelain"])).toContain(dirty)
+        if (dirt === "uninitialized-payload") {
+          expect(await readFile(join(dirty, "packages/alpha", "private.txt"), "utf8")).toBe("keep me\n")
+        }
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   /**
    * @failure Tree materialization gives up after 30 s while a queue merge still holds the shared writer lock (25274).
    * @level l1

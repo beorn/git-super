@@ -1,13 +1,15 @@
-import { statSync } from "node:fs"
+import { readdirSync, statSync } from "node:fs"
 import { isAbsolute, join, posix } from "node:path"
 import { recursiveNameStatusDiff, type ConsultedRepository } from "./diff.ts"
-import { repositoryRoot, runGit } from "./git.ts"
+import { probeRepository, repositoryRoot, runGit } from "./git.ts"
 
 export type SuperStatusOptions = Readonly<{ repo: string; indexFile?: string }>
 
 export type SuperStatusResult = Readonly<{
   records: readonly string[]
   consultedRepositories: readonly ConsultedRepository[]
+  /** Existing empty gitlink directories with no repository of their own; these are not dirty records. */
+  uninitializedSubmodules: readonly string[]
 }>
 
 type Gitlink = Readonly<{ path: string; indexPin: string }>
@@ -71,18 +73,29 @@ function statusRepository(
   indexFile?: string,
 ): SuperStatusResult {
   const gitlinks = indexGitlinks(root, indexFile)
-  const gitlinkPaths = new Set(gitlinks.map(({ path }) => path))
+  const checkedOutGitlinks = new Set<string>()
   const rootRecords = parsePorcelain(
     runGit(root, ["-c", "status.renames=false", "status", "--porcelain=v1", "-z", "--untracked-files=all"], indexFile),
-  )
-    .filter((record) => !gitlinkPaths.has(record.slice(3)))
-    .map((record) => prefixPorcelain(record, prefix))
+  ).map((record) => prefixPorcelain(record, prefix))
   const consultedRepositories: ConsultedRepository[] = [consulted]
   const nestedRecords: string[] = []
+  const uninitializedSubmodules: string[] = []
 
   for (const gitlink of gitlinks) {
-    const nestedRoot = repositoryRoot(join(root, gitlink.path))
+    const child = join(root, gitlink.path)
+    const nestedRoot = repositoryRoot(child)
     const nestedPrefix = posix.join(prefix, gitlink.path)
+    const probe = probeRepository(nestedRoot, runGit(child, ["rev-parse", "--show-prefix"]))
+    if (probe.kind === "absent") {
+      if (readdirSync(child).length > 0) {
+        throw new Error(
+          `git super: ${nestedPrefix} is not checked out and its directory ${child} is not empty; preserve its files before removal`,
+        )
+      }
+      uninitializedSubmodules.push(nestedPrefix)
+      continue
+    }
+    checkedOutGitlinks.add(nestedPrefix)
     const checkoutPin = runGit(nestedRoot, ["rev-parse", "HEAD"]).trim()
     const headPin = treeGitlink(root, "HEAD", gitlink.path)
     if (headPin === undefined) {
@@ -98,13 +111,15 @@ function statusRepository(
     })
     nestedRecords.push(...nested.records)
     consultedRepositories.push(...nested.consultedRepositories)
+    uninitializedSubmodules.push(...nested.uninitializedSubmodules)
   }
 
   return {
-    records: [...new Set([...rootRecords, ...nestedRecords])].sort((left, right) =>
-      left.slice(3).localeCompare(right.slice(3)),
-    ),
+    records: [
+      ...new Set([...rootRecords.filter((record) => !checkedOutGitlinks.has(record.slice(3))), ...nestedRecords]),
+    ].sort((left, right) => left.slice(3).localeCompare(right.slice(3))),
     consultedRepositories,
+    uninitializedSubmodules,
   }
 }
 

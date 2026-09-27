@@ -3,6 +3,7 @@ import { tmpdir } from "node:os"
 import { isAbsolute, join, resolve } from "node:path"
 import { readCommitGitlinks } from "./commit-graph.ts"
 import { createExclusive, type Exclusive } from "./exclusive.ts"
+import { probeRepository } from "./git.ts"
 import { ensureCommitObject } from "./objects.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
 import { gitSuperResult, type GitResultDetail, type GitSuperRepositoryResult, type GitSuperResult } from "./result.ts"
@@ -428,7 +429,14 @@ async function freezeRepositoryGraph(
       const childPath = path === "." ? entry.path : `${path}/${entry.path}`
       const childRepository = join(repository, entry.path)
       const discovered = await run(git, childRepository, ["rev-parse", "--show-toplevel"])
-      if (discovered.code !== 0) {
+      const probe =
+        discovered.code === 0
+          ? probeRepository(
+              discovered.stdout.trim(),
+              await required(git, childRepository, ["rev-parse", "--show-prefix"], "freeze-target-graph"),
+            )
+          : undefined
+      if (probe === undefined || probe.kind === "absent") {
         throw Object.assign(new Error(`submodule ${childPath} is not initialized`), {
           resultDetail: detail(
             "submodule-not-initialized",

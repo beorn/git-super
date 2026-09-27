@@ -38,6 +38,29 @@ function outputSink(): { output: string; write(value: string): void } {
 }
 
 describe("git super pull --ff-only", () => {
+  /**
+   * @failure Pull discovers the parent as an uninitialized child and reads or fetches child commits in the wrong repository (26264).
+   * @level l1
+   * @consumer git-super pull
+   * @testonly none
+   */
+  test("refuses an empty child directory by name before reading its parent as the child", async () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-pull-uninitialized-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const checkout = join(root, "checkout")
+    git(root, "clone", "-q", fixture.product, checkout)
+    advanceRepository(fixture.product, "README.md", "next\n")
+    const before = git(checkout, "rev-parse", "HEAD")
+    const result = await superPull({ repo: checkout, repository: "origin", refspecs: ["main"], ffOnly: true })
+    expect(result).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: { code: "submodule-not-initialized", paths: ["packages/alpha"] },
+    })
+    expect(git(checkout, "rev-parse", "HEAD")).toBe(before)
+  })
+
   test("uses the configured upstream when repository and refspec are omitted", async () => {
     const fixture = mkdtempSync(join(tmpdir(), "git-super-pull-upstream-"))
     roots.push(fixture)

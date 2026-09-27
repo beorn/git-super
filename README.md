@@ -54,7 +54,9 @@ Normal path or porcelain output stays on stdout. A rendered report of the reposi
 }
 ```
 
-Missing checkouts, missing commit objects, added or removed gitlinks without a resolvable commit range, and ambiguous commit ownership all fail loudly. **The tool never turns an unresolved repository boundary into an empty success** — that is the failure it exists to prevent, so it may not commit it itself.
+Status reports an existing empty submodule directory as `path: not checked out` on stderr and in the JSON `uninitializedSubmodules` list (always present, empty when all checkouts exist). It does not consult the parent repository as that child or invent a dirty record. A staged gitlink change remains a native dirty record, and clean worktree removal can proceed when submodules have never been checked out. A nonempty uninitialized directory refuses with its path, so ignored files cannot be discarded.
+
+Missing or unreadable checkout directories, missing commit objects, added or removed gitlinks without a resolvable commit range, and ambiguous commit ownership all fail loudly. Pull, push and merge still refuse uninitialized child repositories. **The tool never turns an unresolved repository boundary into an empty success** — that is the failure it exists to prevent, so it may not commit it itself.
 
 ### Merge and settle gitlinks
 

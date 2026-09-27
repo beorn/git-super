@@ -695,6 +695,7 @@ async function writeResult(
     await writeReport(diff.consultedRepositories, stderr)
   } else if (captured.node === nodes.status) {
     const status = result as SuperStatusResult
+    for (const path of status.uninitializedSubmodules) stderr.write(`${path}: not checked out\n`)
     if (status.records.length > 0) {
       stdout.write(`${status.records.join(captured.nul ? "\0" : "\n")}${captured.nul ? "\0" : "\n"}`)
     }
