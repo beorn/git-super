@@ -2226,6 +2226,7 @@ describe("a frozen push works only on the children its merge moved (25303, obser
         },
       }
       const reports: string[] = []
+      const reportTimes: number[] = []
       vi.useFakeTimers()
       try {
         const operation = superPush({
@@ -2234,14 +2235,23 @@ describe("a frozen push works only on the children its merge moved (25303, obser
           refspecs: [`${source}:refs/heads/main`],
           recurseSubmodules: "no",
           git: stalled,
-          report: (line) => reports.push(line),
+          report: (line) => {
+            reports.push(line)
+            reportTimes.push(Date.now())
+          },
         })
         await held
+        const heldAt = Date.now()
+        const firstHeldReport = reports.length
         await vi.advanceTimersByTimeAsync(stage === "plan" ? 25_000 : 10_000)
         expect(writes).toBe(0)
-        expect(reports.some((line) => /git-super push: .*\d+\/\d+ \+9000ms/u.test(line))).toBe(true)
-        if (stage === "plan") {
-          expect(reports.some((line) => /git-super push: .*\d+\/\d+ \+18000ms/u.test(line))).toBe(true)
+        const heldReports = reports.slice(firstHeldReport)
+        expect(heldReports.length).toBeGreaterThan(0)
+        expect(heldReports.every((line) => /^git-super push: [^\n]* \d+\/\d+ \+\d+ms\n$/u.test(line))).toBe(true)
+        // Include the tail so one early pulse followed by a stopped heartbeat fails.
+        const edges = [heldAt, ...reportTimes.slice(firstHeldReport), Date.now()]
+        for (let index = 1; index < edges.length; index++) {
+          expect(edges[index]! - edges[index - 1]!).toBeLessThanOrEqual(10_000)
         }
         release?.()
         await expect(operation).resolves.toMatchObject({ state: "updated" })
@@ -2272,6 +2282,7 @@ describe("a frozen push works only on the children its merge moved (25303, obser
       },
     }
     const reports: string[] = []
+    const reportTimes: number[] = []
     vi.useFakeTimers()
     // A nominal 10s interval fires late under load; the heartbeat needs room for that delay.
     const originalSetInterval = globalThis.setInterval
@@ -2285,11 +2296,22 @@ describe("a frozen push works only on the children its merge moved (25303, obser
         refspecs: [`${source}:refs/heads/main`],
         recurseSubmodules: "no",
         exclusive,
-        report: (line) => reports.push(line),
+        report: (line) => {
+          reports.push(line)
+          reportTimes.push(Date.now())
+        },
       })
       await held
+      const heldAt = Date.now()
+      const firstHeldReport = reports.length
       await vi.advanceTimersByTimeAsync(10_000)
-      expect(reports).toContain("git-super push: wait-writer-lock 0/1 +9500ms\n")
+      const heldReports = reports.slice(firstHeldReport)
+      expect(heldReports.length).toBeGreaterThan(0)
+      expect(heldReports.every((line) => /^git-super push: wait-writer-lock 0\/1 \+\d+ms\n$/u.test(line))).toBe(true)
+      const edges = [heldAt, ...reportTimes.slice(firstHeldReport), Date.now()]
+      for (let index = 1; index < edges.length; index++) {
+        expect(edges[index]! - edges[index - 1]!).toBeLessThanOrEqual(10_000)
+      }
       release?.()
       await expect(operation).resolves.toMatchObject({ state: "updated" })
     } finally {
