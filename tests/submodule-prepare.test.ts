@@ -3,6 +3,7 @@
  *          checkout-free stores, or a repeated preparation changes that binding.
  * @level l4 — real Git common-dir module stores and ordinary submodule materialization.
  * @consumer Yrd captured submodule readers
+ * @reach fs-walk <fixture-only: superSubmodulePrepare uses mkdtempSync(tmpdir()) Git repos>
  * retire-when: the submodule-store command is subsumed by a broader Git Super persistent-store lifecycle suite.
  */
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs"

@@ -1,3 +1,6 @@
+/**
+ * @reach fs-walk <fixture-only: superPull and git-super CLI use mkdtempSync(canonicalTmpdir()) repos>
+ */
 import { afterEach, describe, expect, test, vi } from "vitest"
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"

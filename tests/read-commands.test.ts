@@ -1,3 +1,6 @@
+/**
+ * @reach fs-walk <fixture-only: runCli and CLI entry read mkdtempSync(tmpdir()) Git repos>
+ */
 import { afterEach, describe, expect, test } from "vitest"
 import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"

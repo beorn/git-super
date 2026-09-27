@@ -2,6 +2,7 @@
  * @failure Gitlink writers duplicate raw index plumbing, move a submodule checkout, or quietly accept a non-gitlink path or unavailable commit.
  * @level l1
  * @consumer @i/10-merge-queue/git-super-one-layer F1 and Yrd composition callers
+ * @reach fs-walk <fixture-only: createProductFixture under mkdtempSync(canonicalTmpdir())>
  */
 
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"

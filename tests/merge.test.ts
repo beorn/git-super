@@ -2,6 +2,7 @@
  * @failure A merge records a gitlink commit that submodule main does not contain.
  * @level l1
  * @consumer Yrd settled candidate preparation and landing
+ * @reach fs-walk <fixture-only: superMerge uses Git repos under mkdtempSync(canonicalTmpdir())>
  */
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { dirname, isAbsolute, join, relative } from "node:path"
