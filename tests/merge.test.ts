@@ -3075,14 +3075,19 @@ describe("git super merge — the root's child mains are fetched together (25303
     let inFlight = 0
     let maxInFlight = 0
     let fetches = 0
+    let taggedFetches = 0
     let release: () => void = () => undefined
     const bothStarted = new Promise<void>((resolve) => {
       release = resolve
     })
     const recording: GitProcess = {
       run: async (request) => {
-        if (!isMainFetch(request.args)) return local.run(request)
+        if (!isMainFetch(request.args)) {
+          expect(request.env?.GIT_SUPER_PHASE).toBeUndefined()
+          return local.run(request)
+        }
         fetches += 1
+        if (request.env?.GIT_SUPER_PHASE === "refresh") taggedFetches += 1
         maxInFlight = Math.max(maxInFlight, ++inFlight)
         if (inFlight >= 2) release()
         // A one-at-a-time walk never starts the second fetch, so the wait is bounded.
@@ -3099,6 +3104,7 @@ describe("git super merge — the root's child mains are fetched together (25303
 
     expect(result).toMatchObject({ state: "updated" })
     expect(fetches).toBe(2)
+    expect(taggedFetches).toBe(fetches)
     expect(maxInFlight).toBe(2)
   })
 

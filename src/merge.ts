@@ -2416,7 +2416,15 @@ async function fetchSubmoduleMain(
   const { path, target: pin } = entry
   if (!noFetch) {
     const fetchArgs = ["fetch", "--no-tags", "origin", `+refs/heads/${branch}:refs/remotes/origin/${branch}`]
-    const fetched = await run(git, submodule, fetchArgs, timeoutMs)
+    // Yrd's round Trace2 asks Git to record this per-process tag, so its receipt can
+    // distinguish the component-main refresh from every later SSH read. Scope the
+    // tag to this fetch: other Git commands in the plan are beyond refresh.
+    const fetched = await git.run({
+      repo: submodule,
+      args: fetchArgs,
+      timeoutMs,
+      env: { GIT_SUPER_PHASE: "refresh" },
+    })
     if (fetched.code !== 0) throw submoduleMainError(submodule, path, pin, fetchArgs, fetched)
   }
   const resolveArgs = ["rev-parse", `refs/remotes/origin/${branch}^{commit}`]
