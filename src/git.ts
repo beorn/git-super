@@ -42,10 +42,12 @@ export type GitResult = Readonly<{
   stderr: string
 }>
 
-export function tryGit(cwd: string, args: readonly string[]): GitResult {
+export function tryGit(cwd: string, args: readonly string[], indexFile?: string): GitResult {
+  const env = cleanGitRepositoryEnvironment()
+  if (indexFile !== undefined) env.GIT_INDEX_FILE = indexFile
   const result = spawnSync("git", ["-C", cwd, ...args], {
     encoding: "utf8",
-    env: cleanGitRepositoryEnvironment(),
+    env,
     maxBuffer: 64 * 1024 * 1024,
   })
   if (result.error) throw new Error(`failed to run git in ${cwd}: ${result.error.message}`)
@@ -56,8 +58,8 @@ export function tryGit(cwd: string, args: readonly string[]): GitResult {
   }
 }
 
-export function runGit(cwd: string, args: readonly string[]): string {
-  const result = tryGit(cwd, args)
+export function runGit(cwd: string, args: readonly string[], indexFile?: string): string {
+  const result = tryGit(cwd, args, indexFile)
   if (result.exitCode !== 0) throw gitError(cwd, args, result.exitCode, result.stderr)
   return result.stdout
 }
