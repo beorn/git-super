@@ -120,8 +120,10 @@ type Probe = Readonly<{
    * this whole classification exists to skip.
    */
   detached: Detachment | undefined
+  heldInWorktree: boolean
   name: string
   path: string
+  referenceHasIt: boolean
   referenceSubmodule: string | undefined
   required: string
 }>
@@ -361,6 +363,8 @@ async function warmReference(git: SubmoduleGit, reference: string, sha: string):
     true,
   )
 }
+
+const REMOTE_PIN_REJECTION = /not our ref|couldn'?t find remote ref|could not find remote ref|unadvertised/iu
 
 /**
  * Guarantee the durable module store line in a materialized submodule's
@@ -688,10 +692,12 @@ export async function materializeSubmodules(
        */
       absentStore: boolean
       detached: Detachment | undefined
+      originRejected?: boolean
       path: string
       reference: string
       required: string
       why: string
+      worktreeSubmodule?: string
     }>
   > = []
 
@@ -784,12 +790,15 @@ export async function materializeSubmodules(
               if (required === undefined) {
                 return { code: 1, stdout: "", stderr: `could not resolve gitlink '${path}' in ${worktree}` }
               }
+              const ownSubmodule = join(worktree, path)
+              const heldInWorktree = await referenceContains(git, ownSubmodule, required)
               const referenceSubmodule = reference === undefined ? undefined : join(reference, path)
-              const canBorrow =
+              const referenceHasIt =
                 referenceSubmodule !== undefined && (await referenceContains(git, referenceSubmodule, required))
+              const canBorrow = heldInWorktree || referenceHasIt
               const detached =
                 canBorrow || reference === undefined ? undefined : await detachedFromReference(git, reference, path)
-              return { canBorrow, detached, name, path, referenceSubmodule, required }
+              return { canBorrow, detached, heldInWorktree, name, path, referenceHasIt, referenceSubmodule, required }
             }),
         )),
       )
@@ -800,8 +809,18 @@ export async function materializeSubmodules(
 
     // PHASE B — THE NETWORK, STRICTLY ONE AT A TIME. Only a miss reaches this
     // loop, so on a healthy reference store it does nothing at all.
-    for (const { canBorrow: borrowable, detached, name, path, referenceSubmodule, required } of probes as Probe[]) {
+    for (const {
+      canBorrow: borrowable,
+      detached,
+      heldInWorktree,
+      name,
+      path,
+      referenceHasIt: refHasIt,
+      referenceSubmodule,
+      required,
+    } of probes as Probe[]) {
       let canBorrow = borrowable
+      let referenceHasIt = refHasIt
       if (!canBorrow && referenceSubmodule !== undefined) {
         // One connection into the reference repairs it for every later bay;
         // sixteen connections out of sixteen candidates repair nothing.
@@ -859,7 +878,8 @@ export async function materializeSubmodules(
           using warmSpan = log?.span?.("warm", { path, required, reference: referenceSubmodule })
           log?.debug?.("warming the reference with one fetch", { path, required })
           const warm = await warmReference(git, referenceSubmodule, required)
-          canBorrow = warm.code === 0 && (await referenceContains(git, referenceSubmodule, required))
+          referenceHasIt = warm.code === 0 && (await referenceContains(git, referenceSubmodule, required))
+          canBorrow = referenceHasIt
           if (warmSpan !== undefined) {
             Object.assign(warmSpan.spanData, { outcome: canBorrow ? "warmed" : "failed" })
           }
@@ -872,9 +892,11 @@ export async function materializeSubmodules(
             misses.push({
               absentStore: false,
               detached: undefined,
+              originRejected: warm.code !== 0 && REMOTE_PIN_REJECTION.test(warm.stderr),
               path,
               reference: referenceSubmodule,
               required,
+              worktreeSubmodule: join(worktree, path),
               why:
                 warm.code === 0
                   ? "warm-up fetch succeeded but the reference still lacks the commit"
@@ -883,7 +905,7 @@ export async function materializeSubmodules(
           }
         }
       }
-      resolved.push({ canBorrow, detached, name, path, referenceSubmodule, required })
+      resolved.push({ canBorrow, detached, heldInWorktree, name, path, referenceHasIt, referenceSubmodule, required })
       considered += 1
     }
     span?.lap("resolve")
@@ -911,9 +933,15 @@ export async function materializeSubmodules(
       )
     }
     const prepared: Array<
-      Readonly<{ args: readonly string[]; name: string; nestedReference: string | undefined; path: string }>
+      Readonly<{
+        args: readonly string[]
+        isLocal: boolean
+        name: string
+        nestedReference: string | undefined
+        path: string
+      }>
     > = []
-    for (const [index, { canBorrow, name, path, referenceSubmodule, required }] of resolved.entries()) {
+    for (const [index, { canBorrow, name, path, referenceHasIt, referenceSubmodule, required }] of resolved.entries()) {
       const configuredUrl = configuredUrls[index]
       if (configuredUrl === undefined || configuredUrl.code !== 0 || configuredUrl.stdout.trim() === "") {
         return {
@@ -922,7 +950,8 @@ export async function materializeSubmodules(
           stderr: configuredUrl?.stderr || `could not resolve configured URL for submodule '${name}' in ${worktree}`,
         }
       }
-      const borrowFrom = canBorrow && referenceSubmodule !== undefined ? referenceSubmodule : undefined
+      const borrowFrom = referenceHasIt && referenceSubmodule !== undefined ? referenceSubmodule : undefined
+      const isLocal = canBorrow
       const args = [
         "-c",
         `submodule.alternateLocation=${SUBMODULE_ALTERNATE_LOCATION}`,
@@ -939,13 +968,13 @@ export async function materializeSubmodules(
         "submodule",
         "update",
         "--init",
-        ...(borrowFrom !== undefined ? ["--no-fetch"] : []),
+        ...(isLocal ? ["--no-fetch"] : []),
         ...(options.force ? ["--force"] : []),
         ...(borrowFrom === undefined ? [] : ["--reference", borrowFrom]),
         "--",
         path,
       ]
-      if (borrowFrom !== undefined) {
+      if (isLocal) {
         borrowed += 1
       } else if (referenceSubmodule !== undefined) {
         remoteFallbacks += 1
@@ -962,7 +991,15 @@ export async function materializeSubmodules(
         unreferenced += 1
         unreferencedPaths.push(path)
       }
-      prepared.push({ args, name, nestedReference: borrowFrom, path })
+      prepared.push({
+        args,
+        isLocal,
+        name,
+        nestedReference:
+          borrowFrom ??
+          (referenceSubmodule !== undefined && existsSync(referenceSubmodule) ? referenceSubmodule : undefined),
+        path,
+      })
     }
     span?.lap("prepare")
     // A borrow clones from a local path and may fan out; a remote fallback
@@ -972,8 +1009,8 @@ export async function materializeSubmodules(
     // (port 22 refused, 443 reset at key exchange) and stopped every fetch,
     // push, submit and landing fleet-wide. Local first, wide; then remote,
     // one at a time.
-    const local = prepared.filter(({ nestedReference }) => nestedReference !== undefined)
-    const viaRemote = prepared.filter(({ nestedReference }) => nestedReference === undefined)
+    const local = prepared.filter(({ isLocal }) => isLocal)
+    const viaRemote = prepared.filter(({ isLocal }) => !isLocal)
     // NO SILENT ERRORS. Until now this counter was incremented, printed, and
     // read by nobody: the exact signal that would have caught 2026-08-21 went
     // into a log with no consumer, and the fleet spent a night inferring a
@@ -1016,19 +1053,36 @@ export async function materializeSubmodules(
         // reported that dead string to @chief as the diagnostic covering the
         // no-reference case. It never covered anything. The real coverage for
         // that case is the refusal below, which needs no reference to fire.
-        .map(
-          ({ path, reference, required, why }) =>
-            `  ${path} needs ${required}\n    reference: ${reference}\n    why: ${why}`,
-        )
+        .map(({ originRejected, path, reference, required, why, worktreeSubmodule }) => {
+          if (originRejected && worktreeSubmodule !== undefined) {
+            return (
+              `  ${path} needs ${required}\n` +
+              `    looked in:\n` +
+              `      - the worktree component store: ${worktreeSubmodule} (commit absent)\n` +
+              `      - the shared reference: ${reference} (commit absent)\n` +
+              `      - origin (fetch failed)\n` +
+              `    why: ${why}`
+            )
+          }
+          return `  ${path} needs ${required}\n    reference: ${reference}\n    why: ${why}`
+        })
         .join("\n")
-      // THREE CLASSES, THREE REMEDIES, AND ONLY THE APPLICABLE ONES PRINT. A
+      // FOUR CLASSES, FOUR REMEDIES, AND ONLY THE APPLICABLE ONES PRINT. A
       // cold store is repaired by a fetch; an absent store must be populated
       // first, and a fetch aimed at one lands nowhere; a removed submodule is
       // not repairable at all, and printing either command beside it is what
       // sent branch owners to provision a store the repository had deliberately
-      // dropped.
+      // dropped; a pin genuinely missing everywhere must not prescribe fetching
+      // from origin and must name submitting the component change.
       const removed = misses.filter(({ detached }) => detached !== undefined)
-      const repairable = misses.filter(({ absentStore, detached }) => !absentStore && detached === undefined)
+      const absentStores = misses.filter(({ absentStore }) => absentStore)
+      const missingEverywhere = misses.filter(
+        ({ absentStore, detached, originRejected }) =>
+          !absentStore && detached === undefined && Boolean(originRejected),
+      )
+      const repairable = misses.filter(
+        ({ absentStore, detached, originRejected }) => !absentStore && detached === undefined && !originRejected,
+      )
       const detachmentRemedy =
         removed.length === 0
           ? ""
@@ -1044,6 +1098,19 @@ export async function materializeSubmodules(
             `A rebase does not help either; it still materializes this tree.\n` +
             `Re-author the change onto a branch cut from current ${reference} HEAD, and close the original ` +
             `as superseded once the replacement is on the landing branch by content.\n`
+      const missingEverywhereRemedy =
+        missingEverywhere.length === 0
+          ? ""
+          : `\nThe pin is absent from the worktree component store, the shared reference, and origin.\n` +
+            `Do NOT attempt to fetch it from origin; origin cannot have this commit.\n` +
+            `Cure: submitting the component change or fetching from the worktree that holds it:\n` +
+            missingEverywhere
+              .map(
+                ({ reference, required }) =>
+                  `  git -C ${reference} fetch <worktree-holding-it> ${required}:refs/git-super/pins/${required}`,
+              )
+              .join("\n") +
+            `\nOnce the component change is submitted or fetched from the worktree that holds it, retry the sync.\n`
       const repairRemedy =
         repairable.length === 0
           ? ""
@@ -1074,16 +1141,23 @@ export async function materializeSubmodules(
       return {
         code: 1,
         stdout: "",
-        stderr: `${headline}\n${detail}\n${detachmentRemedy}${absentRemedy}${repairRemedy}`,
+        stderr: `${headline}\n${detail}\n${detachmentRemedy}${absentRemedy}${missingEverywhereRemedy}${repairRemedy}`,
       }
     }
     const update = async ({
       args,
+      isLocal,
       name,
       nestedReference,
       path,
-    }: Readonly<{ args: readonly string[]; name: string; nestedReference: string | undefined; path: string }>) => {
-      const source = nestedReference === undefined ? "remote" : "local"
+    }: Readonly<{
+      args: readonly string[]
+      isLocal: boolean
+      name: string
+      nestedReference: string | undefined
+      path: string
+    }>) => {
+      const source = isLocal ? "local" : "remote"
       const submoduleDir = join(worktree, path)
       const freshClone = !existsSync(join(submoduleDir, ".git"))
       // The span closes over the `git.run` ALONE. Letting it wrap the recursive
