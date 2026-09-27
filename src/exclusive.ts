@@ -76,7 +76,7 @@ export async function acquireExclusive(
       options.onContended?.(`${held.holder} (${held.owner}, age ${held.age})`)
     }
     if (now >= deadline) throw busy(path, now, now - startedAt, timeoutMs, holder)
-    await Bun.sleep(1 + Math.floor(fullJitter(pollMs, pollMs, 0)))
+    await Bun.sleep(Math.min(pollMs, 1 + Math.floor(fullJitter(pollMs, pollMs, 0))))
   }
 }
 

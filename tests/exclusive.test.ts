@@ -13,7 +13,7 @@ import { acquireExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS } from "../src/exclusiv
 
 describe("exclusive writer policy", () => {
   // 25677: a contended writer must use a positive shared-jitter delay without exceeding its poll cap.
-  test("keeps a contended poll within its delay cap", async () => {
+  test.each([10, 1.5])("keeps a contended poll within its %s ms delay cap", async (pollIntervalMs) => {
     const dir = await mkdtemp(join(tmpdir(), "git-super-exclusive-"))
     const first = await acquireExclusive(dir, { timeoutMs: 0 }, "holder")
     const delays: number[] = []
@@ -26,11 +26,11 @@ describe("exclusive writer policy", () => {
       released = true
     })
     try {
-      const second = await acquireExclusive(dir, { timeoutMs: 100, pollIntervalMs: 10 }, "contender")
+      const second = await acquireExclusive(dir, { timeoutMs: 100, pollIntervalMs }, "contender")
       second.release()
       expect(delays).toHaveLength(1)
       expect(delays[0]).toBeGreaterThan(0)
-      expect(delays[0]).toBeLessThanOrEqual(10)
+      expect(delays[0]).toBeLessThanOrEqual(pollIntervalMs)
     } finally {
       if (!released) first.release()
       vi.restoreAllMocks()
