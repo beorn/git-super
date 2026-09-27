@@ -21,6 +21,7 @@ import {
   type SubmoduleGitResult,
 } from "../src/submodules.ts"
 import { createLocalGitProcess, type GitProcessRequest } from "../src/process.ts"
+import { createLocalGitWorktreeStore } from "../src/worktree.ts"
 import { cleanGitRepositoryEnvironment } from "../src/git.ts"
 
 const success = (): SubmoduleGitResult => ({ code: 0, stdout: "", stderr: "" })
@@ -1674,6 +1675,57 @@ describe("materializeSubmodules", () => {
       // Condition 2: assert component origin/main equals remote, and name the stale value it would have had
       expect(candidateOriginMain).toBe(cRemote)
       expect(candidateOriginMain).not.toBe(cStale)
+    } finally {
+      if (previousGitAllowProtocol === undefined) delete process.env.GIT_ALLOW_PROTOCOL
+      else process.env.GIT_ALLOW_PROTOCOL = previousGitAllowProtocol
+    }
+  })
+
+  it("initializes component origin/main via worktree store on fresh borrowed clone", async () => {
+    const root = await mkdtemp(join(tmpdir(), "git-super-store-origin-main-"))
+    roots.push(root)
+    const depRemote = join(root, "dep-remote.git")
+    git(root, ["init", "-q", "--bare", "--initial-branch=main", depRemote])
+
+    const depWork = join(root, "dep-work")
+    git(root, ["clone", "-q", depRemote, depWork])
+    git(depWork, ["config", "user.name", "Git Super Test"])
+    git(depWork, ["config", "user.email", "git-super@example.invalid"])
+    writeFileSync(join(depWork, "file.txt"), "v1\n")
+    git(depWork, ["add", "file.txt"])
+    git(depWork, ["commit", "-qm", "v1"])
+    git(depWork, ["push", "-q", "origin", "main"])
+    const cRemote = git(depWork, ["rev-parse", "HEAD"]).trim()
+
+    const owner = join(root, "owner")
+    git(root, ["init", "-q", "-b", "main", owner])
+    git(owner, ["config", "user.name", "Git Super Test"])
+    git(owner, ["config", "user.email", "git-super@example.invalid"])
+    git(owner, ["config", "protocol.file.allow", "always"])
+    writeFileSync(join(owner, "README.md"), "owner\n")
+    git(owner, ["add", "README.md"])
+    git(owner, ["commit", "-qm", "init owner"])
+    git(owner, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", depRemote, "vendor/dep"])
+    git(owner, ["commit", "-qm", "add dep"])
+    git(owner, ["submodule", "update", "--init"])
+
+    // Delete local branch main in ownerDep so clone via insteadOf creates no tracking main
+    const ownerDep = join(owner, "vendor/dep")
+    git(ownerDep, ["checkout", "-q", "--detach", cRemote])
+    git(ownerDep, ["branch", "-D", "main"])
+
+    const candidate = join(root, "candidate")
+    git(owner, ["worktree", "add", "-q", "--detach", candidate, "HEAD"])
+
+    const previousGitAllowProtocol = process.env.GIT_ALLOW_PROTOCOL
+    process.env.GIT_ALLOW_PROTOCOL = "file"
+    try {
+      const store = createLocalGitWorktreeStore({ repo: owner })
+      await store.materializeSubmodules(candidate)
+
+      const candidateDep = join(candidate, "vendor/dep")
+      const candidateOriginMain = git(candidateDep, ["rev-parse", "refs/remotes/origin/main"]).trim()
+      expect(candidateOriginMain).toBe(cRemote)
     } finally {
       if (previousGitAllowProtocol === undefined) delete process.env.GIT_ALLOW_PROTOCOL
       else process.env.GIT_ALLOW_PROTOCOL = previousGitAllowProtocol

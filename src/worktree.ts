@@ -123,8 +123,16 @@ export function createGit(
     args: readonly string[],
     allowFailure = false,
     timeoutMs = operationTimeoutMs,
+    options?: Readonly<{ env?: NodeJS.ProcessEnv; stdin?: string }>,
   ): Promise<GitResult> => {
-    const result = await process.run({ repo, args, env, ...(signal === undefined ? {} : { signal }), timeoutMs })
+    const result = await process.run({
+      repo,
+      args,
+      env: options?.env === undefined ? env : { ...env, ...options.env },
+      ...(signal === undefined ? {} : { signal }),
+      ...(options?.stdin === undefined ? {} : { stdin: options.stdin }),
+      timeoutMs,
+    })
     const unsettled = unsettledReason(result, timeoutMs)
     if (unsettled !== undefined) {
       const message = `git ${args.join(" ")} ${unsettled} in ${repo}`
@@ -377,6 +385,10 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
             withHookPolicy(request.args, materializeOptions.hooks),
             true,
             request.timeoutMs,
+            {
+              ...(request.stdin === undefined ? {} : { stdin: request.stdin }),
+              ...(request.env === undefined ? {} : { env: request.env }),
+            },
           )
           return { code: result.code, stdout: result.stdout, stderr: result.stderr }
         },
