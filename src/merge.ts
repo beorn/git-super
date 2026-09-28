@@ -16,7 +16,7 @@ import { ensureCommitObject, pinRef } from "./objects.ts"
 import { prepareSubmoduleTreeUnderLock } from "./submodule-prepare.ts"
 import { mapInOrder } from "./map-in-order.ts"
 import { capturePushIntent, discoverRepository, type ObservedMains, rootPushIdentity } from "./push.ts"
-import { PUSH_INTENT_TRAILER, sameHostedOwner } from "./push-intent.ts"
+import { PUSH_INTENT_TRAILER, sameHostedOwner, sameHostedRepository } from "./push-intent.ts"
 import { createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS, type Exclusive } from "./exclusive.ts"
 import { parseIndexEntries, type IndexEntry } from "./index-entries.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessRequest, type GitProcessResult } from "./process.ts"
@@ -170,11 +170,11 @@ export type SuperMergeOptions = Readonly<{
   timeoutMs?: number
   git?: GitProcess
   exclusive?: Exclusive
-  /** Reports writer-lock contention without writing to stderr from the library. */
+  /** Reports writer-lock contention and unavailable refresh-cache evidence. */
   report?: (line: string) => void
   /**
-   * Emergency / submit preflight: bypass remote network fetches of child mains,
-   * reading local tracking refs or reference stores.
+   * Reuse untouched Equal child mains observed within ten minutes in their
+   * persistent stores. Moved or non-Equal pins always fetch fresh.
    */
   noFetch?: boolean
 }>
@@ -376,7 +376,7 @@ async function mergeUnderLock(
   steps.begin("plan")
   let planned: GitlinkPlans
   try {
-    planned = await planGitlinks(git, root, head, tree, timeoutMs, options.noFetch)
+    planned = await planGitlinks(git, root, head, tree, timeoutMs, options.noFetch, options.report)
   } catch (error) {
     return failed(root, [], resultError(error, "inspect-gitlinks"))
   }
@@ -393,7 +393,7 @@ async function mergeUnderLock(
     forkComposed = forked.composed
     composed = new Map([...composed, ...forked.composed])
     try {
-      planned = await planGitlinks(git, root, head, tree, timeoutMs, options.noFetch)
+      planned = await planGitlinks(git, root, head, tree, timeoutMs, options.noFetch, options.report)
     } catch (error) {
       return failed(root, [], resultError(error, "inspect-gitlinks"))
     }
@@ -1941,6 +1941,7 @@ async function planGitlinks(
   tree: string,
   timeoutMs: number,
   noFetch?: boolean,
+  report?: (line: string) => void,
 ): Promise<GitlinkPlans> {
   const plans: GitlinkPlan[] = []
   const descents: SuperMergeDescentResult[] = []
@@ -2106,6 +2107,7 @@ async function planGitlinks(
           entry,
           timeoutMs,
           noFetch && before.get(entry.path) === entry.target,
+          report,
         ).then(
           (main) => ({ ok: true as const, main }),
           (error: unknown) => ({ ok: false as const, error }),
@@ -2149,7 +2151,7 @@ async function planGitlinks(
       if (fetched?.ok === false) throw fetched.error
       const read =
         fetched?.main ??
-        (await fetchSubmoduleMain(git, repository, submodule, entry, timeoutMs, noFetch && !changedByMerge))
+        (await fetchSubmoduleMain(git, repository, submodule, entry, timeoutMs, noFetch && !changedByMerge, report))
       mains.set(path, read)
       const main = read.oid
       if (entry.target === main) {
@@ -2328,6 +2330,8 @@ async function mergeApplicationFailure(
 
 /** At most this many child mains are fetched at once; the cap push's plan reads use. */
 const MAIN_FETCH_CONCURRENCY = 4
+const MAIN_REFRESH_TTL_MS = 10 * 60_000
+const MAIN_REFRESH_MESSAGE = "git-super component-main refresh"
 
 /** A child main as read from its remote: which remote, which branch, and the commit it named. */
 type SubmoduleMain = Readonly<{ remote: string; destination: string; oid: string; store?: string }>
@@ -2405,44 +2409,90 @@ async function fetchSubmoduleMain(
   entry: CommitSubmodule,
   timeoutMs: number,
   noFetch?: boolean,
+  report?: (line: string) => void,
 ): Promise<SubmoduleMain> {
+  if (entry.url === undefined) throw new Error(`Submodule ${entry.path} has no declared URL while reading its main`)
   const branch = await resolveSubmoduleBranch(
     { run: (request) => git.run({ ...request, timeoutMs }) },
     superproject,
     submodule,
     entry,
-    "origin",
+    entry.url,
   )
   const { path, target: pin } = entry
-  if (!noFetch) {
-    const fetchArgs = ["fetch", "--no-tags", "origin", `+refs/heads/${branch}:refs/remotes/origin/${branch}`]
+  const ref = `refs/remotes/origin/${branch}`
+  // Borrowed checkouts copy tracking refs, but a copy is not a remote
+  // observation. Read and refresh the validated persistent owner first.
+  const alternate = await resolveSubmoduleMainFromAlternates(git, superproject, submodule, entry, branch, timeoutMs)
+  const owner = alternate?.store ?? submodule
+  const originArgs = ["config", "--get", "remote.origin.url"]
+  const originRead = await run(git, owner, originArgs, timeoutMs)
+  if (originRead.code !== 0) throw submoduleMainError(owner, path, pin, originArgs, originRead)
+  const origin = originRead.stdout.trim()
+  const sameOrigin = sameHostedRepository(origin, entry.url)
+  const source = sameOrigin ? origin : entry.url
+  const refreshMessage = `${MAIN_REFRESH_MESSAGE} ${source}`
+  const resolveArgs = ["rev-parse", `${ref}^{commit}`]
+  let resolved = await run(git, owner, resolveArgs, timeoutMs)
+  if (resolved.code !== 0 && noFetch) throw submoduleMainError(owner, path, pin, resolveArgs, resolved)
+  const warn = (operation: string, evidence: string): void => {
+    const line = `git-super merge: ${path} refresh cache in ${owner}: ${operation}; ${evidence.trim().replaceAll(/\s+/gu, " ")}; treating observation as expired\n`
+    if (report === undefined) process.stderr.write(line)
+    else report(line)
+  }
+  if (!sameOrigin) warn("origin identity mismatch", `configured origin ${origin}; declared URL ${entry.url}; fetching declared repository`)
+  let fresh = false
+  if (noFetch && sameOrigin && resolved.code === 0 && resolved.stdout.trim() === pin) {
+    const observation = await run(
+      git,
+      owner,
+      ["reflog", "show", "-1", "--format=%H%x00%gD%x00%gs", "--date=raw", `--grep-reflog=^${MAIN_REFRESH_MESSAGE}`, ref],
+      timeoutMs,
+    )
+    if (observation.code !== 0)
+      warn("cannot read named refresh entry", observation.stderr || `git exited ${observation.code}`)
+    else if (observation.stdout.trim() !== "") {
+      const [oid, selector, message] = observation.stdout.trim().split("\0")
+      const timestamp = selector?.match(/@\{(\d+) [+-]\d{4}\}$/u)?.[1]
+      if (oid === undefined || !OBJECT_ID.test(oid) || timestamp === undefined) {
+        warn("invalid named refresh entry", observation.stdout)
+      } else {
+        const age = Date.now() - Number(timestamp) * 1000
+        if (!Number.isFinite(age) || age < 0) warn("invalid refresh clock", selector ?? "")
+        else fresh = message === refreshMessage && oid === resolved.stdout.trim() && age < MAIN_REFRESH_TTL_MS
+      }
+    }
+  }
+  if (!fresh) {
+    const fetchArgs = ["fetch", "--no-tags", sameOrigin ? "origin" : entry.url, `+refs/heads/${branch}:refs/remotes/origin/${branch}`]
     // Yrd's round Trace2 asks Git to record this per-process tag, so its receipt can
     // distinguish the component-main refresh from every later SSH read. Scope the
     // tag to this fetch: other Git commands in the plan are beyond refresh.
     const fetched = await git.run({
-      repo: submodule,
+      repo: owner,
       args: fetchArgs,
       timeoutMs,
       env: { GIT_SUPER_PHASE: "refresh" },
     })
-    if (fetched.code !== 0) throw submoduleMainError(submodule, path, pin, fetchArgs, fetched)
+    if (fetched.code !== 0) throw submoduleMainError(owner, path, pin, fetchArgs, fetched)
+    resolved = await run(git, owner, resolveArgs, timeoutMs)
+    if (resolved.code !== 0) throw submoduleMainError(owner, path, pin, resolveArgs, resolved)
+    const oid = resolved.stdout.trim()
+    const visibilityArgs = ["cat-file", "-e", `${oid}^{commit}`]
+    const visible = await run(git, submodule, visibilityArgs, timeoutMs)
+    if (visible.code !== 0) throw submoduleMainError(submodule, path, pin, visibilityArgs, visible)
+    const stamp = await run(git, owner, ["reflog", "write", ref, oid, oid, refreshMessage], timeoutMs)
+    if (stamp.code !== 0) warn("cannot record successful refresh", stamp.stderr || `git exited ${stamp.code}`)
   }
-  const resolveArgs = ["rev-parse", `refs/remotes/origin/${branch}^{commit}`]
-  let resolved = await run(git, submodule, resolveArgs, timeoutMs)
-  let resolvedStore: string | undefined
-  if (resolved.code !== 0 && noFetch) {
-    const alternate = await resolveSubmoduleMainFromAlternates(git, superproject, submodule, entry, branch, timeoutMs)
-    if (alternate !== undefined) {
-      resolved = { code: 0, stdout: `${alternate.oid}\n`, stderr: "" }
-      resolvedStore = alternate.store
-    }
-  }
-  if (resolved.code !== 0) throw submoduleMainError(submodule, path, pin, resolveArgs, resolved)
+  if (resolved.code !== 0) throw submoduleMainError(owner, path, pin, resolveArgs, resolved)
   return {
-    remote: "origin",
+    // A source read from the declared URL cannot supply an origin lease when
+    // local config names another repository. The existing freezer must read
+    // that destination independently.
+    remote: sameOrigin ? "origin" : entry.url,
     destination: `refs/heads/${branch}`,
     oid: resolved.stdout.trim(),
-    ...(resolvedStore === undefined ? {} : { store: resolvedStore }),
+    ...(alternate === undefined ? {} : { store: owner }),
   }
 }
 
