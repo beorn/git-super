@@ -365,4 +365,30 @@ describe("git super diff --stat / --patch human output", () => {
     ).toBe(0)
     expect(stdout.output).toContain(" logo.bin | Bin")
   })
+
+  test("diff --stat over a dirty submodule lists its changed files under its own repository", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-diff-dirty-submodule-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    writeFileSync(join(fixture.product, "packages/alpha/alpha.ts"), "export const alpha = 999;\n")
+
+    const result = superDiff({ repo: fixture.product, stat: true, patch: true })
+
+    expect(result.paths).toEqual(["packages/alpha/alpha.ts"])
+    expect(result.stats?.map((s) => s.repository)).toEqual([".", "packages/alpha"])
+    const [root, alpha] = result.stats ?? []
+    expect(root?.files).toEqual([])
+    expect(root?.pointerMoves).toEqual([])
+    expect(alpha?.files).toEqual([{ path: "alpha.ts", added: 1, deleted: 1, binary: false }])
+    expect(alpha?.totals).toEqual({ files: 1, added: 1, deleted: 1 })
+    expect(alpha?.pointerMoves).toEqual([])
+
+    const stdout = outputSink()
+    const stderr = outputSink()
+    expect(await runCli(["--repo", fixture.product, "diff", "--stat"], stdout, stderr)).toBe(0)
+    expect(stdout.output).toContain("== packages/alpha ==")
+    expect(stdout.output).toContain(" alpha.ts | +1 -1")
+    expect(stdout.output).toContain(" 1 file changed, 1 insertion(+), 1 deletion(-)")
+    expect(stdout.output).not.toContain("pointer")
+  })
 })

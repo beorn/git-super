@@ -170,19 +170,32 @@ export function recursiveNameStatusDiff(options: RecursiveNameStatusOptions): Re
           "no old/new commit range exists for expansion",
       )
     }
+    const isDirtySubmodule = move.oldPin === move.newPin
     const nestedPrefix = prefixPath(options.prefix, move.path)
     const nestedRoot = repositoryRoot(join(root, move.path))
     const nested = recursiveNameStatusDiff({
       repo: nestedRoot,
       prefix: nestedPrefix,
-      refs: [`${move.oldPin}..${move.newPin}`],
-      ...(options.diffFilter === undefined ? {} : { diffFilter: options.diffFilter }),
-      consulted: {
-        path: nestedPrefix,
-        root: nestedRoot,
-        from: move.oldPin,
-        to: move.newPin,
-      },
+      ...(isDirtySubmodule
+        ? {
+            refs: [move.oldPin],
+            ...(options.diffFilter === undefined ? {} : { diffFilter: options.diffFilter }),
+            consulted: {
+              path: nestedPrefix,
+              root: nestedRoot,
+              from: move.oldPin,
+            },
+          }
+        : {
+            refs: [`${move.oldPin}..${move.newPin}`],
+            ...(options.diffFilter === undefined ? {} : { diffFilter: options.diffFilter }),
+            consulted: {
+              path: nestedPrefix,
+              root: nestedRoot,
+              from: move.oldPin,
+              to: move.newPin,
+            },
+          }),
     })
     entries.push(...nested.entries)
     consultedRepositories.push(...nested.consultedRepositories)
@@ -247,6 +260,13 @@ function rangeArgsFor(entry: ConsultedRepository, options: SuperDiffOptions): st
       `${entry.from}..${entry.to}`,
     ]
   }
+  if (entry.from !== undefined) {
+    return [
+      "--no-renames",
+      ...(options.diffFilter === undefined ? [] : [`--diff-filter=${options.diffFilter}`]),
+      entry.from,
+    ]
+  }
   return commonDiffArgs(options)
 }
 
@@ -269,10 +289,20 @@ function pointerMovesFor(entry: ConsultedRepository, all: readonly ConsultedRepo
   return all
     .filter((candidate): candidate is ConsultedRepository & { from: string; to: string } => {
       return (
-        candidate.from !== undefined && candidate.to !== undefined && isDirectChild(entry.path, candidate.path, all)
+        candidate.from !== undefined &&
+        candidate.to !== undefined &&
+        candidate.from !== candidate.to &&
+        isDirectChild(entry.path, candidate.path, all)
       )
     })
     .map((candidate) => ({ path: candidate.path.slice(prefix.length), from: candidate.from, to: candidate.to }))
+}
+
+function directChildSubmodules(entry: ConsultedRepository, all: readonly ConsultedRepository[]): string[] {
+  const prefix = entry.path === "." ? "" : `${entry.path}/`
+  return all
+    .filter((candidate) => isDirectChild(entry.path, candidate.path, all))
+    .map((candidate) => candidate.path.slice(prefix.length))
 }
 
 function parseNumstat(
@@ -295,7 +325,7 @@ function computeRepositoryStat(
   all: readonly ConsultedRepository[],
 ): RepositoryDiffStat {
   const pointerMoves = pointerMovesFor(entry, all)
-  const excluded = new Set(pointerMoves.map((move) => move.path))
+  const excluded = new Set([...pointerMoves.map((move) => move.path), ...directChildSubmodules(entry, all)])
   const raw = runGit(entry.root, ["diff", "--numstat", "-z", ...rangeArgsFor(entry, options)])
   const files = parseNumstat(raw).filter((file) => !excluded.has(file.path))
   const totals = files.reduce<{ files: number; added: number; deleted: number }>(
