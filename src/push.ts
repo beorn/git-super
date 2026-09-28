@@ -1022,7 +1022,10 @@ async function logicalPushUrl(git: GitProcess, repository: string, remote: strin
  * makes the lease the exact main the merge was composed against; a main that moves in between fails that lease at
  * publication, as a moved main already does.
  */
-export type ObservedMains = ReadonlyMap<string, Readonly<{ remote: string; destination: string; oid: string }>>
+export type ObservedMains = ReadonlyMap<
+  string,
+  Readonly<{ remote: string; sourceUrl?: string; destination: string; oid: string }>
+>
 
 /** Freeze the existing recursive planner's inputs before the merge is committed or checked. */
 export async function capturePushIntent(
@@ -1738,10 +1741,12 @@ async function childUpdate(
       expectedDestination: { state: "missing" },
     }
   }
-  // A read from this same remote already resolved the branch (through resolveSubmoduleBranch, from the same
-  // parent and entry) and named its commit; a read from any other remote stands in for nothing.
+  // A nickname can be reconfigured after the merge read it. Only the captured source URL proves that the read
+  // came from this publication destination. Older producers have no such proof and observe independently.
   const known = observedMains?.get(requirement.path)
-  const reused = known?.remote === remote ? known : undefined
+  const destinationUrl = await logicalPushUrl(git, requirement.repository, remote)
+  const reused =
+    known?.sourceUrl !== undefined && sameHostedRepository(known.sourceUrl, destinationUrl) ? known : undefined
   const destination =
     reused?.destination ??
     `refs/heads/${await resolveSubmoduleBranch(git, requirement.superproject, requirement.repository, requirement.entry, remote)}`
@@ -1749,13 +1754,19 @@ async function childUpdate(
     reused === undefined
       ? await observeDestination(
           git,
-          { repository: requirement.repository, remote, destination },
+          { repository: requirement.repository, remote: destinationUrl, destination },
           "observe-submodule-destination",
         )
       : { state: "oid", oid: reused.oid }
   let source = requirement.target
   if (observed.state === "oid") {
-    await ensureCommitObject({ repository: requirement.repository, remote, commit: observed.oid, timeoutMs, git })
+    await ensureCommitObject({
+      repository: requirement.repository,
+      remote: destinationUrl,
+      commit: observed.oid,
+      timeoutMs,
+      git,
+    })
     const args = ["merge-base", "--is-ancestor", requirement.target, observed.oid]
     const contained = await git.run({ repo: requirement.repository, args })
     if (contained.code === 0 && !contained.timedOut && contained.failure === undefined) source = observed.oid

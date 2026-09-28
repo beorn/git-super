@@ -1947,7 +1947,7 @@ async function planGitlinks(
   const descents: SuperMergeDescentResult[] = []
   const checkouts = new Map<string, GitlinkCheckoutPlan>()
   const stores = new Map<string, string>()
-  const mains = new Map<string, { remote: string; destination: string; oid: string }>()
+  const mains = new Map<string, { remote: string; sourceUrl: string; destination: string; oid: string }>()
   const visiting = new Set<string>()
   const completed = new Set<string>()
 
@@ -2334,7 +2334,7 @@ const MAIN_REFRESH_TTL_MS = 10 * 60_000
 const MAIN_REFRESH_MESSAGE = "git-super component-main refresh"
 
 /** A child main as read from its remote: which remote, which branch, and the commit it named. */
-type SubmoduleMain = Readonly<{ remote: string; destination: string; oid: string; store?: string }>
+type SubmoduleMain = Readonly<{ remote: string; sourceUrl: string; destination: string; oid: string; store?: string }>
 
 type AlternateResolution = Readonly<{ oid: string; store: string }>
 
@@ -2440,18 +2440,30 @@ async function fetchSubmoduleMain(
     if (report === undefined) process.stderr.write(line)
     else report(line)
   }
-  if (!sameOrigin) warn("origin identity mismatch", `configured origin ${origin}; declared URL ${entry.url}; fetching declared repository`)
+  if (!sameOrigin)
+    warn(
+      "origin identity mismatch",
+      `configured origin ${origin}; declared URL ${entry.url}; fetching declared repository`,
+    )
   let fresh = false
   if (noFetch && sameOrigin && resolved.code === 0 && resolved.stdout.trim() === pin) {
     const observation = await run(
       git,
       owner,
-      ["reflog", "show", "-1", "--format=%H%x00%gD%x00%gs", "--date=raw", `--grep-reflog=^${MAIN_REFRESH_MESSAGE}`, ref],
+      [
+        "reflog",
+        "show",
+        "-1",
+        "--format=%H%x00%gD%x00%gs",
+        "--date=raw",
+        `--grep-reflog=^${MAIN_REFRESH_MESSAGE}`,
+        ref,
+      ],
       timeoutMs,
     )
-    if (observation.code !== 0)
+    if (observation.code !== 0) {
       warn("cannot read named refresh entry", observation.stderr || `git exited ${observation.code}`)
-    else if (observation.stdout.trim() !== "") {
+    } else if (observation.stdout.trim() !== "") {
       const [oid, selector, message] = observation.stdout.trim().split("\0")
       const timestamp = selector?.match(/@\{(\d+) [+-]\d{4}\}$/u)?.[1]
       if (oid === undefined || !OBJECT_ID.test(oid) || timestamp === undefined) {
@@ -2464,7 +2476,7 @@ async function fetchSubmoduleMain(
     }
   }
   if (!fresh) {
-    const fetchArgs = ["fetch", "--no-tags", sameOrigin ? "origin" : entry.url, `+refs/heads/${branch}:refs/remotes/origin/${branch}`]
+    const fetchArgs = ["fetch", "--no-tags", source, `+refs/heads/${branch}:refs/remotes/origin/${branch}`]
     // Yrd's round Trace2 asks Git to record this per-process tag, so its receipt can
     // distinguish the component-main refresh from every later SSH read. Scope the
     // tag to this fetch: other Git commands in the plan are beyond refresh.
@@ -2486,10 +2498,8 @@ async function fetchSubmoduleMain(
   }
   if (resolved.code !== 0) throw submoduleMainError(owner, path, pin, resolveArgs, resolved)
   return {
-    // A source read from the declared URL cannot supply an origin lease when
-    // local config names another repository. The existing freezer must read
-    // that destination independently.
-    remote: sameOrigin ? "origin" : entry.url,
+    remote: "origin",
+    sourceUrl: source,
     destination: `refs/heads/${branch}`,
     oid: resolved.stdout.trim(),
     ...(alternate === undefined ? {} : { store: owner }),

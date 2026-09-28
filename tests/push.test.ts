@@ -2362,6 +2362,7 @@ describe("a frozen push works only on the children its merge moved (25303, obser
     }
     const read = (path: "child" | "other") => ({
       remote: "origin",
+      sourceUrl: shape.hosted(path),
       destination: "refs/heads/main",
       oid: shape.before[path],
     })
@@ -2388,38 +2389,66 @@ describe("a frozen push works only on the children its merge moved (25303, obser
     })
   })
 
-  test("capture observes a child whose earlier read came from another remote (25570 control)", async () => {
-    const shape = twoChildFrozenMerge("capture-other-branch")
-    const tree = git(shape.root, "rev-parse", `${shape.merge}^{tree}`)
-    const moved = shape.moveMain("child")
-    const calls: string[][] = []
-    const local = createLocalGitProcess()
-    const recording: GitProcess = {
-      run: (request) => {
-        calls.push([...request.args])
-        return local.run(request)
-      },
-    }
+  // @failure: an old or differently sourced observation freezes a lease for the wrong repository.
+  // @level: l1 — real Git capture consumer with hosted URLs routed to local bare repositories.
+  // @consumer: capturePushIntent must independently observe an unproven publication destination.
+  // @testonly: none; existing GitProcess recording and recursive fixture.
+  test.each(["another source", "old producer", "origin changed"])(
+    "capture independently observes an unproven child main: %s",
+    async (scenario) => {
+      const shape = twoChildFrozenMerge("capture-other-branch")
+      const tree = git(shape.root, "rev-parse", `${shape.merge}^{tree}`)
+      const moved = shape.moveMain("child")
+      if (scenario === "origin changed") {
+        const replacement = shape.hosted("replacement")
+        const child = join(shape.root, "child")
+        // The source was already observed. Change only the logical origin identity before freezing.
+        // Its new destination has the moved main, so it must be observed independently.
+        const physicalRemote = git(child, "remote", "get-url", "origin")
+        git(child, "config", `url.${physicalRemote}.insteadOf`, replacement)
+        git(child, "remote", "set-url", "origin", replacement)
+      }
+      const calls: string[][] = []
+      const local = createLocalGitProcess()
+      const recording: GitProcess = {
+        run: (request) => {
+          calls.push([...request.args])
+          return local.run(request)
+        },
+      }
 
-    const capture = capturePushIntent(
-      recording,
-      shape.root,
-      shape.rootBefore,
-      tree,
-      new Map(),
-      30_000,
-      undefined,
-      new Map([["child", { remote: "upstream", destination: "refs/heads/main", oid: shape.before.child }]]),
-    )
+      const capture = capturePushIntent(
+        recording,
+        shape.root,
+        shape.rootBefore,
+        tree,
+        new Map(),
+        30_000,
+        undefined,
+        new Map([
+          [
+            "child",
+            {
+              remote: scenario === "another source" ? "upstream" : "origin",
+              ...(scenario === "old producer"
+                ? {}
+                : { sourceUrl: scenario === "another source" ? shape.hosted("upstream") : shape.hosted("child") }),
+              destination: "refs/heads/main",
+              oid: shape.before.child,
+            },
+          ],
+        ]),
+      )
 
-    // Observed, not reused: the freeze sees the moved main and refuses the child that no longer fast-forwards, as a
-    // refusal with a cure rather than a git failure (25591).
-    await expect(capture).rejects.toMatchObject({
-      message: expect.stringContaining(`does not contain required commit ${moved}`),
-      resultDetail: { code: "gitlink-publication-non-fast-forward" },
-    })
-    expect(calls.filter(isObservation).length).toBeGreaterThan(0)
-  })
+      // Observed, not reused: the freeze sees the moved main and refuses the child that no longer fast-forwards, as a
+      // refusal with a cure rather than a git failure (25591).
+      await expect(capture).rejects.toMatchObject({
+        message: expect.stringContaining(`does not contain required commit ${moved}`),
+        resultDetail: { code: "gitlink-publication-non-fast-forward" },
+      })
+      expect(calls.filter(isObservation).length).toBeGreaterThan(0)
+    },
+  )
 
   test("observes a plan's destinations concurrently, at most four at a time", async () => {
     const shape = twoChildFrozenMerge("concurrent")

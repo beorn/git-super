@@ -1737,7 +1737,9 @@ describe("git super merge", () => {
     const candidate = candidateWithRootChange(fixture, "candidate-unreadable")
     const submodule = join(fixture.product, "packages/alpha")
     git(fixture.product, "config", "submodule.packages/alpha.branch", "main")
-    git(submodule, "remote", "set-url", "origin", join(fixtureRoot, "missing-alpha-origin"))
+    const origin = git(submodule, "config", "--get", "remote.origin.url")
+    git(submodule, "config", "--unset-all", `url.${fixture.alpha}.insteadOf`)
+    git(submodule, "config", `url.${join(fixtureRoot, "missing-alpha-origin")}.insteadOf`, origin)
     const headBefore = git(fixture.product, "rev-parse", "HEAD")
     const stdout = outputSink()
     const stderr = outputSink()
@@ -1746,7 +1748,7 @@ describe("git super merge", () => {
     expect(stdout.output).toBe("")
     expect(stderr.output).toContain("submodule-main-unreadable")
     expect(stderr.output).toContain("packages/alpha")
-    expect(stderr.output).toContain("fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main")
+    expect(stderr.output).toContain(`fetch --no-tags ${origin} +refs/heads/main:refs/remotes/origin/main`)
     expect(stderr.output).toContain("owner: the submodule writer")
     expect(git(fixture.product, "rev-parse", "HEAD")).toBe(headBefore)
   })
@@ -3063,7 +3065,7 @@ describe("git super merge — a one-sided fork the merge composes (25389)", () =
 })
 
 describe("git super merge — the root's child mains are fetched together (25303 f2)", () => {
-  /** The descent's own read of one child's main: `fetch --no-tags origin +refs/heads/<branch>:...`. */
+  /** The descent's own read of one child's main: `fetch --no-tags <source> +refs/heads/<branch>:...`. */
   const isMainFetch = (args: readonly string[]): boolean =>
     args[0] === "fetch" && args[1] === "--no-tags" && args.some((arg) => arg.startsWith("+refs/heads/"))
 
@@ -3116,13 +3118,11 @@ describe("git super merge — the root's child mains are fetched together (25303
     const candidate = candidateWithRootChange(fixture, "candidate-order")
     for (const path of ["packages/alpha", "vendor/beta"]) {
       git(fixture.product, "config", `submodule.${path}.branch`, "main")
-      git(
-        join(fixture.product, path),
-        "remote",
-        "set-url",
-        "origin",
-        join(fixtureRoot, `missing-${path.replace("/", "-")}`),
-      )
+      const child = join(fixture.product, path)
+      const origin = git(child, "config", "--get", "remote.origin.url")
+      const repository = path === "packages/alpha" ? fixture.alpha : fixture.beta
+      git(child, "config", "--unset-all", `url.${repository}.insteadOf`)
+      git(child, "config", `url.${join(fixtureRoot, `missing-${path.replace("/", "-")}`)}.insteadOf`, origin)
     }
     const headBefore = git(fixture.product, "rev-parse", "HEAD")
     const local = createLocalGitProcess()
@@ -3294,8 +3294,9 @@ describe("git super merge — bounded reuse of untouched Equal child mains (2562
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-shared-refresh-"))
     roots.push(fixtureRoot)
     const fixture = createProductFixture(fixtureRoot)
-    for (const path of ["packages/alpha", "vendor/beta"])
+    for (const path of ["packages/alpha", "vendor/beta"]) {
       git(fixture.product, "config", `submodule.${path}.branch`, "main")
+    }
     const warm = candidateWithRootChange(fixture, "warm-owner")
     expect(await superMerge({ repo: fixture.product, commit: warm, noFetch: true })).toMatchObject({ state: "updated" })
     const candidate = candidateWithRootChange(fixture, "borrowed-candidate")
@@ -3350,8 +3351,9 @@ describe("git super merge — bounded reuse of untouched Equal child mains (2562
       const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-refresh-evidence-"))
       roots.push(fixtureRoot)
       const fixture = createProductFixture(fixtureRoot)
-      for (const path of ["packages/alpha", "vendor/beta"])
+      for (const path of ["packages/alpha", "vendor/beta"]) {
         git(fixture.product, "config", `submodule.${path}.branch`, "main")
+      }
       const sub = join(fixture.product, "packages/alpha")
       const local = createLocalGitProcess()
       const refreshes: string[] = []
@@ -3437,7 +3439,9 @@ describe("git super merge — bounded reuse of untouched Equal child mains (2562
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-refresh-origin-"))
     roots.push(fixtureRoot)
     const fixture = createProductFixture(fixtureRoot)
-    for (const path of ["packages/alpha", "vendor/beta"]) git(fixture.product, "config", `submodule.${path}.branch`, "main")
+    for (const path of ["packages/alpha", "vendor/beta"]) {
+      git(fixture.product, "config", `submodule.${path}.branch`, "main")
+    }
     const warm = candidateWithRootChange(fixture, "warm-origin")
     expect(await superMerge({ repo: fixture.product, commit: warm, noFetch: true })).toMatchObject({ state: "updated" })
     const replacement = join(fixtureRoot, "replacement")
