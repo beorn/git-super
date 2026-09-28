@@ -130,6 +130,7 @@
       "src/commit-graph.ts",
       "src/exclusive.ts",
       "src/gitlink.ts",
+      "src/gitlink-carrier.ts",
       "src/objects.ts",
       "src/process.ts",
       "src/pull.ts",
