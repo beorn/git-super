@@ -750,13 +750,15 @@ describe("git super merge", () => {
   it("refuses content changes inside a submodule already at the staged pin", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-dirty-pre-settled-checkout-"))
     roots.push(fixtureRoot)
-    const fixture = createProductFixture(fixtureRoot)
+    const fixture = createNestedProductFixture(fixtureRoot)
     const submodule = join(fixture.product, "packages/alpha")
+    const leafCheckout = join(submodule, "apps/maddoc")
+    const recordedAlpha = git(submodule, "rev-parse", "HEAD")
     const newestAlpha = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
     const candidate = candidateWithRootChange(fixture, "candidate-dirty-pre-settled-checkout")
     git(submodule, "fetch", "-q", "origin")
     git(submodule, "checkout", "-q", "--detach", newestAlpha)
-    writeFileSync(join(submodule, "alpha.ts"), "export const alpha = 'uncommitted'\n")
+    writeFileSync(join(leafCheckout, "leaf.ts"), "export const leaf = 'uncommitted'\n")
     const headBefore = git(fixture.product, "rev-parse", "HEAD")
     const indexBefore = git(fixture.product, "write-tree")
     const mergeHead = join(fixture.product, ".git", "MERGE_HEAD")
@@ -777,7 +779,7 @@ describe("git super merge", () => {
       checkouts: [
         {
           path: "packages/alpha",
-          recorded: fixture.alphaBase,
+          recorded: recordedAlpha,
           index: newestAlpha,
           preCheckout: newestAlpha,
           checkout: newestAlpha,
@@ -789,7 +791,7 @@ describe("git super merge", () => {
     expect(git(fixture.product, "write-tree")).toBe(indexBefore)
     expect(existsSync(mergeHead)).toBe(false)
     expect(git(submodule, "rev-parse", "HEAD")).toBe(newestAlpha)
-    expect(git(submodule, "diff", "--", "alpha.ts")).toContain("uncommitted")
+    expect(git(leafCheckout, "diff", "--", "leaf.ts")).toContain("uncommitted")
   })
 
   it("refuses unrelated submodule checkout drift before touching HEAD, index, or MERGE_HEAD", async () => {
@@ -839,8 +841,12 @@ describe("git super merge", () => {
   it("checks out staged gitlink pins before the concluding commit hook", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-hook-coherence-"))
     roots.push(fixtureRoot)
-    const fixture = createProductFixture(fixtureRoot)
-    const newestAlpha = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
+    const fixture = createNestedProductFixture(fixtureRoot)
+    const newestLeaf = raiseNestedPinOnAlphaMain(fixture, "export const leaf = 2\n")
+    const newestAlpha = git(fixture.alpha, "rev-parse", "HEAD")
+    const leafCheckout = join(fixture.product, "packages/alpha/apps/maddoc")
+    // The real 26390 specimen already holds the new nested object, but still checks out the old pin.
+    git(leafCheckout, "fetch", "-q", "origin")
     const candidate = candidateWithRootChange(fixture, "candidate-hook-coherence")
     const hook = join(fixture.product, ".git", "hooks", "pre-commit")
     writeFileSync(
@@ -852,6 +858,12 @@ describe("git super merge", () => {
         "checkout=$(git -C packages/alpha rev-parse HEAD)",
         'if [ "$index" != "$checkout" ]; then',
         '  printf "gitlink drift: index=%s checkout=%s\\n" "$index" "$checkout" >&2',
+        "  exit 23",
+        "fi",
+        'nested=$(git -C packages/alpha rev-parse "$index:apps/maddoc")',
+        "nested_checkout=$(git -C packages/alpha/apps/maddoc rev-parse HEAD)",
+        'if [ "$nested" != "$nested_checkout" ]; then',
+        '  printf "nested gitlink drift: index=%s checkout=%s\\n" "$nested" "$nested_checkout" >&2',
         "  exit 23",
         "fi",
         "",
@@ -866,20 +878,26 @@ describe("git super merge", () => {
     expect(stderr.output).not.toContain("gitlink drift")
     expect(git(fixture.product, "ls-tree", "HEAD", "packages/alpha")).toContain(newestAlpha)
     expect(git(join(fixture.product, "packages/alpha"), "rev-parse", "HEAD")).toBe(newestAlpha)
+    expect(git(leafCheckout, "rev-parse", "HEAD")).toBe(newestLeaf)
     expect(git(fixture.product, "status", "--porcelain=v1")).toBe("")
   })
 
   it("restores every settled checkout to its root-recorded pin when the concluding commit is rejected", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-commit-rollback-"))
     roots.push(fixtureRoot)
-    const fixture = createProductFixture(fixtureRoot)
+    const fixture = createNestedProductFixture(fixtureRoot)
     const submodule = join(fixture.product, "packages/alpha")
+    const leafCheckout = join(submodule, "apps/maddoc")
+    const recordedAlpha = git(submodule, "rev-parse", "HEAD")
     const betaSubmodule = join(fixture.product, "vendor/beta")
-    const newestAlpha = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
+    const newestLeaf = raiseNestedPinOnAlphaMain(fixture, "export const leaf = 2\n")
+    const newestAlpha = git(fixture.alpha, "rev-parse", "HEAD")
     const newestBeta = advanceRepository(fixture.beta, "beta.ts", "export const beta = 2\n")
     const candidate = candidateWithRootChange(fixture, "candidate-commit-rollback")
     git(submodule, "fetch", "-q", "origin")
-    git(submodule, "checkout", "-q", "--detach", newestAlpha)
+    git(leafCheckout, "fetch", "-q", "origin")
+    git(submodule, "checkout", "-q", "--detach", "--recurse-submodules", newestAlpha)
+    expect(git(leafCheckout, "rev-parse", "HEAD")).toBe(newestLeaf)
     const headBefore = git(fixture.product, "rev-parse", "HEAD")
     const hook = join(fixture.product, ".git", "hooks", "pre-commit")
     writeFileSync(hook, "#!/bin/sh\necho commit-policy-refused >&2\nexit 23\n")
@@ -897,10 +915,10 @@ describe("git super merge", () => {
       checkouts: [
         {
           path: "packages/alpha",
-          recorded: fixture.alphaBase,
+          recorded: recordedAlpha,
           index: newestAlpha,
           preCheckout: newestAlpha,
-          checkout: fixture.alphaBase,
+          checkout: recordedAlpha,
           state: "restored",
         },
         {
@@ -913,9 +931,10 @@ describe("git super merge", () => {
         },
       ],
     })
-    expect(result.detail?.evidence).toContain(`recorded=${fixture.alphaBase}`)
-    expect(result.detail?.evidence).toContain(`checkout=${fixture.alphaBase}`)
-    expect(git(submodule, "rev-parse", "HEAD")).toBe(fixture.alphaBase)
+    expect(result.detail?.evidence).toContain(`recorded=${recordedAlpha}`)
+    expect(result.detail?.evidence).toContain(`checkout=${recordedAlpha}`)
+    expect(git(submodule, "rev-parse", "HEAD")).toBe(recordedAlpha)
+    expect(git(leafCheckout, "rev-parse", "HEAD")).toBe(fixture.leafBase)
     expect(git(betaSubmodule, "rev-parse", "HEAD")).toBe(fixture.betaBase)
     expect(git(fixture.product, "rev-parse", "HEAD")).toBe(headBefore)
     expect(git(fixture.product, "rev-parse", "MERGE_HEAD")).toBe(candidate)

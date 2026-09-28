@@ -966,7 +966,8 @@ async function settleSubmoduleCheckouts(
     if (plan === undefined) continue
     if (plan.preCheckout === plan.index) continue
     const submodule = join(root, plan.path)
-    const args = ["checkout", "--detach", plan.index]
+    // The staged parent commit also owns the exact pins of its initialized nested checkouts.
+    const args = ["checkout", "--detach", "--recurse-submodules", plan.index]
     const checkedOut = await run(git, submodule, args, timeoutMs)
     if (checkedOut.code !== 0) {
       rows[index] = { ...plan, checkout: plan.preCheckout, state: "settle-failed" }
@@ -1007,7 +1008,7 @@ async function restoreSubmoduleCheckouts(
     const row = rows[index]
     if (row?.state !== "settled" && row?.state !== "settle-failed") continue
     const submodule = join(root, plan.path)
-    const args = ["checkout", "--detach", plan.recorded]
+    const args = ["checkout", "--detach", "--recurse-submodules", plan.recorded]
     const restored = await run(git, submodule, args, timeoutMs)
     const observed = await run(git, submodule, ["rev-parse", "HEAD^{commit}"], timeoutMs)
     const checkout = observed.code === 0 ? observed.stdout.trim() : undefined
@@ -2440,11 +2441,12 @@ async function fetchSubmoduleMain(
     if (report === undefined) process.stderr.write(line)
     else report(line)
   }
-  if (!sameOrigin)
+  if (!sameOrigin) {
     warn(
       "origin identity mismatch",
       `configured origin ${origin}; declared URL ${entry.url}; fetching declared repository`,
     )
+  }
   let fresh = false
   if (noFetch && sameOrigin && resolved.code === 0 && resolved.stdout.trim() === pin) {
     const observation = await run(
