@@ -183,6 +183,8 @@ A record can retain the merge through commit ancestry while keeping its own tree
 
 A fresh clone can fetch the record and retry publication of its exact merge using the retained child sources, without the author's checkout, a replacement merge, or a materialized child worktree. Retention refs are not automatically reclaimed. External submodules receive no retention writes; indirect record publication refuses when it cannot establish durable external sources without writing external refs.
 
+On first publication of an existing project, a cold owned child store may lack both the pinned commit and its retention ref. Git Super reads that exact ref first. If absent, it fetches advertised branch and tag tips from the frozen child remote and proves one contains the commit before creating the immutable retention ref with an absent lease. An identical concurrent winner succeeds; a conflicting ref, an unreachable commit or a failed read refuses. Adoption retention finishes before child branches or root refs move, and successful retention remains visible if a later publication fails. Warm unchanged children still perform no remote work.
+
 These mechanisms provide ordered publication and retry, not cross-repository rollback. A queue must publish its checked record durably before beginning the landing and retain its root leases for recovery. [Yrd](https://github.com/beorn/yrd#readme) owns queue activation and restart orchestration; the Git Super mechanisms alone do not enable that integration.
 
 ### Worktree with submodules
