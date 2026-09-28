@@ -354,7 +354,7 @@ async function runInvocation(
     .option("--no-verify", "emergency only: bypass ordinary merge and commit hooks")
     .option(
       "--no-fetch",
-      "fetches only the child mains of gitlinks the candidate moves; read local tracking refs for unmoved gitlinks",
+      "reuse untouched Equal main observations under ten minutes old; fetch moved, unequal or expired mains",
     )
     .argument("<commit>", "commit to merge into the current branch")
     .action((commit, options, command) => {
