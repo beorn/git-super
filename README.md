@@ -36,6 +36,8 @@ git super --repo /work/product --json worktree remove <path> --retain <directory
 
 Use `--repo` to name the superproject explicitly for enriched operations. `diff` accepts `--diff-filter`, `--cached`, and `-z`. `status` includes tracked and untracked changes in checked-out submodules. In hook context, `status --index-file <absolute path>` reads the index Git will commit for the root repository only; nested submodules use their own indexes. The JSON root `consultedRepositories` row names the selected index file. A relative or missing index file is refused. `merge-base --is-ancestor` discovers which repository owns the first commit and compares it with that repository's pin in the selected superproject ref.
 
+`status --json` always includes `submoduleProblems`, an empty array when none are found. Each entry names the submodule `path` and `reason`, plus `gitDir` when resolved. Status can exit 0 while reporting these problems: the root read succeeded, but the affected child remains unknown. Ordinary tracked, untracked, and staged gitlink changes remain in `records`. A nonempty `submoduleProblems` array bars worktree removal even when `records` is empty. Non-JSON output names the problems on stderr.
+
 Normal path or porcelain output stays on stdout. A rendered report of the repositories consulted goes to stderr, so existing pipelines stay composable. `--json` puts the result and the consulted repositories together on stdout.
 
 ```json
