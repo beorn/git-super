@@ -12,6 +12,7 @@ import { acquireExclusive } from "../src/exclusive.ts"
 import { superPush } from "../src/push.ts"
 import { decodePushIntent, PUSH_INTENT_TRAILER } from "../src/push-intent.ts"
 import { SUPER_MERGE_STEPS, superMerge } from "../src/merge.ts"
+import { superWorktreeAdd } from "../src/worktree-add.ts"
 import { createLocalGitProcess, type GitProcess } from "../src/process.ts"
 import type { GitResultDetail } from "../src/result.ts"
 import {
@@ -1736,7 +1737,9 @@ describe("git super merge", () => {
     const candidate = candidateWithRootChange(fixture, "candidate-unreadable")
     const submodule = join(fixture.product, "packages/alpha")
     git(fixture.product, "config", "submodule.packages/alpha.branch", "main")
-    git(submodule, "remote", "set-url", "origin", join(fixtureRoot, "missing-alpha-origin"))
+    const origin = git(submodule, "config", "--get", "remote.origin.url")
+    git(submodule, "config", "--unset-all", `url.${fixture.alpha}.insteadOf`)
+    git(submodule, "config", `url.${join(fixtureRoot, "missing-alpha-origin")}.insteadOf`, origin)
     const headBefore = git(fixture.product, "rev-parse", "HEAD")
     const stdout = outputSink()
     const stderr = outputSink()
@@ -1745,7 +1748,7 @@ describe("git super merge", () => {
     expect(stdout.output).toBe("")
     expect(stderr.output).toContain("submodule-main-unreadable")
     expect(stderr.output).toContain("packages/alpha")
-    expect(stderr.output).toContain("fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main")
+    expect(stderr.output).toContain(`fetch --no-tags ${origin} +refs/heads/main:refs/remotes/origin/main`)
     expect(stderr.output).toContain("owner: the submodule writer")
     expect(git(fixture.product, "rev-parse", "HEAD")).toBe(headBefore)
   })
@@ -3062,7 +3065,7 @@ describe("git super merge — a one-sided fork the merge composes (25389)", () =
 })
 
 describe("git super merge — the root's child mains are fetched together (25303 f2)", () => {
-  /** The descent's own read of one child's main: `fetch --no-tags origin +refs/heads/<branch>:...`. */
+  /** The descent's own read of one child's main: `fetch --no-tags <source> +refs/heads/<branch>:...`. */
   const isMainFetch = (args: readonly string[]): boolean =>
     args[0] === "fetch" && args[1] === "--no-tags" && args.some((arg) => arg.startsWith("+refs/heads/"))
 
@@ -3115,13 +3118,11 @@ describe("git super merge — the root's child mains are fetched together (25303
     const candidate = candidateWithRootChange(fixture, "candidate-order")
     for (const path of ["packages/alpha", "vendor/beta"]) {
       git(fixture.product, "config", `submodule.${path}.branch`, "main")
-      git(
-        join(fixture.product, path),
-        "remote",
-        "set-url",
-        "origin",
-        join(fixtureRoot, `missing-${path.replace("/", "-")}`),
-      )
+      const child = join(fixture.product, path)
+      const origin = git(child, "config", "--get", "remote.origin.url")
+      const repository = path === "packages/alpha" ? fixture.alpha : fixture.beta
+      git(child, "config", "--unset-all", `url.${repository}.insteadOf`)
+      git(child, "config", `url.${join(fixtureRoot, `missing-${path.replace("/", "-")}`)}.insteadOf`, origin)
     }
     const headBefore = git(fixture.product, "rev-parse", "HEAD")
     const local = createLocalGitProcess()
@@ -3187,17 +3188,18 @@ describe("git super merge — each child main is read from its remote once (2557
  * @level l1
  * @consumer Yrd submit preflight inspection and offline/no-fetch merges
  */
-describe("git super merge — no-fetch bypasses remote reads of child mains (25626)", () => {
+describe("git super merge — bounded reuse of untouched Equal child mains (25626)", () => {
   const isRemoteRead = (args: readonly string[]): boolean =>
     args[0] === "ls-remote" || (args[0] === "fetch" && args.some((arg) => arg.startsWith("+refs/heads/")))
 
-  it("performs zero remote fetches when noFetch is true and tracking refs exist locally", async () => {
+  it("refreshes untouched Equal mains once per ten minutes, including unchanged refs with logging disabled", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-25626-nofetch-"))
     roots.push(fixtureRoot)
     const fixture = createProductFixture(fixtureRoot)
     const candidate = candidateWithRootChange(fixture, "candidate-nofetch")
     for (const path of ["packages/alpha", "vendor/beta"]) {
       git(fixture.product, "config", `submodule.${path}.branch`, "main")
+      git(join(fixture.product, path), "config", "core.logAllRefUpdates", "false")
     }
     const local = createLocalGitProcess()
     const reads: string[] = []
@@ -3211,7 +3213,251 @@ describe("git super merge — no-fetch bypasses remote reads of child mains (256
     const result = await superMerge({ repo: fixture.product, commit: candidate, noFetch: true, git: recording })
 
     expect(result).toMatchObject({ state: "updated" })
+    expect(reads.sort()).toEqual(["packages/alpha", "vendor/beta"])
+    reads.length = 0
+
+    const advanced = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
+    const withinTtl = candidateWithRootChange(fixture, "candidate-within-ttl")
+    expect(await superMerge({ repo: fixture.product, commit: withinTtl, noFetch: true, git: recording })).toMatchObject(
+      { state: "updated" },
+    )
     expect(reads).toEqual([])
+    expect(git(fixture.product, "rev-parse", "HEAD:packages/alpha")).toBe(fixture.alphaBase)
+
+    // Fake only the reader's clock: the real Git refresh stamp remains wall time.
+    const afterTtl = candidateWithRootChange(fixture, "candidate-after-ttl")
+    vi.useFakeTimers({ toFake: ["Date"] })
+    try {
+      vi.setSystemTime(Date.now() + 601_000)
+      expect(
+        await superMerge({ repo: fixture.product, commit: afterTtl, noFetch: true, git: recording }),
+      ).toMatchObject({ state: "updated" })
+      expect(reads.sort()).toEqual(["packages/alpha", "vendor/beta"])
+      expect(git(fixture.product, "rev-parse", "HEAD:packages/alpha")).toBe(advanced)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  /**
+   * @failure Cached non-Equal child mains raise stale pins or falsely refuse an already published child.
+   * @level l1
+   * @consumer Yrd round and submit composition
+   * @testonly none
+   */
+  it.each(["Behind", "Ahead", "Diverged"] as const)(
+    "refreshes an untouched cached %s before deciding",
+    async (classification) => {
+      const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-stale-main-"))
+      roots.push(fixtureRoot)
+      const fixture = createProductFixture(fixtureRoot)
+      const sub = join(fixture.product, "packages/alpha")
+      let fresh = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
+      git(sub, "fetch", "-q", "origin")
+      if (classification === "Behind") fresh = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 3\n")
+      if (classification !== "Behind") {
+        git(sub, "checkout", "-q", fresh)
+        git(fixture.product, "add", "packages/alpha")
+        git(fixture.product, "commit", "-q", "-m", "record already published alpha")
+      }
+      if (classification === "Ahead") {
+        git(sub, "update-ref", "refs/remotes/origin/main", fixture.alphaBase)
+      } else if (classification === "Diverged") {
+        git(sub, "checkout", "-q", fixture.alphaBase)
+        const offMain = advanceRepository(sub, "off-main.txt", "other branch\n")
+        git(sub, "update-ref", "refs/remotes/origin/main", offMain)
+        git(sub, "checkout", "-q", fresh)
+      }
+      const candidate = candidateWithRootChange(fixture, `candidate-stale-${classification.toLowerCase()}`)
+      const local = createLocalGitProcess()
+      const refreshed: string[] = []
+      const recording: GitProcess = {
+        run: (request) => {
+          if (request.env?.GIT_SUPER_PHASE === "refresh") refreshed.push(relative(fixture.product, request.repo))
+          return local.run(request)
+        },
+      }
+      const result = await superMerge({ repo: fixture.product, commit: candidate, noFetch: true, git: recording })
+      expect(result).toMatchObject({ state: "updated", partial: false })
+      expect(refreshed).toContain("packages/alpha")
+      expect(git(fixture.product, "rev-parse", "HEAD:packages/alpha")).toBe(fresh)
+    },
+  )
+
+  /**
+   * @failure New borrowed round clones reset or lose freshness and refresh every component again.
+   * @level l1
+   * @consumer Yrd candidate workspaces sharing a persistent reference
+   * @testonly none
+   */
+  it("shares refresh observations across borrowed worktrees without treating copied refs as fresh", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-shared-refresh-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    for (const path of ["packages/alpha", "vendor/beta"]) {
+      git(fixture.product, "config", `submodule.${path}.branch`, "main")
+    }
+    const warm = candidateWithRootChange(fixture, "warm-owner")
+    expect(await superMerge({ repo: fixture.product, commit: warm, noFetch: true })).toMatchObject({ state: "updated" })
+    const candidate = candidateWithRootChange(fixture, "borrowed-candidate")
+    const head = git(fixture.product, "rev-parse", "HEAD")
+    const local = createLocalGitProcess()
+    const refreshed: string[] = []
+    const recording: GitProcess = {
+      run: (request) => {
+        if (request.env?.GIT_SUPER_PHASE === "refresh") refreshed.push(request.repo)
+        return local.run(request)
+      },
+    }
+    const first = join(fixtureRoot, "round-one")
+    expect(
+      await superWorktreeAdd({ repo: fixture.product, path: first, commit: head, reference: fixture.product }),
+    ).toMatchObject({ state: "updated" })
+    const firstResult = await superMerge({ repo: first, commit: candidate, noFetch: true, git: recording })
+    expect(firstResult, JSON.stringify(firstResult)).toMatchObject({ state: "updated" })
+    expect(refreshed).toEqual([])
+    const advanced = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
+    const second = join(fixtureRoot, "round-two")
+    vi.useFakeTimers({ toFake: ["Date"] })
+    try {
+      vi.setSystemTime(Date.now() + 601_000)
+      expect(
+        await superWorktreeAdd({ repo: fixture.product, path: second, commit: head, reference: fixture.product }),
+      ).toMatchObject({ state: "updated" })
+      expect(await superMerge({ repo: second, commit: candidate, noFetch: true, git: recording })).toMatchObject({
+        state: "updated",
+      })
+      expect(refreshed.sort()).toEqual(
+        [
+          git(join(fixture.product, "packages/alpha"), "rev-parse", "--absolute-git-dir"),
+          git(join(fixture.product, "vendor/beta"), "rev-parse", "--absolute-git-dir"),
+        ].sort(),
+      )
+      expect(git(second, "rev-parse", "HEAD:packages/alpha")).toBe(advanced)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  /**
+   * @failure Uncorrelated, unreadable, future, or unwritten refresh evidence silently grants stale reuse.
+   * @level l1
+   * @consumer Merge callers using bounded component freshness
+   * @testonly none
+   */
+  it.each(["changed OID", "unreadable log", "failed stamp", "future clock"] as const)(
+    "expires %s evidence and reports unavailable metadata once",
+    async (condition) => {
+      const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-refresh-evidence-"))
+      roots.push(fixtureRoot)
+      const fixture = createProductFixture(fixtureRoot)
+      for (const path of ["packages/alpha", "vendor/beta"]) {
+        git(fixture.product, "config", `submodule.${path}.branch`, "main")
+      }
+      const sub = join(fixture.product, "packages/alpha")
+      const local = createLocalGitProcess()
+      const refreshes: string[] = []
+      const warnings: string[] = []
+      let armed = condition === "failed stamp"
+      let injected = 0
+      const recording: GitProcess = {
+        run: (request) => {
+          if (request.env?.GIT_SUPER_PHASE === "refresh") refreshes.push(request.repo)
+          if (
+            armed &&
+            request.repo === sub &&
+            request.args[0] === "reflog" &&
+            ((condition === "unreadable log" && request.args[1] === "show") ||
+              (condition === "failed stamp" && request.args[1] === "write"))
+          ) {
+            injected++
+            return Promise.resolve({ code: 1, stdout: "", stderr: "fixture refresh metadata unavailable" })
+          }
+          return local.run(request)
+        },
+      }
+      const warm = candidateWithRootChange(fixture, "warm-evidence")
+      expect(
+        await superMerge({
+          repo: fixture.product,
+          commit: warm,
+          noFetch: true,
+          git: recording,
+          report: (line) => warnings.push(line),
+        }),
+      ).toMatchObject({ state: "updated" })
+      if (condition === "failed stamp") expect(injected).toBe(1)
+      refreshes.length = 0
+      warnings.length = 0
+      injected = 0
+      armed = true
+      if (condition === "changed OID") {
+        const advanced = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
+        git(sub, "fetch", "-q", "origin")
+        git(sub, "checkout", "-q", advanced)
+        git(fixture.product, "add", "packages/alpha")
+        git(fixture.product, "commit", "-q", "-m", "record separately observed alpha")
+      }
+      const candidate = candidateWithRootChange(fixture, "candidate-evidence")
+      if (condition === "future clock") {
+        vi.useFakeTimers({ toFake: ["Date"] })
+        vi.setSystemTime(Date.now() - 2_000)
+      }
+      try {
+        expect(
+          await superMerge({
+            repo: fixture.product,
+            commit: candidate,
+            noFetch: true,
+            git: recording,
+            report: (line) => warnings.push(line),
+          }),
+        ).toMatchObject({ state: "updated" })
+        expect(refreshes.sort()).toEqual(
+          (condition === "future clock" ? [sub, join(fixture.product, "vendor/beta")] : [sub]).sort(),
+        )
+        if (condition === "changed OID") expect(warnings).toEqual([])
+        else {
+          expect(warnings).toHaveLength(condition === "future clock" ? 2 : 1)
+          expect(warnings[0]).toContain("refresh cache in")
+          expect(warnings[0]).toContain("treating observation as expired")
+        }
+        if (condition === "unreadable log" || condition === "failed stamp") expect(injected).toBe(1)
+      } finally {
+        vi.useRealTimers()
+      }
+    },
+  )
+
+  /**
+   * @failure Switching to another origin with the same tracking OID reuses the old repository's observation.
+   * @level l1
+   * @consumer Merge callers changing a component's declared repository
+   * @testonly none
+   */
+  it("expires an Equal observation when the component origin changes despite an identical cached OID", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-refresh-origin-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    for (const path of ["packages/alpha", "vendor/beta"]) {
+      git(fixture.product, "config", `submodule.${path}.branch`, "main")
+    }
+    const warm = candidateWithRootChange(fixture, "warm-origin")
+    expect(await superMerge({ repo: fixture.product, commit: warm, noFetch: true })).toMatchObject({ state: "updated" })
+    const replacement = join(fixtureRoot, "replacement")
+    git(fixtureRoot, "clone", "-q", fixture.alpha, replacement)
+    const advanced = advanceRepository(replacement, "alpha.ts", "export const alpha = 2\n")
+    const url = "https://git-super.test/owned/replacement-alpha.git"
+    const sub = join(fixture.product, "packages/alpha")
+    git(sub, "remote", "set-url", "origin", url)
+    git(sub, "config", `url.${replacement}.insteadOf`, url)
+    git(fixture.product, "config", "--file", ".gitmodules", "submodule.packages/alpha.url", url)
+    git(fixture.product, "config", "submodule.packages/alpha.url", url)
+    git(fixture.product, "commit", "-q", "-am", "declare replacement origin")
+    const candidate = candidateWithRootChange(fixture, "candidate-origin")
+    const result = await superMerge({ repo: fixture.product, commit: candidate, noFetch: true })
+    expect(result).toMatchObject({ state: "updated", partial: false })
+    expect(git(fixture.product, "rev-parse", "HEAD:packages/alpha")).toBe(advanced)
   })
 
   it("resolves tracking refs from alternates when child clone has no local tracking ref", async () => {
@@ -3229,6 +3475,9 @@ describe("git super merge — no-fetch bypasses remote reads of child mains (256
       const resolvedGitdir = isAbsolute(subGitdir) ? subGitdir : join(sub, subGitdir)
       // Point submodule alternates to the upstream store where refs/remotes/origin/main exists
       const upstreamStore = fixture[path === "packages/alpha" ? "alpha" : "beta"]
+      const url = `https://git-super.test/owned/${path === "packages/alpha" ? "alpha" : "beta"}.git`
+      git(upstreamStore, "remote", "add", "origin", url)
+      git(upstreamStore, "config", `url.${upstreamStore}.insteadOf`, url)
       git(upstreamStore, "update-ref", "refs/remotes/origin/main", git(upstreamStore, "rev-parse", "refs/heads/main"))
       const altFile = join(resolvedGitdir, "objects", "info", "alternates")
       mkdirSync(dirname(altFile), { recursive: true })
@@ -3258,7 +3507,7 @@ describe("git super merge — no-fetch bypasses remote reads of child mains (256
     const result = await superMerge({ repo: fixture.product, commit: candidate, noFetch: true, git: recording })
 
     expect(result).toMatchObject({ state: "updated" })
-    expect(reads).toEqual([])
+    expect(reads.sort()).toEqual(["../alpha/.git", "../beta/.git"])
     // Tracking ref was NOT written into the checkout (writing no tracking ref at all)
     for (const path of ["packages/alpha", "vendor/beta"]) {
       const sub = join(fixture.product, path)
@@ -3338,6 +3587,9 @@ describe("git super merge — no-fetch bypasses remote reads of child mains (256
     mkdirSync(dirname(altSuperAlpha), { recursive: true })
     writeFileSync(altSuperAlpha, `${join(resolvedSubGitdir, "objects")}\n`)
     git(superStoreAlpha, "update-ref", "refs/remotes/origin/main", commitSuper)
+    git(superStoreAlpha, "remote", "add", "origin", "https://git-super.test/owned/alpha.git")
+    git(superStoreAlpha, "config", `url.${sub}.insteadOf`, "https://git-super.test/owned/alpha.git")
+    git(sub, "update-ref", "refs/heads/main", commitSuper)
 
     // Set up submodule alternate
     const storeSub = mkdtempSync(join(tmpdir(), "sub-store-"))
@@ -3417,6 +3669,8 @@ describe("git super merge — no-fetch bypasses remote reads of child mains (256
     for (const path of ["packages/alpha", "vendor/beta"]) {
       git(fixture.product, "config", `submodule.${path}.branch`, "main")
     }
+    const warm = candidateWithRootChange(fixture, "warm-moved-test")
+    expect(await superMerge({ repo: fixture.product, commit: warm, noFetch: true })).toMatchObject({ state: "updated" })
 
     // Move packages/alpha gitlink in candidate, but leave vendor/beta unmoved
     const alphaSub = join(fixture.product, "packages/alpha")
