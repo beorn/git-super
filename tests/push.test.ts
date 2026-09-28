@@ -1977,6 +1977,50 @@ function twoChildFrozenMerge(
     git(remotes[repo], "update-ref", "refs/heads/main", moved)
     return moved
   }
+  const cold = (name: string, retainMoved = true) => {
+    // Submit retains the moved child, but an unchanged pre-Yrd pin has no ref.
+    if (retainMoved) git(child, "push", "-q", remotes.child, `${childSource}:refs/git-super/pins/${childSource}`)
+    git(root, "push", "-q", remotes.root, `${merge}:refs/checks/frozen`)
+    const repo = join(fixture, name)
+    git(fixture, "clone", "-q", "--no-checkout", "--no-local", remotes.root, repo)
+    git(repo, "fetch", "-q", "origin", "refs/checks/frozen")
+    git(repo, "fetch", "-q", root, record)
+    git(repo, "remote", "set-url", "origin", hosted("root"))
+    expect(existsSync(join(repo, ".git", "modules", "other"))).toBe(false)
+    const local = createLocalGitProcess({
+      ...globalThis.process.env,
+      GIT_CONFIG_COUNT: "3",
+      GIT_CONFIG_KEY_0: `url.${remotes.root}.insteadOf`,
+      GIT_CONFIG_VALUE_0: hosted("root"),
+      GIT_CONFIG_KEY_1: `url.${remotes.child}.insteadOf`,
+      GIT_CONFIG_VALUE_1: hosted("child"),
+      GIT_CONFIG_KEY_2: `url.${remotes.other}.insteadOf`,
+      GIT_CONFIG_VALUE_2: hosted("other"),
+    })
+    const calls: { args: string[]; repo: string }[] = []
+    const recording: GitProcess = {
+      run: (request) => {
+        calls.push({ args: [...request.args], repo: request.repo })
+        return local.run(request)
+      },
+    }
+    return {
+      repo,
+      git: recording,
+      calls,
+      push: (route: "leased" | "observed", process: GitProcess = recording) =>
+        superPush({
+          repo,
+          remote: "origin",
+          refspecs:
+            route === "leased"
+              ? [`${merge}:refs/heads/main`]
+              : [`${merge}:refs/heads/main`, `${record}:refs/checks/retained`],
+          recurseSubmodules: "only",
+          git: process,
+        }),
+    }
+  }
   return {
     fixture,
     root,
@@ -1990,6 +2034,7 @@ function twoChildFrozenMerge(
     record,
     calls,
     moveMain,
+    cold,
     maxObserveInFlight: () => maxObserveInFlight,
     /** One frozen merge to main: the leased path, yrd's publish command. */
     push: () =>
@@ -2011,6 +2056,237 @@ function twoChildFrozenMerge(
       }),
   }
 }
+
+/**
+ * @failure Cold adopted pins have no immutable ref; local presence after a
+ * fetch is not remote ancestry, and retention effects must survive later errors.
+ * @level l3
+ * @consumer Yrd's ordinary frozen superPush publication, including its observed fallback.
+ */
+describe("cold first publication retains an existing child pin (26421)", () => {
+  const routes = ["leased", "observed"] as const
+  test.each(routes.flatMap((route) => (["branch", "tag"] as const).map((anchor) => ({ route, anchor }))))(
+    "$route adopts an unchanged pin reachable through an advertised $anchor",
+    async ({ route, anchor }) => {
+      const shape = twoChildFrozenMerge(`adopt-${route}-${anchor}`)
+      const pin = shape.before.other
+      if (anchor === "tag") {
+        git(shape.remotes.other, "tag", "-a", "adopted", pin, "-m", "existing project pin")
+        shape.moveMain("other")
+      }
+      const otherMain = git(shape.remotes.other, "rev-parse", "refs/heads/main")
+      const cold = shape.cold("cold")
+
+      const result = await cold.push(route)
+      expect(result, JSON.stringify(result.detail)).toMatchObject({ state: "updated", partial: false })
+
+      expect(git(shape.remotes.other, "rev-parse", `refs/git-super/pins/${pin}`)).toBe(pin)
+      expect(git(shape.remotes.other, "rev-parse", "refs/heads/main")).toBe(otherMain)
+      expect(git(shape.remotes.child, "rev-parse", "refs/heads/main")).toBe(shape.childSource)
+      expect(git(shape.remotes.root, "rev-parse", "refs/heads/main")).toBe(shape.rootBefore)
+    },
+  )
+
+  test.each(
+    routes.flatMap((route) =>
+      (
+        [
+          "orphan",
+          "conflict",
+          "raced-conflict",
+          "transport",
+          "unreadable",
+          "ancestry-failure",
+          "advertisement-failure",
+        ] as const
+      ).map((fault) => ({ route, fault })),
+    ),
+  )("$route refuses $fault before publishing any branch", async ({ route, fault }) => {
+    const shape = twoChildFrozenMerge(`refuse-${route}-${fault}`)
+    const pin = shape.before.other
+    const ref = `refs/git-super/pins/${pin}`
+    if (fault === "orphan" || fault === "conflict") shape.moveMain("other")
+    const otherMain = git(shape.remotes.other, "rev-parse", "refs/heads/main")
+    const wrongSource =
+      fault === "raced-conflict"
+        ? git(
+            shape.remotes.other,
+            "commit-tree",
+            git(shape.remotes.other, "rev-parse", `${pin}^{tree}`),
+            "-m",
+            "conflicting immutable winner",
+          )
+        : otherMain
+    if (fault === "conflict") git(shape.remotes.other, "update-ref", ref, otherMain)
+    const cold = shape.cold("cold")
+    let injected = false
+    const process: GitProcess = {
+      run: async (request) => {
+        if (
+          (fault === "ancestry-failure" && request.args[0] === "merge-base" && request.args.includes(pin)) ||
+          (fault === "advertisement-failure" &&
+            request.args[0] === "ls-remote" &&
+            request.args.includes(shape.hosted("other")))
+        ) {
+          const result = await cold.git.run(request)
+          injected = true
+          return { ...result, code: 0, failure: "remote proof unavailable" }
+        }
+        if (
+          fault === "raced-conflict" &&
+          request.args[0] === "push" &&
+          !request.args.includes("--dry-run") &&
+          request.args.includes(`${pin}:${ref}`)
+        ) {
+          // Another writer wins after this publisher's missing observation.
+          git(shape.remotes.other, "update-ref", ref, wrongSource)
+          injected = true
+        }
+        if (request.args[0] === "fetch" && request.args.some((arg) => arg === ref || arg.startsWith(`+${ref}:`))) {
+          if (fault === "transport") return { code: 73, stdout: "", stderr: "declared child transport refused" }
+          if (fault === "unreadable") {
+            return {
+              code: 128,
+              stdout: "",
+              stderr: `fatal: couldn't find remote ref ${ref}`,
+              failure: "declared child transport unavailable",
+            }
+          }
+          if (fault === "orphan" && !injected) {
+            // Supply the held object AFTER the initial cold decision. It is
+            // still unreachable from every advertised ref on the frozen remote.
+            git(request.repo, "fetch", "-q", join(shape.fixture, "other-seed"), pin)
+            injected = true
+          }
+        }
+        return cold.git.run(request)
+      },
+    }
+    const result = await cold.push(route, process)
+    expect(result).toMatchObject({ state: fault === "raced-conflict" ? "unknown" : "failed", partial: false })
+    expect(JSON.stringify(fault === "raced-conflict" ? result.repositories : result.detail)).toContain(
+      fault === "transport"
+        ? "declared child transport refused"
+        : fault === "ancestry-failure" || fault === "advertisement-failure"
+          ? "remote proof unavailable"
+          : fault === "unreadable"
+            ? "declared child transport unavailable"
+            : pin,
+    )
+    if (
+      fault === "orphan" ||
+      fault === "raced-conflict" ||
+      fault === "ancestry-failure" ||
+      fault === "advertisement-failure"
+    )
+      expect(injected).toBe(true)
+    expect(git(shape.remotes.other, "rev-parse", "refs/heads/main")).toBe(otherMain)
+    expect(git(shape.remotes.other, "for-each-ref", "--format=%(objectname)", ref)).toBe(
+      fault === "conflict" || fault === "raced-conflict" ? wrongSource : "",
+    )
+    expect(git(shape.remotes.child, "rev-parse", "refs/heads/main")).toBe(shape.before.child)
+    expect(git(shape.remotes.root, "rev-parse", "refs/heads/main")).toBe(shape.rootBefore)
+  })
+
+  test.each(routes)("%s accepts the immutable winner from independent first publishers", async (route) => {
+    const shape = twoChildFrozenMerge(`race-${route}`)
+    const pin = shape.before.other
+    const ref = `refs/git-super/pins/${pin}`
+    const first = shape.cold("first")
+    const second = shape.cold("second")
+    // Race the immutable adoption ref independently of an unrelated concurrent
+    // child-main update: the moved child's source is already published.
+    git(shape.remotes.child, "update-ref", "refs/heads/main", shape.childSource)
+    let observed = 0
+    let release!: () => void
+    const bothMissing = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const racing = (cold: typeof first): GitProcess => ({
+      run: async (request) => {
+        const result = await cold.git.run(request)
+        if (
+          isObservation(request.args) &&
+          request.args.some((arg) => arg.startsWith(`+${ref}:`)) &&
+          result.code !== 0 &&
+          observed < 2
+        ) {
+          observed += 1
+          if (observed === 2) release()
+          await bothMissing
+        }
+        return result
+      },
+    })
+    const results = await Promise.all([first.push(route, racing(first)), second.push(route, racing(second))])
+    expect(observed).toBe(2)
+    for (const result of results) {
+      expect(["updated", "unchanged"], JSON.stringify(result)).toContain(result.state)
+      expect(result.partial).toBe(false)
+    }
+    expect(git(shape.remotes.other, "rev-parse", ref)).toBe(pin)
+  })
+
+  test.each(routes)("%s reports successful cold retention when later child publication fails", async (route) => {
+    const shape = twoChildFrozenMerge(`partial-${route}`)
+    const ref = `refs/git-super/pins/${shape.before.other}`
+    const cold = shape.cold("cold")
+    const process: GitProcess = {
+      run: (request) =>
+        request.args[0] === "push" &&
+        !request.args.includes("--dry-run") &&
+        request.args.includes(`${shape.childSource}:refs/heads/main`)
+          ? Promise.resolve({ code: 73, stdout: "", stderr: "child publication refused after retention" })
+          : cold.git.run(request),
+    }
+    const result = await cold.push(route, process)
+    expect(result).toMatchObject({ state: "failed", partial: true })
+    expect(result.repositories.flatMap((repository) => repository.refs)).toEqual(
+      expect.arrayContaining([expect.objectContaining({ destination: ref, state: "updated" })]),
+    )
+    expect(git(shape.remotes.other, "rev-parse", ref)).toBe(shape.before.other)
+    expect(git(shape.remotes.child, "rev-parse", "refs/heads/main")).toBe(shape.before.child)
+    expect(git(shape.remotes.root, "rev-parse", "refs/heads/main")).toBe(shape.rootBefore)
+  })
+
+  test.each(routes)("%s preserves prior retention when a later retention read fails", async (route) => {
+    const shape = twoChildFrozenMerge(`partial-read-${route}`)
+    // Both sources are advertised, but neither immutable retention ref exists.
+    git(join(shape.root, "child"), "push", "-q", shape.remotes.child, `${shape.childSource}:refs/heads/main`)
+    const cold = shape.cold("cold", false)
+    const firstRef = `refs/git-super/pins/${shape.childSource}`
+    const laterRef = `refs/git-super/pins/${shape.before.other}`
+    let retained = false
+    let refused = false
+    const process: GitProcess = {
+      run: async (request) => {
+        if (retained && request.args[0] === "fetch" && request.args.some((arg) => arg.startsWith(`+${laterRef}:`))) {
+          refused = true
+          return { code: 73, stdout: "", stderr: "later retention read refused" }
+        }
+        const result = await cold.git.run(request)
+        if (
+          request.args[0] === "push" &&
+          !request.args.includes("--dry-run") &&
+          request.args.includes(`${shape.childSource}:${firstRef}`) &&
+          result.code === 0
+        )
+          retained = true
+        return result
+      },
+    }
+    const result = await cold.push(route, process)
+    expect(retained && refused).toBe(true)
+    expect(result, JSON.stringify(result)).toMatchObject({ state: "failed", partial: true })
+    expect(result.repositories.flatMap((repository) => repository.refs)).toEqual(
+      expect.arrayContaining([expect.objectContaining({ destination: firstRef, state: "updated" })]),
+    )
+    expect(git(shape.remotes.child, "rev-parse", firstRef)).toBe(shape.childSource)
+    expect(git(shape.remotes.other, "for-each-ref", "--format=%(objectname)", laterRef)).toBe("")
+    expect(git(shape.remotes.other, "rev-parse", "refs/heads/main")).toBe(shape.before.other)
+    expect(git(shape.remotes.root, "rev-parse", "refs/heads/main")).toBe(shape.rootBefore)
+  })
+})
 
 describe("a frozen push works only on the children its merge moved (25303, observed path)", () => {
   test("publishes and retains the moved child and never asks the unchanged one's remote", async () => {
