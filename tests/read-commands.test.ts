@@ -2,7 +2,7 @@
  * @reach fs-walk <fixture-only: runCli and CLI entry read mkdtempSync(tmpdir()) Git repos>
  */
 import { afterEach, describe, expect, test } from "vitest"
-import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { copyFileSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { flattenCommandNodes, resolveInvocation } from "@silvery/command"
@@ -146,13 +146,137 @@ describe("Phase 1 read commands", () => {
     ])
   })
 
-  test("status fails loudly when a nested submodule checkout is missing", () => {
+  /**
+   * @failure One malformed child hides ordinary root dirt and staged pins, allowing an incomplete cleanliness judgment (26270).
+   * @level l1
+   * @consumer git-super status --json and retained worktree removal
+   * @testonly none
+   */
+  test.each([
+    ["symlink", "normal"],
+    ["symlink", "alternate"],
+    ["dangling-symlink", "normal"],
+    ["dangling-symlink", "alternate"],
+    ["missing-gitdir", "normal"],
+    ["missing-gitdir", "alternate"],
+  ])("status names %s while preserving root and %s-index dirt", async (shape, indexKind) => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-problem-status-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const child = join(fixture.product, "packages/alpha")
+    const missingGitDir = join(root, "absent-gitdir")
+    if (shape === "symlink" || shape === "dangling-symlink") {
+      rmSync(child, { recursive: true, force: true })
+      symlinkSync(shape === "symlink" ? fixture.alpha : missingGitDir, child, "dir")
+    } else writeFileSync(join(child, ".git"), `gitdir: ${missingGitDir}\n`)
+    writeFileSync(join(fixture.product, "root-dirt.txt"), "preserve root dirt\n")
+    const indexFile = indexKind === "alternate" ? join(root, "selected-index") : undefined
+    if (indexFile !== undefined) copyFileSync(join(fixture.product, ".git/index"), indexFile)
+    const env = { ...process.env, ...(indexFile === undefined ? {} : { GIT_INDEX_FILE: indexFile }) }
+    const statusOptions = { repo: fixture.product, ...(indexFile === undefined ? {} : { indexFile }) }
+    const staged = Bun.spawnSync(
+      ["git", "-C", fixture.product, "update-index", "--cacheinfo", `160000,${fixture.betaBase},packages/alpha`],
+      { env, stdout: "pipe", stderr: "pipe" },
+    )
+    expect(staged.exitCode, staged.stderr.toString()).toBe(0)
+    const plain = superStatus({ repo: fixture.product })
+    expect(plain.records).toContain("?? root-dirt.txt")
+    if (indexKind === "alternate") expect(plain.records).not.toContain("M  packages/alpha")
+    const stdout = outputSink()
+    const stderr = outputSink()
+    const indexArgs = indexFile === undefined ? [] : ["--index-file", indexFile]
+    expect(
+      await runCli(["--repo", fixture.product, "--json", "status", ...indexArgs], stdout, stderr),
+      stderr.output,
+    ).toBe(0)
+    const selected = JSON.parse(stdout.output) as SuperStatusResult
+    expect(selected.records).toContain("?? root-dirt.txt")
+    expect(selected.records).toContain("M  packages/alpha")
+    expect(selected).toMatchObject({
+      submoduleProblems: [
+        {
+          path: "packages/alpha",
+          reason: expect.any(String),
+          ...(shape === "missing-gitdir" ? { gitDir: missingGitDir } : {}),
+        },
+      ],
+    })
+    expect(selected.uninitializedSubmodules).not.toContain("packages/alpha")
+    expect(stderr.output).toContain("packages/alpha")
+    if (shape === "dangling-symlink") expect(selected.submoduleProblems[0]!.reason).toContain("symbolic link checkout")
+    if (shape === "missing-gitdir") expect(stderr.output).toContain(missingGitDir)
+    const textOut = outputSink()
+    const textErr = outputSink()
+    expect(await runCli(["--repo", fixture.product, "status", ...indexArgs], textOut, textErr)).toBe(0)
+    expect(textOut.output).toContain("M  packages/alpha")
+    expect(textOut.output).toContain("?? root-dirt.txt")
+    expect(textErr.output).toContain("packages/alpha")
+    if (shape === "missing-gitdir") expect(textErr.output).toContain(missingGitDir)
+    const removed = Bun.spawnSync(["git", "-C", fixture.product, "update-index", "--force-remove", "packages/alpha"], {
+      env,
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(removed.exitCode, removed.stderr.toString()).toBe(0)
+    expect(superStatus(statusOptions).records).toContain("D  packages/alpha")
+    const blob = git(fixture.product, "rev-parse", "HEAD:.gitmodules")
+    const retyped = Bun.spawnSync(
+      ["git", "-C", fixture.product, "update-index", "--add", "--cacheinfo", `100644,${blob},packages/alpha`],
+      { env, stdout: "pipe", stderr: "pipe" },
+    )
+    expect(retyped.exitCode, retyped.stderr.toString()).toBe(0)
+    expect(
+      superStatus(statusOptions).records.some((record) => record[0] === "T" && record.slice(3) === "packages/alpha"),
+    ).toBe(true)
+    symlinkSync(fixture.alpha, join(fixture.product, "new-child"), "dir")
+    const added = Bun.spawnSync(
+      ["git", "-C", fixture.product, "update-index", "--add", "--cacheinfo", `160000,${fixture.alphaBase},new-child`],
+      { env, stdout: "pipe", stderr: "pipe" },
+    )
+    expect(added.exitCode, added.stderr.toString()).toBe(0)
+    const additions = superStatus(statusOptions)
+    expect(additions.records).toContain("A  new-child")
+    expect(additions.submoduleProblems).toContainEqual({
+      path: "new-child",
+      reason: expect.stringContaining("symbolic link"),
+    })
+  })
+
+  test("status names a missing nested checkout as a problem instead of claiming it was consulted", () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-nested-missing-"))
     roots.push(fixtureRoot)
     const fixture = addNestedAlphaSubmodule(createProductFixture(fixtureRoot))
     rmSync(join(fixture.product, "packages/alpha/apps/maddoc"), { recursive: true, force: true })
 
-    expect(() => superStatus({ repo: fixture.product })).toThrow("rev-parse --show-toplevel failed")
+    const result = superStatus({ repo: fixture.product })
+    expect(result.submoduleProblems).toEqual([
+      { path: "packages/alpha/apps/maddoc", reason: expect.stringContaining("packages/alpha/apps/maddoc") },
+    ])
+    expect(result.consultedRepositories.map(({ path }) => path)).not.toContain("packages/alpha/apps/maddoc")
+  })
+
+  /**
+   * @failure An unmerged added gitlink disappears when ordinary porcelain ignores submodules (26270).
+   * @level l1
+   * @consumer retained worktree removal
+   * @testonly none
+   */
+  test.each(["normal", "alternate"])("status preserves an unmerged added gitlink in the %s index", (kind) => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-unmerged-status-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const indexFile = kind === "alternate" ? join(root, "conflict-index") : undefined
+    if (indexFile !== undefined) copyFileSync(join(fixture.product, ".git/index"), indexFile)
+    const result = Bun.spawnSync(["git", "-C", fixture.product, "update-index", "--index-info"], {
+      env: { ...process.env, ...(indexFile === undefined ? {} : { GIT_INDEX_FILE: indexFile }) },
+      stdin: Buffer.from(`160000 ${fixture.alphaBase} 2\tconflicted\n160000 ${fixture.betaBase} 3\tconflicted\n`),
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(result.exitCode, result.stderr.toString()).toBe(0)
+    const status = superStatus({ repo: fixture.product, ...(indexFile === undefined ? {} : { indexFile }) })
+    expect(status.records.some((record) => record.slice(3) === "conflicted")).toBe(true)
+    expect(status.submoduleProblems).toContainEqual({ path: "conflicted", reason: expect.stringContaining("unmerged") })
   })
 
   test("merge-base finds the repository that owns a sha and compares against the ref's pin", () => {
@@ -182,6 +306,49 @@ describe("Phase 1 read commands", () => {
     git(fixture.product, "add", "packages/alpha")
 
     expect(superStatus({ repo: fixture.product }).records).toEqual(["M  packages/alpha/alpha.ts"])
+  })
+
+  /**
+   * @failure A changed gitlink with the same tree has no file expansion and must still remain staged dirt (26270).
+   * @level l1
+   * @consumer retained worktree removal and status --index-file
+   * @testonly none
+   */
+  test.each(["normal", "alternate"])("status retains a same-tree staged pin in the %s index", (kind) => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-empty-pin-status-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    git(fixture.alpha, "commit", "-q", "--allow-empty", "-m", "same tree, new commit")
+    const next = git(fixture.alpha, "rev-parse", "HEAD")
+    const child = join(fixture.product, "packages/alpha")
+    git(child, "fetch", "-q", "origin")
+    git(child, "checkout", "-q", next)
+    const indexFile = kind === "alternate" ? join(root, "pin-index") : undefined
+    if (indexFile !== undefined) copyFileSync(join(fixture.product, ".git/index"), indexFile)
+    const staged = Bun.spawnSync(
+      ["git", "-C", fixture.product, "update-index", "--cacheinfo", `160000,${next},packages/alpha`],
+      {
+        env: { ...process.env, ...(indexFile === undefined ? {} : { GIT_INDEX_FILE: indexFile }) },
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    )
+    expect(staged.exitCode, staged.stderr.toString()).toBe(0)
+    const status = superStatus({ repo: fixture.product, ...(indexFile === undefined ? {} : { indexFile }) })
+    expect(status.records).toContain("M  packages/alpha")
+    expect(status.submoduleProblems).toEqual([])
+    const unstaged = Bun.spawnSync(
+      ["git", "-C", fixture.product, "update-index", "--cacheinfo", `160000,${fixture.alphaBase},packages/alpha`],
+      {
+        env: { ...process.env, ...(indexFile === undefined ? {} : { GIT_INDEX_FILE: indexFile }) },
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    )
+    expect(unstaged.exitCode, unstaged.stderr.toString()).toBe(0)
+    expect(superStatus({ repo: fixture.product, ...(indexFile === undefined ? {} : { indexFile }) }).records).toContain(
+      " M packages/alpha",
+    )
   })
 
   test("status --index-file judges only the root temporary index and reports its source", async () => {
