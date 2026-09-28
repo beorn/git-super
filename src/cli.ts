@@ -668,6 +668,13 @@ async function writeResult(
   stderr: OutputSink,
   nodes: typeof commands,
 ): Promise<void> {
+  if (captured.node === nodes.status) {
+    for (const problem of (result as SuperStatusResult).submoduleProblems) {
+      stderr.write(
+        `${problem.path}: ${problem.reason}${problem.gitDir === undefined ? "" : `; Git directory ${problem.gitDir}`}\n`,
+      )
+    }
+  }
   if (captured.json) {
     stdout.write(stableJson(result))
   } else if (captured.node === nodes.diff) {

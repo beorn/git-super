@@ -1,13 +1,18 @@
-import { createHash } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import {
   cpSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
+  readlinkSync,
   realpathSync,
   renameSync,
+  statSync,
+  symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs"
 import { spawnSync } from "node:child_process"
@@ -63,7 +68,9 @@ export function rehomeBorrowers(
   lenderModules: string,
   options?: RehomeBorrowersOptions,
 ): readonly string[] {
-  if (!existsSync(lenderModules)) return []
+  guardRetainedBorrowers(commonDir, lenderGitDir)
+  const hasLenderModules = present(lenderModules)
+  const canonicalCommon = realpathSync(commonDir)
 
   const worktreesDir = join(commonDir, "worktrees")
   const candidates: Array<{ adminDir: string; name: string }> = []
@@ -101,7 +108,31 @@ export function rehomeBorrowers(
 
     try {
       for (const entry of readdirSync(candidateModules, { recursive: true, withFileTypes: true })) {
-        if (!entry.isFile() || entry.name !== "alternates") continue
+        if (entry.isSymbolicLink() && entry.name === "objects") {
+          const objects = join(entry.parentPath, entry.name)
+          let target: string
+          try {
+            target = realpathSync(objects)
+            if (!statSync(target).isDirectory()) throw new Error("target is not a directory")
+          } catch (error) {
+            throw new Error(
+              `borrower ${borrowerIdentity} has an unresolved objects link ${objects}; resolve it before removing ${lenderGitDir}`,
+              { cause: error },
+            )
+          }
+          if (!within(canonicalCommon, target)) {
+            throw new Error(
+              `borrower ${borrowerIdentity} objects link ${objects} targets ${target} outside common-store custody ${canonicalCommon}; resolve it before removing ${lenderGitDir}`,
+            )
+          }
+          if (within(realpathSync(lenderGitDir), target)) {
+            throw new Error(
+              `borrower ${borrowerIdentity} submodule ${relative(candidateModules, entry.parentPath)} still links objects ${objects} to ${target}; preserve its objects before removing ${lenderGitDir}`,
+            )
+          }
+          continue
+        }
+        if (!hasLenderModules || !entry.isFile() || entry.name !== "alternates") continue
         const alternatesPath = join(entry.parentPath, entry.name)
         const objectsDir = dirname(entry.parentPath)
         const content = readFileSync(alternatesPath, "utf8")
@@ -164,6 +195,11 @@ async function cleanSnapshot(
   inspect: (repository: string, path: string) => Promise<WorktreeInspection>,
 ): Promise<readonly Readonly<{ path: string; head: string }>[]> {
   const status = superStatus({ repo: path })
+  if (status.submoduleProblems.length > 0) {
+    throw new Error(
+      `worktree ${path} has unknown submodule state: ${status.submoduleProblems.map((problem) => `${problem.path}: ${problem.reason}${problem.gitDir === undefined ? "" : ` (gitdir ${problem.gitDir})`}`).join("; ")}; preserve and resolve it before removal`,
+    )
+  }
   if (status.records.length > 0) {
     throw new Error(`worktree ${path} is dirty: ${status.records.join("; ")}; preserve its changes before removal`)
   }
@@ -185,33 +221,207 @@ async function cleanSnapshot(
     if (state.locked !== undefined) {
       throw new Error(`worktree ${entry.root} is locked: ${state.locked}; resolve its holder before removal`)
     }
-    const dirty = await git.text(entry.root, [
-      "status",
-      "--porcelain=v1",
-      "-z",
-      "--untracked-files=all",
-      "--ignore-submodules=none",
-    ])
-    if (dirty !== "") throw new Error(`worktree ${entry.root} is dirty: ${dirty}; preserve its changes before removal`)
+    const checked = superStatus({ repo: entry.root })
+    if (checked.submoduleProblems.length > 0) {
+      throw new Error(
+        `worktree ${entry.root} has unknown submodule state: ${checked.submoduleProblems.map((problem) => `${problem.path}: ${problem.reason}`).join("; ")}; preserve and resolve it before removal`,
+      )
+    }
+    if (checked.records.length > 0) {
+      throw new Error(
+        `worktree ${entry.root} is dirty: ${checked.records.join("; ")}; preserve its changes before removal`,
+      )
+    }
     const head = await git.commit(entry.root, "HEAD")
     snapshot.push({ path: entry.root, head })
   }
   return snapshot
 }
 
-/** Refuse symlinks and unfinished Git mutations; a retained manifest covers every ordinary file, including refs and reflogs. */
-function manifest(root: string): Readonly<Record<string, string>> {
-  const hashes: Record<string, string> = {}
+type ExternalObjectStore = Readonly<{ path: string; declaration: string; target: string }>
+type ManifestEntry = Readonly<
+  { kind: "file"; sha256: string } | { kind: "objects-link"; declaration: string; target: string }
+>
+type StoreManifest = Readonly<{
+  entries: Readonly<Record<string, ManifestEntry>>
+  files: Readonly<Record<string, string>>
+  externalObjectStores: readonly ExternalObjectStore[]
+}>
+type StoreCustody = Readonly<{ common: string; checkout: string; gitDir: string; modules: string }>
+
+/** Inspect link identities without walking their objects; only common-store objects directories may be borrowed. */
+function manifest(root: string, custody: StoreCustody, hashFiles = true): StoreManifest {
+  const entries: Record<string, ManifestEntry> = {}
+  const files: Record<string, string> = {}
+  const externalObjectStores: ExternalObjectStore[] = []
   for (const entry of readdirSync(root, { recursive: true, withFileTypes: true })) {
     const path = join(entry.parentPath, entry.name)
+    const key = relative(root, path)
     if (entry.name.endsWith(".lock")) throw new Error(`Git lock ${path} prevents worktree removal; resolve its holder`)
     if (entry.isDirectory()) continue
+    if (entry.isSymbolicLink()) {
+      const modulePath = relative(custody.modules, path)
+      if (!within(custody.modules, path) || entry.name !== "objects" || !modulePath.includes(sep)) {
+        throw new Error(
+          `Git metadata link ${path} is not a submodule objects directory; preserve and resolve it before removal`,
+        )
+      }
+      const declaration = readlinkSync(path)
+      let target: string
+      try {
+        target = realpathSync(path)
+        if (!statSync(target).isDirectory()) throw new Error("target is not a directory")
+      } catch (error) {
+        throw new Error(`Git objects link ${path} has an unavailable target ${declaration}; worktree preserved`, {
+          cause: error,
+        })
+      }
+      if (!within(custody.common, target) || within(custody.checkout, target) || within(custody.gitDir, target)) {
+        throw new Error(
+          `Git objects link ${path} targets ${target} outside common-store custody or inside removal paths ${custody.checkout} or ${custody.gitDir}; preserve its objects before removal`,
+        )
+      }
+      entries[key] = { kind: "objects-link", declaration, target }
+      externalObjectStores.push({ path: key, declaration, target })
+      continue
+    }
     if (!entry.isFile()) {
       throw new Error(`Git store ${path} is not a regular file; preserve and resolve it before removal`)
     }
-    hashes[relative(root, path)] = createHash("sha256").update(readFileSync(path)).digest("hex")
+    if (!hashFiles) continue
+    const sha256 = createHash("sha256").update(readFileSync(path)).digest("hex")
+    files[key] = sha256
+    entries[key] = { kind: "file", sha256 }
   }
-  return Object.fromEntries(Object.entries(hashes).sort(([a], [b]) => a.localeCompare(b)))
+  return {
+    entries: Object.fromEntries(Object.entries(entries).sort(([a], [b]) => a.localeCompare(b))),
+    files: Object.fromEntries(Object.entries(files).sort(([a], [b]) => a.localeCompare(b))),
+    externalObjectStores: externalObjectStores.sort((a, b) => a.path.localeCompare(b.path)),
+  }
+}
+
+function present(path: string): boolean {
+  try {
+    lstatSync(path)
+    return true
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false
+    throw error
+  }
+}
+
+/** A pointer per manifest avoids shared aggregate updates; publication occurs under the common writer lock. */
+function registerRetainedBorrower(common: string, retained: string, manifestPath: string): void {
+  const registry = join(common, "git-super-retained-borrowers")
+  try {
+    mkdirSync(registry, { recursive: true })
+    if (!lstatSync(registry).isDirectory()) {
+      throw new Error(`retained borrower registry ${registry} is not an owned directory; worktree preserved`)
+    }
+    const name = createHash("sha256").update(manifestPath).digest("hex")
+    const staged = join(registry, `${name}.${randomUUID()}.tmp`)
+    writeFileSync(staged, `${JSON.stringify({ retained, manifest: manifestPath })}\n`, { flag: "wx" })
+    renameSync(staged, join(registry, `${name}.json`))
+  } catch (error) {
+    throw new Error(
+      `retained borrower ${retained} could not be registered in ${registry}; worktree preserved (${error instanceof Error ? error.message : String(error)})`,
+      { cause: error },
+    )
+  }
+}
+
+/** Retained copies are borrowers too: verify their actual links before allowing an owner store to disappear. */
+function guardRetainedBorrowers(common: string, lenderGitDir: string): void {
+  const registry = join(common, "git-super-retained-borrowers")
+  if (!present(registry)) return
+  if (!lstatSync(registry).isDirectory()) {
+    throw new Error(`retained borrower registry ${registry} is not an owned directory; worktree preserved`)
+  }
+  const registrations = readdirSync(registry)
+    .filter((name) => name.endsWith(".json"))
+    .sort()
+  if (registrations.length === 0) return
+  const pointer = join(lenderGitDir, "gitdir")
+  let checkout: string
+  try {
+    const declaration = readFileSync(pointer, "utf8")
+      .trim()
+      .replace(/^gitdir:\s*/u, "")
+    if (declaration === "") throw new Error("empty gitdir pointer")
+    checkout = realpathSync(dirname(resolve(lenderGitDir, declaration)))
+  } catch (error) {
+    throw new Error(
+      `worktree ${lenderGitDir} cannot be removed: cannot resolve checkout from ${pointer} while retained borrowers exist`,
+      { cause: error },
+    )
+  }
+  for (const name of registrations) {
+    const registration = join(registry, name)
+    let retained = registration
+    try {
+      const record = JSON.parse(readFileSync(registration, "utf8")) as { retained?: unknown; manifest?: unknown }
+      if (
+        typeof record.retained !== "string" ||
+        !isAbsolute(record.retained) ||
+        typeof record.manifest !== "string" ||
+        !isAbsolute(record.manifest)
+      ) {
+        throw new Error("invalid retained borrower pointer")
+      }
+      retained = record.retained
+      if (!present(retained)) {
+        unlinkSync(registration)
+        process.stderr.write(`retained borrower ${retained} is gone; dropped registry entry ${registration}\n`)
+        continue
+      }
+      if (!lstatSync(retained).isDirectory()) throw new Error("retained copy is not an owned directory")
+      const proof = JSON.parse(readFileSync(record.manifest, "utf8")) as {
+        retained?: unknown
+        externalObjectStores?: unknown
+      }
+      if (proof.retained !== retained || !Array.isArray(proof.externalObjectStores)) {
+        throw new Error("invalid retained dependency manifest")
+      }
+      for (const dependency of proof.externalObjectStores as Array<{ path?: unknown; target?: unknown }>) {
+        if (
+          typeof dependency.path !== "string" ||
+          typeof dependency.target !== "string" ||
+          !isAbsolute(dependency.target)
+        ) {
+          throw new Error("invalid retained objects dependency")
+        }
+        const link = resolve(retained, dependency.path)
+        if (!within(retained, link) || basename(link) !== "objects") {
+          throw new Error(`invalid retained objects path ${link}`)
+        }
+      }
+      // The manifest declaration cannot hide an actual link or authorise deletion of its current target.
+      const actual = manifest(retained, { common, checkout, gitDir: lenderGitDir, modules: retained }, false)
+      const linkedStores = join(realpathSync(common), "worktrees")
+      const primaryStores = join(realpathSync(common), "modules")
+      let linkedDependency = false
+      for (const dependency of actual.externalObjectStores) {
+        if (within(linkedStores, dependency.target)) {
+          linkedDependency = true
+        } else if (!within(primaryStores, dependency.target)) {
+          throw new Error(
+            `retained objects link ${join(retained, dependency.path)} targets ${dependency.target} with unknown removal custody in ${common}; preserve and resolve it before removal`,
+          )
+        }
+      }
+      if (!linkedDependency) {
+        unlinkSync(registration)
+        process.stderr.write(
+          `retained borrower ${retained} has no objects links into removable linked stores; dropped registry entry ${registration}\n`,
+        )
+      }
+    } catch (error) {
+      throw new Error(
+        `worktree ${lenderGitDir} cannot be removed: retained copy ${retained} could not be proved independent (${error instanceof Error ? error.message : String(error)})`,
+        { cause: error },
+      )
+    }
+  }
 }
 
 /** Runs inside the worktree store's existing mutation lock, immediately before its one native remove. */
@@ -235,11 +445,14 @@ export async function retainWorktreeModules(
   if (gitDir === common) {
     throw new Error(`worktree ${path} is the primary worktree; only a linked worktree can be removed`)
   }
-  const before = await cleanSnapshot(git, path, inspect)
   const modules = join(gitDir, "modules")
+  const custody = { common, checkout: path, gitDir, modules }
+  // Diagnose metadata links before Git discovery can hide their source and target in an object lookup failure.
+  manifest(gitDir, custody, false)
+  const before = await cleanSnapshot(git, path, inspect)
   // Check metadata locks before copying. The modules subtree includes every store,
   // even one left by an earlier gitlink that the current tree no longer records.
-  manifest(gitDir)
+  const metadata = manifest(gitDir, custody)
   const requestedRoot = resolve(retention.root)
   // Resolve existing ancestors before creating anything, so a symlink cannot put
   // the only retained copy back inside either native deletion path.
@@ -255,26 +468,40 @@ export async function retainWorktreeModules(
       `retention directory ${canonical} is inside worktree removal paths ${path} or ${gitDir}; choose an external durable directory`,
     )
   }
+  for (const dependency of metadata.externalObjectStores) {
+    if (within(dependency.target, canonical)) {
+      throw new Error(
+        `retention directory ${canonical} is inside external objects target ${dependency.target}; choose a directory that does not modify borrowed objects`,
+      )
+    }
+  }
   mkdirSync(canonical, { recursive: true })
   const retainedRoot = mkdtempSync(join(canonical, `${basename(gitDir)}-`))
   const retained = existsSync(modules) ? join(retainedRoot, "modules") : null
-  let hashes: Readonly<Record<string, string>> = {}
+  let retainedManifest: StoreManifest = { entries: {}, files: {}, externalObjectStores: [] }
   if (retained !== null) {
-    hashes = manifest(modules)
-    cpSync(modules, retained, { recursive: true, errorOnExist: true, force: false })
-    const compared = spawnSync("diff", ["-r", "--", modules, retained], {
-      encoding: "utf8",
-      timeout: 120_000,
-      maxBuffer: 1024 * 1024,
+    retainedManifest = manifest(modules, custody)
+    cpSync(modules, retained, {
+      recursive: true,
+      errorOnExist: true,
+      force: false,
+      dereference: false,
+      verbatimSymlinks: true,
     })
-    if (compared.error || compared.status !== 0) {
-      throw new Error(
-        `retention comparison failed for ${modules} and ${retained}: ${compared.error?.message || compared.stderr || compared.stdout || `exit ${String(compared.status)}`}; worktree preserved`,
-      )
+    for (const dependency of retainedManifest.externalObjectStores) {
+      const link = join(retained, dependency.path)
+      unlinkSync(link)
+      symlinkSync(dependency.target, link, "dir")
     }
+    const expectedCopy = Object.fromEntries(
+      Object.entries(retainedManifest.entries).map(([key, entry]) => [
+        key,
+        entry.kind === "file" ? entry : { ...entry, declaration: entry.target },
+      ]),
+    )
     if (
-      JSON.stringify(manifest(retained)) !== JSON.stringify(hashes) ||
-      JSON.stringify(manifest(modules)) !== JSON.stringify(hashes)
+      JSON.stringify(manifest(retained, { ...custody, modules: retained }).entries) !== JSON.stringify(expectedCopy) ||
+      JSON.stringify(manifest(modules, custody).entries) !== JSON.stringify(retainedManifest.entries)
     ) {
       throw new Error(
         `Git store ${modules} changed during retention at ${retained}; worktree preserved, retry after its writer stops`,
@@ -297,7 +524,14 @@ export async function retainWorktreeModules(
     retainUntil: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
     ...(rehomedBorrowers.length === 0 ? {} : { rehomedBorrowers }),
   }
-  writeFileSync(proof.manifest, `${JSON.stringify({ ...proof, files: hashes }, null, 2)}\n`, { flag: "wx" })
+  writeFileSync(
+    proof.manifest,
+    `${JSON.stringify({ ...proof, files: retainedManifest.files, entries: retainedManifest.entries, externalObjectStores: retainedManifest.externalObjectStores }, null, 2)}\n`,
+    { flag: "wx" },
+  )
+  if (retained !== null && retainedManifest.externalObjectStores.length > 0) {
+    registerRetainedBorrower(common, retained, proof.manifest)
+  }
   retention.report(proof)
   return proof
 }
