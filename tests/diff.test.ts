@@ -391,4 +391,30 @@ describe("git super diff --stat / --patch human output", () => {
     expect(stdout.output).toContain(" 1 file changed, 1 insertion(+), 1 deletion(-)")
     expect(stdout.output).not.toContain("pointer")
   })
+
+  test("diff --stat over a submodule dirty only through untracked files names the submodule", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-diff-untracked-submodule-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    writeFileSync(join(fixture.product, "packages/alpha/untracked.ts"), "export const untracked = true;\n")
+
+    const result = superDiff({ repo: fixture.product, stat: true, patch: true })
+
+    expect(result.consultedRepositories.map((r) => r.path)).toEqual([".", "packages/alpha"])
+    expect(result.stats?.map((s) => s.repository)).toEqual([".", "packages/alpha"])
+    const [root, alpha] = result.stats ?? []
+    expect(root?.files).toEqual([])
+    expect(root?.pointerMoves).toEqual([])
+    expect(alpha?.files).toEqual([])
+    expect(alpha?.totals).toEqual({ files: 0, added: 0, deleted: 0 })
+    expect(alpha?.pointerMoves).toEqual([])
+    expect(alpha?.untrackedOnly).toBe(true)
+
+    const stdout = outputSink()
+    const stderr = outputSink()
+    expect(await runCli(["--repo", fixture.product, "diff", "--stat"], stdout, stderr)).toBe(0)
+    expect(stdout.output).toContain("== packages/alpha ==")
+    expect(stdout.output).toContain("dirty (untracked files only)")
+    expect(stderr.output).toContain("✓  packages/alpha")
+  })
 })

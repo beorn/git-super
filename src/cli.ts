@@ -684,6 +684,10 @@ async function writeResult(
     }
     for (const stat of diff.stats ?? []) {
       stdout.write(`\n== ${stat.repository} ==\n`)
+      if (stat.untrackedOnly) {
+        stdout.write(" dirty (untracked files only)\n")
+        continue
+      }
       for (const file of stat.files) {
         stdout.write(` ${file.path} | ${file.binary ? "Bin" : `+${file.added} -${file.deleted}`}\n`)
       }

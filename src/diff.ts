@@ -50,6 +50,7 @@ export type RepositoryDiffStat = Readonly<{
   files: readonly DiffFileStat[]
   totals: DiffTotals
   pointerMoves: readonly PointerMove[]
+  untrackedOnly?: boolean
 }>
 
 export type RepositoryDiffPatch = Readonly<{
@@ -114,6 +115,7 @@ function parseRawDiff(raw: string): RawDiffRow[] {
 function commonDiffArgs(options: SuperDiffOptions): string[] {
   return [
     "--no-renames",
+    "--ignore-submodules=none",
     ...(options.cached ? ["--cached"] : []),
     ...(options.diffFilter === undefined ? [] : [`--diff-filter=${options.diffFilter}`]),
     ...(options.refs ?? []),
@@ -337,12 +339,19 @@ function computeRepositoryStat(
     { files: 0, added: 0, deleted: 0 },
   )
   const range = entryRange(entry, options)
+  const isWorkingTreeDiff = entry.from !== undefined && entry.to === undefined
+  const untrackedOnly =
+    isWorkingTreeDiff &&
+    files.length === 0 &&
+    pointerMoves.length === 0 &&
+    runGit(entry.root, ["ls-files", "--others", "--exclude-standard"]).trim().length > 0
   return {
     repository: entry.path,
     ...(range === undefined ? {} : { range }),
     files,
     totals,
     pointerMoves,
+    ...(untrackedOnly ? { untrackedOnly: true } : {}),
   }
 }
 
