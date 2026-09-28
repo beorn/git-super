@@ -64,6 +64,8 @@ Missing or unreadable checkout directories, missing commit objects, added or rem
 
 The submodule branch comes from `submodule.<name>.branch` in local Git config, then the frozen `.gitmodules`, then the remote's symbolic HEAD. A value of `.` uses the current superproject branch and refuses when that HEAD is detached. Each participating pin is compared with the fetched branch:
 
+`--no-fetch` reuses only untouched Equal pins whose persistent component store records a successful refresh of the current origin URL and tracking OID within the last ten minutes. Moved pins and cached Behind/Ahead/Diverged pins fetch fresh before classification. Borrowed checkouts use the validated reference/alternate store, never the timestamp of copied refs. Successful fetches append an explicit same-OID reflog observation, including unchanged refs with logging disabled. These observations are a cache: losing the store or its observation expires reuse and requires a fetch; correctness never depends on retaining them. A configured origin that differs from the declared repository is named and refreshed from the declared URL, without reusing that read for another publication destination. Unreadable observations or failed recording produce a named diagnostic and no recording retry. Root and component publication retain their independent remote observations and leases.
+
 | Authored pin relative to the submodule branch | Result                                                                          |
 | --------------------------------------------- | ------------------------------------------------------------------------------- |
 | Equal                                         | Keep the pin.                                                                   |
