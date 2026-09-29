@@ -142,6 +142,9 @@ export type SuperMergeStepName = (typeof SUPER_MERGE_STEPS)[number]
 /** How long one phase of the merge took. */
 export type SuperMergeStepResult = Readonly<{ name: SuperMergeStepName; ms: number }>
 
+/** An unchanged pin compared with a local child main without an age bound. */
+export type SuperMergeUnboundedLocalMain = Readonly<{ path: string; pin: string; store: string }>
+
 export type SuperMergeResult = GitSuperResult &
   Readonly<{
     commit?: string
@@ -160,6 +163,8 @@ export type SuperMergeResult = GitSuperResult &
      * does not read it is unaffected.
      */
     descents?: readonly SuperMergeDescentResult[]
+    /** Present only when requested local main reads bypassed the refresh age bound. */
+    unboundedLocalMains?: readonly SuperMergeUnboundedLocalMain[]
   }>
 
 export type SuperMergeOptions = Readonly<{
@@ -177,6 +182,8 @@ export type SuperMergeOptions = Readonly<{
    * persistent stores. Moved or non-Equal pins always fetch fresh.
    */
   noFetch?: boolean
+  /** With noFetch, classify unchanged Equal pins from local main regardless of refresh age. */
+  unboundedLocalMain?: boolean
 }>
 
 type GitlinkPlan = Readonly<{
@@ -195,6 +202,7 @@ type GitlinkPlans = Readonly<{
   descents: readonly SuperMergeDescentResult[]
   /** Every child main the plan read from its remote, which the push freeze reuses rather than reads again. */
   mains: ObservedMains
+  unboundedLocalMains: readonly SuperMergeUnboundedLocalMain[]
 }>
 
 type GitlinkCheckoutPlan = Readonly<{
@@ -231,6 +239,19 @@ async function mergeWithSteps(options: SuperMergeOptions, steps: StepClock): Pro
   const git = options.git ?? createLocalGitProcess()
   const timeoutMs = options.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS
   const fallbackRoot = resolve(options.repo)
+  if (options.unboundedLocalMain && !options.noFetch) {
+    return failed(
+      fallbackRoot,
+      [],
+      obviousDetail(
+        "unbounded-local-main-requires-no-fetch",
+        "git super merge --unbounded-local-main requires --no-fetch.",
+        "Pass both options together, or omit --unbounded-local-main.",
+        "Rerun with --no-fetch when local Equal classification is intended.",
+        "the caller",
+      ),
+    )
+  }
   let root: string
   try {
     root = resolve(await required(git, options.repo, ["rev-parse", "--show-toplevel"], "discover-root", timeoutMs))
@@ -376,7 +397,16 @@ async function mergeUnderLock(
   steps.begin("plan")
   let planned: GitlinkPlans
   try {
-    planned = await planGitlinks(git, root, head, tree, timeoutMs, options.noFetch, options.report)
+    planned = await planGitlinks(
+      git,
+      root,
+      head,
+      tree,
+      timeoutMs,
+      options.noFetch,
+      options.unboundedLocalMain,
+      options.report,
+    )
   } catch (error) {
     return failed(root, [], resultError(error, "inspect-gitlinks"))
   }
@@ -393,7 +423,16 @@ async function mergeUnderLock(
     forkComposed = forked.composed
     composed = new Map([...composed, ...forked.composed])
     try {
-      planned = await planGitlinks(git, root, head, tree, timeoutMs, options.noFetch, options.report)
+      planned = await planGitlinks(
+        git,
+        root,
+        head,
+        tree,
+        timeoutMs,
+        options.noFetch,
+        options.unboundedLocalMain,
+        options.report,
+      )
     } catch (error) {
       return failed(root, [], resultError(error, "inspect-gitlinks"))
     }
@@ -745,6 +784,7 @@ async function mergeUnderLock(
     gitlinks: completed,
     ...(settledCheckouts.rows.length === 0 ? {} : { checkouts: settledCheckouts.rows }),
     ...(planned.descents.length === 0 ? {} : { descents: planned.descents }),
+    ...(planned.unboundedLocalMains.length === 0 ? {} : { unboundedLocalMains: planned.unboundedLocalMains }),
     repositories: [{ repository: root, state: "updated", refs: [] }],
   }
 }
@@ -1942,10 +1982,12 @@ async function planGitlinks(
   tree: string,
   timeoutMs: number,
   noFetch?: boolean,
+  unboundedLocalMain?: boolean,
   report?: (line: string) => void,
 ): Promise<GitlinkPlans> {
   const plans: GitlinkPlan[] = []
   const descents: SuperMergeDescentResult[] = []
+  const unboundedLocalMains: SuperMergeUnboundedLocalMain[] = []
   const checkouts = new Map<string, GitlinkCheckoutPlan>()
   const stores = new Map<string, string>()
   const mains = new Map<string, { remote: string; sourceUrl: string; destination: string; oid: string }>()
@@ -1953,7 +1995,8 @@ async function planGitlinks(
   const completed = new Set<string>()
 
   const rootMerged = await readCommitSubmodules(git, root, tree)
-  if (rootMerged.length === 0) return { settlements: plans, checkouts: [], stores, descents: [], mains }
+  if (rootMerged.length === 0)
+    return { settlements: plans, checkouts: [], stores, descents: [], mains, unboundedLocalMains }
   const rootRemote = await rootPushIdentity(git, root)
   const rootBefore = new Map((await readCommitSubmodules(git, root, head)).map((entry) => [entry.path, entry.target]))
   const added = new Set(rootMerged.filter((entry) => !rootBefore.has(entry.path)).map((entry) => entry.path))
@@ -2108,6 +2151,7 @@ async function planGitlinks(
           entry,
           timeoutMs,
           noFetch && before.get(entry.path) === entry.target,
+          unboundedLocalMain,
           report,
         ).then(
           (main) => ({ ok: true as const, main }),
@@ -2152,7 +2196,16 @@ async function planGitlinks(
       if (fetched?.ok === false) throw fetched.error
       const read =
         fetched?.main ??
-        (await fetchSubmoduleMain(git, repository, submodule, entry, timeoutMs, noFetch && !changedByMerge, report))
+        (await fetchSubmoduleMain(
+          git,
+          repository,
+          submodule,
+          entry,
+          timeoutMs,
+          noFetch && !changedByMerge,
+          unboundedLocalMain,
+          report,
+        ))
       mains.set(path, read)
       const main = read.oid
       if (entry.target === main) {
@@ -2176,6 +2229,9 @@ async function planGitlinks(
         // that pushes no settlement row, so without this line the descent leaves
         // no trace in the output at all.
         recordDescent("equal")
+        if (read.unboundedLocalMain) {
+          unboundedLocalMains.push({ path, pin: entry.target, store: read.store ?? submodule })
+        }
         continue
       }
       // THE CANDIDATE PIN HAS TO BE HERE BEFORE ANYTHING COMPARES IT. Compose opens
@@ -2293,7 +2349,7 @@ async function planGitlinks(
   }
 
   await walk(root, "", head, tree, undefined)
-  return { settlements: plans, checkouts: [...checkouts.values()], stores, descents, mains }
+  return { settlements: plans, checkouts: [...checkouts.values()], stores, descents, mains, unboundedLocalMains }
 }
 
 async function mergeApplicationFailure(
@@ -2335,7 +2391,14 @@ const MAIN_REFRESH_TTL_MS = 10 * 60_000
 const MAIN_REFRESH_MESSAGE = "git-super component-main refresh"
 
 /** A child main as read from its remote: which remote, which branch, and the commit it named. */
-type SubmoduleMain = Readonly<{ remote: string; sourceUrl: string; destination: string; oid: string; store?: string }>
+type SubmoduleMain = Readonly<{
+  remote: string
+  sourceUrl: string
+  destination: string
+  oid: string
+  store?: string
+  unboundedLocalMain?: boolean
+}>
 
 type AlternateResolution = Readonly<{ oid: string; store: string }>
 
@@ -2410,6 +2473,7 @@ async function fetchSubmoduleMain(
   entry: CommitSubmodule,
   timeoutMs: number,
   noFetch?: boolean,
+  unboundedLocalMain?: boolean,
   report?: (line: string) => void,
 ): Promise<SubmoduleMain> {
   if (entry.url === undefined) throw new Error(`Submodule ${entry.path} has no declared URL while reading its main`)
@@ -2448,7 +2512,15 @@ async function fetchSubmoduleMain(
     )
   }
   let fresh = false
-  if (noFetch && sameOrigin && resolved.code === 0 && resolved.stdout.trim() === pin) {
+  let usedUnboundedLocalMain = false
+  if (noFetch && unboundedLocalMain && sameOrigin && resolved.code === 0 && resolved.stdout.trim() === pin) {
+    const visibilityArgs = ["cat-file", "-e", `${pin}^{commit}`]
+    const visible = await run(git, submodule, visibilityArgs, timeoutMs)
+    if (visible.code !== 0) throw submoduleMainError(submodule, path, pin, visibilityArgs, visible)
+    fresh = true
+    usedUnboundedLocalMain = true
+  }
+  if (!fresh && noFetch && sameOrigin && resolved.code === 0 && resolved.stdout.trim() === pin) {
     const observation = await run(
       git,
       owner,
@@ -2505,6 +2577,7 @@ async function fetchSubmoduleMain(
     destination: `refs/heads/${branch}`,
     oid: resolved.stdout.trim(),
     ...(alternate === undefined ? {} : { store: owner }),
+    ...(usedUnboundedLocalMain ? { unboundedLocalMain: true } : {}),
   }
 }
 

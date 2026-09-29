@@ -122,6 +122,7 @@ function inputObjects(command: string, args: readonly string[]): readonly { argu
           "--atomic",
           "--no-verify",
           "--no-fetch",
+          "--unbounded-local-main",
           "--is-ancestor",
           "--cached",
           "--staged",
@@ -356,6 +357,10 @@ async function runInvocation(
       "--no-fetch",
       "reuse untouched Equal main observations under ten minutes old; fetch moved, unequal or expired mains",
     )
+    .option(
+      "--unbounded-local-main",
+      "with --no-fetch, read unchanged Equal child mains locally without a refresh age bound",
+    )
     .argument("<commit>", "commit to merge into the current branch")
     .action((commit, options, command) => {
       const globals = command.optsWithGlobals() as { repo: string; json?: boolean }
@@ -366,6 +371,7 @@ async function runInvocation(
           ...(typeof options.message === "string" ? { message: options.message } : {}),
           ...(options.verify === false ? { noVerify: true } : {}),
           ...(options.fetch === false ? { noFetch: true } : {}),
+          ...(options.unboundedLocalMain === true ? { unboundedLocalMain: true } : {}),
         },
         json: globals.json === true,
         nul: false,

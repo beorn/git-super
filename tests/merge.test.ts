@@ -3211,6 +3211,41 @@ describe("git super merge — bounded reuse of untouched Equal child mains (2562
   const isRemoteRead = (args: readonly string[]): boolean =>
     args[0] === "ls-remote" || (args[0] === "fetch" && args.some((arg) => arg.startsWith("+refs/heads/")))
 
+  /**
+   * @failure A cold submit refetches every unchanged Equal child despite its present local tracking ref.
+   * @level l1
+   * @consumer Yrd submit candidate verification
+   */
+  it("reads unchanged Equal mains locally without an age bound or a refresh stamp when requested", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-25626-local-main-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const candidate = candidateWithRootChange(fixture, "candidate-local-main")
+    const alpha = join(fixture.product, "packages/alpha")
+    const before = git(alpha, "reflog", "show", "-1", "--format=%H%x00%gs", "refs/remotes/origin/main")
+    const local = createLocalGitProcess()
+    const refreshes: string[] = []
+    const recording: GitProcess = {
+      run: (request) => {
+        if (request.env?.GIT_SUPER_PHASE === "refresh") refreshes.push(relative(fixture.product, request.repo))
+        return local.run(request)
+      },
+    }
+
+    const result = await superMerge({
+      repo: fixture.product,
+      commit: candidate,
+      noFetch: true,
+      unboundedLocalMain: true,
+      git: recording,
+    })
+
+    expect(result).toMatchObject({ state: "updated", partial: false })
+    expect(refreshes).toEqual([])
+    expect(result.unboundedLocalMains?.map((row) => row.path).sort()).toEqual(["packages/alpha", "vendor/beta"])
+    expect(git(alpha, "reflog", "show", "-1", "--format=%H%x00%gs", "refs/remotes/origin/main")).toBe(before)
+  })
+
   it("refreshes untouched Equal mains once per ten minutes, including unchanged refs with logging disabled", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-25626-nofetch-"))
     roots.push(fixtureRoot)

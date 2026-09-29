@@ -116,6 +116,7 @@ const merge = commandNode<CommandContext, MergeParams, SuperMergeResult>({
         ...(input.message === undefined ? {} : { message: input.message }),
         ...(input.noVerify === true ? { noVerify: true } : {}),
         ...(input.noFetch === true ? { noFetch: true } : {}),
+        ...(input.unboundedLocalMain === true ? { unboundedLocalMain: true } : {}),
       }
     },
     (value) => {
@@ -140,6 +141,7 @@ const merge = commandNode<CommandContext, MergeParams, SuperMergeResult>({
       ...(input.message === undefined ? [] : ["-m", input.message]),
       ...(input.noVerify === true ? ["--no-verify"] : []),
       ...(input.noFetch === true ? ["--no-fetch"] : []),
+      ...(input.unboundedLocalMain === true ? ["--unbounded-local-main"] : []),
     ]
     const next = `Wait for the named holder to finish, then run ${argv.map(shellQuote).join(" ")}.`
     const detail = result.detail
