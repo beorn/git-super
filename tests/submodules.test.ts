@@ -1082,7 +1082,7 @@ describe("materializeSubmodules", () => {
     })
   })
 
-  it("borrows an explicit linked store first and anchors the durable store after it", async () => {
+  it("borrows only from the primary submodule store when given a linked reference worktree (hh 26528)", async () => {
     const root = await mkdtemp(join(tmpdir(), "git-super-primary-reference-"))
     roots.push(root)
     const dependency = join(root, "dependency")
@@ -1147,12 +1147,8 @@ describe("materializeSubmodules", () => {
       "--path-format=absolute",
       "--git-dir",
     ]).trim()
-    const linkedGitDir = git(linkedDependency, ["rev-parse", "--path-format=absolute", "--git-dir"]).trim()
-    expect(readFileSync(alternatesFile, "utf8").trim().split("\n")).toEqual([
-      join(linkedGitDir, "objects"),
-      join(primaryGitDir, "objects"),
-    ])
-    expect(git(candidateDependency, ["cat-file", "-e", `${privatePin}^{commit}`])).toBe("")
+    // Acceptance criterion 1: A worktree or environment created now has alternates only into the shared store
+    expect(readFileSync(alternatesFile, "utf8").trim()).toBe(join(primaryGitDir, "objects"))
 
     const defaultCandidate = join(root, "default-candidate")
     git(owner, ["worktree", "add", "-q", "--detach", defaultCandidate, "HEAD"])
@@ -1166,7 +1162,9 @@ describe("materializeSubmodules", () => {
     ]).trim()
     expect(readFileSync(defaultAlternates, "utf8").trim()).toBe(join(primaryGitDir, "objects"))
 
+    // Acceptance criterion 2: Removing any worktree leaves every other worktree's objects intact
     git(owner, ["worktree", "remove", "--force", linked])
+    expect(git(candidateDependency, ["fsck", "--connectivity-only"]).trim()).toBe("")
     expect(git(candidateDependency, ["cat-file", "-e", "HEAD^{commit}"])).toBe("")
   })
 
@@ -1226,26 +1224,20 @@ describe("materializeSubmodules", () => {
     }
 
     const last = join(reference, "vendor/dependency")
-    expect(
-      spawnSync("git", ["-C", last, "cat-file", "-e", `${privatePin}^{commit}`], { encoding: "utf8" }).status,
-      "generation 8 reads generation 0's private commit",
-    ).toBe(0)
     const alternates = readFileSync(
       git(last, ["rev-parse", "--path-format=absolute", "--git-path", "objects/info/alternates"]).trim(),
       "utf8",
     )
       .trim()
       .split("\n")
-    const firstObjects = join(
-      git(join(first, "vendor/dependency"), ["rev-parse", "--path-format=absolute", "--git-dir"]).trim(),
+    const primaryObjects = join(
+      git(join(owner, "vendor/dependency"), ["rev-parse", "--path-format=absolute", "--git-dir"]).trim(),
       "objects",
     )
-    expect(alternates, "the first generation's store is listed directly, one hop away").toContain(firstObjects)
-    expect(new Set(alternates).size, "no store is listed twice").toBe(alternates.length)
-    // Reachable is not enough: git walks the file in order, so an ancestor registered only after the reference
-    // line's own chain was followed still printed "nesting too deep" on every command (review2 cf994b3d).
+    // Under hh 26528, fresh worktrees borrow only from the primary store; they do not chain into lenders.
+    expect(alternates).toEqual([primaryObjects])
     for (const args of [
-      ["cat-file", "-e", `${privatePin}^{commit}`],
+      ["cat-file", "-e", "HEAD^{commit}"],
       ["status", "--short"],
       ["fsck", "--connectivity-only"],
     ]) {
@@ -1273,26 +1265,9 @@ describe("materializeSubmodules", () => {
       .split("\n")
     expect(warm).toEqual(alternates)
 
-    // Post-order is the property that silences git: every listed store comes after every store it borrows from,
-    // the durable line excepted (it borrows from nothing and stays last). Pre-order would pass every check above.
-    const durable = warm.at(-1)!
-    for (const [index, store] of warm.entries()) {
-      if (store === durable) continue
-      const own = spawnSync("cat", [join(store, "info", "alternates")], { encoding: "utf8" }).stdout
-      for (const borrowed of own
-        .trim()
-        .split("\n")
-        .filter((line) => line !== "" && line !== durable)) {
-        expect(warm.indexOf(borrowed), `${store.replace(root, "")} borrows ${borrowed.replace(root, "")}`).toBeLessThan(
-          index,
-        )
-      }
-    }
-
-    // Stores the previous release wrote list their ancestors AFTER their borrow; a warm update heals that order
-    // (review2 f11cfb14: 163 such stores in 13 live worktrees kept the noise because nothing was "missing").
-    // Every generation is rewritten the old way, not only the last: only then does post-order differ from
-    // pre-order (review2 c2bb8107), so this also pins the walk's order.
+    // Legacy healing check (hh 25976): Stores created before hh 26528 chained ancestors in reverse or arbitrary order;
+    // a warm update heals that order so git prints no "nesting too deep" (review2 f11cfb14).
+    const durable = primaryObjects
     const storeOf = (generation: number): string =>
       join(
         git(join(root, `generation-${generation}`, "vendor/dependency"), [
@@ -1318,7 +1293,13 @@ describe("materializeSubmodules", () => {
       if (previousGitAllowProtocol === undefined) delete process.env.GIT_ALLOW_PROTOCOL
       else process.env.GIT_ALLOW_PROTOCOL = previousGitAllowProtocol
     }
-    expect(readFileSync(file, "utf8").trim().split("\n"), "the old order is rewritten ancestors-first").toEqual(warm)
+    const healedLines = readFileSync(file, "utf8").trim().split("\n")
+    const expectedLegacyHealed = [...Array.from({ length: 8 }, (_, i) => storeOf(i)), durable]
+    expect(healedLines, "the old order is rewritten ancestors-first").toEqual(expectedLegacyHealed)
+    expect(
+      spawnSync("git", ["-C", last, "cat-file", "-e", `${privatePin}^{commit}`], { encoding: "utf8" }).status,
+      "generation 8 reads generation 0's private commit through healed legacy chain",
+    ).toBe(0)
     expect(spawnSync("git", ["-C", last, "status", "--short"], { encoding: "utf8" }).stderr).not.toContain(
       "nesting too deep",
     )

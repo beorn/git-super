@@ -616,14 +616,12 @@ async function alternatesLineage(stores: readonly string[], own: string): Promis
  * module store (`<superproject common dir>/modules/<name>/objects`), because
  * either alone leaves a hole that killed 62 stores on 2026-08-25:
  *
- * 1. Without an explicit reference, borrows use the primary worktree. An
- *    explicit reference uses its own submodule stores first, including local
- *    commits in a linked worktree that have not been published yet.
+ * 1. Borrows are REDIRECTED to the primary worktree (`primaryWorktree` above),
+ *    so a fresh clone's alternates line lands on the durable shared store instead of
+ *    a disposable linked worktree's `worktrees/<wt>/modules` store (hh 26528).
  * 2. After EVERY successful update — fresh clone or warm no-op — the durable
  *    line is appended to the store's `objects/info/alternates` unless already
- *    present (`anchorDurableAlternates` below). Redirection alone cannot do
- *    this: a warm `submodule update` never rewrites alternates. The explicit
- *    reference line stays first; the durable line is also present.
+ *    present (`anchorDurableAlternates` below).
  */
 export async function materializeSubmodules(
   git: SubmoduleGit,
@@ -649,7 +647,9 @@ export async function materializeSubmodules(
         unreferencedPaths: [],
       }
     }
-    referenceRoot = requestedReference
+    if (canonical(primary) !== canonical(options.worktree)) {
+      referenceRoot = primary
+    }
   }
   let borrowed = 0
   let remoteFallbacks = 0
@@ -1307,8 +1307,7 @@ export async function materializeSubmodulesFromLocalWorktreeParallel(
 ): Promise<HostSubmoduleMaterializationResult> {
   const environment = cleanGitRepositoryEnvironment(options.env ?? process.env)
   const git = hostGit(environment)
-  const discovered =
-    options.referenceWorktree === undefined ? await primaryWorktree(git, options.worktree) : options.referenceWorktree
+  const discovered = await primaryWorktree(git, options.referenceWorktree ?? options.worktree)
   if (typeof discovered !== "string") {
     return {
       ...discovered,
