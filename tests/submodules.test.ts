@@ -1168,6 +1168,49 @@ describe("materializeSubmodules", () => {
     expect(git(candidateDependency, ["cat-file", "-e", "HEAD^{commit}"])).toBe("")
   })
 
+  it("treats a reference naming the worktree itself as no reference, not as its primary (hh 26528)", async () => {
+    // hh's base-root pool retries a cold `--no-checkout` queue clone's refusal
+    // with `referenceWorktree: <its own root>`. Redirecting that to the primary
+    // handed the refusing queue straight back, so the retry refused again.
+    const root = await mkdtemp(join(tmpdir(), "git-super-self-reference-"))
+    roots.push(root)
+    const dependency = join(root, "dependency")
+    const owner = join(root, "owner")
+    const queue = join(root, "queue")
+    const candidate = join(root, "candidate")
+    for (const repository of [dependency, owner]) {
+      git(root, ["init", "-q", "-b", "main", repository])
+      git(repository, ["config", "user.name", "Git Super Test"])
+      git(repository, ["config", "user.email", "git-super@example.invalid"])
+      writeFileSync(join(repository, "README.md"), `${repository}\n`)
+      git(repository, ["add", "README.md"])
+      git(repository, ["commit", "-qm", "initial"])
+    }
+    git(owner, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", dependency, "vendor/dependency"])
+    git(owner, ["commit", "-qam", "add dependency"])
+    const pin = git(dependency, ["rev-parse", "HEAD"]).trim()
+    git(root, ["clone", "-q", "--no-checkout", owner, queue])
+    git(queue, ["worktree", "add", "-q", "--detach", candidate, "HEAD"])
+
+    const previousGitAllowProtocol = process.env.GIT_ALLOW_PROTOCOL
+    process.env.GIT_ALLOW_PROTOCOL = "file"
+    try {
+      const discovered = await materializeSubmodulesFromLocalWorktreeParallel({ worktree: candidate })
+      expect(discovered.exitCode, "the discovered cold queue still refuses").toBe(1)
+      expect(discovered.stderr).toContain("holds no object store")
+
+      const unreferenced = await materializeSubmodulesFromLocalWorktreeParallel({
+        worktree: candidate,
+        referenceWorktree: candidate,
+      })
+      expect(unreferenced, unreferenced.stderr).toMatchObject({ exitCode: 0, borrowed: 0 })
+    } finally {
+      if (previousGitAllowProtocol === undefined) delete process.env.GIT_ALLOW_PROTOCOL
+      else process.env.GIT_ALLOW_PROTOCOL = previousGitAllowProtocol
+    }
+    expect(git(join(candidate, "vendor/dependency"), ["rev-parse", "HEAD"]).trim()).toBe(pin)
+  })
+
   it("keeps every store one hop from its lineage when worktrees borrow from worktrees (hh 25976)", async () => {
     // Each worktree borrowing from the one before chained one alternates line per generation; git follows
     // alternates only five deep ("ignoring alternate object stores, nesting too deep"), so the 9-deep yrd env

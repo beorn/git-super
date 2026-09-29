@@ -1307,8 +1307,15 @@ export async function materializeSubmodulesFromLocalWorktreeParallel(
 ): Promise<HostSubmoduleMaterializationResult> {
   const environment = cleanGitRepositoryEnvironment(options.env ?? process.env)
   const git = hostGit(environment)
-  const discovered = await primaryWorktree(git, options.referenceWorktree ?? options.worktree)
-  if (typeof discovered !== "string") {
+  // A reference naming the worktree itself is how a caller spells "no
+  // reference". Discovering its primary would hand back the very store the
+  // caller opted out of, e.g. a cold queue clone that refused a moment ago.
+  const selfReference =
+    options.referenceWorktree !== undefined && canonical(options.referenceWorktree) === canonical(options.worktree)
+  const discovered = selfReference
+    ? undefined
+    : await primaryWorktree(git, options.referenceWorktree ?? options.worktree)
+  if (discovered !== undefined && typeof discovered !== "string") {
     return {
       ...discovered,
       exitCode: discovered.code,
