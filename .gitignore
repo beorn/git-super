@@ -1,3 +1,4 @@
 node_modules/
+.ci-siblings/
 dist/
 *.tgz

@@ -1,0 +1,10 @@
+{
+  "schema": "vendor-kit/source-siblings/v1",
+  "siblings": [
+    {
+      "name": "gitomic",
+      "repository": "beorn/gitomic",
+      "commit": "c104848faf0426cb554728d802b669290b37e643"
+    }
+  ]
+}

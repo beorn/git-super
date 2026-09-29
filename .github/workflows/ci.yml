@@ -17,7 +17,7 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.2
-      - run: bun install --frozen-lockfile
+      - uses: ./.github/actions/source-siblings
       - run: bun run check
       # Keep the Linux production descriptor-owner cases pinned separately
       # from the historic conformance corpus.
@@ -52,7 +52,7 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.2
-      - run: bun install --frozen-lockfile
+      - uses: ./.github/actions/source-siblings
       # Consume the existing Yrd cases at an immutable test-only revision.
       # Their fixture writes and ref assertions always use native Git.
       - uses: actions/checkout@v4
