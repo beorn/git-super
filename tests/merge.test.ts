@@ -3221,6 +3221,11 @@ describe("git super merge — bounded reuse of untouched Equal child mains (2562
     roots.push(fixtureRoot)
     const fixture = createProductFixture(fixtureRoot)
     const candidate = candidateWithRootChange(fixture, "candidate-local-main")
+    const invalid = await superMerge({ repo: fixture.product, commit: candidate, unboundedLocalMain: true })
+    expect(invalid).toMatchObject({
+      state: "failed",
+      detail: { code: "unbounded-local-main-requires-no-fetch" },
+    })
     const alpha = join(fixture.product, "packages/alpha")
     const before = git(alpha, "reflog", "show", "-1", "--format=%H%x00%gs", "refs/remotes/origin/main")
     const local = createLocalGitProcess()
@@ -3244,6 +3249,41 @@ describe("git super merge — bounded reuse of untouched Equal child mains (2562
     expect(refreshes).toEqual([])
     expect(result.unboundedLocalMains?.map((row) => row.path).sort()).toEqual(["packages/alpha", "vendor/beta"])
     expect(git(alpha, "reflog", "show", "-1", "--format=%H%x00%gs", "refs/remotes/origin/main")).toBe(before)
+  })
+
+  /**
+   * @failure A copied tracking ref classifies Equal when its commit is absent from the child store.
+   * @level l1
+   * @consumer Yrd submit candidate verification
+   */
+  it("refuses a local Equal whose pin commit is absent from the child store", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-25626-local-object-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const candidate = candidateWithRootChange(fixture, "candidate-local-object")
+    const alpha = join(fixture.product, "packages/alpha")
+    const pin = git(alpha, "rev-parse", "refs/remotes/origin/main")
+    const local = createLocalGitProcess()
+    const unavailable: GitProcess = {
+      run: (request) =>
+        request.repo === alpha && request.args.join(" ") === `cat-file -e ${pin}^{commit}`
+          ? Promise.resolve({ code: 1, stdout: "", stderr: "fixture: child commit absent" })
+          : local.run(request),
+    }
+
+    const result = await superMerge({
+      repo: fixture.product,
+      commit: candidate,
+      noFetch: true,
+      unboundedLocalMain: true,
+      git: unavailable,
+    })
+
+    expect(result).toMatchObject({
+      state: "failed",
+      detail: { code: "submodule-main-unreadable", subject: expect.stringContaining("packages/alpha") },
+    })
+    expect(result.unboundedLocalMains).toBeUndefined()
   })
 
   it("refreshes untouched Equal mains once per ten minutes, including unchanged refs with logging disabled", async () => {
@@ -3331,7 +3371,13 @@ describe("git super merge — bounded reuse of untouched Equal child mains (2562
           return local.run(request)
         },
       }
-      const result = await superMerge({ repo: fixture.product, commit: candidate, noFetch: true, git: recording })
+      const result = await superMerge({
+        repo: fixture.product,
+        commit: candidate,
+        noFetch: true,
+        unboundedLocalMain: true,
+        git: recording,
+      })
       expect(result).toMatchObject({ state: "updated", partial: false })
       expect(refreshed).toContain("packages/alpha")
       expect(git(fixture.product, "rev-parse", "HEAD:packages/alpha")).toBe(fresh)
@@ -3711,7 +3757,12 @@ describe("git super merge — bounded reuse of untouched Equal child mains (2562
       git(sub, "update-ref", "-d", "refs/remotes/origin/main")
     }
 
-    const result = await superMerge({ repo: fixture.product, commit: candidate, noFetch: true })
+    const result = await superMerge({
+      repo: fixture.product,
+      commit: candidate,
+      noFetch: true,
+      unboundedLocalMain: true,
+    })
 
     expect(result).toMatchObject({ state: "failed", detail: { code: "submodule-main-unreadable" } })
   })
@@ -3748,7 +3799,13 @@ describe("git super merge — bounded reuse of untouched Equal child mains (2562
       },
     }
 
-    const result = await superMerge({ repo: fixture.product, commit: candidate, noFetch: true, git: recording })
+    const result = await superMerge({
+      repo: fixture.product,
+      commit: candidate,
+      noFetch: true,
+      unboundedLocalMain: true,
+      git: recording,
+    })
 
     expect(result).toMatchObject({ state: "updated" })
     // Only packages/alpha was moved, so only packages/alpha was fetched; vendor/beta was bypassed!

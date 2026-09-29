@@ -665,23 +665,29 @@ describe("Phase 1 read commands", () => {
     })
   })
 
-  test("merge --help advertises --no-fetch option", async () => {
+  test("merge --help advertises local-main options", async () => {
     const stdout = outputSink()
     const stderr = outputSink()
     expect(await runCli(["merge", "--help"], stdout, stderr)).toBe(0)
     expect(stdout.output).toContain("--no-fetch")
+    expect(stdout.output).toContain("--unbounded-local-main")
     expect(stderr.output).toBe("")
   })
 
-  test("commands.merge params accepts and preserves noFetch (25626 Arm A4)", () => {
-    const invocation = resolveInvocation(commands.merge, { repo: "." }, { commit: "abc", noFetch: true })
+  test("commands.merge params preserves the local-main option (25626)", () => {
+    const invocation = resolveInvocation(
+      commands.merge,
+      { repo: "." },
+      { commit: "abc", noFetch: true, unboundedLocalMain: true },
+    )
     expect(invocation.state).toBe("ready")
     if (invocation.state === "ready") {
       expect(invocation.params.noFetch).toBe(true)
+      expect(invocation.params.unboundedLocalMain).toBe(true)
     }
   })
 
-  test("runCli forwards --no-fetch to commands.merge as noFetch: true (25626 Arm A3)", async () => {
+  test("runCli forwards local-main options to commands.merge (25626)", async () => {
     let capturedInput: unknown
     const originalRun = commands.merge.run
     try {
@@ -691,9 +697,13 @@ describe("Phase 1 read commands", () => {
       }
       const stdout = outputSink()
       const stderr = outputSink()
-      const code = await runCli(["--repo", ".", "--json", "merge", "--no-fetch", "HEAD"], stdout, stderr)
+      const code = await runCli(
+        ["--repo", ".", "--json", "merge", "--no-fetch", "--unbounded-local-main", "HEAD"],
+        stdout,
+        stderr,
+      )
       expect(code).toBe(0)
-      expect(capturedInput).toMatchObject({ noFetch: true })
+      expect(capturedInput).toMatchObject({ noFetch: true, unboundedLocalMain: true })
     } finally {
       commands.merge.run = originalRun
     }
