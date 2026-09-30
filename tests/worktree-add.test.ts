@@ -7,6 +7,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, w
 import { spawnSync } from "node:child_process"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { fileURLToPath } from "node:url"
 import { afterEach, describe, expect, it } from "vitest"
 import { runCli } from "../src/cli.ts"
 import { acquireExclusive } from "../src/exclusive.ts"
@@ -517,7 +518,7 @@ describe("git super worktree add", () => {
       `,
         lockDir,
         ready,
-        join(process.cwd(), "vendor/git-super/src/exclusive.ts"),
+        fileURLToPath(new URL("../src/exclusive.ts", import.meta.url)),
       ],
       { cwd: process.cwd(), stdout: "pipe", stderr: "pipe" },
     )
