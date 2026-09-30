@@ -1487,6 +1487,24 @@ async function readAdvertisement(
   return rows
 }
 
+/** Exact `ls-remote` of one ref. Prefix matching would also hit `foreign-next`. */
+async function readExactAdvertisedRef(
+  git: GitProcess,
+  repository: string,
+  remote: string,
+  ref: string,
+): Promise<AdvertisedRef | null> {
+  const advertised = await git.run({ repo: repository, args: ["ls-remote", "--refs", remote, ref] })
+  if (advertised.code !== 0 || !ancestrySettled(advertised)) {
+    throw operationError(repository, ["ls-remote", "--refs", remote, ref], "inspect-submodule-remote", advertised)
+  }
+  for (const line of advertised.stdout.split(/\r?\n/u).filter((row) => row !== "")) {
+    const [oid, name] = line.split(/\s+/u, 2)
+    if (oid !== undefined && name === ref && OBJECT_ID.test(oid)) return { oid, ref: name }
+  }
+  return null
+}
+
 /**
  * Read raw presence and commit peel together in one batch. Only absent refs
  * need a bounded fetch and a second batch over that subset (25142).
@@ -1555,6 +1573,44 @@ async function advertisedTips(
     )
   }
   const fetched = absent.length === 0 ? [] : await inspect(queries(absent))
+  const liveAbsent: AdvertisedRef[] = []
+  const liveFetched: BatchCheckResult[] = []
+  for (let index = 0; index < absent.length; index += 1) {
+    const row = absent[index]
+    if (row === undefined) continue
+    const raw = fetched[index * 2]
+    const peeled = fetched[index * 2 + 1]
+    if (raw === undefined || peeled === undefined) {
+      throw new Error(`Missing object answer for ${row.ref} in ${repository}`)
+    }
+    if (!("missing" in raw)) {
+      liveAbsent.push(row)
+      liveFetched.push(raw, peeled)
+      continue
+    }
+    // 26853: fetch-by-name can land a newer tip than ls-remote froze. The
+    // advertised object is then absent because the ref moved, not because a
+    // required object is missing. Re-read that one ref; keep the loud refusal
+    // when the advertised object is still the current tip.
+    const current = await readExactAdvertisedRef(git, repository, remote, row.ref)
+    if (current === null) continue
+    if (current.oid === row.oid) {
+      throw new Error(`Advertised object ${row.oid} at ${row.ref} from ${remote} remains missing in ${repository}`)
+    }
+    const moved = await inspect(queries([current]))
+    const movedRaw = moved[0]
+    const movedPeeled = moved[1]
+    if (movedRaw === undefined || movedPeeled === undefined) {
+      throw new Error(`Missing object answer for ${row.ref} in ${repository}`)
+    }
+    if ("missing" in movedRaw) {
+      throw new Error(
+        `Advertised object ${row.oid} at ${row.ref} from ${remote} remains missing in ${repository} (ref now ${current.oid}; that object is also absent)`,
+      )
+    }
+    liveAbsent.push(current)
+    liveFetched.push(movedRaw, movedPeeled)
+  }
   const tips = new Set<string>()
   const collect = (
     selected: readonly AdvertisedRef[],
@@ -1585,7 +1641,7 @@ async function advertisedTips(
     })
   }
   collect(rows, first, false)
-  collect(absent, fetched, true)
+  collect(liveAbsent, liveFetched, true)
   return [...tips]
 }
 

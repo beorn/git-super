@@ -1649,6 +1649,50 @@ describe("explicit recursive push mechanics", () => {
   )
 
   /**
+   * 26853: preservation is a task-branch on-demand push. An unrelated
+   * refs/yrd/main/runner that advances between advertisement and fetch must
+   * not fail plan-push; the missing-object refusal stays in the sibling test.
+   * @failure A task-branch push is refused at plan-push because the queue runner moved
+   * @level l2
+   * @consumer Yrd preservation push via git-super superPush on-demand
+   */
+  test("on-demand task-branch push survives a moving refs/yrd/main/runner (26853)", async () => {
+    const fixture = recursivePushFixture("moving-runner-task-push")
+    const runnerSeed = join(fixture.fixture, "runner-seed")
+    const advertisedRunner = createRepository(runnerSeed, "runner.txt", "advertised\n")
+    git(runnerSeed, "push", "-q", fixture.rootRemote, `${advertisedRunner}:refs/yrd/main/runner`)
+    const movedSeed = join(fixture.fixture, "runner-moved")
+    const movedRunner = createRepository(movedSeed, "runner.txt", "moved\n")
+    git(movedSeed, "push", "-q", fixture.rootRemote, `${movedRunner}:refs/yrd/main/runner-next`)
+    expect(() => git(fixture.root, "cat-file", "-e", `${advertisedRunner}^{commit}`)).toThrow()
+
+    const local = createLocalGitProcess()
+    let advanced = false
+    const racing: GitProcess = {
+      run(request) {
+        if (!advanced && request.args[0] === "fetch" && request.args.includes("refs/yrd/main/runner")) {
+          advanced = true
+          git(fixture.rootRemote, "update-ref", "refs/yrd/main/runner", movedRunner)
+        }
+        return local.run(request)
+      },
+    }
+
+    const result = await superPush({
+      repo: fixture.root,
+      remote: "origin",
+      refspecs: [`${fixture.rootSource}:refs/heads/task/26853-preserve`],
+      recurseSubmodules: "on-demand",
+      git: racing,
+    })
+
+    expect(result).toMatchObject({ state: "updated", partial: false })
+    expect(advanced).toBe(true)
+    expect(git(fixture.rootRemote, "rev-parse", "refs/heads/task/26853-preserve")).toBe(fixture.rootSource)
+    expect(() => git(fixture.root, "cat-file", "-e", `${advertisedRunner}^{commit}`)).toThrow()
+  })
+
+  /**
    * Control for 24901: the queue's publication to main still moves each child's
    * main to the merged commit — the non-main guard does not break the happy path.
    *
@@ -2178,8 +2222,9 @@ describe("cold first publication retains an existing child pin (26421)", () => {
       fault === "raced-conflict" ||
       fault === "ancestry-failure" ||
       fault === "advertisement-failure"
-    )
+    ) {
       expect(injected).toBe(true)
+    }
     expect(git(shape.remotes.other, "rev-parse", "refs/heads/main")).toBe(otherMain)
     expect(git(shape.remotes.other, "for-each-ref", "--format=%(objectname)", ref)).toBe(
       fault === "conflict" || fault === "raced-conflict" ? wrongSource : "",
@@ -2270,8 +2315,9 @@ describe("cold first publication retains an existing child pin (26421)", () => {
           !request.args.includes("--dry-run") &&
           request.args.includes(`${shape.childSource}:${firstRef}`) &&
           result.code === 0
-        )
+        ) {
           retained = true
+        }
         return result
       },
     }
@@ -2389,6 +2435,45 @@ describe("a frozen push works only on the children its merge moved (25303, obser
     await expect(
       remoteContainsCommit({ repository, remote: "origin", commit: source, git: withoutFetch }),
     ).rejects.toThrow(new RegExp(`${missing}.*refs/heads/foreign.*origin.*remains missing`, "u"))
+  })
+
+  /**
+   * 26853: a real remote fetch of an advertised ref can land a newer tip than
+   * ls-remote froze. The original object is then absent; that is a moved
+   * unrelated ref, not a missing required object.
+   * @failure git-super refuses a task-branch push because refs/yrd/main/runner moved
+   * @level l2
+   * @consumer vendor/git-super/src/push.ts advertisedTips — preservation push
+   */
+  test("survives an advertised ref advancing between advertisement and a real fetch (26853)", async () => {
+    const { fixture, repository, remote, source } = pushFixture("moving-advertised-ref")
+    git(repository, "remote", "add", "origin", remote)
+    git(repository, "push", "-q", "origin", `${source}:refs/heads/main`)
+    const foreign = join(fixture, "foreign")
+    git(fixture, "clone", "-q", remote, foreign)
+    const advertised = advanceRepository(foreign, "foreign.txt", "advertised\n")
+    git(foreign, "push", "-q", "origin", `${advertised}:refs/heads/foreign`)
+    const movedSeed = join(fixture, "moved")
+    const moved = createRepository(movedSeed, "moved.txt", "moved\n")
+    git(movedSeed, "remote", "add", "origin", remote)
+    git(movedSeed, "push", "-q", "origin", `${moved}:refs/heads/foreign-next`)
+    expect(() => git(repository, "cat-file", "-e", `${advertised}^{commit}`)).toThrow()
+
+    const local = createLocalGitProcess()
+    let advanced = false
+    const racing: GitProcess = {
+      run(request) {
+        if (!advanced && request.args[0] === "fetch" && request.args.includes("refs/heads/foreign")) {
+          advanced = true
+          git(remote, "update-ref", "refs/heads/foreign", moved)
+        }
+        return local.run(request)
+      },
+    }
+    await expect(remoteContainsCommit({ repository, remote: "origin", commit: source, git: racing })).resolves.toBe(
+      true,
+    )
+    expect(advanced).toBe(true)
   })
 
   test("peels a fetched annotated tag in the second batch without rereading present refs", async () => {
