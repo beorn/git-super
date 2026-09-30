@@ -34,12 +34,15 @@ export type WorktreeRemovalProof = Readonly<{
   retainUntil: string
   rehomedBorrowers?: readonly string[]
   writerLocks: readonly WriterLockProof[]
+  createdWriterLocks: readonly WriterLockProof[]
 }>
 
 export type WriterLockProof = Readonly<{ path: string; body: string; lease: "free" }>
 
 export type RemovalWriterLeases = Readonly<{
   proof: readonly WriterLockProof[]
+  created: readonly WriterLockProof[]
+  refusal: (error: unknown) => unknown
   release: () => void
 }>
 
@@ -282,9 +285,17 @@ function isWriterLeasePath(path: string, root: string, rootIsGitDir: boolean): b
 }
 
 /** Take every in-custody Git directory's writer lease before retention; callers hold them through native removal. */
-export function acquireRemovalWriterLeases(gitDir: string): RemovalWriterLeases {
+export function acquireRemovalWriterLeases(gitDir: string, onAcquired?: (path: string) => void): RemovalWriterLeases {
   const handles: FlockHandle[] = []
   const proof: WriterLockProof[] = []
+  const created: WriterLockProof[] = []
+  const refusal = (error: unknown): unknown =>
+    created.length === 0
+      ? error
+      : new Error(
+          `${error instanceof Error ? error.message : String(error)}; writer lock paths created by this removal (kept): ${created.map((entry) => entry.path).join(", ")}`,
+          { cause: error },
+        )
   const release = () => {
     const failures: unknown[] = []
     for (const handle of handles.reverse()) {
@@ -339,9 +350,12 @@ export function acquireRemovalWriterLeases(gitDir: string): RemovalWriterLeases 
       ) {
         throw new Error(`writer lease ${path} changed identity during acquisition; worktree preserved`)
       }
-      proof.push({ path, body: readFileSync(handle.fd, "utf8"), lease: "free" })
+      const entry: WriterLockProof = { path, body: readFileSync(handle.fd, "utf8"), lease: "free" }
+      if (before === null) created.push(entry)
+      else proof.push(entry)
+      onAcquired?.(path)
     }
-    return { proof, release }
+    return { proof, created, refusal, release }
   } catch (error) {
     try {
       release()
@@ -351,7 +365,7 @@ export function acquireRemovalWriterLeases(gitDir: string): RemovalWriterLeases 
         `writer lease acquisition and release both failed under ${gitDir}`,
       )
     }
-    throw error
+    throw refusal(error)
   }
 }
 
@@ -540,6 +554,7 @@ export async function retainWorktreeModules(
   retention: WorktreeRetention,
   inspect: (repository: string, path: string) => Promise<WorktreeInspection>,
   writerLocks: readonly WriterLockProof[],
+  createdWriterLocks: readonly WriterLockProof[],
 ): Promise<WorktreeRemovalProof> {
   const path = realpathSync(requested)
   const registered = await inspect(repo, path)
@@ -633,6 +648,7 @@ export async function retainWorktreeModules(
     retainUntil: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
     ...(rehomedBorrowers.length === 0 ? {} : { rehomedBorrowers }),
     writerLocks,
+    createdWriterLocks,
   }
   writeFileSync(
     proof.manifest,
