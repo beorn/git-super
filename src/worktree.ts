@@ -432,6 +432,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
               removeOptions.retention,
               (repository, target) => inspectWorktree(git, repository, target),
               writerLeases.proof,
+              writerLeases.created,
             )
           } else {
             if (removeOptions.unlock === true) await unlockWorktree(git, repo, path)
@@ -444,6 +445,8 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
           if (existsSync(path) || (await inspectWorktree(git, repo, path)).registered) {
             throw new Error(`git reported success but did not fully remove worktree '${path}'`)
           }
+        } catch (error) {
+          throw writerLeases.refusal(error)
         } finally {
           writerLeases.release()
         }

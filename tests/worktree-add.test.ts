@@ -10,6 +10,7 @@ import { join } from "node:path"
 import { afterEach, describe, expect, it } from "vitest"
 import { runCli } from "../src/cli.ts"
 import { acquireExclusive } from "../src/exclusive.ts"
+import { acquireRemovalWriterLeases } from "../src/worktree-removal.ts"
 import { tryAcquireFlock } from "@bearly/flock"
 
 const roots: string[] = []
@@ -290,6 +291,7 @@ describe("git super worktree add", () => {
     const lockPath = join(childGitDir, "yrd-worktree-mutations", "writer.lock")
     expect(existsSync(lockPath)).toBe(false)
     let contender: string | undefined
+    const output = outputSink()
     const diagnostic = {
       write(value: string) {
         if (!value.startsWith("worktree removal proof ")) return
@@ -309,11 +311,105 @@ describe("git super worktree add", () => {
     expect(
       await runCli(
         ["--repo", fixture.product, "--json", "worktree", "remove", worktree, "--retain", retained],
-        outputSink(),
+        output,
         diagnostic,
       ),
     ).toBe(0)
     expect(contender).toBe("busy")
+    const result = JSON.parse(output.output) as {
+      proof: {
+        writerLocks: Array<{ path: string }>
+        createdWriterLocks: Array<{ path: string; body: string; lease: string }>
+      }
+    }
+    expect(result.proof.createdWriterLocks).toContainEqual({ path: lockPath, body: "", lease: "free" })
+    expect(result.proof.writerLocks).not.toContainEqual(expect.objectContaining({ path: lockPath }))
+    expect(existsSync(worktree)).toBe(false)
+  }, 30_000)
+
+  /**
+   * @failure A later absent writer path races into a held lease after removal created an earlier path (25714).
+   * @level l1
+   * @consumer Yrd environment close
+   */
+  it("keeps and names created lock paths when a later absent path becomes held", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-worktree-absent-race-"))
+    roots.push(fixtureRoot)
+    const fixture = createSuperproject(fixtureRoot)
+    const worktree = join(fixtureRoot, "candidate")
+    const retained = join(fixtureRoot, "retained")
+    expect(
+      await runCli(["--repo", fixture.product, "worktree", "add", worktree, "HEAD"], outputSink(), outputSink()),
+    ).toBe(0)
+    const adminGitDir = git(worktree, ["rev-parse", "--absolute-git-dir"])
+    const childGitDir = git(join(worktree, "vendor/dep"), ["rev-parse", "--absolute-git-dir"])
+    const firstPath = join(childGitDir, "yrd-worktree-mutations", "writer.lock")
+    const laterPath = join(adminGitDir, "yrd-worktree-mutations", "writer.lock")
+    expect(existsSync(firstPath)).toBe(false)
+    expect(existsSync(laterPath)).toBe(false)
+    const ready = join(fixtureRoot, "later-holder-ready")
+    let holder: ReturnType<typeof Bun.spawn> | undefined
+    const sleeper = new Int32Array(new SharedArrayBuffer(4))
+    try {
+      let refusal: unknown
+      try {
+        const unexpectedlyAcquired = acquireRemovalWriterLeases(adminGitDir, (path) => {
+          if (path !== firstPath) return
+          holder = Bun.spawn(
+            [
+              process.execPath,
+              "-e",
+              `
+              import {tryAcquireFlock} from "@bearly/flock";
+              import {writeFileSync} from "node:fs";
+              const lock=tryAcquireFlock(process.argv[1], {body:"racing child"});
+              if(!lock) throw new Error("child could not acquire later lease");
+              writeFileSync(process.argv[2], String(process.pid));
+              setInterval(() => {}, 1000);
+            `,
+              laterPath,
+              ready,
+            ],
+            { cwd: process.cwd(), stdout: "pipe", stderr: "pipe" },
+          )
+          for (let poll = 0; poll < 300 && !existsSync(ready) && holder.exitCode === null; poll += 1) {
+            Atomics.wait(sleeper, 0, 0, 10)
+          }
+          if (!existsSync(ready)) throw new Error("racing child did not acquire the later lease")
+        })
+        unexpectedlyAcquired.release()
+      } catch (error) {
+        refusal = error
+      }
+      expect(refusal).toBeInstanceOf(Error)
+      expect((refusal as Error).message).toContain("writer lock paths created by this removal (kept):")
+      expect((refusal as Error).message).toContain(firstPath)
+      expect((refusal as Error).message).toContain(laterPath)
+      expect(existsSync(firstPath)).toBe(true)
+      const released = tryAcquireFlock(firstPath)
+      expect(released).not.toBeNull()
+      released?.release()
+      expect(existsSync(worktree)).toBe(true)
+      expect(existsSync(retained)).toBe(false)
+      expect(git(fixture.product, ["worktree", "list", "--porcelain"])).toContain(worktree)
+    } finally {
+      holder?.kill()
+      if (holder !== undefined) await holder.exited
+    }
+    const output = outputSink()
+    expect(
+      await runCli(
+        ["--repo", fixture.product, "--json", "worktree", "remove", worktree, "--retain", retained],
+        output,
+        outputSink(),
+      ),
+    ).toBe(0)
+    const result = JSON.parse(output.output) as {
+      proof: { writerLocks: Array<{ path: string; body: string; lease: string }>; createdWriterLocks: unknown[] }
+    }
+    expect(result.proof.writerLocks).toContainEqual({ path: firstPath, body: "", lease: "free" })
+    expect(result.proof.writerLocks).toContainEqual({ path: laterPath, body: "racing child", lease: "free" })
+    expect(result.proof.createdWriterLocks).toEqual([])
     expect(existsSync(worktree)).toBe(false)
   }, 30_000)
 
@@ -523,6 +619,9 @@ describe("git super worktree add", () => {
     expect(
       await runCli(["--repo", fixture.product, "worktree", "add", worktree, "HEAD"], outputSink(), outputSink()),
     ).toBe(0)
+    const childGitDir = git(join(worktree, "vendor/dep"), ["rev-parse", "--absolute-git-dir"])
+    const lockPath = join(childGitDir, "yrd-worktree-mutations", "writer.lock")
+    expect(existsSync(lockPath)).toBe(false)
     const out = outputSink()
     expect(
       await runCli(
@@ -532,8 +631,34 @@ describe("git super worktree add", () => {
       ),
     ).toBe(2)
     expect(out.output).toContain(blocker)
+    expect(out.output).toContain(`writer lock paths created by this removal (kept):`)
+    expect(out.output).toContain(lockPath)
+    expect(existsSync(lockPath)).toBe(true)
     expect(existsSync(worktree)).toBe(true)
     expect(git(fixture.product, ["worktree", "list", "--porcelain"])).toContain(worktree)
+    const retry = outputSink()
+    expect(
+      await runCli(
+        [
+          "--repo",
+          fixture.product,
+          "--json",
+          "worktree",
+          "remove",
+          worktree,
+          "--retain",
+          join(fixtureRoot, "retained"),
+        ],
+        retry,
+        outputSink(),
+      ),
+    ).toBe(0)
+    const result = JSON.parse(retry.output) as {
+      proof: { writerLocks: Array<{ path: string; body: string; lease: string }>; createdWriterLocks: unknown[] }
+    }
+    expect(result.proof.writerLocks).toContainEqual({ path: lockPath, body: "", lease: "free" })
+    expect(result.proof.createdWriterLocks).toEqual([])
+    expect(existsSync(worktree)).toBe(false)
   })
 
   it("materializes a submodule at the pin the reference already holds", async () => {
