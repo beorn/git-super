@@ -1,3 +1,7 @@
 {
-  "modules": ["source-siblings"]
+  "modules": ["source-siblings", "release"],
+  "vars": {
+    "bunVersion": "1.4.2",
+    "testCommand": "bun run check"
+  }
 }
