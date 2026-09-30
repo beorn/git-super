@@ -5,7 +5,7 @@
     "": {
       "name": "git-super",
       "dependencies": {
-        "@bearly/flock": "^0.1.0",
+        "@bearly/flock": "^0.2.1",
         "@bearly/pacing": "^0.1.0",
         "@silvery/command": "0.23.2",
         "@silvery/commander": "0.23.2",
@@ -36,7 +36,7 @@
 
     "@babel/types": ["@babel/types@7.29.8", "", { "dependencies": { "@babel/helper-string-parser": "^7.29.7", "@babel/helper-validator-identifier": "^7.29.7" } }, "sha512-Vj1jF3cPfxg7OAfoI7QnVKLoILlm2JF9pnVHrX8qx7AHMiYWT+NDAA7jChlNgRS4WTLc/fD1lXLmPixluj+3Gg=="],
 
-    "@bearly/flock": ["@bearly/flock@0.1.0", "", {}, "sha512-L9qQPH3Df+xKaFfOoYOamyL00CmRltbvilx0XfXzylFw76MRMN4SrhydxrVc4ROsZ5nkVZE0prl3G3zv3ZOH5w=="],
+    "@bearly/flock": ["@bearly/flock@0.2.1", "", {}, "sha512-74FLfW30FMkpZcD6oPp820QB+mPBXWykWMzAS6QShj39AXRvwa6AsMPJ1qf7O4oIRymgBmsdINOoyWpKQydDcg=="],
 
     "@bearly/pacing": ["@bearly/pacing@0.1.0", "", {}, "sha512-t5c9YUrcZjETONe+DvjjnRtfqlNzPexR3CgFFe7sdqeWlMCVQ8e41qHl/ACHwm42wpRERRrn9dHRuZFLl9I7cg=="],
 
