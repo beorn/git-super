@@ -192,7 +192,7 @@ describe("git super worktree add", () => {
       const result = JSON.parse(stdout.output) as {
         proof: { writerLocks: Array<{ path: string; body: string; lease: string }> }
       }
-      expect(result.proof.writerLocks).toEqual([{ path: lockPath, body, lease: "free" }])
+      expect(result.proof.writerLocks).toContainEqual({ path: lockPath, body, lease: "free" })
       expect(existsSync(worktree)).toBe(false)
     },
     30_000,
@@ -287,9 +287,8 @@ describe("git super worktree add", () => {
       await runCli(["--repo", fixture.product, "worktree", "add", worktree, "HEAD"], outputSink(), outputSink()),
     ).toBe(0)
     const childGitDir = git(join(worktree, "vendor/dep"), ["rev-parse", "--absolute-git-dir"])
-    const old = await acquireExclusive(join(childGitDir, "yrd-worktree-mutations"), { timeoutMs: 0 }, "finished")
-    old.release()
     const lockPath = join(childGitDir, "yrd-worktree-mutations", "writer.lock")
+    expect(existsSync(lockPath)).toBe(false)
     let contender: string | undefined
     const diagnostic = {
       write(value: string) {
@@ -323,7 +322,7 @@ describe("git super worktree add", () => {
    * @level l1
    * @consumer Yrd environment close
    */
-  it.each(["index.lock", "other/writer.lock"])(
+  it.each(["index.lock", "other/writer.lock", "modules-root/writer.lock"])(
     "keeps %s as a removal barrier",
     async (relativeLock) => {
       const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-worktree-other-lock-"))
@@ -335,7 +334,10 @@ describe("git super worktree add", () => {
         await runCli(["--repo", fixture.product, "worktree", "add", worktree, "HEAD"], outputSink(), outputSink()),
       ).toBe(0)
       const childGitDir = git(join(worktree, "vendor/dep"), ["rev-parse", "--absolute-git-dir"])
-      const barrier = join(childGitDir, relativeLock)
+      const barrier =
+        relativeLock === "modules-root/writer.lock"
+          ? join(git(worktree, ["rev-parse", "--absolute-git-dir"]), "modules/yrd-worktree-mutations/writer.lock")
+          : join(childGitDir, relativeLock)
       mkdirSync(join(barrier, ".."), { recursive: true })
       writeFileSync(barrier, "do not remove")
       const out = outputSink()
@@ -415,9 +417,11 @@ describe("git super worktree add", () => {
     const result = JSON.parse(out.output) as {
       proof: { writerLocks: Array<{ path: string; body: string; lease: string }> }
     }
-    expect(result.proof.writerLocks).toEqual([
-      { path: lockPath, body: expect.stringContaining("git super push"), lease: "free" },
-    ])
+    expect(result.proof.writerLocks).toContainEqual({
+      path: lockPath,
+      body: expect.stringContaining("git super push"),
+      lease: "free",
+    })
     expect(existsSync(worktree)).toBe(false)
   }, 30_000)
 

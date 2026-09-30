@@ -260,12 +260,9 @@ type StoreManifest = Readonly<{
 }>
 type StoreCustody = Readonly<{ common: string; checkout: string; gitDir: string; modules: string }>
 
-/** Only git-super's writer lock directly inside a Git directory is a lease; Git's other .lock files remain barriers. */
-function isWriterLeasePath(path: string, rootGitDir: string): boolean {
-  if (basename(path) !== "writer.lock" || basename(dirname(path)) !== "yrd-worktree-mutations") return false
-  const owner = dirname(dirname(path))
-  if (!within(rootGitDir, owner)) return false
-  if (owner === rootGitDir) return true
+function isGitDirectory(owner: string, root: string, rootIsGitDir: boolean): boolean {
+  if (!within(root, owner)) return false
+  if (owner === root) return rootIsGitDir
   return (
     present(join(owner, "HEAD")) &&
     lstatSync(join(owner, "HEAD")).isFile() &&
@@ -275,7 +272,16 @@ function isWriterLeasePath(path: string, rootGitDir: string): boolean {
   )
 }
 
-/** Take every existing writer lease before retention changes anything; callers hold them through native removal. */
+/** Only git-super's writer lock directly inside a Git directory is a lease; Git's other .lock files remain barriers. */
+function isWriterLeasePath(path: string, root: string, rootIsGitDir: boolean): boolean {
+  return (
+    basename(path) === "writer.lock" &&
+    basename(dirname(path)) === "yrd-worktree-mutations" &&
+    isGitDirectory(dirname(dirname(path)), root, rootIsGitDir)
+  )
+}
+
+/** Take every in-custody Git directory's writer lease before retention; callers hold them through native removal. */
 export function acquireRemovalWriterLeases(gitDir: string): RemovalWriterLeases {
   const handles: FlockHandle[] = []
   const proof: WriterLockProof[] = []
@@ -292,13 +298,28 @@ export function acquireRemovalWriterLeases(gitDir: string): RemovalWriterLeases 
     if (failures.length > 0) throw new AggregateError(failures, `could not release writer leases under ${gitDir}`)
   }
   try {
-    const paths = readdirSync(gitDir, { recursive: true, withFileTypes: true })
-      .filter((entry) => entry.isFile() && isWriterLeasePath(join(entry.parentPath, entry.name), gitDir))
-      .map((entry) => join(entry.parentPath, entry.name))
-      .sort()
-    for (const path of paths) {
-      const before = lstatSync(path)
-      const handle = tryAcquireFlock(path, { createParent: false })
+    const entries = readdirSync(gitDir, { recursive: true, withFileTypes: true })
+    for (const entry of entries) {
+      if (!entry.name.endsWith(".lock")) continue
+      const path = join(entry.parentPath, entry.name)
+      if (!entry.isFile() || !isWriterLeasePath(path, gitDir, true)) {
+        throw new Error(`Git lock ${path} prevents worktree removal; resolve its holder`)
+      }
+    }
+    const directories = [
+      gitDir,
+      ...entries.filter((entry) => entry.isDirectory()).map((entry) => join(entry.parentPath, entry.name)),
+    ]
+    const paths = directories
+      .filter((directory) => isGitDirectory(directory, gitDir, true))
+      .map((directory) => join(directory, "yrd-worktree-mutations", "writer.lock"))
+    const existing = paths.filter((path) => present(path)).sort()
+    const absent = paths.filter((path) => !present(path)).sort()
+    // Refuse held existing leases before creating any missing path. Missing paths are then
+    // acquired too, so a writer that starts during retention cannot create and take one.
+    for (const path of [...existing, ...absent]) {
+      const before = present(path) ? lstatSync(path) : null
+      const handle = tryAcquireFlock(path)
       if (handle === null) {
         const note = readFileSync(path, "utf8")
         const holder =
@@ -312,8 +333,7 @@ export function acquireRemovalWriterLeases(gitDir: string): RemovalWriterLeases 
       const named = lstatSync(path)
       if (
         !named.isFile() ||
-        before.dev !== opened.dev ||
-        before.ino !== opened.ino ||
+        (before !== null && (before.dev !== opened.dev || before.ino !== opened.ino)) ||
         named.dev !== opened.dev ||
         named.ino !== opened.ino
       ) {
@@ -343,7 +363,7 @@ function manifest(root: string, custody: StoreCustody, hashFiles = true): StoreM
   for (const entry of readdirSync(root, { recursive: true, withFileTypes: true })) {
     const path = join(entry.parentPath, entry.name)
     const key = relative(root, path)
-    if (entry.name.endsWith(".lock") && !isWriterLeasePath(path, root)) {
+    if (entry.name.endsWith(".lock") && !isWriterLeasePath(path, root, root === custody.gitDir)) {
       throw new Error(`Git lock ${path} prevents worktree removal; resolve its holder`)
     }
     if (entry.isDirectory()) continue
