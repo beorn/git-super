@@ -119,7 +119,7 @@
     "oxlint": "1.85.0",
     "tsdown": "^0.15.7",
     "typescript": "^6.0.3",
-    "verify-publishable": "github:beorn/verify-publishable#f634aef30d11ab0a7610ed5e82dc92bebdaab601",
+    "verify-publishable": "github:beorn/verify-publishable#7026fe16a7a424bd1dfb07dced0096f1a4b0c413",
     "vitest": "^4.1.10"
   },
   "tsdown": {

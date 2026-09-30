@@ -21,7 +21,7 @@
         "oxlint": "1.85.0",
         "tsdown": "^0.15.7",
         "typescript": "^6.0.3",
-        "verify-publishable": "github:beorn/verify-publishable#f634aef30d11ab0a7610ed5e82dc92bebdaab601",
+        "verify-publishable": "github:beorn/verify-publishable#7026fe16a7a424bd1dfb07dced0096f1a4b0c413",
         "vitest": "^4.1.10",
       },
     },
@@ -1115,7 +1115,7 @@
 
     "verdaccio-htpasswd": ["verdaccio-htpasswd@13.1.3", "", { "dependencies": { "@verdaccio/core": "8.3.0", "@verdaccio/file-locking": "13.1.0", "apache-md5": "1.1.8", "bcryptjs": "2.4.3", "debug": "4.4.3", "http-errors": "2.0.1", "unix-crypt-td-js": "1.1.4" } }, "sha512-q2od2foCPblMasnUdKPLcNYXN5iXW0Q9Imh58qTpNsvCeYGtlfMqyC+aO+/0wtTGkD+H+mWfbqtb/8G9TMc0DQ=="],
 
-    "verify-publishable": ["verify-publishable@github:beorn/verify-publishable#f634aef", { "dependencies": { "@arethetypeswrong/cli": "0.18.5", "pnpm": "9.15.9", "publint": "0.3.24", "verdaccio": "6.10.2" }, "bin": { "verify-publishable": "bin/verify-publishable" } }, "beorn-verify-publishable-f634aef", "sha512-V/5OOthK0xnKrDins7wNHDomfqmthC11IyaHaTmsULY2lYUGOSZNMfGGs8Mvw22pBdxI//C63ufPH6X19zUL9w=="],
+    "verify-publishable": ["verify-publishable@github:beorn/verify-publishable#7026fe1", { "dependencies": { "@arethetypeswrong/cli": "0.18.5", "pnpm": "9.15.9", "publint": "0.3.24", "verdaccio": "6.10.2" }, "bin": { "verify-publishable": "bin/verify-publishable" } }, "beorn-verify-publishable-7026fe1", "sha512-Uo+G8oRzhpwma89n1r9OTii2vsogNdrhOSrNAuo9NLAaWSNOkHKgEU8soVL1ye/+9BEC8+GG3GcjhxKvQx4ELQ=="],
 
     "verror": ["verror@1.10.0", "", { "dependencies": { "assert-plus": "^1.0.0", "core-util-is": "1.0.2", "extsprintf": "^1.2.0" } }, "sha512-ZZKSmDAEFOijERBLkmYfJ+vmk3w+7hOLYDNkRCuRuMJGEmqYNCNLyBBFwWKVMhfwaEF3WOd0Zlw86U/WC/+nYw=="],
 
