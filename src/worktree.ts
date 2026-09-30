@@ -4,7 +4,12 @@ import { appendFile } from "node:fs/promises"
 import { isAbsolute, join, relative, resolve, sep } from "node:path"
 import { fileURLToPath } from "node:url"
 import { createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS } from "./exclusive.ts"
-import { rehomeBorrowers, retainWorktreeModules, type WorktreeRetention } from "./worktree-removal.ts"
+import {
+  acquireRemovalWriterLeases,
+  rehomeBorrowers,
+  retainWorktreeModules,
+  type WorktreeRetention,
+} from "./worktree-removal.ts"
 import { cleanGitEnvironment } from "./git.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
 import { createProgressReporter } from "./progress.ts"
@@ -413,22 +418,34 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       removeOptions: Readonly<{ operation?: string; unlock?: boolean; retention?: WorktreeRetention }> = {},
     ): Promise<void> {
       await mutate(removeOptions.operation ?? `worktree remove ${path}`, async () => {
-        if (removeOptions.retention !== undefined) {
-          if (removeOptions.unlock === true) {
-            throw new Error(`retained worktree removal cannot unlock ${path}; resolve its holder first`)
-          }
-          await retainWorktreeModules(git, repo, path, removeOptions.retention, (repository, target) =>
-            inspectWorktree(git, repository, target),
-          )
-        } else {
-          if (removeOptions.unlock === true) await unlockWorktree(git, repo, path)
-          const gitDir = realpathSync(await git.text(path, ["rev-parse", "--absolute-git-dir"]))
-          const common = realpathSync(await git.text(path, ["rev-parse", "--path-format=absolute", "--git-common-dir"]))
-          rehomeBorrowers(common, gitDir, join(gitDir, "modules"))
+        if (removeOptions.retention !== undefined && removeOptions.unlock === true) {
+          throw new Error(`retained worktree removal cannot unlock ${path}; resolve its holder first`)
         }
-        await git.run(repo, ["worktree", "remove", "--force", path], false, timeouts.cleanup)
-        if (existsSync(path) || (await inspectWorktree(git, repo, path)).registered) {
-          throw new Error(`git reported success but did not fully remove worktree '${path}'`)
+        const gitDir = realpathSync(await git.text(path, ["rev-parse", "--absolute-git-dir"]))
+        const writerLeases = acquireRemovalWriterLeases(gitDir)
+        try {
+          if (removeOptions.retention !== undefined) {
+            await retainWorktreeModules(
+              git,
+              repo,
+              path,
+              removeOptions.retention,
+              (repository, target) => inspectWorktree(git, repository, target),
+              writerLeases.proof,
+            )
+          } else {
+            if (removeOptions.unlock === true) await unlockWorktree(git, repo, path)
+            const common = realpathSync(
+              await git.text(path, ["rev-parse", "--path-format=absolute", "--git-common-dir"]),
+            )
+            rehomeBorrowers(common, gitDir, join(gitDir, "modules"))
+          }
+          await git.run(repo, ["worktree", "remove", "--force", path], false, timeouts.cleanup)
+          if (existsSync(path) || (await inspectWorktree(git, repo, path)).registered) {
+            throw new Error(`git reported success but did not fully remove worktree '${path}'`)
+          }
+        } finally {
+          writerLeases.release()
         }
       })
     },

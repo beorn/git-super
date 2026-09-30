@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto"
 import {
   cpSync,
   existsSync,
+  fstatSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -15,6 +16,8 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs"
+import { tryAcquireFlock, type FlockHandle } from "@bearly/flock"
+import { fileLockHolders, formatLockHolders } from "@bearly/flock/holders"
 import { spawnSync } from "node:child_process"
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { superStatus } from "./status.ts"
@@ -30,6 +33,14 @@ export type WorktreeRemovalProof = Readonly<{
   createdAt: string
   retainUntil: string
   rehomedBorrowers?: readonly string[]
+  writerLocks: readonly WriterLockProof[]
+}>
+
+export type WriterLockProof = Readonly<{ path: string; body: string; lease: "free" }>
+
+export type RemovalWriterLeases = Readonly<{
+  proof: readonly WriterLockProof[]
+  release: () => void
 }>
 
 export type WorktreeRetention = Readonly<{
@@ -249,6 +260,81 @@ type StoreManifest = Readonly<{
 }>
 type StoreCustody = Readonly<{ common: string; checkout: string; gitDir: string; modules: string }>
 
+/** Only git-super's writer lock directly inside a Git directory is a lease; Git's other .lock files remain barriers. */
+function isWriterLeasePath(path: string, rootGitDir: string): boolean {
+  if (basename(path) !== "writer.lock" || basename(dirname(path)) !== "yrd-worktree-mutations") return false
+  const owner = dirname(dirname(path))
+  if (!within(rootGitDir, owner)) return false
+  if (owner === rootGitDir) return true
+  return (
+    present(join(owner, "HEAD")) &&
+    lstatSync(join(owner, "HEAD")).isFile() &&
+    present(join(owner, "config")) &&
+    lstatSync(join(owner, "config")).isFile() &&
+    present(join(owner, "objects"))
+  )
+}
+
+/** Take every existing writer lease before retention changes anything; callers hold them through native removal. */
+export function acquireRemovalWriterLeases(gitDir: string): RemovalWriterLeases {
+  const handles: FlockHandle[] = []
+  const proof: WriterLockProof[] = []
+  const release = () => {
+    const failures: unknown[] = []
+    for (const handle of handles.reverse()) {
+      try {
+        handle.release()
+      } catch (error) {
+        failures.push(error)
+      }
+    }
+    handles.length = 0
+    if (failures.length > 0) throw new AggregateError(failures, `could not release writer leases under ${gitDir}`)
+  }
+  try {
+    const paths = readdirSync(gitDir, { recursive: true, withFileTypes: true })
+      .filter((entry) => entry.isFile() && isWriterLeasePath(join(entry.parentPath, entry.name), gitDir))
+      .map((entry) => join(entry.parentPath, entry.name))
+      .sort()
+    for (const path of paths) {
+      const before = lstatSync(path)
+      const handle = tryAcquireFlock(path, { createParent: false })
+      if (handle === null) {
+        const note = readFileSync(path, "utf8")
+        const holder =
+          process.platform === "linux"
+            ? formatLockHolders(fileLockHolders([path], { self: process.pid }))
+            : "kernel holder lookup unavailable on this platform"
+        throw new Error(`writer lease ${path} is held; ${holder}; body note (not authority): ${note}`)
+      }
+      handles.push(handle)
+      const opened = fstatSync(handle.fd)
+      const named = lstatSync(path)
+      if (
+        !named.isFile() ||
+        before.dev !== opened.dev ||
+        before.ino !== opened.ino ||
+        named.dev !== opened.dev ||
+        named.ino !== opened.ino
+      ) {
+        throw new Error(`writer lease ${path} changed identity during acquisition; worktree preserved`)
+      }
+      proof.push({ path, body: readFileSync(handle.fd, "utf8"), lease: "free" })
+    }
+    return { proof, release }
+  } catch (error) {
+    try {
+      release()
+    } catch (releaseError) {
+      throw new AggregateError(
+        [error, releaseError],
+        `writer lease acquisition and release both failed under ${gitDir}`,
+      )
+    }
+    throw error
+  }
+}
+
 /** Inspect link identities without walking their objects; only common-store objects directories may be borrowed. */
 function manifest(root: string, custody: StoreCustody, hashFiles = true): StoreManifest {
   const entries: Record<string, ManifestEntry> = {}
@@ -257,7 +343,9 @@ function manifest(root: string, custody: StoreCustody, hashFiles = true): StoreM
   for (const entry of readdirSync(root, { recursive: true, withFileTypes: true })) {
     const path = join(entry.parentPath, entry.name)
     const key = relative(root, path)
-    if (entry.name.endsWith(".lock")) throw new Error(`Git lock ${path} prevents worktree removal; resolve its holder`)
+    if (entry.name.endsWith(".lock") && !isWriterLeasePath(path, root)) {
+      throw new Error(`Git lock ${path} prevents worktree removal; resolve its holder`)
+    }
     if (entry.isDirectory()) continue
     if (entry.isSymbolicLink()) {
       const modulePath = relative(custody.modules, path)
@@ -431,6 +519,7 @@ export async function retainWorktreeModules(
   requested: string,
   retention: WorktreeRetention,
   inspect: (repository: string, path: string) => Promise<WorktreeInspection>,
+  writerLocks: readonly WriterLockProof[],
 ): Promise<WorktreeRemovalProof> {
   const path = realpathSync(requested)
   const registered = await inspect(repo, path)
@@ -523,6 +612,7 @@ export async function retainWorktreeModules(
     createdAt: new Date().toISOString(),
     retainUntil: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
     ...(rehomedBorrowers.length === 0 ? {} : { rehomedBorrowers }),
+    writerLocks,
   }
   writeFileSync(
     proof.manifest,

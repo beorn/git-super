@@ -10,6 +10,7 @@ import { join } from "node:path"
 import { afterEach, describe, expect, it } from "vitest"
 import { runCli } from "../src/cli.ts"
 import { acquireExclusive } from "../src/exclusive.ts"
+import { tryAcquireFlock } from "@bearly/flock"
 
 const roots: string[] = []
 
@@ -196,6 +197,229 @@ describe("git super worktree add", () => {
     },
     30_000,
   )
+
+  /**
+   * @failure A live child writer can lose its module store, or a later held lease leaves an earlier one held (25714).
+   * @level l1
+   * @consumer Yrd environment close
+   */
+  it.each(["child", "second"])(
+    "refuses a %s held writer lease without changing the worktree",
+    async (heldAt) => {
+      const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-worktree-held-child-lock-"))
+      roots.push(fixtureRoot)
+      const fixture = createSuperproject(fixtureRoot)
+      const worktree = join(fixtureRoot, "candidate")
+      const retained = join(fixtureRoot, "retained")
+      expect(
+        await runCli(["--repo", fixture.product, "worktree", "add", worktree, "HEAD"], outputSink(), outputSink()),
+      ).toBe(0)
+      const adminGitDir = git(worktree, ["rev-parse", "--absolute-git-dir"])
+      const childGitDir = git(join(worktree, "vendor/dep"), ["rev-parse", "--absolute-git-dir"])
+      const childLock = join(childGitDir, "yrd-worktree-mutations", "writer.lock")
+      const rootLock = join(adminGitDir, "yrd-worktree-mutations", "writer.lock")
+      const free = await acquireExclusive(
+        join(childGitDir, "yrd-worktree-mutations"),
+        { timeoutMs: 0 },
+        "finished child",
+      )
+      free.release()
+      const heldPath = heldAt === "child" ? childLock : rootLock
+      const ready = join(fixtureRoot, "holder-ready")
+      const holder = Bun.spawn(
+        [
+          process.execPath,
+          "-e",
+          `
+        import { tryAcquireFlock } from "@bearly/flock";
+        import { writeFileSync } from "node:fs";
+        const lock = tryAcquireFlock(process.argv[1], { body: "live child note" });
+        if (!lock) throw new Error("could not take test lease");
+        writeFileSync(process.argv[2], String(process.pid));
+        setInterval(() => {}, 1000);
+      `,
+          heldPath,
+          ready,
+        ],
+        { cwd: process.cwd(), stdout: "pipe", stderr: "pipe" },
+      )
+      try {
+        for (let poll = 0; poll < 200 && !existsSync(ready) && holder.exitCode === null; poll += 1) await Bun.sleep(10)
+        expect(existsSync(ready)).toBe(true)
+        const out = outputSink()
+        expect(
+          await runCli(
+            ["--repo", fixture.product, "--json", "worktree", "remove", worktree, "--retain", retained],
+            out,
+            outputSink(),
+          ),
+        ).toBe(2)
+        expect(out.output).toContain(heldPath)
+        expect(out.output).toContain(String(holder.pid))
+        expect(out.output).toContain("body note (not authority): live child note")
+        expect(existsSync(worktree)).toBe(true)
+        expect(existsSync(retained)).toBe(false)
+        if (heldAt === "second") {
+          const reclaimed = tryAcquireFlock(childLock)
+          expect(reclaimed).not.toBeNull()
+          reclaimed?.release()
+        }
+      } finally {
+        holder.kill()
+        await holder.exited
+      }
+    },
+    30_000,
+  )
+
+  /**
+   * @failure A writer starts during retention and acquires a lease before its store is removed (25714).
+   * @level l1
+   * @consumer Yrd environment close
+   */
+  it("holds the writer lease through the native remove", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-worktree-contender-"))
+    roots.push(fixtureRoot)
+    const fixture = createSuperproject(fixtureRoot)
+    const worktree = join(fixtureRoot, "candidate")
+    const retained = join(fixtureRoot, "retained")
+    expect(
+      await runCli(["--repo", fixture.product, "worktree", "add", worktree, "HEAD"], outputSink(), outputSink()),
+    ).toBe(0)
+    const childGitDir = git(join(worktree, "vendor/dep"), ["rev-parse", "--absolute-git-dir"])
+    const old = await acquireExclusive(join(childGitDir, "yrd-worktree-mutations"), { timeoutMs: 0 }, "finished")
+    old.release()
+    const lockPath = join(childGitDir, "yrd-worktree-mutations", "writer.lock")
+    let contender: string | undefined
+    const diagnostic = {
+      write(value: string) {
+        if (!value.startsWith("worktree removal proof ")) return
+        const result = spawnSync(
+          process.execPath,
+          [
+            "-e",
+            `import {tryAcquireFlock} from "@bearly/flock"; const lock=tryAcquireFlock(process.argv[1]); if(lock){lock.release();process.stdout.write("acquired")}else{process.stdout.write("busy")}`,
+            lockPath,
+          ],
+          { cwd: process.cwd(), encoding: "utf8" },
+        )
+        expect(result.status).toBe(0)
+        contender = result.stdout
+      },
+    }
+    expect(
+      await runCli(
+        ["--repo", fixture.product, "--json", "worktree", "remove", worktree, "--retain", retained],
+        outputSink(),
+        diagnostic,
+      ),
+    ).toBe(0)
+    expect(contender).toBe("busy")
+    expect(existsSync(worktree)).toBe(false)
+  }, 30_000)
+
+  /**
+   * @failure A generic Git lock or same-named file outside a Git directory is mistaken for a free writer lease (25714).
+   * @level l1
+   * @consumer Yrd environment close
+   */
+  it.each(["index.lock", "other/writer.lock"])(
+    "keeps %s as a removal barrier",
+    async (relativeLock) => {
+      const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-worktree-other-lock-"))
+      roots.push(fixtureRoot)
+      const fixture = createSuperproject(fixtureRoot)
+      const worktree = join(fixtureRoot, "candidate")
+      const retained = join(fixtureRoot, "retained")
+      expect(
+        await runCli(["--repo", fixture.product, "worktree", "add", worktree, "HEAD"], outputSink(), outputSink()),
+      ).toBe(0)
+      const childGitDir = git(join(worktree, "vendor/dep"), ["rev-parse", "--absolute-git-dir"])
+      const barrier = join(childGitDir, relativeLock)
+      mkdirSync(join(barrier, ".."), { recursive: true })
+      writeFileSync(barrier, "do not remove")
+      const out = outputSink()
+      expect(
+        await runCli(
+          ["--repo", fixture.product, "--json", "worktree", "remove", worktree, "--retain", retained],
+          out,
+          outputSink(),
+        ),
+      ).toBe(2)
+      expect(out.output).toContain(`Git lock ${barrier}`)
+      expect(existsSync(worktree)).toBe(true)
+    },
+    30_000,
+  )
+
+  /**
+   * @failure A killed push leaves its diagnostic pathname and a later removal treats that pathname as a live lock (25714).
+   * @level l1
+   * @consumer Yrd environment close after an interrupted push
+   */
+  it("removes a worktree after a push writer is killed and its lock file remains", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-worktree-killed-writer-"))
+    roots.push(fixtureRoot)
+    const fixture = createSuperproject(fixtureRoot)
+    const worktree = join(fixtureRoot, "candidate")
+    const retained = join(fixtureRoot, "retained")
+    expect(
+      await runCli(["--repo", fixture.product, "worktree", "add", worktree, "HEAD"], outputSink(), outputSink()),
+    ).toBe(0)
+    const childGitDir = git(join(worktree, "vendor/dep"), ["rev-parse", "--absolute-git-dir"])
+    const lockDir = join(childGitDir, "yrd-worktree-mutations")
+    const lockPath = join(lockDir, "writer.lock")
+    const ready = join(fixtureRoot, "push-ready")
+    const holder = Bun.spawn(
+      [
+        process.execPath,
+        "-e",
+        `
+        import { writeFileSync } from "node:fs";
+        const { acquireExclusive } = await import(process.argv[3]);
+        await acquireExclusive(process.argv[1], { timeoutMs: 0 }, "git super push");
+        writeFileSync(process.argv[2], String(process.pid));
+        setInterval(() => {}, 1000);
+      `,
+        lockDir,
+        ready,
+        join(process.cwd(), "vendor/git-super/src/exclusive.ts"),
+      ],
+      { cwd: process.cwd(), stdout: "pipe", stderr: "pipe" },
+    )
+    try {
+      for (let poll = 0; poll < 200 && !existsSync(ready) && holder.exitCode === null; poll += 1) await Bun.sleep(10)
+      if (!existsSync(ready)) {
+        holder.kill()
+        await holder.exited
+        throw new Error(`push writer did not start: ${await new Response(holder.stderr).text()}`)
+      }
+      expect(existsSync(ready)).toBe(true)
+      expect(existsSync(lockPath)).toBe(true)
+    } finally {
+      holder.kill("SIGKILL")
+      await holder.exited
+    }
+    expect(existsSync(lockPath)).toBe(true)
+    const free = tryAcquireFlock(lockPath)
+    expect(free).not.toBeNull()
+    free?.release()
+    const out = outputSink()
+    expect(
+      await runCli(
+        ["--repo", fixture.product, "--json", "worktree", "remove", worktree, "--retain", retained],
+        out,
+        outputSink(),
+      ),
+    ).toBe(0)
+    const result = JSON.parse(out.output) as {
+      proof: { writerLocks: Array<{ path: string; body: string; lease: string }> }
+    }
+    expect(result.proof.writerLocks).toEqual([
+      { path: lockPath, body: expect.stringContaining("git super push"), lease: "free" },
+    ])
+    expect(existsSync(worktree)).toBe(false)
+  }, 30_000)
 
   it("retains complete module stores before removing a clean unlocked populated worktree", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-worktree-remove-"))
