@@ -150,6 +150,53 @@ describe("git super worktree add", () => {
     }
   }, 30_000)
 
+  /**
+   * @failure A released git-super flock leaves its diagnostic pathname, and blanket .lock refusal strands clean worktrees (25714).
+   * @level l1
+   * @consumer Yrd environment close through git super worktree remove --retain
+   */
+  it.each([
+    ["dead", 2 ** 22 + 1],
+    ["live", process.pid],
+  ])(
+    "removes a clean tree with a free child writer lease despite a %s pid note",
+    async (_label, recordedPid) => {
+      const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-worktree-free-child-lock-"))
+      roots.push(fixtureRoot)
+      const fixture = createSuperproject(fixtureRoot)
+      const worktree = join(fixtureRoot, "candidate")
+      const retained = join(fixtureRoot, "retained")
+      expect(
+        await runCli(["--repo", fixture.product, "worktree", "add", worktree, "HEAD"], outputSink(), outputSink()),
+      ).toBe(0)
+      const childGitDir = git(join(worktree, "vendor/dep"), ["rev-parse", "--absolute-git-dir"])
+      const lock = await acquireExclusive(
+        join(childGitDir, "yrd-worktree-mutations"),
+        { timeoutMs: 0 },
+        "finished push",
+      )
+      lock.release()
+      const lockPath = join(childGitDir, "yrd-worktree-mutations", "writer.lock")
+      const body = JSON.stringify({ pid: recordedPid, holder: "finished push", startedAt: "2026-09-01T00:00:00.000Z" })
+      writeFileSync(lockPath, body)
+
+      const stdout = outputSink()
+      expect(
+        await runCli(
+          ["--repo", fixture.product, "--json", "worktree", "remove", worktree, "--retain", retained],
+          stdout,
+          outputSink(),
+        ),
+      ).toBe(0)
+      const result = JSON.parse(stdout.output) as {
+        proof: { writerLocks: Array<{ path: string; body: string; lease: string }> }
+      }
+      expect(result.proof.writerLocks).toEqual([{ path: lockPath, body, lease: "free" }])
+      expect(existsSync(worktree)).toBe(false)
+    },
+    30_000,
+  )
+
   it("retains complete module stores before removing a clean unlocked populated worktree", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-worktree-remove-"))
     roots.push(fixtureRoot)
