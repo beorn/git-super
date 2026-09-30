@@ -289,11 +289,12 @@ export function acquireRemovalWriterLeases(gitDir: string, onAcquired?: (path: s
   const handles: FlockHandle[] = []
   const proof: WriterLockProof[] = []
   const created: WriterLockProof[] = []
+  const createdPaths: string[] = []
   const refusal = (error: unknown): unknown =>
-    created.length === 0
+    createdPaths.length === 0
       ? error
       : new Error(
-          `${error instanceof Error ? error.message : String(error)}; writer lock paths created by this removal (kept): ${created.map((entry) => entry.path).join(", ")}`,
+          `${error instanceof Error ? error.message : String(error)}; writer lock paths created by this removal (kept): ${createdPaths.join(", ")}`,
           { cause: error },
         )
   const release = () => {
@@ -340,6 +341,8 @@ export function acquireRemovalWriterLeases(gitDir: string, onAcquired?: (path: s
         throw new Error(`writer lease ${path} is held; ${holder}; body note (not authority): ${note}`)
       }
       handles.push(handle)
+      if (before === null) createdPaths.push(path)
+      onAcquired?.(path)
       const opened = fstatSync(handle.fd)
       const named = lstatSync(path)
       if (
@@ -353,7 +356,6 @@ export function acquireRemovalWriterLeases(gitDir: string, onAcquired?: (path: s
       const entry: WriterLockProof = { path, body: readFileSync(handle.fd, "utf8"), lease: "free" }
       if (before === null) created.push(entry)
       else proof.push(entry)
-      onAcquired?.(path)
     }
     return { proof, created, refusal, release }
   } catch (error) {
