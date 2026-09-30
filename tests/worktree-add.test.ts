@@ -414,6 +414,42 @@ describe("git super worktree add", () => {
   }, 30_000)
 
   /**
+   * @failure A diagnostic failure after creating a lock path omits that path from the refusal (25714).
+   * @level l1
+   * @consumer Yrd environment close
+   */
+  it("names a created path even when diagnosis fails before its body is read", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-worktree-lock-diagnostic-"))
+    roots.push(fixtureRoot)
+    const fixture = createSuperproject(fixtureRoot)
+    const worktree = join(fixtureRoot, "candidate")
+    expect(
+      await runCli(["--repo", fixture.product, "worktree", "add", worktree, "HEAD"], outputSink(), outputSink()),
+    ).toBe(0)
+    const adminGitDir = git(worktree, ["rev-parse", "--absolute-git-dir"])
+    const childGitDir = git(join(worktree, "vendor/dep"), ["rev-parse", "--absolute-git-dir"])
+    const lockPath = join(childGitDir, "yrd-worktree-mutations", "writer.lock")
+    expect(existsSync(lockPath)).toBe(false)
+    let refusal: unknown
+    try {
+      const unexpectedlyAcquired = acquireRemovalWriterLeases(adminGitDir, (path) => {
+        if (path === lockPath) throw new Error("diagnostic read failed")
+      })
+      unexpectedlyAcquired.release()
+    } catch (error) {
+      refusal = error
+    }
+    expect(refusal).toBeInstanceOf(Error)
+    expect((refusal as Error).message).toContain("diagnostic read failed")
+    expect((refusal as Error).message).toContain(`writer lock paths created by this removal (kept): ${lockPath}`)
+    expect(existsSync(lockPath)).toBe(true)
+    const free = tryAcquireFlock(lockPath)
+    expect(free).not.toBeNull()
+    free?.release()
+    expect(existsSync(worktree)).toBe(true)
+  }, 30_000)
+
+  /**
    * @failure A generic Git lock or same-named file outside a Git directory is mistaken for a free writer lease (25714).
    * @level l1
    * @consumer Yrd environment close
