@@ -1666,6 +1666,22 @@ describe("git super merge", () => {
     })
     expect(defaultPending.detail?.message).toContain("left as found")
     expect(defaultPending.detail).not.toHaveProperty("owner")
+    const unreadableTarget = await superMerge({
+      repo: repository,
+      commit: "refs/heads/missing-continuation-target",
+      continue: true,
+      expectedHead: head,
+      expectedBranch: branch,
+    })
+    expect(unreadableTarget).toMatchObject({
+      state: "failed",
+      partial: false,
+      pending: { branch, head, target, unmergedPaths: ["shared.txt"] },
+    })
+    expect(unreadableTarget.detail?.message).toContain("left as found")
+    expect(git(repository, "rev-parse", "HEAD")).toBe(head)
+    expect(git(repository, "rev-parse", "MERGE_HEAD")).toBe(target)
+    expect(git(repository, "ls-files", "-u")).toContain("shared.txt")
     // These leases cannot authorize mutation; the ordinary conflict must remain native.
     for (const [expectedHead, expectedBranch, expectedCode] of [
       [target, branch, "merge-continuation-lease-mismatch"],

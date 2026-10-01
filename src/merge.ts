@@ -342,107 +342,126 @@ async function mergeUnderLock(
 ): Promise<SuperMergeResult> {
   const nativeHeads = await nativeMergeHeads(git, root, timeoutMs)
   const pending = nativeHeads === undefined ? undefined : await observePending(git, root, nativeHeads, timeoutMs)
-  const refuse = (code: string, message: string): SuperMergeResult => {
+  try {
+    const refuse = (code: string, message: string): SuperMergeResult => {
+      const result = failed(
+        root,
+        [],
+        obviousDetail(
+          code,
+          message,
+          `git -C ${shellQuote(root)} status --short`,
+          pending === undefined ? "Use one merge mode with its required expectations." : pendingRemedy(root, pending),
+          undefined,
+        ),
+      )
+      return pending === undefined ? result : unchangedPending(result, pending)
+    }
+    for (const marker of ["rebase-merge", "rebase-apply", "CHERRY_PICK_HEAD"] as const) {
+      const path = await required(git, root, ["rev-parse", "--git-path", marker], "observe-native-operation", timeoutMs)
+      try {
+        statSync(resolve(root, path))
+      } catch (error) {
+        if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") continue
+        throw error
+      }
+      return refuse(
+        "merge-other-operation-pending",
+        `Native operation marker ${marker} is present; finish or abort that operation before merging.`,
+      )
+    }
+    // Pending native state takes precedence over every mode's prospective interpretation.
+    if (pending !== undefined && !options.continue) {
+      return refuse("merge-already-pending", "A native merge is already pending.")
+    }
+    if (options.unboundedLocalMain && !options.noFetch) {
+      return refuse(
+        "unbounded-local-main-requires-no-fetch",
+        "git super merge --unbounded-local-main requires --no-fetch.",
+      )
+    }
+    if (options.preserveConflicts && options.continue) {
+      return refuse("merge-modes-exclusive", "--preserve-conflicts and --continue are mutually exclusive.")
+    }
+    if (!options.continue && (options.expectedHead !== undefined || options.expectedBranch !== undefined)) {
+      return refuse("merge-expectations-require-continue", "Merge expectations require --continue.")
+    }
+    if (options.continue) {
+      if (pending === undefined) return refuse("merge-not-pending", "No native merge is pending.")
+      if (
+        nativeHeads?.length !== 1 ||
+        options.expectedHead !== pending.head ||
+        options.expectedBranch !== pending.branch
+      ) {
+        return refuse(
+          "merge-continuation-lease-mismatch",
+          "Continuation requires exactly one MERGE_HEAD and matching original HEAD and full symbolic branch expectations.",
+        )
+      }
+      const target = await required(
+        git,
+        root,
+        ["rev-parse", `${options.commit}^{commit}`],
+        "resolve-merge-target",
+        timeoutMs,
+      )
+      if (target !== pending.target) {
+        return refuse(
+          "merge-continuation-target-mismatch",
+          `Continuation target ${target} differs from pending target ${pending.target}.`,
+        )
+      }
+      if (pending.unmergedPaths.length > 0) {
+        return refuse(
+          "merge-continuation-unresolved",
+          `Unmerged paths remain: ${pending.unmergedPaths.map(shellQuote).join(", ")}.`,
+        )
+      }
+    }
+    let result: SuperMergeResult
+    try {
+      result = await mergeObserved(git, root, options, timeoutMs, steps, initializations)
+    } catch (error) {
+      result = failed(root, [], resultError(error, "merge"))
+    }
+    if (result.partial && result.detail?.code === "settled-merge-commit-failed") {
+      try {
+        const heads = await nativeMergeHeads(git, root, timeoutMs)
+        if (heads === undefined) throw new Error(`Rejected commit at ${root}: expected native MERGE_HEAD is missing`)
+        const observed = await observePending(git, root, heads, timeoutMs)
+        const detail = { ...result.detail, next: `Inspect the named Git failure. ${pendingRemedy(root, observed)}` }
+        return {
+          ...result,
+          pending: observed,
+          detail,
+          repositories: result.repositories.map((row) => ({ ...row, detail })),
+        }
+      } catch (error) {
+        const detail = resultError(error, "observe-rejected-pending-merge")
+        return { ...result, detail, repositories: result.repositories.map((row) => ({ ...row, detail })) }
+      }
+    }
+    return pending !== undefined && result.state === "failed" && !result.partial
+      ? unchangedPending(result, pending)
+      : result
+  } catch (error) {
+    const detail = resultError(error, "merge-preflight")
     const result = failed(
       root,
       [],
-      obviousDetail(
-        code,
-        message,
-        `git -C ${shellQuote(root)} status --short`,
-        pending === undefined ? "Use one merge mode with its required expectations." : pendingRemedy(root, pending),
-        undefined,
-      ),
+      pending === undefined
+        ? detail
+        : obviousDetail(
+            detail.code,
+            detail.subject ?? `Pending merge at ${root}: ${messageOf(error)}`,
+            detail.evidence ?? `git -C ${shellQuote(root)} status --short`,
+            pendingRemedy(root, pending),
+            undefined,
+            { phase: detail.phase, paths: detail.paths, objectIds: detail.objectIds },
+          ),
     )
     return pending === undefined ? result : unchangedPending(result, pending)
   }
-  for (const marker of ["rebase-merge", "rebase-apply", "CHERRY_PICK_HEAD"] as const) {
-    const path = await required(git, root, ["rev-parse", "--git-path", marker], "observe-native-operation", timeoutMs)
-    try {
-      statSync(resolve(root, path))
-    } catch (error) {
-      if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") continue
-      throw error
-    }
-    return refuse(
-      "merge-other-operation-pending",
-      `Native operation marker ${marker} is present; finish or abort that operation before merging.`,
-    )
-  }
-  // Pending native state takes precedence over every mode's prospective interpretation.
-  if (pending !== undefined && !options.continue) {
-    return refuse("merge-already-pending", "A native merge is already pending.")
-  }
-  if (options.unboundedLocalMain && !options.noFetch) {
-    return refuse(
-      "unbounded-local-main-requires-no-fetch",
-      "git super merge --unbounded-local-main requires --no-fetch.",
-    )
-  }
-  if (options.preserveConflicts && options.continue) {
-    return refuse("merge-modes-exclusive", "--preserve-conflicts and --continue are mutually exclusive.")
-  }
-  if (!options.continue && (options.expectedHead !== undefined || options.expectedBranch !== undefined)) {
-    return refuse("merge-expectations-require-continue", "Merge expectations require --continue.")
-  }
-  if (options.continue) {
-    if (pending === undefined) return refuse("merge-not-pending", "No native merge is pending.")
-    if (
-      nativeHeads?.length !== 1 ||
-      options.expectedHead !== pending.head ||
-      options.expectedBranch !== pending.branch
-    ) {
-      return refuse(
-        "merge-continuation-lease-mismatch",
-        "Continuation requires exactly one MERGE_HEAD and matching original HEAD and full symbolic branch expectations.",
-      )
-    }
-    const target = await required(
-      git,
-      root,
-      ["rev-parse", `${options.commit}^{commit}`],
-      "resolve-merge-target",
-      timeoutMs,
-    )
-    if (target !== pending.target) {
-      return refuse(
-        "merge-continuation-target-mismatch",
-        `Continuation target ${target} differs from pending target ${pending.target}.`,
-      )
-    }
-    if (pending.unmergedPaths.length > 0) {
-      return refuse(
-        "merge-continuation-unresolved",
-        `Unmerged paths remain: ${pending.unmergedPaths.map(shellQuote).join(", ")}.`,
-      )
-    }
-  }
-  let result: SuperMergeResult
-  try {
-    result = await mergeObserved(git, root, options, timeoutMs, steps, initializations)
-  } catch (error) {
-    result = failed(root, [], resultError(error, "merge"))
-  }
-  if (result.partial && result.detail?.code === "settled-merge-commit-failed") {
-    try {
-      const heads = await nativeMergeHeads(git, root, timeoutMs)
-      if (heads === undefined) throw new Error(`Rejected commit at ${root}: expected native MERGE_HEAD is missing`)
-      const observed = await observePending(git, root, heads, timeoutMs)
-      const detail = { ...result.detail, next: `Inspect the named Git failure. ${pendingRemedy(root, observed)}` }
-      return {
-        ...result,
-        pending: observed,
-        detail,
-        repositories: result.repositories.map((row) => ({ ...row, detail })),
-      }
-    } catch (error) {
-      const detail = resultError(error, "observe-rejected-pending-merge")
-      return { ...result, detail, repositories: result.repositories.map((row) => ({ ...row, detail })) }
-    }
-  }
-  return pending !== undefined && result.state === "failed" && !result.partial
-    ? unchangedPending(result, pending)
-    : result
 }
 
 async function mergeObserved(
