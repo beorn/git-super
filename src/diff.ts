@@ -1,5 +1,13 @@
 import { join, posix } from "node:path"
-import { probeRepository, repositoryRoot, runGit, tryGit } from "./git.ts"
+import {
+  indexGitlinks,
+  isSubmoduleExcluded,
+  probeRepository,
+  repositoryRoot,
+  runGit,
+  tryGit,
+  validateExcludedSubmodules,
+} from "./git.ts"
 import { joinCommitSubmodules, parseCommitSubmoduleConfig, type CommitSubmodule } from "./commit-graph.ts"
 import { pinRef } from "./objects.ts"
 import { shellQuote } from "./shell-command.ts"
@@ -24,6 +32,7 @@ export type ConsultedRepository = Readonly<{
 
 export type SuperDiffOptions = Readonly<{
   repo: string
+  excludedSubmodules?: readonly string[]
   refs?: readonly string[]
   cached?: boolean
   diffFilter?: string
@@ -136,7 +145,7 @@ function parseRawDiff(raw: string): RawDiffRow[] {
 function commonDiffArgs(options: SuperDiffOptions): string[] {
   return [
     "--no-renames",
-    "--ignore-submodules=none",
+    options.excludedSubmodules?.length ? "--ignore-submodules=dirty" : "--ignore-submodules=none",
     ...(options.cached ? ["--cached"] : []),
     ...(options.diffFilter === undefined ? [] : [`--diff-filter=${options.diffFilter}`]),
     ...(options.refs ?? []),
@@ -149,6 +158,7 @@ function prefixPath(root: string, path: string): string {
 
 type RecursiveNameStatusOptions = Readonly<{
   repo: string
+  excludedSubmodules?: readonly string[]
   prefix: string
   refs?: readonly string[]
   cached?: boolean
@@ -210,9 +220,19 @@ function comparisonSubmodules(root: string, options: SuperDiffOptions): Map<stri
   const selected = rootRange(root, options)?.to ?? options.refs?.[0] ?? "HEAD"
   const frozen = runGit(root, ["rev-parse", `${selected}^{tree}`]).trim()
   const tree = parseRawDiff(
-    runGit(root, ["diff", "--raw", "-z", "--abbrev=40", "--no-renames", "--ignore-submodules=dirty", EMPTY_TREE, frozen]),
+    runGit(root, [
+      "diff",
+      "--raw",
+      "-z",
+      "--abbrev=40",
+      "--no-renames",
+      "--ignore-submodules=dirty",
+      EMPTY_TREE,
+      frozen,
+    ]),
   )
   const gitlinks = new Map(tree.filter(({ newMode }) => newMode === "160000").map(({ path, newPin }) => [path, newPin]))
+  if (gitlinks.size === 0) return new Map()
   const configured = runGit(root, [
     "config",
     "--null",
@@ -235,6 +255,7 @@ export function recursiveNameStatusDiff(options: RecursiveNameStatusOptions): Re
   const common = commonDiffArgs(options)
   const unfilteredOptions: SuperDiffOptions = {
     repo: options.repo,
+    ...(options.excludedSubmodules === undefined ? {} : { excludedSubmodules: options.excludedSubmodules }),
     ...(options.refs === undefined ? {} : { refs: options.refs }),
     ...(options.cached === true ? { cached: true } : {}),
   }
@@ -249,11 +270,39 @@ export function recursiveNameStatusDiff(options: RecursiveNameStatusOptions): Re
     .map((row) => ({ path: prefixPath(options.prefix, row.path), status: row.status }))
   const consultedRepositories: ConsultedRepository[] = [options.consulted]
   const notCompared: NotCompared[] = []
-  const descriptors = gitlinks.some(({ newMode }) => newMode === "160000")
-    ? comparisonSubmodules(root, options)
-    : new Map<string, CommitSubmodule>()
+  const descriptors =
+    options.excludedSubmodules?.length || gitlinks.some(({ newMode }) => newMode === "160000")
+      ? comparisonSubmodules(root, options)
+      : new Map<string, CommitSubmodule>()
+  if (options.excludedSubmodules?.length) {
+    const working = !options.cached && (options.refs?.length ?? 0) <= 1 && !options.refs?.[0]?.includes("..")
+    const candidates = working
+      ? indexGitlinks(root)
+      : [...descriptors.values()].map(({ path, target }) => ({ path, indexPin: target }))
+    for (const { path, indexPin } of candidates) {
+      if (!working && !isSubmoduleExcluded(prefixPath(options.prefix, path), options.excludedSubmodules)) continue
+      if (gitlinks.some((row) => row.path === path)) continue
+      if (indexPin === undefined) {
+        notCompared.push({
+          path: prefixPath(options.prefix, path),
+          reason: "unreadable",
+          message: "unmerged gitlink has no resolved index pin",
+        })
+        continue
+      }
+      gitlinks.push({ path, oldMode: "160000", newMode: "160000", oldPin: indexPin, newPin: indexPin, status: "M" })
+    }
+  }
 
   for (const gitlink of gitlinks) {
+    if (isSubmoduleExcluded(prefixPath(options.prefix, gitlink.path), options.excludedSubmodules)) {
+      notCompared.push({
+        path: prefixPath(options.prefix, gitlink.path),
+        reason: "excluded",
+        message: "component excluded, not compared",
+      })
+      continue
+    }
     if (gitlink.oldMode === "160000" && gitlink.newMode === "000000") {
       notCompared.push({
         path: prefixPath(options.prefix, gitlink.path),
@@ -312,6 +361,7 @@ export function recursiveNameStatusDiff(options: RecursiveNameStatusOptions): Re
     }
     const nested = recursiveNameStatusDiff({
       repo: nestedRoot,
+      ...(options.excludedSubmodules === undefined ? {} : { excludedSubmodules: options.excludedSubmodules }),
       prefix: nestedPrefix,
       ...(isDirtySubmodule
         ? {
@@ -394,6 +444,7 @@ function rangeArgsFor(entry: ConsultedRepository, options: SuperDiffOptions): st
   if (entry.from !== undefined && entry.to !== undefined) {
     return [
       "--no-renames",
+      ...(options.excludedSubmodules?.length ? ["--ignore-submodules=dirty"] : []),
       ...(options.diffFilter === undefined ? [] : [`--diff-filter=${options.diffFilter}`]),
       `${entry.from}..${entry.to}`,
     ]
@@ -401,6 +452,7 @@ function rangeArgsFor(entry: ConsultedRepository, options: SuperDiffOptions): st
   if (entry.from !== undefined) {
     return [
       "--no-renames",
+      ...(options.excludedSubmodules?.length ? ["--ignore-submodules=dirty"] : []),
       ...(options.diffFilter === undefined ? [] : [`--diff-filter=${options.diffFilter}`]),
       entry.from,
     ]
@@ -507,10 +559,12 @@ function computeRepositoryPatch(entry: ConsultedRepository, options: SuperDiffOp
 }
 
 export function superDiff(options: SuperDiffOptions): SuperDiffResult {
+  validateExcludedSubmodules(options.excludedSubmodules)
   const root = repositoryRoot(options.repo)
   const consulted = { path: ".", root } as const
   const shared = {
     repo: root,
+    ...(options.excludedSubmodules === undefined ? {} : { excludedSubmodules: options.excludedSubmodules }),
     prefix: "",
     ...(options.refs === undefined ? {} : { refs: options.refs }),
     ...(options.cached === true ? { cached: true } : {}),

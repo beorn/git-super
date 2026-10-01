@@ -60,6 +60,9 @@ const diff = commandNode<CommandContext, DiffParams, SuperDiffResult>({
     const input = record(value)
     return {
       refs: stringArray(input.refs, "refs"),
+      ...(input.excludedSubmodules === undefined
+        ? {}
+        : { excludedSubmodules: stringArray(input.excludedSubmodules, "excludedSubmodules") }),
       ...(input.cached === true ? { cached: true } : {}),
       ...(typeof input.diffFilter === "string" ? { diffFilter: input.diffFilter } : {}),
       ...(input.stat === true ? { stat: true } : {}),

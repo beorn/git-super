@@ -1,5 +1,39 @@
 import { spawnSync } from "node:child_process"
 
+export type IndexGitlink = Readonly<{ path: string; indexPin: string | undefined }>
+
+/** Parent index metadata only; shared by status and comparisons. */
+export function indexGitlinks(root: string, indexFile?: string): IndexGitlink[] {
+  return runGit(root, ["ls-files", "--stage", "-z"], indexFile)
+    .split("\0")
+    .filter(Boolean)
+    .map((field) => {
+      const match = /^160000 ([0-9a-f]{40}) ([0-3])\t(.+)$/u.exec(field)
+      const path = match?.[3]
+      return path === undefined ? undefined : { indexPin: match?.[2] === "0" ? match[1] : undefined, path }
+    })
+    .filter((value): value is IndexGitlink => value !== undefined)
+    .sort((left, right) => left.path.localeCompare(right.path))
+}
+
+export function validateExcludedSubmodules(paths: readonly string[] = []): void {
+  for (const path of paths) {
+    if (
+      path.includes("\\") ||
+      path.includes("\0") ||
+      path.split("/").some((part) => part === "" || part === "." || part === "..")
+    ) {
+      throw new Error(
+        `git super: excluded submodule must be a literal normalized root-relative path: ${JSON.stringify(path)}`,
+      )
+    }
+  }
+}
+
+export function isSubmoduleExcluded(path: string, exclusions: readonly string[] = []): boolean {
+  return exclusions.some((excluded) => path === excluded || path.startsWith(`${excluded}/`))
+}
+
 export function cleanGitEnvironment(environment: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   return {
     ...Object.fromEntries(

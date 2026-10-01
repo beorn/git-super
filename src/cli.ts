@@ -556,6 +556,12 @@ async function runInvocation(
   program
     .command("diff")
     .description(commands.diff.description ?? commands.diff.title)
+    .option(
+      "--exclude-submodule <path>",
+      "exclude a literal root-relative submodule and its descendants before content access",
+      (value: string, previous: string[]) => [...previous, value],
+      [],
+    )
     .option("--name-only", "emit root-relative changed paths")
     .option("-z, --null", "terminate paths with NUL instead of newline")
     .option("--cached", "compare the index instead of the working tree")
@@ -569,6 +575,7 @@ async function runInvocation(
         node: commands.diff,
         params: {
           refs,
+          ...(options.excludeSubmodule?.length ? { excludedSubmodules: options.excludeSubmodule } : {}),
           ...(options.cached ? { cached: true } : {}),
           ...(options.diffFilter === undefined ? {} : { diffFilter: options.diffFilter }),
           ...(options.stat === true ? { stat: true } : {}),

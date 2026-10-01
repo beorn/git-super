@@ -1,4 +1,13 @@
-import { afterEach, describe, expect, test } from "vitest"
+import { afterEach, describe, expect, test, vi } from "vitest"
+import childProcess from "node:child_process"
+import { syncBuiltinESMExports } from "node:module"
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process") & { default: typeof childProcess }>()
+  return {
+    ...actual,
+    spawnSync: (...args: Parameters<typeof actual.spawnSync>) => actual.default.spawnSync(...args),
+  }
+})
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -31,6 +40,83 @@ afterEach(() => {
 })
 
 describe("superDiff", () => {
+  /**
+   * @failure An explicit exclusion still reads the child's Git content or silently hides included working dirt (#27058 AC3).
+   * @level l1
+   * @consumer git super diff, including native argv and CLI narration
+   * @testonly none
+   */
+  test.each(["historical", "working"] as const)(
+    "reports exclusions before child access in %s comparisons",
+    async (mode) => {
+      const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-excluded-"))
+      roots.push(fixtureRoot)
+      const fixture = createProductFixture(fixtureRoot)
+      const head = bumpProductSubmodules(fixture)
+      if (mode === "working") {
+        writeFileSync(join(fixture.product, "packages/alpha/alpha.ts"), "private canary\n")
+        writeFileSync(join(fixture.product, "vendor/beta/beta.ts"), "included working change\n")
+      }
+      const original = childProcess.spawnSync
+      const excluded = join(fixture.product, "packages/alpha")
+      const spy = vi.spyOn(childProcess, "spawnSync").mockImplementation((command, args, options) => {
+        if (
+          Array.isArray(args) &&
+          args[0] === "-C" &&
+          typeof args[1] === "string" &&
+          (args[1] === excluded || args[1].startsWith(`${excluded}/`))
+        ) {
+          throw new Error(`excluded component content was probed: ${args.join(" ")}`)
+        }
+        return original(command, args, options)
+      })
+      syncBuiltinESMExports()
+      try {
+        const options = {
+          repo: fixture.product,
+          ...(mode === "historical" ? { refs: [`${fixture.productBase}..${head}`] } : {}),
+          excludedSubmodules: ["packages/alpha"],
+          stat: true,
+          patch: true,
+        }
+        const result = superDiff(options)
+        expect(spy.mock.calls.length).toBeGreaterThan(0)
+        expect(result).toMatchObject({
+          notCompared: [expect.objectContaining({ path: "packages/alpha", reason: "excluded" })],
+        })
+        expect(result.paths).toEqual([mode === "historical" ? "vendor/beta/new-beta.ts" : "vendor/beta/beta.ts"])
+        expect(result.consultedRepositories.map(({ path }) => path)).toEqual([".", "vendor/beta"])
+        expect(result.stats?.flatMap(({ files }) => files.map(({ path }) => path))).not.toContain("packages/alpha")
+        if (mode === "working") {
+          const parentDiffs = spy.mock.calls.filter(
+            ([, args]) => Array.isArray(args) && args[1] === fixture.product && args.includes("diff"),
+          )
+          expect(parentDiffs.length).toBeGreaterThan(0)
+          for (const [, args] of parentDiffs) expect(args).toContain("--ignore-submodules=dirty")
+        }
+        const stdout = outputSink()
+        const stderr = outputSink()
+        expect(
+          await runCli(
+            [
+              "--repo",
+              fixture.product,
+              "diff",
+              "--exclude-submodule",
+              "packages/alpha",
+              ...(mode === "historical" ? [`${fixture.productBase}..${head}`] : []),
+            ],
+            stdout,
+            stderr,
+          ),
+        ).toBe(0)
+        expect(stderr.output).toContain("packages/alpha: component excluded, not compared")
+      } finally {
+        spy.mockRestore()
+        syncBuiltinESMExports()
+      }
+    },
+  )
   test("expands two moved gitlinks into root-relative inner files", () => {
     const fixture = mkdtempSync(join(tmpdir(), "git-super-diff-"))
     roots.push(fixture)

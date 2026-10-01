@@ -1,7 +1,7 @@
 import { lstatSync, readFileSync, readdirSync, statSync } from "node:fs"
 import { isAbsolute, join, posix, resolve } from "node:path"
 import { recursiveNameStatusDiff, type ConsultedRepository } from "./diff.ts"
-import { gitError, probeRepository, repositoryRoot, runGit, tryGit } from "./git.ts"
+import { gitError, indexGitlinks, probeRepository, repositoryRoot, runGit, tryGit } from "./git.ts"
 
 export type SuperStatusOptions = Readonly<{ repo: string; indexFile?: string }>
 
@@ -14,22 +14,8 @@ export type SuperStatusResult = Readonly<{
   submoduleProblems: readonly Readonly<{ path: string; reason: string; gitDir?: string }>[]
 }>
 
-type Gitlink = Readonly<{ path: string; indexPin: string | undefined }>
-
 function nulFields(value: string): string[] {
   return value.split("\0").filter(Boolean)
-}
-
-function indexGitlinks(root: string, indexFile?: string): Gitlink[] {
-  const fields = nulFields(runGit(root, ["ls-files", "--stage", "-z"], indexFile))
-  return fields
-    .map((field) => {
-      const match = /^160000 ([0-9a-f]{40}) ([0-3])\t(.+)$/u.exec(field)
-      const path = match?.[3]
-      return path === undefined ? undefined : { indexPin: match?.[2] === "0" ? match[1] : undefined, path }
-    })
-    .filter((value): value is Gitlink => value !== undefined)
-    .sort((left, right) => left.path.localeCompare(right.path))
 }
 
 function headGitlinks(root: string): Map<string, string> {
