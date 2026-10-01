@@ -1,7 +1,7 @@
 /**
  * @reach fs-walk <fixture-only: superPull and git-super CLI use mkdtempSync(canonicalTmpdir()) repos>
  */
-import { afterEach, describe, expect, test, vi } from "vitest"
+import { afterEach, describe, expect, onTestFinished, test, vi } from "vitest"
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -9,6 +9,7 @@ import { runCli } from "../src/cli.ts"
 import { acquireExclusive, createExclusive } from "../src/exclusive.ts"
 import { adaptProcessGit, createLocalGitProcess, type GitProcess } from "../src/process.ts"
 import { superPull } from "../src/pull.ts"
+import { superSubmodulePrepare } from "../src/submodule-prepare.ts"
 import type { GitSuperResult } from "../src/result.ts"
 import {
   addNestedAlphaSubmodule,
@@ -59,6 +60,71 @@ describe("git super pull --ff-only", () => {
       detail: { code: "submodule-not-initialized", paths: ["packages/alpha"] },
     })
     expect(git(checkout, "rev-parse", "HEAD")).toBe(before)
+  })
+
+  /**
+   * @failure A target that ADDS a submodule is refused as not initialized, and the printed remedy cannot work because
+   * the new path is not in the index until the pull moves HEAD: shared main froze on vendor/brain8, whose module store
+   * a git-super merge had already prepared (26972).
+   * @level l1
+   * @consumer git-super pull
+   * @testonly none
+   */
+  test.each([
+    { store: "no module store", prepare: false },
+    { store: "a module store a git-super merge prepared", prepare: true },
+  ])("initializes a submodule the target adds, from $store, at its gitlink (26972)", async ({ prepare }) => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-pull-added-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const checkout = join(fixtureRoot, "checkout")
+    git(
+      fixtureRoot,
+      "-c",
+      "protocol.file.allow=always",
+      "clone",
+      "-q",
+      "--recurse-submodules",
+      fixture.product,
+      checkout,
+    )
+    const gamma = join(fixtureRoot, "gamma")
+    createRepository(gamma, "gamma.ts", "export const gamma = 1\n")
+    git(fixture.product, "-c", "protocol.file.allow=always", "submodule", "add", "-q", gamma, "vendor/gamma")
+    git(fixture.product, "commit", "-q", "-m", "add gamma")
+    const target = git(fixture.product, "rev-parse", "HEAD")
+    const gammaTarget = git(fixture.product, "rev-parse", `${target}:vendor/gamma`)
+    // The fixture's remotes are local paths, which git refuses to clone for a submodule unless asked; real ones are ssh.
+    vi.stubEnv("GIT_CONFIG_COUNT", "1")
+    vi.stubEnv("GIT_CONFIG_KEY_0", "protocol.file.allow")
+    vi.stubEnv("GIT_CONFIG_VALUE_0", "always")
+    onTestFinished(() => {
+      vi.unstubAllEnvs()
+    })
+    if (prepare) {
+      git(checkout, "fetch", "-q", "origin")
+      const prepared = await superSubmodulePrepare({ repo: checkout, commit: target, remote: "origin" })
+      expect(prepared.detail).toBeUndefined()
+      expect(prepared.submodules.map(({ path }) => path)).toContain("vendor/gamma")
+    }
+
+    const result = await superPull({ repo: checkout, repository: "origin", refspecs: ["main"], ffOnly: true })
+
+    expect(result.detail).toBeUndefined()
+    expect(result.state).toBe("updated")
+    expect(git(checkout, "rev-parse", "HEAD")).toBe(target)
+    expect(git(join(checkout, "vendor/gamma"), "rev-parse", "HEAD")).toBe(gammaTarget)
+    expect(readFileSync(join(checkout, "vendor/gamma/gamma.ts"), "utf8")).toBe("export const gamma = 1\n")
+    expect(git(checkout, "status", "--porcelain")).toBe("")
+    expect(git(join(checkout, "vendor/gamma"), "rev-parse", "--path-format=absolute", "--git-dir")).toBe(
+      join(checkout, ".git/modules/vendor/gamma"),
+    )
+    expect(result.repositories).toContainEqual(
+      expect.objectContaining({ repository: join(checkout, "vendor/gamma"), state: "updated" }),
+    )
+
+    const again = await superPull({ repo: checkout, repository: "origin", refspecs: ["main"], ffOnly: true })
+    expect(again.state).toBe("unchanged")
   })
 
   test("uses the configured upstream when repository and refspec are omitted", async () => {

@@ -47,6 +47,11 @@ type PullRepositoryPlan = Readonly<{
   path: string
   current: string
   target: string
+  /**
+   * A gitlink the target adds: absent from the parent's current commit, so it has no checkout to freeze. It is
+   * initialized after its parent moves, when the path and its .gitmodules entry are in the parent's index (26972).
+   */
+  added?: Readonly<{ parent: string; path: string }>
 }>
 
 const DEFAULT_GIT_TIMEOUT_MS = 30_000
@@ -425,6 +430,7 @@ async function freezeRepositoryGraph(
   const walk = async (repository: string, path: string, from: string, to: string): Promise<void> => {
     repositories.push({ repository, path, current: from, target: to })
     const entries = await readCommitGitlinks(git, repository, to)
+    const recordedBefore = new Set((await readCommitGitlinks(git, repository, from)).map((entry) => entry.path))
     for (const entry of entries) {
       const childPath = path === "." ? entry.path : `${path}/${entry.path}`
       const childRepository = join(repository, entry.path)
@@ -436,6 +442,17 @@ async function freezeRepositoryGraph(
               await required(git, childRepository, ["rev-parse", "--show-prefix"], "freeze-target-graph"),
             )
           : undefined
+      if ((probe === undefined || probe.kind === "absent") && !recordedBefore.has(entry.path)) {
+        // Added by this target: there is nothing to freeze yet, and nothing below it to walk until it exists.
+        repositories.push({
+          repository: childRepository,
+          path: childPath,
+          current: "0".repeat(entry.target.length),
+          target: entry.target,
+          added: { parent: repository, path: entry.path },
+        })
+        continue
+      }
       if (probe === undefined || probe.kind === "absent") {
         throw Object.assign(new Error(`submodule ${childPath} is not initialized`), {
           resultDetail: detail(
@@ -465,6 +482,7 @@ async function freezeRepositoryGraph(
 
 async function proveRepositoryTransitions(git: GitProcess, repositories: readonly PullRepositoryPlan[]): Promise<void> {
   for (const repository of repositories) {
+    if (repository.added !== undefined) continue
     await proveTreeTransition(git, repository.repository, repository.current, repository.target)
   }
 }
@@ -594,6 +612,38 @@ function repositoryResult(
   }
 }
 
+/**
+ * Initialize a gitlink the parent's move just added (26972). Its path and .gitmodules entry are in the parent's index
+ * now, so git's own submodule update clones it into the parent's per-worktree module store, or reuses a store already
+ * there, and checks out exactly the recorded commit, with anything it carries below it.
+ */
+async function initializeAddedSubmodule(
+  git: GitProcess,
+  repository: PullRepositoryPlan,
+  added: NonNullable<PullRepositoryPlan["added"]>,
+): Promise<GitResultDetail | undefined> {
+  const args = ["-c", "submodule.recurse=false", "submodule", "update", "--init", "--recursive", "--", added.path]
+  const initialized = await runApply(git, added.parent, args)
+  if (initialized.code !== 0 || initialized.failure !== undefined || initialized.timedOut === true) {
+    return operationError(added.parent, "apply-added-submodule", args, initialized).resultDetail
+  }
+  const headArgs = ["rev-parse", "HEAD^{commit}"]
+  const head = await run(git, repository.repository, headArgs)
+  if (head.code !== 0 || head.failure !== undefined) {
+    return operationError(repository.repository, "verify-added-submodule", headArgs, head).resultDetail
+  }
+  const actual = head.stdout.trim()
+  if (actual !== repository.target) {
+    return detail(
+      "added-submodule-not-at-gitlink",
+      "verify-added-submodule",
+      `Submodule ${repository.path} was initialized at ${actual}, not at its recorded gitlink ${repository.target}.`,
+      { paths: [repository.path], objectIds: [repository.target, actual] },
+    )
+  }
+  return undefined
+}
+
 /** Fetch, freeze, preflight, recheck under the shared mutation lock, then fast-forward. */
 /**
  * Move every repository to its target: the root merge (post-merge suppressed), each submodule checkout, then the
@@ -609,6 +659,19 @@ async function applyRepositories(
   for (const [index, repository] of plan.repositories.entries()) {
     if (repository.current === repository.target) {
       results.push(repositoryResult(repository, "unchanged"))
+      continue
+    }
+    if (repository.added !== undefined) {
+      phase(`apply-added-submodule ${repository.path}`)
+      const failure = await initializeAddedSubmodule(git, repository, repository.added)
+      if (failure !== undefined) {
+        results.push(repositoryResult(repository, "failed", failure))
+        for (const remaining of plan.repositories.slice(index + 1)) {
+          results.push(repositoryResult(remaining, "not-run", failure))
+        }
+        return gitSuperResult(results, failure)
+      }
+      results.push(repositoryResult(repository, "updated"))
       continue
     }
     phase(index === 0 ? "apply-root" : `apply-submodule ${repository.path}`)
@@ -732,6 +795,7 @@ export async function superPull(options: SuperPullOptions): Promise<GitSuperResu
           }
         }
         for (const repository of plan.repositories) {
+          if (repository.added !== undefined) continue
           const current = await required(
             git,
             repository.repository,
