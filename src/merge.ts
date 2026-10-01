@@ -351,7 +351,7 @@ async function mergeUnderLock(
         message,
         `git -C ${shellQuote(root)} status --short`,
         pending === undefined ? "Use one merge mode with its required expectations." : pendingRemedy(root, pending),
-        "the caller",
+        undefined,
       ),
     )
     return pending === undefined ? result : unchangedPending(result, pending)
@@ -591,7 +591,7 @@ async function mergeObserved(
             `Ordinary merge conflicts remain pending on ${branch}. ${pendingRemedy(root, observed)}`,
             `git -C ${shellQuote(root)} status --short`,
             pendingRemedy(root, observed),
-            "the caller",
+            undefined,
             { paths, objectIds: [head, target] },
           ),
         ),
@@ -1149,7 +1149,7 @@ async function mergeObserved(
         messageOf(error),
         `git -C ${shellQuote(root)} show ${mergeCommit}`,
         "Preserve the observed commit; no success receipt was written and nothing was rolled back.",
-        "the caller",
+        undefined,
         { objectIds: [head, target, mergeCommit] },
       ),
       settledCheckouts.rows,
@@ -1366,7 +1366,7 @@ async function verifyRestingCheckouts(
         `${entry.path} must remain clean at pre-merge HEAD pin ${entry.target}; observed ${observed}${status === "" ? "" : ` with changes ${JSON.stringify(status)}`}.`,
         `git -C ${shellQuote(child)} status --short`,
         `Preserve child work and restore ${entry.path} to ${entry.target} before continuing.`,
-        "the caller",
+        undefined,
         { paths: [entry.path], objectIds: [entry.target, observed] },
       )
     }
@@ -1439,7 +1439,7 @@ async function validateContinuationPins(
       `Staged gitlink ${path} is ${pin ?? "absent"}; the prospective merge requires ${requiredPins.join(" and ") || "no gitlink"}. ${cure}`,
       `git -C ${shellQuote(root)} ls-files --stage -- ${shellQuote(path)}`,
       cure,
-      "the caller",
+      undefined,
       { paths: [path], objectIds: [...(pin === undefined ? [] : [pin]), ...requiredPins] },
     )
   }
@@ -3194,17 +3194,17 @@ function obviousDetail(
   subject: string,
   evidence: string,
   next: string,
-  owner: string,
+  owner: string | undefined,
   extra: Partial<GitResultDetail> = {},
 ): GitResultDetail {
   return {
     code,
     phase: extra.phase ?? "preflight",
-    message: `${code}: ${subject}; evidence: ${evidence}; next: ${next}; owner: ${owner}`,
+    message: `${code}: ${subject}; evidence: ${evidence}; next: ${next}${owner === undefined ? "" : `; owner: ${owner}`}`,
     subject,
     evidence,
     next,
-    owner,
+    ...(owner === undefined ? {} : { owner }),
     remedy: next,
     ...extra,
   }

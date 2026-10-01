@@ -1627,6 +1627,9 @@ describe("git super merge", () => {
       await runCli(["--repo", repository, "--json", "merge", target, "--preserve-conflicts"], pendingOut, pendingErr),
     ).toBe(2)
     expect(JSON.parse(pendingOut.output)).toMatchObject({ state: "failed", partial: true })
+    // New diagnostics obey ADR-0007; routing is not part of their payload or prose.
+    expect(JSON.parse(pendingOut.output)).not.toHaveProperty("detail.owner")
+    expect(pendingOut.output).not.toContain("; owner:")
     expect(git(repository, "rev-parse", "HEAD")).toBe(head)
     expect(git(repository, "symbolic-ref", "HEAD")).toBe(branch)
     expect(git(repository, "rev-parse", "MERGE_HEAD")).toBe(target)
@@ -1662,6 +1665,7 @@ describe("git super merge", () => {
       pending: { branch, head, target, unmergedPaths: ["shared.txt"] },
     })
     expect(defaultPending.detail?.message).toContain("left as found")
+    expect(defaultPending.detail).not.toHaveProperty("owner")
     // These leases cannot authorize mutation; the ordinary conflict must remain native.
     for (const [expectedHead, expectedBranch, expectedCode] of [
       [target, branch, "merge-continuation-lease-mismatch"],
@@ -1676,6 +1680,7 @@ describe("git super merge", () => {
         expectedBranch,
       })
       expect(refused).toMatchObject({ state: "failed", partial: false, detail: { code: expectedCode } })
+      expect(refused.detail).not.toHaveProperty("owner")
       expect(refused.detail?.message).toContain("left as found")
       expect(git(repository, "rev-parse", "HEAD")).toBe(head)
       expect(git(repository, "rev-parse", "MERGE_HEAD")).toBe(target)
@@ -1812,6 +1817,7 @@ describe("git super merge", () => {
       detail: { code: "merge-continuation-gitlink-mismatch", paths: ["packages/alpha"] },
     })
     expect(stale.detail?.message).toContain(fixture.alphaBase)
+    expect(stale.detail).not.toHaveProperty("owner")
     expect(stale.detail?.message).toContain(advanced)
     expect(stale.detail?.next).toContain(`160000,${advanced},packages/alpha`)
     expect(git(fixture.product, "rev-parse", ":packages/alpha")).toBe(fixture.alphaBase)
@@ -1986,6 +1992,7 @@ describe("git super merge", () => {
         commit: observed,
         detail: { code: "merge-postcondition-mismatch" },
       })
+      expect(result.detail).not.toHaveProperty("owner")
       expect(() => git(fixture.product, "rev-parse", "--verify", receipt)).toThrow()
       expect(git(fixture.product, "rev-parse", "HEAD")).toBe(observed)
       if (changed === "gitlink") {
