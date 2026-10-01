@@ -6,8 +6,18 @@ import { createExclusive, type Exclusive } from "./exclusive.ts"
 import { probeRepository } from "./git.ts"
 import { ensureCommitObject } from "./objects.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
-import { materializeSubmodulesWithProcess } from "./submodules.ts"
+import { materializeSubmodulesWithProcess, type SubmoduleMaterializationResult } from "./submodules.ts"
 import { gitSuperResult, type GitResultDetail, type GitSuperRepositoryResult, type GitSuperResult } from "./result.ts"
+
+/** Added-checkout receipts expose the shared materializer's actual borrow partition. */
+type PullRepositoryResult = GitSuperRepositoryResult &
+  Readonly<{
+    materialization?: Pick<
+      SubmoduleMaterializationResult,
+      "considered" | "borrowed" | "remoteFallbacks" | "unreferenced" | "timedOut" | "failure"
+    >
+  }>
+type PullResult = Omit<GitSuperResult, "repositories"> & Readonly<{ repositories: readonly PullRepositoryResult[] }>
 
 export type SuperPullOptions = Readonly<{
   repo: string
@@ -623,8 +633,9 @@ async function applyRepositories(
   plan: PullPlan,
   hooksDir: string,
   phase: Phase,
-): Promise<GitSuperResult> {
-  const results: GitSuperRepositoryResult[] = []
+  warn: (message: string) => void,
+): Promise<PullResult> {
+  const results: PullRepositoryResult[] = []
   for (const [index, repository] of plan.repositories.entries()) {
     if (repository.current === repository.target) {
       results.push(repositoryResult(repository, "unchanged"))
@@ -632,40 +643,73 @@ async function applyRepositories(
     }
     if (repository.added !== undefined) {
       phase(`apply-added-submodule ${repository.path}`)
-      const initialized = await materializeSubmodulesWithProcess(git, {
-        worktree: repository.added.parent,
-        paths: [repository.added.path],
-        source: "head",
-      }).catch((error: unknown) => ({
-        code: 1,
-        stdout: "",
-        stderr: error instanceof Error ? error.message : String(error),
-      }))
-      const head = existsSync(join(repository.repository, ".git"))
+      const initialized: GitProcessResult & Partial<SubmoduleMaterializationResult> =
+        await materializeSubmodulesWithProcess(
+          git,
+          {
+            worktree: repository.added.parent,
+            paths: [repository.added.path],
+            source: "head",
+          },
+          { resolveReferenceWorktree: true, detached: true },
+        ).catch((error: unknown) => ({
+          code: 1,
+          stdout: "",
+          stderr: error instanceof Error ? error.message : String(error),
+        }))
+      const { considered, borrowed, remoteFallbacks, unreferenced } = initialized
+      const materialization =
+        considered === undefined ||
+        borrowed === undefined ||
+        remoteFallbacks === undefined ||
+        unreferenced === undefined
+          ? {}
+          : {
+              materialization: {
+                considered,
+                borrowed,
+                remoteFallbacks,
+                unreferenced,
+                ...(initialized.timedOut === undefined ? {} : { timedOut: initialized.timedOut }),
+                ...(initialized.failure === undefined ? {} : { failure: initialized.failure }),
+              },
+            }
+      if ((initialized.unreferenced ?? 0) > 0) {
+        warn(
+          `git-super pull: materializing ${repository.path} used no reference store for ${initialized.unreferenced} of ${initialized.considered} gitlinks: ${initialized.unreferencedPaths?.join(", ")}\n`,
+        )
+      }
+      const head: GitProcessResult = existsSync(join(repository.repository, ".git"))
         ? await run(git, repository.repository, ["rev-parse", "HEAD^{commit}"]).catch((error: unknown) => ({
             code: 1,
             stdout: "",
             stderr: error instanceof Error ? error.message : String(error),
           }))
         : { code: 1, stdout: "", stderr: `Submodule checkout ${repository.path} has no .git entry.` }
-      const actual = head.code === 0 ? head.stdout.trim() : undefined
+      const actual = head.code === 0 && !head.timedOut && head.failure === undefined ? head.stdout.trim() : undefined
+      const initializationFailed =
+        initialized.code !== 0 || initialized.timedOut === true || initialized.failure !== undefined
       const failure =
-        initialized.code !== 0 || actual !== repository.target
+        initializationFailed || actual !== repository.target
           ? detail(
-              "added-submodule-not-at-gitlink",
+              initializationFailed
+                ? "added-submodule-initialization-failed"
+                : actual === undefined
+                  ? "added-submodule-head-unreadable"
+                  : "added-submodule-not-at-gitlink",
               "apply-added-submodule",
-              `Submodule ${repository.path} could not be initialized at recorded gitlink ${repository.target}; actual checkout ${actual ?? "unreadable"}. ${initialized.stderr || head.stderr}`,
+              `Submodule ${repository.path} could not be initialized at recorded gitlink ${repository.target}; actual checkout ${actual ?? "unreadable"}. ${initializationFailed ? operationError(repository.repository, "apply-added-submodule", ["submodule", "update", "--init"], initialized).message : actual === undefined ? operationError(repository.repository, "observe-added-submodule", ["rev-parse", "HEAD^{commit}"], head).message : "The checkout did not match the recorded pin."}`,
               { paths: [repository.path], objectIds: [repository.target, ...(actual === undefined ? [] : [actual])] },
             )
           : undefined
       if (failure !== undefined) {
-        results.push(repositoryResult(repository, "failed", failure))
+        results.push({ ...repositoryResult(repository, "failed", failure), ...materialization })
         for (const remaining of plan.repositories.slice(index + 1)) {
           results.push(repositoryResult(remaining, "not-run", failure))
         }
         return gitSuperResult(results, failure)
       }
-      results.push(repositoryResult(repository, "updated"))
+      results.push({ ...repositoryResult(repository, "updated"), ...materialization })
       continue
     }
     phase(index === 0 ? "apply-root" : `apply-submodule ${repository.path}`)
@@ -723,7 +767,7 @@ async function applyRepositories(
   return gitSuperResult(results, plan.detail)
 }
 
-export async function superPull(options: SuperPullOptions): Promise<GitSuperResult> {
+export async function superPull(options: SuperPullOptions): Promise<PullResult> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
     const failure = detail("invalid-timeout", "validate", "Git command timeout must be a positive finite number.")
@@ -821,10 +865,10 @@ export async function superPull(options: SuperPullOptions): Promise<GitSuperResu
         const hooks = await hooksWithoutPostMerge(git, root.repository)
         // From the first write until every repository is at the target, no signal stops the apply (24907).
         deferral = deferApplySignals(warn)
-        let applied: GitSuperResult
+        let applied: PullResult
         let deferred: DeferredSignal | undefined
         try {
-          applied = await applyRepositories(git, plan, hooks.dir, phase)
+          applied = await applyRepositories(git, plan, hooks.dir, phase, warn)
         } finally {
           deferred = deferral.release()
           deferral = undefined

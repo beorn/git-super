@@ -13,7 +13,11 @@ import {
   type SubmoduleTreeConflict,
 } from "./composition.ts"
 import { ensureCommitObject, pinRef } from "./objects.ts"
-import { materializeSubmodulesWithProcess } from "./submodules.ts"
+import {
+  materializeSubmodulesWithProcess,
+  type SubmoduleMaterializationResult,
+  type SubmoduleGitResult,
+} from "./submodules.ts"
 import { prepareSubmoduleTreeUnderLock } from "./submodule-prepare.ts"
 import { mapInOrder } from "./map-in-order.ts"
 import { capturePushIntent, discoverRepository, type ObservedMains, rootPushIdentity } from "./push.ts"
@@ -65,6 +69,10 @@ type SuperMergeInitializationResult = Readonly<{
   path: string
   index: string
   checkout?: string
+  materialization?: Pick<
+    SubmoduleMaterializationResult,
+    "considered" | "borrowed" | "remoteFallbacks" | "unreferenced" | "timedOut" | "failure"
+  >
   state: "initialized" | "initialization-failed" | "not-run" | "initialization-required"
 }>
 
@@ -488,25 +496,32 @@ async function mergeUnderLock(
 
   // Existing parents can acquire children even when their selected pin is a raise to main.
   // Refuse this unsupported initialization before touching the root or existing checkouts.
+  const missingNested: Array<{ path: string; target: string; parent: string; parentTarget: string }> = []
   for (const checkout of planned.checkouts) {
     const repository = join(root, checkout.path)
     const before = new Set((await readCommitSubmodules(git, repository, checkout.recorded)).map((entry) => entry.path))
-    const addition = (await readCommitSubmodules(git, repository, checkout.index)).find(
-      (entry) => !before.has(entry.path) && !existsSync(join(repository, entry.path, ".git")),
-    )
-    if (addition === undefined) continue
-    const path = `${checkout.path}/${addition.path}`
-    initializations.push({ path, index: addition.target, state: "initialization-required" })
+    for (const addition of await readCommitSubmodules(git, repository, checkout.index)) {
+      if (before.has(addition.path) || existsSync(join(repository, addition.path, ".git"))) continue
+      const path = `${checkout.path}/${addition.path}`
+      initializations.push({ path, index: addition.target, state: "initialization-required" })
+      missingNested.push({ path, target: addition.target, parent: repository, parentTarget: checkout.index })
+    }
+  }
+  if (missingNested.length > 0) {
     return failed(
       root,
-      visiblePlans,
+      [],
       obviousDetail(
         "nested-submodule-initialization-required",
-        `Merge would add ${path}@${addition.target} inside existing submodule ${checkout.path}; nested checkout initialization is required before this merge can apply.`,
-        `git -C ${repository} show ${checkout.index}:.gitmodules`,
-        `Initialize ${path} in ${repository} at parent commit ${checkout.index}, preserving the root recorded pin, then rerun the same merge.`,
+        `Merge requires nested checkout initialization before it can apply: ${missingNested.map(({ path, target }) => `${path}@${target}`).join(", ")}.`,
+        missingNested.map(({ parent, parentTarget }) => `git -C ${parent} show ${parentTarget}:.gitmodules`).join("; "),
+        `Initialize the named additions at their selected parent commits, preserving the root recorded pins, then rerun the same merge.`,
         "the submodule writer",
-        { paths: [path], objectIds: [addition.target, checkout.index] },
+        {
+          paths: missingNested.map(({ path }) => path),
+          objectIds: missingNested.flatMap(({ target, parentTarget }) => [target, parentTarget]),
+          phase: "preflight-nested-initialization",
+        },
       ),
     )
   }
@@ -677,46 +692,102 @@ async function mergeUnderLock(
   }
 
   steps.begin("initialize")
-  for (const path of planned.added) {
-    const index = await required(git, root, ["rev-parse", `:${path}`], "observe-added-gitlink", timeoutMs)
-    initializations.push({ path, index, state: "not-run" })
+  try {
+    for (const path of planned.added) {
+      const index = await required(git, root, ["rev-parse", `:${path}`], "observe-added-gitlink", timeoutMs)
+      initializations.push({ path, index, state: "not-run" })
+    }
+  } catch (error) {
+    return partial(root, undefined, completed, resultError(error, "observe-added-gitlink"), preparedRows)
   }
   for (const [position, row] of initializations.entries()) {
-    const initialized = await materializeSubmodulesWithProcess(git, {
-      worktree: root,
-      paths: [row.path],
-      source: "index",
-    }).catch((error: unknown) => ({
-      code: 1,
-      stdout: "",
-      stderr: error instanceof Error ? error.message : String(error),
-    }))
-    const observed = existsSync(join(root, row.path, ".git"))
+    const initialized: SubmoduleGitResult & Partial<SubmoduleMaterializationResult> =
+      await materializeSubmodulesWithProcess(
+        git,
+        {
+          worktree: root,
+          paths: [row.path],
+          source: "index",
+        },
+        { resolveReferenceWorktree: true, timeoutMs },
+      ).catch((error: unknown) => ({
+        code: 1,
+        stdout: "",
+        stderr: error instanceof Error ? error.message : String(error),
+      }))
+    const { considered, borrowed, remoteFallbacks, unreferenced } = initialized
+    const materialization =
+      considered === undefined || borrowed === undefined || remoteFallbacks === undefined || unreferenced === undefined
+        ? undefined
+        : {
+            considered,
+            borrowed,
+            remoteFallbacks,
+            unreferenced,
+            ...(initialized.timedOut === undefined ? {} : { timedOut: initialized.timedOut }),
+            ...(initialized.failure === undefined ? {} : { failure: initialized.failure }),
+          }
+    if ((initialized.unreferenced ?? 0) > 0) {
+      const warning = `git-super merge: materializing ${row.path} used no reference store for ${initialized.unreferenced} of ${initialized.considered} gitlinks: ${initialized.unreferencedPaths?.join(", ")}\n`
+      if (options.report === undefined) process.stderr.write(warning)
+      else options.report(warning)
+    }
+    const observed: GitProcessResult = existsSync(join(root, row.path, ".git"))
       ? await run(git, join(root, row.path), ["rev-parse", "HEAD^{commit}"], timeoutMs).catch((error: unknown) => ({
           code: 1,
           stdout: "",
           stderr: error instanceof Error ? error.message : String(error),
         }))
       : { code: 1, stdout: "", stderr: `Submodule checkout ${row.path} has no .git entry.` }
-    const checkout = observed.code === 0 ? observed.stdout.trim() : undefined
-    const ok = initialized.code === 0 && observed.code === 0 && checkout === row.index
+    const checkout =
+      observed.code === 0 && !observed.timedOut && observed.failure === undefined ? observed.stdout.trim() : undefined
+    const initializationFailed =
+      initialized.code !== 0 || initialized.timedOut === true || initialized.failure !== undefined
+    const ok = !initializationFailed && checkout === row.index
     initializations[position] = {
       ...row,
+      ...(materialization === undefined ? {} : { materialization }),
       ...(checkout === undefined ? {} : { checkout }),
       state: ok ? "initialized" : "initialization-failed",
     }
     if (!ok) {
+      const incoming = visiblePlans.find((plan) => plan.path === row.path)?.from
+      const cause = initializationFailed
+        ? resultDetailFromGit(
+            "added-submodule-initialization-failed",
+            "initialize-added-submodule",
+            root,
+            ["submodule", "update", "--init", "--", row.path],
+            initialized,
+          ).message + (initialized.failure === undefined ? "" : `; transport failure: ${initialized.failure}`)
+        : observed.code !== 0 || observed.timedOut || observed.failure !== undefined
+          ? resultDetailFromGit(
+              "added-submodule-head-unreadable",
+              "initialize-added-submodule",
+              join(root, row.path),
+              ["rev-parse", "HEAD^{commit}"],
+              observed,
+            ).message
+          : "The checkout did not match the staged pin."
       return partial(
         root,
         undefined,
         completed,
         obviousDetail(
-          "added-submodule-initialization-failed",
-          `The root merge remains staged: ${row.path} incoming pin ${visiblePlans.find((plan) => plan.path === row.path)?.from ?? row.index} could not be initialized at staged index pin ${row.index}; actual checkout ${checkout ?? "unreadable"}. ${initialized.stderr || observed.stderr || "The checkout did not match the staged pin."}`,
+          initializationFailed
+            ? "added-submodule-initialization-failed"
+            : checkout === undefined
+              ? "added-submodule-head-unreadable"
+              : "added-submodule-not-at-gitlink",
+          `The root merge remains staged: ${row.path}${incoming === undefined ? "" : ` incoming pin ${incoming}`} could not be initialized at staged index pin ${row.index}; actual checkout ${checkout ?? "unreadable"}. ${cause}`,
           `git -C ${root} status --short`,
           "Inspect and preserve the staged root merge and named addition before retrying; existing checkouts have not moved.",
           "the caller",
-          { paths: [row.path], objectIds: [row.index, ...(checkout === undefined ? [] : [checkout])] },
+          {
+            phase: "initialize-added-submodule",
+            paths: [row.path],
+            objectIds: [row.index, ...(checkout === undefined ? [] : [checkout])],
+          },
         ),
         preparedRows,
       )

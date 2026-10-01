@@ -13,7 +13,7 @@ import { superPush } from "../src/push.ts"
 import { decodePushIntent, PUSH_INTENT_TRAILER } from "../src/push-intent.ts"
 import { SUPER_MERGE_STEPS, superMerge } from "../src/merge.ts"
 import { superWorktreeAdd } from "../src/worktree-add.ts"
-import { createLocalGitProcess, type GitProcess } from "../src/process.ts"
+import { createLocalGitProcess, type GitProcess, type GitProcessRequest } from "../src/process.ts"
 import { materializeSubmodulesWithProcess } from "../src/submodules.ts"
 import type { GitResultDetail } from "../src/result.ts"
 import {
@@ -110,7 +110,7 @@ describe("git super merge", () => {
    * @consumer git-super merge and authoring hooks
    * @testonly none
    */
-  it.each(["none", "exit", "throw"] as const)(
+  it.each(["none", "exit", "throw", "timeout", "stage0", "head", "mismatch", "unknown-pin"] as const)(
     "initializes an added gitlink at its pin before the concluding commit hook (26988), initialization failure=%s",
     async (failure) => {
       const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-added-"))
@@ -119,7 +119,7 @@ describe("git super merge", () => {
       const primary = join(fixtureRoot, "primary")
       const checkout = join(fixtureRoot, "checkout")
       const gamma = join(fixtureRoot, "gamma")
-      createRepository(gamma, "gamma.ts", "export const gamma = 1\n")
+      const gammaBase = createRepository(gamma, "gamma.ts", "export const gamma = 1\n")
       const rootUrl = "https://git-super.test/owned/product.git"
       const gammaUrl = "https://git-super.test/owned/gamma.git"
       // Ownership remains hosted; every recursive Git process uses local fixture transport.
@@ -145,7 +145,8 @@ describe("git super merge", () => {
         expect(initial).toMatchObject({ code: 0, considered: 2, borrowed: 2, remoteFallbacks: 0, unreferenced: 0 })
         git(fixture.product, "submodule", "add", "-q", gammaUrl, "vendor/gamma")
         git(fixture.product, "commit", "-q", "-m", "main adds gamma")
-        const gammaPin = advanceRepository(gamma, "gamma.ts", "export const gamma = 2\n")
+        const gammaPin =
+          failure === "unknown-pin" ? gammaBase : advanceRepository(gamma, "gamma.ts", "export const gamma = 2\n")
         git(checkout, "fetch", "-q", "origin")
         const hook = git(checkout, "rev-parse", "--path-format=absolute", "--git-path", "hooks/pre-commit")
         writeFileSync(
@@ -156,22 +157,76 @@ describe("git super merge", () => {
         const alphaBefore = git(join(checkout, "packages/alpha"), "rev-parse", "HEAD")
         advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
         const local = createLocalGitProcess()
+        const requests: GitProcessRequest[] = []
         const process: GitProcess = {
           run: (request) => {
-            if (failure !== "none" && request.args.includes("update") && request.args.includes("vendor/gamma")) {
+            requests.push(request)
+            if (
+              failure === "stage0" &&
+              request.repo === checkout &&
+              request.args.join(" ") === "rev-parse :vendor/gamma"
+            ) {
+              return Promise.resolve({ code: 1, stdout: "", stderr: "injected stage-0 read failure" })
+            }
+            if (
+              (failure === "head" || failure === "mismatch") &&
+              request.repo === join(checkout, "vendor/gamma") &&
+              request.args.join(" ") === "rev-parse HEAD^{commit}"
+            ) {
+              return Promise.resolve(
+                failure === "head"
+                  ? { code: 1, stdout: "", stderr: "injected unreadable HEAD" }
+                  : { code: 0, stdout: rootBefore, stderr: "" },
+              )
+            }
+            if (
+              (failure === "exit" || failure === "throw" || failure === "timeout" || failure === "unknown-pin") &&
+              request.args.includes("update") &&
+              request.args.includes("vendor/gamma")
+            ) {
               if (failure === "throw") throw new Error("injected thrown initialization failure")
+              if (failure === "timeout") {
+                return Promise.resolve({
+                  code: 1,
+                  stdout: "",
+                  stderr: "injected timeout",
+                  timedOut: true,
+                  failure: "SIGTERM",
+                })
+              }
               return Promise.resolve({ code: 1, stdout: "", stderr: "injected added-submodule initialization failure" })
             }
             return local.run(request)
           },
         }
         const rootBefore = git(checkout, "rev-parse", "HEAD")
-        const result = await superMerge({ repo: checkout, commit: "origin/main", git: process })
+        const result = await superMerge({ repo: checkout, commit: "origin/main", git: process, timeoutMs: 12345 })
+        if (failure === "stage0") {
+          expect(result).toMatchObject({
+            state: "failed",
+            partial: true,
+            repositories: [{ state: "updated" }],
+            detail: { phase: "observe-added-gitlink" },
+          })
+          expect(result.gitlinks).toContainEqual(expect.objectContaining({ path: "packages/alpha", state: "raised" }))
+          expect(git(checkout, "rev-parse", ":vendor/gamma")).toBe(gammaPin)
+          expect(git(checkout, "rev-parse", "HEAD")).toBe(rootBefore)
+          return
+        }
         if (failure !== "none") {
           expect(result).toMatchObject({
             state: "failed",
             partial: true,
-            detail: { code: "added-submodule-initialization-failed", paths: ["vendor/gamma"] },
+            detail: {
+              code:
+                failure === "head"
+                  ? "added-submodule-head-unreadable"
+                  : failure === "mismatch"
+                    ? "added-submodule-not-at-gitlink"
+                    : "added-submodule-initialization-failed",
+              phase: "initialize-added-submodule",
+              paths: ["vendor/gamma"],
+            },
             initializations: [{ path: "vendor/gamma", index: gammaPin, state: "initialization-failed" }],
           })
           expect(result.detail?.message).toContain(gammaPin)
@@ -180,38 +235,44 @@ describe("git super merge", () => {
           expect(git(checkout, "rev-parse", ":vendor/gamma")).toBe(gammaPin)
           expect(git(join(checkout, "packages/alpha"), "rev-parse", "HEAD")).toBe(alphaBefore)
           expect(result.steps?.at(-1)?.name).toBe("initialize")
-          expect(existsSync(join(checkout, "vendor/gamma/.git"))).toBe(false)
+          expect(existsSync(join(checkout, "vendor/gamma/.git"))).toBe(failure === "head" || failure === "mismatch")
+          if (failure === "unknown-pin") expect(result.detail?.message).not.toContain("incoming pin")
+          if (failure === "timeout") {
+            expect(result.detail?.message).toContain("timed out")
+            expect(result.detail?.message).toContain("SIGTERM")
+            expect(result.initializations).toContainEqual(
+              expect.objectContaining({
+                materialization: expect.objectContaining({ timedOut: true, failure: "SIGTERM" }),
+              }),
+            )
+          }
           return
         }
-        // CTO0093c0db: measure the existing owner against the linked worktree's staged addition.
-        const materialized = await materializeSubmodulesWithProcess(createLocalGitProcess(), {
-          worktree: checkout,
-          referenceWorktree: primary,
-          paths: ["vendor/gamma"],
-          source: "index",
-        })
+        // The caller must borrow on its OWN call; a second explicit-reference call masked the regression.
+        const update = requests.find(
+          (request) => request.args.includes("update") && request.args.includes("vendor/gamma"),
+        )
+        expect(update?.args).toEqual(expect.arrayContaining(["--reference", "--no-fetch"]))
+        expect(update?.timeoutMs).toBe(12345)
+        expect(result.initializations).toContainEqual(
+          expect.objectContaining({
+            path: "vendor/gamma",
+            materialization: { considered: 1, borrowed: 1, remoteFallbacks: 0, unreferenced: 0 },
+          }),
+        )
         const common = git(checkout, "rev-parse", "--path-format=absolute", "--git-common-dir")
-        expect
-          .soft({
-            stagedPin: git(checkout, "rev-parse", ":vendor/gamma"),
-            primaryCheckoutPresent: existsSync(join(primary, "vendor/gamma/.git")),
-            preparedStorePin: git(join(common, "modules/vendor/gamma"), "rev-parse", `${gammaPin}^{commit}`),
-            materialized,
-          })
-          .toMatchObject({
-            stagedPin: gammaPin,
-            primaryCheckoutPresent: false,
-            preparedStorePin: gammaPin,
-            materialized: { code: 0, considered: 1, borrowed: 1, remoteFallbacks: 0, unreferenced: 0 },
-          })
+        expect(existsSync(join(primary, "vendor/gamma/.git"))).toBe(false)
+        expect(git(join(common, "modules/vendor/gamma"), "rev-parse", `${gammaPin}^{commit}`)).toBe(gammaPin)
         expect(result.detail).toBeUndefined()
         expect(result.state).toBe("updated")
-        expect(result.initializations).toContainEqual({
-          path: "vendor/gamma",
-          index: gammaPin,
-          checkout: gammaPin,
-          state: "initialized",
-        })
+        expect(result.initializations).toContainEqual(
+          expect.objectContaining({
+            path: "vendor/gamma",
+            index: gammaPin,
+            checkout: gammaPin,
+            state: "initialized",
+          }),
+        )
         const gammaCheckout = join(checkout, "vendor/gamma")
         expect(git(gammaCheckout, "rev-parse", "HEAD")).toBe(gammaPin)
         const gitdir = git(gammaCheckout, "rev-parse", "--path-format=absolute", "--git-dir")
@@ -252,7 +313,10 @@ describe("git super merge", () => {
       onTestFinished(() => {
         vi.unstubAllEnvs()
       })
-      git(fixture.alpha, "commit", "-q", "-am", "add nested leaf")
+      git(fixture.alpha, "-c", "protocol.file.allow=always", "submodule", "add", "-q", leaf, "apps/other")
+      git(fixture.alpha, "config", "--file", ".gitmodules", "submodule.apps/other.url", leafUrl)
+      git(fixture.alpha, "config", "submodule.apps/other.url", leafUrl)
+      git(fixture.alpha, "commit", "-q", "-am", "add nested leaves")
       const alphaCheckout = join(fixture.product, "packages/alpha")
       if (initializeBeforeMerge) {
         git(alphaCheckout, "fetch", "-q", "origin")
@@ -270,8 +334,15 @@ describe("git super merge", () => {
       expect(result, JSON.stringify(result)).toMatchObject({
         state: "failed",
         partial: false,
-        detail: { code: "nested-submodule-initialization-required", paths: ["packages/alpha/apps/leaf"] },
-        initializations: [{ path: "packages/alpha/apps/leaf", index: leafPin, state: "initialization-required" }],
+        detail: {
+          code: "nested-submodule-initialization-required",
+          paths: ["packages/alpha/apps/leaf", "packages/alpha/apps/other"],
+        },
+        gitlinks: [],
+        initializations: [
+          { path: "packages/alpha/apps/leaf", index: leafPin, state: "initialization-required" },
+          { path: "packages/alpha/apps/other", index: leafPin, state: "initialization-required" },
+        ],
       })
       expect(git(fixture.product, "rev-parse", "HEAD")).toBe(before)
       expect(git(join(fixture.product, "packages/alpha"), "rev-parse", "HEAD")).toBe(alphaBefore)

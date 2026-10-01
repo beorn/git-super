@@ -6,7 +6,7 @@ import { fileURLToPath, pathToFileURL } from "node:url"
 import { createLogger, type ConditionalLogger, type LogLevel } from "loggily"
 import { pinRef } from "./objects.ts"
 import { cleanGitRepositoryEnvironment } from "./git.ts"
-import { createLocalGitProcess, type GitProcess } from "./process.ts"
+import { createLocalGitProcess, type GitProcess, type GitProcessRequest, type GitProcessResult } from "./process.ts"
 import { shellQuote } from "./shell-command.ts"
 import { preparedSubmoduleStore } from "./submodule-prepare.ts"
 
@@ -14,7 +14,7 @@ export const SUBMODULE_ALTERNATE_LOCATION = "superproject"
 export const SUBMODULE_ALTERNATE_ERROR_STRATEGY = "info"
 const MAX_CONCURRENT_SUBMODULE_UPDATES = 20
 
-export type SubmoduleGitResult = Readonly<{ code: number; stdout: string; stderr: string }>
+export type SubmoduleGitResult = GitProcessResult
 
 export type SubmoduleGit = Readonly<{
   run(
@@ -105,7 +105,7 @@ export type HostSubmoduleMaterializationResult = Readonly<{
   unreferencedPaths: readonly string[]
 }>
 
-export type HostSubmoduleMaterializationOptions = Omit<SubmoduleMaterializationOptions, "force"> &
+export type HostSubmoduleMaterializationOptions = Omit<SubmoduleMaterializationOptions, "force" | "source"> &
   Readonly<{ env?: NodeJS.ProcessEnv }>
 
 const success = (): SubmoduleGitResult => ({ code: 0, stdout: "", stderr: "" })
@@ -288,14 +288,20 @@ async function detachedFromReference(
   git: SubmoduleGit,
   reference: string,
   path: string,
-): Promise<Detachment | undefined> {
+): Promise<Detachment | SubmoduleGitResult | undefined> {
   const tree = await git.run(reference, ["ls-tree", "HEAD", "--", path], true)
   if (tree.code !== 0 || GITLINK_ROW.test(tree.stdout)) return undefined
   // Derived, never hardcoded: the same probe names whichever commit detached
   // whichever submodule, so a future layout change is covered on the day it
   // lands rather than the day someone edits this file.
   const removal = await git.run(reference, ["log", "-1", "--format=%h %s", "--diff-filter=D", "HEAD", "--", path], true)
-  const removedBy = removal.code === 0 ? removal.stdout.trim() : ""
+  if (removal.code !== 0) {
+    return {
+      ...removal,
+      stderr: `cannot read removal history for gitlink '${path}' in ${reference}\n${removal.stderr}`,
+    }
+  }
+  const removedBy = removal.stdout.trim()
   return { removedBy: removedBy === "" ? undefined : removedBy }
 }
 
@@ -757,6 +763,7 @@ export async function materializeSubmodules(
     durableLevel: () => Promise<string | SubmoduleGitResult>,
     selectedPaths?: ReadonlySet<string>,
     depth = 0,
+    preparedReference = false,
   ): Promise<SubmoduleGitResult> => {
     const policy = await configureSubmoduleAlternatePolicy(git, worktree)
     if (policy.code !== 0) return policy
@@ -840,16 +847,19 @@ export async function materializeSubmodules(
               let referenceHasIt =
                 referenceSubmodule !== undefined && (await referenceContains(git, referenceSubmodule, required))
               let detached =
-                heldInWorktree || referenceHasIt || reference === undefined
+                heldInWorktree || referenceHasIt || reference === undefined || preparedReference
                   ? undefined
                   : await detachedFromReference(git, reference, path)
+              if (detached !== undefined && "code" in detached) return detached
               // A selected addition can have a prepared durable store before the primary
-              // checkout carries it. Admit it before treating HEAD's absence as a removal.
+              // checkout carries it. Its nested stores share this same validator; a
+              // checkout-free parent has no authoritative HEAD to use as a removal probe.
               if (
-                depth === 0 &&
-                selectedPaths?.has(path) === true &&
-                detached !== undefined &&
-                detached.removedBy === undefined &&
+                (preparedReference ||
+                  (depth === 0 &&
+                    selectedPaths?.has(path) === true &&
+                    detached !== undefined &&
+                    detached.removedBy === undefined)) &&
                 referenceSubmodule !== undefined &&
                 !(await referenceStoreAt(git, referenceSubmodule))
               ) {
@@ -1043,10 +1053,14 @@ export async function materializeSubmodules(
         isLocal: boolean
         name: string
         nestedReference: string | undefined
+        referenceIsPrepared: boolean
         path: string
       }>
     > = []
-    for (const [index, { canBorrow, name, path, referenceHasIt, referenceSubmodule, required }] of resolved.entries()) {
+    for (const [
+      index,
+      { canBorrow, name, path, referenceHasIt, referenceIsPrepared, referenceSubmodule, required },
+    ] of resolved.entries()) {
       const configuredUrl = configuredUrls[index]
       if (configuredUrl === undefined || configuredUrl.code !== 0 || configuredUrl.stdout.trim() === "") {
         return {
@@ -1100,6 +1114,7 @@ export async function materializeSubmodules(
         args,
         isLocal,
         name,
+        referenceIsPrepared,
         nestedReference:
           borrowFrom ??
           (referenceSubmodule !== undefined && existsSync(referenceSubmodule) ? referenceSubmodule : undefined),
@@ -1254,12 +1269,14 @@ export async function materializeSubmodules(
       isLocal,
       name,
       nestedReference,
+      referenceIsPrepared,
       path,
     }: Readonly<{
       args: readonly string[]
       isLocal: boolean
       name: string
       nestedReference: string | undefined
+      referenceIsPrepared: boolean
       path: string
     }>) => {
       const source = isLocal ? "local" : "remote"
@@ -1287,7 +1304,14 @@ export async function materializeSubmodules(
       const durableGitDir = join(level, "modules", name)
       const anchored = await anchorDurableAlternates(git, submoduleDir, durableGitDir, log)
       if (anchored.code !== 0) return anchored
-      return walk(submoduleDir, nestedReference, () => Promise.resolve(durableGitDir), undefined, depth + 1)
+      return walk(
+        submoduleDir,
+        nestedReference,
+        () => Promise.resolve(durableGitDir),
+        undefined,
+        depth + 1,
+        referenceIsPrepared,
+      )
     }
     for (let start = 0; start < local.length; start += MAX_CONCURRENT_SUBMODULE_UPDATES) {
       const results = await Promise.all(local.slice(start, start + MAX_CONCURRENT_SUBMODULE_UPDATES).map(update))
@@ -1324,14 +1348,17 @@ export async function materializeSubmodules(
   return { ...result, considered, borrowed, remoteFallbacks, unreferenced, warmed, remotePaths, unreferencedPaths }
 }
 
-function adaptGitProcess(process: GitProcess): SubmoduleGit {
+function adaptGitProcess(
+  process: GitProcess,
+  processOptions: Pick<GitProcessRequest, "timeoutMs" | "detached"> = {},
+): SubmoduleGit {
   const run: SubmoduleGit["run"] = async (repo, args, _allowFailure, options) => {
-    const result = await process.run({
+    return process.run({
+      ...processOptions,
       repo,
       args,
       ...(options?.stdin === undefined ? {} : { stdin: options.stdin }),
     })
-    return { code: result.code, stdout: result.stdout, stderr: result.stderr }
   }
   const mutateConfig: NonNullable<SubmoduleGit["mutateConfig"]> = async (repo, args) => {
     let result = await run(repo, args, true)
@@ -1349,11 +1376,39 @@ function adaptGitProcess(process: GitProcess): SubmoduleGit {
 }
 
 /** Canonical GitProcess entry; the legacy SubmoduleGit overload is a compatibility boundary for Gate D. */
-export function materializeSubmodulesWithProcess(
+export async function materializeSubmodulesWithProcess(
   process: GitProcess,
   options: SubmoduleMaterializationOptions,
+  processOptions: Readonly<{
+    timeoutMs?: number
+    detached?: boolean
+    /** Reuse the host adapter's primary-worktree discovery for linked callers. */
+    resolveReferenceWorktree?: boolean
+  }> = {},
 ): Promise<SubmoduleMaterializationResult> {
-  return materializeSubmodules(adaptGitProcess(process), options)
+  const git = adaptGitProcess(process, {
+    ...(processOptions.timeoutMs === undefined ? {} : { timeoutMs: processOptions.timeoutMs }),
+    ...(processOptions.detached === undefined ? {} : { detached: processOptions.detached }),
+  })
+  if (processOptions.resolveReferenceWorktree !== true) return materializeSubmodules(git, options)
+  const referenceWorktree = await discoverReferenceWorktree(git, options)
+  if (referenceWorktree !== undefined && typeof referenceWorktree !== "string") {
+    return {
+      ...referenceWorktree,
+      considered: 0,
+      borrowed: 0,
+      remoteFallbacks: 0,
+      unreferenced: 0,
+      warmed: 0,
+      remotePaths: [],
+      unreferencedPaths: [],
+    }
+  }
+  const { referenceWorktree: _requestedReference, ...selected } = options
+  return materializeSubmodules(git, {
+    ...selected,
+    ...(referenceWorktree === undefined ? {} : { referenceWorktree }),
+  })
 }
 
 function hostGit(environment: NodeJS.ProcessEnv): SubmoduleGit {
@@ -1386,8 +1441,7 @@ async function primaryWorktree(git: SubmoduleGit, repo: string): Promise<string 
   const listed = await git.run(repo, ["worktree", "list", "--porcelain"], true)
   if (listed.code !== 0) {
     return {
-      code: listed.code,
-      stdout: listed.stdout,
+      ...listed,
       stderr:
         `git-super: cannot prove the primary worktree for reference '${repo}'; refusing to create ` +
         `submodule alternates from a potentially disposable linked worktree.\n${listed.stderr}`,
@@ -1406,24 +1460,31 @@ async function primaryWorktree(git: SubmoduleGit, repo: string): Promise<string 
   return canonical(primary)
 }
 
+async function discoverReferenceWorktree(
+  git: SubmoduleGit,
+  options: Pick<SubmoduleMaterializationOptions, "worktree" | "referenceWorktree">,
+): Promise<string | SubmoduleGitResult | undefined> {
+  // A reference naming the worktree itself explicitly opts out of borrowing.
+  const selfReference =
+    options.referenceWorktree !== undefined && canonical(options.referenceWorktree) === canonical(options.worktree)
+  const discovered = selfReference
+    ? undefined
+    : await primaryWorktree(git, options.referenceWorktree ?? options.worktree)
+  if (discovered !== undefined && typeof discovered !== "string") return discovered
+  return discovered !== undefined && canonical(discovered) !== canonical(options.worktree) ? discovered : undefined
+}
+
 /** Host adapter for callers that need git-super to supply the Git process. */
 export async function materializeSubmodulesFromLocalWorktreeParallel(
   options: HostSubmoduleMaterializationOptions,
 ): Promise<HostSubmoduleMaterializationResult> {
   const environment = cleanGitRepositoryEnvironment(options.env ?? process.env)
   const git = hostGit(environment)
-  // A reference naming the worktree itself is how a caller spells "no
-  // reference". Discovering its primary would hand back the very store the
-  // caller opted out of, e.g. a cold queue clone that refused a moment ago.
-  const selfReference =
-    options.referenceWorktree !== undefined && canonical(options.referenceWorktree) === canonical(options.worktree)
-  const discovered = selfReference
-    ? undefined
-    : await primaryWorktree(git, options.referenceWorktree ?? options.worktree)
-  if (discovered !== undefined && typeof discovered !== "string") {
+  const referenceWorktree = await discoverReferenceWorktree(git, options)
+  if (referenceWorktree !== undefined && typeof referenceWorktree !== "string") {
     return {
-      ...discovered,
-      exitCode: discovered.code,
+      ...referenceWorktree,
+      exitCode: referenceWorktree.code,
       considered: 0,
       borrowed: 0,
       remoteFallbacks: 0,
@@ -1433,8 +1494,6 @@ export async function materializeSubmodulesFromLocalWorktreeParallel(
       unreferencedPaths: [],
     }
   }
-  const referenceWorktree =
-    discovered !== undefined && canonical(discovered) !== canonical(options.worktree) ? discovered : undefined
   const result = await materializeSubmodules(git, {
     worktree: options.worktree,
     ...(referenceWorktree === undefined ? {} : { referenceWorktree }),

@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Merge initializes newly added gitlinks at their staged pins after raises and before settling existing checkouts or running commit hooks. Pull additions now use the same recursive materializer and durable local borrowing. Initialization failures preserve the staged root merge and name the path and pins; nested additions in existing changed parents refuse explicitly before the root moves.
+- Merge initializes newly added gitlinks at their staged pins after raises and before settling existing checkouts or running commit hooks. Pull additions now use the same recursive materializer and durable local borrowing, including prepared nested stores. Both callers resolve the primary reference, report borrowing and unreferenced paths, and preserve command timeouts; pull retains detached apply process groups. Initialization failures preserve the staged root merge and name the path and pins; nested additions in existing changed parents refuse explicitly before the root moves.
 
 - `diff` expands a gitlink the range adds as every file in its tree, each counted as added, instead of refusing the range. The added repository's consulted range, stat range and root pointer move start at git's empty tree (`4b825dc642cb6eb9a060e54bf8d69288fbee4904`), not a commit, so a consumer running `log` or `merge-base` on `from` must check it is a commit first. `--patch` prints the whole added tree. A gitlink nested inside an added gitlink expands too.
 - `status` inherits this: an unstaged pin move whose range adds a nested gitlink lists that gitlink's files.

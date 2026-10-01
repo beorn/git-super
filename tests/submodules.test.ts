@@ -138,11 +138,11 @@ afterEach(async () => {
 
 describe("materializeSubmodules", () => {
   /**
-   * @failure A staged addition silently considers zero paths or bypasses the durable prepared store.
+   * @failure A staged addition bypasses validated durable stores, ignores removal-probe failures, or fails nested borrowing.
    * @level l1
    * @consumer superMerge's staged-submodule initialization
    */
-  it.each(["present", "missing", "partial"] as const)(
+  it.each(["present", "missing", "partial", "invalid", "history-failed", "nested"] as const)(
     "materializes staged linked-worktree additions with a %s prepared pin",
     async (pinState) => {
       const root = await mkdtemp(join(tmpdir(), "git-super-staged-store-"))
@@ -151,7 +151,17 @@ describe("materializeSubmodules", () => {
       const owner = join(root, "owner")
       const candidate = join(root, "candidate")
       createRepository(dependency, "dependency.txt", "old pin\n")
-      const required = advanceRepository(dependency, "dependency.txt", "selected pin\n")
+      let required = advanceRepository(dependency, "dependency.txt", "selected pin\n")
+      let nestedPin: string | undefined
+      const nested = join(root, "nested")
+      if (pinState === "nested") {
+        nestedPin = createRepository(nested, "nested.txt", "nested selected pin\n")
+        writeFileSync(join(dependency, ".gitmodules"), `[submodule "nested-store"]\n path = nested\n url = ${nested}\n`)
+        git(dependency, ["add", ".gitmodules"])
+        git(dependency, ["update-index", "--add", "--cacheinfo", `160000,${nestedPin},nested`])
+        git(dependency, ["commit", "-q", "-m", "add nested gitlink"])
+        required = git(dependency, ["rev-parse", "HEAD"]).trim()
+      }
       createRepository(owner, ".gitmodules", "")
       git(owner, ["worktree", "add", "-q", "--detach", candidate, "HEAD"])
       writeFileSync(
@@ -171,12 +181,28 @@ describe("materializeSubmodules", () => {
       const store = descriptor.gitdir
       expect(existsSync(join(owner, "gamma", ".git"))).toBe(false)
       if (pinState !== "missing") git(store, ["fetch", "-q", dependency, `${required}:refs/heads/main`])
+      if (pinState === "nested") {
+        const nestedPrepared = await prepareSubmoduleTreeUnderLock(
+          { repo: store, commit: git(store, ["rev-parse", `${required}^{tree}`]).trim(), remote: dependency },
+          new Set(["nested"]),
+        )
+        expect(nestedPrepared.state, JSON.stringify(nestedPrepared.detail)).toBe("updated")
+        const nestedStore = nestedPrepared.submodules[0]?.gitdir
+        if (nestedStore === undefined || nestedPin === undefined) {
+          throw new Error("prepare returned no nested descriptor")
+        }
+        git(nestedStore, ["fetch", "-q", nested, `${nestedPin}:refs/heads/main`])
+      }
       if (pinState === "partial") git(store, ["config", "remote.origin.promisor", "true"])
+      if (pinState === "invalid") git(store, ["config", "core.bare", "true"])
       const process = createLocalGitProcess()
       const requests: GitProcessRequest[] = []
       const selectedProcess = {
         async run(request: GitProcessRequest) {
           requests.push(request)
+          if (pinState === "history-failed" && request.repo === owner && request.args[0] === "log") {
+            return { code: 128, stdout: "", stderr: "removal history unreadable", timedOut: false }
+          }
           if (request.args[0] === "fetch") {
             return { code: 128, stdout: "", stderr: "prepared pin unavailable in this test", timedOut: false }
           }
@@ -197,9 +223,18 @@ describe("materializeSubmodules", () => {
         paths: ["gamma"],
         source: "index",
       })
-      expect(result.considered).toBe(1)
-      if (pinState === "present") {
-        expect(result).toMatchObject({ code: 0, borrowed: 1, remoteFallbacks: 0, unreferenced: 0, warmed: 0 })
+      if (pinState === "nested") expect(result.code, result.stderr).toBe(0)
+      expect(result.considered).toBe(
+        pinState === "invalid" || pinState === "history-failed" ? 0 : pinState === "nested" ? 2 : 1,
+      )
+      if (pinState === "present" || pinState === "nested") {
+        expect(result).toMatchObject({
+          code: 0,
+          borrowed: pinState === "nested" ? 2 : 1,
+          remoteFallbacks: 0,
+          unreferenced: 0,
+          warmed: 0,
+        })
         expect(git(join(candidate, "gamma"), ["rev-parse", "HEAD"]).trim()).toBe(required)
         const gitdir = git(join(candidate, "gamma"), ["rev-parse", "--path-format=absolute", "--git-dir"]).trim()
         expect(gitdir).toContain("/worktrees/candidate/modules/gamma-store")
@@ -207,6 +242,16 @@ describe("materializeSubmodules", () => {
           join(store, "objects"),
         )
         expect(requests.some(({ args }) => args[0] === "fetch")).toBe(false)
+        if (pinState === "nested") {
+          expect(git(join(candidate, "gamma", "nested"), ["rev-parse", "HEAD"]).trim()).toBe(nestedPin)
+          expect(requests.filter(({ args }) => args.includes("submodule") && args.includes("update"))).toHaveLength(2)
+        }
+      } else if (pinState === "invalid" || pinState === "history-failed") {
+        expect(result.code).not.toBe(0)
+        expect(result.stderr).toContain(pinState === "invalid" ? "core.bare=false" : "removal history unreadable")
+        expect(requests.some(({ args }) => args[0] === "fetch")).toBe(false)
+        expect(requests.some(({ args }) => args.includes("submodule") && args.includes("update"))).toBe(false)
+        expect(existsSync(join(candidate, "gamma", ".git"))).toBe(false)
       } else {
         expect(result.code).not.toBe(0)
         expect(result.stderr).toContain("gamma")
@@ -285,31 +330,49 @@ describe("materializeSubmodules", () => {
    * @level l1
    * @consumer superMerge's stage-0 materialization contract
    */
-  it.each(["unmerged", "non-gitlink", "absent"] as const)("refuses a named %s index gitlink", async (state) => {
-    const root = await mkdtemp(join(tmpdir(), "git-super-staged-pin-"))
-    roots.push(root)
-    const owner = join(root, "owner")
-    const required = createRepository(owner, ".gitmodules", '[submodule "gamma"]\n path = gamma\n url = /unavailable\n')
-    if (state === "unmerged") {
-      const staged = spawnSync("git", ["-C", owner, "update-index", "--index-info"], {
-        encoding: "utf8",
-        input: `160000 ${required} 1\tgamma\n160000 ${required} 2\tgamma\n`,
+  it.each(["unmerged", "non-gitlink", "absent", "undeclared"] as const)(
+    "refuses a named %s index gitlink",
+    async (state) => {
+      const root = await mkdtemp(join(tmpdir(), "git-super-staged-pin-"))
+      roots.push(root)
+      const owner = join(root, "owner")
+      const required = createRepository(
+        owner,
+        ".gitmodules",
+        '[submodule "gamma"]\n path = gamma\n url = /unavailable\n',
+      )
+      if (state === "unmerged") {
+        const staged = spawnSync("git", ["-C", owner, "update-index", "--index-info"], {
+          encoding: "utf8",
+          input: `160000 ${required} 1\tgamma\n160000 ${required} 2\tgamma\n`,
+        })
+        expect(staged.status, staged.stderr).toBe(0)
+      } else if (state === "non-gitlink") {
+        const blob = git(owner, ["rev-parse", "HEAD:.gitmodules"]).trim()
+        git(owner, ["update-index", "--add", "--cacheinfo", `100644,${blob},gamma`])
+      }
+      if (state === "undeclared") {
+        git(owner, ["update-index", "--add", "--cacheinfo", `160000,${required},gamma`])
+        writeFileSync(join(owner, ".gitmodules"), "")
+        git(owner, ["add", ".gitmodules"])
+      }
+      const result = await materializeSubmodulesWithProcess(createLocalGitProcess(), {
+        worktree: owner,
+        paths: ["gamma"],
+        source: "index",
       })
-      expect(staged.status, staged.stderr).toBe(0)
-    } else if (state === "non-gitlink") {
-      const blob = git(owner, ["rev-parse", "HEAD:.gitmodules"]).trim()
-      git(owner, ["update-index", "--add", "--cacheinfo", `100644,${blob},gamma`])
-    }
-    const result = await materializeSubmodulesWithProcess(createLocalGitProcess(), {
-      worktree: owner,
-      paths: ["gamma"],
-      source: "index",
-    })
-    expect(result.code).not.toBe(0)
-    expect(result.stderr).toContain("gamma")
-    expect(result.stderr).toContain(state === "unmerged" ? "unmerged" : "stage-0 gitlink")
-    expect(existsSync(join(owner, "gamma", ".git"))).toBe(false)
-  })
+      expect(result.code).not.toBe(0)
+      expect(result.stderr).toContain("gamma")
+      expect(result.stderr).toContain(
+        state === "unmerged"
+          ? "unmerged"
+          : state === "undeclared"
+            ? "not declared in stage-0 .gitmodules"
+            : "stage-0 gitlink",
+      )
+      expect(existsSync(join(owner, "gamma", ".git"))).toBe(false)
+    },
+  )
 
   it("creates a worktree after deleting a gitlink and reports its stale local config once", async () => {
     const fixtureRoot = await mkdtemp(join(tmpdir(), "git-super-stale-config-"))
@@ -368,6 +431,30 @@ describe("materializeSubmodules", () => {
     expect(result.code).toBe(0)
     expect(requests.every((request) => request.repo === "/worktree")).toBe(true)
   })
+
+  /**
+   * @failure Materialization drops cancellation bounds or failure metadata from the canonical process.
+   * @level l1
+   * @consumer merge's lock-bound initialization and pull's detached apply
+   */
+  it.each([false, true])(
+    "preserves process bounds and failure details with reference discovery %s",
+    async (discover) => {
+      const requests: GitProcessRequest[] = []
+      const result = await materializeSubmodulesWithProcess(
+        {
+          async run(request) {
+            requests.push(request)
+            return { code: 143, stdout: "", stderr: "initialization timed out", timedOut: true, failure: "timeout" }
+          },
+        },
+        { worktree: "/worktree" },
+        { timeoutMs: 45, detached: true, resolveReferenceWorktree: discover },
+      )
+      expect(requests[0]).toMatchObject({ timeoutMs: 45, detached: true })
+      expect(result).toMatchObject({ code: 143, timedOut: true, failure: "timeout" })
+    },
+  )
 
   it("strips repository pointers without deleting caller Git policy", () => {
     expect(

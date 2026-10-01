@@ -2,13 +2,14 @@
  * @reach fs-walk <fixture-only: superPull and git-super CLI use mkdtempSync(canonicalTmpdir()) repos>
  */
 import { afterEach, describe, expect, onTestFinished, test, vi } from "vitest"
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { runCli } from "../src/cli.ts"
 import { acquireExclusive, createExclusive } from "../src/exclusive.ts"
-import { adaptProcessGit, createLocalGitProcess, type GitProcess } from "../src/process.ts"
+import { adaptProcessGit, createLocalGitProcess, type GitProcess, type GitProcessRequest } from "../src/process.ts"
 import { superPull } from "../src/pull.ts"
+import { materializeSubmodulesWithProcess } from "../src/submodules.ts"
 import { superSubmodulePrepare } from "../src/submodule-prepare.ts"
 import type { GitSuperResult } from "../src/result.ts"
 import {
@@ -71,88 +72,185 @@ describe("git super pull --ff-only", () => {
    * @testonly none
    */
   test.each([
-    { store: "no module store", prepare: false, throws: false },
-    { store: "a module store a git-super merge prepared", prepare: true, throws: false },
-    { store: "a throwing materializer after root update", prepare: true, throws: true },
-  ])("initializes a submodule the target adds, from $store, at its gitlink (26972)", async ({ prepare, throws }) => {
-    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-pull-added-"))
-    roots.push(fixtureRoot)
-    const fixture = createProductFixture(fixtureRoot)
-    const checkout = join(fixtureRoot, "checkout")
-    git(
-      fixtureRoot,
-      "-c",
-      "protocol.file.allow=always",
-      "clone",
-      "-q",
-      "--recurse-submodules",
-      fixture.product,
-      checkout,
-    )
-    const gamma = join(fixtureRoot, "gamma")
-    createRepository(gamma, "gamma.ts", "export const gamma = 1\n")
-    git(fixture.product, "-c", "protocol.file.allow=always", "submodule", "add", "-q", gamma, "vendor/gamma")
-    git(fixture.product, "commit", "-q", "-m", "add gamma")
-    const target = git(fixture.product, "rev-parse", "HEAD")
-    const gammaTarget = git(fixture.product, "rev-parse", `${target}:vendor/gamma`)
-    // The fixture's remotes are local paths, which git refuses to clone for a submodule unless asked; real ones are ssh.
-    vi.stubEnv("GIT_CONFIG_COUNT", "1")
-    vi.stubEnv("GIT_CONFIG_KEY_0", "protocol.file.allow")
-    vi.stubEnv("GIT_CONFIG_VALUE_0", "always")
-    onTestFinished(() => {
-      vi.unstubAllEnvs()
-    })
-    if (prepare) {
-      git(checkout, "fetch", "-q", "origin")
-      const prepared = await superSubmodulePrepare({ repo: checkout, commit: target, remote: "origin" })
-      expect(prepared.detail).toBeUndefined()
-      expect(prepared.submodules.map(({ path }) => path)).toContain("vendor/gamma")
-    }
-
-    const local = createLocalGitProcess()
-    const process: GitProcess = {
-      run: (request) => {
-        if (throws && request.args.includes("update") && request.args.includes("vendor/gamma")) {
-          throw new Error("injected thrown pull initialization failure")
-        }
-        return local.run(request)
-      },
-    }
-    const result = await superPull({
-      repo: checkout,
-      repository: "origin",
-      refspecs: ["main"],
-      ffOnly: true,
-      git: process,
-    })
-    if (throws) {
-      expect(result).toMatchObject({
-        state: "failed",
-        partial: true,
-        detail: { code: "added-submodule-not-at-gitlink", paths: ["vendor/gamma"] },
+    { store: "no module store", prepare: false, failure: "none", linked: false, cold: false },
+    { store: "a module store a git-super merge prepared", prepare: true, failure: "none", linked: false, cold: false },
+    { store: "a linked worktree canonical prepared owner", prepare: true, failure: "none", linked: true, cold: false },
+    {
+      store: "a primary module store missing the incoming pin",
+      prepare: true,
+      failure: "none",
+      linked: false,
+      cold: true,
+    },
+    { store: "a throwing materializer after root update", prepare: true, failure: "throw" },
+    { store: "a timed-out materializer", prepare: true, failure: "timeout" },
+    { store: "an unreadable HEAD", prepare: true, failure: "head" },
+    { store: "a mismatched HEAD", prepare: true, failure: "mismatch" },
+  ])(
+    "initializes a submodule the target adds, from $store, at its gitlink (26972)",
+    async ({ prepare, failure, linked, cold }) => {
+      const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-pull-added-"))
+      roots.push(fixtureRoot)
+      const fixture = createProductFixture(fixtureRoot)
+      const checkout = join(fixtureRoot, "checkout")
+      const primary = linked ? join(fixtureRoot, "primary") : checkout
+      git(
+        fixtureRoot,
+        "-c",
+        "protocol.file.allow=always",
+        "clone",
+        "-q",
+        "--recurse-submodules",
+        fixture.product,
+        primary,
+      )
+      if (linked) {
+        git(primary, "worktree", "add", "-q", "-b", "task/pull-added", checkout, "HEAD")
+      }
+      const gamma = join(fixtureRoot, "gamma")
+      createRepository(gamma, "gamma.ts", "export const gamma = 1\n")
+      git(fixture.product, "-c", "protocol.file.allow=always", "submodule", "add", "-q", gamma, "vendor/gamma")
+      git(fixture.product, "commit", "-q", "-m", "add gamma")
+      let target = git(fixture.product, "rev-parse", "HEAD")
+      let gammaTarget = git(fixture.product, "rev-parse", `${target}:vendor/gamma`)
+      // The fixture's remotes are local paths, which git refuses to clone for a submodule unless asked; real ones are ssh.
+      vi.stubEnv("GIT_CONFIG_COUNT", "1")
+      vi.stubEnv("GIT_CONFIG_KEY_0", "protocol.file.allow")
+      vi.stubEnv("GIT_CONFIG_VALUE_0", "always")
+      onTestFinished(() => {
+        vi.unstubAllEnvs()
       })
-      expect(result.detail?.message).toContain("injected thrown pull initialization failure")
+      if (linked) {
+        const initialized = await materializeSubmodulesWithProcess(createLocalGitProcess(), {
+          worktree: checkout,
+          referenceWorktree: primary,
+        })
+        expect(initialized).toMatchObject({ code: 0, borrowed: 2, unreferenced: 0 })
+      }
+      if (prepare) {
+        git(checkout, "fetch", "-q", "origin")
+        const prepared = await superSubmodulePrepare({ repo: checkout, commit: target, remote: "origin" })
+        expect(prepared.detail).toBeUndefined()
+        expect(prepared.submodules.map(({ path }) => path)).toContain("vendor/gamma")
+      }
+
+      if (cold) {
+        gammaTarget = advanceRepository(gamma, "gamma.ts", "export const gamma = 2\n")
+        git(join(fixture.product, "vendor/gamma"), "fetch", "-q", "origin")
+        git(join(fixture.product, "vendor/gamma"), "checkout", "-q", "--detach", gammaTarget)
+        git(fixture.product, "commit", "-q", "-am", "move added gamma pin after preparation")
+        target = git(fixture.product, "rev-parse", "HEAD")
+        expect(git(join(primary, ".git/modules/vendor/gamma"), "rev-parse", "HEAD")).not.toBe(gammaTarget)
+      }
+      const warnings = outputSink()
+      const local = createLocalGitProcess()
+      const requests: GitProcessRequest[] = []
+      const process: GitProcess = {
+        run: (request) => {
+          requests.push(request)
+          if (
+            (failure === "throw" || failure === "timeout") &&
+            request.args.includes("update") &&
+            request.args.includes("vendor/gamma")
+          ) {
+            if (failure === "throw") throw new Error("injected thrown pull initialization failure")
+            return Promise.resolve({
+              code: 1,
+              stdout: "",
+              stderr: "injected initialization timeout",
+              timedOut: true,
+              failure: "SIGTERM",
+            })
+          }
+          if (
+            (failure === "head" || failure === "mismatch") &&
+            request.repo === join(checkout, "vendor/gamma") &&
+            request.args.join(" ") === "rev-parse HEAD^{commit}"
+          ) {
+            return Promise.resolve(
+              failure === "head"
+                ? { code: 1, stdout: "", stderr: "injected unreadable HEAD" }
+                : { code: 0, stdout: target, stderr: "" },
+            )
+          }
+          return local.run(request)
+        },
+      }
+      const result = await superPull({
+        repo: checkout,
+        repository: "origin",
+        refspecs: ["main"],
+        ffOnly: true,
+        git: process,
+        warn: (message) => warnings.write(message),
+      })
+      const update = requests.find(
+        (request) => request.args.includes("update") && request.args.includes("vendor/gamma"),
+      )
+      expect(update?.detached).toBe(true)
+      if (failure !== "none") {
+        expect(result).toMatchObject({
+          state: "failed",
+          partial: true,
+          detail: {
+            code:
+              failure === "head"
+                ? "added-submodule-head-unreadable"
+                : failure === "mismatch"
+                  ? "added-submodule-not-at-gitlink"
+                  : "added-submodule-initialization-failed",
+            paths: ["vendor/gamma"],
+          },
+        })
+        if (failure === "throw") expect(result.detail?.message).toContain("injected thrown pull initialization failure")
+        if (failure === "timeout") {
+          expect(result.detail?.message).toContain("timed out")
+          expect(result.detail?.message).toContain("SIGTERM")
+          const addition = result.repositories.find(({ repository }) => repository === join(checkout, "vendor/gamma"))
+          expect(addition?.materialization).toMatchObject({ timedOut: true, failure: "SIGTERM" })
+        }
+        expect(git(checkout, "rev-parse", "HEAD")).toBe(target)
+        expect(git(checkout, "rev-parse", ":vendor/gamma")).toBe(gammaTarget)
+        return
+      }
+
+      if (linked) {
+        const addition = result.repositories.find(({ repository }) => repository === join(checkout, "vendor/gamma"))
+        expect(addition?.materialization).toEqual({ considered: 1, borrowed: 1, remoteFallbacks: 0, unreferenced: 0 })
+        // HEAD is now the incoming root; admission must use its declaration and the primary's durable store.
+        expect(existsSync(join(primary, "vendor/gamma/.git"))).toBe(false)
+        expect(update?.args).toEqual(
+          expect.arrayContaining(["--reference", join(primary, ".git/modules/vendor/gamma"), "--no-fetch"]),
+        )
+        expect(requests.some((request) => request.repo === checkout && request.args.includes("HEAD:.gitmodules"))).toBe(
+          true,
+        )
+        expect(warnings.output).toBe("")
+      } else {
+        expect(update?.args).not.toContain("--reference")
+        expect(warnings.output).toContain("used no reference store for 1 of 1 gitlinks: vendor/gamma")
+      }
+      expect(result.detail).toBeUndefined()
+      expect(result.state).toBe("updated")
       expect(git(checkout, "rev-parse", "HEAD")).toBe(target)
-      expect(git(checkout, "rev-parse", ":vendor/gamma")).toBe(gammaTarget)
-      return
-    }
+      expect(git(join(checkout, "vendor/gamma"), "rev-parse", "HEAD")).toBe(gammaTarget)
+      expect(readFileSync(join(checkout, "vendor/gamma/gamma.ts"), "utf8")).toBe(
+        `export const gamma = ${cold ? 2 : 1}\n`,
+      )
+      expect(git(checkout, "status", "--porcelain")).toBe("")
+      expect(git(join(checkout, "vendor/gamma"), "rev-parse", "--path-format=absolute", "--git-dir")).toBe(
+        linked
+          ? join(primary, ".git/worktrees/checkout/modules/vendor/gamma")
+          : join(checkout, ".git/modules/vendor/gamma"),
+      )
+      expect(result.repositories).toContainEqual(
+        expect.objectContaining({ repository: join(checkout, "vendor/gamma"), state: "updated" }),
+      )
 
-    expect(result.detail).toBeUndefined()
-    expect(result.state).toBe("updated")
-    expect(git(checkout, "rev-parse", "HEAD")).toBe(target)
-    expect(git(join(checkout, "vendor/gamma"), "rev-parse", "HEAD")).toBe(gammaTarget)
-    expect(readFileSync(join(checkout, "vendor/gamma/gamma.ts"), "utf8")).toBe("export const gamma = 1\n")
-    expect(git(checkout, "status", "--porcelain")).toBe("")
-    expect(git(join(checkout, "vendor/gamma"), "rev-parse", "--path-format=absolute", "--git-dir")).toBe(
-      join(checkout, ".git/modules/vendor/gamma"),
-    )
-    expect(result.repositories).toContainEqual(
-      expect.objectContaining({ repository: join(checkout, "vendor/gamma"), state: "updated" }),
-    )
-
-    const again = await superPull({ repo: checkout, repository: "origin", refspecs: ["main"], ffOnly: true })
-    expect(again.state).toBe("unchanged")
-  })
+      const again = await superPull({ repo: checkout, repository: "origin", refspecs: ["main"], ffOnly: true })
+      expect(again.state).toBe("unchanged")
+    },
+  )
 
   test("uses the configured upstream when repository and refspec are omitted", async () => {
     const fixture = mkdtempSync(join(tmpdir(), "git-super-pull-upstream-"))

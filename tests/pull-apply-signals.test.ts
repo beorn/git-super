@@ -14,12 +14,19 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { runCli } from "../src/cli.ts"
+import { superSubmodulePrepare } from "../src/submodule-prepare.ts"
 import { createLocalGitProcess } from "../src/process.ts"
 import type { GitSuperResult } from "../src/result.ts"
-import { bumpProductSubmodules, canonicalTmpdir as tmpdir, createProductFixture, git } from "./fixture.ts"
+import {
+  bumpProductSubmodules,
+  canonicalTmpdir as tmpdir,
+  createProductFixture,
+  createRepository,
+  git,
+} from "./fixture.ts"
 
 const roots: string[] = []
 const gitSuperBin = fileURLToPath(new URL("../bin/git-super", import.meta.url))
@@ -96,9 +103,9 @@ async function until(condition: () => boolean, what: string, ms = 20_000): Promi
 }
 
 /** `git super pull` as ff-main runs it, in its own process group so the test can signal that group. */
-function spawnPull(w: World) {
+function spawnPull(w: World, environment: NodeJS.ProcessEnv = {}) {
   return Bun.spawn(["git", "-C", w.checkout, "super", "--json", "pull", "--ff-only", "origin", "main"], {
-    env: { ...process.env, PATH: w.path, GIT_SUPER_PROGRESS: "1" },
+    env: { ...process.env, ...environment, PATH: w.path, GIT_SUPER_PROGRESS: "1" },
     stdout: "pipe",
     stderr: "pipe",
     detached: true,
@@ -136,6 +143,58 @@ describe("git super pull: the apply is not stopped by a signal (24907 row 2)", (
     expect(stderr).toContain("git-super pull: deferring SIGINT until the apply completes (phase apply-root)")
     expect(JSON.parse(stdout)).toMatchObject({ state: "updated", deferredSignal: { signal: "SIGINT" } })
     expectWhole(w)
+  }, 30_000)
+
+  /**
+   * @failure SIGINT reaches the added-submodule updater's process group and tears a pull after its root has moved.
+   * @level l1
+   * @consumer git-super pull on an incoming addition
+   */
+  test("SIGINT during added-submodule initialization: its process group finishes before the deferred exit", async () => {
+    const w = world("added-sigint", { "post-merge": RECORD_POST_MERGE })
+    const upstream = git(w.checkout, "remote", "get-url", "origin")
+    const gamma = join(dirname(w.checkout), "gamma")
+    const gammaTarget = createRepository(gamma, "gamma.ts", "export const gamma = 1\n")
+    git(upstream, "-c", "protocol.file.allow=always", "submodule", "add", "-q", gamma, "vendor/gamma")
+    git(upstream, "commit", "-q", "-m", "add gamma during pull")
+    const target = git(upstream, "rev-parse", "HEAD")
+    git(w.checkout, "fetch", "-q", "origin")
+    const prepared = await superSubmodulePrepare({ repo: w.checkout, commit: target, remote: "origin" })
+    expect(prepared.detail).toBeUndefined()
+    const hook = join(w.checkout, ".git/modules/vendor/gamma/hooks/post-checkout")
+    writeFileSync(hook, `#!/bin/sh\necho held > '${w.marks}/added-initialization'\nsleep 2\n`)
+    chmodSync(hook, 0o755)
+    const pull = spawnPull(w, {
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "protocol.file.allow",
+      GIT_CONFIG_VALUE_0: "always",
+    })
+    const stdoutText = new Response(pull.stdout).text()
+    const stderrText = new Response(pull.stderr).text()
+    let exited = false
+    void pull.exited.then(() => {
+      exited = true
+    })
+    await until(
+      () => existsSync(join(w.marks, "added-initialization")) || exited,
+      "the added initialization to be held",
+    )
+    if (!existsSync(join(w.marks, "added-initialization"))) {
+      throw new Error(`Pull ended before initialization hook: ${await stderrText}; ${await stdoutText}`)
+    }
+    process.kill(-pull.pid, "SIGINT")
+    const [stdout, stderr] = await Promise.all([stdoutText, stderrText])
+    await pull.exited
+    expect(stderr).toContain(
+      "git-super pull: deferring SIGINT until the apply completes (phase apply-added-submodule vendor/gamma)",
+    )
+    expect(JSON.parse(stdout)).toMatchObject({
+      state: "updated",
+      partial: false,
+      deferredSignal: { signal: "SIGINT", phase: "apply-added-submodule vendor/gamma" },
+    })
+    expectWhole({ ...w, target })
+    expect(git(join(w.checkout, "vendor/gamma"), "rev-parse", "HEAD")).toBe(gammaTarget)
   }, 30_000)
 
   test("the backstop kills every process of the pull, a group it knows only from the record included, and the next pull proceeds", async () => {
