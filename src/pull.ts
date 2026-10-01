@@ -6,6 +6,7 @@ import { createExclusive, type Exclusive } from "./exclusive.ts"
 import { probeRepository } from "./git.ts"
 import { ensureCommitObject } from "./objects.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
+import { materializeSubmodulesWithProcess } from "./submodules.ts"
 import { gitSuperResult, type GitResultDetail, type GitSuperRepositoryResult, type GitSuperResult } from "./result.ts"
 
 export type SuperPullOptions = Readonly<{
@@ -612,38 +613,6 @@ function repositoryResult(
   }
 }
 
-/**
- * Initialize a gitlink the parent's move just added (26972). Its path and .gitmodules entry are in the parent's index
- * now, so git's own submodule update clones it into the parent's per-worktree module store, or reuses a store already
- * there, and checks out exactly the recorded commit, with anything it carries below it.
- */
-async function initializeAddedSubmodule(
-  git: GitProcess,
-  repository: PullRepositoryPlan,
-  added: NonNullable<PullRepositoryPlan["added"]>,
-): Promise<GitResultDetail | undefined> {
-  const args = ["-c", "submodule.recurse=false", "submodule", "update", "--init", "--recursive", "--", added.path]
-  const initialized = await runApply(git, added.parent, args)
-  if (initialized.code !== 0 || initialized.failure !== undefined || initialized.timedOut === true) {
-    return operationError(added.parent, "apply-added-submodule", args, initialized).resultDetail
-  }
-  const headArgs = ["rev-parse", "HEAD^{commit}"]
-  const head = await run(git, repository.repository, headArgs)
-  if (head.code !== 0 || head.failure !== undefined) {
-    return operationError(repository.repository, "verify-added-submodule", headArgs, head).resultDetail
-  }
-  const actual = head.stdout.trim()
-  if (actual !== repository.target) {
-    return detail(
-      "added-submodule-not-at-gitlink",
-      "verify-added-submodule",
-      `Submodule ${repository.path} was initialized at ${actual}, not at its recorded gitlink ${repository.target}.`,
-      { paths: [repository.path], objectIds: [repository.target, actual] },
-    )
-  }
-  return undefined
-}
-
 /** Fetch, freeze, preflight, recheck under the shared mutation lock, then fast-forward. */
 /**
  * Move every repository to its target: the root merge (post-merge suppressed), each submodule checkout, then the
@@ -663,7 +632,18 @@ async function applyRepositories(
     }
     if (repository.added !== undefined) {
       phase(`apply-added-submodule ${repository.path}`)
-      const failure = await initializeAddedSubmodule(git, repository, repository.added)
+      const initialized = await materializeSubmodulesWithProcess(git, {
+        worktree: repository.added.parent, paths: [repository.added.path], source: "head",
+      })
+      const head = existsSync(join(repository.repository, ".git"))
+        ? await run(git, repository.repository, ["rev-parse", "HEAD^{commit}"])
+        : { code: 1, stdout: "", stderr: `Submodule checkout ${repository.path} has no .git entry.` }
+      const actual = head.code === 0 ? head.stdout.trim() : undefined
+      const failure = initialized.code !== 0 || actual !== repository.target
+        ? detail("added-submodule-not-at-gitlink", "apply-added-submodule",
+          `Submodule ${repository.path} could not be initialized at recorded gitlink ${repository.target}; actual checkout ${actual ?? "unreadable"}. ${initialized.stderr || head.stderr}`,
+          { paths: [repository.path], objectIds: [repository.target, ...(actual === undefined ? [] : [actual])] })
+        : undefined
       if (failure !== undefined) {
         results.push(repositoryResult(repository, "failed", failure))
         for (const remaining of plan.repositories.slice(index + 1)) {

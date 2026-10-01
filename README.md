@@ -58,7 +58,7 @@ Normal path or porcelain output stays on stdout. A rendered report of the reposi
 
 Status reports an existing empty submodule directory as `path: not checked out` on stderr and in the JSON `uninitializedSubmodules` list (always present, empty when all checkouts exist). It does not consult the parent repository as that child or invent a dirty record. A staged gitlink change remains a native dirty record, and clean worktree removal can proceed when submodules have never been checked out. A nonempty uninitialized directory refuses with its path, so ignored files cannot be discarded.
 
-Missing or unreadable checkout directories, missing commit objects, added or removed gitlinks without a resolvable commit range, and ambiguous commit ownership all fail loudly. Pull, push and merge still refuse uninitialized child repositories. **The tool never turns an unresolved repository boundary into an empty success** — that is the failure it exists to prevent, so it may not commit it itself.
+Missing or unreadable checkout directories, missing commit objects, added or removed gitlinks without a resolvable commit range, and ambiguous commit ownership all fail loudly. Pull, push and merge refuse uninitialized child repositories already recorded before the operation. Newly added gitlinks are initialized by pull and merge at their exact selected pins. **The tool never turns an unresolved repository boundary into an empty success** — that is the failure it exists to prevent, so it may not commit it itself.
 
 ### Merge and settle gitlinks
 
@@ -75,11 +75,13 @@ The submodule branch comes from `submodule.<name>.branch` in local Git config, t
 | Ahead                                         | Keep the authored pin and freeze its branch publication.                        |
 | Diverged                                      | Refuse an incoming change; preserve an untouched divergence as `left-off-main`. |
 
-Git applies a no-ff merge without committing it, then writes the proved raises. Existing affected submodule checkouts settle at their staged pins before the concluding commit and hooks, including active nested submodules at the exact pins recorded by their parent commits. Native checkout refuses changes it would overwrite and missing nested objects; it does not fetch or select newer nested branch tips. Newly introduced submodules use persistent stores for object and branch inspection and remain unmaterialized until a later submodule update or worktree preparation. Raises and retained anomalies appear in `Settled:` trailers; the merge also freezes recursive publication inputs for [ordered pushing](#landing-across-repositories).
+Git applies a no-ff merge without committing it, then writes the proved raises. Existing affected submodule checkouts settle at their staged pins before the concluding commit and hooks, including active nested submodules at the exact pins recorded by their parent commits. Native checkout refuses changes it would overwrite and missing nested objects; it does not fetch or select newer nested branch tips. Newly introduced submodules use persistent stores for object and branch inspection, then the shared recursive materializer initializes them at stage-zero index pins after any raises and before existing checkouts settle. A new nested gitlink in an existing changed parent is refused before the root merge, with its full path and required pin in an `initializations` row. Raises and retained anomalies appear in `Settled:` trailers; the merge also freezes recursive publication inputs for [ordered pushing](#landing-across-repositories).
 
 When Git Super raises root gitlinks, it writes a temporary receipt at `refs/git-super/receipts/<merge>`. The receipt's sole parent is that exact merge, and its `receipt.json` contains only the automatic root-entry changes. Callers can copy the exact payload into a durable record before deleting the temporary ref under its exact old-value lease.
 
 Human output puts the resulting merge commit on stdout and settlement evidence on stderr. `--json` emits one byte-clean `SuperMergeResult` with the same commit and gitlink rows. Its additive `checkouts` rows record each affected direct submodule's pin in root `HEAD` (`recorded`), staged gitlink (`index`), exact pre-operation checkout (`preCheckout`), observed checkout, and whether it is `settled`, `settle-failed`, `restored`, `restore-failed`, or `not-run`. Nested checkout settlement and restoration follow the pins recorded by those parent commits.
+
+Its additive `initializations` rows name newly added paths, staged `index`, observed `checkout` when available, and `initialized`, `initialization-failed`, `not-run`, or `initialization-required`. These paths have no invented prior recorded pin. An initialization failure leaves the root merge staged and existing checkouts unmoved; it names incoming, staged, and observed pins and preserves every directory and store.
 
 Its additive `steps` rows time the merge's phases as `{ "name", "ms" }`, in the order they ran. The names form a closed list, and the phases run one after another without overlapping, covering the whole call, so their `ms` add up to its wall time:
 
@@ -91,6 +93,7 @@ Its additive `steps` rows time the merge's phases as `{ "name", "ms" }`, in the 
 | `capture`    | the `Settled:` trailers and the frozen push intent                                                                                  |
 | `checkouts`  | preparing affected submodule checkouts and proving the worktree clean                                                               |
 | `merge`      | the native no-ff merge and the gitlink raises                                                                                       |
+| `initialize` | materializing added submodules at staged index pins before existing checkouts move |
 | `settle`     | checking affected submodules out at their staged pins                                                                               |
 | `commit`     | the concluding commit, its hooks, and the root receipt                                                                              |
 
@@ -146,7 +149,7 @@ The operation may prepare and fetch into the existing isolated submodule object 
 
 ### Safe fast-forward pull
 
-`pull --ff-only` fetches and freezes one exact root target. It then works out the full graph of initialized submodules without checking anything out, fetches only the recorded child commits it is missing, and tests every working-tree change before the first write. Applying the change rechecks the remote ref and every repository HEAD under a shared lock, fast-forwards the root, then checks out changed submodules at their exact recorded commits.
+`pull --ff-only` fetches and freezes one exact root target. It then works out the full graph of initialized submodules without checking anything out, fetches only the recorded child commits it is missing, and tests every working-tree change before the first write. Applying the change rechecks the remote ref and every repository HEAD under a shared lock, fast-forwards the root, then checks out changed submodules at their exact recorded commits. Additions use the same recursive materializer as merge, reading `.gitmodules` and pins from the updated parent HEAD and borrowing durable local stores where available.
 
 If the root already contains the target, pull keeps the current root tree and its submodule pins and reports why it is already up to date.
 
