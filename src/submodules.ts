@@ -849,6 +849,7 @@ export async function materializeSubmodules(
                 depth === 0 &&
                 selectedPaths?.has(path) === true &&
                 detached !== undefined &&
+                detached.removedBy === undefined &&
                 referenceSubmodule !== undefined &&
                 !(await referenceStoreAt(git, referenceSubmodule))
               ) {

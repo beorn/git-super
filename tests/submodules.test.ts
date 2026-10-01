@@ -165,7 +165,10 @@ describe("materializeSubmodules", () => {
         new Set(["gamma"]),
       )
       expect(prepared.state, JSON.stringify(prepared.detail)).toBe("updated")
-      const store = prepared.submodules[0]!.gitdir
+      const descriptor = prepared.submodules[0]
+      if (descriptor === undefined) throw new Error("prepare returned no gamma descriptor")
+      expect(descriptor.path).toBe("gamma")
+      const store = descriptor.gitdir
       expect(existsSync(join(owner, "gamma", ".git"))).toBe(false)
       if (pinState !== "missing") git(store, ["fetch", "-q", dependency, `${required}:refs/heads/main`])
       if (pinState === "partial") git(store, ["config", "remote.origin.promisor", "true"])
@@ -217,6 +220,63 @@ describe("materializeSubmodules", () => {
         expect(existsSync(join(candidate, "gamma", ".git"))).toBe(false)
         expect(requests.some(({ args }) => args.includes("update") && args.includes("submodule"))).toBe(false)
       }
+    },
+  )
+
+  /**
+   * @failure A retained prepared store resurrects a path deliberately removed by reference HEAD.
+   * @level l1
+   * @consumer merge and pull's selected-submodule materialization
+   */
+  it.each(["head", "index"] as const)(
+    "refuses a deliberately removed path with a retained prepared store from %s",
+    async (source) => {
+      const root = await mkdtemp(join(tmpdir(), "git-super-removed-prepared-store-"))
+      roots.push(root)
+      const dependency = join(root, "dependency")
+      const owner = join(root, "owner")
+      const candidate = join(root, "candidate")
+      const required = createRepository(dependency, "dependency.txt", "retained pin\n")
+      createRepository(owner, ".gitmodules", `[submodule "gamma-store"]\n path = gamma\n url = ${dependency}\n`)
+      git(owner, ["update-index", "--add", "--cacheinfo", `160000,${required},gamma`])
+      git(owner, ["commit", "-q", "-m", "add gamma"])
+      const withGamma = git(owner, ["rev-parse", "HEAD"]).trim()
+      const prepared = await prepareSubmoduleTreeUnderLock(
+        { repo: owner, commit: git(owner, ["write-tree"]).trim(), remote: owner },
+        new Set(["gamma"]),
+      )
+      expect(prepared.state, JSON.stringify(prepared.detail)).toBe("updated")
+      const descriptor = prepared.submodules[0]
+      if (descriptor === undefined) throw new Error("prepare returned no gamma descriptor")
+      expect(descriptor.path).toBe("gamma")
+      const store = descriptor.gitdir
+      git(store, ["fetch", "-q", dependency, `${required}:refs/heads/main`])
+      git(owner, ["update-index", "--force-remove", "gamma"])
+      writeFileSync(join(owner, ".gitmodules"), "")
+      git(owner, ["add", ".gitmodules"])
+      git(owner, ["commit", "-q", "-m", "deliberately remove gamma"])
+      const removedBy = git(owner, ["rev-parse", "--short", "HEAD"]).trim()
+      git(owner, ["worktree", "add", "-q", "--detach", candidate, withGamma])
+      const process = createLocalGitProcess()
+      const requests: GitProcessRequest[] = []
+      const result = await materializeSubmodulesWithProcess(
+        {
+          async run(request) {
+            requests.push(request)
+            return process.run(request)
+          },
+        },
+        { worktree: candidate, referenceWorktree: owner, paths: ["gamma"], source },
+      )
+      expect(result.code).not.toBe(0)
+      expect(result.stderr).toContain("gamma")
+      expect(result.stderr).toContain(required)
+      expect(result.stderr).toContain(removedBy)
+      expect(result.stderr).toContain("Do NOT provision a reference store")
+      expect(requests.some(({ args }) => args[0] === "fetch")).toBe(false)
+      expect(requests.some(({ args }) => args.includes("submodule") && args.includes("update"))).toBe(false)
+      expect(existsSync(join(candidate, "gamma", ".git"))).toBe(false)
+      expect(git(store, ["cat-file", "-e", `${required}^{commit}`])).toBe("")
     },
   )
 

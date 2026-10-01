@@ -4,7 +4,13 @@ export * from "./gitlink-carrier.ts"
 export * from "./pull.ts"
 export * from "./push.ts"
 export * from "./result.ts"
-export * from "./submodule-prepare.ts"
+export {
+  superSubmodulePrepare,
+  prepareSubmoduleTreeUnderLock,
+  type PreparedSubmodule,
+  type SuperSubmodulePrepareResult,
+  type SuperSubmodulePrepareOptions,
+} from "./submodule-prepare.ts"
 export {
   registrationNameForOwner,
   ownerFromRegistrationName,
