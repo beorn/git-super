@@ -633,17 +633,31 @@ async function applyRepositories(
     if (repository.added !== undefined) {
       phase(`apply-added-submodule ${repository.path}`)
       const initialized = await materializeSubmodulesWithProcess(git, {
-        worktree: repository.added.parent, paths: [repository.added.path], source: "head",
-      })
+        worktree: repository.added.parent,
+        paths: [repository.added.path],
+        source: "head",
+      }).catch((error: unknown) => ({
+        code: 1,
+        stdout: "",
+        stderr: error instanceof Error ? error.message : String(error),
+      }))
       const head = existsSync(join(repository.repository, ".git"))
-        ? await run(git, repository.repository, ["rev-parse", "HEAD^{commit}"])
+        ? await run(git, repository.repository, ["rev-parse", "HEAD^{commit}"]).catch((error: unknown) => ({
+            code: 1,
+            stdout: "",
+            stderr: error instanceof Error ? error.message : String(error),
+          }))
         : { code: 1, stdout: "", stderr: `Submodule checkout ${repository.path} has no .git entry.` }
       const actual = head.code === 0 ? head.stdout.trim() : undefined
-      const failure = initialized.code !== 0 || actual !== repository.target
-        ? detail("added-submodule-not-at-gitlink", "apply-added-submodule",
-          `Submodule ${repository.path} could not be initialized at recorded gitlink ${repository.target}; actual checkout ${actual ?? "unreadable"}. ${initialized.stderr || head.stderr}`,
-          { paths: [repository.path], objectIds: [repository.target, ...(actual === undefined ? [] : [actual])] })
-        : undefined
+      const failure =
+        initialized.code !== 0 || actual !== repository.target
+          ? detail(
+              "added-submodule-not-at-gitlink",
+              "apply-added-submodule",
+              `Submodule ${repository.path} could not be initialized at recorded gitlink ${repository.target}; actual checkout ${actual ?? "unreadable"}. ${initialized.stderr || head.stderr}`,
+              { paths: [repository.path], objectIds: [repository.target, ...(actual === undefined ? [] : [actual])] },
+            )
+          : undefined
       if (failure !== undefined) {
         results.push(repositoryResult(repository, "failed", failure))
         for (const remaining of plan.repositories.slice(index + 1)) {

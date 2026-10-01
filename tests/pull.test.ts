@@ -71,9 +71,10 @@ describe("git super pull --ff-only", () => {
    * @testonly none
    */
   test.each([
-    { store: "no module store", prepare: false },
-    { store: "a module store a git-super merge prepared", prepare: true },
-  ])("initializes a submodule the target adds, from $store, at its gitlink (26972)", async ({ prepare }) => {
+    { store: "no module store", prepare: false, throws: false },
+    { store: "a module store a git-super merge prepared", prepare: true, throws: false },
+    { store: "a throwing materializer after root update", prepare: true, throws: true },
+  ])("initializes a submodule the target adds, from $store, at its gitlink (26972)", async ({ prepare, throws }) => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-pull-added-"))
     roots.push(fixtureRoot)
     const fixture = createProductFixture(fixtureRoot)
@@ -108,7 +109,33 @@ describe("git super pull --ff-only", () => {
       expect(prepared.submodules.map(({ path }) => path)).toContain("vendor/gamma")
     }
 
-    const result = await superPull({ repo: checkout, repository: "origin", refspecs: ["main"], ffOnly: true })
+    const local = createLocalGitProcess()
+    const process: GitProcess = {
+      run: (request) => {
+        if (throws && request.args.includes("update") && request.args.includes("vendor/gamma")) {
+          throw new Error("injected thrown pull initialization failure")
+        }
+        return local.run(request)
+      },
+    }
+    const result = await superPull({
+      repo: checkout,
+      repository: "origin",
+      refspecs: ["main"],
+      ffOnly: true,
+      git: process,
+    })
+    if (throws) {
+      expect(result).toMatchObject({
+        state: "failed",
+        partial: true,
+        detail: { code: "added-submodule-not-at-gitlink", paths: ["vendor/gamma"] },
+      })
+      expect(result.detail?.message).toContain("injected thrown pull initialization failure")
+      expect(git(checkout, "rev-parse", "HEAD")).toBe(target)
+      expect(git(checkout, "rev-parse", ":vendor/gamma")).toBe(gammaTarget)
+      return
+    }
 
     expect(result.detail).toBeUndefined()
     expect(result.state).toBe("updated")

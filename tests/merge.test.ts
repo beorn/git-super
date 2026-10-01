@@ -6,7 +6,7 @@
  */
 import { chmodSync, existsSync, readFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { dirname, isAbsolute, join, relative } from "node:path"
-import { afterEach, describe, expect, it, vi } from "vitest"
+import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest"
 import { runCli } from "../src/cli.ts"
 import { acquireExclusive } from "../src/exclusive.ts"
 import { superPush } from "../src/push.ts"
@@ -110,126 +110,174 @@ describe("git super merge", () => {
    * @consumer git-super merge and authoring hooks
    * @testonly none
    */
-  it.each([false, true])("initializes an added gitlink at its pin before the concluding commit hook (26988), initialization failure=%s", async (failInitialization) => {
-    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-added-"))
-    roots.push(fixtureRoot)
-    const fixture = createProductFixture(fixtureRoot)
-    const primary = join(fixtureRoot, "primary")
-    const checkout = join(fixtureRoot, "checkout")
-    const gamma = join(fixtureRoot, "gamma")
-    createRepository(gamma, "gamma.ts", "export const gamma = 1\n")
-    const rootUrl = "https://git-super.test/owned/product.git"
-    const gammaUrl = "https://git-super.test/owned/gamma.git"
-    // Ownership remains hosted; every recursive Git process uses local fixture transport.
-    const config = [
-      ["protocol.file.allow", "always"],
-      [`url.${fixture.product}.insteadOf`, rootUrl],
-      [`url.${fixture.alpha}.insteadOf`, "https://git-super.test/owned/alpha.git"],
-      [`url.${fixture.beta}.insteadOf`, "https://git-super.test/owned/beta.git"],
-      [`url.${gamma}.insteadOf`, gammaUrl],
-    ] as const
-    vi.stubEnv("GIT_CONFIG_COUNT", String(config.length))
-    for (const [index, [key, value]] of config.entries()) {
-      vi.stubEnv(`GIT_CONFIG_KEY_${index}`, key)
-      vi.stubEnv(`GIT_CONFIG_VALUE_${index}`, value)
-    }
-    try {
-      git(fixtureRoot, "clone", "-q", "--recurse-submodules", rootUrl, primary)
-      git(primary, "worktree", "add", "-q", "-b", "task/added-gitlink", checkout, "HEAD")
-      const initial = await materializeSubmodulesWithProcess(createLocalGitProcess(), {
-        worktree: checkout,
-        referenceWorktree: primary,
-      })
-      expect(initial).toMatchObject({ code: 0, considered: 2, borrowed: 2, remoteFallbacks: 0, unreferenced: 0 })
-      git(fixture.product, "submodule", "add", "-q", gammaUrl, "vendor/gamma")
-      git(fixture.product, "commit", "-q", "-m", "main adds gamma")
-      const gammaPin = advanceRepository(gamma, "gamma.ts", "export const gamma = 2\n")
-      git(checkout, "fetch", "-q", "origin")
-      const hook = git(checkout, "rev-parse", "--path-format=absolute", "--git-path", "hooks/pre-commit")
-      writeFileSync(
-        hook,
-        "#!/bin/sh\nif ! test -e vendor/gamma/.git; then echo 'added gitlink checkout missing before commit' >&2; exit 1; fi\n",
-      )
-      chmodSync(hook, 0o755)
-      const alphaBefore = git(join(checkout, "packages/alpha"), "rev-parse", "HEAD")
-      advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
-      const local = createLocalGitProcess()
-      const process: GitProcess = { run: (request) => failInitialization && request.args.includes("update") && request.args.includes("vendor/gamma")
-        ? Promise.resolve({ code: 1, stdout: "", stderr: "injected added-submodule initialization failure" }) : local.run(request) }
-      const rootBefore = git(checkout, "rev-parse", "HEAD")
-      const result = await superMerge({ repo: checkout, commit: "origin/main", git: process })
-      if (failInitialization) {
-        expect(result).toMatchObject({ state: "failed", partial: true,
-          detail: { code: "added-submodule-initialization-failed", paths: ["vendor/gamma"] },
-          initializations: [{ path: "vendor/gamma", index: gammaPin, state: "initialization-failed" }],
-        })
-        expect(result.detail?.message).toContain(gammaPin)
-        expect(git(checkout, "rev-parse", "HEAD")).toBe(rootBefore)
-        expect(git(checkout, "rev-parse", ":vendor/gamma")).toBe(gammaPin)
-        expect(git(join(checkout, "packages/alpha"), "rev-parse", "HEAD")).toBe(alphaBefore)
-        expect(result.steps?.at(-1)?.name).toBe("initialize")
-        expect(existsSync(join(checkout, "vendor/gamma/.git"))).toBe(false)
-        return
+  it.each(["none", "exit", "throw"] as const)(
+    "initializes an added gitlink at its pin before the concluding commit hook (26988), initialization failure=%s",
+    async (failure) => {
+      const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-added-"))
+      roots.push(fixtureRoot)
+      const fixture = createProductFixture(fixtureRoot)
+      const primary = join(fixtureRoot, "primary")
+      const checkout = join(fixtureRoot, "checkout")
+      const gamma = join(fixtureRoot, "gamma")
+      createRepository(gamma, "gamma.ts", "export const gamma = 1\n")
+      const rootUrl = "https://git-super.test/owned/product.git"
+      const gammaUrl = "https://git-super.test/owned/gamma.git"
+      // Ownership remains hosted; every recursive Git process uses local fixture transport.
+      const config = [
+        ["protocol.file.allow", "always"],
+        [`url.${fixture.product}.insteadOf`, rootUrl],
+        [`url.${fixture.alpha}.insteadOf`, "https://git-super.test/owned/alpha.git"],
+        [`url.${fixture.beta}.insteadOf`, "https://git-super.test/owned/beta.git"],
+        [`url.${gamma}.insteadOf`, gammaUrl],
+      ] as const
+      vi.stubEnv("GIT_CONFIG_COUNT", String(config.length))
+      for (const [index, [key, value]] of config.entries()) {
+        vi.stubEnv(`GIT_CONFIG_KEY_${index}`, key)
+        vi.stubEnv(`GIT_CONFIG_VALUE_${index}`, value)
       }
-      // CTO0093c0db: measure the existing owner against the linked worktree's staged addition.
-      const materialized = await materializeSubmodulesWithProcess(createLocalGitProcess(), {
-        worktree: checkout,
-        referenceWorktree: primary,
-        paths: ["vendor/gamma"],
-        source: "index",
-      })
-      const common = git(checkout, "rev-parse", "--path-format=absolute", "--git-common-dir")
-      expect
-        .soft({
-          stagedPin: git(checkout, "rev-parse", ":vendor/gamma"),
-          primaryCheckoutPresent: existsSync(join(primary, "vendor/gamma/.git")),
-          preparedStorePin: git(join(common, "modules/vendor/gamma"), "rev-parse", `${gammaPin}^{commit}`),
-          materialized,
+      try {
+        git(fixtureRoot, "clone", "-q", "--recurse-submodules", rootUrl, primary)
+        git(primary, "worktree", "add", "-q", "-b", "task/added-gitlink", checkout, "HEAD")
+        const initial = await materializeSubmodulesWithProcess(createLocalGitProcess(), {
+          worktree: checkout,
+          referenceWorktree: primary,
         })
-        .toMatchObject({
-          stagedPin: gammaPin,
-          primaryCheckoutPresent: false,
-          preparedStorePin: gammaPin,
-          materialized: { code: 0, considered: 1, borrowed: 1, remoteFallbacks: 0, unreferenced: 0 },
+        expect(initial).toMatchObject({ code: 0, considered: 2, borrowed: 2, remoteFallbacks: 0, unreferenced: 0 })
+        git(fixture.product, "submodule", "add", "-q", gammaUrl, "vendor/gamma")
+        git(fixture.product, "commit", "-q", "-m", "main adds gamma")
+        const gammaPin = advanceRepository(gamma, "gamma.ts", "export const gamma = 2\n")
+        git(checkout, "fetch", "-q", "origin")
+        const hook = git(checkout, "rev-parse", "--path-format=absolute", "--git-path", "hooks/pre-commit")
+        writeFileSync(
+          hook,
+          "#!/bin/sh\nif ! test -e vendor/gamma/.git; then echo 'added gitlink checkout missing before commit' >&2; exit 1; fi\n",
+        )
+        chmodSync(hook, 0o755)
+        const alphaBefore = git(join(checkout, "packages/alpha"), "rev-parse", "HEAD")
+        advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
+        const local = createLocalGitProcess()
+        const process: GitProcess = {
+          run: (request) => {
+            if (failure !== "none" && request.args.includes("update") && request.args.includes("vendor/gamma")) {
+              if (failure === "throw") throw new Error("injected thrown initialization failure")
+              return Promise.resolve({ code: 1, stdout: "", stderr: "injected added-submodule initialization failure" })
+            }
+            return local.run(request)
+          },
+        }
+        const rootBefore = git(checkout, "rev-parse", "HEAD")
+        const result = await superMerge({ repo: checkout, commit: "origin/main", git: process })
+        if (failure !== "none") {
+          expect(result).toMatchObject({
+            state: "failed",
+            partial: true,
+            detail: { code: "added-submodule-initialization-failed", paths: ["vendor/gamma"] },
+            initializations: [{ path: "vendor/gamma", index: gammaPin, state: "initialization-failed" }],
+          })
+          expect(result.detail?.message).toContain(gammaPin)
+          if (failure === "throw") expect(result.detail?.message).toContain("injected thrown initialization failure")
+          expect(git(checkout, "rev-parse", "HEAD")).toBe(rootBefore)
+          expect(git(checkout, "rev-parse", ":vendor/gamma")).toBe(gammaPin)
+          expect(git(join(checkout, "packages/alpha"), "rev-parse", "HEAD")).toBe(alphaBefore)
+          expect(result.steps?.at(-1)?.name).toBe("initialize")
+          expect(existsSync(join(checkout, "vendor/gamma/.git"))).toBe(false)
+          return
+        }
+        // CTO0093c0db: measure the existing owner against the linked worktree's staged addition.
+        const materialized = await materializeSubmodulesWithProcess(createLocalGitProcess(), {
+          worktree: checkout,
+          referenceWorktree: primary,
+          paths: ["vendor/gamma"],
+          source: "index",
         })
-      expect(result.detail).toBeUndefined()
-      expect(result.state).toBe("updated")
-      expect(result.initializations).toContainEqual({ path: "vendor/gamma", index: gammaPin, checkout: gammaPin, state: "initialized" })
-      const gammaCheckout = join(checkout, "vendor/gamma")
-      expect(git(gammaCheckout, "rev-parse", "HEAD")).toBe(gammaPin)
-      const gitdir = git(gammaCheckout, "rev-parse", "--path-format=absolute", "--git-dir")
-      expect(gitdir).toBe(join(common, "worktrees/checkout/modules/vendor/gamma"))
-      expect(readFileSync(join(gitdir, "objects/info/alternates"), "utf8").trim()).toBe(join(common, "modules/vendor/gamma/objects"))
-    } finally {
-      vi.unstubAllEnvs()
-    }
-  })
+        const common = git(checkout, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        expect
+          .soft({
+            stagedPin: git(checkout, "rev-parse", ":vendor/gamma"),
+            primaryCheckoutPresent: existsSync(join(primary, "vendor/gamma/.git")),
+            preparedStorePin: git(join(common, "modules/vendor/gamma"), "rev-parse", `${gammaPin}^{commit}`),
+            materialized,
+          })
+          .toMatchObject({
+            stagedPin: gammaPin,
+            primaryCheckoutPresent: false,
+            preparedStorePin: gammaPin,
+            materialized: { code: 0, considered: 1, borrowed: 1, remoteFallbacks: 0, unreferenced: 0 },
+          })
+        expect(result.detail).toBeUndefined()
+        expect(result.state).toBe("updated")
+        expect(result.initializations).toContainEqual({
+          path: "vendor/gamma",
+          index: gammaPin,
+          checkout: gammaPin,
+          state: "initialized",
+        })
+        const gammaCheckout = join(checkout, "vendor/gamma")
+        expect(git(gammaCheckout, "rev-parse", "HEAD")).toBe(gammaPin)
+        const gitdir = git(gammaCheckout, "rev-parse", "--path-format=absolute", "--git-dir")
+        expect(gitdir).toBe(join(common, "worktrees/checkout/modules/vendor/gamma"))
+        expect(readFileSync(join(gitdir, "objects/info/alternates"), "utf8").trim()).toBe(
+          join(common, "modules/vendor/gamma/objects"),
+        )
+      } finally {
+        vi.unstubAllEnvs()
+      }
+    },
+  )
 
   /**
    * @failure An existing parent acquires a nested gitlink and a merge silently leaves it uninitialized.
    * @level l1
    * @consumer git-super merge
    */
-  it("names a nested addition in an existing submodule before applying the root merge", async () => {
-    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-nested-added-"))
-    roots.push(fixtureRoot)
-    const fixture = createProductFixture(fixtureRoot)
-    const before = git(fixture.product, "rev-parse", "HEAD")
-    const alphaBefore = git(join(fixture.product, "packages/alpha"), "rev-parse", "HEAD")
-    const leaf = join(fixtureRoot, "leaf")
-    const leafPin = createRepository(leaf, "leaf.ts", "export const leaf = 1\n")
-    git(fixture.alpha, "-c", "protocol.file.allow=always", "submodule", "add", "-q", leaf, "apps/leaf")
-    git(fixture.alpha, "commit", "-q", "-am", "add nested leaf")
-    const candidate = candidateWithRootChange(fixture, "candidate-nested-addition")
-    const result = await superMerge({ repo: fixture.product, commit: candidate })
-    expect(result, JSON.stringify(result)).toMatchObject({ state: "failed", partial: false,
-      detail: { code: "nested-submodule-initialization-required", paths: ["packages/alpha/apps/leaf"] },
-      initializations: [{ path: "packages/alpha/apps/leaf", index: leafPin, state: "initialization-required" }],
-    })
-    expect(git(fixture.product, "rev-parse", "HEAD")).toBe(before)
-    expect(git(join(fixture.product, "packages/alpha"), "rev-parse", "HEAD")).toBe(alphaBefore)
-    expect(git(fixture.product, "status", "--porcelain")).toBe("")
-  })
+  it.each([false, true])(
+    "names a nested addition in an existing submodule before applying the root merge, already initialized=%s",
+    async (initializeBeforeMerge) => {
+      const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-nested-added-"))
+      roots.push(fixtureRoot)
+      const fixture = createProductFixture(fixtureRoot)
+      const before = git(fixture.product, "rev-parse", "HEAD")
+      const alphaBefore = git(join(fixture.product, "packages/alpha"), "rev-parse", "HEAD")
+      const leaf = join(fixtureRoot, "leaf")
+      const leafPin = createRepository(leaf, "leaf.ts", "export const leaf = 1\n")
+      git(fixture.alpha, "-c", "protocol.file.allow=always", "submodule", "add", "-q", leaf, "apps/leaf")
+      const leafUrl = "https://git-super.test/owned/leaf.git"
+      git(fixture.alpha, "config", "--file", ".gitmodules", "submodule.apps/leaf.url", leafUrl)
+      git(fixture.alpha, "config", "submodule.apps/leaf.url", leafUrl)
+      vi.stubEnv("GIT_CONFIG_COUNT", "2")
+      vi.stubEnv("GIT_CONFIG_KEY_0", `url.${leaf}.insteadOf`)
+      vi.stubEnv("GIT_CONFIG_VALUE_0", leafUrl)
+      vi.stubEnv("GIT_CONFIG_KEY_1", "protocol.file.allow")
+      vi.stubEnv("GIT_CONFIG_VALUE_1", "always")
+      onTestFinished(() => {
+        vi.unstubAllEnvs()
+      })
+      git(fixture.alpha, "commit", "-q", "-am", "add nested leaf")
+      const alphaCheckout = join(fixture.product, "packages/alpha")
+      if (initializeBeforeMerge) {
+        git(alphaCheckout, "fetch", "-q", "origin")
+        git(alphaCheckout, "checkout", "-q", git(fixture.alpha, "rev-parse", "HEAD"))
+        git(alphaCheckout, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
+      }
+      const candidate = candidateWithRootChange(fixture, "candidate-nested-addition")
+      const result = await superMerge({ repo: fixture.product, commit: candidate })
+      if (initializeBeforeMerge) {
+        expect(result, JSON.stringify(result)).toMatchObject({ state: "updated", partial: false })
+        expect(result.initializations).toBeUndefined()
+        expect(git(join(alphaCheckout, "apps/leaf"), "rev-parse", "HEAD")).toBe(leafPin)
+        return
+      }
+      expect(result, JSON.stringify(result)).toMatchObject({
+        state: "failed",
+        partial: false,
+        detail: { code: "nested-submodule-initialization-required", paths: ["packages/alpha/apps/leaf"] },
+        initializations: [{ path: "packages/alpha/apps/leaf", index: leafPin, state: "initialization-required" }],
+      })
+      expect(git(fixture.product, "rev-parse", "HEAD")).toBe(before)
+      expect(git(join(fixture.product, "packages/alpha"), "rev-parse", "HEAD")).toBe(alphaBefore)
+      expect(git(fixture.product, "status", "--porcelain")).toBe("")
+    },
+  )
 
   /**
    * @failure A submit's candidate merge gives up after 30 s while the queue's merge still holds the writer lock (25274).

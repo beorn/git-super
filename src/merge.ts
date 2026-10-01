@@ -249,7 +249,11 @@ export async function superMerge(options: SuperMergeOptions): Promise<SuperMerge
   return { ...result, steps: steps.finish(), ...(initializations.length === 0 ? {} : { initializations }) }
 }
 
-async function mergeWithSteps(options: SuperMergeOptions, steps: StepClock, initializations: SuperMergeInitializationResult[]): Promise<SuperMergeResult> {
+async function mergeWithSteps(
+  options: SuperMergeOptions,
+  steps: StepClock,
+  initializations: SuperMergeInitializationResult[],
+): Promise<SuperMergeResult> {
   const git = options.git ?? createLocalGitProcess()
   const timeoutMs = options.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS
   const fallbackRoot = resolve(options.repo)
@@ -487,17 +491,24 @@ async function mergeUnderLock(
   for (const checkout of planned.checkouts) {
     const repository = join(root, checkout.path)
     const before = new Set((await readCommitSubmodules(git, repository, checkout.recorded)).map((entry) => entry.path))
-    const addition = (await readCommitSubmodules(git, repository, checkout.index)).find((entry) => !before.has(entry.path) && !existsSync(join(repository, entry.path, ".git")))
+    const addition = (await readCommitSubmodules(git, repository, checkout.index)).find(
+      (entry) => !before.has(entry.path) && !existsSync(join(repository, entry.path, ".git")),
+    )
     if (addition === undefined) continue
     const path = `${checkout.path}/${addition.path}`
     initializations.push({ path, index: addition.target, state: "initialization-required" })
-    return failed(root, visiblePlans, obviousDetail(
-      "nested-submodule-initialization-required",
-      `Merge would add ${path}@${addition.target} inside existing submodule ${checkout.path}; nested checkout initialization is required before this merge can apply.`,
-      `git -C ${repository} show ${checkout.index}:.gitmodules`,
-      `Prepare a worktree at ${checkout.index} with ${path} initialized, then record that parent pin before retrying the merge.`,
-      "the submodule writer", { paths: [path], objectIds: [addition.target, checkout.index] },
-    ))
+    return failed(
+      root,
+      visiblePlans,
+      obviousDetail(
+        "nested-submodule-initialization-required",
+        `Merge would add ${path}@${addition.target} inside existing submodule ${checkout.path}; nested checkout initialization is required before this merge can apply.`,
+        `git -C ${repository} show ${checkout.index}:.gitmodules`,
+        `Initialize ${path} in ${repository} at parent commit ${checkout.index}, preserving the root recorded pin, then rerun the same merge.`,
+        "the submodule writer",
+        { paths: [path], objectIds: [addition.target, checkout.index] },
+      ),
+    )
   }
 
   steps.begin("capture")
@@ -670,22 +681,46 @@ async function mergeUnderLock(
     const index = await required(git, root, ["rev-parse", `:${path}`], "observe-added-gitlink", timeoutMs)
     initializations.push({ path, index, state: "not-run" })
   }
-  for (let position = 0; position < initializations.length; position += 1) {
-    const row = initializations[position]!
-    const initialized = await materializeSubmodulesWithProcess(git, { worktree: root, paths: [row.path], source: "index" })
+  for (const [position, row] of initializations.entries()) {
+    const initialized = await materializeSubmodulesWithProcess(git, {
+      worktree: root,
+      paths: [row.path],
+      source: "index",
+    }).catch((error: unknown) => ({
+      code: 1,
+      stdout: "",
+      stderr: error instanceof Error ? error.message : String(error),
+    }))
     const observed = existsSync(join(root, row.path, ".git"))
-      ? await run(git, join(root, row.path), ["rev-parse", "HEAD^{commit}"], timeoutMs)
+      ? await run(git, join(root, row.path), ["rev-parse", "HEAD^{commit}"], timeoutMs).catch((error: unknown) => ({
+          code: 1,
+          stdout: "",
+          stderr: error instanceof Error ? error.message : String(error),
+        }))
       : { code: 1, stdout: "", stderr: `Submodule checkout ${row.path} has no .git entry.` }
     const checkout = observed.code === 0 ? observed.stdout.trim() : undefined
     const ok = initialized.code === 0 && observed.code === 0 && checkout === row.index
-    initializations[position] = { ...row, ...(checkout === undefined ? {} : { checkout }), state: ok ? "initialized" : "initialization-failed" }
-    if (!ok) {return partial(root, undefined, completed, obviousDetail(
-      "added-submodule-initialization-failed",
-      `The root merge remains staged: ${row.path} incoming pin ${visiblePlans.find((plan) => plan.path === row.path)?.from ?? row.index} could not be initialized at staged index pin ${row.index}; actual checkout ${checkout ?? "unreadable"}. ${initialized.stderr || observed.stderr || "The checkout did not match the staged pin."}`,
-      `git -C ${root} status --short`,
-      "Inspect and preserve the staged root merge and named addition before retrying; existing checkouts have not moved.",
-      "the caller", { paths: [row.path], objectIds: [row.index, ...(checkout === undefined ? [] : [checkout])] },
-    ), preparedRows)}
+    initializations[position] = {
+      ...row,
+      ...(checkout === undefined ? {} : { checkout }),
+      state: ok ? "initialized" : "initialization-failed",
+    }
+    if (!ok) {
+      return partial(
+        root,
+        undefined,
+        completed,
+        obviousDetail(
+          "added-submodule-initialization-failed",
+          `The root merge remains staged: ${row.path} incoming pin ${visiblePlans.find((plan) => plan.path === row.path)?.from ?? row.index} could not be initialized at staged index pin ${row.index}; actual checkout ${checkout ?? "unreadable"}. ${initialized.stderr || observed.stderr || "The checkout did not match the staged pin."}`,
+          `git -C ${root} status --short`,
+          "Inspect and preserve the staged root merge and named addition before retrying; existing checkouts have not moved.",
+          "the caller",
+          { paths: [row.path], objectIds: [row.index, ...(checkout === undefined ? [] : [checkout])] },
+        ),
+        preparedRows,
+      )
+    }
   }
 
   steps.begin("settle")
@@ -2051,8 +2086,9 @@ async function planGitlinks(
   const completed = new Set<string>()
 
   const rootMerged = await readCommitSubmodules(git, root, tree)
-  if (rootMerged.length === 0)
-    {return { added: [], settlements: plans, checkouts: [], stores, descents: [], mains, unboundedLocalMains }}
+  if (rootMerged.length === 0) {
+    return { added: [], settlements: plans, checkouts: [], stores, descents: [], mains, unboundedLocalMains }
+  }
   const rootRemote = await rootPushIdentity(git, root)
   const rootBefore = new Map((await readCommitSubmodules(git, root, head)).map((entry) => [entry.path, entry.target]))
   const added = new Set(rootMerged.filter((entry) => !rootBefore.has(entry.path)).map((entry) => entry.path))
@@ -2405,7 +2441,15 @@ async function planGitlinks(
   }
 
   await walk(root, "", head, tree, undefined)
-  return { added: [...added], settlements: plans, checkouts: [...checkouts.values()], stores, descents, mains, unboundedLocalMains }
+  return {
+    added: [...added],
+    settlements: plans,
+    checkouts: [...checkouts.values()],
+    stores,
+    descents,
+    mains,
+    unboundedLocalMains,
+  }
 }
 
 async function mergeApplicationFailure(
