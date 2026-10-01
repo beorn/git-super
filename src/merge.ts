@@ -26,6 +26,7 @@ import { createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS, type Exclusive } from "
 import { parseIndexEntries, type IndexEntry } from "./index-entries.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessRequest, type GitProcessResult } from "./process.ts"
 import { createProgressReporter } from "./progress.ts"
+import { shellQuote } from "./shell-command.ts"
 import type { GitResultDetail, GitSuperRepositoryResult, GitSuperResult } from "./result.ts"
 
 /**
@@ -166,6 +167,8 @@ export type SuperMergeUnboundedLocalMain = Readonly<{ path: string; pin: string;
 export type SuperMergeResult = GitSuperResult &
   Readonly<{
     commit?: string
+    /** Native pending state observed by this invocation; this does not witness its creator. */
+    pending?: Readonly<{ branch: string; head: string; target: string; unmergedPaths: readonly string[] }>
     /** Added paths have no prior recorded or checkout pin. */
     initializations?: readonly SuperMergeInitializationResult[]
     gitlinks: readonly SuperMergeGitlinkResult[]
@@ -204,6 +207,10 @@ export type SuperMergeOptions = Readonly<{
   noFetch?: boolean
   /** With noFetch, classify unchanged Equal pins from local main regardless of refresh age. */
   unboundedLocalMain?: boolean
+  preserveConflicts?: boolean
+  continue?: boolean
+  expectedHead?: string
+  expectedBranch?: string
 }>
 
 type GitlinkPlan = Readonly<{
@@ -265,19 +272,6 @@ async function mergeWithSteps(
   const git = options.git ?? createLocalGitProcess()
   const timeoutMs = options.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS
   const fallbackRoot = resolve(options.repo)
-  if (options.unboundedLocalMain && !options.noFetch) {
-    return failed(
-      fallbackRoot,
-      [],
-      obviousDetail(
-        "unbounded-local-main-requires-no-fetch",
-        "git super merge --unbounded-local-main requires --no-fetch.",
-        "Pass both options together, or omit --unbounded-local-main.",
-        "Rerun with --no-fetch when local Equal classification is intended.",
-        "the caller",
-      ),
-    )
-  }
   let root: string
   try {
     root = resolve(await required(git, options.repo, ["rev-parse", "--show-toplevel"], "discover-root", timeoutMs))
@@ -346,6 +340,96 @@ async function mergeUnderLock(
   steps: StepClock,
   initializations: SuperMergeInitializationResult[],
 ): Promise<SuperMergeResult> {
+  const nativeHeads = await nativeMergeHeads(git, root, timeoutMs)
+  let pending: SuperMergeResult["pending"]
+  if (nativeHeads !== undefined) {
+    const branch = await required(git, root, ["symbolic-ref", "HEAD"], "observe-pending-branch", timeoutMs)
+    const head = await required(git, root, ["rev-parse", "HEAD^{commit}"], "observe-pending-head", timeoutMs)
+    const paths = await unmergedPaths(git, root, timeoutMs)
+    if (paths === undefined) throw new Error(`Pending merge at ${root}: unmerged paths could not be read`)
+    pending = { branch, head, target: nativeHeads[0] ?? "", unmergedPaths: paths }
+  }
+  const refuse = (code: string, message: string): SuperMergeResult => {
+    const result = failed(
+      root,
+      [],
+      obviousDetail(
+        code,
+        message,
+        `git -C ${shellQuote(root)} status --short`,
+        pending === undefined ? "Use one merge mode with its required expectations." : pendingRemedy(root, pending),
+        "the caller",
+      ),
+    )
+    return pending === undefined ? result : unchangedPending(result, pending)
+  }
+  // Pending native state takes precedence over every mode's prospective interpretation.
+  if (pending !== undefined && !options.continue) {
+    return refuse("merge-already-pending", "A native merge is already pending.")
+  }
+  if (options.unboundedLocalMain && !options.noFetch) {
+    return refuse(
+      "unbounded-local-main-requires-no-fetch",
+      "git super merge --unbounded-local-main requires --no-fetch.",
+    )
+  }
+  if (options.preserveConflicts && options.continue) {
+    return refuse("merge-modes-exclusive", "--preserve-conflicts and --continue are mutually exclusive.")
+  }
+  if (!options.continue && (options.expectedHead !== undefined || options.expectedBranch !== undefined)) {
+    return refuse("merge-expectations-require-continue", "Merge expectations require --continue.")
+  }
+  if (options.continue) {
+    if (pending === undefined) return refuse("merge-not-pending", "No native merge is pending.")
+    if (
+      nativeHeads?.length !== 1 ||
+      options.expectedHead !== pending.head ||
+      options.expectedBranch !== pending.branch
+    ) {
+      return refuse(
+        "merge-continuation-lease-mismatch",
+        "Continuation requires exactly one MERGE_HEAD and matching original HEAD and full symbolic branch expectations.",
+      )
+    }
+    const target = await required(
+      git,
+      root,
+      ["rev-parse", `${options.commit}^{commit}`],
+      "resolve-merge-target",
+      timeoutMs,
+    )
+    if (target !== pending.target) {
+      return refuse(
+        "merge-continuation-target-mismatch",
+        `Continuation target ${target} differs from pending target ${pending.target}.`,
+      )
+    }
+    if (pending.unmergedPaths.length > 0) {
+      return refuse(
+        "merge-continuation-unresolved",
+        `Unmerged paths remain: ${pending.unmergedPaths.map(shellQuote).join(", ")}.`,
+      )
+    }
+  }
+  let result: SuperMergeResult
+  try {
+    result = await mergeObserved(git, root, options, timeoutMs, steps, initializations)
+  } catch (error) {
+    result = failed(root, [], resultError(error, "merge"))
+  }
+  return pending !== undefined && result.state === "failed" && !result.partial
+    ? unchangedPending(result, pending)
+    : result
+}
+
+async function mergeObserved(
+  git: GitProcess,
+  root: string,
+  options: SuperMergeOptions,
+  timeoutMs: number,
+  steps: StepClock,
+  initializations: SuperMergeInitializationResult[],
+): Promise<SuperMergeResult> {
   const statusArgs = ["status", "--porcelain=v1", "-z", "--untracked-files=all"]
   const status = await run(git, root, statusArgs, timeoutMs)
   if (status.code !== 0) {
@@ -393,6 +477,31 @@ async function mergeUnderLock(
       ),
     )
   }
+  if (options.continue) {
+    const checkoutFailure = await verifyRestingCheckouts(git, root, head, timeoutMs)
+    if (checkoutFailure !== undefined) return failed(root, [], checkoutFailure)
+    const unstaged = await required(
+      git,
+      root,
+      ["diff", "--name-only", "-z", "--ignore-submodules=all"],
+      "verify-resolved-worktree",
+      timeoutMs,
+    )
+    const untracked = await required(
+      git,
+      root,
+      ["ls-files", "--others", "--exclude-standard", "-z"],
+      "verify-resolved-worktree",
+      timeoutMs,
+    )
+    if (unstaged !== "" || untracked !== "") {
+      return failed(
+        root,
+        [],
+        dirtyWorktreeDetail(root, options.commit, [...nulRecords(unstaged), ...nulRecords(untracked)]),
+      )
+    }
+  }
   steps.begin("merge-tree")
   const prospective = await prospectiveTree(git, root, head, target, timeoutMs)
   /**
@@ -408,7 +517,64 @@ async function mergeUnderLock(
   let tree: string
   let composed: ReadonlyMap<string, ComposedGitlink> = new Map()
   let forkComposed: ReadonlyMap<string, ComposedGitlink> = new Map()
-  if ("failure" in prospective) {
+  if (options.continue) {
+    tree = await required(git, root, ["write-tree"], "read-resolved-index", timeoutMs)
+    const pinFailure = await validateContinuationPins(git, root, tree, prospective, timeoutMs)
+    if (pinFailure !== undefined) return failed(root, [], pinFailure)
+  } else if ("failure" in prospective) {
+    if (
+      options.preserveConflicts &&
+      prospective.conflict !== undefined &&
+      prospective.conflict.entries.every((entry) => entry.mode !== "160000")
+    ) {
+      if (status.stdout !== "") {
+        return failed(root, [], dirtyWorktreeDetail(root, options.commit, nulRecords(status.stdout)))
+      }
+      const checkoutFailure = await verifyRestingCheckouts(git, root, head, timeoutMs)
+      if (checkoutFailure !== undefined) return failed(root, [], checkoutFailure)
+      const branch = await required(git, root, ["symbolic-ref", "HEAD"], "observe-merge-branch", timeoutMs)
+      steps.begin("merge")
+      const args = [
+        "-c",
+        "core.commitGraph=false",
+        "-c",
+        "submodule.recurse=false",
+        "merge",
+        "--no-ff",
+        "--no-commit",
+        ...(options.noVerify ? ["--no-verify"] : []),
+        target,
+      ]
+      const applied = await run(git, root, args, timeoutMs)
+      const native = await nativeMergeHeads(git, root, timeoutMs)
+      const paths = await unmergedPaths(git, root, timeoutMs)
+      if (
+        applied.code !== 1 ||
+        native?.length !== 1 ||
+        native[0] !== target ||
+        paths === undefined ||
+        paths.length === 0
+      ) {
+        return mergeApplicationFailure(git, root, head, target, args, applied, timeoutMs)
+      }
+      const observed = { branch, head, target, unmergedPaths: paths }
+      return {
+        ...partial(
+          root,
+          undefined,
+          [],
+          obviousDetail(
+            "merge-conflicts-pending",
+            `Ordinary merge conflicts remain pending on ${branch}. ${pendingRemedy(root, observed)}`,
+            `git -C ${shellQuote(root)} status --short`,
+            pendingRemedy(root, observed),
+            "the caller",
+            { paths, objectIds: [head, target] },
+          ),
+        ),
+        pending: observed,
+      }
+    }
     const composition =
       prospective.conflict === undefined
         ? undefined
@@ -528,6 +694,15 @@ async function mergeUnderLock(
 
   steps.begin("capture")
   const requestedMessage = options.message ?? `Merge ${target.slice(0, 12)} into ${head.slice(0, 12)}`
+  const frozenPins = new Map((await readCommitSubmodules(git, root, tree)).map((entry) => [entry.path, entry.target]))
+  for (const plan of visiblePlans) if (plan.state === "raised") frozenPins.set(plan.path, plan.to)
+  const frozenModules = await required(
+    git,
+    root,
+    ["ls-tree", "-z", tree, "--", ".gitmodules"],
+    "freeze-merge-descriptors",
+    timeoutMs,
+  )
   const trailers = visiblePlans.map((plan) =>
     plan.state === "raised"
       ? `Settled: ${plan.path}@${plan.to}`
@@ -588,14 +763,9 @@ async function mergeUnderLock(
   if ("failure" in prepared) return failed(root, [], prepared.failure, prepared.rows)
   const preparedCheckouts = prepared.checkouts
   const preparedRows = checkoutResults(preparedCheckouts)
-  const statusFailure = await validateWorktreeStatus(
-    git,
-    root,
-    options.commit,
-    status.stdout,
-    preparedCheckouts,
-    timeoutMs,
-  )
+  const statusFailure = options.continue
+    ? undefined
+    : await validateWorktreeStatus(git, root, options.commit, status.stdout, preparedCheckouts, timeoutMs)
   if (statusFailure !== undefined) return failed(root, [], statusFailure, preparedRows)
 
   steps.begin("merge")
@@ -612,7 +782,7 @@ async function mergeUnderLock(
     ...(options.noVerify === true ? ["--no-verify"] : []),
     target,
   ]
-  const merged = await run(git, root, mergeArgs, timeoutMs)
+  const merged = options.continue ? { code: 0, stdout: "", stderr: "" } : await run(git, root, mergeArgs, timeoutMs)
   if (merged.code !== 0) {
     /**
      * THE NATIVE MERGE STILL CONFLICTS ON A COMPOSED GITLINK, and it has to.
@@ -921,6 +1091,48 @@ async function mergeUnderLock(
   }
   const mergeCommit = observedSettled.stdout.trim()
   try {
+    const parents = await required(
+      git,
+      root,
+      ["show", "-s", "--format=%P", mergeCommit],
+      "verify-merge-postcondition",
+      timeoutMs,
+    )
+    const actualPins = new Map(
+      (await readCommitSubmodules(git, root, mergeCommit)).map((entry) => [entry.path, entry.target]),
+    )
+    const actualModules = await required(
+      git,
+      root,
+      ["ls-tree", "-z", mergeCommit, "--", ".gitmodules"],
+      "verify-merge-postcondition",
+      timeoutMs,
+    )
+    if (
+      parents !== `${head} ${target}` ||
+      actualModules !== frozenModules ||
+      actualPins.size !== frozenPins.size ||
+      [...frozenPins].some(([path, pin]) => actualPins.get(path) !== pin)
+    ) {
+      throw new Error(`Observed commit ${mergeCommit} differs from frozen parents, gitlinks or .gitmodules`)
+    }
+  } catch (error) {
+    return partial(
+      root,
+      mergeCommit,
+      completed,
+      obviousDetail(
+        "merge-postcondition-mismatch",
+        messageOf(error),
+        `git -C ${shellQuote(root)} show ${mergeCommit}`,
+        "Preserve the observed commit; no success receipt was written and nothing was rolled back.",
+        "the caller",
+        { objectIds: [head, target, mergeCommit] },
+      ),
+      settledCheckouts.rows,
+    )
+  }
+  try {
     await writeRootReceipt(git, root, mergeCommit, head, target, raises, timeoutMs)
   } catch (error) {
     return partial(
@@ -1038,6 +1250,145 @@ async function writeRootReceipt(
   // A competing identical producer may have won the create-only CAS.
   if ((await readExisting()) !== undefined) return
   throw operationError(root, phase, args, published)
+}
+
+async function nativeMergeHeads(git: GitProcess, root: string, timeoutMs: number): Promise<string[] | undefined> {
+  const path = await required(git, root, ["rev-parse", "--git-path", "MERGE_HEAD"], "observe-native-merge", timeoutMs)
+  let text: string
+  try {
+    text = readFileSync(resolve(root, path), "utf8")
+  } catch (error) {
+    if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") return undefined
+    throw error
+  }
+  const heads = text.trim().split(/\r?\n/u)
+  if (heads.length === 0 || heads.some((head) => !OBJECT_ID.test(head))) {
+    throw new Error(`Malformed native MERGE_HEAD at ${root}; preserve its contents`)
+  }
+  return heads
+}
+
+function pendingRemedy(root: string, pending: NonNullable<SuperMergeResult["pending"]>): string {
+  const command = [
+    "git",
+    "super",
+    "--repo",
+    root,
+    "merge",
+    pending.target,
+    "--continue",
+    "--expected-head",
+    pending.head,
+    "--expected-branch",
+    pending.branch,
+  ]
+    .map(shellQuote)
+    .join(" ")
+  return `Resolve and stage the ordinary conflicts, then run ${command}; or run git -C ${shellQuote(root)} merge --abort.`
+}
+
+function unchangedPending(
+  result: SuperMergeResult,
+  pending: NonNullable<SuperMergeResult["pending"]>,
+): SuperMergeResult {
+  const detail =
+    result.detail === undefined
+      ? undefined
+      : {
+          ...result.detail,
+          message: `${result.detail.message} The pending merge was left as found. ${pendingRemedy(result.repositories[0]?.repository ?? ".", pending)}`,
+        }
+  return {
+    ...result,
+    pending,
+    ...(detail === undefined ? {} : { detail }),
+    repositories: result.repositories.map((row) => ({ ...row, ...(detail === undefined ? {} : { detail }) })),
+  }
+}
+
+/** Child status includes dirty or moved nested checkouts; ignore configuration must not hide them. */
+async function verifyRestingCheckouts(
+  git: GitProcess,
+  root: string,
+  head: string,
+  timeoutMs: number,
+): Promise<GitResultDetail | undefined> {
+  for (const entry of await readCommitSubmodules(git, root, head)) {
+    const child = join(root, entry.path)
+    if (!existsSync(join(child, ".git"))) continue // No checkout exists to move; materialization keeps its existing owner.
+    const observed = await required(git, child, ["rev-parse", "HEAD^{commit}"], "observe-resting-checkout", timeoutMs)
+    const status = await required(
+      git,
+      child,
+      ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none"],
+      "observe-resting-checkout",
+      timeoutMs,
+    )
+    if (observed !== entry.target || status !== "") {
+      return obviousDetail(
+        "merge-resting-checkout-mismatch",
+        `${entry.path} must remain clean at pre-merge HEAD pin ${entry.target}; observed ${observed}${status === "" ? "" : ` with changes ${JSON.stringify(status)}`}.`,
+        `git -C ${shellQuote(child)} status --short`,
+        `Preserve child work and restore ${entry.path} to ${entry.target} before continuing.`,
+        "the caller",
+        { paths: [entry.path], objectIds: [entry.target, observed] },
+      )
+    }
+  }
+  return undefined
+}
+
+async function validateContinuationPins(
+  git: GitProcess,
+  root: string,
+  stagedTree: string,
+  prospective: Readonly<{ tree: string }> | ProspectiveFailure,
+  timeoutMs: number,
+): Promise<GitResultDetail | undefined> {
+  if ("failure" in prospective && prospective.conflict?.tree === undefined) return prospective.failure
+  const referenceTree = "failure" in prospective ? prospective.conflict?.tree : prospective.tree
+  if (referenceTree === undefined) throw new Error("Prospective merge has no reference tree")
+  const requiredPins = new Map(
+    (await readCommitSubmodules(git, root, referenceTree)).map((entry) => [entry.path, [entry.target]]),
+  )
+  if ("failure" in prospective) {
+    for (const entry of prospective.conflict?.entries ?? []) {
+      if (entry.mode !== "160000" || entry.stage === 1) continue
+      const pins = requiredPins.get(entry.path) ?? []
+      if (!pins.includes(entry.oid)) pins.push(entry.oid)
+      requiredPins.set(entry.path, pins)
+    }
+  }
+  const staged = new Map((await readCommitSubmodules(git, root, stagedTree)).map((entry) => [entry.path, entry]))
+  const refusal = (path: string, pin: string | undefined, requiredPins: readonly string[]): GitResultDetail => {
+    const cure =
+      requiredPins.length === 1
+        ? `git -C ${shellQuote(root)} update-index --cacheinfo ${shellQuote(`160000,${requiredPins[0]},${path}`)}`
+        : requiredPins.length === 0
+          ? `git -C ${shellQuote(root)} update-index --force-remove -- ${shellQuote(path)}`
+          : `Merge the required component pins ${requiredPins.join(" and ")}, then git -C ${shellQuote(root)} update-index --cacheinfo ${shellQuote(`160000,<resolved-pin>,${path}`)}`
+    return obviousDetail(
+      "merge-continuation-gitlink-mismatch",
+      `Staged gitlink ${path} is ${pin ?? "absent"}; the prospective merge requires ${requiredPins.join(" and ") || "no gitlink"}. ${cure}`,
+      `git -C ${shellQuote(root)} ls-files --stage -- ${shellQuote(path)}`,
+      cure,
+      "the caller",
+      { paths: [path], objectIds: [...(pin === undefined ? [] : [pin]), ...requiredPins] },
+    )
+  }
+  for (const [path, pins] of requiredPins) {
+    const entry = staged.get(path)
+    if (entry === undefined) return refusal(path, undefined, pins)
+    for (const pin of pins) {
+      if (entry.target === pin) continue
+      const store = await discoverRepository(git, join(root, path), "inspect-continuation-gitlink", true)
+      const contained = await containsCommit(git, store, pin, entry.target, timeoutMs)
+      if (typeof contained === "string") throw new Error(contained)
+      if (!contained) return refusal(path, entry.target, pins)
+    }
+  }
+  for (const [path, entry] of staged) if (!requiredPins.has(path)) return refusal(path, entry.target, [])
+  return undefined
 }
 
 async function prepareSubmoduleCheckouts(

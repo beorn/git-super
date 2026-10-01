@@ -111,10 +111,17 @@ const merge = commandNode<CommandContext, MergeParams, SuperMergeResult>({
       if (input.message !== undefined && typeof input.message !== "string") {
         throw new Error("message must be a string")
       }
+      for (const name of ["expectedHead", "expectedBranch"] as const) {
+        if (input[name] !== undefined && typeof input[name] !== "string") throw new Error(`${name} must be a string`)
+      }
       return {
         commit: input.commit,
         ...(input.message === undefined ? {} : { message: input.message }),
         ...(input.noVerify === true ? { noVerify: true } : {}),
+        ...(input.preserveConflicts === true ? { preserveConflicts: true } : {}),
+        ...(input.continue === true ? { continue: true } : {}),
+        ...(typeof input.expectedHead === "string" ? { expectedHead: input.expectedHead } : {}),
+        ...(typeof input.expectedBranch === "string" ? { expectedBranch: input.expectedBranch } : {}),
         ...(input.noFetch === true ? { noFetch: true } : {}),
         ...(input.unboundedLocalMain === true ? { unboundedLocalMain: true } : {}),
       }
@@ -140,6 +147,10 @@ const merge = commandNode<CommandContext, MergeParams, SuperMergeResult>({
       input.commit,
       ...(input.message === undefined ? [] : ["-m", input.message]),
       ...(input.noVerify === true ? ["--no-verify"] : []),
+      ...(input.preserveConflicts === true ? ["--preserve-conflicts"] : []),
+      ...(input.continue === true ? ["--continue"] : []),
+      ...(input.expectedHead === undefined ? [] : ["--expected-head", input.expectedHead]),
+      ...(input.expectedBranch === undefined ? [] : ["--expected-branch", input.expectedBranch]),
       ...(input.noFetch === true ? ["--no-fetch"] : []),
       ...(input.unboundedLocalMain === true ? ["--unbounded-local-main"] : []),
     ]

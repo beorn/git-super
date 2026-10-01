@@ -1567,6 +1567,35 @@ describe("git super merge", () => {
     expect(git(repository, "rev-parse", "MERGE_HEAD")).toBe(target)
     expect(git(repository, "ls-files", "-u")).toContain("shared.txt")
 
+    // A pending root must be diagnosed before default merge's prospective refusal.
+    const defaultPending = await superMerge({ repo: repository, commit: target })
+    expect(defaultPending).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: { code: "merge-already-pending" },
+      pending: { branch, head, target, unmergedPaths: ["shared.txt"] },
+    })
+    expect(defaultPending.detail?.message).toContain("left as found")
+    // These leases cannot authorize mutation; the ordinary conflict must remain native.
+    for (const [expectedHead, expectedBranch, expectedCode] of [
+      [target, branch, "merge-continuation-lease-mismatch"],
+      [head, "refs/heads/candidate", "merge-continuation-lease-mismatch"],
+      [head, branch, "merge-continuation-unresolved"],
+    ] as const) {
+      const refused = await superMerge({
+        repo: repository,
+        commit: target,
+        continue: true,
+        expectedHead,
+        expectedBranch,
+      })
+      expect(refused).toMatchObject({ state: "failed", partial: false, detail: { code: expectedCode } })
+      expect(refused.detail?.message).toContain("left as found")
+      expect(git(repository, "rev-parse", "HEAD")).toBe(head)
+      expect(git(repository, "rev-parse", "MERGE_HEAD")).toBe(target)
+      expect(git(repository, "ls-files", "-u")).toContain("shared.txt")
+    }
+
     writeFileSync(join(repository, "shared.txt"), "human resolution\n")
     git(repository, "add", "shared.txt")
     const finishedOut = outputSink()

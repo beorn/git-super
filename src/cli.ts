@@ -114,7 +114,7 @@ function inputObjects(command: string, args: readonly string[]): readonly { argu
       if (command === "diff") break // The remaining words are paths, not revisions.
       options = false
     } else if (options && arg.startsWith("-")) {
-      if (["-m", "--message", "-b", "-B"].includes(arg)) index += 1
+      if (["-m", "--message", "-b", "-B", "--expected-head", "--expected-branch"].includes(arg)) index += 1
       else if (
         ![
           "--quiet",
@@ -123,6 +123,8 @@ function inputObjects(command: string, args: readonly string[]): readonly { argu
           "--no-verify",
           "--no-fetch",
           "--unbounded-local-main",
+          "--preserve-conflicts",
+          "--continue",
           "--is-ancestor",
           "--cached",
           "--staged",
@@ -138,7 +140,9 @@ function inputObjects(command: string, args: readonly string[]): readonly { argu
           "-n",
         ].includes(arg) &&
         !arg.startsWith("--force-with-lease=") &&
-        !arg.startsWith("--message=")
+        !arg.startsWith("--message=") &&
+        !arg.startsWith("--expected-head=") &&
+        !arg.startsWith("--expected-branch=")
       ) {
         throw new Error(`implicit ${command} cannot determine input objects for option '${arg}'`)
       }
@@ -353,6 +357,10 @@ async function runInvocation(
     .description(commands.merge.description ?? commands.merge.title)
     .option("-m, --message <message>", "merge commit message")
     .option("--no-verify", "emergency only: bypass ordinary merge and commit hooks")
+    .option("--preserve-conflicts", "leave ordinary conflicts pending on the current branch")
+    .option("--continue", "finish a resolved pending merge using the required caller expectations")
+    .option("--expected-head <oid>", "original HEAD required by --continue")
+    .option("--expected-branch <full-ref>", "original symbolic branch required by --continue")
     .option(
       "--no-fetch",
       "reuse untouched Equal main observations under ten minutes old; fetch moved, unequal or expired mains",
@@ -370,6 +378,10 @@ async function runInvocation(
           commit,
           ...(typeof options.message === "string" ? { message: options.message } : {}),
           ...(options.verify === false ? { noVerify: true } : {}),
+          ...(options.preserveConflicts === true ? { preserveConflicts: true } : {}),
+          ...(options.continue === true ? { continue: true } : {}),
+          ...(typeof options.expectedHead === "string" ? { expectedHead: options.expectedHead } : {}),
+          ...(typeof options.expectedBranch === "string" ? { expectedBranch: options.expectedBranch } : {}),
           ...(options.fetch === false ? { noFetch: true } : {}),
           ...(options.unboundedLocalMain === true ? { unboundedLocalMain: true } : {}),
         },
