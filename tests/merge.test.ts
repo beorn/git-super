@@ -1643,6 +1643,28 @@ describe("git super merge", () => {
     const pullOut = outputSink()
     expect(await runCli(["--repo", repository, "--json", "pull", "--ff-only"], pullOut, outputSink())).toBe(0)
     expect(JSON.parse(pullOut.output)).toMatchObject({ state: "unchanged", partial: false })
+    // A remote advance must refuse with native conflict state intact, rather
+    // than letting the equal-target no-op stand in for pending-root coverage.
+    const remoteWork = join(fixtureRoot, "remote-work")
+    git(repository, "clone", "-q", upstream, remoteWork)
+    advanceRepository(remoteWork, "remote.txt", "remote advance\n")
+    git(remoteWork, "push", "-q", "origin", "main")
+    const stagesBeforePull = git(repository, "ls-files", "-u")
+    const advancedPullOut = outputSink()
+    const advancedPullCode = await runCli(
+      ["--repo", repository, "--json", "pull", "--ff-only"],
+      advancedPullOut,
+      outputSink(),
+    )
+    expect(advancedPullCode, advancedPullOut.output).not.toBe(0)
+    expect(JSON.parse(advancedPullOut.output)).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: { code: "git-failed", phase: "preflight-tree-transition" },
+    })
+    expect(git(repository, "rev-parse", "HEAD")).toBe(head)
+    expect(git(repository, "rev-parse", "MERGE_HEAD")).toBe(target)
+    expect(git(repository, "ls-files", "-u")).toBe(stagesBeforePull)
     const pushOut = outputSink()
     expect(
       await runCli(
@@ -3562,6 +3584,13 @@ describe("git super merge — a diverged gitlink the merge composes", () => {
       const result = await superMerge({ repo: fixture.product, commit: candidate, preserveConflicts })
       expect(result).toMatchObject({ state: "failed", partial: false, detail: { code: "merge-conflict" } })
       expect(result.detail?.paths).toEqual(expect.arrayContaining(["root.txt", "packages/alpha"]))
+      if (preserveConflicts) {
+        expect(result.detail?.message).toContain(
+          '--preserve-conflicts was declined because gitlink paths conflict: "packages/alpha"; nothing was preserved.',
+        )
+      } else {
+        expect(result.detail?.message).not.toContain("--preserve-conflicts was declined")
+      }
       expect(git(fixture.product, "rev-parse", "HEAD")).toBe(head)
       expect(git(fixture.product, "ls-files", "--stage", "-z")).toBe(index)
       expect(git(submodule, "rev-parse", "HEAD")).toBe(ours)
@@ -4001,6 +4030,8 @@ describe("git super merge — bounded reuse of untouched Equal child mains (2562
       state: "failed",
       detail: { code: "unbounded-local-main-requires-no-fetch" },
     })
+    expect(invalid.detail?.evidence).toBe("Pass both options together, or omit --unbounded-local-main.")
+    expect(invalid.detail?.next).toBe("Rerun with --no-fetch when local Equal classification is intended.")
     const alpha = join(fixture.product, "packages/alpha")
     const before = git(alpha, "reflog", "show", "-1", "--format=%H%x00%gs", "refs/remotes/origin/main")
     const local = createLocalGitProcess()

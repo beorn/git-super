@@ -375,10 +375,18 @@ async function mergeUnderLock(
       return refuse("merge-already-pending", "A native merge is already pending.")
     }
     if (options.unboundedLocalMain && !options.noFetch) {
-      return refuse(
-        "unbounded-local-main-requires-no-fetch",
-        "git super merge --unbounded-local-main requires --no-fetch.",
+      const result = failed(
+        root,
+        [],
+        obviousDetail(
+          "unbounded-local-main-requires-no-fetch",
+          "git super merge --unbounded-local-main requires --no-fetch.",
+          "Pass both options together, or omit --unbounded-local-main.",
+          "Rerun with --no-fetch when local Equal classification is intended.",
+          "the caller",
+        ),
       )
+      return pending === undefined ? result : unchangedPending(result, pending)
     }
     if (options.preserveConflicts && options.continue) {
       return refuse("merge-modes-exclusive", "--preserve-conflicts and --continue are mutually exclusive.")
@@ -621,7 +629,19 @@ async function mergeObserved(
       prospective.conflict === undefined
         ? undefined
         : await composeDivergedGitlinks(git, root, head, target, prospective.conflict, options.message, timeoutMs)
-    if (composition === undefined) return failed(root, [], prospective.failure)
+    if (composition === undefined) {
+      const gitlinkPaths = [
+        ...new Set(prospective.conflict?.entries.filter((entry) => entry.mode === "160000").map((entry) => entry.path)),
+      ]
+      const failure =
+        options.preserveConflicts && gitlinkPaths.length > 0
+          ? {
+              ...prospective.failure,
+              message: `${prospective.failure.message} --preserve-conflicts was declined because gitlink paths conflict: ${gitlinkPaths.map((path) => JSON.stringify(path)).join(", ")}; nothing was preserved.`,
+            }
+          : prospective.failure
+      return failed(root, [], failure)
+    }
     if ("failure" in composition) return failed(root, [], composition.failure)
     tree = composition.tree
     composed = composition.composed
