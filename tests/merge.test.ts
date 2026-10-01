@@ -1797,7 +1797,7 @@ describe("git super merge", () => {
     writeFileSync(rootFile, "base\n")
     git(fixture.product, "add", "shared.txt")
     git(fixture.product, "commit", "-q", "-m", "root conflict base")
-    const child = join(fixture.product, "packages/alpha")
+    const child = join(fixtureRoot, "product", "packages/alpha")
     const advanced = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
     git(child, "fetch", "-q", "origin")
     git(fixture.product, "switch", "-q", "-c", "candidate-pins")

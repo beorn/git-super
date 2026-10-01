@@ -465,7 +465,11 @@ async function mergeUnderLock(
             detail.evidence ?? `git -C ${shellQuote(root)} status --short`,
             pendingRemedy(root, pending),
             undefined,
-            { phase: detail.phase, paths: detail.paths, objectIds: detail.objectIds },
+            {
+              phase: detail.phase,
+              ...(detail.paths === undefined ? {} : { paths: detail.paths }),
+              ...(detail.objectIds === undefined ? {} : { objectIds: detail.objectIds }),
+            },
           ),
     )
     return pending === undefined ? result : unchangedPending(result, pending)
