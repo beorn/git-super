@@ -93,7 +93,7 @@ Its additive `steps` rows time the merge's phases as `{ "name", "ms" }`, in the 
 | `capture`    | the `Settled:` trailers and the frozen push intent                                                                                  |
 | `checkouts`  | preparing affected submodule checkouts and proving the worktree clean                                                               |
 | `merge`      | the native no-ff merge and the gitlink raises                                                                                       |
-| `initialize` | materializing added submodules at staged index pins before existing checkouts move |
+| `initialize` | materializing added submodules at staged index pins before existing checkouts move                                                  |
 | `settle`     | checking affected submodules out at their staged pins                                                                               |
 | `commit`     | the concluding commit, its hooks, and the root receipt                                                                              |
 
