@@ -1,11 +1,20 @@
 import { join } from "node:path"
-import type { ConsultedRepository } from "./diff.ts"
-import { gitError, repositoryRoot, runGit, tryGit } from "./git.ts"
+import type { ConsultedRepository, NotCompared } from "./diff.ts"
+import {
+  gitError,
+  isSubmoduleExcluded,
+  probeRepository,
+  repositoryRoot,
+  runGit,
+  tryGit,
+  validateExcludedSubmodules,
+} from "./git.ts"
 
 export type SuperIsAncestorOptions = Readonly<{
   repo: string
   ancestor: string
   descendant: string
+  excludedSubmodules?: readonly string[]
 }>
 
 export type SuperIsAncestorResult = Readonly<{
@@ -13,6 +22,7 @@ export type SuperIsAncestorResult = Readonly<{
   owningRepository: string
   comparedTo: string
   consultedRepositories: readonly ConsultedRepository[]
+  notCompared: readonly NotCompared[]
 }>
 
 type TreeGitlink = Readonly<{ path: string; pin: string }>
@@ -80,6 +90,7 @@ function treeGitlinks(root: string, ref: string): TreeGitlink[] {
 }
 
 export function superIsAncestor(options: SuperIsAncestorOptions): SuperIsAncestorResult {
+  validateExcludedSubmodules(options.excludedSubmodules)
   const root = repositoryRoot(options.repo)
   const consultedRepositories: ConsultedRepository[] = [{ path: ".", root }]
 
@@ -87,6 +98,7 @@ export function superIsAncestor(options: SuperIsAncestorOptions): SuperIsAncesto
   const ancestor = resolveAncestorInRoot(root, options.ancestor)
   const spelled = ancestor === options.ancestor ? ancestor : `${options.ancestor} (${ancestor})`
   const owners: Array<{ path: string; root: string; target: string }> = []
+  const notCompared: NotCompared[] = []
   // The superproject is a CANDIDATE owner, never an automatic one. Returning
   // here on object presence alone is the defect this replaces: a submodule sha
   // sitting in the root store resolved to ".", compared an unrelated history
@@ -98,10 +110,35 @@ export function superIsAncestor(options: SuperIsAncestorOptions): SuperIsAncesto
     owners.push({ path: ".", root, target: options.descendant })
   }
   for (const gitlink of treeGitlinks(root, options.descendant)) {
-    const nestedRoot = repositoryRoot(join(root, gitlink.path))
-    consultedRepositories.push({ path: gitlink.path, root: nestedRoot, to: gitlink.pin })
-    if (!objectExists(nestedRoot, ancestor)) continue
-    owners.push({ path: gitlink.path, root: nestedRoot, target: gitlink.pin })
+    if (isSubmoduleExcluded(gitlink.path, options.excludedSubmodules)) {
+      notCompared.push({ path: gitlink.path, reason: "excluded", message: "component excluded, not compared" })
+      continue
+    }
+    try {
+      const child = join(root, gitlink.path)
+      const nestedRoot = repositoryRoot(child)
+      if (probeRepository(nestedRoot, runGit(child, ["rev-parse", "--show-prefix"])).kind === "absent") {
+        throw new Error(`not initialized; initialize ${gitlink.path} before searching its commit ownership`)
+      }
+      if (!objectExists(nestedRoot, gitlink.pin)) {
+        throw new Error(`comparison pin ${gitlink.pin} is unreadable in ${nestedRoot}`)
+      }
+      consultedRepositories.push({ path: gitlink.path, root: nestedRoot, to: gitlink.pin })
+      if (!objectExists(nestedRoot, ancestor)) continue
+      owners.push({ path: gitlink.path, root: nestedRoot, target: gitlink.pin })
+    } catch (error) {
+      notCompared.push({
+        path: gitlink.path,
+        reason: "unreadable",
+        objectIds: [gitlink.pin],
+        message: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }
+  if (notCompared.some(({ reason }) => reason === "unreadable")) {
+    throw new Error(
+      `git super: ancestry unknown for ${spelled}; searched ${root} and included components:\n${notCompared.map(({ path, message }) => `${path}: ${message}`).join("\n")}`,
+    )
   }
   if (owners.length === 0) {
     // The breadcrumb for the case that used to answer silently and wrongly.
@@ -127,5 +164,6 @@ export function superIsAncestor(options: SuperIsAncestorOptions): SuperIsAncesto
     owningRepository: owner.path,
     comparedTo: owner.target,
     consultedRepositories,
+    notCompared,
   }
 }

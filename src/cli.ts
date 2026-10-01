@@ -589,6 +589,12 @@ async function runInvocation(
   program
     .command("status")
     .description(commands.status.description ?? commands.status.title)
+    .option(
+      "--exclude-submodule <path>",
+      "exclude a literal root-relative submodule and descendants before content access",
+      (value: string, previous: string[]) => [...previous, value],
+      [],
+    )
     .option("--porcelain", "emit stable machine-readable status")
     .option("-z, --null", "terminate records with NUL instead of newline")
     .option("--index-file <absolute-path>", "hook context: the index git will commit (root repository only)")
@@ -596,7 +602,10 @@ async function runInvocation(
       const globals = command.optsWithGlobals() as { repo: string; json?: boolean }
       captured = {
         node: commands.status,
-        params: options.indexFile === undefined ? {} : { indexFile: options.indexFile },
+        params: {
+          ...(options.indexFile === undefined ? {} : { indexFile: options.indexFile }),
+          ...(options.excludeSubmodule?.length ? { excludedSubmodules: options.excludeSubmodule } : {}),
+        },
         json: globals.json === true,
         nul: options.null === true,
       }
@@ -605,14 +614,24 @@ async function runInvocation(
   program
     .command("merge-base")
     .description(commands["merge-base"].description ?? commands["merge-base"].title)
+    .option(
+      "--exclude-submodule <path>",
+      "exclude a literal root-relative submodule and descendants before content access",
+      (value: string, previous: string[]) => [...previous, value],
+      [],
+    )
     .requiredOption("--is-ancestor", "test whether the first commit is an ancestor of the second")
     .argument("<ancestor>", "commit whose owning repository should be discovered")
     .argument("<descendant>", "commit or superproject ref to compare")
-    .action((ancestor, descendant, _options, command) => {
+    .action((ancestor, descendant, options, command) => {
       const globals = command.optsWithGlobals() as { repo: string; json?: boolean }
       captured = {
         node: commands["merge-base"],
-        params: { ancestor, descendant },
+        params: {
+          ancestor,
+          descendant,
+          ...(options.excludeSubmodule?.length ? { excludedSubmodules: options.excludeSubmodule } : {}),
+        },
         json: globals.json === true,
         nul: false,
       }
@@ -703,6 +722,12 @@ async function writeResult(
   stderr: OutputSink,
   nodes: typeof commands,
 ): Promise<void> {
+  if (captured.node === nodes.diff || captured.node === nodes.status || captured.node === nodes["merge-base"]) {
+    for (const observation of (result as SuperDiffResult | SuperStatusResult | SuperIsAncestorResult).notCompared) {
+      stderr.write(`${observation.path}: ${observation.message}\n`)
+      if (observation.remedy !== undefined) stderr.write(`${observation.remedy}\n`)
+    }
+  }
   if (captured.node === nodes.status) {
     for (const problem of (result as SuperStatusResult).submoduleProblems) {
       stderr.write(
@@ -714,10 +739,6 @@ async function writeResult(
     stdout.write(stableJson(result))
   } else if (captured.node === nodes.diff) {
     const diff = result as SuperDiffResult
-    for (const observation of diff.notCompared) {
-      stderr.write(`${observation.path}: ${observation.message}\n`)
-      if (observation.remedy !== undefined) stderr.write(`${observation.remedy}\n`)
-    }
     if (diff.paths.length > 0) {
       stdout.write(`${diff.paths.join(captured.nul ? "\0" : "\n")}${captured.nul ? "\0" : "\n"}`)
     }

@@ -13,7 +13,7 @@ import { superPull, type SuperPullOptions } from "./pull.ts"
 import { superPush, type SuperPushOptions } from "./push.ts"
 import type { GitSuperResult } from "./result.ts"
 import { shellQuote } from "./shell-command.ts"
-import { superStatus, type SuperStatusResult } from "./status.ts"
+import { superStatus, type SuperStatusOptions, type SuperStatusResult } from "./status.ts"
 import {
   superSubmodulePrepare,
   type SuperSubmodulePrepareOptions,
@@ -24,7 +24,7 @@ import { superWorktreeRemove, type SuperWorktreeRemoveOptions } from "./worktree
 
 export type CommandContext = Readonly<{ repo: string; report?: (message: string) => void }>
 export type DiffParams = Omit<SuperDiffOptions, "repo">
-export type StatusParams = Readonly<{ indexFile?: string }>
+export type StatusParams = Omit<SuperStatusOptions, "repo">
 export type MergeBaseParams = Omit<SuperIsAncestorOptions, "repo">
 export type MergeParams = Omit<SuperMergeOptions, "repo" | "git" | "exclusive" | "report">
 export type PullParams = Omit<SuperPullOptions, "repo" | "git" | "exclusive" | "report"> & { progress?: boolean }
@@ -80,7 +80,12 @@ const status = commandNode<CommandContext, StatusParams, SuperStatusResult>({
     if (input.indexFile !== undefined && typeof input.indexFile !== "string") {
       throw new Error("indexFile must be a string")
     }
-    return input.indexFile === undefined ? {} : { indexFile: input.indexFile as string }
+    return {
+      ...(input.indexFile === undefined ? {} : { indexFile: input.indexFile as string }),
+      ...(input.excludedSubmodules === undefined
+        ? {}
+        : { excludedSubmodules: stringArray(input.excludedSubmodules, "excludedSubmodules") }),
+    }
   }),
   run: (context, input) => superStatus({ repo: context.repo, ...input }),
 })
@@ -94,7 +99,13 @@ const mergeBase = commandNode<CommandContext, MergeBaseParams, SuperIsAncestorRe
       if (typeof input.ancestor !== "string" || typeof input.descendant !== "string") {
         throw new Error("ancestor and descendant must be strings")
       }
-      return { ancestor: input.ancestor, descendant: input.descendant }
+      return {
+        ancestor: input.ancestor,
+        descendant: input.descendant,
+        ...(input.excludedSubmodules === undefined
+          ? {}
+          : { excludedSubmodules: stringArray(input.excludedSubmodules, "excludedSubmodules") }),
+      }
     },
     (value) => {
       const input = typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {}

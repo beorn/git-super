@@ -1,7 +1,20 @@
 /**
  * @reach fs-walk <fixture-only: runCli and CLI entry read mkdtempSync(tmpdir()) Git repos>
  */
-import { afterEach, describe, expect, test } from "vitest"
+import { afterEach, describe, expect, test, vi } from "vitest"
+import childProcess from "node:child_process"
+import fileSystem from "node:fs"
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process") & { default: typeof childProcess }>()
+  return { ...actual, spawnSync: (...args: Parameters<typeof actual.spawnSync>) => actual.default.spawnSync(...args) }
+})
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs") & { default: typeof fileSystem }>()
+  return {
+    ...actual,
+    readFileSync: (...args: Parameters<typeof actual.readFileSync>) => actual.default.readFileSync(...args),
+  }
+})
 import { copyFileSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -36,6 +49,93 @@ function outputSink(): { output: string; write(value: string): void } {
 }
 
 describe("Phase 1 read commands", () => {
+  /**
+   * @failure Status or ancestry enters an explicitly excluded Git store (#27058 AC3).
+   * @level l1
+   * @consumer git super status and merge-base, including CLI selection and narration
+   * @testonly none
+   */
+  test.each(["status", "ancestry"] as const)("%s excludes component content before access", async (kind) => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-read-exclusion-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    writeFileSync(join(fixture.product, "vendor/beta/beta.ts"), "included dirt\n")
+    const excluded = join(fixture.product, "packages/alpha")
+    const originalSpawn = childProcess.spawnSync
+    const originalRead = fileSystem.readFileSync
+    const spawn = vi.spyOn(childProcess, "spawnSync").mockImplementation((command, args, options) => {
+      if (
+        Array.isArray(args) &&
+        args[0] === "-C" &&
+        typeof args[1] === "string" &&
+        (args[1] === excluded || args[1].startsWith(`${excluded}/`))
+      ) {
+        throw new Error(`excluded Git content accessed: ${args.join(" ")}`)
+      }
+      return originalSpawn(command, args, options)
+    })
+    const read = vi.spyOn(fileSystem, "readFileSync").mockImplementation((path, options) => {
+      if (String(path).startsWith(`${excluded}/`)) throw new Error(`excluded file content accessed: ${path}`)
+      return originalRead(path, options)
+    })
+    try {
+      const selection = { excludedSubmodules: ["packages/alpha"] }
+      const result =
+        kind === "status"
+          ? superStatus({ repo: fixture.product, ...selection })
+          : superIsAncestor({ repo: fixture.product, ancestor: fixture.productBase, descendant: "HEAD", ...selection })
+      expect(result).toMatchObject({ notCompared: [{ path: "packages/alpha", reason: "excluded" }] })
+      expect(result.consultedRepositories.map(({ path }) => path)).toEqual([".", "vendor/beta"])
+      if (kind === "status") expect((result as SuperStatusResult).records).toEqual([" M vendor/beta/beta.ts"])
+      else expect(result).toMatchObject({ isAncestor: true, owningRepository: "." })
+      expect(spawn.mock.calls.length).toBeGreaterThan(0)
+      const stdout = outputSink()
+      const stderr = outputSink()
+      const args = kind === "status" ? ["status"] : ["merge-base", "--is-ancestor", fixture.productBase, "HEAD"]
+      expect(
+        await runCli(
+          ["--repo", fixture.product, "--json", ...args, "--exclude-submodule", "packages/alpha"],
+          stdout,
+          stderr,
+        ),
+      ).toBe(0)
+      expect(JSON.parse(stdout.output)).toMatchObject({
+        notCompared: [expect.objectContaining({ path: "packages/alpha", reason: "excluded" })],
+      })
+      expect(stderr.output).toContain("packages/alpha: component excluded, not compared")
+    } finally {
+      spawn.mockRestore()
+      read.mockRestore()
+    }
+  })
+
+  /**
+   * @failure Discovery from empty child directories invents a parent owner instead of unknown ancestry (#27058).
+   * @level l1
+   * @consumer git super merge-base --is-ancestor
+   * @testonly none
+   */
+  test("ancestry refuses every uninitialized searched component without inventing parent owners", async () => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-empty-ancestry-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    git(fixture.product, "submodule", "deinit", "-f", "--all")
+    const stdout = outputSink()
+    const stderr = outputSink()
+    expect(
+      await runCli(
+        ["--repo", fixture.product, "--json", "merge-base", "--is-ancestor", fixture.productBase, "HEAD"],
+        stdout,
+        stderr,
+      ),
+    ).toBe(2)
+    expect(stdout.output).toBe("")
+    expect(stderr.output).toContain("ancestry unknown")
+    expect(stderr.output).toContain("packages/alpha")
+    expect(stderr.output).toContain("vendor/beta")
+    expect(stderr.output).not.toContain("ambiguous")
+  })
+
   // Gate A: existing extension calls use --repo/--json and formatted results.
   // Native callers need unchanged syntax even for names already registered here.
   test("plain repository calls, including registered names, match native Git bytes", async () => {
