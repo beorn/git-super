@@ -1596,7 +1596,7 @@ describe("git super merge", () => {
     // truthful no-op; push publishes the explicitly selected HEAD, not the index.
     const statusOut = outputSink()
     expect(await runCli(["--repo", repository, "--json", "status"], statusOut, outputSink())).toBe(0)
-    expect(JSON.parse(statusOut.output).records).toContain("UU shared.txt")
+    expect(JSON.parse(statusOut.output)).toMatchObject({ records: expect.arrayContaining(["UU shared.txt"]) })
     const pullOut = outputSink()
     expect(await runCli(["--repo", repository, "--json", "pull", "--ff-only"], pullOut, outputSink())).toBe(0)
     expect(JSON.parse(pullOut.output)).toMatchObject({ state: "unchanged", partial: false })
