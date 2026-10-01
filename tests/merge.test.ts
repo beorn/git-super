@@ -104,6 +104,56 @@ function candidateWithRootChange(fixture: ProductFixture, name: string): string 
 
 describe("git super merge", () => {
   /**
+   * @failure A merge adds a gitlink but leaves its prepared store without a checkout before the concluding commit hook (26988).
+   * @level l1
+   * @consumer git-super merge and authoring hooks
+   * @testonly none
+   */
+  it("initializes an added gitlink at its pin before the concluding commit hook (26988)", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-added-"))
+    roots.push(fixtureRoot)
+    const fixture = createLocalProductFixture(fixtureRoot)
+    const checkout = join(fixtureRoot, "checkout")
+    git(
+      fixtureRoot,
+      "-c",
+      "protocol.file.allow=always",
+      "clone",
+      "-q",
+      "--recurse-submodules",
+      fixture.product,
+      checkout,
+    )
+    git(checkout, "switch", "-q", "-c", "task/added-gitlink")
+    const gamma = join(fixtureRoot, "gamma")
+    const gammaPin = createRepository(gamma, "gamma.ts", "export const gamma = 1\n")
+    git(fixture.product, "-c", "protocol.file.allow=always", "submodule", "add", "-q", gamma, "vendor/gamma")
+    git(fixture.product, "commit", "-q", "-m", "main adds gamma")
+    git(checkout, "fetch", "-q", "origin")
+    // The frozen push intent requires hosted root identity; transport stays in the existing local fixture.
+    const rootUrl = "https://git-super.test/owned/product.git"
+    git(checkout, "remote", "set-url", "origin", rootUrl)
+    git(checkout, "config", `url.${fixture.product}.insteadOf`, rootUrl)
+    const hook = join(checkout, ".git/hooks/pre-commit")
+    writeFileSync(
+      hook,
+      "#!/bin/sh\nif ! test -e vendor/gamma/.git; then echo 'added gitlink checkout missing before commit' >&2; exit 1; fi\n",
+    )
+    chmodSync(hook, 0o755)
+    vi.stubEnv("GIT_CONFIG_COUNT", "1")
+    vi.stubEnv("GIT_CONFIG_KEY_0", "protocol.file.allow")
+    vi.stubEnv("GIT_CONFIG_VALUE_0", "always")
+    try {
+      const result = await superMerge({ repo: checkout, commit: "origin/main" })
+      expect(result.detail).toBeUndefined()
+      expect(result.state).toBe("updated")
+      expect(git(join(checkout, "vendor/gamma"), "rev-parse", "HEAD")).toBe(gammaPin)
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  })
+
+  /**
    * @failure A submit's candidate merge gives up after 30 s while the queue's merge still holds the writer lock (25274).
    * @level l1
    * @consumer Yrd submit candidate verification
