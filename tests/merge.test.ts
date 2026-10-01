@@ -14,6 +14,7 @@ import { decodePushIntent, PUSH_INTENT_TRAILER } from "../src/push-intent.ts"
 import { SUPER_MERGE_STEPS, superMerge } from "../src/merge.ts"
 import { superWorktreeAdd } from "../src/worktree-add.ts"
 import { createLocalGitProcess, type GitProcess } from "../src/process.ts"
+import { materializeSubmodulesWithProcess } from "../src/submodules.ts"
 import type { GitResultDetail } from "../src/result.ts"
 import {
   addNestedAlphaSubmodule,
@@ -113,6 +114,7 @@ describe("git super merge", () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-added-"))
     roots.push(fixtureRoot)
     const fixture = createProductFixture(fixtureRoot)
+    const primary = join(fixtureRoot, "primary")
     const checkout = join(fixtureRoot, "checkout")
     const gamma = join(fixtureRoot, "gamma")
     const gammaPin = createRepository(gamma, "gamma.ts", "export const gamma = 1\n")
@@ -132,18 +134,43 @@ describe("git super merge", () => {
       vi.stubEnv(`GIT_CONFIG_VALUE_${index}`, value)
     }
     try {
-      git(fixtureRoot, "clone", "-q", "--recurse-submodules", rootUrl, checkout)
-      git(checkout, "switch", "-q", "-c", "task/added-gitlink")
+      git(fixtureRoot, "clone", "-q", "--recurse-submodules", rootUrl, primary)
+      git(primary, "worktree", "add", "-q", "-b", "task/added-gitlink", checkout, "HEAD")
+      const initial = await materializeSubmodulesWithProcess(createLocalGitProcess(), {
+        worktree: checkout,
+        referenceWorktree: primary,
+      })
+      expect(initial).toMatchObject({ code: 0, considered: 2, borrowed: 2, remoteFallbacks: 0, unreferenced: 0 })
       git(fixture.product, "submodule", "add", "-q", gammaUrl, "vendor/gamma")
       git(fixture.product, "commit", "-q", "-m", "main adds gamma")
       git(checkout, "fetch", "-q", "origin")
-      const hook = join(checkout, ".git/hooks/pre-commit")
+      const hook = git(checkout, "rev-parse", "--path-format=absolute", "--git-path", "hooks/pre-commit")
       writeFileSync(
         hook,
         "#!/bin/sh\nif ! test -e vendor/gamma/.git; then echo 'added gitlink checkout missing before commit' >&2; exit 1; fi\n",
       )
       chmodSync(hook, 0o755)
       const result = await superMerge({ repo: checkout, commit: "origin/main" })
+      // CTO0093c0db: measure the existing owner against the linked worktree's staged addition.
+      const materialized = await materializeSubmodulesWithProcess(createLocalGitProcess(), {
+        worktree: checkout,
+        referenceWorktree: primary,
+        paths: ["vendor/gamma"],
+      })
+      const common = git(checkout, "rev-parse", "--path-format=absolute", "--git-common-dir")
+      expect
+        .soft({
+          stagedPin: git(checkout, "rev-parse", ":vendor/gamma"),
+          primaryCheckoutPresent: existsSync(join(primary, "vendor/gamma/.git")),
+          preparedStorePin: git(join(common, "modules/vendor/gamma"), "rev-parse", `${gammaPin}^{commit}`),
+          materialized,
+        })
+        .toMatchObject({
+          stagedPin: gammaPin,
+          primaryCheckoutPresent: false,
+          preparedStorePin: gammaPin,
+          materialized: { code: 0, considered: 1, borrowed: 1, remoteFallbacks: 0, unreferenced: 0 },
+        })
       expect(result.detail).toBeUndefined()
       expect(result.state).toBe("updated")
       expect(git(join(checkout, "vendor/gamma"), "rev-parse", "HEAD")).toBe(gammaPin)
