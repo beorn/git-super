@@ -1190,6 +1190,26 @@ describe("git super merge", () => {
     // The recovery names each staged pin that differs from HEAD, and where to move it (25807 row 2).
     expect(result.detail?.next).toContain(`packages/alpha to ${newestAlpha}`)
     expect(result.detail?.next).toContain(`vendor/beta to ${newestBeta}`)
+
+    // CTO correction 3: hook rejection and explicit conflict entry share the
+    // same resting state and the same continuation owner, including nested pins.
+    writeFileSync(hook, "#!/bin/sh\nexit 0\n")
+    const finished = await superMerge({
+      repo: fixture.product,
+      commit: candidate,
+      continue: true,
+      expectedHead: headBefore,
+      expectedBranch: "refs/heads/main",
+    })
+    expect(finished).toMatchObject({ state: "updated", partial: false })
+    expect(git(fixture.product, "show", "-s", "--format=%P", "HEAD")).toBe(`${headBefore} ${candidate}`)
+    expect(git(submodule, "rev-parse", "HEAD")).toBe(newestAlpha)
+    expect(git(leafCheckout, "rev-parse", "HEAD")).toBe(newestLeaf)
+    expect(git(betaSubmodule, "rev-parse", "HEAD")).toBe(newestBeta)
+    // Raises already staged by the rejected invocation are not new automatic writes.
+    expect(existsSync(join(fixture.product, ".git", "refs", "git-super", "receipts", finished.commit ?? ""))).toBe(
+      false,
+    )
   })
 
   it("gives the concluding commit the merge's commit budget rather than one plumbing call's, so a slow hook completes", async () => {
@@ -1598,6 +1618,23 @@ describe("git super merge", () => {
 
     writeFileSync(join(repository, "shared.txt"), "human resolution\n")
     git(repository, "add", "shared.txt")
+    const mergeHeadPath = git(repository, "rev-parse", "--path-format=absolute", "--git-path", "MERGE_HEAD")
+    const expectations = {
+      repo: repository,
+      commit: target,
+      continue: true,
+      expectedHead: head,
+      expectedBranch: branch,
+    }
+    for (const nativeHeads of [`${head}\n`, `${target}\n${head}\n`]) {
+      writeFileSync(mergeHeadPath, nativeHeads)
+      const refused = await superMerge(expectations)
+      expect(refused).toMatchObject({ state: "failed", partial: false })
+      expect(refused.detail?.code).toMatch(/^merge-continuation-(target|lease)-mismatch$/u)
+      expect(readFileSync(mergeHeadPath, "utf8")).toBe(nativeHeads)
+      expect(git(repository, "show", ":shared.txt")).toBe("human resolution")
+    }
+    writeFileSync(mergeHeadPath, `${target}\n`)
     const finishedOut = outputSink()
     const finishedErr = outputSink()
     expect(
@@ -1624,6 +1661,137 @@ describe("git super merge", () => {
     expect(git(repository, "show", "-s", "--format=%P", "HEAD")).toBe(`${head} ${target}`)
     expect(git(repository, "ls-files", "-u")).toBe("")
     expect(git(repository, "status", "--porcelain=v1")).toBe("")
+  })
+
+  /**
+   * @failure git add -A silently lowers a merged pin, or continuation overwrites moved/dirty child work (26988).
+   * @level l1
+   * @consumer Callers resolving a root conflict with an independently advanced gitlink
+   * @testonly none
+   * Default conflict-refusal coverage never exposes an index ahead of its resting checkout.
+   */
+  it("validates staged pins and resting checkouts before continuing an ordinary conflict (26988)", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-continue-pins-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const rootFile = join(fixture.product, "shared.txt")
+    writeFileSync(rootFile, "base\n")
+    git(fixture.product, "add", "shared.txt")
+    git(fixture.product, "commit", "-q", "-m", "root conflict base")
+    const child = join(fixture.product, "packages/alpha")
+    const advanced = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
+    git(child, "fetch", "-q", "origin")
+    git(fixture.product, "switch", "-q", "-c", "candidate-pins")
+    git(fixture.product, "update-index", "--cacheinfo", `160000,${advanced},packages/alpha`)
+    writeFileSync(rootFile, "candidate\n")
+    git(fixture.product, "add", "shared.txt")
+    git(fixture.product, "commit", "-q", "-m", "advance pin and root content")
+    const target = git(fixture.product, "rev-parse", "HEAD")
+    git(fixture.product, "switch", "-q", "main")
+    writeFileSync(rootFile, "main\n")
+    git(fixture.product, "commit", "-q", "-am", "main content")
+    const head = git(fixture.product, "rev-parse", "HEAD")
+    expect(await superMerge({ repo: fixture.product, commit: target, preserveConflicts: true })).toMatchObject({
+      state: "failed",
+      partial: true,
+    })
+    expect(git(child, "rev-parse", "HEAD")).toBe(fixture.alphaBase)
+    expect(git(fixture.product, "rev-parse", ":packages/alpha")).toBe(advanced)
+    // The implicit form recognizes extension flags before its existing topology refusal.
+    const implicitOut = outputSink()
+    const implicitErr = outputSink()
+    expect(
+      await runCli(
+        [
+          "-C",
+          fixture.product,
+          "merge",
+          target,
+          "--continue",
+          "--expected-head",
+          head,
+          "--expected-branch",
+          "refs/heads/main",
+        ],
+        implicitOut,
+        implicitErr,
+      ),
+    ).toBe(2)
+    expect(implicitErr.output).toContain(`explicit git-super --repo ${fixture.product}`)
+    expect(implicitErr.output).not.toContain("cannot determine input objects for option")
+    writeFileSync(rootFile, "human resolution\n")
+    git(fixture.product, "add", "-A")
+    expect(git(fixture.product, "rev-parse", ":packages/alpha")).toBe(fixture.alphaBase)
+    const options = {
+      repo: fixture.product,
+      commit: target,
+      continue: true,
+      expectedHead: head,
+      expectedBranch: "refs/heads/main",
+    }
+    const stale = await superMerge(options)
+    expect(stale).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: { code: "merge-continuation-gitlink-mismatch", paths: ["packages/alpha"] },
+    })
+    expect(stale.detail?.message).toContain(fixture.alphaBase)
+    expect(stale.detail?.message).toContain(advanced)
+    expect(stale.detail?.next).toContain(`160000,${advanced},packages/alpha`)
+    expect(git(fixture.product, "rev-parse", ":packages/alpha")).toBe(fixture.alphaBase)
+    git(fixture.product, "update-index", "--cacheinfo", `160000,${advanced},packages/alpha`)
+
+    git(child, "checkout", "-q", "--detach", advanced)
+    const moved = await superMerge(options)
+    expect(moved).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: { code: "merge-resting-checkout-mismatch" },
+    })
+    expect(git(child, "rev-parse", "HEAD")).toBe(advanced)
+    git(child, "checkout", "-q", "--detach", fixture.alphaBase)
+    const childFile = join(child, "alpha.ts")
+    const childBytes = readFileSync(childFile, "utf8")
+    writeFileSync(childFile, "private child work\n")
+    const dirty = await superMerge(options)
+    expect(dirty).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: { code: "merge-resting-checkout-mismatch" },
+    })
+    expect(readFileSync(childFile, "utf8")).toBe("private child work\n")
+    writeFileSync(childFile, childBytes)
+
+    // A syntactically valid staged descriptor cannot introduce a gitlink absent from this merge.
+    const modules = readFileSync(join(fixture.product, ".gitmodules"), "utf8")
+    git(fixture.product, "config", "--file", ".gitmodules", "submodule.extra.path", "vendor/extra")
+    git(
+      fixture.product,
+      "config",
+      "--file",
+      ".gitmodules",
+      "submodule.extra.url",
+      "https://git-super.test/owned/beta.git",
+    )
+    git(fixture.product, "add", ".gitmodules")
+    git(fixture.product, "update-index", "--add", "--cacheinfo", `160000,${fixture.betaBase},vendor/extra`)
+    const extra = await superMerge(options)
+    expect(extra).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: { code: "merge-continuation-gitlink-mismatch", paths: ["vendor/extra"] },
+    })
+    expect(git(fixture.product, "rev-parse", ":vendor/extra")).toBe(fixture.betaBase)
+    git(fixture.product, "update-index", "--force-remove", "--", "vendor/extra")
+    writeFileSync(join(fixture.product, ".gitmodules"), modules)
+    git(fixture.product, "add", ".gitmodules")
+
+    const finished = await superMerge(options)
+    expect(finished).toMatchObject({ state: "updated", partial: false })
+    expect(git(fixture.product, "show", "HEAD:shared.txt")).toBe("human resolution")
+    expect(git(fixture.product, "show", "-s", "--format=%P", "HEAD")).toBe(`${head} ${target}`)
+    expect(git(fixture.product, "rev-parse", "HEAD:packages/alpha")).toBe(advanced)
+    expect(git(child, "rev-parse", "HEAD")).toBe(advanced)
   })
 
   it.each(["shared.txt", "space \tand\nnewline.txt"])(
