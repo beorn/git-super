@@ -169,12 +169,10 @@ function statusRepository(
       const indexPin = indexed.get(path)
       if (headPin !== undefined && indexPin !== undefined) {
         const indexRecords = diffRecords(nestedRoot, headPin, indexPin, "index", nestedPrefix)
-        const checkoutRecords = diffRecords(nestedRoot, indexPin, checkoutPin, "worktree", nestedPrefix)
         // A pointer move can have an unchanged tree; its commit identity is still dirt.
         nestedRecords.push(...indexRecords)
         if (headPin !== indexPin && indexRecords.length === 0) nestedRecords.push(`M  ${nestedPrefix}`)
-        nestedRecords.push(...checkoutRecords)
-        if (indexPin !== checkoutPin && checkoutRecords.length === 0) nestedRecords.push(` M ${nestedPrefix}`)
+        if (indexPin !== checkoutPin) nestedRecords.push(` M ${nestedPrefix}`)
       }
       const nested = statusRepository(nestedRoot, nestedPrefix, {
         path: nestedPrefix,
