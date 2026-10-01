@@ -341,14 +341,7 @@ async function mergeUnderLock(
   initializations: SuperMergeInitializationResult[],
 ): Promise<SuperMergeResult> {
   const nativeHeads = await nativeMergeHeads(git, root, timeoutMs)
-  let pending: SuperMergeResult["pending"]
-  if (nativeHeads !== undefined) {
-    const branch = await required(git, root, ["symbolic-ref", "HEAD"], "observe-pending-branch", timeoutMs)
-    const head = await required(git, root, ["rev-parse", "HEAD^{commit}"], "observe-pending-head", timeoutMs)
-    const paths = await unmergedPaths(git, root, timeoutMs)
-    if (paths === undefined) throw new Error(`Pending merge at ${root}: unmerged paths could not be read`)
-    pending = { branch, head, target: nativeHeads[0] ?? "", unmergedPaths: paths }
-  }
+  const pending = nativeHeads === undefined ? undefined : await observePending(git, root, nativeHeads, timeoutMs)
   const refuse = (code: string, message: string): SuperMergeResult => {
     const result = failed(
       root,
@@ -429,6 +422,23 @@ async function mergeUnderLock(
     result = await mergeObserved(git, root, options, timeoutMs, steps, initializations)
   } catch (error) {
     result = failed(root, [], resultError(error, "merge"))
+  }
+  if (result.partial && result.detail?.code === "settled-merge-commit-failed") {
+    try {
+      const heads = await nativeMergeHeads(git, root, timeoutMs)
+      if (heads === undefined) throw new Error(`Rejected commit at ${root}: expected native MERGE_HEAD is missing`)
+      const observed = await observePending(git, root, heads, timeoutMs)
+      const detail = { ...result.detail, next: `Inspect the named Git failure. ${pendingRemedy(root, observed)}` }
+      return {
+        ...result,
+        pending: observed,
+        detail,
+        repositories: result.repositories.map((row) => ({ ...row, detail })),
+      }
+    } catch (error) {
+      const detail = resultError(error, "observe-rejected-pending-merge")
+      return { ...result, detail, repositories: result.repositories.map((row) => ({ ...row, detail })) }
+    }
   }
   return pending !== undefined && result.state === "failed" && !result.partial
     ? unchangedPending(result, pending)
@@ -1075,7 +1085,7 @@ async function mergeObserved(
             committed,
             `The prospective merge of ${target} and its Settled report remain staged, the concluding commit was not written, and every submodule checkout was restored to its recorded pin.`,
             evidence,
-            `Inspect the preserved root merge and named Git failure; ${stagedPinMoves(restored.rows)} before retrying the commit.`,
+            "Inspect the preserved root merge and named Git failure before continuing or aborting.",
             "the caller",
           )
         : rollbackFailureDetail(root, "the rejected settled merge commit", undefined, restored.failure, restored.rows),
@@ -1281,6 +1291,19 @@ async function nativeMergeHeads(git: GitProcess, root: string, timeoutMs: number
   return heads
 }
 
+async function observePending(
+  git: GitProcess,
+  root: string,
+  heads: readonly string[],
+  timeoutMs: number,
+): Promise<NonNullable<SuperMergeResult["pending"]>> {
+  const branch = await required(git, root, ["symbolic-ref", "HEAD"], "observe-pending-branch", timeoutMs)
+  const head = await required(git, root, ["rev-parse", "HEAD^{commit}"], "observe-pending-head", timeoutMs)
+  const paths = await unmergedPaths(git, root, timeoutMs)
+  if (paths === undefined) throw new Error(`Pending merge at ${root}: unmerged paths could not be read`)
+  return { branch, head, target: heads[0] ?? "", unmergedPaths: paths }
+}
+
 function pendingRemedy(root: string, pending: NonNullable<SuperMergeResult["pending"]>): string {
   const command = [
     "git",
@@ -1359,8 +1382,40 @@ async function validateContinuationPins(
   timeoutMs: number,
 ): Promise<GitResultDetail | undefined> {
   if ("failure" in prospective && prospective.conflict?.tree === undefined) return prospective.failure
-  const referenceTree = "failure" in prospective ? prospective.conflict?.tree : prospective.tree
+  let referenceTree = "failure" in prospective ? prospective.conflict?.tree : prospective.tree
   if (referenceTree === undefined) throw new Error("Prospective merge has no reference tree")
+  // The human's staged descriptor owns metadata; the prospective tree is only
+  // the reference for pins. Reuse composition's scratch-index owner rather
+  // than parsing unresolved descriptor text or changing the caller's index.
+  const staged = new Map((await readCommitSubmodules(git, root, stagedTree)).map((entry) => [entry.path, entry]))
+  if ("failure" in prospective && prospective.conflict?.paths.includes(".gitmodules")) {
+    const raw = await required(
+      git,
+      root,
+      ["ls-files", "--stage", "-z", "--", ".gitmodules"],
+      "read-resolved-descriptor",
+      timeoutMs,
+    )
+    const entries = parseIndexEntries(
+      raw,
+      (record) => new Error(`Malformed resolved .gitmodules index entry ${JSON.stringify(record)}`),
+    )
+    const descriptor = entries[0]
+    if (
+      entries.length !== 1 ||
+      descriptor === undefined ||
+      descriptor.stage !== 0 ||
+      !/^100[0-9]{3}$/u.test(descriptor.mode)
+    ) {
+      throw new Error(
+        "Continuation requires a resolved regular-file .gitmodules index entry before validating the prospective gitlinks",
+      )
+    }
+    const resolved = await resolveComposedTree(git, root, referenceTree, new Map(), timeoutMs, descriptor)
+    if ("failure" in resolved) return resolved.failure
+    if (resolved.tree === undefined) throw new Error("Resolved descriptor reference still has unmerged entries")
+    referenceTree = resolved.tree
+  }
   const requiredPins = new Map(
     (await readCommitSubmodules(git, root, referenceTree)).map((entry) => [entry.path, [entry.target]]),
   )
@@ -1372,7 +1427,6 @@ async function validateContinuationPins(
       requiredPins.set(entry.path, pins)
     }
   }
-  const staged = new Map((await readCommitSubmodules(git, root, stagedTree)).map((entry) => [entry.path, entry]))
   const refusal = (path: string, pin: string | undefined, requiredPins: readonly string[]): GitResultDetail => {
     const cure =
       requiredPins.length === 1
@@ -1596,14 +1650,6 @@ async function restoreSubmoduleCheckouts(
     rows[index] = { ...plan, checkout, state: "restored" }
   }
   return { rows, ...(failure === undefined ? {} : { failure }) }
-}
-
-/** The staged pins that differ from HEAD, by name, so a recovery says which submodule goes where (25807 row 2). */
-function stagedPinMoves(rows: readonly SuperMergeCheckoutResult[]): string {
-  const moves = rows.filter((row) => row.index !== row.recorded).map((row) => `${row.path} to ${row.index}`)
-  return moves.length === 0
-    ? "no staged pin differs from HEAD"
-    : `move ${moves.join(", ")} (the staged pins that differ from HEAD)`
 }
 
 function formatCheckoutEvidence(rows: readonly SuperMergeCheckoutResult[]): string {
@@ -2278,15 +2324,19 @@ async function resolveComposedTree(
   merged: string,
   pins: ReadonlyMap<string, string>,
   timeoutMs: number,
+  descriptor?: Pick<IndexEntry, "path" | "mode" | "oid">,
 ): Promise<Readonly<{ tree: string | undefined }> | Readonly<{ failure: GitResultDetail }>> {
   const commonDir = await required(git, root, ["rev-parse", "--git-common-dir"], "compose-gitlinks", timeoutMs)
   const indexFile = join(isAbsolute(commonDir) ? commonDir : resolve(root, commonDir), COMPOSE_INDEX)
   const env = { GIT_INDEX_FILE: indexFile }
-  const paths = [...pins.keys()]
+  const paths = [...pins.keys(), ...(descriptor === undefined ? [] : [descriptor.path])]
   try {
     const staging = [
       ["read-tree", merged],
       ...[...pins].map(([path, sha]) => ["update-index", "--cacheinfo", `160000,${sha},${path}`]),
+      ...(descriptor === undefined
+        ? []
+        : [["update-index", "--cacheinfo", `${descriptor.mode},${descriptor.oid},${descriptor.path}`]]),
     ]
     for (const args of staging) {
       const result = await git.run({ args, env, repo: root, timeoutMs })

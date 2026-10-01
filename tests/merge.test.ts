@@ -110,8 +110,8 @@ describe("git super merge", () => {
    * @consumer git-super merge and authoring hooks
    * @testonly none
    */
-  it.each(["none", "exit", "throw", "timeout", "stage0", "head", "mismatch", "unknown-pin"] as const)(
-    "initializes an added gitlink at its pin before the concluding commit hook (26988), initialization failure=%s",
+  it.each(["none", "exit", "throw", "timeout", "stage0", "head", "mismatch", "unknown-pin", "continue"] as const)(
+    "initializes an added gitlink at its pin before the concluding commit hook (26988), initialization case=%s",
     async (failure) => {
       const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-added-"))
       roots.push(fixtureRoot)
@@ -136,6 +136,11 @@ describe("git super merge", () => {
         vi.stubEnv(`GIT_CONFIG_VALUE_${index}`, value)
       }
       try {
+        if (failure === "continue") {
+          writeFileSync(join(fixture.product, "README.md"), "base root content\n")
+          git(fixture.product, "add", "README.md")
+          git(fixture.product, "commit", "-q", "-m", "base root content")
+        }
         git(fixtureRoot, "clone", "-q", "--recurse-submodules", rootUrl, primary)
         git(primary, "worktree", "add", "-q", "-b", "task/added-gitlink", checkout, "HEAD")
         const initial = await materializeSubmodulesWithProcess(createLocalGitProcess(), {
@@ -143,6 +148,12 @@ describe("git super merge", () => {
           referenceWorktree: primary,
         })
         expect(initial).toMatchObject({ code: 0, considered: 2, borrowed: 2, remoteFallbacks: 0, unreferenced: 0 })
+        if (failure === "continue") {
+          writeFileSync(join(fixture.product, "README.md"), "incoming root content\n")
+          git(fixture.product, "add", "README.md")
+          writeFileSync(join(checkout, "README.md"), "local root content\n")
+          git(checkout, "commit", "-q", "-am", "local root content")
+        }
         git(fixture.product, "submodule", "add", "-q", gammaUrl, "vendor/gamma")
         git(fixture.product, "commit", "-q", "-m", "main adds gamma")
         const gammaPin =
@@ -200,7 +211,28 @@ describe("git super merge", () => {
           },
         }
         const rootBefore = git(checkout, "rev-parse", "HEAD")
-        const result = await superMerge({ repo: checkout, commit: "origin/main", git: process, timeoutMs: 12345 })
+        if (failure === "continue") {
+          const pending = await superMerge({
+            repo: checkout,
+            commit: "origin/main",
+            git: process,
+            preserveConflicts: true,
+            timeoutMs: 12345,
+          })
+          expect(pending).toMatchObject({ state: "failed", partial: true })
+          expect(existsSync(join(checkout, "vendor/gamma/.git"))).toBe(false)
+          writeFileSync(join(checkout, "README.md"), "human root resolution\n")
+          git(checkout, "add", "README.md")
+        }
+        const result = await superMerge({
+          repo: checkout,
+          commit: "origin/main",
+          git: process,
+          timeoutMs: 12345,
+          ...(failure === "continue"
+            ? { continue: true, expectedHead: rootBefore, expectedBranch: "refs/heads/task/added-gitlink" }
+            : {}),
+        })
         if (failure === "stage0") {
           expect(result).toMatchObject({
             state: "failed",
@@ -213,7 +245,7 @@ describe("git super merge", () => {
           expect(git(checkout, "rev-parse", "HEAD")).toBe(rootBefore)
           return
         }
-        if (failure !== "none") {
+        if (failure !== "none" && failure !== "continue") {
           expect(result).toMatchObject({
             state: "failed",
             partial: true,
@@ -1187,9 +1219,17 @@ describe("git super merge", () => {
     expect(git(fixture.product, "rev-parse", "MERGE_HEAD")).toBe(candidate)
     expect(git(fixture.product, "ls-files", "--stage", "--", "packages/alpha")).toContain(newestAlpha)
     expect(git(fixture.product, "ls-files", "--stage", "--", "vendor/beta")).toContain(newestBeta)
-    // The recovery names each staged pin that differs from HEAD, and where to move it (25807 row 2).
-    expect(result.detail?.next).toContain(`packages/alpha to ${newestAlpha}`)
-    expect(result.detail?.next).toContain(`vendor/beta to ${newestBeta}`)
+    // The same resting state must advertise the same continuation owner (26988).
+    expect(result.pending).toEqual({
+      branch: "refs/heads/main",
+      head: headBefore,
+      target: candidate,
+      unmergedPaths: [],
+    })
+    expect(result.detail?.next).toContain(
+      `'--continue' '--expected-head' '${headBefore}' '--expected-branch' 'refs/heads/main'`,
+    )
+    expect(result.detail?.next).toContain("merge --abort")
 
     // CTO correction 3: hook rejection and explicit conflict entry share the
     // same resting state and the same continuation owner, including nested pins.
@@ -1828,6 +1868,49 @@ describe("git super merge", () => {
     expect(git(fixture.product, "show", "-s", "--format=%P", "HEAD")).toBe(`${head} ${target}`)
     expect(git(fixture.product, "rev-parse", "HEAD:packages/alpha")).toBe(advanced)
     expect(git(child, "rev-parse", "HEAD")).toBe(advanced)
+  })
+
+  /**
+   * @failure Continuation parses unresolved prospective descriptor text instead of the human's staged resolution (26988).
+   * @level l1
+   * @consumer Callers resolving a .gitmodules conflict without changing required gitlinks
+   * @testonly none
+   * The ordinary-file lifecycle never conflicts on the descriptor used by recursive planning.
+   */
+  it("preserves a resolved descriptor conflict while recomputing only required gitlinks (26988)", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-continue-descriptors-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const modules = join(fixture.product, ".gitmodules")
+    const original = readFileSync(modules, "utf8")
+    writeFileSync(modules, `# base descriptor\n${original}`)
+    git(fixture.product, "commit", "-q", "-am", "descriptor base")
+    git(fixture.product, "switch", "-q", "-c", "candidate-descriptors")
+    writeFileSync(modules, `# candidate descriptor\n${original}`)
+    git(fixture.product, "commit", "-q", "-am", "candidate descriptor")
+    const target = git(fixture.product, "rev-parse", "HEAD")
+    git(fixture.product, "switch", "-q", "main")
+    writeFileSync(modules, `# main descriptor\n${original}`)
+    git(fixture.product, "commit", "-q", "-am", "main descriptor")
+    const head = git(fixture.product, "rev-parse", "HEAD")
+    const pending = await superMerge({ repo: fixture.product, commit: target, preserveConflicts: true })
+    expect(pending).toMatchObject({ state: "failed", partial: true, pending: { unmergedPaths: [".gitmodules"] } })
+    const resolved = `# human descriptor\n${original}`
+    writeFileSync(modules, resolved)
+    git(fixture.product, "add", ".gitmodules")
+    const finished = await superMerge({
+      repo: fixture.product,
+      commit: target,
+      continue: true,
+      expectedHead: head,
+      expectedBranch: "refs/heads/main",
+    })
+    expect(finished).toMatchObject({ state: "updated", partial: false })
+    expect(readFileSync(modules, "utf8")).toBe(resolved)
+    expect(git(fixture.product, "show", "HEAD:.gitmodules")).toBe(resolved.trim())
+    expect(git(fixture.product, "rev-parse", "HEAD:packages/alpha")).toBe(fixture.alphaBase)
+    expect(git(fixture.product, "rev-parse", "HEAD:vendor/beta")).toBe(fixture.betaBase)
+    expect(git(fixture.product, "show", "-s", "--format=%P", "HEAD")).toBe(`${head} ${target}`)
   })
 
   /**
@@ -3450,10 +3533,17 @@ describe("git super merge — a diverged gitlink the merge composes", () => {
     git(fixture.product, "add", "packages/alpha", "root.txt")
     git(fixture.product, "commit", "-q", "-m", "pin ours and edit the root file")
 
-    const result = await superMerge({ repo: fixture.product, commit: candidate })
-
-    expect(result).toMatchObject({ state: "failed", partial: false, detail: { code: "merge-conflict" } })
-    expect(result.detail?.paths).toEqual(expect.arrayContaining(["root.txt"]))
+    const head = git(fixture.product, "rev-parse", "HEAD")
+    const index = git(fixture.product, "ls-files", "--stage", "-z")
+    for (const preserveConflicts of [false, true]) {
+      const result = await superMerge({ repo: fixture.product, commit: candidate, preserveConflicts })
+      expect(result).toMatchObject({ state: "failed", partial: false, detail: { code: "merge-conflict" } })
+      expect(result.detail?.paths).toEqual(expect.arrayContaining(["root.txt", "packages/alpha"]))
+      expect(git(fixture.product, "rev-parse", "HEAD")).toBe(head)
+      expect(git(fixture.product, "ls-files", "--stage", "-z")).toBe(index)
+      expect(git(submodule, "rev-parse", "HEAD")).toBe(ours)
+      expect(readFileSync(join(fixture.product, "root.txt"), "utf8")).toBe("main\n")
+    }
     expect(retainedPins(fixture.alpha)).toEqual([])
   })
 
