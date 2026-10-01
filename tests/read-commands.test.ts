@@ -146,6 +146,25 @@ describe("Phase 1 read commands", () => {
     ])
   })
 
+  test("status lists the files of a nested gitlink that an unstaged pin move adds", () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-added-nested-status-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const leaf = join(fixtureRoot, "leaf")
+    createRepository(leaf, "leaf.ts", "export const leaf = 1\n")
+    git(fixture.alpha, "-c", "protocol.file.allow=always", "submodule", "add", "-q", leaf, "apps/maddoc")
+    git(fixture.alpha, "commit", "-q", "-am", "add nested app")
+    const alphaWithNested = git(fixture.alpha, "rev-parse", "HEAD")
+    const alphaCheckout = join(fixture.product, "packages/alpha")
+    git(alphaCheckout, "fetch", "-q", "origin")
+    git(alphaCheckout, "checkout", "-q", alphaWithNested)
+    git(alphaCheckout, "-c", "protocol.file.allow=always", "submodule", "update", "-q", "--init")
+
+    const result = superStatus({ repo: fixture.product })
+
+    expect(result.records.some((record) => record.endsWith("packages/alpha/apps/maddoc/leaf.ts"))).toBe(true)
+  })
+
   /**
    * @failure One malformed child hides ordinary root dirt and staged pins, allowing an incomplete cleanliness judgment (26270).
    * @level l1

@@ -24,6 +24,7 @@ function outputSink(): { output: string; write(value: string): void } {
 }
 
 const roots: string[] = []
+const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
@@ -46,10 +47,10 @@ describe("superDiff", () => {
    * @failure An added gitlink threw "no old/new commit range exists", so affected-tests refused to judge every
    * post-merge range that spanned a submodule addition (vendor/brain8, 26972).
    * @level l1
-   * @consumer git super diff and affected-tests
+   * @consumer git super diff, affected-tests, the nightly red comparison and pm-metrics
    * @testonly none
    */
-  test("expands an added gitlink as every file in its tree, each added", () => {
+  test("expands an added gitlink from git's empty tree: paths, consulted range, stat, pointer move and patch", () => {
     const fixture = mkdtempSync(join(tmpdir(), "git-super-added-link-"))
     roots.push(fixture)
     const dependency = join(fixture, "dependency")
@@ -62,16 +63,87 @@ describe("superDiff", () => {
     git(product, "commit", "-q", "-am", "add dependency")
     const pin = git(product, "rev-parse", "HEAD:vendor/dependency")
 
-    const result = superDiff({ repo: product, refs: [`${base}..HEAD`], stat: true })
+    const result = superDiff({ repo: product, refs: [`${base}..HEAD`], stat: true, patch: true })
 
     expect(result.paths).toEqual([".gitmodules", "vendor/dependency/dependency.ts", "vendor/dependency/notes.md"])
     expect(result.deletedPaths).toEqual([])
-    expect(result.consultedRepositories).toContainEqual(expect.objectContaining({ path: "vendor/dependency", to: pin }))
+    expect(result.consultedRepositories).toContainEqual(
+      expect.objectContaining({ path: "vendor/dependency", from: EMPTY_TREE, to: pin }),
+    )
     const added = result.stats?.find((stat) => stat.repository === "vendor/dependency")
+    expect(added?.range).toEqual({ from: EMPTY_TREE, to: pin })
     expect(added?.files.map(({ path, deleted }) => ({ path, deleted }))).toEqual([
       { path: "dependency.ts", deleted: 0 },
       { path: "notes.md", deleted: 0 },
     ])
+    const root = result.stats?.find((stat) => stat.repository === ".")
+    expect(root?.pointerMoves).toEqual([{ path: "vendor/dependency", from: EMPTY_TREE, to: pin }])
+    const patch = result.patches?.find((entry) => entry.repository === "vendor/dependency")?.patch ?? ""
+    expect(patch).toContain("+++ b/dependency.ts")
+    expect(patch).toContain("+++ b/notes.md")
+  })
+
+  test("expands a gitlink nested inside an added gitlink", () => {
+    const fixture = mkdtempSync(join(tmpdir(), "git-super-added-nested-"))
+    roots.push(fixture)
+    const leaf = join(fixture, "leaf")
+    const dependency = join(fixture, "dependency")
+    const product = join(fixture, "product")
+    createRepository(leaf, "leaf.ts", "export const leaf = 1\n")
+    createRepository(dependency, "dependency.ts", "export const value = 1\n")
+    git(dependency, "-c", "protocol.file.allow=always", "submodule", "add", "-q", leaf, "apps/leaf")
+    git(dependency, "commit", "-q", "-am", "add leaf")
+    createRepository(product, "root.ts", "export const root = 1\n")
+    const base = git(product, "rev-parse", "HEAD")
+    git(product, "-c", "protocol.file.allow=always", "submodule", "add", "-q", dependency, "vendor/dependency")
+    git(join(product, "vendor/dependency"), "-c", "protocol.file.allow=always", "submodule", "update", "-q", "--init")
+    git(product, "commit", "-q", "-am", "add dependency")
+
+    const result = superDiff({ repo: product, refs: [`${base}..HEAD`] })
+
+    expect(result.paths).toEqual([
+      ".gitmodules",
+      "vendor/dependency/.gitmodules",
+      "vendor/dependency/apps/leaf/leaf.ts",
+      "vendor/dependency/dependency.ts",
+    ])
+  })
+
+  test("refuses an added gitlink whose checkout is not initialized, naming it and its pin", () => {
+    const fixture = mkdtempSync(join(tmpdir(), "git-super-added-uninit-"))
+    roots.push(fixture)
+    const dependency = join(fixture, "dependency")
+    const product = join(fixture, "product")
+    const clone = join(fixture, "clone")
+    createRepository(dependency, "dependency.ts", "export const value = 1\n")
+    createRepository(product, "root.ts", "export const root = 1\n")
+    const base = git(product, "rev-parse", "HEAD")
+    git(fixture, "clone", "-q", product, clone)
+    git(product, "-c", "protocol.file.allow=always", "submodule", "add", "-q", dependency, "vendor/dependency")
+    git(product, "commit", "-q", "-am", "add dependency")
+    const pin = git(product, "rev-parse", "HEAD:vendor/dependency")
+    git(clone, "fetch", "-q", "origin")
+
+    expect(() => superDiff({ repo: clone, refs: [`${base}..origin/main`] })).toThrow(
+      `vendor/dependency is an added gitlink at ${pin}; its checkout is not initialized`,
+    )
+  })
+
+  test("refuses a file replaced by a gitlink with its own message", () => {
+    const fixture = mkdtempSync(join(tmpdir(), "git-super-file-to-link-"))
+    roots.push(fixture)
+    const dependency = join(fixture, "dependency")
+    const product = join(fixture, "product")
+    createRepository(dependency, "dependency.ts", "export const value = 1\n")
+    createRepository(product, "linked", "a file at the future gitlink path\n")
+    const base = git(product, "rev-parse", "HEAD")
+    git(product, "rm", "-q", "linked")
+    git(product, "-c", "protocol.file.allow=always", "submodule", "add", "-q", dependency, "linked")
+    git(product, "commit", "-q", "-am", "replace the file with a gitlink")
+
+    expect(() => superDiff({ repo: product, refs: [`${base}..HEAD`] })).toThrow(
+      "linked changed from a file to a gitlink",
+    )
   })
 
   test("still fails loudly when a gitlink is removed", () => {

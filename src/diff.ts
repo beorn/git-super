@@ -1,5 +1,5 @@
 import { join, posix } from "node:path"
-import { repositoryRoot, runGit } from "./git.ts"
+import { probeRepository, repositoryRoot, runGit, tryGit } from "./git.ts"
 
 const ZERO_OID = "0".repeat(40)
 /** Git's empty tree: an added gitlink is measured from here to its pin, so every file in it reads as added. */
@@ -10,6 +10,10 @@ export type ConsultedRepository = Readonly<{
   root: string
   /** Explicit root index consulted by status when a hook uses a temporary commit index. */
   indexFile?: string
+  /**
+   * The old endpoint. A commit for a moved gitlink, or git's empty tree for one this range ADDED, which is measured
+   * from nothing to its pin; a consumer running log or merge-base on it must check it is a commit first.
+   */
   from?: string
   to?: string
 }>
@@ -41,6 +45,7 @@ export type DiffTotals = Readonly<{
 /** A gitlink pointer bump inside one repository's OWN diff — excluded from that repository's `files`/`totals` (never counted as product lines) and reported here instead. */
 export type PointerMove = Readonly<{
   path: string
+  /** A commit, or git's empty tree for a gitlink this range added (see ConsultedRepository.from). */
   from: string
   to: string
 }>
@@ -142,6 +147,49 @@ export type RecursiveNameStatusResult = Readonly<{
   consultedRepositories: readonly ConsultedRepository[]
 }>
 
+/**
+ * The commit range one gitlink row expands over, or a refusal naming its case. An added gitlink is a move from git's
+ * empty tree to its pin, so every file in it reads as added, as git's own --submodule=diff renders it (26972).
+ */
+function expandableGitlink(row: RawDiffRow, path: string): RawDiffRow {
+  const gitlinkBefore = row.oldMode === "160000"
+  const gitlinkAfter = row.newMode === "160000"
+  const absentBefore = row.oldMode === "000000"
+  if (gitlinkBefore && gitlinkAfter && row.oldPin !== ZERO_OID && row.newPin !== ZERO_OID) return row
+  if (absentBefore && gitlinkAfter) {
+    if (row.newPin === ZERO_OID) {
+      throw new Error(
+        `git super: ${path} is an added gitlink whose new pin git reports as zero; no commit exists to expand`,
+      )
+    }
+    return { ...row, oldMode: "160000", oldPin: EMPTY_TREE }
+  }
+  if (gitlinkBefore && (row.newMode === "000000" || row.newPin === ZERO_OID)) {
+    throw new Error(`git super: ${path} is a removed gitlink; no new commit exists to expand its deleted files from`)
+  }
+  if (gitlinkBefore) {
+    throw new Error(`git super: ${path} changed from a gitlink to a file; no commit range exists for expansion`)
+  }
+  throw new Error(`git super: ${path} changed from a file to a gitlink; no old commit exists to expand from`)
+}
+
+/** The submodule's own repository root, refusing an uninitialized checkout instead of resolving to the parent. */
+function initializedCheckout(root: string, move: RawDiffRow, path: string, added: boolean): string {
+  const directory = join(root, move.path)
+  const discovered = tryGit(directory, ["rev-parse", "--show-toplevel"])
+  const prefix = discovered.exitCode === 0 ? tryGit(directory, ["rev-parse", "--show-prefix"]) : undefined
+  const probe =
+    discovered.exitCode === 0 && prefix?.exitCode === 0
+      ? probeRepository(discovered.stdout.trim(), prefix.stdout)
+      : undefined
+  if (probe === undefined || probe.kind === "absent") {
+    throw new Error(
+      `git super: ${path} is ${added ? "an added" : "a moved"} gitlink at ${move.newPin}; its checkout is not initialized`,
+    )
+  }
+  return probe.root
+}
+
 /** Internal recursive primitive shared by `diff` and `status`. */
 export function recursiveNameStatusDiff(options: RecursiveNameStatusOptions): RecursiveNameStatusResult {
   const root = repositoryRoot(options.repo)
@@ -163,23 +211,10 @@ export function recursiveNameStatusDiff(options: RecursiveNameStatusOptions): Re
   const consultedRepositories: ConsultedRepository[] = [options.consulted]
 
   for (const gitlink of gitlinks) {
-    // An added gitlink has no old commit; it is measured from the empty tree, so its whole tree reads as added (26972).
-    const added = gitlink.oldPin === ZERO_OID && gitlink.newMode === "160000" && gitlink.newPin !== ZERO_OID
-    const move = added ? { ...gitlink, oldMode: "160000", oldPin: EMPTY_TREE } : gitlink
-    if (
-      move.oldMode !== "160000" ||
-      move.newMode !== "160000" ||
-      move.oldPin === ZERO_OID ||
-      move.newPin === ZERO_OID
-    ) {
-      throw new Error(
-        `git super: ${prefixPath(options.prefix, move.path)} is a removed gitlink; ` +
-          "no new commit exists to expand its deleted files from",
-      )
-    }
+    const move = expandableGitlink(gitlink, prefixPath(options.prefix, gitlink.path))
     const isDirtySubmodule = move.oldPin === move.newPin
     const nestedPrefix = prefixPath(options.prefix, move.path)
-    const nestedRoot = repositoryRoot(join(root, move.path))
+    const nestedRoot = initializedCheckout(root, move, nestedPrefix, gitlink.oldPin === ZERO_OID)
     const nested = recursiveNameStatusDiff({
       repo: nestedRoot,
       prefix: nestedPrefix,
