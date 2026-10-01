@@ -8,7 +8,7 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs"
 import { mkdir, mkdtemp, rm } from "node:fs/promises"
 import { spawnSync } from "node:child_process"
-import { canonicalTmpdir as tmpdir } from "./fixture.ts"
+import { canonicalTmpdir as tmpdir, createRepository, advanceRepository } from "./fixture.ts"
 import { join } from "node:path"
 import { createLogger, type ConditionalLogger, type Event } from "loggily"
 import { afterEach, describe, expect, it } from "vitest"
@@ -24,6 +24,7 @@ import {
 import { createLocalGitProcess, type GitProcessRequest } from "../src/process.ts"
 import { createLocalGitWorktreeStore } from "../src/worktree.ts"
 import { cleanGitRepositoryEnvironment } from "../src/git.ts"
+import { prepareSubmoduleTreeUnderLock } from "../src/submodule-prepare.ts"
 
 const success = (): SubmoduleGitResult => ({ code: 0, stdout: "", stderr: "" })
 const roots: string[] = []
@@ -136,6 +137,120 @@ afterEach(async () => {
 })
 
 describe("materializeSubmodules", () => {
+  /**
+   * @failure A staged addition silently considers zero paths or bypasses the durable prepared store.
+   * @level l1
+   * @consumer superMerge's staged-submodule initialization
+   */
+  it.each(["present", "missing", "partial"] as const)(
+    "materializes staged linked-worktree additions with a %s prepared pin",
+    async (pinState) => {
+      const root = await mkdtemp(join(tmpdir(), "git-super-staged-store-"))
+      roots.push(root)
+      const dependency = join(root, "dependency")
+      const owner = join(root, "owner")
+      const candidate = join(root, "candidate")
+      createRepository(dependency, "dependency.txt", "old pin\n")
+      const required = advanceRepository(dependency, "dependency.txt", "selected pin\n")
+      createRepository(owner, ".gitmodules", "")
+      git(owner, ["worktree", "add", "-q", "--detach", candidate, "HEAD"])
+      writeFileSync(
+        join(candidate, ".gitmodules"),
+        `[submodule "gamma-store"]\n  path = gamma\n  url = ${dependency}\n`,
+      )
+      git(candidate, ["add", ".gitmodules"])
+      git(candidate, ["update-index", "--add", "--cacheinfo", `160000,${required},gamma`])
+      const prepared = await prepareSubmoduleTreeUnderLock(
+        { repo: candidate, commit: git(candidate, ["write-tree"]).trim(), remote: owner },
+        new Set(["gamma"]),
+      )
+      expect(prepared.state, JSON.stringify(prepared.detail)).toBe("updated")
+      const store = prepared.submodules[0]!.gitdir
+      expect(existsSync(join(owner, "gamma", ".git"))).toBe(false)
+      if (pinState !== "missing") git(store, ["fetch", "-q", dependency, `${required}:refs/heads/main`])
+      if (pinState === "partial") git(store, ["config", "remote.origin.promisor", "true"])
+      const process = createLocalGitProcess()
+      const requests: GitProcessRequest[] = []
+      const selectedProcess = {
+        async run(request: GitProcessRequest) {
+          requests.push(request)
+          if (request.args[0] === "fetch") {
+            return { code: 128, stdout: "", stderr: "prepared pin unavailable in this test", timedOut: false }
+          }
+          return process.run(request)
+        },
+      }
+      // HEAD intentionally lacks the addition; existing callers retain their default census.
+      const head = await materializeSubmodulesWithProcess(selectedProcess, {
+        worktree: candidate,
+        referenceWorktree: owner,
+        paths: ["gamma"],
+      })
+      expect(head).toMatchObject({ code: 0, considered: 0 })
+      requests.length = 0
+      const result = await materializeSubmodulesWithProcess(selectedProcess, {
+        worktree: candidate,
+        referenceWorktree: owner,
+        paths: ["gamma"],
+        source: "index",
+      })
+      expect(result.considered).toBe(1)
+      if (pinState === "present") {
+        expect(result).toMatchObject({ code: 0, borrowed: 1, remoteFallbacks: 0, unreferenced: 0, warmed: 0 })
+        expect(git(join(candidate, "gamma"), ["rev-parse", "HEAD"]).trim()).toBe(required)
+        const gitdir = git(join(candidate, "gamma"), ["rev-parse", "--path-format=absolute", "--git-dir"]).trim()
+        expect(gitdir).toContain("/worktrees/candidate/modules/gamma-store")
+        expect(readFileSync(join(gitdir, "objects/info/alternates"), "utf8").trim().split("\n")).toContain(
+          join(store, "objects"),
+        )
+        expect(requests.some(({ args }) => args[0] === "fetch")).toBe(false)
+      } else {
+        expect(result.code).not.toBe(0)
+        expect(result.stderr).toContain("gamma")
+        expect(result.stderr).toContain(required)
+        expect(result.stderr).toContain("limit 0")
+        expect(result).toMatchObject({ borrowed: 0, remoteFallbacks: 1, unreferenced: 0, warmed: 0 })
+        const fetches = requests.filter(({ args }) => args[0] === "fetch")
+        expect(fetches).toHaveLength(pinState === "missing" ? 1 : 0)
+        if (pinState === "missing") expect(fetches[0]!.repo).toBe(store)
+        else expect(result.stderr).toContain("partial clone")
+        expect(existsSync(join(candidate, "gamma", ".git"))).toBe(false)
+        expect(requests.some(({ args }) => args.includes("update") && args.includes("submodule"))).toBe(false)
+      }
+    },
+  )
+
+  /**
+   * @failure A selected unresolved index path silently succeeds without materialization.
+   * @level l1
+   * @consumer superMerge's stage-0 materialization contract
+   */
+  it.each(["unmerged", "non-gitlink", "absent"] as const)("refuses a named %s index gitlink", async (state) => {
+    const root = await mkdtemp(join(tmpdir(), "git-super-staged-pin-"))
+    roots.push(root)
+    const owner = join(root, "owner")
+    const required = createRepository(owner, ".gitmodules", '[submodule "gamma"]\n path = gamma\n url = /unavailable\n')
+    if (state === "unmerged") {
+      const staged = spawnSync("git", ["-C", owner, "update-index", "--index-info"], {
+        encoding: "utf8",
+        input: `160000 ${required} 1\tgamma\n160000 ${required} 2\tgamma\n`,
+      })
+      expect(staged.status, staged.stderr).toBe(0)
+    } else if (state === "non-gitlink") {
+      const blob = git(owner, ["rev-parse", "HEAD:.gitmodules"]).trim()
+      git(owner, ["update-index", "--add", "--cacheinfo", `100644,${blob},gamma`])
+    }
+    const result = await materializeSubmodulesWithProcess(createLocalGitProcess(), {
+      worktree: owner,
+      paths: ["gamma"],
+      source: "index",
+    })
+    expect(result.code).not.toBe(0)
+    expect(result.stderr).toContain("gamma")
+    expect(result.stderr).toContain(state === "unmerged" ? "unmerged" : "stage-0 gitlink")
+    expect(existsSync(join(owner, "gamma", ".git"))).toBe(false)
+  })
+
   it("creates a worktree after deleting a gitlink and reports its stale local config once", async () => {
     const fixtureRoot = await mkdtemp(join(tmpdir(), "git-super-stale-config-"))
     roots.push(fixtureRoot)
@@ -2070,8 +2185,9 @@ describe("materializeSubmodules", () => {
         // cat-file -e fails both in worktree and in reference
         if (args[0] === "cat-file" && args[1] === "-e") return { ...success(), code: 1 }
         // fetch from origin fails (origin does not have this commit)
-        if (args[0] === "fetch")
+        if (args[0] === "fetch") {
           return { code: 128, stdout: "", stderr: `fatal: couldn't find remote ref ${missingSha}\n` }
+        }
         return success()
       },
     }

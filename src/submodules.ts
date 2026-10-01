@@ -8,6 +8,7 @@ import { pinRef } from "./objects.ts"
 import { cleanGitRepositoryEnvironment } from "./git.ts"
 import { createLocalGitProcess, type GitProcess } from "./process.ts"
 import { shellQuote } from "./shell-command.ts"
+import { preparedSubmoduleStore } from "./submodule-prepare.ts"
 
 export const SUBMODULE_ALTERNATE_LOCATION = "superproject"
 export const SUBMODULE_ALTERNATE_ERROR_STRATEGY = "info"
@@ -58,6 +59,8 @@ export type SubmoduleMaterializationOptions = Readonly<{
   force?: boolean
   /** Restrict only the top-level pass; nested submodules still recurse. */
   paths?: readonly string[]
+  /** Read top-level declarations and pins from stage 0 for a staged merge; nested levels use HEAD. */
+  source?: "head" | "index"
   /**
    * Structured logger. Spans here are the only way to learn where
    * materialization time goes: the whole operation used to report one exit code
@@ -124,6 +127,7 @@ type Probe = Readonly<{
   name: string
   path: string
   referenceHasIt: boolean
+  referenceIsPrepared: boolean
   referenceSubmodule: string | undefined
   required: string
 }>
@@ -166,14 +170,15 @@ export async function configureSubmoduleAlternatePolicy(git: SubmoduleGit, repo:
 
 type Submodule = Readonly<{ name: string; path: string }>
 
-async function submodules(git: SubmoduleGit, repo: string): Promise<Submodule[] | SubmoduleGitResult> {
-  const tracked = await git.run(repo, ["cat-file", "-e", "HEAD:.gitmodules"], true)
+async function submodules(
+  git: SubmoduleGit,
+  repo: string,
+  source: "head" | "index",
+): Promise<Submodule[] | SubmoduleGitResult> {
+  const blob = source === "index" ? ":0:.gitmodules" : "HEAD:.gitmodules"
+  const tracked = await git.run(repo, ["cat-file", "-e", blob], true)
   if (tracked.code !== 0) return []
-  const configured = await git.run(
-    repo,
-    ["config", "--blob", "HEAD:.gitmodules", "--get-regexp", "^submodule\\..*\\.path$"],
-    true,
-  )
+  const configured = await git.run(repo, ["config", "--blob", blob, "--get-regexp", "^submodule\\..*\\.path$"], true)
   if (configured.code === 1 && configured.stdout === "" && configured.stderr === "") return []
   if (configured.code !== 0) return configured
   return configured.stdout
@@ -226,10 +231,30 @@ async function reportStaleLocalSubmoduleConfig(
 
 const GITLINK_ROW = /^160000 commit ([0-9a-f]+)\t/mu
 
-async function requiredGitlink(git: SubmoduleGit, repo: string, path: string): Promise<string | undefined> {
+async function requiredGitlink(
+  git: SubmoduleGit,
+  repo: string,
+  path: string,
+  source: "head" | "index",
+): Promise<string | SubmoduleGitResult> {
+  if (source === "index") {
+    const index = await git.run(repo, ["ls-files", "--stage", "-z", "--", path], true)
+    if (index.code !== 0) {
+      return { ...index, stderr: `could not read index gitlink '${path}' in ${repo}\n${index.stderr}` }
+    }
+    const rows = index.stdout.split("\0").flatMap((row) => {
+      const entry = /^(\d{6}) ([0-9a-f]+) ([0-3])\t(.+)$/su.exec(row)
+      return entry?.[4] === path ? [entry] : []
+    })
+    if (rows.some((row) => row[3] !== "0")) {
+      return { code: 1, stdout: "", stderr: `unmerged index gitlink '${path}' in ${repo}; stage 0 is required` }
+    }
+    const pin = rows.find((row) => row[1] === "160000" && row[3] === "0")?.[2]
+    return pin ?? { code: 1, stdout: "", stderr: `selected path '${path}' has no stage-0 gitlink in ${repo}` }
+  }
   const tree = await git.run(repo, ["ls-tree", "HEAD", "--", path], true)
-  if (tree.code !== 0) return undefined
-  return GITLINK_ROW.exec(tree.stdout)?.[1]
+  const pin = tree.code === 0 ? GITLINK_ROW.exec(tree.stdout)?.[1] : undefined
+  return pin ?? { code: 1, stdout: "", stderr: `could not resolve gitlink '${path}' in ${repo}` }
 }
 
 /**
@@ -736,8 +761,28 @@ export async function materializeSubmodules(
     const policy = await configureSubmoduleAlternatePolicy(git, worktree)
     if (policy.code !== 0) return policy
 
-    const entries = await submodules(git, worktree)
+    const source = depth === 0 ? (options.source ?? "head") : "head"
+    const selectedPins = new Map<string, string>()
+    if (source === "index" && selectedPaths !== undefined) {
+      for (const path of selectedPaths) {
+        const pin = await requiredGitlink(git, worktree, path, source)
+        if (typeof pin !== "string") return pin
+        selectedPins.set(path, pin)
+      }
+    }
+    const entries = await submodules(git, worktree, source)
     if (!Array.isArray(entries)) return entries
+    if (source === "index" && selectedPaths !== undefined) {
+      for (const path of selectedPaths) {
+        if (!entries.some((entry) => entry.path === path)) {
+          return {
+            code: 1,
+            stdout: "",
+            stderr: `selected index gitlink '${path}' is not declared in stage-0 .gitmodules in ${worktree}`,
+          }
+        }
+      }
+    }
     if (depth === 0) {
       const staleConfig = await reportStaleLocalSubmoduleConfig(git, worktree, entries, log)
       if (staleConfig.code !== 0) return staleConfig
@@ -786,19 +831,67 @@ export async function materializeSubmodules(
           selected
             .slice(start, start + MAX_CONCURRENT_SUBMODULE_UPDATES)
             .map(async ({ name, path }): Promise<Probe | SubmoduleGitResult> => {
-              const required = await requiredGitlink(git, worktree, path)
-              if (required === undefined) {
-                return { code: 1, stdout: "", stderr: `could not resolve gitlink '${path}' in ${worktree}` }
-              }
+              const required = selectedPins.get(path) ?? (await requiredGitlink(git, worktree, path, source))
+              if (typeof required !== "string") return required
               const ownSubmodule = join(worktree, path)
               const heldInWorktree = await referenceContains(git, ownSubmodule, required)
-              const referenceSubmodule = reference === undefined ? undefined : join(reference, path)
-              const referenceHasIt =
+              let referenceSubmodule = reference === undefined ? undefined : join(reference, path)
+              let referenceIsPrepared = false
+              let referenceHasIt =
                 referenceSubmodule !== undefined && (await referenceContains(git, referenceSubmodule, required))
+              let detached =
+                heldInWorktree || referenceHasIt || reference === undefined
+                  ? undefined
+                  : await detachedFromReference(git, reference, path)
+              // A selected addition can have a prepared durable store before the primary
+              // checkout carries it. Admit it before treating HEAD's absence as a removal.
+              if (
+                depth === 0 &&
+                selectedPaths?.has(path) === true &&
+                detached !== undefined &&
+                referenceSubmodule !== undefined &&
+                !(await referenceStoreAt(git, referenceSubmodule))
+              ) {
+                const common = await durableLevel()
+                if (typeof common !== "string") return common
+                try {
+                  const prepared = await preparedSubmoduleStore(
+                    {
+                      run: (request) => git.run(request.repo, request.args, true),
+                    },
+                    common,
+                    name,
+                  )
+                  if (prepared !== undefined) {
+                    referenceSubmodule = prepared
+                    referenceIsPrepared = true
+                    detached = undefined
+                    // Check the existing closure discriminator before cat-file can lazily fetch.
+                    referenceHasIt =
+                      (await promisorRemote(git, prepared)) === undefined &&
+                      (await referenceContains(git, prepared, required))
+                  }
+                } catch (error) {
+                  return {
+                    code: 1,
+                    stdout: "",
+                    stderr: `cannot use prepared store for submodule '${path}': ${error instanceof Error ? error.message : String(error)}`,
+                  }
+                }
+              }
               const canBorrow = heldInWorktree || referenceHasIt
-              const detached =
-                canBorrow || reference === undefined ? undefined : await detachedFromReference(git, reference, path)
-              return { canBorrow, detached, heldInWorktree, name, path, referenceHasIt, referenceSubmodule, required }
+              if (canBorrow) detached = undefined
+              return {
+                canBorrow,
+                detached,
+                heldInWorktree,
+                name,
+                path,
+                referenceHasIt,
+                referenceIsPrepared,
+                referenceSubmodule,
+                required,
+              }
             }),
         )),
       )
@@ -816,6 +909,7 @@ export async function materializeSubmodules(
       name,
       path,
       referenceHasIt: refHasIt,
+      referenceIsPrepared,
       referenceSubmodule,
       required,
     } of probes as Probe[]) {
@@ -829,7 +923,7 @@ export async function materializeSubmodules(
         // store is expected for it; then whether a store exists at all, because
         // the two probes below both read config INSIDE one and answer about the
         // superproject when there is none.
-        const store = detached !== undefined || (await referenceStoreAt(git, referenceSubmodule))
+        const store = referenceIsPrepared || detached !== undefined || (await referenceStoreAt(git, referenceSubmodule))
         const promisor = !store ? undefined : await promisorRemote(git, referenceSubmodule)
         if (detached !== undefined) {
           // NO WARM-UP. The reference dropped this submodule, so the fetch below
@@ -905,7 +999,17 @@ export async function materializeSubmodules(
           }
         }
       }
-      resolved.push({ canBorrow, detached, heldInWorktree, name, path, referenceHasIt, referenceSubmodule, required })
+      resolved.push({
+        canBorrow,
+        detached,
+        heldInWorktree,
+        name,
+        path,
+        referenceHasIt,
+        referenceIsPrepared,
+        referenceSubmodule,
+        required,
+      })
       considered += 1
     }
     span?.lap("resolve")

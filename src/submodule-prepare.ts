@@ -379,6 +379,24 @@ async function validateStore(git: GitProcess, store: string): Promise<void> {
   }
 }
 
+/** Internal local-reference admission; shares preparation's complete store validator. */
+export async function preparedSubmoduleStore(
+  git: GitProcess,
+  common: string,
+  name: string,
+): Promise<string | undefined> {
+  const store = safeStorePath(common, name)
+  await requirePhysicalDirectories(common, store)
+  try {
+    await lstat(store)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined
+    throw error
+  }
+  await validateStore(git, store)
+  return store
+}
+
 async function prepareStore(
   git: GitProcess,
   common: string,
