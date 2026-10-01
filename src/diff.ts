@@ -2,6 +2,8 @@ import { join, posix } from "node:path"
 import { repositoryRoot, runGit } from "./git.ts"
 
 const ZERO_OID = "0".repeat(40)
+/** Git's empty tree: an added gitlink is measured from here to its pin, so every file in it reads as added. */
+const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
 export type ConsultedRepository = Readonly<{
   path: string
@@ -160,7 +162,10 @@ export function recursiveNameStatusDiff(options: RecursiveNameStatusOptions): Re
     .map((row) => ({ path: prefixPath(options.prefix, row.path), status: row.status }))
   const consultedRepositories: ConsultedRepository[] = [options.consulted]
 
-  for (const move of gitlinks) {
+  for (const gitlink of gitlinks) {
+    // An added gitlink has no old commit; it is measured from the empty tree, so its whole tree reads as added (26972).
+    const added = gitlink.oldPin === ZERO_OID && gitlink.newMode === "160000" && gitlink.newPin !== ZERO_OID
+    const move = added ? { ...gitlink, oldMode: "160000", oldPin: EMPTY_TREE } : gitlink
     if (
       move.oldMode !== "160000" ||
       move.newMode !== "160000" ||
@@ -168,8 +173,8 @@ export function recursiveNameStatusDiff(options: RecursiveNameStatusOptions): Re
       move.newPin === ZERO_OID
     ) {
       throw new Error(
-        `git super: ${prefixPath(options.prefix, move.path)} is an added or removed gitlink; ` +
-          "no old/new commit range exists for expansion",
+        `git super: ${prefixPath(options.prefix, move.path)} is a removed gitlink; ` +
+          "no new commit exists to expand its deleted files from",
       )
     }
     const isDirtySubmodule = move.oldPin === move.newPin

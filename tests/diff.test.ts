@@ -42,20 +42,52 @@ describe("superDiff", () => {
     expect(result.consultedRepositories.map(({ path }) => path)).toEqual([".", "packages/alpha", "vendor/beta"])
   })
 
-  test("fails loudly when a gitlink is added without an old commit range", () => {
+  /**
+   * @failure An added gitlink threw "no old/new commit range exists", so affected-tests refused to judge every
+   * post-merge range that spanned a submodule addition (vendor/brain8, 26972).
+   * @level l1
+   * @consumer git super diff and affected-tests
+   * @testonly none
+   */
+  test("expands an added gitlink as every file in its tree, each added", () => {
     const fixture = mkdtempSync(join(tmpdir(), "git-super-added-link-"))
     roots.push(fixture)
     const dependency = join(fixture, "dependency")
     const product = join(fixture, "product")
     createRepository(dependency, "dependency.ts", "export const value = 1\n")
+    advanceRepository(dependency, "notes.md", "notes\n")
     createRepository(product, "root.ts", "export const root = 1\n")
     const base = git(product, "rev-parse", "HEAD")
     git(product, "-c", "protocol.file.allow=always", "submodule", "add", "-q", dependency, "vendor/dependency")
     git(product, "commit", "-q", "-am", "add dependency")
+    const pin = git(product, "rev-parse", "HEAD:vendor/dependency")
 
-    expect(() => superDiff({ repo: product, refs: [`${base}..HEAD`] })).toThrow(
-      "is an added or removed gitlink; no old/new commit range exists",
-    )
+    const result = superDiff({ repo: product, refs: [`${base}..HEAD`], stat: true })
+
+    expect(result.paths).toEqual([".gitmodules", "vendor/dependency/dependency.ts", "vendor/dependency/notes.md"])
+    expect(result.deletedPaths).toEqual([])
+    expect(result.consultedRepositories).toContainEqual(expect.objectContaining({ path: "vendor/dependency", to: pin }))
+    const added = result.stats?.find((stat) => stat.repository === "vendor/dependency")
+    expect(added?.files.map(({ path, deleted }) => ({ path, deleted }))).toEqual([
+      { path: "dependency.ts", deleted: 0 },
+      { path: "notes.md", deleted: 0 },
+    ])
+  })
+
+  test("still fails loudly when a gitlink is removed", () => {
+    const fixture = mkdtempSync(join(tmpdir(), "git-super-removed-link-"))
+    roots.push(fixture)
+    const dependency = join(fixture, "dependency")
+    const product = join(fixture, "product")
+    createRepository(dependency, "dependency.ts", "export const value = 1\n")
+    createRepository(product, "root.ts", "export const root = 1\n")
+    git(product, "-c", "protocol.file.allow=always", "submodule", "add", "-q", dependency, "vendor/dependency")
+    git(product, "commit", "-q", "-am", "add dependency")
+    const base = git(product, "rev-parse", "HEAD")
+    git(product, "rm", "-q", "vendor/dependency")
+    git(product, "commit", "-q", "-m", "remove dependency")
+
+    expect(() => superDiff({ repo: product, refs: [`${base}..HEAD`] })).toThrow("is a removed gitlink")
   })
 
   test("recursively expands a moved gitlink inside a moved submodule", () => {
