@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs"
+import { existsSync, readFileSync, statSync } from "node:fs"
 import { rm } from "node:fs/promises"
 import { dirname, isAbsolute, join, resolve } from "node:path"
 import { readCommitSubmodules, resolveSubmoduleBranch, type CommitSubmodule } from "./commit-graph.ts"
@@ -362,6 +362,19 @@ async function mergeUnderLock(
       ),
     )
     return pending === undefined ? result : unchangedPending(result, pending)
+  }
+  for (const marker of ["rebase-merge", "rebase-apply", "CHERRY_PICK_HEAD"] as const) {
+    const path = await required(git, root, ["rev-parse", "--git-path", marker], "observe-native-operation", timeoutMs)
+    try {
+      statSync(resolve(root, path))
+    } catch (error) {
+      if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") continue
+      throw error
+    }
+    return refuse(
+      "merge-other-operation-pending",
+      `Native operation marker ${marker} is present; finish or abort that operation before merging.`,
+    )
   }
   // Pending native state takes precedence over every mode's prospective interpretation.
   if (pending !== undefined && !options.continue) {

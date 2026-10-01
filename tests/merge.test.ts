@@ -1575,6 +1575,11 @@ describe("git super merge", () => {
     git(repository, "commit", "-q", "-am", "main conflict")
     const head = git(repository, "rev-parse", "HEAD")
     const branch = git(repository, "symbolic-ref", "HEAD")
+    const upstream = join(fixtureRoot, "upstream.git")
+    git(repository, "clone", "-q", "--bare", repository, upstream)
+    git(repository, "remote", "add", "origin", upstream)
+    git(repository, "config", "branch.main.remote", "origin")
+    git(repository, "config", "branch.main.merge", "refs/heads/main")
     const pendingOut = outputSink()
     const pendingErr = outputSink()
 
@@ -1584,6 +1589,27 @@ describe("git super merge", () => {
     expect(JSON.parse(pendingOut.output)).toMatchObject({ state: "failed", partial: true })
     expect(git(repository, "rev-parse", "HEAD")).toBe(head)
     expect(git(repository, "symbolic-ref", "HEAD")).toBe(branch)
+    expect(git(repository, "rev-parse", "MERGE_HEAD")).toBe(target)
+    expect(git(repository, "ls-files", "-u")).toContain("shared.txt")
+
+    // CTO correction 4: status reports conflicts; an equal-target pull is a
+    // truthful no-op; push publishes the explicitly selected HEAD, not the index.
+    const statusOut = outputSink()
+    expect(await runCli(["--repo", repository, "--json", "status"], statusOut, outputSink())).toBe(0)
+    expect(JSON.parse(statusOut.output).records).toContain("UU shared.txt")
+    const pullOut = outputSink()
+    expect(await runCli(["--repo", repository, "--json", "pull", "--ff-only"], pullOut, outputSink())).toBe(0)
+    expect(JSON.parse(pullOut.output)).toMatchObject({ state: "unchanged", partial: false })
+    const pushOut = outputSink()
+    expect(
+      await runCli(
+        ["--repo", repository, "--json", "push", "origin", "HEAD:refs/heads/pending-observation"],
+        pushOut,
+        outputSink(),
+      ),
+    ).toBe(0)
+    expect(JSON.parse(pushOut.output)).toMatchObject({ state: "updated", partial: false })
+    expect(git(upstream, "rev-parse", "refs/heads/pending-observation")).toBe(head)
     expect(git(repository, "rev-parse", "MERGE_HEAD")).toBe(target)
     expect(git(repository, "ls-files", "-u")).toContain("shared.txt")
 
@@ -1616,6 +1642,16 @@ describe("git super merge", () => {
       expect(git(repository, "ls-files", "-u")).toContain("shared.txt")
     }
 
+    // Native abort returns to the original state without a GitSuper abort mode.
+    git(repository, "merge", "--abort")
+    expect(git(repository, "rev-parse", "HEAD")).toBe(head)
+    expect(git(repository, "symbolic-ref", "HEAD")).toBe(branch)
+    expect(git(repository, "status", "--porcelain=v1")).toBe("")
+    expect(readFileSync(join(repository, "shared.txt"), "utf8")).toBe("main\n")
+    expect(await superMerge({ repo: repository, commit: target, preserveConflicts: true })).toMatchObject({
+      state: "failed",
+      partial: true,
+    })
     writeFileSync(join(repository, "shared.txt"), "human resolution\n")
     git(repository, "add", "shared.txt")
     const mergeHeadPath = git(repository, "rev-parse", "--path-format=absolute", "--git-path", "MERGE_HEAD")
@@ -1793,6 +1829,125 @@ describe("git super merge", () => {
     expect(git(fixture.product, "rev-parse", "HEAD:packages/alpha")).toBe(advanced)
     expect(git(child, "rev-parse", "HEAD")).toBe(advanced)
   })
+
+  /**
+   * @failure A hook changes frozen publication inputs yet merge reports success, or rejects harmless ordinary formatting (26988).
+   * @level l1
+   * @consumer Fresh and continued merges before their success receipt is emitted
+   * @testonly none
+   * Existing hook rows cover rejection and checkout coherence, not the committed tree's frozen inputs.
+   */
+  it.each([
+    ["fresh", "ordinary"],
+    ["fresh", "gitlink"],
+    ["fresh", "modules"],
+    ["continue", "ordinary"],
+    ["continue", "gitlink"],
+    ["continue", "modules"],
+  ] as const)("verifies frozen publication inputs after %s merge hook changes %s (26988)", async (mode, changed) => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-hook-inputs-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const shared = join(fixture.product, "shared.txt")
+    writeFileSync(shared, "base\n")
+    git(fixture.product, "add", "shared.txt")
+    git(fixture.product, "commit", "-q", "-m", "shared root base")
+    const raised = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
+    git(fixture.product, "switch", "-q", "-c", "candidate-hook-inputs")
+    writeFileSync(shared, "candidate\n")
+    git(fixture.product, "commit", "-q", "-am", "candidate content")
+    const target = git(fixture.product, "rev-parse", "HEAD")
+    git(fixture.product, "switch", "-q", "main")
+    if (mode === "continue") {
+      writeFileSync(shared, "main\n")
+      git(fixture.product, "commit", "-q", "-am", "main content")
+      expect(await superMerge({ repo: fixture.product, commit: target, preserveConflicts: true })).toMatchObject({
+        state: "failed",
+        partial: true,
+      })
+      writeFileSync(shared, "human resolution\n")
+      git(fixture.product, "add", "shared.txt")
+    }
+    const head = git(fixture.product, "rev-parse", "HEAD")
+    const hook = git(fixture.product, "rev-parse", "--path-format=absolute", "--git-path", "hooks/pre-commit")
+    const action =
+      changed === "ordinary"
+        ? "printf 'formatted ordinary content\\n' > shared.txt\ngit add shared.txt\n"
+        : changed === "gitlink"
+          ? `git update-index --cacheinfo 160000,${fixture.alphaBase},packages/alpha\n`
+          : "printf '# hook descriptor mutation\\n' >> .gitmodules\ngit add .gitmodules\n"
+    writeFileSync(hook, `#!/bin/sh\nset -e\n${action}`)
+    chmodSync(hook, 0o755)
+    const result = await superMerge({
+      repo: fixture.product,
+      commit: target,
+      ...(mode === "continue" ? { continue: true, expectedHead: head, expectedBranch: "refs/heads/main" } : {}),
+    })
+    const observed = git(fixture.product, "rev-parse", "HEAD")
+    expect(observed).not.toBe(head)
+    expect(result.commit).toBe(observed)
+    expect(git(fixture.product, "show", "-s", "--format=%P", observed)).toBe(`${head} ${target}`)
+    expect(git(join(fixture.product, "packages/alpha"), "rev-parse", "HEAD")).toBe(raised)
+    const receipt = `refs/git-super/receipts/${observed}`
+    if (changed === "ordinary") {
+      expect(result).toMatchObject({ state: "updated", partial: false })
+      expect(git(fixture.product, "show", "HEAD:shared.txt")).toBe("formatted ordinary content")
+      expect(JSON.parse(git(fixture.product, "show", `${receipt}:receipt.json`))).toMatchObject({
+        merge: observed,
+        changes: [{ path: "packages/alpha", mode: "160000", from: fixture.alphaBase, to: raised }],
+      })
+    } else {
+      expect(result).toMatchObject({
+        state: "failed",
+        partial: true,
+        commit: observed,
+        detail: { code: "merge-postcondition-mismatch" },
+      })
+      expect(() => git(fixture.product, "rev-parse", "--verify", receipt)).toThrow()
+      expect(git(fixture.product, "rev-parse", "HEAD")).toBe(observed)
+      if (changed === "gitlink") {
+        expect(git(fixture.product, "rev-parse", "HEAD:packages/alpha")).toBe(fixture.alphaBase)
+      } else expect(git(fixture.product, "show", "HEAD:.gitmodules")).toContain("# hook descriptor mutation")
+    }
+  })
+
+  /**
+   * @failure Explicit conflict entry starts a second operation during a native rebase or cherry-pick (26988).
+   * @level l1
+   * @consumer Standalone merge callers sharing native repository operation state
+   * @testonly none
+   * Ordinary MERGE_HEAD rows do not represent the other native operation markers.
+   */
+  it.each(["rebase", "cherry-pick"] as const)(
+    "refuses pending native %s before explicit conflict entry (26988)",
+    async (operation) => {
+      const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-other-pending-"))
+      roots.push(fixtureRoot)
+      const repository = join(fixtureRoot, "conflict")
+      createRepository(repository, "shared.txt", "base\n")
+      git(repository, "switch", "-q", "-c", "candidate")
+      writeFileSync(join(repository, "shared.txt"), "candidate\n")
+      git(repository, "commit", "-q", "-am", "candidate conflict")
+      const target = git(repository, "rev-parse", "HEAD")
+      git(repository, "switch", "-q", "main")
+      writeFileSync(join(repository, "shared.txt"), "main\n")
+      git(repository, "commit", "-q", "-am", "main conflict")
+      expect(() => git(repository, operation, target)).toThrow()
+      const observedHead = git(repository, "rev-parse", "HEAD")
+      const stages = git(repository, "ls-files", "--stage", "-z")
+      const bytes = readFileSync(join(repository, "shared.txt"), "utf8")
+      const result = await superMerge({ repo: repository, commit: target, preserveConflicts: true })
+      expect(result).toMatchObject({
+        state: "failed",
+        partial: false,
+        detail: { code: "merge-other-operation-pending" },
+      })
+      expect(result.detail?.message).toContain(operation === "rebase" ? "rebase-merge" : "CHERRY_PICK_HEAD")
+      expect(git(repository, "rev-parse", "HEAD")).toBe(observedHead)
+      expect(git(repository, "ls-files", "--stage", "-z")).toBe(stages)
+      expect(readFileSync(join(repository, "shared.txt"), "utf8")).toBe(bytes)
+    },
+  )
 
   it.each(["shared.txt", "space \tand\nnewline.txt"])(
     "reports a conflict at %j before writing HEAD, the index, or the worktree",
