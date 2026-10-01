@@ -1,5 +1,9 @@
 import { join, posix } from "node:path"
 import { probeRepository, repositoryRoot, runGit, tryGit } from "./git.ts"
+import { joinCommitSubmodules, parseCommitSubmoduleConfig, type CommitSubmodule } from "./commit-graph.ts"
+import { pinRef } from "./objects.ts"
+import { shellQuote } from "./shell-command.ts"
+import { resolveSubmoduleOrigin } from "./submodule-origin.ts"
 
 const ZERO_OID = "0".repeat(40)
 /** Git's empty tree: an added gitlink is measured from here to its pin, so every file in it reads as added. */
@@ -201,6 +205,30 @@ function initializedCheckout(root: string, move: RawDiffRow, path: string, added
   return probe.root
 }
 
+/** Parent-only frozen descriptors, using the existing raw-diff parser and graph-owned config join. */
+function comparisonSubmodules(root: string, options: SuperDiffOptions): Map<string, CommitSubmodule> {
+  const selected = rootRange(root, options)?.to ?? options.refs?.[0] ?? "HEAD"
+  const frozen = runGit(root, ["rev-parse", `${selected}^{tree}`]).trim()
+  const tree = parseRawDiff(
+    runGit(root, ["diff", "--raw", "-z", "--abbrev=40", "--no-renames", "--ignore-submodules=dirty", EMPTY_TREE, frozen]),
+  )
+  const gitlinks = new Map(tree.filter(({ newMode }) => newMode === "160000").map(({ path, newPin }) => [path, newPin]))
+  const configured = runGit(root, [
+    "config",
+    "--null",
+    "--blob",
+    `${frozen}:.gitmodules`,
+    "--get-regexp",
+    "^submodule\\..*\\.(path|url|branch)$",
+  ])
+  return new Map(
+    joinCommitSubmodules(gitlinks, parseCommitSubmoduleConfig(configured, frozen), frozen).map((entry) => [
+      entry.path,
+      entry,
+    ]),
+  )
+}
+
 /** Internal recursive primitive shared by `diff` and `status`. */
 export function recursiveNameStatusDiff(options: RecursiveNameStatusOptions): RecursiveNameStatusResult {
   const root = repositoryRoot(options.repo)
@@ -221,6 +249,9 @@ export function recursiveNameStatusDiff(options: RecursiveNameStatusOptions): Re
     .map((row) => ({ path: prefixPath(options.prefix, row.path), status: row.status }))
   const consultedRepositories: ConsultedRepository[] = [options.consulted]
   const notCompared: NotCompared[] = []
+  const descriptors = gitlinks.some(({ newMode }) => newMode === "160000")
+    ? comparisonSubmodules(root, options)
+    : new Map<string, CommitSubmodule>()
 
   for (const gitlink of gitlinks) {
     if (gitlink.oldMode === "160000" && gitlink.newMode === "000000") {
@@ -235,6 +266,50 @@ export function recursiveNameStatusDiff(options: RecursiveNameStatusOptions): Re
     const isDirtySubmodule = move.oldPin === move.newPin
     const nestedPrefix = prefixPath(options.prefix, move.path)
     const nestedRoot = initializedCheckout(root, move, nestedPrefix, gitlink.oldPin === ZERO_OID)
+    const unreadable = [...new Set([move.oldPin, move.newPin])]
+      .filter((pin) => pin !== EMPTY_TREE && pin !== ZERO_OID)
+      .map((pin) => ({ pin, result: tryGit(nestedRoot, ["cat-file", "-e", `${pin}^{commit}`]) }))
+      .filter(({ result }) => result.exitCode !== 0)
+    if (unreadable.length > 0) {
+      const descriptor = descriptors.get(move.path)
+      const declaredUrl = descriptor?.url
+      const relativeUrl = declaredUrl?.startsWith("./") || declaredUrl?.startsWith("../")
+      const parentOrigin = relativeUrl ? tryGit(root, ["remote", "get-url", "origin"]) : undefined
+      const url =
+        declaredUrl === undefined || (relativeUrl && parentOrigin?.exitCode !== 0)
+          ? undefined
+          : resolveSubmoduleOrigin(root, parentOrigin?.stdout.trim(), declaredUrl)
+      const remedy =
+        url === undefined
+          ? declaredUrl === undefined
+            ? `Frozen .gitmodules in ${root} has no remote URL for ${move.path}; restore that descriptor before fetching.`
+            : `Cannot resolve frozen relative URL ${declaredUrl} for ${move.path}: git remote get-url origin in ${root} failed (${parentOrigin?.stderr}); restore that parent origin before fetching.`
+          : unreadable
+              .map(({ pin }) =>
+                [
+                  "git",
+                  "-C",
+                  nestedRoot,
+                  "fetch",
+                  "--no-tags",
+                  "--no-recurse-submodules",
+                  "--no-write-fetch-head",
+                  url,
+                  `${pin}:${pinRef(pin)}`,
+                ]
+                  .map(shellQuote)
+                  .join(" "),
+              )
+              .join("\n")
+      notCompared.push({
+        path: nestedPrefix,
+        reason: "unreadable",
+        objectIds: unreadable.map(({ pin }) => pin),
+        message: `cannot read component objects in ${nestedRoot}: ${unreadable.map(({ pin, result }) => `${pin} (${result.stderr || `git cat-file exited ${result.exitCode}`})`).join("; ")}`,
+        remedy,
+      })
+      continue
+    }
     const nested = recursiveNameStatusDiff({
       repo: nestedRoot,
       prefix: nestedPrefix,

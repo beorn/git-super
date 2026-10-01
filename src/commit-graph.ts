@@ -126,8 +126,15 @@ export async function readCommitSubmodules(
   if (gitProcessFailed(configured)) {
     throw operationError(repository, "read-target-submodules", configuredArgs, configured)
   }
-  const configuredByName = new Map<string, { path?: string; url?: string; branch?: string }>()
-  for (const entry of configured.stdout.split("\0").filter((value) => value !== "")) {
+  return joinCommitSubmodules(gitlinks, parseCommitSubmoduleConfig(configured.stdout, commit), commit)
+}
+
+type ConfiguredSubmodule = { path?: string; url?: string; branch?: string }
+
+/** The one parser of Git's frozen NUL config output; shared by async graph and sync comparison. */
+export function parseCommitSubmoduleConfig(raw: string, commit: string): Map<string, ConfiguredSubmodule> {
+  const configuredByName = new Map<string, ConfiguredSubmodule>()
+  for (const entry of raw.split("\0").filter((value) => value !== "")) {
     const separator = entry.indexOf("\n")
     const match = /^submodule\.(.+)\.(path|url|branch)$/u.exec(separator < 0 ? "" : entry.slice(0, separator))
     if (separator < 1 || match?.[1] === undefined || match[2] === undefined) {
@@ -156,6 +163,15 @@ export async function readCommitSubmodules(
     current[property] = value
     configuredByName.set(match[1], current)
   }
+  return configuredByName
+}
+
+/** Join one frozen tree's native pins and configuration, retaining the graph's strict refusals. */
+export function joinCommitSubmodules(
+  gitlinks: ReadonlyMap<string, string>,
+  configuredByName: ReadonlyMap<string, ConfiguredSubmodule>,
+  commit: string,
+): CommitSubmodule[] {
   const entries: CommitSubmodule[] = []
   const configuredPaths = new Map<string, CommitSubmodule>()
   for (const [name, configuredEntry] of [...configuredByName].sort(([, left], [, right]) =>

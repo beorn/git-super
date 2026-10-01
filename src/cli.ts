@@ -644,6 +644,16 @@ async function runInvocation(
     return 2
   }
   await writeResult(captured, result, stdout, stderr, commands)
+  if (
+    captured.node === commands.diff &&
+    (result as SuperDiffResult).notCompared.some(({ reason }) => reason === "unreadable")
+  ) {
+    await protocol?.refuse(
+      "unjudged",
+      "Comparison contains unreadable components; see each named observation and remedy.",
+    )
+    return 2
+  }
 
   if (captured.node === commands["merge-base"] && !(result as SuperIsAncestorResult).isAncestor) return 1
   if (captured.node === commands.merge) {

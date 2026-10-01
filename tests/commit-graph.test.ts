@@ -4,8 +4,9 @@ import { join } from "node:path"
 import { afterEach, describe, expect, test } from "vitest"
 
 import { changedCommitGitlinks, readCommitSubmodules } from "../src/commit-graph.ts"
+import { superDiff } from "../src/diff.ts"
 import { createLocalGitProcess, type GitProcess } from "../src/process.ts"
-import { createProductFixture, git } from "./fixture.ts"
+import { advanceRepository, createProductFixture, git } from "./fixture.ts"
 
 const roots: string[] = []
 
@@ -23,9 +24,12 @@ describe("commit submodule graph", () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-commit-graph-"))
     roots.push(fixtureRoot)
     const fixture = createProductFixture(fixtureRoot)
+    const alphaHead = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
+    git(join(fixture.product, "packages/alpha"), "fetch", "-q", "origin")
+    git(join(fixture.product, "packages/alpha"), "checkout", "-q", alphaHead)
 
     git(fixture.product, "config", "--file", ".gitmodules", "submodule.packages/alpha.branch", "release/stable")
-    git(fixture.product, "add", ".gitmodules")
+    git(fixture.product, "add", ".gitmodules", "packages/alpha")
     git(fixture.product, "commit", "-q", "-m", "declare submodule branch")
     const declared = git(fixture.product, "rev-parse", "HEAD")
     git(fixture.product, "config", "--file", ".gitmodules", "submodule.packages/alpha.branch", "uncommitted")
@@ -35,7 +39,7 @@ describe("commit submodule graph", () => {
         branch: "release/stable",
         name: "packages/alpha",
         path: "packages/alpha",
-        target: fixture.alphaBase,
+        target: alphaHead,
         url: fixture.alpha,
       },
       {
@@ -45,6 +49,16 @@ describe("commit submodule graph", () => {
         url: fixture.beta,
       },
     ])
+    const comparison = superDiff({ repo: fixture.product, refs: [`${fixture.productBase}..${declared}`] })
+    expect(comparison.paths).toContain("packages/alpha/alpha.ts")
+    expect(comparison.consultedRepositories).toContainEqual(
+      expect.objectContaining({
+        path: "packages/alpha",
+        from: fixture.alphaBase,
+        to: alphaHead,
+      }),
+    )
+    expect(comparison.notCompared).toEqual([])
 
     git(fixture.product, "config", "--file", ".gitmodules", "--add", "submodule.packages/alpha.branch", "other")
     git(fixture.product, "add", ".gitmodules")
@@ -52,6 +66,11 @@ describe("commit submodule graph", () => {
     await expect(readCommitSubmodules(createLocalGitProcess(), fixture.product, "HEAD")).rejects.toMatchObject({
       resultDetail: { code: "conflicting-target-submodule-config", paths: [".gitmodules"] },
     })
+    expect(() => superDiff({ repo: fixture.product, refs: [`${fixture.productBase}..HEAD`] })).toThrowError(
+      expect.objectContaining({
+        resultDetail: expect.objectContaining({ code: "conflicting-target-submodule-config" }),
+      }),
+    )
 
     git(fixture.product, "config", "--file", ".gitmodules", "--unset-all", "submodule.packages/alpha.branch")
     git(fixture.product, "config", "--file", ".gitmodules", "submodule.alias.path", "packages/alpha")
