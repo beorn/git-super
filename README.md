@@ -271,7 +271,7 @@ bun run typecheck
 
 The package depends only on published packages: `@bearly/flock`, `@silvery/command`, `@silvery/commander`, `react`, and `silvery`. It contains no scheduler, no delivery daemon, no task tracker, and no imports from any host repository.
 
-Library consumers may import the root `git-super` surface, or `git-super/gitlink` for exact index-pin writes, `git-super/commit-graph` for frozen submodule descriptors, `git-super/objects` for exact-object loading, `git-super/submodule-origin` for remote resolution, `git-super/worktree` for injected worktree mechanics, and `git-super/submodules` for recursive materialization.
+Library consumers may import the root `git-super` surface, or `git-super/gitlink` for exact index-pin writes, `git-super/commit-graph` for frozen submodule descriptors, `git-super/objects` for exact-object loading, `git-super/submodule-origin` for remote resolution, `git-super/worktree` for injected worktree mechanics, `git-super/status` for recursive repository inventory and status, and `git-super/submodules` for recursive materialization.
 
 The recursive materializer's `source` option defaults to `"head"`, reading top-level `.gitmodules` and pins from HEAD. Merge passes `"index"` to read stage-0 declarations and pins from its staged merge; named paths without a declared stage-0 gitlink refuse. Nested levels always read their checked-out parent HEAD. Host adapters expose HEAD materialization only and omit `source` from their options.
 
