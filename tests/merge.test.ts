@@ -1534,6 +1534,69 @@ describe("git super merge", () => {
     expect(git(repository, "rev-parse", "HEAD")).toBe(headBefore)
   })
 
+  /**
+   * @failure Explicit ordinary conflict resolution cannot finish on its original branch, or discards the human resolution (26988).
+   * @level l1
+   * @consumer Standalone GitSuper callers resolving an ordinary root merge conflict
+   * @testonly none
+   * Existing default-refusal rows do not enter or continue a native pending merge.
+   */
+  it("preserves ordinary conflicts and continues the human resolution on the original branch (26988)", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-continue-"))
+    roots.push(fixtureRoot)
+    const repository = join(fixtureRoot, "conflict")
+    createRepository(repository, "shared.txt", "base\n")
+    git(repository, "switch", "-q", "-c", "candidate")
+    writeFileSync(join(repository, "shared.txt"), "candidate\n")
+    git(repository, "commit", "-q", "-am", "candidate conflict")
+    const target = git(repository, "rev-parse", "HEAD")
+    git(repository, "switch", "-q", "main")
+    writeFileSync(join(repository, "shared.txt"), "main\n")
+    git(repository, "commit", "-q", "-am", "main conflict")
+    const head = git(repository, "rev-parse", "HEAD")
+    const branch = git(repository, "symbolic-ref", "HEAD")
+    const pendingOut = outputSink()
+    const pendingErr = outputSink()
+
+    expect(
+      await runCli(["--repo", repository, "--json", "merge", target, "--preserve-conflicts"], pendingOut, pendingErr),
+    ).toBe(2)
+    expect(JSON.parse(pendingOut.output)).toMatchObject({ state: "failed", partial: true })
+    expect(git(repository, "rev-parse", "HEAD")).toBe(head)
+    expect(git(repository, "symbolic-ref", "HEAD")).toBe(branch)
+    expect(git(repository, "rev-parse", "MERGE_HEAD")).toBe(target)
+    expect(git(repository, "ls-files", "-u")).toContain("shared.txt")
+
+    writeFileSync(join(repository, "shared.txt"), "human resolution\n")
+    git(repository, "add", "shared.txt")
+    const finishedOut = outputSink()
+    const finishedErr = outputSink()
+    expect(
+      await runCli(
+        [
+          "--repo",
+          repository,
+          "--json",
+          "merge",
+          target,
+          "--continue",
+          "--expected-head",
+          head,
+          "--expected-branch",
+          branch,
+        ],
+        finishedOut,
+        finishedErr,
+      ),
+    ).toBe(0)
+    expect(JSON.parse(finishedOut.output)).toMatchObject({ state: "updated", partial: false })
+    expect(git(repository, "symbolic-ref", "HEAD")).toBe(branch)
+    expect(git(repository, "show", "HEAD:shared.txt")).toBe("human resolution")
+    expect(git(repository, "show", "-s", "--format=%P", "HEAD")).toBe(`${head} ${target}`)
+    expect(git(repository, "ls-files", "-u")).toBe("")
+    expect(git(repository, "status", "--porcelain=v1")).toBe("")
+  })
+
   it.each(["shared.txt", "space \tand\nnewline.txt"])(
     "reports a conflict at %j before writing HEAD, the index, or the worktree",
     async (sharedPath) => {
