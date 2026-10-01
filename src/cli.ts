@@ -697,6 +697,10 @@ async function writeResult(
     stdout.write(stableJson(result))
   } else if (captured.node === nodes.diff) {
     const diff = result as SuperDiffResult
+    for (const observation of diff.notCompared) {
+      stderr.write(`${observation.path}: ${observation.message}\n`)
+      if (observation.remedy !== undefined) stderr.write(`${observation.remedy}\n`)
+    }
     if (diff.paths.length > 0) {
       stdout.write(`${diff.paths.join(captured.nul ? "\0" : "\n")}${captured.nul ? "\0" : "\n"}`)
     }

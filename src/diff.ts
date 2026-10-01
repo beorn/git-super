@@ -71,8 +71,18 @@ export type SuperDiffResult = Readonly<{
   paths: readonly string[]
   deletedPaths: readonly string[]
   consultedRepositories: readonly ConsultedRepository[]
+  notCompared: readonly NotCompared[]
   stats?: readonly RepositoryDiffStat[]
   patches?: readonly RepositoryDiffPatch[]
+}>
+
+/** An explicit omission from a comparison, never evidence that a component is clean. */
+export type NotCompared = Readonly<{
+  path: string
+  reason: "removed" | "excluded" | "unreadable"
+  message: string
+  objectIds?: readonly string[]
+  remedy?: string
 }>
 
 type RawDiffRow = Readonly<{
@@ -145,6 +155,7 @@ type RecursiveNameStatusOptions = Readonly<{
 export type RecursiveNameStatusResult = Readonly<{
   entries: readonly Readonly<{ path: string; status: string }>[]
   consultedRepositories: readonly ConsultedRepository[]
+  notCompared: readonly NotCompared[]
 }>
 
 /**
@@ -209,8 +220,17 @@ export function recursiveNameStatusDiff(options: RecursiveNameStatusOptions): Re
     .filter((row) => row.oldMode !== "160000" && row.newMode !== "160000")
     .map((row) => ({ path: prefixPath(options.prefix, row.path), status: row.status }))
   const consultedRepositories: ConsultedRepository[] = [options.consulted]
+  const notCompared: NotCompared[] = []
 
   for (const gitlink of gitlinks) {
+    if (gitlink.oldMode === "160000" && gitlink.newMode === "000000") {
+      notCompared.push({
+        path: prefixPath(options.prefix, gitlink.path),
+        reason: "removed",
+        message: "component removed, not compared",
+      })
+      continue
+    }
     const move = expandableGitlink(gitlink, prefixPath(options.prefix, gitlink.path))
     const isDirtySubmodule = move.oldPin === move.newPin
     const nestedPrefix = prefixPath(options.prefix, move.path)
@@ -241,9 +261,10 @@ export function recursiveNameStatusDiff(options: RecursiveNameStatusOptions): Re
     })
     entries.push(...nested.entries)
     consultedRepositories.push(...nested.consultedRepositories)
+    notCompared.push(...nested.notCompared)
   }
 
-  return { entries, consultedRepositories }
+  return { entries, consultedRepositories, notCompared }
 }
 
 function uniqueRepositories(repositories: readonly ConsultedRepository[]): ConsultedRepository[] {
@@ -365,9 +386,14 @@ function computeRepositoryStat(
   entry: ConsultedRepository,
   options: SuperDiffOptions,
   all: readonly ConsultedRepository[],
+  notCompared: readonly NotCompared[],
 ): RepositoryDiffStat {
   const pointerMoves = pointerMovesFor(entry, all)
   const excluded = new Set([...pointerMoves.map((move) => move.path), ...directChildSubmodules(entry, all)])
+  const prefix = entry.path === "." ? "" : `${entry.path}/`
+  for (const observation of notCompared) {
+    if (observation.path.startsWith(prefix)) excluded.add(observation.path.slice(prefix.length))
+  }
   const raw = runGit(entry.root, ["diff", "--numstat", "-z", ...rangeArgsFor(entry, options)])
   const files = parseNumstat(raw).filter((file) => !excluded.has(file.path))
   const totals = files.reduce<{ files: number; added: number; deleted: number }>(
@@ -425,13 +451,26 @@ export function superDiff(options: SuperDiffOptions): SuperDiffResult {
     consulted,
   })
   const consultedRepositories = uniqueRepositories([...changed.consultedRepositories, ...deleted.consultedRepositories])
+  const notCompared = [
+    ...new Map(
+      [...changed.notCompared, ...deleted.notCompared].map((observation) => [
+        `${observation.path}\0${observation.reason}`,
+        observation,
+      ]),
+    ).values(),
+  ]
 
   return {
     paths: [...new Set(changed.entries.map(({ path }) => path))].sort(),
     deletedPaths: [...new Set(deleted.entries.map(({ path }) => path))].sort(),
     consultedRepositories,
+    notCompared,
     ...(options.stat === true
-      ? { stats: consultedRepositories.map((entry) => computeRepositoryStat(entry, options, consultedRepositories)) }
+      ? {
+          stats: consultedRepositories.map((entry) =>
+            computeRepositoryStat(entry, options, consultedRepositories, notCompared),
+          ),
+        }
       : {}),
     ...(options.patch === true
       ? { patches: consultedRepositories.map((entry) => computeRepositoryPatch(entry, options)) }

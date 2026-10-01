@@ -146,7 +146,13 @@ describe("superDiff", () => {
     )
   })
 
-  test("still fails loudly when a gitlink is removed", () => {
+  /**
+   * @failure A removed component aborts the whole comparison and hides readable root changes (#27058 AC1/AC4).
+   * @level l1
+   * @consumer git super diff and deriving comparison consumers
+   * @testonly none
+   */
+  test("reports a removed component without losing readable root changes", async () => {
     const fixture = mkdtempSync(join(tmpdir(), "git-super-removed-link-"))
     roots.push(fixture)
     const dependency = join(fixture, "dependency")
@@ -157,9 +163,37 @@ describe("superDiff", () => {
     git(product, "commit", "-q", "-am", "add dependency")
     const base = git(product, "rev-parse", "HEAD")
     git(product, "rm", "-q", "vendor/dependency")
-    git(product, "commit", "-q", "-m", "remove dependency")
+    writeFileSync(join(product, "root.ts"), "export const root = 2\n")
+    git(product, "add", "root.ts")
+    git(product, "commit", "-q", "-m", "remove dependency and change root")
 
-    expect(() => superDiff({ repo: product, refs: [`${base}..HEAD`] })).toThrow("is a removed gitlink")
+    const result = superDiff({ repo: product, refs: [`${base}..HEAD`], stat: true })
+
+    expect(result.paths).toEqual([".gitmodules", "root.ts"])
+    expect(result).toMatchObject({
+      notCompared: [
+        expect.objectContaining({
+          path: "vendor/dependency",
+          reason: "removed",
+          message: "component removed, not compared",
+        }),
+      ],
+    })
+    expect(result.consultedRepositories.map(({ path }) => path)).toEqual(["."])
+    expect(result.stats?.[0]?.files.map(({ path }) => path)).toEqual([".gitmodules", "root.ts"])
+    for (const json of [false, true]) {
+      const stdout = outputSink()
+      const stderr = outputSink()
+      expect(
+        await runCli(["--repo", product, ...(json ? ["--json"] : []), "diff", `${base}..HEAD`], stdout, stderr),
+      ).toBe(0)
+      if (json) {
+        expect(JSON.parse(stdout.output)).toMatchObject({ notCompared: result.notCompared })
+      } else {
+        expect(stdout.output).toContain("root.ts")
+        expect(stderr.output).toContain("vendor/dependency: component removed, not compared")
+      }
+    }
   })
 
   test("recursively expands a moved gitlink inside a moved submodule", () => {
@@ -264,27 +298,59 @@ describe("superDiff --stat / --patch", () => {
     expect(result.stats?.[2]?.files).toEqual([{ path: "leaf.ts", added: 1, deleted: 1, binary: false }])
   })
 
-  test("a gitlink whose target commit is absent locally fails loud naming the repository and the missing sha", () => {
+  /**
+   * @failure The first missing sibling pin aborts comparison, hiding other missing pins and readable root data (#27058 AC2/AC4).
+   * @level l1
+   * @consumer git super diff CLI and affected-tests
+   * @testonly none
+   */
+  test("reports every unreadable sibling pin and readable root data before CLI refusal", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-diff-stat-missing-"))
     roots.push(fixtureRoot)
     const fixture = createProductFixture(fixtureRoot)
     const alphaHead = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
+    const betaHead = advanceRepository(fixture.beta, "beta.ts", "export const beta = 2\n")
     const alphaCheckout = join(fixture.product, "packages/alpha")
-    // Deliberately skip fetch/checkout: alphaHead's object never reaches the nested checkout.
+    const betaCheckout = join(fixture.product, "vendor/beta")
+    // Deliberately skip both fetches: neither new object reaches its nested checkout.
     git(fixture.product, "update-index", "--cacheinfo", `160000,${alphaHead},packages/alpha`)
-    git(fixture.product, "commit", "-q", "-m", "bump alpha pin without fetching")
+    git(fixture.product, "update-index", "--cacheinfo", `160000,${betaHead},vendor/beta`)
+    writeFileSync(join(fixture.product, "root.ts"), "export const root = 1\n")
+    git(fixture.product, "add", "root.ts")
+    git(fixture.product, "commit", "-q", "-m", "bump two pins without fetching and change root")
     const head = git(fixture.product, "rev-parse", "HEAD")
 
-    let thrown: unknown
-    try {
-      superDiff({ repo: fixture.product, refs: [`${fixture.productBase}..${head}`], stat: true })
-    } catch (error) {
-      thrown = error
+    const stdout = outputSink()
+    const stderr = outputSink()
+    const code = await runCli(
+      ["--repo", fixture.product, "--json", "diff", "--stat", `${fixture.productBase}..${head}`],
+      stdout,
+      stderr,
+    )
+
+    expect(code).toBe(2)
+    expect(stdout.output).toContain("root.ts")
+    const result = JSON.parse(stdout.output) as {
+      paths: string[]
+      consultedRepositories: { path: string }[]
+      notCompared: { path: string; reason: string; objectIds: string[]; remedy: string }[]
     }
-    expect(thrown).toBeInstanceOf(Error)
-    const message = (thrown as Error).message
-    expect(message).toContain(alphaCheckout)
-    expect(message).toContain(alphaHead)
+    expect(result.paths).toEqual(["root.ts"])
+    expect(result.consultedRepositories.map(({ path }) => path)).toEqual(["."])
+    expect(result.notCompared).toEqual([
+      expect.objectContaining({ path: "packages/alpha", reason: "unreadable", objectIds: [alphaHead] }),
+      expect.objectContaining({ path: "vendor/beta", reason: "unreadable", objectIds: [betaHead] }),
+    ])
+    for (const [index, checkout, origin, pin] of [
+      [0, alphaCheckout, fixture.alpha, alphaHead],
+      [1, betaCheckout, fixture.beta, betaHead],
+    ] as const) {
+      const remedy = result.notCompared[index]?.remedy
+      expect(remedy).toContain(checkout)
+      expect(remedy).toContain(origin)
+      expect(remedy).toContain("fetch")
+      expect(remedy).toContain(`${pin}:refs/git-super/pins/${pin}`)
+    }
   })
 
   test("CLI --json --stat carries the same per-repository split, and plain --json without either flag is unchanged", async () => {
