@@ -6,16 +6,25 @@ import {
 
 const encoded = process.argv[2]
 if (encoded === undefined) {
-  throw new Error("usage: bun submodule-runner.ts <worktree> [reference-worktree] [path ...]")
+  throw new Error(
+    "usage: bun submodule-runner.ts <worktree> [reference-worktree] [path ...]\n" +
+      "       bun submodule-runner.ts <worktree> -- <path ...>   (the reference discovered as with no argument)",
+  )
 }
 const jsonMode = encoded.startsWith("{")
+// `--` in the reference position names paths and leaves the reference to discovery. Without it a caller that
+// syncs some paths had to name a reference, and naming the worktree itself means NO reference: every path then
+// materialized from the network (hh 26874, @cto 2f497476 A).
+const pathsOnly = process.argv[3] === "--"
 const options = jsonMode
   ? (JSON.parse(encoded) as HostSubmoduleMaterializationOptions)
-  : {
-      worktree: encoded,
-      ...(process.argv[3] === undefined ? {} : { referenceWorktree: process.argv[3] }),
-      ...(process.argv.length <= 4 ? {} : { paths: process.argv.slice(4) }),
-    }
+  : pathsOnly
+    ? { worktree: encoded, ...(process.argv.length <= 4 ? {} : { paths: process.argv.slice(4) }) }
+    : {
+        worktree: encoded,
+        ...(process.argv[3] === undefined ? {} : { referenceWorktree: process.argv[3] }),
+        ...(process.argv.length <= 4 ? {} : { paths: process.argv.slice(4) }),
+      }
 // Collected rather than written straight through: JSON mode returns the lines
 // in its payload and human mode prints them, so the sink cannot be stdout here.
 const messages: string[] = []
