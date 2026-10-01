@@ -112,38 +112,37 @@ describe("git super merge", () => {
   it("initializes an added gitlink at its pin before the concluding commit hook (26988)", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-added-"))
     roots.push(fixtureRoot)
-    const fixture = createLocalProductFixture(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
     const checkout = join(fixtureRoot, "checkout")
-    git(
-      fixtureRoot,
-      "-c",
-      "protocol.file.allow=always",
-      "clone",
-      "-q",
-      "--recurse-submodules",
-      fixture.product,
-      checkout,
-    )
-    git(checkout, "switch", "-q", "-c", "task/added-gitlink")
     const gamma = join(fixtureRoot, "gamma")
     const gammaPin = createRepository(gamma, "gamma.ts", "export const gamma = 1\n")
-    git(fixture.product, "-c", "protocol.file.allow=always", "submodule", "add", "-q", gamma, "vendor/gamma")
-    git(fixture.product, "commit", "-q", "-m", "main adds gamma")
-    git(checkout, "fetch", "-q", "origin")
-    // The frozen push intent requires hosted root identity; transport stays in the existing local fixture.
     const rootUrl = "https://git-super.test/owned/product.git"
-    git(checkout, "remote", "set-url", "origin", rootUrl)
-    git(checkout, "config", `url.${fixture.product}.insteadOf`, rootUrl)
-    const hook = join(checkout, ".git/hooks/pre-commit")
-    writeFileSync(
-      hook,
-      "#!/bin/sh\nif ! test -e vendor/gamma/.git; then echo 'added gitlink checkout missing before commit' >&2; exit 1; fi\n",
-    )
-    chmodSync(hook, 0o755)
-    vi.stubEnv("GIT_CONFIG_COUNT", "1")
-    vi.stubEnv("GIT_CONFIG_KEY_0", "protocol.file.allow")
-    vi.stubEnv("GIT_CONFIG_VALUE_0", "always")
+    const gammaUrl = "https://git-super.test/owned/gamma.git"
+    // Ownership remains hosted; every recursive Git process uses local fixture transport.
+    const config = [
+      ["protocol.file.allow", "always"],
+      [`url.${fixture.product}.insteadOf`, rootUrl],
+      [`url.${fixture.alpha}.insteadOf`, "https://git-super.test/owned/alpha.git"],
+      [`url.${fixture.beta}.insteadOf`, "https://git-super.test/owned/beta.git"],
+      [`url.${gamma}.insteadOf`, gammaUrl],
+    ] as const
+    vi.stubEnv("GIT_CONFIG_COUNT", String(config.length))
+    for (const [index, [key, value]] of config.entries()) {
+      vi.stubEnv(`GIT_CONFIG_KEY_${index}`, key)
+      vi.stubEnv(`GIT_CONFIG_VALUE_${index}`, value)
+    }
     try {
+      git(fixtureRoot, "clone", "-q", "--recurse-submodules", rootUrl, checkout)
+      git(checkout, "switch", "-q", "-c", "task/added-gitlink")
+      git(fixture.product, "submodule", "add", "-q", gammaUrl, "vendor/gamma")
+      git(fixture.product, "commit", "-q", "-m", "main adds gamma")
+      git(checkout, "fetch", "-q", "origin")
+      const hook = join(checkout, ".git/hooks/pre-commit")
+      writeFileSync(
+        hook,
+        "#!/bin/sh\nif ! test -e vendor/gamma/.git; then echo 'added gitlink checkout missing before commit' >&2; exit 1; fi\n",
+      )
+      chmodSync(hook, 0o755)
       const result = await superMerge({ repo: checkout, commit: "origin/main" })
       expect(result.detail).toBeUndefined()
       expect(result.state).toBe("updated")
