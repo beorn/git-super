@@ -528,16 +528,24 @@ async function runInvocation(
     .command("add")
     .description(commands.worktree.add.description ?? commands.worktree.add.title)
     .option("--reference <path>", "repository whose object stores the gitlinks borrow from")
+    .option(
+      "--exclude-submodule <path>",
+      "leave a literal root-relative submodule and descendants empty and uninitialized; no init, store or gitfile",
+      (value: string, previous: string[]) => [...previous, value],
+      [],
+    )
     .argument("<path>", "path the new detached worktree is created at")
     .argument("<commit>", "commit the worktree and every recorded gitlink are placed at")
     .action((path, commit, options, command) => {
       const globals = command.optsWithGlobals() as { repo: string; json?: boolean }
+      const excluded = (options as { excludeSubmodule?: string[] }).excludeSubmodule
       captured = {
         node: commands.worktree.add,
         params: {
           path,
           commit,
           ...(typeof options.reference === "string" ? { reference: options.reference } : {}),
+          ...(excluded?.length ? { excludedSubmodules: excluded } : {}),
         },
         json: globals.json === true,
         nul: false,

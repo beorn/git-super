@@ -1,5 +1,7 @@
 import { isAbsolute, resolve } from "node:path"
 import type { ConditionalLogger } from "loggily"
+import type { NotCompared } from "./diff.ts"
+import { validateExcludedSubmodules } from "./git.ts"
 import { gitSuperResult, type GitResultDetail, type GitSuperResult } from "./result.ts"
 import { materializeSubmodulesFromLocalWorktreeParallel } from "./submodules.ts"
 import { createLocalGitWorktreeStore, type GitWorktreeStore } from "./worktree.ts"
@@ -154,6 +156,12 @@ export type SuperWorktreeAddOptions = Readonly<{
   commit: string
   /** Whose object stores the gitlinks borrow from; defaults to `repo`. */
   reference?: string
+  /**
+   * Literal root-relative submodule paths left empty and uninitialized, with
+   * no init, module store or gitfile, and no reference store opened for them.
+   * Each one is reported as an `excluded` observation in `notCompared`.
+   */
+  excludedSubmodules?: readonly string[]
   env?: NodeJS.ProcessEnv
   log?: ConditionalLogger
   report?: (line: string) => void
@@ -169,6 +177,8 @@ export type SuperWorktreeAddResult = GitSuperResult &
     /** Whether the commit records a `.gitmodules` at all. */
     gitmodules?: boolean
     gitlinks?: WorktreeGitlinkCounts
+    /** One observation per excluded submodule; empty when the caller excluded nothing. */
+    notCompared?: readonly NotCompared[]
   }>
 
 const NO_GITLINKS: WorktreeGitlinkCounts = {
@@ -249,6 +259,21 @@ export async function superWorktreeAdd(options: SuperWorktreeAddOptions): Promis
     ...(gitmodules === undefined ? {} : { gitmodules }),
   })
 
+  const excludedSubmodules = options.excludedSubmodules ?? []
+  try {
+    validateExcludedSubmodules(excludedSubmodules)
+  } catch (error) {
+    return failed(
+      "failed",
+      detail(
+        "invalid-excluded-submodule",
+        "parameters",
+        `${at(path, options.commit, undefined)} refused before the worktree existed.\n${message(error)}`,
+        "Name each excluded submodule as a literal normalized root-relative path, then rerun.",
+      ),
+    )
+  }
+
   try {
     await store.add({ kind: "detached", path, ref: options.commit, operation: `git super worktree add ${path}` })
   } catch (error) {
@@ -285,12 +310,14 @@ export async function superWorktreeAdd(options: SuperWorktreeAddOptions): Promis
         commit,
         gitmodules,
         gitlinks: NO_GITLINKS,
+        notCompared: [],
       }
     }
     const materialized = await materializeSubmodulesFromLocalWorktreeParallel({
       worktree: path,
       ...(options.reference === undefined ? {} : { referenceWorktree: reference }),
       maxRemoteFallbacks: UNBOUNDED_REMOTE_FALLBACKS,
+      ...(excludedSubmodules.length === 0 ? {} : { excludedSubmodules }),
       ...(env === undefined ? {} : { env }),
       ...(options.log === undefined ? {} : { log: options.log }),
     })
@@ -309,7 +336,12 @@ export async function superWorktreeAdd(options: SuperWorktreeAddOptions): Promis
       fetchedPaths: materialized.remotePaths,
       absentPaths: materialized.unreferencedPaths,
     }
-    const report = `${at(path, options.commit, commit)}: ${counts(gitlinks)}`
+    const excluded = materialized.notCompared.filter((observation) => observation.reason === "excluded")
+    const report =
+      `${at(path, options.commit, commit)}: ${counts(gitlinks)}` +
+      (excluded.length === 0
+        ? ""
+        : `; ${String(excluded.length)} excluded, left empty and uninitialized (${excluded.map((entry) => entry.path).join(", ")})`)
     return {
       ...gitSuperResult([{ repository: repo, state: "updated", refs: [] }], detail("worktree-added", "report", report)),
       path,
@@ -317,6 +349,7 @@ export async function superWorktreeAdd(options: SuperWorktreeAddOptions): Promis
       commit,
       gitmodules,
       gitlinks,
+      notCompared: materialized.notCompared,
     }
   } catch (error) {
     const reason = message(error)

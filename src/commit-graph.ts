@@ -4,7 +4,12 @@ import { validateExcludedSubmodules } from "./git.ts"
 import { parseIndexEntries, type IndexEntry } from "./index-entries.ts"
 
 export type CommitGitlink = Readonly<{ path: string; target: string }>
-export type CommitSubmodule = CommitGitlink & Readonly<{ name: string; url?: string; branch?: string }>
+/**
+ * `private` is the declaration `private = true` in the submodule's own `.gitmodules` section: the
+ * repository says this child must not be materialized by default. git-super only reports it; what a tool
+ * does about it is the caller's `excludedSubmodules`.
+ */
+export type CommitSubmodule = CommitGitlink & Readonly<{ name: string; url?: string; branch?: string; private?: true }>
 
 /** Native parent facts for a selected path; disagreement is evidence, not an empty graph. */
 export type SelectedCommitPath = Readonly<{
@@ -43,6 +48,53 @@ function operationError(
 
 function gitProcessFailed(result: GitProcessResult): boolean {
   return result.code !== 0 || result.timedOut === true || result.failure !== undefined
+}
+
+/**
+ * The paths one frozen commit's `.gitmodules` declares `private = true`, sorted, read from its configuration
+ * alone. It reads no gitlink and joins nothing, so a caller that only needs the declaration (which children to
+ * leave out) does not inherit `readCommitSubmodules`' refusals about pins. A private flag on a section with no
+ * path refuses by name; a commit with no `.gitmodules` declares nothing.
+ */
+export async function readPrivateSubmodulePaths(
+  git: GitProcess,
+  repository: string,
+  commit: string,
+): Promise<string[]> {
+  const manifestArgs = ["ls-tree", commit, "--", ".gitmodules"]
+  const manifest = await git.run({ repo: repository, args: manifestArgs })
+  if (gitProcessFailed(manifest)) throw operationError(repository, "read-target-manifest", manifestArgs, manifest)
+  if (manifest.stdout.trim() === "") return []
+  // --list succeeds on a valid empty manifest, where --get-regexp's "no match" exit 1 would read as a failure.
+  const configuredArgs = ["config", "--null", "--blob", `${commit}:.gitmodules`, "--list"]
+  const configured = await git.run({ repo: repository, args: configuredArgs })
+  if (gitProcessFailed(configured)) {
+    throw operationError(repository, "read-target-submodules", configuredArgs, configured)
+  }
+  const configuredByName = parseCommitSubmoduleConfig(
+    configured.stdout
+      .split("\0")
+      .filter((row) => /^submodule\..*\.(path|private)\n/u.test(row))
+      .join("\0"),
+    commit,
+  )
+  const paths: string[] = []
+  for (const [name, entry] of configuredByName) {
+    if (entry.private !== "true") continue
+    if (entry.path === undefined) {
+      throw Object.assign(new Error(`target ${commit} declares submodule ${name} private without a path`), {
+        resultDetail: detail(
+          "invalid-target-submodule-config",
+          "read-target-submodules",
+          `Target ${commit} declares submodule ${name} private = true but gives it no path.`,
+          { paths: [".gitmodules"], objectIds: [commit] },
+        ),
+      })
+    }
+    validateExcludedSubmodules([entry.path])
+    paths.push(entry.path)
+  }
+  return paths.sort()
 }
 
 /** Read strict submodule metadata and gitlinks from one frozen commit. */
@@ -176,7 +228,7 @@ export async function readCommitSubmodules(
     "--null",
     "--blob",
     `${commit}:.gitmodules`,
-    ...(selection === undefined ? ["--get-regexp", "^submodule\\..*\\.(path|url|branch)$"] : ["--list"]),
+    ...(selection === undefined ? ["--get-regexp", "^submodule\\..*\\.(path|url|branch|private)$"] : ["--list"]),
   ]
   const configured = await git.run({ repo: repository, args: configuredArgs })
   if (gitProcessFailed(configured)) {
@@ -188,7 +240,7 @@ export async function readCommitSubmodules(
       ? configured.stdout
       : configured.stdout
           .split("\0")
-          .filter((entry) => /^submodule\..*\.(path|url|branch)\n/u.test(entry))
+          .filter((entry) => /^submodule\..*\.(path|url|branch|private)\n/u.test(entry))
           .join("\0")
   return finish(parseCommitSubmoduleConfig(configuration, commit))
 }
@@ -279,7 +331,7 @@ async function readIndexSubmodules(
       parseCommitSubmoduleConfig(
         configured.stdout
           .split("\0")
-          .filter((row) => /^submodule\..*\.(path|url|branch)\n/u.test(row))
+          .filter((row) => /^submodule\..*\.(path|url|branch|private)\n/u.test(row))
           .join("\0"),
         head,
       ),
@@ -322,14 +374,14 @@ async function readIndexSubmodules(
   }
 }
 
-type ConfiguredSubmodule = { path?: string; url?: string; branch?: string }
+type ConfiguredSubmodule = { path?: string; url?: string; branch?: string; private?: string }
 
 /** The one parser of Git's frozen NUL config output; shared by async graph and sync comparison. */
 export function parseCommitSubmoduleConfig(raw: string, commit: string): Map<string, ConfiguredSubmodule> {
   const configuredByName = new Map<string, ConfiguredSubmodule>()
   for (const entry of raw.split("\0").filter((value) => value !== "")) {
     const separator = entry.indexOf("\n")
-    const match = /^submodule\.(.+)\.(path|url|branch)$/u.exec(separator < 0 ? "" : entry.slice(0, separator))
+    const match = /^submodule\.(.+)\.(path|url|branch|private)$/u.exec(separator < 0 ? "" : entry.slice(0, separator))
     if (separator < 1 || match?.[1] === undefined || match[2] === undefined) {
       throw Object.assign(new Error(`target ${commit} has invalid submodule metadata`), {
         resultDetail: detail(
@@ -340,8 +392,18 @@ export function parseCommitSubmoduleConfig(raw: string, commit: string): Map<str
         ),
       })
     }
-    const property = match[2] as "path" | "url" | "branch"
+    const property = match[2] as "path" | "url" | "branch" | "private"
     const value = entry.slice(separator + 1)
+    if (property === "private" && value !== "true" && value !== "false") {
+      throw Object.assign(new Error(`target ${commit} has invalid submodule private metadata`), {
+        resultDetail: detail(
+          "invalid-target-submodule-config",
+          "read-target-submodules",
+          `Target ${commit} declares submodule ${match[1]} private = ${JSON.stringify(value)}; write true or false.`,
+          { paths: [".gitmodules"], objectIds: [commit] },
+        ),
+      })
+    }
     const current = configuredByName.get(match[1]) ?? {}
     if (current[property] !== undefined && current[property] !== value) {
       throw Object.assign(new Error(`target ${commit} has conflicting submodule ${property} metadata`), {
@@ -389,9 +451,13 @@ export function joinCommitSubmodules(
       target,
       ...(configuredEntry.url === undefined ? {} : { url: configuredEntry.url }),
       ...(configuredEntry.branch === undefined ? {} : { branch: configuredEntry.branch }),
+      ...(configuredEntry.private === "true" ? { private: true as const } : {}),
     }
     const previous = configuredPaths.get(path)
-    if (previous !== undefined && (previous.url !== submodule.url || previous.branch !== submodule.branch)) {
+    if (
+      previous !== undefined &&
+      (previous.url !== submodule.url || previous.branch !== submodule.branch || previous.private !== submodule.private)
+    ) {
       throw Object.assign(new Error(`target ${commit} has conflicting submodule metadata for ${path}`), {
         resultDetail: detail(
           "conflicting-target-submodule-path",

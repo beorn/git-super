@@ -415,13 +415,21 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
     },
     async materializeSubmodules(
       path: string,
-      materializeOptions: Readonly<{ force?: boolean; hooks?: WorktreeHookPolicy }> = {},
+      materializeOptions: Readonly<{
+        force?: boolean
+        hooks?: WorktreeHookPolicy
+        /** Literal root-relative paths left empty and uninitialized: no init, store or gitfile. */
+        excludedSubmodules?: readonly string[]
+      }> = {},
     ): Promise<void> {
       const materializeProcess = configuredProcess(materializeOptions.hooks)
       const result = await materializeSubmodulesWithProcess(materializeProcess, {
         worktree: path,
         referenceWorktree: repo,
         ...(materializeOptions.force === true ? { force: true } : {}),
+        ...(materializeOptions.excludedSubmodules === undefined
+          ? {}
+          : { excludedSubmodules: materializeOptions.excludedSubmodules }),
       })
       if (result.code !== 0) {
         throw new Error(result.stderr || result.stdout || "could not materialize worktree submodules")

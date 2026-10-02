@@ -2,8 +2,18 @@
  * @failure A worktree is created without its submodules, or left half-materialized after a failed pin.
  * @level l1
  * @consumer Yrd worktree provisioning
+ * @reach fs-walk <fixture-only: lists the temp fixture worktree's excluded submodule directory (27147)>
  */
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs"
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs"
 import { spawnSync } from "node:child_process"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -715,6 +725,60 @@ describe("git super worktree add", () => {
     expect(git(worktree, ["rev-parse", "HEAD"])).toBe(fixture.product_head)
     expect(git(join(worktree, "vendor/dep"), ["rev-parse", "HEAD"])).toBe(fixture.pin)
     expect(existsSync(join(worktree, "vendor/dep/dep.ts"))).toBe(true)
+  })
+
+  /**
+   * @failure An excluded submodule is initialized, gets a module store or gitfile, or goes unreported (27147).
+   * @level l2
+   * @consumer Yrd env open for a repository that declares a private child
+   */
+  it("leaves an excluded submodule empty and uninitialized, with no store or gitfile, and reports it", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-worktree-exclude-"))
+    roots.push(fixtureRoot)
+    const fixture = createSuperproject(fixtureRoot)
+    const secret = join(fixtureRoot, "secret")
+    initRepository(secret, "secret.ts", "export const secret = 1\n")
+    git(fixture.product, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", secret, "vendor/secret"])
+    git(fixture.product, ["commit", "-q", "-m", "add vendor/secret"])
+    const head = git(fixture.product, ["rev-parse", "HEAD"])
+    const worktree = join(fixtureRoot, "candidate")
+    const stdout = outputSink()
+    const stderr = outputSink()
+
+    const code = await runCli(
+      ["--repo", fixture.product, "--json", "worktree", "add", worktree, head, "--exclude-submodule", "vendor/secret"],
+      stdout,
+      stderr,
+    )
+
+    expect(code).toBe(0)
+    const result = JSON.parse(stdout.output) as { notCompared: { path: string; reason: string }[] }
+    expect(result.notCompared.map(({ path, reason }) => [path, reason])).toEqual([["vendor/secret", "excluded"]])
+    expect(git(join(worktree, "vendor/dep"), ["rev-parse", "HEAD"])).toBe(fixture.pin)
+    expect(readdirSync(join(worktree, "vendor/secret"))).toEqual([])
+    expect(git(worktree, ["submodule", "status", "--", "vendor/secret"])).toMatch(/^-/u)
+    const gitDir = git(worktree, ["rev-parse", "--absolute-git-dir"])
+    expect(existsSync(join(gitDir, "modules", "vendor/secret"))).toBe(false)
+    expect(existsSync(join(gitDir, "modules", "vendor/dep"))).toBe(true)
+  })
+
+  it("refuses an exclusion that is not a literal normalized path before the worktree exists", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-worktree-exclude-invalid-"))
+    roots.push(fixtureRoot)
+    const fixture = createSuperproject(fixtureRoot)
+    const worktree = join(fixtureRoot, "candidate")
+    const stdout = outputSink()
+    const stderr = outputSink()
+
+    const code = await runCli(
+      ["--repo", fixture.product, "worktree", "add", worktree, "HEAD", "--exclude-submodule", "vendor/../dep"],
+      stdout,
+      stderr,
+    )
+
+    expect(code).not.toBe(0)
+    expect(stderr.output).toContain("excluded submodule must be a literal normalized root-relative path")
+    expect(existsSync(worktree)).toBe(false)
   })
 
   it("fetches a pin the reference lacks instead of refusing it", async () => {
