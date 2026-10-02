@@ -1,8 +1,18 @@
 import { cleanGitEnvironment, cleanGitRepositoryEnvironment } from "./git.ts"
-import { appendFileSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs"
-import { Blob } from "node:buffer"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
+import {
+  accessSync,
+  appendFileSync,
+  constants,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+} from "node:fs"
+import { spawn } from "node:child_process"
+import type { Readable } from "node:stream"
+import { constants as osConstants, tmpdir } from "node:os"
+import { delimiter, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { fullJitter } from "@bearly/pacing"
 
@@ -12,8 +22,22 @@ export type ProcessOutputSink = Readonly<{ write(value: string | Uint8Array): un
 
 /** Resolve the native executable separately; selecting this binary must not recurse. */
 export function nativeGitExecutable(): string {
-  const executable = Bun.which("git")
-  if (executable === null) throw new Error("git-super: native Git executable 'git' was not found on PATH")
+  let executable: string | undefined
+  for (const directory of process.env.PATH?.split(delimiter) ?? []) {
+    const candidate = resolve(directory, "git")
+    try {
+      if (!statSync(candidate).isFile()) continue
+      accessSync(candidate, constants.X_OK)
+      executable = candidate
+      break
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (code !== "ENOENT" && code !== "ENOTDIR" && code !== "EACCES") {
+        throw new Error(`git-super: cannot inspect native Git candidate ${candidate}`, { cause: error })
+      }
+    }
+  }
+  if (executable === undefined) throw new Error("git-super: native Git executable 'git' was not found on PATH")
   if (realpathSync(executable) === realpathSync(fileURLToPath(new URL("../bin/git-super", import.meta.url)))) {
     throw new Error(`git-super: native Git resolves to git-super itself: ${executable}`)
   }
@@ -25,23 +49,79 @@ function spawnGit(
   args: readonly string[],
   options: {
     env: NodeJS.ProcessEnv
-    stdin: "inherit" | "ignore" | Blob
+    stdin: "inherit" | "ignore" | "pipe"
+    input?: string
     signal?: AbortSignal
     detached?: boolean
   },
 ) {
-  return Bun.spawn([nativeGitExecutable(), ...args], { ...options, stdout: "pipe", stderr: "pipe" })
+  options.signal?.throwIfAborted()
+  const child = spawn(nativeGitExecutable(), [...args], {
+    env: options.env,
+    stdio: [options.stdin, "pipe", "pipe"],
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
+    ...(options.detached === undefined ? {} : { detached: options.detached }),
+  })
+  // Exit and pipe closure are distinct: descendants may retain the pipes after Git exits.
+  // An async exec failure has no exit event. It must still settle this handle.
+  const exited = new Promise<Pick<GitProcessResult, "code" | "signal" | "failure">>((resolve) => {
+    child.once("error", (error) => resolve({ code: 1, failure: String(error) }))
+    child.once("exit", (code, signal) =>
+      resolve({
+        code: code ?? (signal === null ? 1 : 128 + (osConstants.signals[signal] ?? 0)),
+        ...(signal === null ? {} : { signal, failure: `native Git terminated by signal ${signal}` }),
+        ...(code === null && signal === null ? { failure: "native Git exited without an exit code or signal" } : {}),
+      }),
+    )
+  })
+  let inputFailure: string | undefined
+  child.stdin?.on("error", (error: NodeJS.ErrnoException) => {
+    // Git may deliberately stop reading. EPIPE never replaces its exit result.
+    if (error.code !== "EPIPE") inputFailure = `native Git stdin failed: ${String(error)}`
+  })
+  if (options.input !== undefined) child.stdin?.end(options.input)
+  return {
+    pid: child.pid,
+    stdout: child.stdout as Readable,
+    stderr: child.stderr as Readable,
+    exited,
+    kill: () => child.kill("SIGTERM"),
+    inputFailure: () => inputFailure,
+  }
+}
+
+/** Capture pipes independently so a stream failure cannot replace the native process outcome. */
+async function captureGit(child: ReturnType<typeof spawnGit>): Promise<GitProcessResult> {
+  const collect = async (stream: Readable) => {
+    const chunks: Buffer[] = []
+    let failure: string | undefined
+    try {
+      for await (const bytes of stream as AsyncIterable<unknown>) chunks.push(nativeOutputBytes(bytes))
+    } catch (error) {
+      failure = `native Git output capture failed: ${String(error)}`
+    }
+    return { text: Buffer.concat(chunks).toString("utf8"), failure }
+  }
+  const [outcome, stdout, stderr] = await Promise.all([child.exited, collect(child.stdout), collect(child.stderr)])
+  const failure =
+    outcome.failure ?? stdout.failure ?? stderr.failure ?? (outcome.code === 0 ? child.inputFailure() : undefined)
+  return {
+    ...outcome,
+    stdout: stdout.text,
+    stderr: stderr.text || outcome.failure || "",
+    ...(failure === undefined ? {} : { failure }),
+  }
+}
+
+function nativeOutputBytes(value: unknown): Buffer {
+  if (typeof value === "string" || value instanceof Uint8Array) return Buffer.from(value)
+  throw new TypeError("native Git output stream yielded a non-byte chunk")
 }
 
 /** Native command output for dispatch observations. No scrub, retry or text trimming. */
 export async function readNativeGit(args: readonly string[]): Promise<GitProcessResult> {
   const child = spawnGit(args, { env: process.env, stdin: "ignore" })
-  const [code, stdout, stderr] = await Promise.all([
-    child.exited,
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
-  ])
-  return { code, stdout, stderr }
+  return captureGit(child)
 }
 
 /** The executable replaces itself so native Git owns stdin, bytes, signals and lifetime. */
@@ -51,6 +131,9 @@ export async function delegateNativeGit(
   stderr: ProcessOutputSink,
   replaceProcess: boolean,
 ): Promise<number> {
+  if (typeof Bun === "undefined") {
+    throw new Error("git-super: native delegation is a Bun CLI operation; Bun CLI requires Bun >=1.3.14")
+  }
   if (replaceProcess) {
     if (process.execve === undefined) {
       throw new Error(`git-super: Bun ${Bun.version} lacks process.execve; use Bun >=1.3.14 for native Git delegation`)
@@ -60,11 +143,19 @@ export async function delegateNativeGit(
   }
   // In-process CLI consumers retain their process and supply the output sinks.
   const child = spawnGit(args, { env: process.env, stdin: "inherit" })
-  const forward = async (stream: ReadableStream<Uint8Array>, sink: ProcessOutputSink) => {
-    for await (const bytes of stream) sink.write(Buffer.from(bytes))
+  const forward = async (stream: Readable, sink: ProcessOutputSink) => {
+    for await (const bytes of stream as AsyncIterable<unknown>) sink.write(nativeOutputBytes(bytes))
   }
-  const [code] = await Promise.all([child.exited, forward(child.stdout, stdout), forward(child.stderr, stderr)])
-  return code
+  const [outcome, out, err] = await Promise.allSettled([
+    child.exited,
+    forward(child.stdout, stdout),
+    forward(child.stderr, stderr),
+  ])
+  if (outcome.status === "rejected") throw outcome.reason
+  if (outcome.value.code !== 0) return outcome.value.code
+  if (out.status === "rejected") throw out.reason
+  if (err.status === "rejected") throw err.reason
+  return outcome.value.code
 }
 
 export type GitProcessRequest = Readonly<{
@@ -448,7 +539,7 @@ export function createLocalGitProcess(
     {
       let timedOut = false
       let backstop: string | undefined
-      let child: ReturnType<typeof Bun.spawn>
+      let child: ReturnType<typeof spawnGit>
       // The backstop's record of the groups this command's detached descendants start (24907).
       const groupsDir =
         request.backstopMs === undefined ? undefined : mkdtempSync(join(tmpdir(), "git-super-apply-groups-"))
@@ -460,7 +551,8 @@ export function createLocalGitProcess(
             ...request.env,
             ...(groupsFile === undefined ? {} : { [APPLY_GROUPS_ENV]: groupsFile }),
           },
-          stdin: request.stdin === undefined ? "ignore" : new Blob([request.stdin]),
+          stdin: request.stdin === undefined ? "ignore" : "pipe",
+          ...(request.stdin === undefined ? {} : { input: request.stdin }),
           ...(request.signal === undefined ? {} : { signal: request.signal }),
           ...(request.detached === true || groupsFile !== undefined ? { detached: true } : {}),
         })
@@ -469,7 +561,7 @@ export function createLocalGitProcess(
         const failure = error instanceof Error ? error.message : String(error)
         return { code: 1, stdout: "", stderr: failure, failure }
       }
-      if (request.detached === true) recordApplyGroup(child.pid)
+      if (request.detached === true && child.pid !== undefined) recordApplyGroup(child.pid)
       const timer =
         request.timeoutMs === undefined
           ? undefined
@@ -482,22 +574,22 @@ export function createLocalGitProcess(
           ? undefined
           : setTimeout(() => {
               timedOut = true
-              backstop = killBackstopGroups(child.pid, groupsFile, request.backstopMs as number)
+              if (child.pid !== undefined) {
+                backstop = killBackstopGroups(child.pid, groupsFile, request.backstopMs as number)
+              }
             }, request.backstopMs)
-      const [code, stdout, stderr] = await Promise.all([
-        child.exited,
-        new Response(child.stdout as ReadableStream<Uint8Array>).text(),
-        new Response(child.stderr as ReadableStream<Uint8Array>).text(),
-      ])
-      if (timer !== undefined) clearTimeout(timer)
-      if (backstopTimer !== undefined) clearTimeout(backstopTimer)
-      if (groupsDir !== undefined) rmSync(groupsDir, { recursive: true, force: true })
-      return {
-        code,
-        stdout,
-        stderr: stderr.trim(),
-        ...(timedOut ? { timedOut: true } : {}),
-        ...(backstop === undefined ? {} : { backstop }),
+      try {
+        const result = await captureGit(child)
+        return {
+          ...result,
+          stderr: result.stderr.trim(),
+          ...(timedOut ? { timedOut: true } : {}),
+          ...(backstop === undefined ? {} : { backstop }),
+        }
+      } finally {
+        if (timer !== undefined) clearTimeout(timer)
+        if (backstopTimer !== undefined) clearTimeout(backstopTimer)
+        if (groupsDir !== undefined) rmSync(groupsDir, { recursive: true, force: true })
       }
     }
   }

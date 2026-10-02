@@ -9,7 +9,13 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { describe, expect, test, vi } from "vitest"
+import { setTimeout as delay } from "node:timers/promises"
 import { acquireExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS } from "../src/exclusive.ts"
+
+vi.mock("node:timers/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:timers/promises")>()
+  return { ...actual, setTimeout: vi.fn(actual.setTimeout) }
+})
 
 describe("exclusive writer policy", () => {
   // 25677: a contended writer must use a positive shared-jitter delay without exceeding its poll cap.
@@ -19,11 +25,12 @@ describe("exclusive writer policy", () => {
     const delays: number[] = []
     let released = false
     vi.spyOn(Math, "random").mockReturnValue(0.999)
-    vi.spyOn(Bun, "sleep").mockImplementation(async (ms) => {
+    vi.mocked(delay).mockImplementation(async (ms, value) => {
       if (typeof ms !== "number") throw new TypeError("git-super poll delay must be a number of milliseconds")
       delays.push(ms)
       first.release()
       released = true
+      return value
     })
     try {
       const second = await acquireExclusive(dir, { timeoutMs: 100, pollIntervalMs }, "contender")
@@ -33,6 +40,7 @@ describe("exclusive writer policy", () => {
       expect(delays[0]).toBeLessThanOrEqual(pollIntervalMs)
     } finally {
       if (!released) first.release()
+      vi.mocked(delay).mockRestore()
       vi.restoreAllMocks()
       await rm(dir, { recursive: true, force: true })
     }
@@ -70,11 +78,11 @@ describe("exclusive writer policy", () => {
         (lock) => ({ kind: "acquired" as const, lock }),
         (error: unknown) => ({ kind: "rejected" as const, error }),
       )
-      for (let poll = 0; poll < 100 && seen.length === 0; poll += 1) await Bun.sleep(10)
+      for (let poll = 0; poll < 100 && seen.length === 0; poll += 1) await delay(10)
       expect(seen).toEqual([expect.stringContaining("queue merge")])
       vi.setSystemTime(startedAt + 31_000)
       // Leave the real lock held across more than one 5 ms poll at the advanced time.
-      await Bun.sleep(20)
+      await delay(20)
       release()
       const outcome = await settled
       expect(outcome.kind).toBe("acquired")

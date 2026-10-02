@@ -1,5 +1,9 @@
 #!/usr/bin/env bun
 
-import { runCli } from "../src/cli.ts"
-
-process.exitCode = await runCli(process.argv.slice(2), process.stdout, process.stderr, true)
+if (typeof Bun === "undefined") {
+  process.stderr.write("git-super: Bun CLI requires Bun >=1.3.14\n")
+  process.exitCode = 2
+} else {
+  const { runCli } = await import("../src/cli.ts")
+  process.exitCode = await runCli(process.argv.slice(2), process.stdout, process.stderr, true)
+}
