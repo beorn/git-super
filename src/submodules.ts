@@ -5,14 +5,13 @@ import { isAbsolute, join, relative, resolve } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 import { createLogger, type ConditionalLogger, type LogLevel } from "loggily"
 import { pinRef } from "./objects.ts"
-import { cleanGitRepositoryEnvironment, isSubmoduleExcluded, validateExcludedSubmodules } from "./git.ts"
+import { cleanGitRepositoryEnvironment, validateExcludedSubmodules } from "./git.ts"
 import type { NotCompared } from "./diff.ts"
-import { inspectUninitializedCheckout } from "./status.ts"
+import { classifyExcludedPath, inspectExcludedCheckout } from "./status.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessRequest, type GitProcessResult } from "./process.ts"
 import { shellQuote } from "./shell-command.ts"
 import { preparedSubmoduleStore } from "./submodule-prepare.ts"
-import { parseCommitSubmoduleConfig } from "./commit-graph.ts"
-import { parseIndexEntries } from "./index-entries.ts"
+import { readCommitSubmodules, type SelectedCommitSubmodules } from "./commit-graph.ts"
 
 export const SUBMODULE_ALTERNATE_LOCATION = "superproject"
 export const SUBMODULE_ALTERNATE_ERROR_STRATEGY = "info"
@@ -178,25 +177,6 @@ export async function configureSubmoduleAlternatePolicy(git: SubmoduleGit, repo:
 
 type Submodule = Readonly<{ name: string; path: string }>
 
-async function submodules(
-  git: SubmoduleGit,
-  repo: string,
-  source: "head" | "index",
-): Promise<Submodule[] | SubmoduleGitResult> {
-  const blob = source === "index" ? ":0:.gitmodules" : "HEAD:.gitmodules"
-  const tracked = await git.run(repo, ["cat-file", "-e", blob], true)
-  if (tracked.code !== 0) return []
-  const configured = await git.run(repo, ["config", "--blob", blob, "--null", "--list"], true)
-  if (configured.code !== 0) return configured
-  const raw = configured.stdout
-    .split("\0")
-    .filter((row) => /^submodule\..*\.(path|url|branch)\n/u.test(row))
-    .join("\0")
-  return [...parseCommitSubmoduleConfig(raw, blob)].flatMap(([name, entry]) =>
-    entry.path === undefined ? [] : [{ name, path: entry.path }],
-  )
-}
-
 /**
  * Report local config that the target tree deliberately does not declare.
  *
@@ -236,32 +216,6 @@ async function reportStaleLocalSubmoduleConfig(
 }
 
 const GITLINK_ROW = /^160000 commit ([0-9a-f]+)\t/mu
-
-async function requiredGitlink(
-  git: SubmoduleGit,
-  repo: string,
-  path: string,
-  source: "head" | "index",
-): Promise<string | SubmoduleGitResult> {
-  if (source === "index") {
-    const index = await git.run(repo, ["ls-files", "--stage", "-z", "--", path], true)
-    if (index.code !== 0) {
-      return { ...index, stderr: `could not read index gitlink '${path}' in ${repo}\n${index.stderr}` }
-    }
-    const rows = parseIndexEntries(
-      index.stdout,
-      (record) => new Error(`malformed index record for ${JSON.stringify(path)} in ${repo}: ${JSON.stringify(record)}`),
-    ).filter((entry) => entry.path === path)
-    if (rows.some((row) => row.stage !== 0)) {
-      return { code: 1, stdout: "", stderr: `unmerged index gitlink '${path}' in ${repo}; stage 0 is required` }
-    }
-    const pin = rows.find((row) => row.mode === "160000" && row.stage === 0)?.oid
-    return pin ?? { code: 1, stdout: "", stderr: `selected path '${path}' has no stage-0 gitlink in ${repo}` }
-  }
-  const tree = await git.run(repo, ["ls-tree", "HEAD", "--", path], true)
-  const pin = tree.code === 0 ? GITLINK_ROW.exec(tree.stdout)?.[1] : undefined
-  return pin ?? { code: 1, stdout: "", stderr: `could not resolve gitlink '${path}' in ${repo}` }
-}
 
 /**
  * A gitlink the REFERENCE no longer carries at all: its HEAD tree has no entry
@@ -778,16 +732,37 @@ export async function materializeSubmodules(
     if (policy.code !== 0) return policy
 
     const source = depth === 0 ? (options.source ?? "head") : "head"
-    const selectedPins = new Map<string, string>()
-    if (source === "index" && selectedPaths !== undefined) {
-      for (const path of selectedPaths) {
-        const pin = await requiredGitlink(git, worktree, path, source)
-        if (typeof pin !== "string") return pin
-        selectedPins.set(path, pin)
+    const headResult = await git.run(worktree, ["rev-parse", "--verify", "HEAD"], true)
+    if (headResult.code !== 0 || headResult.timedOut || headResult.failure !== undefined) return headResult
+    const head = headResult.stdout.trim()
+    if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(head)) {
+      return {
+        code: 1,
+        stdout: "",
+        stderr: `cannot freeze HEAD in ${worktree}; resolve its commit before materialization`,
       }
     }
-    const entries = await submodules(git, worktree, source)
-    if (!Array.isArray(entries)) return entries
+    const prefix = relative(options.worktree, worktree).split("\\").join("/")
+    const excluded = (options.excludedSubmodules ?? []).flatMap((path) =>
+      prefix === "" ? [path] : path.startsWith(`${prefix}/`) ? [path.slice(prefix.length + 1)] : [],
+    )
+    let metadata: SelectedCommitSubmodules
+    try {
+      metadata = await readCommitSubmodules(
+        { run: (request) => git.run(request.repo, request.args, true) },
+        worktree,
+        head,
+        { excludedSubmodules: excluded, source },
+      )
+    } catch (error) {
+      const resultDetail = (error as { resultDetail?: { paths?: readonly string[]; remedy?: string } }).resultDetail
+      return {
+        code: 1,
+        stdout: "",
+        stderr: `${error instanceof Error ? error.message : String(error)}${resultDetail?.paths === undefined ? "" : `\nPaths: ${resultDetail.paths.join(", ")}`}${resultDetail?.remedy === undefined ? "" : `\n${resultDetail.remedy}`}`,
+      }
+    }
+    const entries = [...metadata.submodules]
     for (const entry of entries) {
       try {
         validateExcludedSubmodules([entry.path])
@@ -799,19 +774,53 @@ export async function materializeSubmodules(
         }
       }
     }
+    const selectedPins = new Map(entries.map(({ path, target }) => [path, target]))
+    for (const evidence of metadata.selectedPaths) {
+      // A selector beneath an included gitlink belongs to that child's existing walk.
+      if (entries.some((entry) => evidence.path.startsWith(`${entry.path}/`))) continue
+      const componentPath = prefix === "" ? evidence.path : `${prefix}/${evidence.path}`
+      const disk = inspectExcludedCheckout(worktree, evidence.path)
+      const exclusion = classifyExcludedPath(
+        evidence.path,
+        [{ ...evidence, repository: worktree, head }],
+        disk.checkout,
+      )
+      if (exclusion.classification === "unclassified" || (disk.checkout !== "absent" && disk.checkout !== "empty")) {
+        notCompared.push({
+          path: componentPath,
+          reason: "inconsistent",
+          message: `excluded ${componentPath}: ${exclusion.classification} parent identity; checkout ${disk.checkout}`,
+          exclusion,
+        })
+        return {
+          code: 1,
+          stdout: "",
+          stderr: `Excluded submodule ${componentPath} has ${exclusion.classification} parent identity and a ${disk.checkout} checkout${disk.unsafeAncestor === undefined ? "" : ` at unsafe ancestor ${disk.unsafeAncestor}`}; preserve and resolve its parent identity and checkout before materialization.`,
+        }
+      }
+      const observation: NotCompared = {
+        path: componentPath,
+        reason: "excluded",
+        message: `component excluded, not compared; ${exclusion.classification} parent identity, checkout ${disk.checkout}`,
+        exclusion,
+      }
+      notCompared.push(observation)
+      log?.info?.(`${componentPath}: ${observation.message}`)
+    }
     if (source === "index" && selectedPaths !== undefined) {
       for (const path of selectedPaths) {
-        if (!entries.some((entry) => entry.path === path)) {
+        if (!selectedPins.has(path) && !excluded.includes(path)) {
           return {
             code: 1,
             stdout: "",
-            stderr: `selected index gitlink '${path}' is not declared in stage-0 .gitmodules in ${worktree}`,
+            stderr: `selected path '${path}' has no declared stage-0 gitlink in ${worktree}`,
           }
         }
       }
     }
     if (depth === 0) {
-      const staleConfig = await reportStaleLocalSubmoduleConfig(git, worktree, entries, log)
+      const declared = [...entries, ...metadata.selectedPaths.flatMap((entry) => entry.declarations)]
+      const staleConfig = await reportStaleLocalSubmoduleConfig(git, worktree, declared, log)
       if (staleConfig.code !== 0) return staleConfig
     }
     // A LEVEL WITH NO SUBMODULES HAS NOTHING TO TIME, and emitting a span for it
@@ -850,30 +859,7 @@ export async function materializeSubmodules(
     // observation: the moment a network call is added here it fans out N-wide,
     // which is exactly the shape that made GitHub refuse SSH from this host on
     // 2026-08-21. Warm-ups live in phase B below and stay serialized.
-    const selected: typeof entries = []
-    for (const entry of entries) {
-      if (selectedPaths !== undefined && !selectedPaths.has(entry.path)) continue
-      const componentPath = relative(options.worktree, join(worktree, entry.path)).split("\\").join("/")
-      if (!isSubmoduleExcluded(componentPath, options.excludedSubmodules)) {
-        selected.push(entry)
-        continue
-      }
-      const state = inspectUninitializedCheckout(join(worktree, entry.path))
-      if (state !== "empty") {
-        return {
-          code: 1,
-          stdout: "",
-          stderr: `Excluded submodule ${componentPath} has a ${state} checkout; preserve its private checkout and Git store before materialization.`,
-        }
-      }
-      const observation: NotCompared = {
-        path: componentPath,
-        reason: "excluded",
-        message: "component excluded, not compared",
-      }
-      notCompared.push(observation)
-      log?.info?.(`${componentPath}: ${observation.message}`)
-    }
+    const selected = entries.filter((entry) => selectedPaths === undefined || selectedPaths.has(entry.path))
     const probes: Array<Probe | SubmoduleGitResult> = []
     for (let start = 0; start < selected.length; start += MAX_CONCURRENT_SUBMODULE_UPDATES) {
       probes.push(
@@ -881,8 +867,10 @@ export async function materializeSubmodules(
           selected
             .slice(start, start + MAX_CONCURRENT_SUBMODULE_UPDATES)
             .map(async ({ name, path }): Promise<Probe | SubmoduleGitResult> => {
-              const required = selectedPins.get(path) ?? (await requiredGitlink(git, worktree, path, source))
-              if (typeof required !== "string") return required
+              const required = selectedPins.get(path)
+              if (required === undefined) {
+                return { code: 1, stdout: "", stderr: `missing frozen gitlink for ${path} in ${worktree}` }
+              }
               const ownSubmodule = join(worktree, path)
               const heldInWorktree = await referenceContains(git, ownSubmodule, required)
               let referenceSubmodule = reference === undefined ? undefined : join(reference, path)

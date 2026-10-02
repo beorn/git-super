@@ -145,6 +145,101 @@ afterEach(async () => {
 
 describe("materializeSubmodules", () => {
   /**
+   * @failure Excluded selections vanish on empty graphs or bypass frozen identity and safe checkout checks (27058 AC3/AC5).
+   * @level l1
+   * @consumer worktree and pull materialization
+   * @testonly none
+   */
+  it.each([
+    "absent",
+    "declared-absent",
+    "declared-empty",
+    "orphan",
+    "blob",
+    "tree",
+    "duplicate",
+    "content",
+    "ancestor",
+    "index-add",
+    "index-remove",
+    "unmerged",
+  ])("classifies frozen excluded identity %s before any child probe", async (state) => {
+    const root = await mkdtemp(join(tmpdir(), "git-super-selected-identity-"))
+    roots.push(root)
+    const owner = join(root, "owner")
+    const pin = createRepository(owner, "README.md", "parent\n")
+    const path = "private/item"
+    const index = state.startsWith("index-") || state === "unmerged"
+    const declared = !["absent", "orphan", "blob", "tree"].includes(state)
+    if (state !== "absent") {
+      writeFileSync(join(owner, ".gitmodules"), `[submodule "private"]\n path = ${path}\n url = /never-fetch\n`)
+      if (declared) git(owner, ["update-index", "--add", "--cacheinfo", `160000,${pin},${path}`])
+      if (state === "duplicate") git(owner, ["config", "--file", ".gitmodules", "submodule.alias.path", path])
+      if (state === "blob" || state === "tree") {
+        await mkdir(join(owner, "private", ...(state === "tree" ? ["item"] : [])), { recursive: true })
+        writeFileSync(join(owner, path, ...(state === "tree" ? ["file"] : [])), "content\n")
+        git(owner, ["add", "--", path])
+      }
+      git(owner, ["add", ".gitmodules"])
+      if (state !== "index-add" && state !== "unmerged") git(owner, ["commit", "-q", "-m", "selected identity"])
+    }
+    if (state === "index-remove") {
+      git(owner, ["update-index", "--force-remove", path])
+      writeFileSync(join(owner, ".gitmodules"), "")
+      git(owner, ["add", ".gitmodules"])
+    }
+    if (state === "unmerged") {
+      git(owner, ["update-index", "--force-remove", path])
+      const updated = spawnSync("git", ["-C", owner, "update-index", "--index-info"], {
+        encoding: "utf8",
+        input: `160000 ${pin} 1\t${path}\n160000 ${pin} 2\t${path}\n`,
+      })
+      expect(updated.status, updated.stderr).toBe(0)
+    }
+    if (state === "declared-empty") await mkdir(join(owner, path), { recursive: true })
+    if (state === "content") {
+      await mkdir(join(owner, "private"), { recursive: true })
+      writeFileSync(join(owner, path), "preserve\n")
+    }
+    if (state === "ancestor") {
+      await mkdir(join(root, "outside"))
+      symlinkSync(join(root, "outside"), join(owner, "private"), "dir")
+    }
+    const local = createLocalGitProcess()
+    const requests: GitProcessRequest[] = []
+    const result = await materializeSubmodulesWithProcess(
+      {
+        run(request) {
+          requests.push(request)
+          if (request.repo !== owner) throw new Error(`excluded child probe: ${request.repo}`)
+          return local.run(request)
+        },
+      },
+      { worktree: owner, excludedSubmodules: [path], ...(index ? { source: "index" as const } : {}) },
+    )
+    const accepted = ["absent", "declared-absent", "declared-empty", "index-add", "index-remove"].includes(state)
+    expect(result.code, result.stderr).toBe(accepted ? 0 : 1)
+    expect(result.considered).toBe(0)
+    expect(requests.every((request) => request.repo === owner)).toBe(true)
+    if (state === "unmerged") {
+      expect(result.stderr).toContain("unmerged")
+      expect(result.stderr).toContain(path)
+    } else {
+      expect(result.notCompared[0]).toMatchObject({ path, reason: accepted ? "excluded" : "inconsistent" })
+      expect(result.notCompared[0]?.exclusion?.classification).toBe(
+        ["absent", "index-remove"].includes(state)
+          ? "absent"
+          : declared && state !== "duplicate"
+            ? "declared"
+            : "unclassified",
+      )
+      const parent = result.notCompared[0]?.exclusion?.parents[0]
+      expect(parent?.head).toBe(git(owner, ["rev-parse", "HEAD"]).trim())
+      if (index) expect(parent?.index?.source).toBe("index")
+    }
+  })
+
+  /**
    * @failure Whitespace enumeration silently names a different path, while unsafe native control bytes reach checkout/reference probes (27058).
    * @level l1
    * @consumer worktree and pull materialization
@@ -234,7 +329,7 @@ describe("materializeSubmodules", () => {
    * @consumer worktree and pull materialization
    * @testonly none
    */
-  it.each(["absent", "initialized", "nonempty", "symlink"])(
+  it.each(["initialized", "nonempty", "symlink"])(
     "refuses an excluded %s checkout before materialization",
     async (condition) => {
       const root = await mkdtemp(join(tmpdir(), "git-super-private-materialization-unsafe-"))
