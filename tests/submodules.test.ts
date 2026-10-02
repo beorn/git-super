@@ -42,6 +42,12 @@ function withPrimaryWorktree(git: SubmoduleGit, primary: string): SubmoduleGit {
       if (repo === primary && args[0] === "worktree" && args[1] === "list") {
         return { ...success(), stdout: `worktree ${primary}\n\n` }
       }
+      if (args[0] === "rev-parse" && args.includes("--show-toplevel")) {
+        return { ...success(), stdout: `${repo}\n` }
+      }
+      if (args[0] === "rev-parse" && args.includes("--absolute-git-dir")) {
+        return { ...success(), stdout: `${join(repo, ".git")}\n` }
+      }
       return git.run(repo, args, allowFailure)
     },
   }
@@ -142,152 +148,172 @@ describe("materializeSubmodules", () => {
    * @level l1
    * @consumer superMerge's staged-submodule initialization
    */
-  it.each(["present", "missing", "partial", "invalid", "history-failed", "nested", "nested-missing"] as const)(
-    "materializes staged linked-worktree additions with a %s prepared pin",
-    async (pinState) => {
-      const root = await mkdtemp(join(tmpdir(), "git-super-staged-store-"))
-      roots.push(root)
-      const dependency = join(root, "dependency")
-      const owner = join(root, "owner")
-      const candidate = join(root, "candidate")
-      createRepository(dependency, "dependency.txt", "old pin\n")
-      let required = advanceRepository(dependency, "dependency.txt", "selected pin\n")
-      let nestedPin: string | undefined
-      const nested = join(root, "nested")
-      if (pinState === "nested" || pinState === "nested-missing") {
-        nestedPin = createRepository(nested, "nested.txt", "nested selected pin\n")
-        writeFileSync(join(dependency, ".gitmodules"), `[submodule "nested-store"]\n path = nested\n url = ../nested\n`)
-        git(dependency, ["add", ".gitmodules"])
-        git(dependency, ["update-index", "--add", "--cacheinfo", `160000,${nestedPin},nested`])
-        git(dependency, ["commit", "-q", "-m", "add nested gitlink"])
-        required = git(dependency, ["rev-parse", "HEAD"]).trim()
+  it.each([
+    "present",
+    "missing",
+    "partial",
+    "invalid",
+    "history-failed",
+    "nested",
+    "nested-missing",
+    "nested-invalid",
+    "nested-unreadable",
+  ] as const)("materializes staged linked-worktree additions with a %s prepared pin", async (pinState) => {
+    const root = await mkdtemp(join(tmpdir(), "git-super-staged-store-"))
+    roots.push(root)
+    const dependency = join(root, "dependency")
+    const owner = join(root, "owner")
+    const candidate = join(root, "candidate")
+    createRepository(dependency, "dependency.txt", "old pin\n")
+    let required = advanceRepository(dependency, "dependency.txt", "selected pin\n")
+    let nestedPin: string | undefined
+    let nestedStore: string | undefined
+    const nested = join(root, "nested")
+    if (pinState.startsWith("nested")) {
+      nestedPin = createRepository(nested, "nested.txt", "nested selected pin\n")
+      writeFileSync(join(dependency, ".gitmodules"), `[submodule "nested-store"]\n path = nested\n url = ../nested\n`)
+      git(dependency, ["add", ".gitmodules"])
+      git(dependency, ["update-index", "--add", "--cacheinfo", `160000,${nestedPin},nested`])
+      git(dependency, ["commit", "-q", "-m", "add nested gitlink"])
+      required = git(dependency, ["rev-parse", "HEAD"]).trim()
+    }
+    createRepository(owner, ".gitmodules", "")
+    git(owner, ["remote", "add", "origin", owner])
+    git(owner, ["worktree", "add", "-q", "--detach", candidate, "HEAD"])
+    writeFileSync(
+      join(candidate, ".gitmodules"),
+      `[submodule "gamma-store"]\n  path = gamma\n  url = ${pinState === "nested-missing" ? "../dependency" : dependency}\n`,
+    )
+    git(candidate, ["add", ".gitmodules"])
+    git(candidate, ["update-index", "--add", "--cacheinfo", `160000,${required},gamma`])
+    const prepared = await prepareSubmoduleTreeUnderLock(
+      { repo: candidate, commit: git(candidate, ["write-tree"]).trim(), remote: owner },
+      new Set(["gamma"]),
+    )
+    expect(prepared.state, JSON.stringify(prepared.detail)).toBe("updated")
+    const descriptor = prepared.submodules[0]
+    if (descriptor === undefined) throw new Error("prepare returned no gamma descriptor")
+    expect(descriptor.path).toBe("gamma")
+    const store = descriptor.gitdir
+    expect(existsSync(join(owner, "gamma", ".git"))).toBe(false)
+    if (pinState !== "missing") git(store, ["fetch", "-q", dependency, `${required}:refs/heads/main`])
+    if (pinState === "nested" || pinState === "nested-invalid" || pinState === "nested-unreadable") {
+      const nestedPrepared = await prepareSubmoduleTreeUnderLock(
+        { repo: store, commit: git(store, ["rev-parse", `${required}^{tree}`]).trim(), remote: dependency },
+        new Set(["nested"]),
+      )
+      expect(nestedPrepared.state, JSON.stringify(nestedPrepared.detail)).toBe("updated")
+      nestedStore = nestedPrepared.submodules[0]?.gitdir
+      if (nestedStore === undefined || nestedPin === undefined) {
+        throw new Error("prepare returned no nested descriptor")
       }
-      createRepository(owner, ".gitmodules", "")
-      git(owner, ["remote", "add", "origin", owner])
-      git(owner, ["worktree", "add", "-q", "--detach", candidate, "HEAD"])
-      writeFileSync(
-        join(candidate, ".gitmodules"),
-        `[submodule "gamma-store"]\n  path = gamma\n  url = ${pinState === "nested-missing" ? "../dependency" : dependency}\n`,
+      git(nestedStore, ["fetch", "-q", nested, `${nestedPin}:refs/heads/main`])
+      if (pinState === "nested-invalid") git(nestedStore, ["config", "core.bare", "true"])
+    }
+    if (pinState === "partial") git(store, ["config", "remote.origin.promisor", "true"])
+    if (pinState === "invalid") git(store, ["config", "core.bare", "true"])
+    const process = createLocalGitProcess()
+    const requests: GitProcessRequest[] = []
+    const selectedProcess = {
+      async run(request: GitProcessRequest) {
+        requests.push(request)
+        if (pinState === "nested-unreadable" && request.repo === nestedStore && request.args[0] === "rev-parse") {
+          return { code: 128, stdout: "", stderr: "nested store unreadable", timedOut: false }
+        }
+        if (pinState === "history-failed" && request.repo === owner && request.args[0] === "log") {
+          return { code: 128, stdout: "", stderr: "removal history unreadable", timedOut: false }
+        }
+        if (request.args[0] === "fetch") {
+          return { code: 128, stdout: "", stderr: "prepared pin unavailable in this test", timedOut: false }
+        }
+        return process.run(request)
+      },
+    }
+    // HEAD intentionally lacks the addition; existing callers retain their default census.
+    const head = await materializeSubmodulesWithProcess(selectedProcess, {
+      worktree: candidate,
+      referenceWorktree: owner,
+      paths: ["gamma"],
+    })
+    expect(head).toMatchObject({ code: 0, considered: 0 })
+    requests.length = 0
+    if (pinState === "nested-missing") {
+      git(root, ["clone", "-q", dependency, join(root, "stale-parent")])
+      git(candidate, ["config", "submodule.gamma-store.url", join(root, "stale-parent")])
+    }
+    const result = await materializeSubmodulesWithProcess(selectedProcess, {
+      worktree: candidate,
+      referenceWorktree: owner,
+      paths: ["gamma"],
+      source: "index",
+    })
+    if (pinState === "nested") expect(result.code, result.stderr).toBe(0)
+    expect(result.considered, result.stderr).toBe(
+      pinState === "invalid" || pinState === "history-failed"
+        ? 0
+        : pinState === "nested" || pinState === "nested-missing"
+          ? 2
+          : 1,
+    )
+    if (pinState === "present" || pinState === "nested") {
+      expect(result).toMatchObject({
+        code: 0,
+        borrowed: pinState === "nested" ? 2 : 1,
+        remoteFallbacks: 0,
+        unreferenced: 0,
+        warmed: 0,
+      })
+      expect(git(join(candidate, "gamma"), ["rev-parse", "HEAD"]).trim()).toBe(required)
+      const gitdir = git(join(candidate, "gamma"), ["rev-parse", "--path-format=absolute", "--git-dir"]).trim()
+      expect(gitdir).toContain("/worktrees/candidate/modules/gamma-store")
+      expect(readFileSync(join(gitdir, "objects/info/alternates"), "utf8").trim().split("\n")).toContain(
+        join(store, "objects"),
       )
-      git(candidate, ["add", ".gitmodules"])
-      git(candidate, ["update-index", "--add", "--cacheinfo", `160000,${required},gamma`])
-      const prepared = await prepareSubmoduleTreeUnderLock(
-        { repo: candidate, commit: git(candidate, ["write-tree"]).trim(), remote: owner },
-        new Set(["gamma"]),
-      )
-      expect(prepared.state, JSON.stringify(prepared.detail)).toBe("updated")
-      const descriptor = prepared.submodules[0]
-      if (descriptor === undefined) throw new Error("prepare returned no gamma descriptor")
-      expect(descriptor.path).toBe("gamma")
-      const store = descriptor.gitdir
-      expect(existsSync(join(owner, "gamma", ".git"))).toBe(false)
-      if (pinState !== "missing") git(store, ["fetch", "-q", dependency, `${required}:refs/heads/main`])
+      expect(requests.some(({ args }) => args[0] === "fetch")).toBe(false)
       if (pinState === "nested") {
-        const nestedPrepared = await prepareSubmoduleTreeUnderLock(
-          { repo: store, commit: git(store, ["rev-parse", `${required}^{tree}`]).trim(), remote: dependency },
-          new Set(["nested"]),
-        )
-        expect(nestedPrepared.state, JSON.stringify(nestedPrepared.detail)).toBe("updated")
-        const nestedStore = nestedPrepared.submodules[0]?.gitdir
-        if (nestedStore === undefined || nestedPin === undefined) {
-          throw new Error("prepare returned no nested descriptor")
-        }
-        git(nestedStore, ["fetch", "-q", nested, `${nestedPin}:refs/heads/main`])
+        expect(git(join(candidate, "gamma", "nested"), ["rev-parse", "HEAD"]).trim()).toBe(nestedPin)
+        expect(requests.filter(({ args }) => args.includes("submodule") && args.includes("update"))).toHaveLength(2)
       }
-      if (pinState === "partial") git(store, ["config", "remote.origin.promisor", "true"])
-      if (pinState === "invalid") git(store, ["config", "core.bare", "true"])
-      const process = createLocalGitProcess()
-      const requests: GitProcessRequest[] = []
-      const selectedProcess = {
-        async run(request: GitProcessRequest) {
-          requests.push(request)
-          if (pinState === "history-failed" && request.repo === owner && request.args[0] === "log") {
-            return { code: 128, stdout: "", stderr: "removal history unreadable", timedOut: false }
-          }
-          if (request.args[0] === "fetch") {
-            return { code: 128, stdout: "", stderr: "prepared pin unavailable in this test", timedOut: false }
-          }
-          return process.run(request)
-        },
-      }
-      // HEAD intentionally lacks the addition; existing callers retain their default census.
-      const head = await materializeSubmodulesWithProcess(selectedProcess, {
-        worktree: candidate,
-        referenceWorktree: owner,
-        paths: ["gamma"],
-      })
-      expect(head).toMatchObject({ code: 0, considered: 0 })
-      requests.length = 0
-      if (pinState === "nested-missing") {
-        git(root, ["clone", "-q", dependency, join(root, "stale-parent")])
-        git(candidate, ["config", "submodule.gamma-store.url", join(root, "stale-parent")])
-      }
-      const result = await materializeSubmodulesWithProcess(selectedProcess, {
-        worktree: candidate,
-        referenceWorktree: owner,
-        paths: ["gamma"],
-        source: "index",
-      })
-      if (pinState === "nested") expect(result.code, result.stderr).toBe(0)
-      expect(result.considered, result.stderr).toBe(
-        pinState === "invalid" || pinState === "history-failed"
-          ? 0
-          : pinState === "nested" || pinState === "nested-missing"
-            ? 2
-            : 1,
-      )
-      if (pinState === "present" || pinState === "nested") {
-        expect(result).toMatchObject({
-          code: 0,
-          borrowed: pinState === "nested" ? 2 : 1,
-          remoteFallbacks: 0,
-          unreferenced: 0,
-          warmed: 0,
-        })
-        expect(git(join(candidate, "gamma"), ["rev-parse", "HEAD"]).trim()).toBe(required)
-        const gitdir = git(join(candidate, "gamma"), ["rev-parse", "--path-format=absolute", "--git-dir"]).trim()
-        expect(gitdir).toContain("/worktrees/candidate/modules/gamma-store")
-        expect(readFileSync(join(gitdir, "objects/info/alternates"), "utf8").trim().split("\n")).toContain(
-          join(store, "objects"),
-        )
-        expect(requests.some(({ args }) => args[0] === "fetch")).toBe(false)
-        if (pinState === "nested") {
-          expect(git(join(candidate, "gamma", "nested"), ["rev-parse", "HEAD"]).trim()).toBe(nestedPin)
-          expect(requests.filter(({ args }) => args.includes("submodule") && args.includes("update"))).toHaveLength(2)
-        }
-      } else if (pinState === "nested-missing") {
-        // The existing nested capability arm supplies both stores explicitly;
-        // this arm proves the absent-store diagnosis uses the real parent pin.
-        expect(result.code).not.toBe(0)
-        expect(result.stderr).toContain("nested-store-missing")
-        expect(result.stderr).toContain(store)
-        expect(result.stderr).toContain(required)
-        expect(result.stderr).toContain(nestedPin)
-        expect(result.stderr).toContain("submodule prepare")
-        expect(result.stderr).toContain(dependency)
-        expect(result.stderr).not.toContain("stale-parent")
-        expect(result.stderr).not.toContain(`git -C ${store} submodule update`)
-      } else if (pinState === "invalid" || pinState === "history-failed") {
-        expect(result.code).not.toBe(0)
-        expect(result.stderr).toContain(pinState === "invalid" ? "core.bare=false" : "removal history unreadable")
-        expect(requests.some(({ args }) => args[0] === "fetch")).toBe(false)
-        expect(requests.some(({ args }) => args.includes("submodule") && args.includes("update"))).toBe(false)
-        expect(existsSync(join(candidate, "gamma", ".git"))).toBe(false)
-      } else {
-        expect(result.code).not.toBe(0)
-        expect(result.stderr).toContain("gamma")
-        expect(result.stderr).toContain(required)
-        expect(result.stderr).toContain("limit 0")
-        expect(result).toMatchObject({ borrowed: 0, remoteFallbacks: 1, unreferenced: 0, warmed: 0 })
-        const fetches = requests.filter(({ args }) => args[0] === "fetch")
-        expect(fetches).toHaveLength(pinState === "missing" ? 1 : 0)
-        if (pinState === "missing") expect(fetches[0]!.repo).toBe(store)
-        else expect(result.stderr).toContain("partial clone")
-        expect(existsSync(join(candidate, "gamma", ".git"))).toBe(false)
-        expect(requests.some(({ args }) => args.includes("update") && args.includes("submodule"))).toBe(false)
-      }
-    },
-  )
+    } else if (pinState === "nested-missing") {
+      // The existing nested capability arm supplies both stores explicitly;
+      // this arm proves the absent-store diagnosis uses the real parent pin.
+      expect(result.code).not.toBe(0)
+      expect(result.stderr).toContain("nested-store-missing")
+      expect(result.stderr).toContain(store)
+      expect(result.stderr).toContain(required)
+      expect(result.stderr).toContain(nestedPin)
+      expect(result.stderr).toContain("submodule prepare")
+      expect(result.stderr).toContain(dependency)
+      expect(result.stderr).not.toContain("stale-parent")
+      expect(result.stderr).not.toContain(`git -C ${store} submodule update`)
+    } else if (pinState === "nested-invalid" || pinState === "nested-unreadable") {
+      // CTO's absence-only remedy contract: existing invalid children keep
+      // their cause, rather than receiving prepare/fetch recreation commands.
+      expect(result.code).not.toBe(0)
+      expect(result.stderr).toContain(pinState === "nested-invalid" ? "core.bare=false" : "nested store unreadable")
+      expect(result.stderr).not.toContain("nested-store-missing")
+      expect(result.stderr).not.toContain("submodule prepare")
+      expect(existsSync(join(candidate, "gamma", "nested", ".git"))).toBe(false)
+    } else if (pinState === "invalid" || pinState === "history-failed") {
+      expect(result.code).not.toBe(0)
+      expect(result.stderr).toContain(pinState === "invalid" ? "core.bare=false" : "removal history unreadable")
+      expect(requests.some(({ args }) => args[0] === "fetch")).toBe(false)
+      expect(requests.some(({ args }) => args.includes("submodule") && args.includes("update"))).toBe(false)
+      expect(existsSync(join(candidate, "gamma", ".git"))).toBe(false)
+    } else {
+      expect(result.code).not.toBe(0)
+      expect(result.stderr).toContain("gamma")
+      expect(result.stderr).toContain(required)
+      expect(result.stderr).toContain("limit 0")
+      expect(result).toMatchObject({ borrowed: 0, remoteFallbacks: 1, unreferenced: 0, warmed: 0 })
+      const fetches = requests.filter(({ args }) => args[0] === "fetch")
+      expect(fetches).toHaveLength(pinState === "missing" ? 1 : 0)
+      if (pinState === "missing") expect(fetches[0]!.repo).toBe(store)
+      else expect(result.stderr).toContain("partial clone")
+      expect(existsSync(join(candidate, "gamma", ".git"))).toBe(false)
+      expect(requests.some(({ args }) => args.includes("update") && args.includes("submodule"))).toBe(false)
+    }
+  })
 
   /**
    * @failure A retained prepared store resurrects a path deliberately removed by reference HEAD.
@@ -1656,7 +1682,7 @@ describe("materializeSubmodules", () => {
    * @consumer process materialization adapters
    * @testonly none
    */
-  it.each(["unreadable", "parent-ascent", "missing-primary", "mismatched-primary"] as const)(
+  it.each(["unreadable", "parent-ascent", "missing-primary", "mismatched-primary", "synthetic-mismatch"] as const)(
     "refuses reference identity %s by name",
     async (failure) => {
       const root = await mkdtemp(join(tmpdir(), "git-super-reference-identity-"))
@@ -1665,36 +1691,44 @@ describe("materializeSubmodules", () => {
       const candidate = join(owner, "candidate")
       createRepository(owner, "README.md", "owner\n")
       const other = join(root, "other")
-      if (failure === "mismatched-primary") createRepository(other, "README.md", "other\n")
+      if (failure === "mismatched-primary" || failure === "synthetic-mismatch") {
+        createRepository(other, "README.md", "other\n")
+      }
       if (failure === "parent-ascent") {
         await mkdir(candidate)
       } else {
         git(owner, ["worktree", "add", "-q", "--detach", candidate, "HEAD"])
       }
       const local = createLocalGitProcess()
+      const synthetic = withPrimaryWorktree({ run: async () => success() }, owner)
       const requests: GitProcessRequest[] = []
       const result = await materializeSubmodulesWithProcess(
         {
           run(request) {
             requests.push(request)
-            if (request.repo === owner && request.args.includes("--show-toplevel") && failure.endsWith("primary")) {
+            if (
+              request.repo === owner &&
+              request.args.includes("--show-toplevel") &&
+              (failure.endsWith("primary") || failure === "synthetic-mismatch")
+            ) {
               return Promise.resolve({ code: 0, stdout: `${other}\n`, stderr: "" })
             }
             if (failure === "unreadable" && request.repo === candidate && request.args.includes("--absolute-git-dir")) {
               return Promise.resolve({ code: 128, stdout: "", stderr: "injected unreadable Git directory" })
             }
-            return local.run(request)
+            return failure === "synthetic-mismatch" ? synthetic.run(request.repo, request.args) : local.run(request)
           },
         },
-        { worktree: candidate },
+        { worktree: candidate, ...(failure === "synthetic-mismatch" ? { referenceWorktree: owner } : {}) },
         { resolveReferenceWorktree: true },
       )
       expect(result.code).not.toBe(0)
+      expect(result).toMatchObject({ considered: 0, borrowed: 0, remoteFallbacks: 0, unreferenced: 0, warmed: 0 })
       expect(result.stderr).toContain("cannot prove reference identity")
       expect(result.stderr).toContain(candidate)
       if (failure === "unreadable") expect(result.stderr).toContain("injected unreadable Git directory")
       else expect(result.stderr).toContain(owner)
-      if (failure.endsWith("primary")) expect(result.stderr).toContain(other)
+      if (failure.endsWith("primary") || failure === "synthetic-mismatch") expect(result.stderr).toContain(other)
       expect(requests.some(({ args }) => args.includes("update"))).toBe(false)
     },
   )

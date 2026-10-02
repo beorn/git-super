@@ -659,27 +659,20 @@ export async function materializeSubmodules(
   options: SubmoduleMaterializationOptions,
 ): Promise<SubmoduleMaterializationResult> {
   const log = options.log
-  const requestedReference =
-    options.referenceWorktree !== undefined && resolve(options.referenceWorktree) !== resolve(options.worktree)
-      ? options.referenceWorktree
-      : undefined
-  let referenceRoot: string | undefined
-  if (requestedReference !== undefined) {
-    const primary = await primaryWorktree(git, requestedReference)
-    if (typeof primary !== "string") {
-      return {
-        ...primary,
-        considered: 0,
-        borrowed: 0,
-        remoteFallbacks: 0,
-        unreferenced: 0,
-        warmed: 0,
-        remotePaths: [],
-        unreferencedPaths: [],
-      }
-    }
-    if (canonical(primary) !== canonical(options.worktree)) {
-      referenceRoot = primary
+  const referenceRoot = await discoverReferenceWorktree(git, {
+    worktree: options.worktree,
+    referenceWorktree: options.referenceWorktree ?? options.worktree,
+  })
+  if (referenceRoot !== undefined && typeof referenceRoot !== "string") {
+    return {
+      ...referenceRoot,
+      considered: 0,
+      borrowed: 0,
+      remoteFallbacks: 0,
+      unreferenced: 0,
+      warmed: 0,
+      remotePaths: [],
+      unreferencedPaths: [],
     }
   }
   let borrowed = 0
