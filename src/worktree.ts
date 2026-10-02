@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url"
 import { createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS } from "./exclusive.ts"
 import {
   acquireRemovalWriterLeases,
+  assertExcludedRemovalCustody,
   rehomeBorrowers,
   retainWorktreeModules,
   type WorktreeRetention,
@@ -297,6 +298,15 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
     throw new Error("git-super: Git worktree capability requires one injected GitProcess")
   }
   const git = createGit(options.gitProcess, options.env ?? process.env, timeouts.operation, options.signal)
+  const configuredProcess = (hooks?: WorktreeHookPolicy): GitProcess => ({
+    async run(request) {
+      const result = await git.run(request.repo, withHookPolicy(request.args, hooks), true, request.timeoutMs, {
+        ...(request.stdin === undefined ? {} : { stdin: request.stdin }),
+        ...(request.env === undefined ? {} : { env: request.env }),
+      })
+      return { code: result.code, stdout: result.stdout, stderr: result.stderr }
+    },
+  })
   const runWithMutationLock = async <Result>(
     dir: string,
     holder: string,
@@ -383,21 +393,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       path: string,
       materializeOptions: Readonly<{ force?: boolean; hooks?: WorktreeHookPolicy }> = {},
     ): Promise<void> {
-      const materializeProcess: GitProcess = {
-        async run(request) {
-          const result = await git.run(
-            request.repo,
-            withHookPolicy(request.args, materializeOptions.hooks),
-            true,
-            request.timeoutMs,
-            {
-              ...(request.stdin === undefined ? {} : { stdin: request.stdin }),
-              ...(request.env === undefined ? {} : { env: request.env }),
-            },
-          )
-          return { code: result.code, stdout: result.stdout, stderr: result.stderr }
-        },
-      }
+      const materializeProcess = configuredProcess(materializeOptions.hooks)
       const result = await materializeSubmodulesWithProcess(materializeProcess, {
         worktree: path,
         referenceWorktree: repo,
@@ -415,13 +411,19 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
     },
     async remove(
       path: string,
-      removeOptions: Readonly<{ operation?: string; unlock?: boolean; retention?: WorktreeRetention }> = {},
+      removeOptions: Readonly<{
+        operation?: string
+        unlock?: boolean
+        retention?: WorktreeRetention
+        excludedSubmodules?: readonly string[]
+      }> = {},
     ): Promise<void> {
       await mutate(removeOptions.operation ?? `worktree remove ${path}`, async () => {
         if (removeOptions.retention !== undefined && removeOptions.unlock === true) {
           throw new Error(`retained worktree removal cannot unlock ${path}; resolve its holder first`)
         }
         const gitDir = realpathSync(await git.text(path, ["rev-parse", "--absolute-git-dir"]))
+        await assertExcludedRemovalCustody(git, configuredProcess(), path, gitDir, removeOptions.excludedSubmodules)
         const writerLeases = acquireRemovalWriterLeases(gitDir)
         try {
           if (removeOptions.retention !== undefined) {

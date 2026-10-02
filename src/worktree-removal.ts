@@ -20,7 +20,10 @@ import { tryAcquireFlock, type FlockHandle } from "@bearly/flock"
 import { fileLockHolders, formatLockHolders } from "@bearly/flock/holders"
 import { spawnSync } from "node:child_process"
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
-import { superStatus } from "./status.ts"
+import { inspectUninitializedCheckout, superStatus } from "./status.ts"
+import { readCommitSubmodules } from "./commit-graph.ts"
+import { validateExcludedSubmodules } from "./git.ts"
+import type { GitProcess } from "./process.ts"
 import type { Git, WorktreeInspection } from "./worktree.ts"
 
 export type WorktreeRemovalProof = Readonly<{
@@ -61,6 +64,65 @@ function toCanonical(path: string): string {
     return realpathSync(path)
   } catch {
     return resolve(path)
+  }
+}
+
+/** Parent metadata must establish excluded custody before leases inspect any store. */
+export async function assertExcludedRemovalCustody(
+  git: Git,
+  process: GitProcess,
+  requested: string,
+  gitDir: string,
+  excludedSubmodules: readonly string[] = [],
+): Promise<void> {
+  validateExcludedSubmodules(excludedSubmodules)
+  if (excludedSubmodules.length === 0) return
+  const checkout = realpathSync(requested)
+  const head = await git.commit(checkout, "HEAD")
+  const declarations = await readCommitSubmodules(process, checkout, head)
+  for (const path of excludedSubmodules) {
+    const declaration = declarations.find((entry) => entry.path === path)
+    if (declaration === undefined) {
+      throw new Error(
+        `excluded submodule ${JSON.stringify(path)} has no direct identity in parent ${checkout} at ${head}; resolve its parent metadata before removal`,
+      )
+    }
+    // A section name is a store path, not necessarily its checkout path.
+    validateExcludedSubmodules([declaration.name])
+    const parts = path.split("/")
+    let ancestor = checkout
+    for (const part of parts.slice(0, -1)) {
+      ancestor = join(ancestor, part)
+      const state = lstatSync(ancestor, { throwIfNoEntry: false })
+      if (state === undefined) break
+      if (!state.isDirectory() || state.isSymbolicLink()) {
+        throw new Error(
+          `excluded submodule ${path} has unsafe checkout ancestor ${ancestor}; worktree preserved; resolve that ancestor before retrying removal`,
+        )
+      }
+    }
+    const state = inspectUninitializedCheckout(join(checkout, path))
+    if (state !== "absent" && state !== "empty") {
+      throw new Error(
+        `excluded submodule ${path} checkout is ${state}; worktree preserved; preserve its content and resolve its checkout before retrying removal`,
+      )
+    }
+    const store = await git.text(checkout, [
+      "rev-parse",
+      "--path-format=absolute",
+      "--git-path",
+      `modules/${declaration.name}`,
+    ])
+    if (store === "" || !isAbsolute(store)) {
+      throw new Error(
+        `excluded submodule ${path} has an invalid parent-resolved store path ${JSON.stringify(store)}; inspect its declaration in parent ${checkout} before retrying removal`,
+      )
+    }
+    if ((within(checkout, store) || within(gitDir, store)) && present(store)) {
+      throw new Error(
+        `excluded submodule ${path} (section ${declaration.name}) store ${store} is inside deletion custody ${checkout} or ${gitDir}; worktree preserved before store inspection; preserve the store outside both deletion paths before retrying removal`,
+      )
+    }
   }
 }
 
