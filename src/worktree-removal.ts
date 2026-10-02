@@ -199,7 +199,7 @@ export async function prepareRemovalBorrowers(
   }
   if (present(join(commonDir, "git-super-retained-borrowers"))) {
     throw new Error(
-      `worktree ${checkout} has retained borrower registrations with unresolved excluded-store identities; resolve their custody before removal`,
+      `worktree ${checkout} has retained borrower registrations with unresolved excluded-store identities for ${excludedSubmodules.map((path) => JSON.stringify(path)).join(", ")}; resolve their custody before removal`,
     )
   }
   const candidates: RemovalBorrower[] = []
