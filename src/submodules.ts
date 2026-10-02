@@ -259,11 +259,10 @@ async function requiredGitlink(
 }
 
 /**
- * A gitlink the REFERENCE no longer carries at all: its HEAD tree has no entry
- * at this path, so the store the candidate needs was not left cold — it was
- * removed, deliberately, by the commit named here.
+ * A gitlink absent from reference HEAD. History distinguishes a deliberate
+ * removal from a target addition newer than the reference; absence alone does not.
  */
-type Detachment = Readonly<{ removedBy: string | undefined }>
+type Detachment = Readonly<{ removedBy: string | undefined; addedBy?: string }>
 
 /**
  * Decide whether a miss is a cold store or a removed submodule, BEFORE any
@@ -282,13 +281,14 @@ type Detachment = Readonly<{ removedBy: string | undefined }>
  * THE FAILED READ IS NOT EVIDENCE. An `ls-tree` that errored says nothing about
  * whether the submodule was removed, and calling an unreadable reference a
  * removal would send a recoverable cold store down the unrecoverable path. Only
- * a SUCCESSFUL read with no gitlink row proves the removal, and only then is the
- * removing commit looked up.
+ * a SUCCESSFUL read with no gitlink row establishes absence. History must then
+ * establish whether it was removed or the reference predates its addition.
  */
 async function detachedFromReference(
   git: SubmoduleGit,
   reference: string,
   path: string,
+  worktree: string,
 ): Promise<Detachment | SubmoduleGitResult | undefined> {
   const tree = await git.run(reference, ["ls-tree", "HEAD", "--", path], true)
   if (tree.code !== 0 || GITLINK_ROW.test(tree.stdout)) return undefined
@@ -303,7 +303,28 @@ async function detachedFromReference(
     }
   }
   const removedBy = removal.stdout.trim()
-  return { removedBy: removedBy === "" ? undefined : removedBy }
+  if (removedBy !== "") return { removedBy }
+  const addition = await git.run(worktree, ["log", "-1", "--format=%H", "--diff-filter=A", "HEAD", "--", path], true)
+  if (addition.code !== 0) {
+    return {
+      ...addition,
+      stderr: `cannot read addition history for gitlink '${path}' in ${worktree}\n${addition.stderr}`,
+    }
+  }
+  const addedBy = addition.stdout.trim()
+  if (addedBy === "") return { removedBy: undefined }
+  const referenceHead = await git.run(reference, ["rev-parse", "HEAD"], true)
+  if (referenceHead.code !== 0) {
+    return { ...referenceHead, stderr: `cannot read reference HEAD in ${reference}\n${referenceHead.stderr}` }
+  }
+  const ancestry = await git.run(worktree, ["merge-base", "--is-ancestor", referenceHead.stdout.trim(), addedBy], true)
+  if (ancestry.code !== 0 && ancestry.code !== 1) {
+    return {
+      ...ancestry,
+      stderr: `cannot compare reference HEAD with adding commit ${addedBy} for '${path}'\n${ancestry.stderr}`,
+    }
+  }
+  return ancestry.code === 0 ? { removedBy: undefined, addedBy } : { removedBy: undefined }
 }
 
 async function referenceContains(git: SubmoduleGit, reference: string, sha: string): Promise<boolean> {
@@ -850,7 +871,7 @@ export async function materializeSubmodules(
               let detached =
                 heldInWorktree || referenceHasIt || reference === undefined || preparedReference
                   ? undefined
-                  : await detachedFromReference(git, reference, path)
+                  : await detachedFromReference(git, reference, path, worktree)
               if (detached !== undefined && "code" in detached) return detached
               // A selected addition can have a prepared durable store before the primary
               // checkout carries it. Its nested stores share this same validator; a
@@ -938,10 +959,8 @@ export async function materializeSubmodules(
         const store = referenceIsPrepared || detached !== undefined || (await referenceStoreAt(git, referenceSubmodule))
         const promisor = !store ? undefined : await promisorRemote(git, referenceSubmodule)
         if (detached !== undefined) {
-          // NO WARM-UP. The reference dropped this submodule, so the fetch below
-          // would ask a store that does not exist for an object nothing will
-          // ever put there. Skipping it is the pre-flight: the refusal lands
-          // before the network rather than after a failure that reads retryable.
+          // NO WARM-UP. Reference HEAD does not declare this path. Name the
+          // proven history instead of treating every absence as a removal.
           misses.push({
             absentStore: false,
             detached,
@@ -949,8 +968,11 @@ export async function materializeSubmodules(
             reference: referenceSubmodule,
             required,
             why:
-              `the reference no longer carries this submodule` +
-              (detached.removedBy === undefined ? "" : `; removed by ${detached.removedBy}`),
+              detached.removedBy !== undefined
+                ? `the reference no longer carries this submodule; removed by ${detached.removedBy}`
+                : detached.addedBy !== undefined
+                  ? `the reference predates the commit that added this submodule: ${detached.addedBy}`
+                  : `reference HEAD does not declare this submodule; its addition or removal history is not established`,
           })
         } else if (!store) {
           // NO WARM-UP EITHER, and for the opposite reason: the reference still
@@ -1195,7 +1217,11 @@ export async function materializeSubmodules(
       // sent branch owners to provision a store the repository had deliberately
       // dropped; a pin genuinely missing everywhere must not prescribe fetching
       // from origin and must name submitting the component change.
-      const removed = misses.filter(({ detached }) => detached !== undefined)
+      const removed = misses.filter(({ detached }) => detached?.removedBy !== undefined)
+      const added = misses.filter(({ detached }) => detached?.addedBy !== undefined)
+      const unclassified = misses.filter(
+        ({ detached }) => detached !== undefined && detached.removedBy === undefined && detached.addedBy === undefined,
+      )
       const absentStores = misses.filter(({ absentStore }) => absentStore)
       const missingEverywhere = misses.filter(
         ({ absentStore, detached, originRejected }) =>
@@ -1232,6 +1258,18 @@ export async function materializeSubmodules(
               )
               .join("\n") +
             `\nOnce the component change is submitted or fetched from the worktree that holds it, retry the sync.\n`
+      const additionRemedy =
+        added.length === 0
+          ? ""
+          : `\nThe reference predates the commit that added these submodules:\n` +
+            added.map(({ path, detached }) => `  ${path} — added by ${detached?.addedBy}`).join("\n") +
+            `\nRetry from a reference at or after the adding commit.\n`
+      const unclassifiedRemedy =
+        unclassified.length === 0
+          ? ""
+          : `\nReference HEAD does not declare these paths, but available history establishes neither an addition nor a removal:\n` +
+            unclassified.map(({ path }) => `  ${path}`).join("\n") +
+            `\nInspect the reference and target path history before choosing a reference that carries these submodules.\n`
       const repairRemedy =
         repairable.length === 0
           ? ""
@@ -1262,7 +1300,7 @@ export async function materializeSubmodules(
       return {
         code: 1,
         stdout: "",
-        stderr: `${headline}\n${detail}\n${detachmentRemedy}${absentRemedy}${missingEverywhereRemedy}${repairRemedy}`,
+        stderr: `${headline}\n${detail}\n${detachmentRemedy}${additionRemedy}${unclassifiedRemedy}${absentRemedy}${missingEverywhereRemedy}${repairRemedy}`,
       }
     }
     const update = async ({
