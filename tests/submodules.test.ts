@@ -5,10 +5,16 @@
  * @reach fs-walk <fixture-only: materializers use mkdtemp(canonicalTmpdir()) Git repos>
  * @testonly syncOriginTrackingRefs: unit test for tracking ref sync across borrowed submodules
  */
-import { existsSync, readFileSync, writeFileSync } from "node:fs"
+import { existsSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import { mkdir, mkdtemp, rm } from "node:fs/promises"
 import { spawnSync } from "node:child_process"
-import { canonicalTmpdir as tmpdir, createRepository, advanceRepository } from "./fixture.ts"
+import {
+  canonicalTmpdir as tmpdir,
+  createRepository,
+  advanceRepository,
+  createProductFixture,
+  addNestedAlphaSubmodule,
+} from "./fixture.ts"
 import { join } from "node:path"
 import { createLogger, type ConditionalLogger, type Event } from "loggily"
 import { afterEach, describe, expect, it } from "vitest"
@@ -137,6 +143,142 @@ afterEach(async () => {
 })
 
 describe("materializeSubmodules", () => {
+  /**
+   * @failure A later included checkout failure makes the synchronous host boundary lose known private skips (27058 AC3).
+   * @level l1
+   * @consumer worktree and pull materialization
+   * @testonly none
+   */
+  it.each(["process", "parallel-host", "sync-host"])(
+    "retains private observations after an included failure through %s",
+    async (adapter) => {
+      const root = await mkdtemp(join(tmpdir(), "git-super-private-materialization-failure-"))
+      roots.push(root)
+      const fixture = createProductFixture(root)
+      const checkout = join(root, "checkout")
+      git(root, ["-c", "protocol.file.allow=always", "clone", "-q", "--recurse-submodules", fixture.product, checkout])
+      const excluded = "packages/alpha"
+      git(checkout, ["submodule", "deinit", "-f", "--", excluded])
+      writeFileSync(join(checkout, "vendor/beta/.git"), "gitdir: /missing-included-beta-store\n")
+      const options = { worktree: checkout, referenceWorktree: fixture.product, excludedSubmodules: [excluded] }
+      const result =
+        adapter === "process"
+          ? await materializeSubmodulesWithProcess(createLocalGitProcess(), options)
+          : adapter === "parallel-host"
+            ? await materializeSubmodulesFromLocalWorktreeParallel(options)
+            : materializeSubmodulesFromLocalWorktree(options)
+      expect("code" in result ? result.code : result.exitCode).not.toBe(0)
+      expect(result).toMatchObject({ notCompared: [{ path: excluded, reason: "excluded" }] })
+      expect(existsSync(join(checkout, excluded, ".git"))).toBe(false)
+      expect(readdirSync(join(checkout, excluded))).toEqual([])
+    },
+  )
+
+  /**
+   * @failure Private exclusion admits unsafe checkouts or treats absence alone as proof of a new addition (27058 AC5).
+   * @level l1
+   * @consumer worktree and pull materialization
+   * @testonly none
+   */
+  it.each(["absent", "initialized", "nonempty", "symlink"])(
+    "refuses an excluded %s checkout before materialization",
+    async (condition) => {
+      const root = await mkdtemp(join(tmpdir(), "git-super-private-materialization-unsafe-"))
+      roots.push(root)
+      const fixture = createProductFixture(root)
+      const checkout = join(root, "checkout")
+      git(root, ["-c", "protocol.file.allow=always", "clone", "-q", "--recurse-submodules", fixture.product, checkout])
+      const excluded = "packages/alpha"
+      const privateCheckout = join(checkout, excluded)
+      if (condition !== "initialized") git(checkout, ["submodule", "deinit", "-f", "--", excluded])
+      if (condition === "nonempty") writeFileSync(join(privateCheckout, "private.txt"), "preserve me\n")
+      if (condition === "absent" || condition === "symlink") rmSync(privateCheckout, { recursive: true })
+      if (condition === "symlink") symlinkSync(fixture.alpha, privateCheckout, "dir")
+      const local = createLocalGitProcess()
+      const privateRequests: GitProcessRequest[] = []
+      const selectedProcess = {
+        run(request: GitProcessRequest) {
+          if (request.repo === privateCheckout || request.repo.startsWith(`${privateCheckout}/`)) {
+            privateRequests.push(request)
+            throw new Error(`excluded private repository was probed: ${request.repo}`)
+          }
+          return local.run(request)
+        },
+      }
+      const result = await materializeSubmodulesWithProcess(selectedProcess, {
+        worktree: checkout,
+        referenceWorktree: fixture.product,
+        paths: [excluded],
+        excludedSubmodules: [excluded],
+      })
+      expect(privateRequests).toEqual([])
+      expect(result.code).toBe(1)
+      expect(result.considered).toBe(0)
+      expect(result.stderr).toContain(excluded)
+      expect(result.stderr).toContain("preserve")
+    },
+  )
+
+  /**
+   * @failure Nested private selection is lost by the existing walk or either host adapter, initializing excluded content (27058 AC3/AC5).
+   * @level l1
+   * @consumer pull and worktree materialization
+   * @testonly none
+   */
+  it.each(["process", "parallel-host", "sync-host"])(
+    "excludes nested private checkout through %s materialization",
+    async (adapter) => {
+      const root = await mkdtemp(join(tmpdir(), "git-super-private-materialization-"))
+      roots.push(root)
+      const fixture = addNestedAlphaSubmodule(createProductFixture(root))
+      const checkout = join(root, "checkout")
+      git(root, ["-c", "protocol.file.allow=always", "clone", "-q", "--recurse-submodules", fixture.product, checkout])
+      const excluded = "packages/alpha/apps/maddoc"
+      const privateCheckout = join(checkout, excluded)
+      const parent = join(checkout, "packages/alpha")
+      const store = git(parent, ["rev-parse", "--path-format=absolute", "--git-path", "modules/apps/maddoc"]).trim()
+      git(parent, ["submodule", "deinit", "-f", "--", "apps/maddoc"])
+      git(checkout, ["config", "submodule.recurse", "true"])
+      expect(readdirSync(privateCheckout)).toEqual([])
+      expect(existsSync(store)).toBe(true)
+      const options = {
+        worktree: checkout,
+        referenceWorktree: fixture.product,
+        paths: ["packages/alpha", "vendor/beta"],
+        excludedSubmodules: [excluded],
+      }
+      const local = createLocalGitProcess()
+      const privateRequests: GitProcessRequest[] = []
+      const privateLocations = [privateCheckout, store, join(fixture.product, excluded)]
+      const selectedProcess = {
+        run(request: GitProcessRequest) {
+          if (privateLocations.some((path) => request.repo === path || request.repo.startsWith(`${path}/`))) {
+            privateRequests.push(request)
+            throw new Error(`excluded private repository was probed: ${request.repo}`)
+          }
+          return local.run(request)
+        },
+      }
+      const result =
+        adapter === "process"
+          ? await materializeSubmodulesWithProcess(selectedProcess, options)
+          : adapter === "parallel-host"
+            ? await materializeSubmodulesFromLocalWorktreeParallel(options)
+            : materializeSubmodulesFromLocalWorktree(options)
+      expect(privateRequests).toEqual([])
+      expect(result).toMatchObject({
+        considered: 2,
+        borrowed: 2,
+        unreferenced: 0,
+        notCompared: [{ path: excluded, reason: "excluded" }],
+      })
+      expect("code" in result ? result.code : result.exitCode).toBe(0)
+      expect(existsSync(join(privateCheckout, ".git"))).toBe(false)
+      expect(readdirSync(privateCheckout)).toEqual([])
+      expect(existsSync(store)).toBe(true)
+    },
+  )
+
   /**
    * @failure A staged addition bypasses validated durable stores, ignores removal-probe failures, or fails nested borrowing.
    * @level l1

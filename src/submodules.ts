@@ -1,11 +1,13 @@
 import { spawnSync } from "node:child_process"
 import { existsSync, realpathSync } from "node:fs"
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises"
-import { isAbsolute, join, resolve } from "node:path"
+import { isAbsolute, join, relative, resolve } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 import { createLogger, type ConditionalLogger, type LogLevel } from "loggily"
 import { pinRef } from "./objects.ts"
-import { cleanGitRepositoryEnvironment } from "./git.ts"
+import { cleanGitRepositoryEnvironment, isSubmoduleExcluded, validateExcludedSubmodules } from "./git.ts"
+import type { NotCompared } from "./diff.ts"
+import { inspectUninitializedCheckout } from "./status.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessRequest, type GitProcessResult } from "./process.ts"
 import { shellQuote } from "./shell-command.ts"
 import { preparedSubmoduleStore } from "./submodule-prepare.ts"
@@ -51,6 +53,7 @@ export type SubmoduleMaterializationResult = SubmoduleGitResult &
      */
     remotePaths: readonly string[]
     unreferencedPaths: readonly string[]
+    notCompared: readonly NotCompared[]
   }>
 
 export type SubmoduleMaterializationOptions = Readonly<{
@@ -59,6 +62,8 @@ export type SubmoduleMaterializationOptions = Readonly<{
   force?: boolean
   /** Restrict only the top-level pass; nested submodules still recurse. */
   paths?: readonly string[]
+  /** Literal paths relative to worktree, applied before checkout/reference probes at every depth. */
+  excludedSubmodules?: readonly string[]
   /** Read top-level declarations and pins from stage 0 for a staged merge; nested levels use HEAD. */
   source?: "head" | "index"
   /**
@@ -103,6 +108,7 @@ export type HostSubmoduleMaterializationResult = Readonly<{
   /** See {@link SubmoduleMaterializationResult}: which paths, not only how many. */
   remotePaths: readonly string[]
   unreferencedPaths: readonly string[]
+  notCompared: readonly NotCompared[]
 }>
 
 export type HostSubmoduleMaterializationOptions = Omit<SubmoduleMaterializationOptions, "force" | "source"> &
@@ -658,6 +664,7 @@ export async function materializeSubmodules(
   git: SubmoduleGit,
   options: SubmoduleMaterializationOptions,
 ): Promise<SubmoduleMaterializationResult> {
+  validateExcludedSubmodules(options.excludedSubmodules)
   const log = options.log
   const requestedReference =
     options.referenceWorktree !== undefined && resolve(options.referenceWorktree) !== resolve(options.worktree)
@@ -676,6 +683,7 @@ export async function materializeSubmodules(
         warmed: 0,
         remotePaths: [],
         unreferencedPaths: [],
+        notCompared: [],
       }
     }
     if (canonical(primary) !== canonical(options.worktree)) {
@@ -688,6 +696,7 @@ export async function materializeSubmodules(
   /** The paths behind `remoteFallbacks + warmed`, and behind `unreferenced`. */
   const remotePaths: string[] = []
   const unreferencedPaths: string[] = []
+  const notCompared: NotCompared[] = []
   /** Gitlinks materialized straight from the network because NO reference store
    * was supplied for them. Legitimate for a plain clone; a silent bug when the
    * caller meant to pass `referenceWorktree`. Counted so the two are separable. */
@@ -830,7 +839,30 @@ export async function materializeSubmodules(
     // observation: the moment a network call is added here it fans out N-wide,
     // which is exactly the shape that made GitHub refuse SSH from this host on
     // 2026-08-21. Warm-ups live in phase B below and stay serialized.
-    const selected = entries.filter(({ path }) => selectedPaths === undefined || selectedPaths.has(path))
+    const selected: typeof entries = []
+    for (const entry of entries) {
+      if (selectedPaths !== undefined && !selectedPaths.has(entry.path)) continue
+      const componentPath = relative(options.worktree, join(worktree, entry.path)).split("\\").join("/")
+      if (!isSubmoduleExcluded(componentPath, options.excludedSubmodules)) {
+        selected.push(entry)
+        continue
+      }
+      const state = inspectUninitializedCheckout(join(worktree, entry.path))
+      if (state !== "empty") {
+        return {
+          code: 1,
+          stdout: "",
+          stderr: `Excluded submodule ${componentPath} has a ${state} checkout; preserve its private checkout and Git store before materialization.`,
+        }
+      }
+      const observation: NotCompared = {
+        path: componentPath,
+        reason: "excluded",
+        message: "component excluded, not compared",
+      }
+      notCompared.push(observation)
+      log?.info?.(`${componentPath}: ${observation.message}`)
+    }
     const probes: Array<Probe | SubmoduleGitResult> = []
     for (let start = 0; start < selected.length; start += MAX_CONCURRENT_SUBMODULE_UPDATES) {
       probes.push(
@@ -1072,6 +1104,8 @@ export async function materializeSubmodules(
       const borrowFrom = referenceHasIt && referenceSubmodule !== undefined ? referenceSubmodule : undefined
       const isLocal = canBorrow
       const args = [
+        "-c",
+        "submodule.recurse=false",
         "-c",
         `submodule.alternateLocation=${SUBMODULE_ALTERNATE_LOCATION}`,
         "-c",
@@ -1345,7 +1379,17 @@ export async function materializeSubmodules(
       outcome: result.code === 0 ? "ok" : "failed",
     })
   }
-  return { ...result, considered, borrowed, remoteFallbacks, unreferenced, warmed, remotePaths, unreferencedPaths }
+  return {
+    ...result,
+    considered,
+    borrowed,
+    remoteFallbacks,
+    unreferenced,
+    warmed,
+    remotePaths,
+    unreferencedPaths,
+    notCompared,
+  }
 }
 
 function adaptGitProcess(
@@ -1402,6 +1446,7 @@ export async function materializeSubmodulesWithProcess(
       warmed: 0,
       remotePaths: [],
       unreferencedPaths: [],
+      notCompared: [],
     }
   }
   const { referenceWorktree: _requestedReference, ...selected } = options
@@ -1492,12 +1537,14 @@ export async function materializeSubmodulesFromLocalWorktreeParallel(
       warmed: 0,
       remotePaths: [],
       unreferencedPaths: [],
+      notCompared: [],
     }
   }
   const result = await materializeSubmodules(git, {
     worktree: options.worktree,
     ...(referenceWorktree === undefined ? {} : { referenceWorktree }),
     ...(options.paths === undefined ? {} : { paths: options.paths }),
+    ...(options.excludedSubmodules === undefined ? {} : { excludedSubmodules: options.excludedSubmodules }),
     ...(options.log === undefined ? {} : { log: options.log }),
     // Forwarded, not defaulted. This adapter accepted `maxRemoteFallbacks` in
     // its type and dropped it on the floor, so a caller that raised the bound
@@ -1523,6 +1570,7 @@ export function materializeSubmodulesFromLocalWorktree(
         worktree: options.worktree,
         referenceWorktree: options.referenceWorktree,
         paths: options.paths,
+        excludedSubmodules: options.excludedSubmodules,
         // JSON has no Infinity; preserve an explicitly unlimited fetch budget.
         maxRemoteFallbacks:
           options.maxRemoteFallbacks === Infinity ? Number.MAX_SAFE_INTEGER : options.maxRemoteFallbacks,
@@ -1530,7 +1578,7 @@ export function materializeSubmodulesFromLocalWorktree(
     ],
     { encoding: "utf8", env: cleanGitRepositoryEnvironment(options.env ?? process.env) },
   )
-  if (child.status !== 0) {
+  if (child.status === null || child.error !== undefined) {
     return {
       exitCode: child.status ?? 1,
       stdout: child.stdout ?? "",
@@ -1546,11 +1594,20 @@ export function materializeSubmodulesFromLocalWorktree(
       warmed: 0,
       remotePaths: [],
       unreferencedPaths: [],
+      notCompared: [],
     }
   }
   try {
     const payload = JSON.parse(child.stdout ?? "") as HostSubmoduleMaterializationResult & {
       messages?: readonly string[]
+    }
+    if (!Array.isArray(payload.notCompared)) {
+      throw new Error("submodule runner result is missing required notCompared observations")
+    }
+    if (!Number.isInteger(payload.exitCode) || payload.exitCode !== child.status) {
+      throw new Error(
+        `submodule runner receipt exit ${String(payload.exitCode)} disagrees with native exit ${String(child.status)}`,
+      )
     }
     // Structure does not survive the process boundary: the child ran the spans
     // in its own logger and only its rendered lines come back. Replayed at info
@@ -1573,6 +1630,7 @@ export function materializeSubmodulesFromLocalWorktree(
       warmed: 0,
       remotePaths: [],
       unreferencedPaths: [],
+      notCompared: [],
     }
   }
 }
