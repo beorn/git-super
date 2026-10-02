@@ -26,6 +26,32 @@ export function inspectUninitializedCheckout(
   return readdirSync(path).length === 0 ? "empty" : "nonempty"
 }
 
+/** Inspect selected checkout metadata without following an ancestor or reading Git pointer/store bytes. */
+export function inspectExcludedCheckout(root: string, path: string) {
+  validateExcludedSubmodules([path])
+  let ancestor = root
+  let unsafeAncestor: string | undefined
+  for (const part of path.split("/").slice(0, -1)) {
+    ancestor = join(ancestor, part)
+    const metadata = lstatSync(ancestor, { throwIfNoEntry: false })
+    if (metadata === undefined) break
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+      unsafeAncestor = ancestor
+      break
+    }
+  }
+  const state = unsafeAncestor === undefined ? inspectUninitializedCheckout(join(root, path)) : "unsafe-ancestor"
+  const checkout: NonNullable<NotCompared["exclusion"]>["checkout"] =
+    state === "non-directory"
+      ? "content"
+      : state === "nonempty"
+        ? lstatSync(join(root, path, ".git"), { throwIfNoEntry: false }) === undefined
+          ? "content"
+          : "checkout"
+        : state
+  return { state, checkout, unsafeAncestor }
+}
+
 /** Classify parent identity from frozen native evidence and checkout metadata, without any Git or filesystem reads. */
 export function classifyExcludedPath(
   path: string,

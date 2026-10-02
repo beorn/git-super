@@ -21,7 +21,7 @@ import { tryAcquireFlock, type FlockHandle } from "@bearly/flock"
 import { fileLockHolders, formatLockHolders } from "@bearly/flock/holders"
 import { spawnSync } from "node:child_process"
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
-import { classifyExcludedPath, inspectUninitializedCheckout, superStatus, type SuperStatusResult } from "./status.ts"
+import { classifyExcludedPath, inspectExcludedCheckout, superStatus, type SuperStatusResult } from "./status.ts"
 import { readCommitSubmodules, type SelectedCommitSubmodules } from "./commit-graph.ts"
 import { validateExcludedSubmodules } from "./git.ts"
 import type { GitProcess } from "./process.ts"
@@ -102,27 +102,7 @@ export async function assertExcludedRemovalCustody(
   const notCompared: NotCompared[] = []
   const declaredPaths: string[] = []
   for (const path of new Set(excludedSubmodules)) {
-    const parts = path.split("/")
-    let ancestor = checkout
-    let unsafeAncestor: string | undefined
-    for (const part of parts.slice(0, -1)) {
-      ancestor = join(ancestor, part)
-      const state = lstatSync(ancestor, { throwIfNoEntry: false })
-      if (state === undefined) break
-      if (!state.isDirectory() || state.isSymbolicLink()) {
-        unsafeAncestor = ancestor
-        break
-      }
-    }
-    const state = unsafeAncestor === undefined ? inspectUninitializedCheckout(join(checkout, path)) : "unsafe-ancestor"
-    const disk: NonNullable<NotCompared["exclusion"]>["checkout"] =
-      state === "non-directory"
-        ? "content"
-        : state === "nonempty"
-          ? lstatSync(join(checkout, path, ".git"), { throwIfNoEntry: false }) === undefined
-            ? "content"
-            : "checkout"
-          : state
+    const { state, checkout: disk, unsafeAncestor } = inspectExcludedCheckout(checkout, path)
     const evidence = parents.map((parent) => {
       const selected = parent.metadata.selectedPaths.find((entry) => entry.path === path)
       if (selected === undefined) {
