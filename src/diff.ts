@@ -92,10 +92,16 @@ export type SuperDiffResult = Readonly<{
 /** An explicit omission from a comparison, never evidence that a component is clean. */
 export type NotCompared = Readonly<{
   path: string
-  reason: "removed" | "excluded" | "unreadable"
+  reason: "removed" | "excluded" | "unreadable" | "inconsistent"
   message: string
   objectIds?: readonly string[]
   remedy?: string
+  exclusion?: Readonly<{
+    classification: "declared" | "absent" | "unclassified"
+    parents: readonly (import("./commit-graph.ts").SelectedCommitPath &
+      Readonly<{ repository: string; head: string }>)[]
+    checkout: "absent" | "empty" | "checkout" | "content" | "symlink" | "unsafe-ancestor"
+  }>
 }>
 
 type RawDiffRow = Readonly<{

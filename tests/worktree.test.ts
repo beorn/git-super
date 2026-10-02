@@ -5,7 +5,7 @@
  * @reach fs-walk <fixture-only: worktree stores and retention checks read isolated mkdtemp Git repositories>
  */
 import { existsSync, readdirSync, readFileSync } from "node:fs"
-import { mkdtemp, readFile, readlink, rename, rm, symlink, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, readlink, rename, rm, symlink, writeFile } from "node:fs/promises"
 import { spawnSync } from "node:child_process"
 import { tmpdir } from "node:os"
 import { dirname, join, relative } from "node:path"
@@ -80,6 +80,10 @@ describe("createGitWorktreeStore", () => {
     "borrower-missing-identity",
     "deletion-store",
     "snapshot-race",
+    "absent",
+    "absent-empty",
+    "absent-checkout",
+    "absent-content",
   ] as const)("shares inspection and removal admission for private %s checkout", async (kind) => {
     const root = await mkdtemp(join(canonicalTmpdir(), "git-super-removal-inspection-"))
     try {
@@ -102,10 +106,20 @@ describe("createGitWorktreeStore", () => {
         git(repo, ["-c", "protocol.file.allow=always", "submodule", "add", component, "vendor/public"])
       }
       git(repo, ["commit", "-q", "-am", "add private fixture"])
+      if (kind.startsWith("absent")) {
+        git(repo, ["update-index", "--force-remove", excluded])
+        git(repo, ["rm", ".gitmodules"])
+        git(repo, ["commit", "-q", "-m", "remove private identity, retain common store"])
+      }
       const linked = join(root, "linked")
       // Native fixture preparation creates no mechanics writer lock; inspection must not create one either.
       git(repo, ["worktree", "add", "--detach", linked, "HEAD"])
       const checkout = join(linked, excluded)
+      if (kind === "absent-empty" || kind === "absent-checkout" || kind === "absent-content") {
+        await mkdir(checkout, { recursive: true })
+        if (kind === "absent-checkout") await writeFile(join(checkout, ".git"), "private pointer; do not read\n")
+        if (kind === "absent-content") await writeFile(join(checkout, "keep.txt"), "private content; do not read\n")
+      }
       if (kind === "missing-identity" || kind === "borrower-missing-identity") {
         const parent = kind === "missing-identity" ? linked : repo
         git(parent, ["update-index", "--force-remove", excluded])
@@ -178,14 +192,31 @@ describe("createGitWorktreeStore", () => {
         (error: unknown) => error,
       )
       expect(objectStoreSnapshot(privateStore)).toEqual(privateBefore)
-      if (kind === "empty" || kind === "uninitialized-public") {
+      if (kind === "absent" || kind === "absent-empty") {
+        expect(inspection.error).toBeUndefined()
+        expect(inspection.result?.notCompared).toContainEqual(
+          expect.objectContaining({
+            path: excluded,
+            reason: "excluded",
+            message: expect.stringContaining("absent at HEAD and on disk, nothing to protect"),
+            exclusion: expect.objectContaining({
+              classification: "absent",
+              checkout: kind === "absent" ? "absent" : "empty",
+            }),
+          }),
+        )
+        expect(removal).toBeUndefined()
+        expect(existsSync(linked)).toBe(false)
+      } else if (kind === "empty" || kind === "uninitialized-public") {
         expect(inspection.error).toBeUndefined()
         expect(inspection.result?.consultedRepositories).toEqual([{ path: ".", root: linked }])
-        expect(inspection.result?.notCompared).toContainEqual({
-          path: excluded,
-          reason: "excluded",
-          message: expect.stringContaining("nothing to preserve in the checkout"),
-        })
+        expect(inspection.result?.notCompared).toContainEqual(
+          expect.objectContaining({
+            path: excluded,
+            reason: "excluded",
+            message: expect.stringContaining("nothing to preserve in the checkout"),
+          }),
+        )
         expect(inspection.result?.uninitializedSubmodules).toEqual(
           kind === "uninitialized-public" ? ["vendor/public"] : [],
         )
@@ -193,17 +224,27 @@ describe("createGitWorktreeStore", () => {
         expect(existsSync(linked)).toBe(false)
       } else {
         expect(removal).toBeInstanceOf(Error)
-        if (kind === "snapshot-race") {
+        if (
+          kind === "missing-identity" ||
+          kind === "borrower-missing-identity" ||
+          kind === "absent-checkout" ||
+          kind === "absent-content"
+        ) {
+          expect(inspection.error).toBeUndefined()
+          const observation = inspection.result?.notCompared.find((entry) => entry.reason === "inconsistent")
+          expect(observation).toMatchObject({ path: excluded, exclusion: { classification: "unclassified" } })
+          expect(removal).toMatchObject({ notCompared: expect.arrayContaining([observation]) })
+          if (kind === "absent-checkout" || kind === "absent-content") {
+            expect(observation).toMatchObject({
+              exclusion: { checkout: kind === "absent-checkout" ? "checkout" : "content" },
+            })
+          }
+        } else if (kind === "snapshot-race") {
           expect((removal as Error).message).toContain("checkout is nonempty")
           expect(await readFile(join(checkout, "arrived-after-inspection.txt"), "utf8")).toBe("preserve me\n")
         } else {
           expect(inspection.error).toBeInstanceOf(Error)
           expect((removal as Error).message).toBe((inspection.error as Error).message)
-        }
-        if (kind === "missing-identity") expect((removal as Error).message).toContain("no direct identity")
-        if (kind === "borrower-missing-identity") {
-          expect((removal as Error).message).toContain("borrower primary")
-          expect((removal as Error).message).toContain("no parent metadata identity")
         }
         if (kind === "deletion-store") expect((removal as Error).message).toContain("inside deletion custody")
         expect((removal as Error).message).toContain(excluded)

@@ -311,19 +311,23 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
   })
   const prepareRemoval = async (path: string, excludedSubmodules?: readonly string[]) => {
     const gitDir = realpathSync(await git.text(path, ["rev-parse", "--absolute-git-dir"]))
-    const checkoutObservations = await assertExcludedRemovalCustody(
+    const common = realpathSync(await git.text(path, ["rev-parse", "--path-format=absolute", "--git-common-dir"]))
+    const custody = await assertExcludedRemovalCustody(
       git,
       configuredProcess(),
       path,
       gitDir,
+      common,
       excludedSubmodules,
     )
-    const common = realpathSync(await git.text(path, ["rev-parse", "--path-format=absolute", "--git-common-dir"]))
-    const rehome = await prepareRemovalBorrowers(git, configuredProcess(), path, common, gitDir, excludedSubmodules)
+    if (custody.notCompared.some((entry) => entry.reason !== "excluded")) {
+      return { gitDir, rehome: undefined, notCompared: custody.notCompared }
+    }
+    const rehome = await prepareRemovalBorrowers(git, path, common, gitDir, custody, excludedSubmodules)
     return {
       gitDir,
       rehome,
-      notCompared: [...checkoutObservations, ...rehome.notCompared],
+      notCompared: [...custody.notCompared, ...rehome.notCompared],
     }
   }
   const runWithMutationLock = async <Result>(
@@ -442,6 +446,18 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
           throw new Error(`retained worktree removal cannot unlock ${path}; resolve its holder first`)
         }
         const { gitDir, rehome, notCompared } = await prepareRemoval(path, removeOptions.excludedSubmodules)
+        if (notCompared.some((entry) => entry.reason !== "excluded")) {
+          throw Object.assign(
+            new Error(
+              `worktree removal refused: ${notCompared
+                .filter((entry) => entry.reason !== "excluded")
+                .map((entry) => entry.message)
+                .join("; ")}`,
+            ),
+            { notCompared },
+          )
+        }
+        if (rehome === undefined) throw new Error(`worktree ${path} has no prepared borrower custody`)
         const writerLeases = acquireRemovalWriterLeases(gitDir)
         try {
           if (removeOptions.retention !== undefined) {
