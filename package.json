@@ -28,6 +28,7 @@
     "./push-intent": "./src/push-intent.ts",
     "./push": "./src/push.ts",
     "./result": "./src/result.ts",
+    "./status": "./src/status.ts",
     "./submodules": "./src/submodules.ts",
     "./submodule-origin": "./src/submodule-origin.ts",
     "./worktree": "./src/worktree.ts"
@@ -78,6 +79,10 @@
       "./result": {
         "types": "./dist/result.d.ts",
         "import": "./dist/result.js"
+      },
+      "./status": {
+        "types": "./dist/status.d.ts",
+        "import": "./dist/status.js"
       },
       "./submodules": {
         "types": "./dist/submodules.d.ts",
@@ -136,6 +141,7 @@
       "src/pull.ts",
       "src/push.ts",
       "src/result.ts",
+      "src/status.ts",
       "src/submodules.ts",
       "src/submodule-origin.ts",
       "src/worktree.ts"

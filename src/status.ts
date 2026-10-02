@@ -1,6 +1,7 @@
 import { lstatSync, readFileSync, readdirSync, statSync } from "node:fs"
 import { isAbsolute, join, posix, resolve } from "node:path"
 import { recursiveNameStatusDiff, type ConsultedRepository, type NotCompared } from "./diff.ts"
+export type { ConsultedRepository } from "./diff.ts"
 import {
   gitError,
   indexGitlinks,
