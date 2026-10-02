@@ -1,6 +1,6 @@
 import { chmodSync, copyFileSync, existsSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { isAbsolute, join, resolve } from "node:path"
+import { isAbsolute, join, relative, resolve } from "node:path"
 import { readCommitGitlinks } from "./commit-graph.ts"
 import { createExclusive, type Exclusive } from "./exclusive.ts"
 import { isSubmoduleExcluded, probeRepository, validateExcludedSubmodules } from "./git.ts"
@@ -55,8 +55,10 @@ type PullPlan = Readonly<{
   observedRemoteTarget?: string
   detail?: GitResultDetail
   repositories: readonly PullRepositoryPlan[]
+  excludedSubmodules: readonly string[]
+  declaredCheckouts: readonly ExcludedCheckout[]
   excludedCheckouts: readonly ExcludedCheckout[]
-  notCompared: readonly NotCompared[]
+  notCompared: NotCompared[]
 }>
 
 type ExcludedCheckout = Readonly<{ path: string; repository: string; allowAbsent: boolean }>
@@ -226,6 +228,15 @@ async function planPull(
     })
   }
   const root = await required(git, options.repo, ["rev-parse", "--show-toplevel"], "discover-root")
+  const excludedSubmodules = options.excludedSubmodules ?? []
+  // This guard proves safety before parent walks, not membership in the frozen graph. An absent declaration
+  // becomes an admitted skip only when the graph proves it is an added gitlink, or the materializer finds it.
+  const declaredCheckouts = excludedSubmodules.map((path) => ({
+    path,
+    repository: join(root, path),
+    allowAbsent: true,
+  }))
+  proveExcludedCheckouts(declaredCheckouts)
   const { repository, refspecs, remoteRef, exactTarget } = await resolvePullTarget(git, root, options)
   phase("fetch-root-target")
   await required(
@@ -301,7 +312,7 @@ async function planPull(
     current,
     target,
     phase,
-    options.excludedSubmodules ?? [],
+    excludedSubmodules,
     excludedCheckouts,
   )
   phase("preflight-tree-transitions")
@@ -314,6 +325,8 @@ async function planPull(
     ...(observedRemoteTarget === undefined ? {} : { observedRemoteTarget }),
     ...(rootDetail === undefined ? {} : { detail: rootDetail }),
     repositories,
+    excludedSubmodules,
+    declaredCheckouts,
     excludedCheckouts,
     notCompared: excludedObservations(excludedCheckouts),
   }
@@ -719,6 +732,11 @@ async function applyRepositories(
     }
     if (repository.added !== undefined) {
       phase(`apply-added-submodule ${repository.path}`)
+      const parentPath = relative(plan.root, repository.added.parent).split("\\").join("/")
+      const parentPrefix = parentPath === "" ? "" : `${parentPath}/`
+      const excludedSubmodules = plan.excludedSubmodules
+        .filter((path) => path.startsWith(parentPrefix))
+        .map((path) => path.slice(parentPrefix.length))
       const initialized: GitProcessResult & Partial<SubmoduleMaterializationResult> =
         await materializeSubmodulesWithProcess(
           git,
@@ -726,6 +744,7 @@ async function applyRepositories(
             worktree: repository.added.parent,
             paths: [repository.added.path],
             source: "head",
+            excludedSubmodules,
           },
           { resolveReferenceWorktree: true, detached: true },
         ).catch((error: unknown) => ({
@@ -733,6 +752,20 @@ async function applyRepositories(
           stdout: "",
           stderr: error instanceof Error ? error.message : String(error),
         }))
+      if (initialized.notCompared === undefined && initialized.code === 0) {
+        throw new Error(
+          `git-super pull: materializer for ${repository.path} returned success without notCompared observations`,
+        )
+      }
+      if (initialized.notCompared !== undefined) {
+        for (const observation of initialized.notCompared) {
+          const path = `${parentPrefix}${observation.path}`
+          if (plan.notCompared.some((known) => known.path === path && known.reason === observation.reason)) continue
+          const mapped = { ...observation, path }
+          plan.notCompared.push(mapped)
+          warn(`git-super pull: ${path}: ${mapped.message}${mapped.remedy === undefined ? "" : ` ${mapped.remedy}`}\n`)
+        }
+      }
       const { considered, borrowed, remoteFallbacks, unreferenced } = initialized
       const materialization =
         considered === undefined ||
@@ -949,8 +982,9 @@ export async function superPull(options: SuperPullOptions): Promise<PullResult> 
             }
           }
           phase("apply-preflight")
-          await proveRepositoryTransitions(git, plan.repositories, plan.excludedCheckouts)
+          proveExcludedCheckouts(plan.declaredCheckouts)
           proveExcludedCheckouts(plan.excludedCheckouts)
+          await proveRepositoryTransitions(git, plan.repositories, plan.excludedCheckouts)
           const root = plan.repositories[0]
           if (root === undefined) throw new Error("git-super: pull plan contained no root repository")
           const hooks = await hooksWithoutPostMerge(git, root.repository)

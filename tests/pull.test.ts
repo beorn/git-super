@@ -5,6 +5,7 @@ import { afterEach, describe, expect, onTestFinished, test, vi } from "vitest"
 import {
   chmodSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
@@ -49,6 +50,100 @@ function outputSink(): { output: string; write(value: string): void } {
 }
 
 describe("git super pull --ff-only", () => {
+  /**
+   * @failure Pull loses private selection beneath an included addition, or scans private content there before refusing (27058 AC3/AC5).
+   * @level l1
+   * @consumer git-super pull
+   * @testonly none
+   */
+  test.each(["absent", "nonempty", "changed-under-lock"])(
+    "applies private selection beneath an added included parent with %s checkout",
+    async (condition) => {
+      const root = mkdtempSync(join(tmpdir(), "git-super-pull-private-added-parent-"))
+      roots.push(root)
+      const fixture = createProductFixture(root)
+      const checkout = join(root, "checkout")
+      git(root, "-c", "protocol.file.allow=always", "clone", "-q", "--recurse-submodules", fixture.product, checkout)
+      const gamma = join(root, "gamma")
+      const leaf = join(root, "leaf")
+      createRepository(gamma, "gamma.ts", "export const gamma = 1\n")
+      createRepository(leaf, "private.txt", "fixture private content\n")
+      git(gamma, "-c", "protocol.file.allow=always", "submodule", "add", "-q", leaf, "private/leaf")
+      git(gamma, "commit", "-q", "-m", "add private leaf")
+      git(fixture.product, "-c", "protocol.file.allow=always", "submodule", "add", "-q", gamma, "vendor/gamma")
+      git(fixture.product, "commit", "-q", "-m", "add included gamma")
+      const excluded = "vendor/gamma/private/leaf"
+      const privateCheckout = join(checkout, excluded)
+      const before = git(checkout, "rev-parse", "HEAD")
+      const target = git(fixture.product, "rev-parse", "HEAD")
+      const addPrivateContent = () => {
+        mkdirSync(privateCheckout, { recursive: true })
+        writeFileSync(join(privateCheckout, "private.txt"), "preserve me\n")
+      }
+      if (condition === "nonempty") addPrivateContent()
+      vi.stubEnv("GIT_CONFIG_COUNT", "1")
+      vi.stubEnv("GIT_CONFIG_KEY_0", "protocol.file.allow")
+      vi.stubEnv("GIT_CONFIG_VALUE_0", "always")
+      onTestFinished(() => {
+        vi.unstubAllEnvs()
+      })
+      const local = createLocalGitProcess()
+      const privateRequests: GitProcessRequest[] = []
+      const process: GitProcess = {
+        run(request) {
+          if (
+            request.repo === privateCheckout ||
+            request.repo.startsWith(`${privateCheckout}/`) ||
+            (request.args.includes("--others") &&
+              request.args.includes("vendor/gamma") &&
+              existsSync(join(privateCheckout, "private.txt")))
+          ) {
+            privateRequests.push(request)
+            throw new Error(`private checkout content was probed through ${request.repo}: ${request.args.join(" ")}`)
+          }
+          return local.run(request)
+        },
+      }
+      const warnings = outputSink()
+      const exclusive: Exclusive = {
+        async run(operation) {
+          if (condition === "changed-under-lock") addPrivateContent()
+          return operation()
+        },
+      }
+      const result = await superPull({
+        repo: checkout,
+        repository: "origin",
+        refspecs: ["main"],
+        ffOnly: true,
+        excludedSubmodules: [excluded],
+        git: process,
+        exclusive,
+        warn: (message) => warnings.write(message),
+      })
+      expect(privateRequests).toEqual([])
+      if (condition === "absent") {
+        expect(result).toMatchObject({
+          state: "updated",
+          partial: false,
+          notCompared: [{ path: excluded, reason: "excluded" }],
+        })
+        expect(git(checkout, "rev-parse", "HEAD")).toBe(target)
+        expect(existsSync(join(privateCheckout, ".git"))).toBe(false)
+        expect(readdirSync(privateCheckout)).toEqual([])
+        expect(warnings.output).toContain(`${excluded}: component excluded, not compared`)
+      } else {
+        expect(result).toMatchObject({
+          state: "failed",
+          partial: false,
+          detail: { code: "excluded-submodule-unsafe", paths: [excluded] },
+        })
+        expect(git(checkout, "rev-parse", "HEAD")).toBe(before)
+        expect(readFileSync(join(privateCheckout, "private.txt"), "utf8")).toBe("preserve me\n")
+      }
+    },
+  )
+
   /**
    * @failure Pull drops known private skips on a later plan refusal or materializes an excluded target addition (27058 AC3/AC5).
    * @level l1
