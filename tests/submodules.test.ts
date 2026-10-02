@@ -798,6 +798,11 @@ describe("materializeSubmodules", () => {
         if (args[0] === "rev-parse" && args.includes("--verify") && args.at(-1) === "HEAD") {
           return { ...success(), stdout: "7".repeat(40) }
         }
+        if (args[0] === "ls-tree" && args.at(-1) === ".gitmodules") {
+          return repo === worktree
+            ? { ...success(), stdout: `100644 blob ${"8".repeat(40)}\t.gitmodules\n` }
+            : success()
+        }
         if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
           if (repo !== worktree) return success()
           const rows = [
@@ -859,6 +864,11 @@ describe("materializeSubmodules", () => {
         commands.push({ repo, args })
         if (args[0] === "rev-parse" && args.includes("--verify") && args.at(-1) === "HEAD") {
           return { ...success(), stdout: "7".repeat(40) }
+        }
+        if (args[0] === "ls-tree" && args.at(-1) === ".gitmodules") {
+          return repo === worktree
+            ? { ...success(), stdout: `100644 blob ${"8".repeat(40)}\t.gitmodules\n` }
+            : success()
         }
         if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
           if (repo !== worktree) return success()
@@ -923,6 +933,11 @@ describe("materializeSubmodules", () => {
         if (args[0] === "rev-parse" && args.includes("--verify") && args.at(-1) === "HEAD") {
           return { ...success(), stdout: "7".repeat(40) }
         }
+        if (args[0] === "ls-tree" && args.at(-1) === ".gitmodules") {
+          return repo === worktree
+            ? { ...success(), stdout: `100644 blob ${"8".repeat(40)}\t.gitmodules\n` }
+            : success()
+        }
         if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
           if (repo !== worktree) return success()
           const rows = [
@@ -945,10 +960,6 @@ describe("materializeSubmodules", () => {
           }
         }
         if (args[0] === "ls-tree") {
-          liveProbes += 1
-          peakProbes = Math.max(peakProbes, liveProbes)
-          await settle()
-          liveProbes -= 1
           const path = args.at(-1)
           return { ...success(), stdout: `160000 commit ${"1".repeat(40)}\t${String(path)}\n` }
         }
@@ -966,7 +977,13 @@ describe("materializeSubmodules", () => {
           return success()
         }
         // Never warm: every gitlink misses, so all five reach the warm-up path.
-        if (args[0] === "cat-file" && args[1] === "-e") return { ...success(), code: 1 }
+        if (args[0] === "cat-file" && args[1] === "-e") {
+          liveProbes += 1
+          peakProbes = Math.max(peakProbes, liveProbes)
+          await settle()
+          liveProbes -= 1
+          return { ...success(), code: 1 }
+        }
         return success()
       },
     }
@@ -996,6 +1013,11 @@ describe("materializeSubmodules", () => {
       async run(repo, args) {
         if (args[0] === "rev-parse" && args.includes("--verify") && args.at(-1) === "HEAD") {
           return { ...success(), stdout: "7".repeat(40) }
+        }
+        if (args[0] === "ls-tree" && args.at(-1) === ".gitmodules") {
+          return repo === worktree
+            ? { ...success(), stdout: `100644 blob ${"8".repeat(40)}\t.gitmodules\n` }
+            : success()
         }
         if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
           if (repo !== worktree) return success()
@@ -1054,6 +1076,11 @@ describe("materializeSubmodules", () => {
         if (args[0] === "rev-parse" && args.includes("--verify") && args.at(-1) === "HEAD") {
           return { ...success(), stdout: "7".repeat(40) }
         }
+        if (args[0] === "ls-tree" && args.at(-1) === ".gitmodules") {
+          return repo === worktree
+            ? { ...success(), stdout: `100644 blob ${"8".repeat(40)}\t.gitmodules\n` }
+            : success()
+        }
         if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
           if (repo !== worktree) return success()
           const rows = [
@@ -1104,6 +1131,11 @@ describe("materializeSubmodules", () => {
       async run(repo, args) {
         if (args[0] === "rev-parse" && args.includes("--verify") && args.at(-1) === "HEAD") {
           return { ...success(), stdout: "7".repeat(40) }
+        }
+        if (args[0] === "ls-tree" && args.at(-1) === ".gitmodules") {
+          return repo === worktree
+            ? { ...success(), stdout: `100644 blob ${"8".repeat(40)}\t.gitmodules\n` }
+            : success()
         }
         if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
           if (repo !== worktree) return success()
@@ -1170,6 +1202,9 @@ describe("materializeSubmodules", () => {
       commands.push({ repo, args })
       if (args[0] === "rev-parse" && args.includes("--verify") && args.at(-1) === "HEAD") {
         return { ...success(), stdout: "7".repeat(40) }
+      }
+      if (args[0] === "ls-tree" && args.at(-1) === ".gitmodules") {
+        return repo === worktree ? { ...success(), stdout: `100644 blob ${"8".repeat(40)}\t.gitmodules\n` } : success()
       }
       if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
         if (repo !== worktree) return success()
@@ -1293,6 +1328,11 @@ describe("materializeSubmodules", () => {
         if (args[0] === "rev-parse" && args.includes("--verify") && args.at(-1) === "HEAD") {
           return { ...success(), stdout: "7".repeat(40) }
         }
+        if (args[0] === "ls-tree" && args.at(-1) === ".gitmodules") {
+          return repo === worktree
+            ? { ...success(), stdout: `100644 blob ${"8".repeat(40)}\t.gitmodules\n` }
+            : success()
+        }
         if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
           if (repo !== worktree) return success()
           const rows = [
@@ -1361,6 +1401,11 @@ describe("materializeSubmodules", () => {
       async run(repo, args) {
         if (args[0] === "rev-parse" && args.includes("--verify") && args.at(-1) === "HEAD") {
           return { ...success(), stdout: "7".repeat(40) }
+        }
+        if (args[0] === "ls-tree" && args.at(-1) === ".gitmodules") {
+          return repo === worktree
+            ? { ...success(), stdout: `100644 blob ${"8".repeat(40)}\t.gitmodules\n` }
+            : success()
         }
         if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
           if (repo !== worktree) return success()
@@ -1431,6 +1476,11 @@ describe("materializeSubmodules", () => {
         commands.push({ repo, args })
         if (args[0] === "rev-parse" && args.includes("--verify") && args.at(-1) === "HEAD") {
           return { ...success(), stdout: "7".repeat(40) }
+        }
+        if (args[0] === "ls-tree" && args.at(-1) === ".gitmodules") {
+          return repo === worktree
+            ? { ...success(), stdout: `100644 blob ${"8".repeat(40)}\t.gitmodules\n` }
+            : success()
         }
         if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
           if (repo !== worktree) return success()
@@ -1505,6 +1555,11 @@ describe("materializeSubmodules", () => {
       async run(repo, args) {
         if (args[0] === "rev-parse" && args.includes("--verify") && args.at(-1) === "HEAD") {
           return { ...success(), stdout: "7".repeat(40) }
+        }
+        if (args[0] === "ls-tree" && args.at(-1) === ".gitmodules") {
+          return repo === worktree
+            ? { ...success(), stdout: `100644 blob ${"8".repeat(40)}\t.gitmodules\n` }
+            : success()
         }
         if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
           if (repo !== worktree) return success()
@@ -1625,6 +1680,11 @@ describe("materializeSubmodules", () => {
         if (args[0] === "rev-parse" && args.includes("--verify") && args.at(-1) === "HEAD") {
           return { ...success(), stdout: "7".repeat(40) }
         }
+        if (args[0] === "ls-tree" && args.at(-1) === ".gitmodules") {
+          return repo === worktree
+            ? { ...success(), stdout: `100644 blob ${"8".repeat(40)}\t.gitmodules\n` }
+            : success()
+        }
         if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
           if (repo !== worktree) return success()
           const rows = [
@@ -1683,6 +1743,11 @@ describe("materializeSubmodules", () => {
         if (args[0] === "rev-parse" && args.includes("--verify") && args.at(-1) === "HEAD") {
           return { ...success(), stdout: "7".repeat(40) }
         }
+        if (args[0] === "ls-tree" && args.at(-1) === ".gitmodules") {
+          return repo === worktree
+            ? { ...success(), stdout: `100644 blob ${"8".repeat(40)}\t.gitmodules\n` }
+            : success()
+        }
         if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
           if (repo !== worktree) return success()
           const rows = [
@@ -1729,7 +1794,7 @@ describe("materializeSubmodules", () => {
       ),
     ).resolves.toMatchObject({ code: 0 })
     expect(commands.filter(({ args }) => args[0] === "submodule" && args[1] === "init")).toEqual([
-      { args: ["submodule", "init", "--", ...paths], mutation: true },
+      { args: ["submodule", "init", "--", ...[...paths].sort()], mutation: true },
     ])
     expect(
       commands
@@ -1768,6 +1833,11 @@ describe("materializeSubmodules", () => {
       async run(repo, args) {
         if (args[0] === "rev-parse" && args.includes("--verify") && args.at(-1) === "HEAD") {
           return { ...success(), stdout: "7".repeat(40) }
+        }
+        if (args[0] === "ls-tree" && args.at(-1) === ".gitmodules") {
+          return repo === worktree
+            ? { ...success(), stdout: `100644 blob ${"8".repeat(40)}\t.gitmodules\n` }
+            : success()
         }
         if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
           if (repo !== worktree) return success()
@@ -2335,6 +2405,11 @@ describe("materializeSubmodules", () => {
         if (args[0] === "rev-parse" && args.includes("--verify") && args.at(-1) === "HEAD") {
           return { ...success(), stdout: "7".repeat(40) }
         }
+        if (args[0] === "ls-tree" && args.at(-1) === ".gitmodules") {
+          return repo === worktree
+            ? { ...success(), stdout: `100644 blob ${"8".repeat(40)}\t.gitmodules\n` }
+            : success()
+        }
         if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
           if (repo !== worktree) return success()
           const rows = [
@@ -2862,6 +2937,11 @@ describe("materializeSubmodules", () => {
         commands.push({ repo, args })
         if (args[0] === "rev-parse" && args.includes("--verify") && args.at(-1) === "HEAD") {
           return { ...success(), stdout: "7".repeat(40) }
+        }
+        if (args[0] === "ls-tree" && args.at(-1) === ".gitmodules") {
+          return repo === worktree
+            ? { ...success(), stdout: `100644 blob ${"8".repeat(40)}\t.gitmodules\n` }
+            : success()
         }
         if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
           if (repo !== worktree) return success()
