@@ -58,6 +58,89 @@ function objectStoreSnapshot(objects: string) {
 
 describe("createGitWorktreeStore", () => {
   /**
+   * @failure Excluded empty checkout hides a private Git store that native removal deletes or retention reads/copies (27058 AC3/AC5).
+   * @level l1
+   * @consumer git-super worktree removal
+   * @testonly none
+   */
+  // Public retention tests authorize hashing/copying; empty-checkout tests do not carry a private owned store.
+  it.each([false, true])(
+    "refuses an excluded store inside deletion custody before touching it; retain=%s",
+    async (retain) => {
+      const root = await mkdtemp(join(canonicalTmpdir(), "git-super-private-removal-custody-"))
+      try {
+        const fixture = createProductFixture(root)
+        const excluded = "vendor/private"
+        const name = "sensitive-store"
+        git(fixture.product, [
+          "-c",
+          "protocol.file.allow=always",
+          "submodule",
+          "add",
+          "--name",
+          name,
+          "-q",
+          fixture.alpha,
+          excluded,
+        ])
+        git(fixture.product, ["commit", "-q", "-m", "add fixture private component"])
+        const linked = join(root, "linked")
+        const privateCheckout = join(linked, excluded)
+        const requests: GitProcessRequest[] = []
+        const local = createLocalGitProcess()
+        const store = createGitWorktreeStore({
+          repo: fixture.product,
+          gitProcess: {
+            run(request) {
+              if (request.repo === privateCheckout || request.repo.startsWith(`${privateCheckout}/`)) {
+                requests.push(request)
+                throw new Error(`private checkout was probed: ${request.repo}`)
+              }
+              return local.run(request)
+            },
+          },
+        })
+        await store.add({ kind: "detached", path: linked, ref: "HEAD" })
+        // Fixture preparation may initialize its own data; the exclusion boundary starts at removal below.
+        git(linked, ["-c", "protocol.file.allow=always", "submodule", "update", "--init", excluded])
+        const privateStore = git(linked, [
+          "rev-parse",
+          "--path-format=absolute",
+          "--git-path",
+          `modules/${name}`,
+        ]).trim()
+        expect(git(privateCheckout, ["rev-parse", "--absolute-git-dir"]).trim()).toBe(privateStore)
+        git(linked, ["submodule", "deinit", "-f", "--", excluded])
+        expect(readdirSync(privateCheckout)).toEqual([])
+        const lease = join(privateStore, "yrd-worktree-mutations", "writer.lock")
+        expect(existsSync(lease)).toBe(false)
+        const retained = join(root, "retained")
+        const options = {
+          excludedSubmodules: [excluded],
+          ...(retain ? { retention: { root: retained, report: () => {} } } : {}),
+        }
+        const failure = await store.remove(linked, options).then(
+          () => undefined,
+          (error: unknown) => error,
+        )
+        expect(failure).toBeInstanceOf(Error)
+        expect((failure as Error).message).toContain(excluded)
+        expect((failure as Error).message).toContain(privateStore)
+        expect((failure as Error).message).toMatch(/custody|deletion/u)
+        expect(requests).toEqual([])
+        expect(existsSync(linked)).toBe(true)
+        expect(readdirSync(privateCheckout)).toEqual([])
+        expect(existsSync(privateStore)).toBe(true)
+        expect(existsSync(lease)).toBe(false)
+        expect(existsSync(retained)).toBe(false)
+        expect(git(fixture.product, ["worktree", "list", "--porcelain"])).toContain(linked)
+      } finally {
+        await rm(root, { recursive: true, force: true })
+      }
+    },
+  )
+
+  /**
    * @failure Retained removal rejects a shared objects symlink or follows it and changes another store (26270).
    * @level l1
    * @consumer git-super worktree remove --retain
