@@ -213,6 +213,24 @@ async function readIndexSubmodules(
       }),
     })
   }
+  for (const entry of entries.filter(
+    (candidate) =>
+      candidate.mode === "160000" ||
+      selected.some((path) => candidate.path === path || candidate.path.startsWith(`${path}/`)),
+  )) {
+    const literalArgs = ["--literal-pathspecs", "ls-files", "--stage", "-z", "--", entry.path]
+    const literal = await git.run({ repo: repository, args: literalArgs })
+    if (gitProcessFailed(literal)) throw operationError(repository, "read-target-index", literalArgs, literal)
+    if (literal.stdout !== `${entry.mode} ${entry.objectId} ${entry.stage}\t${entry.path}\0`) {
+      const message = `Stage-0 index in ${repository}: ${JSON.stringify(entry.path)} does not match its captured native UTF-8 path.`
+      throw Object.assign(new Error(message), {
+        resultDetail: detail("invalid-target-gitlink-path", "read-target-index", message, {
+          paths: [entry.path],
+          remedy: "Use literal UTF-8 index paths and rerun without concurrent index changes.",
+        }),
+      })
+    }
+  }
   const manifest = entries.find((entry) => entry.path === ".gitmodules")
   if (manifest !== undefined && !/^100[0-9]{3}$/u.test(manifest.mode)) {
     throw Object.assign(new Error(`Index in ${repository} has an invalid .gitmodules entry.`), {
@@ -224,6 +242,24 @@ async function readIndexSubmodules(
       ),
     })
   }
+  // The strict parser/join also serve commit readers; only this boundary changes the error's subject.
+  const fromIndex = <T>(read: () => T): T => {
+    try {
+      return read()
+    } catch (failure) {
+      if (!(failure instanceof Error) || !("resultDetail" in failure)) throw failure
+      const original = failure.resultDetail as GitResultDetail
+      const message = original.message.replace(/^Target \S+ /u, `Stage-0 index in ${repository} `)
+      throw Object.assign(new Error(message), {
+        resultDetail: {
+          ...original,
+          message,
+          objectIds: manifest === undefined ? [] : [manifest.objectId],
+          remedy: "Repair the named staged gitlink or .gitmodules metadata, then rerun materialization.",
+        },
+      })
+    }
+  }
   const configuration = new Map<string, ConfiguredSubmodule>()
   if (manifest !== undefined) {
     // Read the captured blob oid rather than a later index state; HEAD remains a separate identity.
@@ -232,12 +268,14 @@ async function readIndexSubmodules(
     if (gitProcessFailed(configured)) {
       throw operationError(repository, "read-target-submodules", configuredArgs, configured)
     }
-    for (const [name, value] of parseCommitSubmoduleConfig(
-      configured.stdout
-        .split("\0")
-        .filter((row) => /^submodule\..*\.(path|url|branch)\n/u.test(row))
-        .join("\0"),
-      head,
+    for (const [name, value] of fromIndex(() =>
+      parseCommitSubmoduleConfig(
+        configured.stdout
+          .split("\0")
+          .filter((row) => /^submodule\..*\.(path|url|branch)\n/u.test(row))
+          .join("\0"),
+        head,
+      ),
     )) {
       configuration.set(name, value)
     }
@@ -265,14 +303,16 @@ async function readIndexSubmodules(
         },
       }
     }),
-    submodules: joinCommitSubmodules(
-      new Map([...gitlinks].filter(([path]) => !selected.includes(path))),
-      new Map(
-        [...configuration].filter(
-          ([, configured]) => configured.path === undefined || !selected.includes(configured.path),
+    submodules: fromIndex(() =>
+      joinCommitSubmodules(
+        new Map([...gitlinks].filter(([path]) => !selected.includes(path))),
+        new Map(
+          [...configuration].filter(
+            ([, configured]) => configured.path === undefined || !selected.includes(configured.path),
+          ),
         ),
+        head,
       ),
-      head,
     ),
   }
 }

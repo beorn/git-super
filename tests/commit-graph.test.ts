@@ -17,21 +17,23 @@ afterEach(() => {
 
 describe("commit submodule graph", () => {
   /**
-   * @failure Create classifies staged additions/removals from HEAD or invents an absent directory despite staged content (27058).
+   * @failure Create loses staged identity, attributes staged defects to HEAD, or invents absence despite staged content (27058).
    * @level l1
    * @consumer Git-super stage-0 exclusion classification
    */
   // Frozen-tree coverage cannot witness an index that differs from HEAD; use the same native parent boundary.
-  test.each(["addition", "removal", "directory", "unmerged"] as const)(
+  test.each(["addition", "removal", "directory", "unmerged", "conflicting-config", "orphan"] as const)(
     "retains native index identity for %s without writing parent objects or probing a child",
     async (kind) => {
       const root = mkdtempSync(join(tmpdir(), "git-super-selected-index-"))
       roots.push(root)
       const fixture = createProductFixture(root)
-      const path = kind === "removal" ? "packages/alpha" : "vendor/private"
-      if (kind === "removal") {
+      const path = kind === "removal" || kind === "orphan" ? "packages/alpha" : "vendor/private"
+      if (kind === "removal" || kind === "orphan") {
         git(fixture.product, "update-index", "--force-remove", path)
-        git(fixture.product, "config", "--file", ".gitmodules", "--remove-section", "submodule.packages/alpha")
+        if (kind === "removal") {
+          git(fixture.product, "config", "--file", ".gitmodules", "--remove-section", "submodule.packages/alpha")
+        }
       } else if (kind === "directory") {
         mkdirSync(join(fixture.product, path))
         writeFileSync(join(fixture.product, path, "file.txt"), "staged content\n")
@@ -40,6 +42,10 @@ describe("commit submodule graph", () => {
         git(fixture.product, "config", "--file", ".gitmodules", "submodule.private.path", path)
         git(fixture.product, "config", "--file", ".gitmodules", "submodule.private.url", fixture.alpha)
         git(fixture.product, "update-index", "--add", "--cacheinfo", `160000,${fixture.alphaBase},${path}`)
+      }
+      if (kind === "conflicting-config") {
+        git(fixture.product, "config", "--file", ".gitmodules", "--add", "submodule.private.branch", "one")
+        git(fixture.product, "config", "--file", ".gitmodules", "--add", "submodule.private.branch", "two")
       }
       git(fixture.product, "add", ".gitmodules")
       const manifestObjectId = git(fixture.product, "rev-parse", ":.gitmodules")
@@ -60,11 +66,22 @@ describe("commit submodule graph", () => {
         },
       }
       const reading = readCommitSubmodules(process, fixture.product, fixture.productBase, {
-        excludedSubmodules: [path],
+        excludedSubmodules: kind === "orphan" ? [] : [path],
         source: "index",
       })
       if (kind === "unmerged") {
         await expect(reading).rejects.toMatchObject({ resultDetail: { code: "unmerged-target-index", paths: [path] } })
+      } else if (kind === "conflicting-config" || kind === "orphan") {
+        // A staged defect belongs to its captured index manifest, never the unchanged HEAD.
+        await expect(reading).rejects.toMatchObject({
+          message: expect.stringMatching(/stage-0 index/iu),
+          resultDetail: {
+            code: kind === "orphan" ? "missing-target-gitlink" : "conflicting-target-submodule-config",
+            paths: [kind === "orphan" ? path : ".gitmodules"],
+            objectIds: [manifestObjectId],
+            message: expect.not.stringContaining(fixture.productBase),
+          },
+        })
       } else {
         const result = await reading
         const selected = result.selectedPaths[0]!
@@ -228,51 +245,58 @@ describe("commit submodule graph", () => {
   })
 
   /**
-   * @failure Non-UTF-8 tree bytes are silently converted into a different receipt path.
+   * @failure Non-UTF-8 tree/index bytes are silently converted into a different receipt path.
    * @level l1
    * @consumer GitSuper frozen graph and automatic-change receipt producer
    */
-  test.each(["invalid-byte", "unicode-replacement", "literal-star"])(
-    "binds %s gitlink paths to native tree bytes",
-    async (kind) => {
-      const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-graph-path-bytes-"))
-      roots.push(fixtureRoot)
-      const fixture = createProductFixture(fixtureRoot)
-      const rawPath =
-        kind === "invalid-byte"
-          ? Buffer.from([0x61, 0xff, 0x62])
-          : Buffer.from(kind === "literal-star" ? "a*b" : "a\ufffdb")
-      const path = rawPath.toString("utf8")
-      const local = createLocalGitProcess()
-      const manifest = await local.run({
-        repo: fixture.product,
-        args: ["hash-object", "-w", "--stdin"],
-        stdin: `[submodule "raw"]\n\tpath = "${path}"\n\turl = "${fixture.alpha}"\n`,
+  test.each(
+    ["head", "index"].flatMap((source) =>
+      ["invalid-byte", "unicode-replacement", "literal-star"].map((kind) => [source, kind] as const),
+    ),
+  )("binds %s %s gitlink paths to native bytes", async (source, kind) => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-graph-path-bytes-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const rawPath =
+      kind === "invalid-byte"
+        ? Buffer.from([0x61, 0xff, 0x62])
+        : Buffer.from(kind === "literal-star" ? "a*b" : "a\ufffdb")
+    const path = rawPath.toString("utf8")
+    const local = createLocalGitProcess()
+    const manifest = await local.run({
+      repo: fixture.product,
+      args: ["hash-object", "-w", "--stdin"],
+      stdin: `[submodule "raw"]\n\tpath = "${path}"\n\turl = "${fixture.alpha}"\n`,
+    })
+    expect(manifest.code).toBe(0)
+    const rawTree = Bun.spawnSync(["git", "-C", fixture.product, "mktree", "-z", "--missing"], {
+      stdin: Buffer.concat([
+        Buffer.from(`100644 blob ${manifest.stdout.trim()}\t.gitmodules\0`),
+        Buffer.from(`160000 commit ${fixture.alphaBase}\t`),
+        rawPath,
+        Buffer.from([0]),
+      ]),
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(rawTree.exitCode, rawTree.stderr.toString()).toBe(0)
+    const selected = rawTree.stdout.toString().trim()
+    if (source === "index") git(fixture.product, "read-tree", selected)
+    const reading =
+      source === "index"
+        ? readCommitSubmodules(local, fixture.product, fixture.productBase, {
+            excludedSubmodules: [],
+            source: "index",
+          }).then((result) => result.submodules)
+        : readCommitSubmodules(local, fixture.product, selected)
+    if (kind === "invalid-byte") {
+      await expect(reading).rejects.toMatchObject({
+        resultDetail: { code: "invalid-target-gitlink-path" },
       })
-      expect(manifest.code).toBe(0)
-      const rawTree = Bun.spawnSync(["git", "-C", fixture.product, "mktree", "-z", "--missing"], {
-        stdin: Buffer.concat([
-          Buffer.from(`100644 blob ${manifest.stdout.trim()}\t.gitmodules\0`),
-          Buffer.from(`160000 commit ${fixture.alphaBase}\t`),
-          rawPath,
-          Buffer.from([0]),
-        ]),
-        stdout: "pipe",
-        stderr: "pipe",
-      })
-      expect(rawTree.exitCode, rawTree.stderr.toString()).toBe(0)
-      const selected = rawTree.stdout.toString().trim()
-      if (kind === "invalid-byte") {
-        await expect(readCommitSubmodules(local, fixture.product, selected)).rejects.toMatchObject({
-          resultDetail: { code: "invalid-target-gitlink-path" },
-        })
-      } else {
-        await expect(readCommitSubmodules(local, fixture.product, selected)).resolves.toEqual([
-          { name: "raw", path, target: fixture.alphaBase, url: fixture.alpha },
-        ])
-      }
-    },
-  )
+    } else {
+      await expect(reading).resolves.toEqual([{ name: "raw", path, target: fixture.alphaBase, url: fixture.alpha }])
+    }
+  })
 
   test("refuses a gitlink graph whose manifest was deleted", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-commit-graph-invalid-"))
