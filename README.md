@@ -235,6 +235,8 @@ The CLI requires Bun 1.3.14 or newer. Native Git delegation uses `process.execve
 
 The library supports Node 24 or newer and Bun 1.3.14 or newer.
 
+The CLI runs under Bun; the library imports from Node 24 and Bun. `verifyPublishable.bunOnlyBins` declares this, so release verification runs the CLI under Bun and records its Node row as not asked.
+
 Node consumers need the built npm package and a built Node-compatible `@bearly/flock` dependency. Installing TypeScript source beneath `node_modules` does not provide that distribution.
 
 Node library operations have been exercised on Linux. Node transport and graph operations on macOS remain unmeasured.

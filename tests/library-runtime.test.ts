@@ -53,6 +53,16 @@ test("the executable names its Bun requirement before loading CLI dependencies o
   }
 })
 
+// 27074 (@cto 240b6f1e): the bin is declared Bun-only for release verification, so its refusal under Node must stay
+// loud and name the cure whatever runtime runs this suite.
+test("under Node the executable exits 2 and names its Bun requirement", () => {
+  const child = spawnSync("node", [join(import.meta.dirname, "../bin/git-super"), "--help"], { encoding: "utf8" })
+  expect(child.error, "node is required on PATH to prove the CLI's Node refusal").toBeUndefined()
+  expect(child.status).toBe(2)
+  expect(child.stdout).toBe("")
+  expect(child.stderr).toBe("git-super: Bun CLI requires Bun >=1.3.14\n")
+})
+
 test("library resolves executable Git on the inherited PATH, skipping non-executable entries", () => {
   const executable = nativeGitExecutable()
   expect(execFileSync(executable, ["--version"], { encoding: "utf8" })).toMatch(/^git version /u)
