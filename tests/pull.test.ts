@@ -50,6 +50,83 @@ function outputSink(): { output: string; write(value: string): void } {
 
 describe("git super pull --ff-only", () => {
   /**
+   * @failure Pull drops known private skips on a later plan refusal or materializes an excluded target addition (27058 AC3/AC5).
+   * @level l1
+   * @consumer git-super pull and CLI
+   * @testonly none
+   */
+  test.each(["cli", "added", "later-plan-refusal"])("preserves private pull observations for %s", async (mode) => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-pull-private-observations-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const checkout = join(root, "checkout")
+    git(root, "-c", "protocol.file.allow=always", "clone", "-q", "--recurse-submodules", fixture.product, checkout)
+    const excluded = mode === "added" ? "vendor/gamma" : "packages/alpha"
+    const privateCheckout = join(checkout, excluded)
+    if (mode === "added") {
+      const gamma = join(root, "gamma")
+      createRepository(gamma, "gamma.ts", "export const gamma = 1\n")
+      git(fixture.product, "-c", "protocol.file.allow=always", "submodule", "add", "-q", gamma, excluded)
+      git(fixture.product, "commit", "-q", "-m", "add private gamma")
+    } else {
+      git(checkout, "submodule", "deinit", "-f", "--", excluded)
+      advanceRepository(fixture.product, "README.md", "next\n")
+    }
+    if (mode === "later-plan-refusal") git(checkout, "submodule", "deinit", "-f", "--", "vendor/beta")
+    const before = git(checkout, "rev-parse", "HEAD")
+    const target = git(fixture.product, "rev-parse", "HEAD")
+    const stderr = outputSink()
+    if (mode === "cli") {
+      const stdout = outputSink()
+      const code = await runCli(
+        ["--repo", checkout, "pull", "--ff-only", "--exclude-submodule", excluded, "origin", "main", "--json"],
+        stdout,
+        stderr,
+      )
+      expect(code).toBe(0)
+      expect(JSON.parse(stdout.output)).toMatchObject({
+        state: "updated",
+        notCompared: [{ path: excluded, reason: "excluded" }],
+      })
+    } else {
+      const local = createLocalGitProcess()
+      const privateRequests: GitProcessRequest[] = []
+      const process: GitProcess = {
+        run(request) {
+          if (request.repo === privateCheckout || request.repo.startsWith(`${privateCheckout}/`)) {
+            privateRequests.push(request)
+            throw new Error(`private checkout was probed: ${request.repo}`)
+          }
+          return local.run(request)
+        },
+      }
+      const result = await superPull({
+        repo: checkout,
+        repository: "origin",
+        refspecs: ["main"],
+        ffOnly: true,
+        excludedSubmodules: [excluded],
+        git: process,
+        warn: (message) => stderr.write(message),
+      })
+      expect(privateRequests).toEqual([])
+      expect(result).toMatchObject({
+        state: mode === "added" ? "updated" : "failed",
+        partial: false,
+        notCompared: [{ path: excluded, reason: "excluded" }],
+      })
+      if (mode === "later-plan-refusal") {
+        expect(result.detail).toMatchObject({ code: "submodule-not-initialized", paths: ["vendor/beta"] })
+      } else {
+        expect(existsSync(join(privateCheckout, ".git"))).toBe(false)
+        if (existsSync(privateCheckout)) expect(readdirSync(privateCheckout)).toEqual([])
+      }
+    }
+    expect(stderr.output).toContain(`${excluded}: component excluded, not compared`)
+    expect(git(checkout, "rev-parse", "HEAD")).toBe(mode === "later-plan-refusal" ? before : target)
+  })
+
+  /**
    * @failure A declared private empty checkout is probed as a repository or blocks included updates (27058 AC3/AC5).
    * @level l1
    * @consumer git-super pull

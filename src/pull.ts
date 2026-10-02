@@ -61,6 +61,10 @@ type PullPlan = Readonly<{
 
 type ExcludedCheckout = Readonly<{ path: string; repository: string; allowAbsent: boolean }>
 
+function excludedObservations(checkouts: readonly ExcludedCheckout[]): NotCompared[] {
+  return checkouts.map(({ path }) => ({ path, reason: "excluded", message: "component excluded, not compared" }))
+}
+
 function proveExcludedCheckouts(checkouts: readonly ExcludedCheckout[]): void {
   for (const checkout of checkouts) {
     const state = inspectUninitializedCheckout(checkout.repository)
@@ -209,7 +213,12 @@ function resultError(error: unknown, phase: string): GitResultDetail {
   })
 }
 
-async function planPull(git: GitProcess, options: SuperPullOptions, phase: Phase): Promise<PullPlan> {
+async function planPull(
+  git: GitProcess,
+  options: SuperPullOptions,
+  phase: Phase,
+  excludedCheckouts: ExcludedCheckout[],
+): Promise<PullPlan> {
   validateExcludedSubmodules(options.excludedSubmodules)
   if (!options.ffOnly) {
     throw Object.assign(new Error("git super pull requires --ff-only"), {
@@ -286,7 +295,6 @@ async function planPull(git: GitProcess, options: SuperPullOptions, phase: Phase
     }
   }
   phase("freeze-target-graph")
-  const excludedCheckouts: ExcludedCheckout[] = []
   const repositories = await freezeRepositoryGraph(
     git,
     root,
@@ -307,11 +315,7 @@ async function planPull(git: GitProcess, options: SuperPullOptions, phase: Phase
     ...(rootDetail === undefined ? {} : { detail: rootDetail }),
     repositories,
     excludedCheckouts,
-    notCompared: excludedCheckouts.map(({ path }) => ({
-      path,
-      reason: "excluded",
-      message: "component excluded, not compared",
-    })),
+    notCompared: excludedObservations(excludedCheckouts),
   }
 }
 
@@ -859,14 +863,17 @@ export async function superPull(options: SuperPullOptions): Promise<PullResult> 
     options.report?.(`git-super pull: ${name} +${Date.now() - startedAt}ms\n`)
   }
   const warn = options.warn ?? ((message: string) => globalThis.process.stderr.write(message))
+  const excludedCheckouts: ExcludedCheckout[] = []
   let plan: PullPlan
   try {
-    plan = await planPull(git, options, phase)
+    plan = await planPull(git, options, phase, excludedCheckouts)
   } catch (error) {
     const failure = resultError(error, "plan")
+    const notCompared = excludedObservations(excludedCheckouts)
+    for (const observation of notCompared) warn(`${observation.path}: ${observation.message}\n`)
     return {
       ...gitSuperResult([{ repository: resolve(options.repo), state: "failed", detail: failure, refs: [] }], failure),
-      notCompared: [],
+      notCompared,
     }
   }
   for (const observation of plan.notCompared) warn(`${observation.path}: ${observation.message}\n`)
