@@ -575,9 +575,10 @@ describe("git super pull --ff-only", () => {
         expect(update?.args).toEqual(
           expect.arrayContaining(["--reference", join(primary, ".git/modules/vendor/gamma"), "--no-fetch"]),
         )
-        expect(requests.some((request) => request.repo === checkout && request.args.includes("HEAD:.gitmodules"))).toBe(
-          true,
-        )
+        // The shared materializer reads the captured incoming commit, avoiding a later mutable HEAD read.
+        expect(
+          requests.some((request) => request.repo === checkout && request.args.includes(`${target}:.gitmodules`)),
+        ).toBe(true)
         expect(warnings.output).toBe("")
       } else {
         expect(update?.args).not.toContain("--reference")

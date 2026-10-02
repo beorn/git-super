@@ -181,7 +181,7 @@ type Submodule = Readonly<{ name: string; path: string }>
  * Report local config that the target tree deliberately does not declare.
  *
  * This is a diagnostic comparison, never an enumeration source: only the
- * entries parsed from `HEAD:.gitmodules` above reach init/update. A removed
+ * entries joined from the captured commit or stage-0 index reach init/update. A removed
  * gitlink can therefore leave any number of keys in one local subsection
  * without resurrecting the path or blocking worktree creation. The subsection
  * is reported once with the exact optional cleanup command.
