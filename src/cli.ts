@@ -548,13 +548,23 @@ async function runInvocation(
     .command("remove")
     .description(commands.worktree.remove.description ?? commands.worktree.remove.title)
     .requiredOption("--retain <directory>", "durable directory outside the worktree and its Git directory")
+    .option(
+      "--exclude-submodule <path>",
+      "exclude a literal root-relative submodule and descendants before content access",
+      (value: string, previous: string[]) => [...previous, value],
+      [],
+    )
     .argument("<path>", "registered clean worktree to remove")
     .action((path, _options, command) => {
       const globals = command.optsWithGlobals() as { repo: string; json?: boolean }
-      const options = command.opts() as { retain: string }
+      const options = command.opts() as { retain: string; excludeSubmodule?: string[] }
       captured = {
         node: commands.worktree.remove,
-        params: { path, retain: options.retain },
+        params: {
+          path,
+          retain: options.retain,
+          ...(options.excludeSubmodule?.length ? { excludedSubmodules: options.excludeSubmodule } : {}),
+        },
         json: globals.json === true,
         nul: false,
       }
@@ -729,7 +739,12 @@ async function writeResult(
   stderr: OutputSink,
   nodes: typeof commands,
 ): Promise<void> {
-  if (captured.node === nodes.diff || captured.node === nodes.status || captured.node === nodes["merge-base"]) {
+  if (
+    captured.node === nodes.diff ||
+    captured.node === nodes.status ||
+    captured.node === nodes["merge-base"] ||
+    captured.node === nodes.worktree.remove
+  ) {
     for (const observation of (result as SuperDiffResult | SuperStatusResult | SuperIsAncestorResult).notCompared) {
       stderr.write(`${observation.path}: ${observation.message}\n`)
       if (observation.remedy !== undefined) stderr.write(`${observation.remedy}\n`)

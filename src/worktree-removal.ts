@@ -25,6 +25,7 @@ import { inspectUninitializedCheckout, superStatus } from "./status.ts"
 import { readCommitSubmodules } from "./commit-graph.ts"
 import { validateExcludedSubmodules } from "./git.ts"
 import type { GitProcess } from "./process.ts"
+import type { NotCompared } from "./diff.ts"
 import type { Git, WorktreeInspection } from "./worktree.ts"
 
 export type WorktreeRemovalProof = Readonly<{
@@ -39,6 +40,7 @@ export type WorktreeRemovalProof = Readonly<{
   rehomedBorrowers?: readonly string[]
   writerLocks: readonly WriterLockProof[]
   createdWriterLocks: readonly WriterLockProof[]
+  notCompared: readonly NotCompared[]
 }>
 
 export type WriterLockProof = Readonly<{ path: string; body: string; lease: "free" }>
@@ -75,13 +77,14 @@ export async function assertExcludedRemovalCustody(
   requested: string,
   gitDir: string,
   excludedSubmodules: readonly string[] = [],
-): Promise<void> {
+): Promise<readonly NotCompared[]> {
   validateExcludedSubmodules(excludedSubmodules)
-  if (excludedSubmodules.length === 0) return
+  if (excludedSubmodules.length === 0) return []
   const checkout = realpathSync(requested)
   const head = await git.commit(checkout, "HEAD")
   const declarations = await readCommitSubmodules(process, checkout, head)
-  for (const path of excludedSubmodules) {
+  const notCompared: NotCompared[] = []
+  for (const path of new Set(excludedSubmodules)) {
     const declaration = declarations.find((entry) => entry.path === path)
     if (declaration === undefined) {
       throw new Error(
@@ -124,7 +127,13 @@ export async function assertExcludedRemovalCustody(
         `excluded submodule ${path} (section ${declaration.name}) store ${store} is inside deletion custody ${checkout} or ${gitDir}; worktree preserved before store inspection; preserve the store outside both deletion paths before retrying removal`,
       )
     }
+    notCompared.push({
+      path,
+      reason: "excluded",
+      message: `excluded checkout is ${state}; not checked out, nothing to preserve in the checkout; Git store custody is reported separately`,
+    })
   }
+  return notCompared
 }
 
 /**
@@ -183,10 +192,10 @@ export async function prepareRemovalBorrowers(
   commonDir: string,
   lenderGitDir: string,
   excludedSubmodules: readonly string[] = [],
-): Promise<() => readonly string[]> {
+): Promise<Readonly<{ run: () => readonly string[]; notCompared: readonly NotCompared[] }>> {
   const lenderModules = join(lenderGitDir, "modules")
   if (excludedSubmodules.length === 0) {
-    return () => rehomeBorrowers(commonDir, lenderGitDir, lenderModules)
+    return { run: () => rehomeBorrowers(commonDir, lenderGitDir, lenderModules), notCompared: [] }
   }
   if (present(join(commonDir, "git-super-retained-borrowers"))) {
     throw new Error(
@@ -194,6 +203,7 @@ export async function prepareRemovalBorrowers(
     )
   }
   const candidates: RemovalBorrower[] = []
+  const notCompared: NotCompared[] = []
   for (const candidate of removalBorrowers(commonDir, lenderGitDir)) {
     const parentProcess: GitProcess = {
       run: (request) =>
@@ -206,7 +216,7 @@ export async function prepareRemovalBorrowers(
     const head = await git.text(checkout, ["--git-dir", candidate.adminDir, "rev-parse", "--verify", "HEAD"])
     const declarations = await readCommitSubmodules(parentProcess, checkout, head)
     const excludedStores: { path: string; store: string }[] = []
-    for (const path of excludedSubmodules) {
+    for (const path of new Set(excludedSubmodules)) {
       const declaration = declarations.find((entry) => entry.path === path)
       if (declaration === undefined) {
         throw new Error(
@@ -233,10 +243,17 @@ export async function prepareRemovalBorrowers(
         )
       }
       excludedStores.push({ path, store })
+      notCompared.push({
+        path,
+        reason: "excluded",
+        message: present(store)
+          ? `excluded borrower ${candidate.name} Git store ${store} preserved untouched outside deletion custody`
+          : `excluded borrower ${candidate.name} parent-resolved Git store ${store} is absent; no store content inspected`,
+      })
     }
     candidates.push({ ...candidate, excludedStores })
   }
-  return () => rehomeBorrowerCandidates(commonDir, lenderGitDir, lenderModules, candidates)
+  return { run: () => rehomeBorrowerCandidates(commonDir, lenderGitDir, lenderModules, candidates), notCompared }
 }
 
 export function rehomeBorrowers(
@@ -730,6 +747,7 @@ export async function retainWorktreeModules(
   createdWriterLocks: readonly WriterLockProof[],
   rehome?: () => readonly string[],
   excludedSubmodules: readonly string[] = [],
+  notCompared: readonly NotCompared[] = [],
 ): Promise<WorktreeRemovalProof> {
   const path = realpathSync(requested)
   const registered = await inspect(repo, path)
@@ -824,6 +842,7 @@ export async function retainWorktreeModules(
     ...(rehomedBorrowers.length === 0 ? {} : { rehomedBorrowers }),
     writerLocks,
     createdWriterLocks,
+    notCompared,
   }
   writeFileSync(
     proof.manifest,

@@ -330,7 +330,15 @@ const worktreeRemove = commandNode<CommandContext, WorktreeRemoveParams, GitSupe
     if (typeof input.path !== "string" || typeof input.retain !== "string" || input.retain.trim() === "") {
       throw new Error("worktree remove requires a path and --retain <external directory>")
     }
-    return { path: input.path, retain: input.retain }
+    return {
+      path: input.path,
+      retain: input.retain,
+      ...(input.excludedSubmodules === undefined
+        ? {}
+        : {
+            excludedSubmodules: stringArray(input.excludedSubmodules, "excludedSubmodules"),
+          }),
+    }
   }),
   run: (context, input) =>
     superWorktreeRemove({

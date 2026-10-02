@@ -423,7 +423,13 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
           throw new Error(`retained worktree removal cannot unlock ${path}; resolve its holder first`)
         }
         const gitDir = realpathSync(await git.text(path, ["rev-parse", "--absolute-git-dir"]))
-        await assertExcludedRemovalCustody(git, configuredProcess(), path, gitDir, removeOptions.excludedSubmodules)
+        const checkoutObservations = await assertExcludedRemovalCustody(
+          git,
+          configuredProcess(),
+          path,
+          gitDir,
+          removeOptions.excludedSubmodules,
+        )
         const common = realpathSync(await git.text(path, ["rev-parse", "--path-format=absolute", "--git-common-dir"]))
         const rehome = await prepareRemovalBorrowers(
           git,
@@ -444,12 +450,13 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
               (repository, target) => inspectWorktree(git, repository, target),
               writerLeases.proof,
               writerLeases.created,
-              rehome,
+              rehome.run,
               removeOptions.excludedSubmodules,
+              [...checkoutObservations, ...rehome.notCompared],
             )
           } else {
             if (removeOptions.unlock === true) await unlockWorktree(git, repo, path)
-            rehome()
+            rehome.run()
           }
           await git.run(repo, ["worktree", "remove", "--force", path], false, timeouts.cleanup)
           if (existsSync(path) || (await inspectWorktree(git, repo, path)).registered) {

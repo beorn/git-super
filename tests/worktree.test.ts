@@ -63,6 +63,99 @@ function objectStoreSnapshot(objects: string) {
 
 describe("createGitWorktreeStore", () => {
   /**
+   * @failure The removal CLI drops the shared exclusion or omits named preserved-store observations (27058 AC3/AC5).
+   * @level l1
+   * @consumer git-super worktree remove CLI and JSON readers
+   * @testonly none
+   */
+  // Engine-only removal cannot prove command parsing, forwarding or the operator-facing receipt.
+  it.each([false, true])("routes removal exclusions and names the untouched store; json=%s", async (json) => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-private-remove-cli-"))
+    try {
+      const fixture = createProductFixture(root)
+      const excluded = "vendor/private"
+      const name = "sensitive-store"
+      git(fixture.product, [
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "--name",
+        name,
+        "-q",
+        fixture.alpha,
+        excluded,
+      ])
+      git(fixture.product, ["commit", "-q", "-m", "add fixture private component"])
+      const privateStore = git(fixture.product, [
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        `modules/${name}`,
+      ]).trim()
+      const before = objectStoreSnapshot(privateStore)
+      const linked = join(root, "linked")
+      await createLocalGitWorktreeStore({ repo: fixture.product }).add({
+        kind: "detached",
+        path: linked,
+        ref: "HEAD",
+      })
+      let stdout = ""
+      let stderr = ""
+      const code = await runCli(
+        [
+          "--repo",
+          fixture.product,
+          ...(json ? ["--json"] : []),
+          "worktree",
+          "remove",
+          linked,
+          "--retain",
+          join(root, "retained"),
+          "--exclude-submodule",
+          excluded,
+          "--exclude-submodule",
+          excluded,
+        ],
+        {
+          write: (text) => {
+            stdout += text
+          },
+        },
+        {
+          write: (text) => {
+            stderr += text
+          },
+        },
+      )
+      expect(code).toBe(0)
+      expect(existsSync(linked)).toBe(false)
+      expect(objectStoreSnapshot(privateStore)).toEqual(before)
+      expect(stderr).toContain(excluded)
+      expect(stderr).toContain(privateStore)
+      expect(stderr).toMatch(/preserved.*untouched|untouched.*preserv/u)
+      if (json) {
+        const result = JSON.parse(stdout) as {
+          state: string
+          notCompared: Array<{ path: string; reason: string; message: string }>
+          proof: { notCompared: unknown }
+        }
+        expect(result.state).toBe("updated")
+        expect(result.notCompared).toContainEqual({
+          path: excluded,
+          reason: "excluded",
+          message: expect.stringContaining(privateStore),
+        })
+        expect(result.proof.notCompared).toEqual(result.notCompared)
+      } else {
+        expect(stdout).toContain("updated")
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  /**
    * @failure Removal walks private stores in surviving common custody despite an empty excluded checkout (27058 AC3/AC5).
    * @level l1
    * @consumer git-super retained worktree removal
