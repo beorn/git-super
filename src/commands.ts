@@ -136,6 +136,9 @@ const merge = commandNode<CommandContext, MergeParams, SuperMergeResult>({
         ...(input.continue === true ? { continue: true } : {}),
         ...(typeof input.expectedHead === "string" ? { expectedHead: input.expectedHead } : {}),
         ...(typeof input.expectedBranch === "string" ? { expectedBranch: input.expectedBranch } : {}),
+        ...(input.excludedSubmodules === undefined
+          ? {}
+          : { excludedSubmodules: stringArray(input.excludedSubmodules, "excludedSubmodules") }),
         ...(input.noFetch === true ? { noFetch: true } : {}),
         ...(input.unboundedLocalMain === true ? { unboundedLocalMain: true } : {}),
       }
@@ -165,6 +168,7 @@ const merge = commandNode<CommandContext, MergeParams, SuperMergeResult>({
       ...(input.continue === true ? ["--continue"] : []),
       ...(input.expectedHead === undefined ? [] : ["--expected-head", input.expectedHead]),
       ...(input.expectedBranch === undefined ? [] : ["--expected-branch", input.expectedBranch]),
+      ...(input.excludedSubmodules ?? []).flatMap((path) => ["--exclude-submodule", path]),
       ...(input.noFetch === true ? ["--no-fetch"] : []),
       ...(input.unboundedLocalMain === true ? ["--unbounded-local-main"] : []),
     ]
