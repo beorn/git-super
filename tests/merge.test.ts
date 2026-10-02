@@ -123,7 +123,18 @@ describe("git super merge", () => {
       createRepository(parent, "parent.txt", "parent\n")
       const leaves = ["one", "two"].map((name) => {
         const repository = join(root, name)
-        return { name, repository, pin: createRepository(repository, "leaf.txt", `${name}\n`) }
+        createRepository(repository, "leaf.txt", `${name}\n`)
+        const descendant = join(root, `${name}-descendant`)
+        const descendantPin = createRepository(descendant, "descendant.txt", `${name} descendant\n`)
+        const descendantUrl = `https://git-super.test/owned/${name}-descendant.git`
+        writeFileSync(
+          join(repository, ".gitmodules"),
+          `[submodule "descendant-store"]\n path = descendant\n url = ${descendantUrl}\n`,
+        )
+        git(repository, "add", ".gitmodules")
+        git(repository, "update-index", "--add", "--cacheinfo", `160000,${descendantPin},descendant`)
+        git(repository, "commit", "-q", "-m", "add descendant")
+        return { name, repository, pin: git(repository, "rev-parse", "HEAD"), descendant, descendantPin, descendantUrl }
       })
       writeFileSync(
         join(parent, ".gitmodules"),
@@ -148,6 +159,7 @@ describe("git super merge", () => {
         [`url.${fixture.beta}.insteadOf`, `${baseUrl}beta.git`],
         [`url.${parent}.insteadOf`, `${baseUrl}parent.git`],
         ...leaves.map(({ name, repository }) => [`url.${repository}.insteadOf`, `${baseUrl}${name}.git`]),
+        ...leaves.map(({ descendant, descendantUrl }) => [`url.${descendant}.insteadOf`, descendantUrl]),
       ]
       vi.stubEnv("GIT_CONFIG_COUNT", String(config.length))
       for (const [index, [key, value]] of config.entries()) {
@@ -203,25 +215,46 @@ describe("git super merge", () => {
       expect(declaredRefusal.detail?.remedy).not.toContain("stale-parent.git")
       expect(warnings.output).toContain("origin identity mismatch")
       git(parentStore, "remote", "set-url", "origin", `${baseUrl}parent.git`)
-      const commands = refused.detail?.remedy?.split("\n").filter((line) => /^\s+git /u.test(line)) ?? []
-      expect(commands.length).toBeGreaterThanOrEqual(3)
-      for (const command of commands) {
-        const executed = Bun.spawnSync(["sh", "-c", command.trim()], {
-          cwd: root,
-          env: {
-            ...process.env,
-            PATH: `${fileURLToPath(new URL("../bin", import.meta.url))}${delimiter}${process.env.PATH}`,
-          },
-          stdout: "pipe",
-          stderr: "pipe",
-        })
-        expect(executed.exitCode, `${command}\n${executed.stderr}`).toBe(0)
+      let repaired = refused
+      // Preparation is direct-only: each refusal lists the whole first missing
+      // depth, including siblings under different checkout-free parents.
+      for (const round of [0, 1]) {
+        const commands = repaired.detail?.remedy?.split("\n").filter((line) => /^\s+git /u.test(line)) ?? []
+        expect(commands.length).toBeGreaterThanOrEqual(round === 0 ? 3 : 4)
+        for (const command of commands) {
+          const executed = Bun.spawnSync(["sh", "-c", command.trim()], {
+            cwd: root,
+            env: {
+              ...process.env,
+              PATH: `${fileURLToPath(new URL("../bin", import.meta.url))}${delimiter}${process.env.PATH}`,
+            },
+            stdout: "pipe",
+            stderr: "pipe",
+          })
+          expect(executed.exitCode, `${command}\n${executed.stderr}`).toBe(0)
+        }
+        repaired = await superMerge({ repo: checkout, commit: target })
+        if (round === 0) {
+          expect(repaired).toMatchObject({
+            state: "failed",
+            partial: false,
+            detail: {
+              code: "nested-store-missing",
+              paths: leaves.map(({ name }) => `added-parent/children/${name}/descendant`),
+            },
+          })
+          expect(git(checkout, "rev-parse", "HEAD")).toBe(before)
+          expect(git(checkout, "write-tree")).toBe(indexBefore)
+          expect(existsSync(join(primary, "added-parent/.git"))).toBe(false)
+        }
       }
-      const repaired = await superMerge({ repo: checkout, commit: target })
       expect(repaired.state, JSON.stringify(repaired.detail)).toBe("updated")
       expect(repaired.partial).toBe(false)
-      for (const { name, pin } of leaves) {
+      for (const { name, pin, descendantPin } of leaves) {
         expect(git(join(checkout, "added-parent/children", name), "rev-parse", "HEAD")).toBe(pin)
+        expect(git(join(checkout, "added-parent/children", name, "descendant"), "rev-parse", "HEAD")).toBe(
+          descendantPin,
+        )
       }
     },
   )
