@@ -194,7 +194,7 @@ function statusRepository(
       if (probe.kind === "absent") {
         if (inspectUninitializedCheckout(child) !== "empty") {
           throw new Error(
-            `directory ${child} is not empty and has no repository of its own; preserve its files before removal`,
+            `uninitialized directory ${child} is not empty and has no repository of its own; preserve its files and initialize the submodule before removal`,
           )
         }
         uninitializedSubmodules.push(nestedPrefix)
