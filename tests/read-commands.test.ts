@@ -826,6 +826,105 @@ describe("Phase 1 read commands", () => {
     expect(stderr.output).toBe("")
   })
 
+  /**
+   * @failure Structured merge dispatch silently drops an exclusion list, or accepts malformed list values.
+   * @level l0
+   * @consumer command-tree merge callers
+   * @testonly none; existing local-main rows do not exercise exclusion transport
+   */
+  test("merge exclusion transport preserves selected paths and rejects malformed lists", () => {
+    const invocation = resolveInvocation(
+      commands.merge,
+      { repo: "." },
+      { commit: "HEAD", excludedSubmodules: ["packages/alpha", "vendor/beta"] },
+    )
+    expect(invocation.state).toBe("ready")
+    if (invocation.state === "ready") {
+      expect(invocation.params).toMatchObject({ excludedSubmodules: ["packages/alpha", "vendor/beta"] })
+    }
+    const invalid = resolveInvocation(commands.merge, { repo: "." }, { commit: "HEAD", excludedSubmodules: [1] })
+    expect(invalid.state).toBe("invalid")
+    if (invalid.state === "invalid") {
+      expect(invalid.error).toBeInstanceOf(Error)
+      if (invalid.error instanceof Error) expect(invalid.error.message).toContain("excludedSubmodules must be strings")
+    }
+    const defaults = resolveInvocation(commands.merge, { repo: "." }, { commit: "HEAD" })
+    expect(defaults.state).toBe("ready")
+    if (defaults.state === "ready") expect(defaults.params).not.toHaveProperty("excludedSubmodules")
+  })
+
+  /**
+   * @failure Merge CLI rejects repeated exclusions, drops one selection, or describes an excluded pin as compared against submodule main.
+   * @level l1
+   * @consumer git super merge JSON/text callers
+   * @testonly none; existing command run seam isolates CLI parsing and rendering from merge admission
+   */
+  test.each(["json", "text"])(
+    "merge exclusion transport forwards repeated selections and renders %s omissions truthfully",
+    async (format) => {
+      const inputs: unknown[] = []
+      const originalRun = commands.merge.run
+      try {
+        commands.merge.run = async (_context, input) => {
+          inputs.push(input)
+          return {
+            state: "updated",
+            partial: false,
+            repositories: [],
+            gitlinks: input.excludedSubmodules?.length
+              ? [{ path: "packages/alpha", from: "a".repeat(40), to: "a".repeat(40), state: "as-written" as const }]
+              : [],
+            ...(input.excludedSubmodules?.length
+              ? {
+                  notCompared: input.excludedSubmodules.map((path) => ({
+                    path,
+                    reason: "excluded" as const,
+                    message: "component excluded, not compared",
+                  })),
+                }
+              : {}),
+          }
+        }
+        const stdout = outputSink()
+        const stderr = outputSink()
+        expect(
+          await runCli(
+            [
+              "--repo",
+              ".",
+              ...(format === "json" ? ["--json"] : []),
+              "merge",
+              "HEAD",
+              "--exclude-submodule",
+              "packages/alpha",
+              "--exclude-submodule",
+              "vendor/beta",
+            ],
+            stdout,
+            stderr,
+          ),
+        ).toBe(0)
+        expect(inputs).toEqual([expect.objectContaining({ excludedSubmodules: ["packages/alpha", "vendor/beta"] })])
+        if (format === "json") {
+          expect(JSON.parse(stdout.output)).toMatchObject({
+            notCompared: [
+              { path: "packages/alpha", reason: "excluded" },
+              { path: "vendor/beta", reason: "excluded" },
+            ],
+          })
+        }
+        for (const path of ["packages/alpha", "vendor/beta"]) {
+          expect(stderr.output).toContain(`${path}: component excluded, not compared`)
+        }
+        expect(stderr.output).not.toContain("not-run packages/alpha")
+        expect(await runCli(["--repo", ".", "--json", "merge", "HEAD"], outputSink(), outputSink())).toBe(0)
+        expect(inputs[1]).not.toHaveProperty("excludedSubmodules")
+      } finally {
+        commands.merge.run = originalRun
+      }
+    },
+  )
+
   test("commands.merge params preserves the local-main option (25626)", () => {
     const invocation = resolveInvocation(
       commands.merge,

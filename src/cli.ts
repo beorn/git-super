@@ -362,6 +362,12 @@ async function runInvocation(
     .option("--expected-head <oid>", "original HEAD required by --continue")
     .option("--expected-branch <full-ref>", "original symbolic branch required by --continue")
     .option(
+      "--exclude-submodule <path>",
+      "exclude an empty root-direct submodule whose HEAD, target and sole merge-base pin are unchanged",
+      (value: string, previous: string[]) => [...previous, value],
+      [],
+    )
+    .option(
       "--no-fetch",
       "reuse untouched Equal main observations under ten minutes old; fetch moved, unequal or expired mains",
     )
@@ -382,6 +388,9 @@ async function runInvocation(
           ...(options.continue === true ? { continue: true } : {}),
           ...(typeof options.expectedHead === "string" ? { expectedHead: options.expectedHead } : {}),
           ...(typeof options.expectedBranch === "string" ? { expectedBranch: options.expectedBranch } : {}),
+          ...(options.excludeSubmodule === undefined || options.excludeSubmodule.length === 0
+            ? {}
+            : { excludedSubmodules: options.excludeSubmodule }),
           ...(options.fetch === false ? { noFetch: true } : {}),
           ...(options.unboundedLocalMain === true ? { unboundedLocalMain: true } : {}),
         },
@@ -751,9 +760,14 @@ async function writeResult(
     captured.node === nodes.diff ||
     captured.node === nodes.status ||
     captured.node === nodes["merge-base"] ||
+    captured.node === nodes.merge ||
     captured.node === nodes.worktree.remove
   ) {
-    for (const observation of (result as SuperDiffResult | SuperStatusResult | SuperIsAncestorResult).notCompared) {
+    const observations =
+      captured.node === nodes.merge
+        ? ((result as SuperMergeResult).notCompared ?? [])
+        : (result as SuperDiffResult | SuperStatusResult | SuperIsAncestorResult).notCompared
+    for (const observation of observations) {
       stderr.write(`${observation.path}: ${observation.message}\n`)
       if (observation.remedy !== undefined) stderr.write(`${observation.remedy}\n`)
     }
@@ -807,6 +821,11 @@ async function writeResult(
     const merge = result as SuperMergeResult
     if (merge.commit !== undefined) stdout.write(`${merge.commit}\n`)
     for (const gitlink of merge.gitlinks) {
+      if (
+        merge.notCompared?.some((observation) => observation.path === gitlink.path && observation.reason === "excluded")
+      ) {
+        continue
+      }
       stderr.write(
         gitlink.state === "raised"
           ? `${gitlink.path} ${gitlink.from.slice(0, 7)} -> ${gitlink.to.slice(0, 7)} (submodule main)\n`

@@ -10,7 +10,7 @@ import {
   type CommitSubmodule,
 } from "./commit-graph.ts"
 import { createExclusive, type Exclusive } from "./exclusive.ts"
-import { probeRepository } from "./git.ts"
+import { isSubmoduleExcluded, probeRepository } from "./git.ts"
 import { mapInOrder } from "./map-in-order.ts"
 import { ensureCommitObject } from "./objects.ts"
 import { createProgressReporter } from "./progress.ts"
@@ -1045,8 +1045,17 @@ export async function capturePushIntent(
   timeoutMs: number,
   rootStores?: ReadonlyMap<string, string>,
   observedMains?: ObservedMains,
+  excludedSubmodules: readonly string[] = [],
 ): Promise<string | undefined> {
-  const requirements = await collectCommitRequirements(git, root, [tree], rootPins, undefined, rootStores)
+  const requirements = await collectCommitRequirements(
+    git,
+    root,
+    [tree],
+    rootPins,
+    undefined,
+    rootStores,
+    excludedSubmodules,
+  )
   if (requirements.length === 0) return undefined
   const rootRemote = await logicalPushUrl(git, root, await configuredPushRemote(git, root))
   const changed = await changedRowPaths(
@@ -1312,6 +1321,7 @@ async function collectCommitRequirements(
   rootPins?: ReadonlyMap<string, string>,
   frozen?: FrozenPushIntent,
   rootStores?: ReadonlyMap<string, string>,
+  excludedSubmodules: readonly string[] = [],
 ): Promise<CommitRequirement[]> {
   const completed = new Set<string>()
   const visiting = new Set<string>()
@@ -1353,6 +1363,7 @@ async function collectCommitRequirements(
       throw new Error(`Git returned an invalid common directory for prepared parent ${repository}: ${parentStore}`)
     }
     for (const recorded of await readCommitSubmodules(git, repository, commit)) {
+      if (path === "." && isSubmoduleExcluded(recorded.path, excludedSubmodules)) continue
       const target = path === "." ? rootPins?.get(recorded.path) : undefined
       const entry = target === undefined ? recorded : { ...recorded, target }
       const childPath = path === "." ? entry.path : `${path}/${entry.path}`
