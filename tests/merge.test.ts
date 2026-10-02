@@ -64,6 +64,7 @@ describe("git super merge — excluded admission (27058)", () => {
     expect(result).toMatchObject({ state: "updated", partial: false, notCompared: [{ path, reason: "excluded" }] })
     expect(result.gitlinks).toContainEqual(expect.objectContaining({ path, state: "as-written" }))
     expect(git(fixture.product, "rev-parse", `HEAD:${path}`)).toBe(pin)
+    expect(git(fixture.product, "show", "-s", "--format=%B", "HEAD").split("\n").filter((line) => line.startsWith(`Settled: ${path}@`))).toEqual([`Settled: ${path}@${pin}`])
     expect(childRequests).toEqual([])
   })
 
@@ -164,7 +165,7 @@ describe("git super merge — excluded admission (27058)", () => {
   })
 
   /**
-   * @failure Continuing a pending root merge validates or fetches an excluded child before refusing its changed staged pin.
+   * @failure Continuing a pending root merge enters an excluded child, or its printed retry loses repeatable exclusions.
    * @level l1
    * @consumer git-super merge --continue with private exclusions
    * @testonly none
@@ -176,6 +177,7 @@ describe("git super merge — excluded admission (27058)", () => {
     const target = candidateWithRootChange(fixture, "excluded-continue-target")
     const path = "packages/alpha"
     git(fixture.product, "submodule", "deinit", "-f", "--", path)
+    git(fixture.product, "submodule", "deinit", "-f", "--", "vendor/beta")
     const head = git(fixture.product, "rev-parse", "HEAD")
     const branch = git(fixture.product, "symbolic-ref", "HEAD")
     git(fixture.product, "merge", "--no-ff", "--no-commit", target)
@@ -192,9 +194,11 @@ describe("git super merge — excluded admission (27058)", () => {
       }
       return local.run(request)
     } }
-    const options = { repo: fixture.product, commit: target, continue: true, expectedHead: head, expectedBranch: branch, excludedSubmodules: [path], git: recording }
+    const options = { repo: fixture.product, commit: target, continue: true, expectedHead: head, expectedBranch: branch, excludedSubmodules: [path, "vendor/beta"], git: recording }
     const result = await superMerge(options)
     expect(result).toMatchObject({ state: "failed", detail: { paths: [path] } })
+    expect(result.detail?.message).toContain(`'--exclude-submodule' '${path}' '--exclude-submodule' 'vendor/beta'`)
+    expect(result.detail?.message).toContain(`'--continue' '--expected-head' '${head}' '--expected-branch' '${branch}'`)
     expect(unsafe).toEqual([])
     expect(git(fixture.product, "rev-parse", "HEAD")).toBe(head)
     expect(git(fixture.product, "write-tree")).toBe(index)

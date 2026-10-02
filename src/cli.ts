@@ -388,7 +388,9 @@ async function runInvocation(
           ...(options.continue === true ? { continue: true } : {}),
           ...(typeof options.expectedHead === "string" ? { expectedHead: options.expectedHead } : {}),
           ...(typeof options.expectedBranch === "string" ? { expectedBranch: options.expectedBranch } : {}),
-          ...(options.excludeSubmodule.length === 0 ? {} : { excludedSubmodules: options.excludeSubmodule }),
+          ...(options.excludeSubmodule === undefined || options.excludeSubmodule.length === 0
+            ? {}
+            : { excludedSubmodules: options.excludeSubmodule }),
           ...(options.fetch === false ? { noFetch: true } : {}),
           ...(options.unboundedLocalMain === true ? { unboundedLocalMain: true } : {}),
         },

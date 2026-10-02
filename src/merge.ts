@@ -356,11 +356,11 @@ async function mergeUnderLock(
           code,
           message,
           `git -C ${shellQuote(root)} status --short`,
-          pending === undefined ? "Use one merge mode with its required expectations." : pendingRemedy(root, pending),
+          pending === undefined ? "Use one merge mode with its required expectations." : pendingRemedy(root, pending, options.excludedSubmodules),
           undefined,
         ),
       )
-      return pending === undefined ? result : unchangedPending(result, pending)
+      return pending === undefined ? result : unchangedPending(result, pending, options.excludedSubmodules)
     }
     for (const marker of ["rebase-merge", "rebase-apply", "CHERRY_PICK_HEAD"] as const) {
       const path = await required(git, root, ["rev-parse", "--git-path", marker], "observe-native-operation", timeoutMs)
@@ -391,7 +391,7 @@ async function mergeUnderLock(
           "the caller",
         ),
       )
-      return pending === undefined ? result : unchangedPending(result, pending)
+      return pending === undefined ? result : unchangedPending(result, pending, options.excludedSubmodules)
     }
     if (options.preserveConflicts && options.continue) {
       return refuse("merge-modes-exclusive", "--preserve-conflicts and --continue are mutually exclusive.")
@@ -442,7 +442,7 @@ async function mergeUnderLock(
         const heads = await nativeMergeHeads(git, root, timeoutMs)
         if (heads === undefined) throw new Error(`Rejected commit at ${root}: expected native MERGE_HEAD is missing`)
         const observed = await observePending(git, root, heads, timeoutMs)
-        const detail = { ...result.detail, next: `Inspect the named Git failure. ${pendingRemedy(root, observed)}` }
+        const detail = { ...result.detail, next: `Inspect the named Git failure. ${pendingRemedy(root, observed, options.excludedSubmodules)}` }
         return {
           ...result,
           pending: observed,
@@ -455,7 +455,7 @@ async function mergeUnderLock(
       }
     }
     return pending !== undefined && result.state === "failed" && !result.partial
-      ? unchangedPending(result, pending)
+      ? unchangedPending(result, pending, options.excludedSubmodules)
       : result
   } catch (error) {
     const detail = resultError(error, "merge-preflight")
@@ -468,7 +468,7 @@ async function mergeUnderLock(
             detail.code,
             detail.subject ?? `Pending merge at ${root}: ${messageOf(error)}`,
             detail.evidence ?? `git -C ${shellQuote(root)} status --short`,
-            pendingRemedy(root, pending),
+            pendingRemedy(root, pending, options.excludedSubmodules),
             undefined,
             {
               phase: detail.phase,
@@ -477,7 +477,7 @@ async function mergeUnderLock(
             },
           ),
     )
-    return pending === undefined ? result : unchangedPending(result, pending)
+    return pending === undefined ? result : unchangedPending(result, pending, options.excludedSubmodules)
   }
 }
 
@@ -734,9 +734,9 @@ async function mergeObserved(
           [],
           obviousDetail(
             "merge-conflicts-pending",
-            `Ordinary merge conflicts remain pending on ${branch}. ${pendingRemedy(root, observed)}`,
+            `Ordinary merge conflicts remain pending on ${branch}. ${pendingRemedy(root, observed, options.excludedSubmodules)}`,
             `git -C ${shellQuote(root)} status --short`,
-            pendingRemedy(root, observed),
+            pendingRemedy(root, observed, options.excludedSubmodules),
             undefined,
             { paths, objectIds: [head, target] },
           ),
@@ -887,7 +887,7 @@ async function mergeObserved(
     timeoutMs,
   )
   const trailers = visiblePlans.map((plan) =>
-    plan.state === "raised"
+    plan.state === "raised" || isSubmoduleExcluded(plan.path, excludedSubmodules)
       ? `Settled: ${plan.path}@${plan.to}`
       : `Settled: ${plan.path}@${plan.from} ${plan.state} submodule-main@${plan.to}`,
   )
@@ -1466,7 +1466,7 @@ async function observePending(
   return { branch, head, target: heads[0] ?? "", unmergedPaths: paths }
 }
 
-function pendingRemedy(root: string, pending: NonNullable<SuperMergeResult["pending"]>): string {
+function pendingRemedy(root: string, pending: NonNullable<SuperMergeResult["pending"]>, excludedSubmodules: readonly string[] = []): string {
   const command = [
     "git",
     "super",
@@ -1479,6 +1479,7 @@ function pendingRemedy(root: string, pending: NonNullable<SuperMergeResult["pend
     pending.head,
     "--expected-branch",
     pending.branch,
+    ...excludedSubmodules.flatMap((path) => ["--exclude-submodule", path]),
   ]
     .map(shellQuote)
     .join(" ")
@@ -1488,13 +1489,14 @@ function pendingRemedy(root: string, pending: NonNullable<SuperMergeResult["pend
 function unchangedPending(
   result: SuperMergeResult,
   pending: NonNullable<SuperMergeResult["pending"]>,
+  excludedSubmodules: readonly string[] = [],
 ): SuperMergeResult {
   const detail =
     result.detail === undefined
       ? undefined
       : {
           ...result.detail,
-          message: `${result.detail.message} The pending merge was left as found. ${pendingRemedy(result.repositories[0]?.repository ?? ".", pending)}`,
+          message: `${result.detail.message} The pending merge was left as found. ${pendingRemedy(result.repositories[0]?.repository ?? ".", pending, excludedSubmodules)}`,
         }
   return {
     ...result,

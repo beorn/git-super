@@ -842,9 +842,12 @@ describe("Phase 1 read commands", () => {
     if (invocation.state === "ready") {
       expect(invocation.params).toMatchObject({ excludedSubmodules: ["packages/alpha", "vendor/beta"] })
     }
-    expect(() => commands.merge.params?.parse({ commit: "HEAD", excludedSubmodules: [1] })).toThrow(
-      "excludedSubmodules must be strings",
-    )
+    const invalid = resolveInvocation(commands.merge, { repo: "." }, { commit: "HEAD", excludedSubmodules: [1] })
+    expect(invalid.state).toBe("invalid")
+    if (invalid.state === "invalid") {
+      expect(invalid.error).toBeInstanceOf(Error)
+      if (invalid.error instanceof Error) expect(invalid.error.message).toContain("excludedSubmodules must be strings")
+    }
     const defaults = resolveInvocation(commands.merge, { repo: "." }, { commit: "HEAD" })
     expect(defaults.state).toBe("ready")
     if (defaults.state === "ready") expect(defaults.params).not.toHaveProperty("excludedSubmodules")
