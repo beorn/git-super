@@ -236,7 +236,17 @@ worktree add /work/candidate at 0123456789abcdef0123456789abcdef01234567 (main):
 
 ## Try it
 
-Requires Bun 1.3.14 or newer. Native Git delegation uses `process.execve` to preserve the process ID, streams, and signals.
+The CLI requires Bun 1.3.14 or newer. Native Git delegation uses `process.execve` to preserve the process ID, streams, and signals. Invoking the executable with Node prints the Bun requirement before loading CLI dependencies.
+
+The library supports Node 24 or newer and Bun 1.3.14 or newer.
+
+The CLI runs under Bun; the library imports from Node 24 and Bun. `verifyPublishable.bunOnlyBins` declares this, so release verification runs the CLI under Bun and records its Node row as not asked.
+
+Node consumers need the built npm package and a built Node-compatible `@bearly/flock` dependency. Installing TypeScript source beneath `node_modules` does not provide that distribution.
+
+Node library operations have been exercised on Linux. Node transport and graph operations on macOS remain unmeasured.
+
+The built flock artifact passes Node 24 acquire, contention, release and reacquire checks on Linux and macOS; see the [CI run](https://github.com/beorn/git-super/actions/runs/36963859423).
 
 The package name is reserved; this first source release is not yet on npm. Clone it, install its public dependencies, and put its executable on `PATH` for one command:
 
@@ -276,7 +286,7 @@ bun run typecheck
 
 The package depends only on published packages: `@bearly/flock`, `@silvery/command`, `@silvery/commander`, `react`, and `silvery`. It contains no scheduler, no delivery daemon, no task tracker, and no imports from any host repository.
 
-Library consumers may import the root `git-super` surface, or `git-super/gitlink` for exact index-pin writes, `git-super/commit-graph` for frozen submodule descriptors, `git-super/objects` for exact-object loading, `git-super/submodule-origin` for remote resolution, `git-super/worktree` for injected worktree mechanics, and `git-super/submodules` for recursive materialization.
+Library consumers may import the root `git-super` surface, or `git-super/gitlink` for exact index-pin writes, `git-super/commit-graph` for frozen submodule descriptors, `git-super/objects` for exact-object loading, `git-super/submodule-origin` for remote resolution, `git-super/worktree` for injected worktree mechanics, `git-super/status` for recursive repository inventory and status, and `git-super/submodules` for recursive materialization.
 
 `GitWorktreeStore.inspectRemoval(path, { excludedSubmodules? })` checks excluded checkout and store custody without writer leases, retention or rehoming, and returns `notCompared`, `consultedRepositories` and `uninitializedSubmodules` from the existing status population. This read-only inspection is a snapshot, not permission: `remove` rechecks admission under its mutation lock. Uninitialized included components remain observations; a caller such as Bearly may require initialization before it can classify their ignored content. Exclusions select skipped components and do not change the store's default removal policy.
 

@@ -1,5 +1,6 @@
 import { existsSync, realpathSync } from "node:fs"
 import { spawnSync } from "node:child_process"
+import { setTimeout as delay } from "node:timers/promises"
 import { appendFile } from "node:fs/promises"
 import { isAbsolute, join, relative, resolve, sep } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -157,7 +158,7 @@ export function createGit(
     for (let attempt = 1; attempt <= 20; attempt += 1) {
       result = await run(repo, args, true)
       if (result.code === 0 || !result.stderr.includes("could not lock config file")) return result
-      await Bun.sleep(attempt * 5)
+      await delay(attempt * 5)
     }
     if (result === undefined) throw new Error("git-super: Git config retry did not run")
     return result

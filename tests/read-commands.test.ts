@@ -246,7 +246,7 @@ describe("Phase 1 read commands", () => {
     ])
   })
 
-  test("status lists the files of a nested gitlink that an unstaged pin move adds", () => {
+  test("status reports an unstaged pin move as a modified gitlink and expands a staged nested gitlink", () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-added-nested-status-"))
     roots.push(fixtureRoot)
     const fixture = createProductFixture(fixtureRoot)
@@ -260,9 +260,42 @@ describe("Phase 1 read commands", () => {
     git(alphaCheckout, "checkout", "-q", alphaWithNested)
     git(alphaCheckout, "-c", "protocol.file.allow=always", "submodule", "update", "-q", "--init")
 
-    const result = superStatus({ repo: fixture.product })
+    // Unstaged pin move reports the modified gitlink; clean committed files in the submodule are not dirty (27069).
+    const unstaged = superStatus({ repo: fixture.product })
+    expect(unstaged.records).toEqual([" M packages/alpha"])
+    expect(unstaged.records.some((record) => record.endsWith("packages/alpha/apps/maddoc/leaf.ts"))).toBe(false)
 
-    expect(result.records.some((record) => record.endsWith("packages/alpha/apps/maddoc/leaf.ts"))).toBe(true)
+    // Staged pin move expands the nested gitlink changes.
+    git(fixture.product, "add", "packages/alpha")
+    const staged = superStatus({ repo: fixture.product })
+    expect(staged.records.some((record) => record.endsWith("packages/alpha/apps/maddoc/leaf.ts"))).toBe(true)
+  })
+
+  /**
+   * @failure GitSuper status reported committed files between an old index pin and a new checkout pin as modified
+   * worktree files, disagreeing with owning Git which reports them clean (#27069).
+   * @level l1
+   * @consumer git-super status and worktree cleanliness checks
+   * @testonly none
+   */
+  test("status agrees with owning Git that a committed submodule file is clean across an unstaged pin move (#27069)", () => {
+    const fixtureRoot = mkdtempSync(join(canonicalTmpdir(), "git-super-submodule-clean-pin-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const alphaHead = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 4\n")
+    const alphaCheckout = join(fixture.product, "packages/alpha")
+    git(alphaCheckout, "fetch", "-q", "origin")
+    git(alphaCheckout, "checkout", "-q", alphaHead)
+
+    // Submodule working tree is clean; owning git status in packages/alpha has no modified files.
+    // GitSuper status must report the moved gitlink, but must NOT report alpha.ts as modified (AC1, AC2).
+    const cleanStatus = superStatus({ repo: fixture.product })
+    expect(cleanStatus.records).toEqual([" M packages/alpha"])
+
+    // A genuinely dirty file inside the submodule still appears with its owning repository path (AC3).
+    writeFileSync(join(alphaCheckout, "alpha.ts"), "export const alpha = 999\n")
+    const dirtyStatus = superStatus({ repo: fixture.product })
+    expect(dirtyStatus.records).toEqual([" M packages/alpha", " M packages/alpha/alpha.ts"])
   })
 
   /**

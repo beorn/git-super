@@ -259,17 +259,8 @@ function statusRepository(
       const indexPin = indexed.get(path)
       if (headPin !== undefined && indexPin !== undefined) {
         const indexDiff = diffRecords(nestedRoot, headPin, indexPin, "index", nestedPrefix, excludedSubmodules)
-        const checkoutDiff = diffRecords(
-          nestedRoot,
-          indexPin,
-          checkoutPin,
-          "worktree",
-          nestedPrefix,
-          excludedSubmodules,
-        )
         const indexRecords = indexDiff.records
-        const checkoutRecords = checkoutDiff.records
-        for (const observation of [...indexDiff.notCompared, ...checkoutDiff.notCompared]) {
+        for (const observation of indexDiff.notCompared) {
           notCompared.push(observation)
           if (observation.reason === "unreadable") {
             submoduleProblems.push({
@@ -283,10 +274,7 @@ function statusRepository(
         if (headPin !== indexPin && indexRecords.length === 0 && indexDiff.notCompared.length === 0) {
           nestedRecords.push(`M  ${nestedPrefix}`)
         }
-        nestedRecords.push(...checkoutRecords)
-        if (indexPin !== checkoutPin && checkoutRecords.length === 0 && checkoutDiff.notCompared.length === 0) {
-          nestedRecords.push(` M ${nestedPrefix}`)
-        }
+        if (indexPin !== checkoutPin) nestedRecords.push(` M ${nestedPrefix}`)
       }
       const nested = statusRepository(
         nestedRoot,
