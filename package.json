@@ -72,6 +72,10 @@
         "types": "./dist/pull.d.ts",
         "import": "./dist/pull.js"
       },
+      "./push-intent": {
+        "types": "./dist/push-intent.d.ts",
+        "import": "./dist/push-intent.js"
+      },
       "./push": {
         "types": "./dist/push.d.ts",
         "import": "./dist/push.js"
@@ -139,6 +143,7 @@
       "src/objects.ts",
       "src/process.ts",
       "src/pull.ts",
+      "src/push-intent.ts",
       "src/push.ts",
       "src/result.ts",
       "src/status.ts",
