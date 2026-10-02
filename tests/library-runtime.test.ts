@@ -6,11 +6,12 @@
  * process.test.ts owns the Bun CLI/fd3 lifecycle; its Bun launch helpers cannot run under Node.
  */
 import { afterEach, expect, test, vi } from "vitest"
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
+import { setTimeout as delay } from "node:timers/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { execFileSync } from "node:child_process"
-import { delegateNativeGit, nativeGitExecutable } from "../src/process.ts"
+import { createLocalGitProcess, delegateNativeGit, nativeGitExecutable, readNativeGit } from "../src/process.ts"
 
 const roots: string[] = []
 afterEach(() => {
@@ -70,4 +71,97 @@ test("native delegation allows Bun and gives Node the named CLI floor refusal", 
     expect(stdout).toMatch(/^git version /u)
     expect(stderr).toBe("")
   }
+})
+
+function installGit(body: string): string {
+  const root = mkdtempSync(join(tmpdir(), "git-super-library-child-"))
+  roots.push(root)
+  writeFileSync(join(root, "git"), `#!${process.execPath}\n${body}\n`, { mode: 0o755 })
+  vi.stubEnv("PATH", root)
+  return root
+}
+
+// The existing Bun-only CLI suite cannot execute the library transport on Node.
+// Real children witness pipe capacity, async exec failure and process settlement without a test-only port.
+test("raw and local library captures preserve their distinct environment and stdin policies", async () => {
+  const root = installGit(`
+const input = []
+for await (const chunk of process.stdin) input.push(Buffer.from(chunk))
+process.stdout.write(JSON.stringify({ args: process.argv.slice(2), dir: process.env.GIT_DIR, policy: process.env.GIT_CONFIG_COUNT, locale: process.env.LC_ALL }) + "\\n")
+process.stdout.write(Buffer.concat(input))
+process.stderr.write(" raw stderr \\n")
+`)
+  vi.stubEnv("GIT_DIR", "/inherited-pointer")
+  vi.stubEnv("GIT_CONFIG_COUNT", "0")
+  vi.stubEnv("LC_ALL", "caller-locale")
+  const raw = await readNativeGit(["opaque"])
+  expect(raw).toEqual({
+    code: 0,
+    stdout:
+      JSON.stringify({ args: ["opaque"], dir: "/inherited-pointer", policy: "0", locale: "caller-locale" }) + "\n",
+    stderr: " raw stderr \n",
+  })
+  const input = "a\u0000λ\n".repeat(32768)
+  const local = await createLocalGitProcess().run({ repo: root, args: ["opaque"], stdin: input })
+  expect(local).toEqual({
+    code: 0,
+    stdout: JSON.stringify({ args: ["-C", root, "opaque"], policy: "0", locale: "caller-locale" }) + "\n" + input,
+    stderr: "raw stderr",
+  })
+})
+
+test("an early stdin close cannot replace the Git exit result with EPIPE", async () => {
+  const root = installGit('process.stderr.write("native refusal\\n"); process.exit(23)')
+  const result = await createLocalGitProcess().run({ repo: root, args: ["opaque"], stdin: "x".repeat(1024 * 1024) })
+  expect(result).toEqual({ code: 23, stdout: "", stderr: "native refusal" })
+})
+
+test("a signaled native child reports the signal as a failure", async () => {
+  const root = installGit('process.kill(process.pid, "SIGTERM")')
+  const result = await createLocalGitProcess().run({ repo: root, args: ["opaque"] })
+  expect(result.code).not.toBe(0)
+  expect(result.signal).toBe("SIGTERM")
+  expect(result.failure).toContain("SIGTERM")
+})
+
+test("an asynchronous executable launch error settles with a named failure", async () => {
+  const root = installGit("")
+  writeFileSync(join(root, "git"), "#!/git-super-test-missing-interpreter\n", { mode: 0o755 })
+  const result = await createLocalGitProcess().run({ repo: root, args: ["opaque"] })
+  expect(result.code).not.toBe(0)
+  expect(result.failure).toContain("ENOENT")
+})
+
+test("abort before launch refuses and abort during launch settles the real child", async () => {
+  const root = installGit(`
+import { writeFileSync } from "node:fs"
+writeFileSync(process.env.MARKER, String(process.pid))
+setInterval(() => {}, 1000)
+`)
+  const marker = join(root, "started")
+  const before = new AbortController()
+  before.abort()
+  const git = createLocalGitProcess()
+  const refused = await git.run({ repo: root, args: ["opaque"], signal: before.signal, env: { MARKER: marker } })
+  expect(refused.code).not.toBe(0)
+  expect(refused.failure).toMatch(/abort/iu)
+  expect(existsSync(marker)).toBe(false)
+  const during = new AbortController()
+  const running = git.run({
+    repo: root,
+    args: ["opaque"],
+    signal: during.signal,
+    timeoutMs: 2000,
+    env: { MARKER: marker },
+  })
+  try {
+    const deadline = Date.now() + 1000
+    while (!existsSync(marker) && Date.now() < deadline) await delay(5)
+    expect(existsSync(marker), "native child did not launch").toBe(true)
+  } finally {
+    during.abort()
+  }
+  const stopped = await running
+  expect(stopped.code).not.toBe(0)
+  expect(stopped.failure).toMatch(/abort|SIGTERM/iu)
 })
