@@ -14,7 +14,61 @@ import { advanceRepository, createRepository, git } from "./fixture.ts"
 
 const cli = fileURLToPath(new URL("../bin/git-super", import.meta.url))
 
+function completeSyscalls(lines: readonly string[]): string[] {
+  const complete: string[] = []
+  const pending = new Map<string, { syscall: string; prefix: string; index: number }>()
+  for (const line of lines) {
+    const unfinished = /^(\d+)\s+(\w+)\(.*<unfinished \.\.\.>$/u.exec(line)
+    if (unfinished) {
+      const [, pid, syscall] = unfinished
+      if (pending.has(pid!)) throw new Error(`Duplicate unfinished strace syscall for PID ${pid}`)
+      pending.set(pid!, {
+        syscall: syscall!,
+        prefix: line.slice(0, line.lastIndexOf("<unfinished")).trimEnd(),
+        index: complete.length,
+      })
+      complete.push(line)
+      continue
+    }
+    const resumed = /^(\d+)\s+<\.\.\. (\w+) resumed>(.*)$/u.exec(line)
+    if (resumed) {
+      const [, pid, syscall, suffix] = resumed
+      const start = pending.get(pid!)
+      if (!start || start.syscall !== syscall) {
+        throw new Error(`Unmatched resumed strace syscall ${syscall} for PID ${pid}`)
+      }
+      complete[start.index] = `${start.prefix}${suffix}`
+      pending.delete(pid!)
+      continue
+    }
+    complete.push(line)
+  }
+  if (pending.size > 0) throw new Error(`Unpaired unfinished strace syscall for PID ${[...pending.keys()].join(", ")}`)
+  return complete
+}
+
 it("finished merge and root merge-base never access an excluded populated store under strace (27058)", () => {
+  // Native scheduling may split rows nondeterministically; pin the interleaved
+  // framing here so missing paths or ENOENT results can never be discarded.
+  expect(
+    completeSyscalls([
+      '1 newfstatat(AT_FDCWD, "child/.git" <unfinished ...>',
+      '2 openat(AT_FDCWD, "store/HEAD", O_RDONLY <unfinished ...>',
+      "1 <... newfstatat resumed>, 0x1, 0) = -1 ENOENT",
+      "2 <... openat resumed>) = 3<store/HEAD>",
+    ]),
+  ).toEqual([
+    '1 newfstatat(AT_FDCWD, "child/.git", 0x1, 0) = -1 ENOENT',
+    '2 openat(AT_FDCWD, "store/HEAD", O_RDONLY) = 3<store/HEAD>',
+  ])
+  for (const malformed of [
+    ['1 newfstatat(AT_FDCWD, "child/.git" <unfinished ...>'],
+    ["1 <... newfstatat resumed>, 0x1, 0) = -1 ENOENT"],
+    ['1 newfstatat(AT_FDCWD, "child/.git" <unfinished ...>', "1 <... openat resumed>) = 3"],
+    ['1 newfstatat(AT_FDCWD, "child/.git" <unfinished ...>', '1 openat(AT_FDCWD, "store/HEAD" <unfinished ...>'],
+  ]) {
+    expect(() => completeSyscalls(malformed)).toThrow(/strace syscall/u)
+  }
   const available = spawnSync("strace", ["--version"], { encoding: "utf8" })
   if (available.error || available.status !== 0) {
     throw new Error("NOT RUN: native exclusion proof requires strace; report this row explicitly on unsupported hosts")
@@ -73,7 +127,7 @@ it("finished merge and root merge-base never access an excluded populated store 
       writeFileSync(retainedTrace, readFileSync(trace))
       expect(result.error, `${name}: ${result.stderr}`).toBeUndefined()
       expect(result.status, `${name}: ${result.stdout}\n${result.stderr}`).toBe(0)
-      const lines = readFileSync(trace, "utf8").split("\n")
+      const lines = completeSyscalls(readFileSync(trace, "utf8").split("\n"))
       // Keep -yy descriptor identities for every syscall, including writes.
       // Read/write buffers and execve argv mention paths without accessing them.
       const accesses = lines.map((line) => {
