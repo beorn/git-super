@@ -5,6 +5,7 @@ import { afterEach, describe, expect, test } from "vitest"
 
 import { changedCommitGitlinks, readCommitSubmodules } from "../src/commit-graph.ts"
 import { superDiff } from "../src/diff.ts"
+import { classifyExcludedPath } from "../src/status.ts"
 import { createLocalGitProcess, type GitProcess } from "../src/process.ts"
 import { advanceRepository, createProductFixture, git } from "./fixture.ts"
 
@@ -15,6 +16,77 @@ afterEach(() => {
 })
 
 describe("commit submodule graph", () => {
+  /**
+   * @failure Create classifies staged additions/removals from HEAD or invents an absent directory despite staged content (27058).
+   * @level l1
+   * @consumer Git-super stage-0 exclusion classification
+   */
+  // Frozen-tree coverage cannot witness an index that differs from HEAD; use the same native parent boundary.
+  test.each(["addition", "removal", "directory", "unmerged"] as const)(
+    "retains native index identity for %s without writing parent objects or probing a child",
+    async (kind) => {
+      const root = mkdtempSync(join(tmpdir(), "git-super-selected-index-"))
+      roots.push(root)
+      const fixture = createProductFixture(root)
+      const path = kind === "removal" ? "packages/alpha" : "vendor/private"
+      if (kind === "removal") {
+        git(fixture.product, "update-index", "--force-remove", path)
+        git(fixture.product, "config", "--file", ".gitmodules", "--remove-section", "submodule.packages/alpha")
+      } else if (kind === "directory") {
+        mkdirSync(join(fixture.product, path))
+        writeFileSync(join(fixture.product, path, "file.txt"), "staged content\n")
+        git(fixture.product, "add", path)
+      } else {
+        git(fixture.product, "config", "--file", ".gitmodules", "submodule.private.path", path)
+        git(fixture.product, "config", "--file", ".gitmodules", "submodule.private.url", fixture.alpha)
+        git(fixture.product, "update-index", "--add", "--cacheinfo", `160000,${fixture.alphaBase},${path}`)
+      }
+      git(fixture.product, "add", ".gitmodules")
+      const manifestObjectId = git(fixture.product, "rev-parse", ":.gitmodules")
+      if (kind === "unmerged") {
+        git(fixture.product, "update-index", "--force-remove", path)
+        const row = `160000 ${fixture.alphaBase} 1\t${path}\n`
+        const result = Bun.spawnSync(["git", "-C", fixture.product, "update-index", "--index-info"], {
+          stdin: Buffer.from(row),
+        })
+        expect(result.exitCode).toBe(0)
+      }
+      const objectsBefore = git(fixture.product, "count-objects", "-v")
+      const local = createLocalGitProcess()
+      const process: GitProcess = {
+        run(request) {
+          if (request.repo !== fixture.product) throw new Error(`child repository was probed: ${request.repo}`)
+          return local.run(request)
+        },
+      }
+      const reading = readCommitSubmodules(process, fixture.product, fixture.productBase, {
+        excludedSubmodules: [path],
+        source: "index",
+      })
+      if (kind === "unmerged") {
+        await expect(reading).rejects.toMatchObject({ resultDetail: { code: "unmerged-target-index", paths: [path] } })
+      } else {
+        const result = await reading
+        const selected = result.selectedPaths[0]!
+        expect(selected.index).toMatchObject({ source: "index", manifestObjectId })
+        expect(selected.index!.entries.map((entry) => entry.path)).toEqual(
+          kind === "removal" ? [] : [kind === "directory" ? `${path}/file.txt` : path],
+        )
+        const classification = classifyExcludedPath(
+          path,
+          [{ ...selected, repository: fixture.product, head: fixture.productBase }],
+          "absent",
+        )
+        expect(classification.classification).toBe(
+          kind === "addition" ? "declared" : kind === "removal" ? "absent" : "unclassified",
+        )
+        expect(classification.parents[0]!.head).toBe(fixture.productBase)
+      }
+      expect(git(fixture.product, "rev-parse", "HEAD")).toBe(fixture.productBase)
+      expect(git(fixture.product, "count-objects", "-v")).toBe(objectsBefore)
+    },
+  )
+
   /**
    * @failure Removal cannot distinguish absent private identity from a tree/config disagreement without opening the child (27058).
    * @level l1

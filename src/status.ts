@@ -43,7 +43,12 @@ export function classifyExcludedPath(
       parent.treeEntry?.mode === "160000" && parent.treeEntry.type === "commit" && parent.declarations.length === 1,
   )
   const absent =
-    parents.every((parent) => parent.treeEntry === null && parent.declarations.length === 0) &&
+    parents.every(
+      (parent) =>
+        parent.treeEntry === null &&
+        parent.declarations.length === 0 &&
+        (parent.index === undefined || parent.index.entries.length === 0),
+    ) &&
     (checkout === "absent" || checkout === "empty")
   return { classification: declared ? "declared" : absent ? "absent" : "unclassified", parents, checkout }
 }

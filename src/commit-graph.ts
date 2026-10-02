@@ -1,6 +1,6 @@
 import type { GitProcess, GitProcessResult } from "./process.ts"
 import type { GitResultDetail } from "./result.ts"
-import { validateExcludedSubmodules } from "./git.ts"
+import { parseIndexEntries, validateExcludedSubmodules, type IndexEntry } from "./git.ts"
 
 export type CommitGitlink = Readonly<{ path: string; target: string }>
 export type CommitSubmodule = CommitGitlink & Readonly<{ name: string; url?: string; branch?: string }>
@@ -10,6 +10,8 @@ export type SelectedCommitPath = Readonly<{
   path: string
   treeEntry: Readonly<{ mode: string; type: string; objectId: string }> | null
   declarations: readonly Readonly<{ name: string; path: string }>[]
+  /** Stage-0 identity is distinct from the actual frozen HEAD carried by its consumer. */
+  index?: Readonly<{ source: "index"; manifestObjectId: string | null; entries: readonly IndexEntry[] }>
 }>
 
 export type SelectedCommitSubmodules = Readonly<{
@@ -48,15 +50,16 @@ export function readCommitSubmodules(
   git: GitProcess,
   repository: string,
   commit: string,
-  selection: Readonly<{ excludedSubmodules: readonly string[] }>,
+  selection: Readonly<{ excludedSubmodules: readonly string[]; source?: "head" | "index" }>,
 ): Promise<SelectedCommitSubmodules>
 export async function readCommitSubmodules(
   git: GitProcess,
   repository: string,
   commit: string,
-  selection?: Readonly<{ excludedSubmodules: readonly string[] }>,
+  selection?: Readonly<{ excludedSubmodules: readonly string[]; source?: "head" | "index" }>,
 ): Promise<CommitSubmodule[] | SelectedCommitSubmodules> {
   validateExcludedSubmodules(selection?.excludedSubmodules)
+  if (selection?.source === "index") return readIndexSubmodules(git, repository, commit, selection.excludedSubmodules)
   const selected = new Set(selection?.excludedSubmodules ?? [])
   const selectedTreeEntries = new Map<string, NonNullable<SelectedCommitPath["treeEntry"]>>()
   const treeArgs = ["ls-tree", "-r", ...(selection === undefined ? [] : ["-t"]), "-z", "--full-tree", commit]
@@ -187,6 +190,91 @@ export async function readCommitSubmodules(
           .filter((entry) => /^submodule\..*\.(path|url|branch)\n/u.test(entry))
           .join("\0")
   return finish(parseCommitSubmoduleConfig(configuration, commit))
+}
+
+/** Collect stage-0 evidence without synthesizing a tree/commit or consulting any child checkout. */
+async function readIndexSubmodules(
+  git: GitProcess,
+  repository: string,
+  head: string,
+  selected: readonly string[],
+): Promise<SelectedCommitSubmodules> {
+  const args = ["ls-files", "--stage", "-z"]
+  const output = await git.run({ repo: repository, args })
+  if (gitProcessFailed(output)) throw operationError(repository, "read-target-index", args, output)
+  const entries = parseIndexEntries(output.stdout)
+  const unmerged = entries.filter((entry) => entry.stage !== 0)
+  if (unmerged.length > 0) {
+    const message = `Index in ${repository} has unmerged entries; resolve every named path to stage 0 before classification.`
+    throw Object.assign(new Error(message), {
+      resultDetail: detail("unmerged-target-index", "read-target-index", message, {
+        paths: [...new Set(unmerged.map((entry) => entry.path))],
+        remedy: "Resolve and stage the named conflicts, then rerun the same materialization.",
+      }),
+    })
+  }
+  const manifest = entries.find((entry) => entry.path === ".gitmodules")
+  if (manifest !== undefined && !/^100[0-9]{3}$/u.test(manifest.mode)) {
+    throw Object.assign(new Error(`Index in ${repository} has an invalid .gitmodules entry.`), {
+      resultDetail: detail(
+        "invalid-target-manifest",
+        "read-target-index",
+        "Stage-0 .gitmodules must be a regular blob.",
+        { paths: [".gitmodules"] },
+      ),
+    })
+  }
+  const configuration = new Map<string, ConfiguredSubmodule>()
+  if (manifest !== undefined) {
+    // Read the captured blob oid rather than a later index state; HEAD remains a separate identity.
+    const configuredArgs = ["config", "--null", "--blob", manifest.objectId, "--list"]
+    const configured = await git.run({ repo: repository, args: configuredArgs })
+    if (gitProcessFailed(configured)) {
+      throw operationError(repository, "read-target-submodules", configuredArgs, configured)
+    }
+    for (const [name, value] of parseCommitSubmoduleConfig(
+      configured.stdout
+        .split("\0")
+        .filter((row) => /^submodule\..*\.(path|url|branch)\n/u.test(row))
+        .join("\0"),
+      head,
+    )) {
+      configuration.set(name, value)
+    }
+  }
+  const gitlinks = new Map(
+    entries.filter((entry) => entry.mode === "160000").map((entry) => [entry.path, entry.objectId]),
+  )
+  validateExcludedSubmodules([...gitlinks.keys()])
+  return {
+    selectedPaths: selected.map((path) => {
+      const entry = entries.find((candidate) => candidate.path === path)
+      return {
+        path,
+        treeEntry:
+          entry === undefined
+            ? null
+            : { mode: entry.mode, type: entry.mode === "160000" ? "commit" : "blob", objectId: entry.objectId },
+        declarations: [...configuration]
+          .filter(([, configured]) => configured.path === path)
+          .map(([name]) => ({ name, path })),
+        index: {
+          source: "index",
+          manifestObjectId: manifest?.objectId ?? null,
+          entries: entries.filter((candidate) => candidate.path === path || candidate.path.startsWith(`${path}/`)),
+        },
+      }
+    }),
+    submodules: joinCommitSubmodules(
+      new Map([...gitlinks].filter(([path]) => !selected.includes(path))),
+      new Map(
+        [...configuration].filter(
+          ([, configured]) => configured.path === undefined || !selected.includes(configured.path),
+        ),
+      ),
+      head,
+    ),
+  }
 }
 
 type ConfiguredSubmodule = { path?: string; url?: string; branch?: string }

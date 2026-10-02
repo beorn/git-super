@@ -2,17 +2,27 @@ import { spawnSync } from "node:child_process"
 
 export type IndexGitlink = Readonly<{ path: string; indexPin: string | undefined }>
 
-/** Parent index metadata only; shared by status and comparisons. */
-export function indexGitlinks(root: string, indexFile?: string): IndexGitlink[] {
-  return runGit(root, ["ls-files", "--stage", "-z"], indexFile)
+export type IndexEntry = Readonly<{ path: string; mode: string; objectId: string; stage: number }>
+
+/** The native NUL index format shared by comparison and frozen parent evidence. */
+export function parseIndexEntries(raw: string): IndexEntry[] {
+  return raw
     .split("\0")
     .filter(Boolean)
     .map((field) => {
-      const match = /^160000 ([0-9a-f]{40}) ([0-3])\t(.+)$/u.exec(field)
-      const path = match?.[3]
-      return path === undefined ? undefined : { indexPin: match?.[2] === "0" ? match[1] : undefined, path }
+      const match = /^([0-7]{6}) ([0-9a-f]{40,64}) ([0-3])\t(.+)$/su.exec(field)
+      if (match?.[1] === undefined || match[2] === undefined || match[3] === undefined || match[4] === undefined) {
+        throw new Error(`git super: malformed native index entry ${JSON.stringify(field)}; reread ls-files --stage -z`)
+      }
+      return { mode: match[1], objectId: match[2], stage: Number(match[3]), path: match[4] }
     })
-    .filter((value): value is IndexGitlink => value !== undefined)
+}
+
+/** Parent index metadata only; shared by status and comparisons. */
+export function indexGitlinks(root: string, indexFile?: string): IndexGitlink[] {
+  return parseIndexEntries(runGit(root, ["ls-files", "--stage", "-z"], indexFile))
+    .filter((entry) => entry.mode === "160000")
+    .map((entry) => ({ path: entry.path, indexPin: entry.stage === 0 ? entry.objectId : undefined }))
     .sort((left, right) => left.path.localeCompare(right.path))
 }
 
