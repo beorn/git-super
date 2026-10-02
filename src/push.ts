@@ -16,6 +16,7 @@ import { ensureCommitObject } from "./objects.ts"
 import { createProgressReporter } from "./progress.ts"
 import {
   frozenExclusionPaths,
+  hasHostedIdentity,
   readFrozenPushIntent,
   readFrozenPushIntents,
   encodePushIntent,
@@ -1064,12 +1065,17 @@ export async function capturePushIntent(
     const pins = new Map((await readCommitSubmodules(git, root, tree)).map((entry) => [entry.path, entry.target]))
     for (const path of [...excludedSubmodules].sort()) {
       const pin = pins.get(path)
-      if (pin === undefined) throw new Error(`Excluded submodule ${path} is not a root gitlink of the merge tree ${tree}`)
+      if (pin === undefined) {
+        throw new Error(`Excluded submodule ${path} is not a root gitlink of the merge tree ${tree}`)
+      }
       excluded.push({ path, pin })
     }
   }
   if (requirements.length === 0 && excluded.length === 0) return undefined
   const rootRemote = await logicalPushUrl(git, root, await configuredPushRemote(git, root))
+  // A merge that only excludes, on a root with no hosted identity, freezes nothing, exactly as before 27147: an intent
+  // names a hosted root, and a local-root merge must keep working (@chief 62bf860d). Its push walks unfrozen.
+  if (requirements.length === 0 && !hasHostedIdentity(rootRemote)) return undefined
   const changed = await changedRowPaths(
     git,
     await readCommitGitlinks(git, root, head),

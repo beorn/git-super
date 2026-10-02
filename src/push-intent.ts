@@ -80,6 +80,19 @@ export function hostedRemoteIdentity(
   return { host, namespace: parts.slice(0, -1).join("/"), repository: path }
 }
 
+/** Whether `remote` names a hosted repository; a local path or file URL does not, and nothing else is swallowed. */
+export function hasHostedIdentity(remote: string): boolean {
+  try {
+    hostedRemoteIdentity(remote)
+    return true
+  } catch (error) {
+    if ((error as { resultDetail?: { code?: string } }).resultDetail?.code === "invalid-frozen-push-intent") {
+      return false
+    }
+    throw error
+  }
+}
+
 export function sameHostedOwner(left: string, right: string): boolean {
   const a = hostedRemoteIdentity(left)
   const b = hostedRemoteIdentity(right)
