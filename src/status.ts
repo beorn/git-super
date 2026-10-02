@@ -111,6 +111,7 @@ function statusRepository(
     runGit(
       root,
       [
+        "--no-optional-locks",
         "-c",
         "status.renames=false",
         "status",

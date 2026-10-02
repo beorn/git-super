@@ -21,7 +21,7 @@ import { tryAcquireFlock, type FlockHandle } from "@bearly/flock"
 import { fileLockHolders, formatLockHolders } from "@bearly/flock/holders"
 import { spawnSync } from "node:child_process"
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
-import { inspectUninitializedCheckout, superStatus } from "./status.ts"
+import { inspectUninitializedCheckout, superStatus, type SuperStatusResult } from "./status.ts"
 import { readCommitSubmodules } from "./commit-graph.ts"
 import { validateExcludedSubmodules } from "./git.ts"
 import type { GitProcess } from "./process.ts"
@@ -382,6 +382,17 @@ function rehomeBorrowerCandidates(
   return [...rehomedBorrowers]
 }
 
+/** Removal never treats an unreadable included repository as an absent population member. */
+export function inspectRemovalStatus(path: string, excludedSubmodules: readonly string[] = []): SuperStatusResult {
+  const status = superStatus({ repo: path, excludedSubmodules })
+  if (status.submoduleProblems.length > 0) {
+    throw new Error(
+      `worktree ${path} has unknown submodule state: ${status.submoduleProblems.map((problem) => `${problem.path}: ${problem.reason}${problem.gitDir === undefined ? "" : ` (gitdir ${problem.gitDir})`}`).join("; ")}; preserve and resolve it before removal`,
+    )
+  }
+  return status
+}
+
 /** The existing status walker owns repository discovery; every native status is exact, including gitlink changes. */
 async function cleanSnapshot(
   git: Git,
@@ -389,12 +400,7 @@ async function cleanSnapshot(
   inspect: (repository: string, path: string) => Promise<WorktreeInspection>,
   excludedSubmodules: readonly string[] = [],
 ): Promise<readonly Readonly<{ path: string; head: string }>[]> {
-  const status = superStatus({ repo: path, excludedSubmodules })
-  if (status.submoduleProblems.length > 0) {
-    throw new Error(
-      `worktree ${path} has unknown submodule state: ${status.submoduleProblems.map((problem) => `${problem.path}: ${problem.reason}${problem.gitDir === undefined ? "" : ` (gitdir ${problem.gitDir})`}`).join("; ")}; preserve and resolve it before removal`,
-    )
-  }
+  const status = inspectRemovalStatus(path, excludedSubmodules)
   if (status.records.length > 0) {
     throw new Error(`worktree ${path} is dirty: ${status.records.join("; ")}; preserve its changes before removal`)
   }

@@ -7,6 +7,7 @@ import { createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS } from "./exclusive.ts"
 import {
   acquireRemovalWriterLeases,
   assertExcludedRemovalCustody,
+  inspectRemovalStatus,
   prepareRemovalBorrowers,
   retainWorktreeModules,
   type WorktreeRetention,
@@ -15,6 +16,7 @@ import { cleanGitEnvironment } from "./git.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
 import { createProgressReporter } from "./progress.ts"
 import { materializeSubmodulesWithProcess } from "./submodules.ts"
+import type { SuperStatusResult } from "./status.ts"
 
 export type GitResult = Readonly<{ code: number; stdout: string; stderr: string }>
 export type Git = ReturnType<typeof createGit>
@@ -307,6 +309,23 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       return { code: result.code, stdout: result.stdout, stderr: result.stderr }
     },
   })
+  const prepareRemoval = async (path: string, excludedSubmodules?: readonly string[]) => {
+    const gitDir = realpathSync(await git.text(path, ["rev-parse", "--absolute-git-dir"]))
+    const checkoutObservations = await assertExcludedRemovalCustody(
+      git,
+      configuredProcess(),
+      path,
+      gitDir,
+      excludedSubmodules,
+    )
+    const common = realpathSync(await git.text(path, ["rev-parse", "--path-format=absolute", "--git-common-dir"]))
+    const rehome = await prepareRemovalBorrowers(git, configuredProcess(), path, common, gitDir, excludedSubmodules)
+    return {
+      gitDir,
+      rehome,
+      notCompared: [...checkoutObservations, ...rehome.notCompared],
+    }
+  }
   const runWithMutationLock = async <Result>(
     dir: string,
     holder: string,
@@ -422,23 +441,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         if (removeOptions.retention !== undefined && removeOptions.unlock === true) {
           throw new Error(`retained worktree removal cannot unlock ${path}; resolve its holder first`)
         }
-        const gitDir = realpathSync(await git.text(path, ["rev-parse", "--absolute-git-dir"]))
-        const checkoutObservations = await assertExcludedRemovalCustody(
-          git,
-          configuredProcess(),
-          path,
-          gitDir,
-          removeOptions.excludedSubmodules,
-        )
-        const common = realpathSync(await git.text(path, ["rev-parse", "--path-format=absolute", "--git-common-dir"]))
-        const rehome = await prepareRemovalBorrowers(
-          git,
-          configuredProcess(),
-          path,
-          common,
-          gitDir,
-          removeOptions.excludedSubmodules,
-        )
+        const { gitDir, rehome, notCompared } = await prepareRemoval(path, removeOptions.excludedSubmodules)
         const writerLeases = acquireRemovalWriterLeases(gitDir)
         try {
           if (removeOptions.retention !== undefined) {
@@ -452,7 +455,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
               writerLeases.created,
               rehome.run,
               removeOptions.excludedSubmodules,
-              [...checkoutObservations, ...rehome.notCompared],
+              notCompared,
             )
           } else {
             if (removeOptions.unlock === true) await unlockWorktree(git, repo, path)
@@ -483,6 +486,19 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
     },
     async inspect(path: string): Promise<WorktreeInspection> {
       return inspectWorktree(git, repo, path)
+    },
+    /** This read-only inspection is a snapshot, not permission: remove rechecks admission under its mutation lock. */
+    async inspectRemoval(
+      path: string,
+      inspectOptions: Readonly<{ excludedSubmodules?: readonly string[] }> = {},
+    ): Promise<Pick<SuperStatusResult, "notCompared" | "consultedRepositories" | "uninitializedSubmodules">> {
+      const prepared = await prepareRemoval(path, inspectOptions.excludedSubmodules)
+      const status = inspectRemovalStatus(path, inspectOptions.excludedSubmodules)
+      return {
+        notCompared: [...prepared.notCompared, ...status.notCompared],
+        consultedRepositories: status.consultedRepositories,
+        uninitializedSubmodules: status.uninitializedSubmodules,
+      }
     },
     async recoverDestroyed(path: string, operation = `recover destroyed worktree ${path}`): Promise<void> {
       await mutate(operation, async () => {
