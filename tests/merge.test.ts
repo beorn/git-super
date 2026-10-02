@@ -31,6 +31,200 @@ import {
 
 const roots: string[] = []
 
+describe("git super merge — excluded admission (27058)", () => {
+  /**
+   * @failure Merge probes an excluded child's populated retained store instead of preserving its unchanged pin.
+   * @level l1
+   * @consumer git-super merge callers selecting private components
+   * @testonly none; existing GitProcess records explicit requests, native access needs the separately required trace
+   */
+  it("keeps an unchanged excluded child as-written with a named omission and no child requests", async () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-merge-excluded-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const target = candidateWithRootChange(fixture, "excluded-target")
+    const path = "packages/alpha"
+    const checkout = join(fixture.product, path)
+    const pin = git(fixture.product, "rev-parse", `HEAD:${path}`)
+    const store = git(fixture.product, "rev-parse", "--path-format=absolute", "--git-path", `modules/${path}`)
+    git(fixture.product, "submodule", "deinit", "-f", "--", path)
+    const local = createLocalGitProcess()
+    const childRequests: GitProcessRequest[] = []
+    const recording: GitProcess = {
+      run(request) {
+        if ([checkout, store].some((selected) => request.repo === selected || request.repo.startsWith(`${selected}/`))) {
+          childRequests.push(request)
+          throw new Error(`excluded child request: ${request.repo}`)
+        }
+        return local.run(request)
+      },
+    }
+    const options = { repo: fixture.product, commit: target, excludedSubmodules: [path], git: recording }
+    const result = await superMerge(options)
+    expect(result).toMatchObject({ state: "updated", partial: false, notCompared: [{ path, reason: "excluded" }] })
+    expect(result.gitlinks).toContainEqual(expect.objectContaining({ path, state: "as-written" }))
+    expect(git(fixture.product, "rev-parse", `HEAD:${path}`)).toBe(pin)
+    expect(childRequests).toEqual([])
+  })
+
+  /**
+   * @failure Native merge-tree reads the excluded store before a moved-pin refusal is decided.
+   * @level l1
+   * @consumer git-super merge admission before native Git composition
+   * @testonly none
+   */
+  it.each(["target-moved", "head-moved", "both-moved", "both-same", "target-removed", "head-removed", "base-absent", "multiple-bases"])("refuses %s excluded identity before any merge-tree or merge request", async (shape) => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-merge-excluded-moved-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const path = "packages/alpha"
+    const original = git(fixture.product, "rev-parse", `HEAD:${path}`)
+    git(fixture.product, "submodule", "deinit", "-f", "--", path)
+    if (shape === "base-absent") {
+      git(fixture.product, "update-index", "--force-remove", path)
+      git(fixture.product, "commit", "-q", "-m", "base has no selected gitlink")
+    }
+    const moved = advanceRepository(fixture.alpha, "excluded-target.txt", "excluded target advance\n")
+    git(fixture.product, "switch", "-q", "-c", "excluded-moved-target")
+    if (["target-moved", "both-moved", "both-same"].includes(shape)) {
+      git(fixture.product, "update-index", "--cacheinfo", `160000,${moved},${path}`)
+    } else if (shape === "target-removed") {
+      git(fixture.product, "update-index", "--force-remove", path)
+    } else if (shape === "base-absent") {
+      git(fixture.product, "update-index", "--add", "--cacheinfo", `160000,${original},${path}`)
+    }
+    writeFileSync(join(fixture.product, "excluded-target-root.txt"), "target root change\n")
+    git(fixture.product, "add", "excluded-target-root.txt")
+    git(fixture.product, "commit", "-q", "-m", "move excluded target pin")
+    const target = git(fixture.product, "rev-parse", "HEAD")
+    git(fixture.product, "switch", "-q", "main")
+    if (["head-moved", "both-moved", "both-same"].includes(shape)) {
+      const headPin = shape === "both-moved" ? advanceRepository(fixture.alpha, "excluded-head.txt", "head advance\n") : moved
+      git(fixture.product, "update-index", "--cacheinfo", `160000,${headPin},${path}`)
+      git(fixture.product, "commit", "-q", "-m", "move excluded HEAD pin")
+    } else if (shape === "head-removed") {
+      git(fixture.product, "update-index", "--force-remove", path)
+      git(fixture.product, "commit", "-q", "-m", "remove excluded HEAD pin")
+    } else if (shape === "base-absent") {
+      git(fixture.product, "update-index", "--add", "--cacheinfo", `160000,${original},${path}`)
+      git(fixture.product, "commit", "-q", "-m", "add excluded HEAD pin")
+    }
+    const head = git(fixture.product, "rev-parse", "HEAD")
+    const local = createLocalGitProcess()
+    const unsafe: GitProcessRequest[] = []
+    const bases = injectionProbe()
+    const recording: GitProcess = {
+      run(request) {
+        // Distinct merge-base multiplicity, supplied at the existing process seam;
+        // the other table rows use real parent trees and their actual merge base.
+        if (shape === "multiple-bases" && request.repo === fixture.product && request.args[0] === "merge-base" && request.args.includes("--all")) {
+          bases.fire("multiple merge bases")
+          return Promise.resolve({ code: 0, stdout: `${head}\n${target}\n`, stderr: "" })
+        }
+        if (request.args[0] === "merge-tree" || request.args[0] === "merge" || request.repo.startsWith(`${fixture.product}/${path}`)) {
+          unsafe.push(request)
+          throw new Error(`admission must precede ${request.args[0]}`)
+        }
+        return local.run(request)
+      },
+    }
+    const options = { repo: fixture.product, commit: target, excludedSubmodules: [path], git: recording }
+    const result = await superMerge(options)
+    if (shape === "multiple-bases") bases.expectFired("multiple merge bases")
+    expect(result).toMatchObject({ state: "failed", detail: { paths: [path] } })
+    expect(unsafe).toEqual([])
+    expect(git(fixture.product, "rev-parse", "HEAD")).toBe(head)
+  })
+
+  /**
+   * @failure A separately selected nested path causes merge to enter its included owner to guess private identity.
+   * @level l1
+   * @consumer root-direct merge exclusions
+   * @testonly none
+   */
+  it("names a separately selected nested path before entering the included owner or native merge", async () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-merge-excluded-nested-"))
+    roots.push(root)
+    const fixture = createNestedProductFixture(root)
+    const target = candidateWithRootChange(fixture, "excluded-nested-target")
+    const path = "packages/alpha/apps/maddoc"
+    const local = createLocalGitProcess()
+    const unsafe: GitProcessRequest[] = []
+    const recording: GitProcess = { run(request) {
+      if (request.repo !== fixture.product || request.args[0] === "merge-tree" || request.args[0] === "merge") {
+        unsafe.push(request)
+        throw new Error(`nested exclusion must refuse before ${request.repo}: ${request.args[0]}`)
+      }
+      return local.run(request)
+    } }
+    const options = { repo: fixture.product, commit: target, excludedSubmodules: [path], git: recording }
+    const result = await superMerge(options)
+    expect(result).toMatchObject({ state: "failed", detail: { paths: [path] } })
+    expect(unsafe).toEqual([])
+  })
+
+  /**
+   * @failure Continuing a pending root merge validates or fetches an excluded child before refusing its changed staged pin.
+   * @level l1
+   * @consumer git-super merge --continue with private exclusions
+   * @testonly none
+   */
+  it("re-proves an excluded staged pin on continue before child validation or prefetch", async () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-merge-excluded-continue-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const target = candidateWithRootChange(fixture, "excluded-continue-target")
+    const path = "packages/alpha"
+    git(fixture.product, "submodule", "deinit", "-f", "--", path)
+    const head = git(fixture.product, "rev-parse", "HEAD")
+    const branch = git(fixture.product, "symbolic-ref", "HEAD")
+    git(fixture.product, "merge", "--no-ff", "--no-commit", target)
+    expect(git(fixture.product, "rev-parse", "MERGE_HEAD")).toBe(target)
+    const staged = advanceRepository(fixture.alpha, "excluded-staged.txt", "staged private pin\n")
+    git(fixture.product, "update-index", "--cacheinfo", `160000,${staged},${path}`)
+    const index = git(fixture.product, "write-tree")
+    const local = createLocalGitProcess()
+    const unsafe: GitProcessRequest[] = []
+    const recording: GitProcess = { run(request) {
+      if (request.repo !== fixture.product || request.args[0] === "merge-tree" || request.args[0] === "merge") {
+        unsafe.push(request)
+        throw new Error(`continue admission must precede ${request.repo}: ${request.args[0]}`)
+      }
+      return local.run(request)
+    } }
+    const options = { repo: fixture.product, commit: target, continue: true, expectedHead: head, expectedBranch: branch, excludedSubmodules: [path], git: recording }
+    const result = await superMerge(options)
+    expect(result).toMatchObject({ state: "failed", detail: { paths: [path] } })
+    expect(unsafe).toEqual([])
+    expect(git(fixture.product, "rev-parse", "HEAD")).toBe(head)
+    expect(git(fixture.product, "write-tree")).toBe(index)
+    expect(git(fixture.product, "rev-parse", "MERGE_HEAD")).toBe(target)
+  })
+
+  /**
+   * @failure Merge moves the root over an excluded checkout containing authored private content.
+   * @level l1
+   * @consumer git-super merge checkout preservation
+   * @testonly none
+   */
+  it("refuses a nonempty excluded checkout as excluded-submodule-unsafe before composition", async () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-merge-excluded-content-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const target = candidateWithRootChange(fixture, "excluded-content-target")
+    const path = "packages/alpha"
+    const checkout = join(fixture.product, path)
+    git(fixture.product, "submodule", "deinit", "-f", "--", path)
+    writeFileSync(join(checkout, "authored.txt"), "keep authored bytes\n")
+    const before = git(fixture.product, "rev-parse", "HEAD")
+    const options = { repo: fixture.product, commit: target, excludedSubmodules: [path] }
+    const result = await superMerge(options)
+    expect(result).toMatchObject({ state: "failed", detail: { code: "excluded-submodule-unsafe", paths: [path] } })
+    expect(git(fixture.product, "rev-parse", "HEAD")).toBe(before)
+    expect(readFileSync(join(checkout, "authored.txt"), "utf8")).toBe("keep authored bytes\n")
+  })
+})
+
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
 })

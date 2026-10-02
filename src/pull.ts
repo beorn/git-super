@@ -61,13 +61,13 @@ type PullPlan = Readonly<{
   notCompared: NotCompared[]
 }>
 
-type ExcludedCheckout = Readonly<{ path: string; repository: string; allowAbsent: boolean }>
+export type ExcludedCheckout = Readonly<{ path: string; repository: string; allowAbsent: boolean }>
 
 function excludedObservations(checkouts: readonly ExcludedCheckout[]): NotCompared[] {
   return checkouts.map(({ path }) => ({ path, reason: "excluded", message: "component excluded, not compared" }))
 }
 
-function proveExcludedCheckouts(root: string, checkouts: readonly ExcludedCheckout[]): void {
+export function proveExcludedCheckouts(root: string, checkouts: readonly ExcludedCheckout[], verb = "pull"): void {
   for (const checkout of checkouts) {
     const { state } = inspectExcludedCheckout(root, checkout.path)
     if (state === "empty" || (state === "absent" && checkout.allowAbsent)) continue
@@ -75,11 +75,11 @@ function proveExcludedCheckouts(root: string, checkouts: readonly ExcludedChecko
       resultDetail: detail(
         "excluded-submodule-unsafe",
         "preflight-excluded-checkouts",
-        `Excluded submodule ${checkout.path} has a ${state} checkout; only an empty uninitialized checkout or an absent added checkout can be skipped.`,
+          `Excluded submodule ${checkout.path} has a ${state} checkout; only an empty uninitialized checkout${checkout.allowAbsent ? " or an absent added checkout" : ""} can be skipped by ${verb}.`,
         {
           paths: [checkout.path],
           remedy:
-            "Preserve the private checkout and its Git store before rerunning pull; exclusion does not authorize accessing or replacing private content.",
+            `Preserve the private checkout and its Git store before rerunning ${verb}; exclusion does not authorize accessing or replacing private content.`,
         },
       ),
     })

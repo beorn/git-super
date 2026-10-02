@@ -27,6 +27,9 @@ import { parseIndexEntries, type IndexEntry } from "./index-entries.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessRequest, type GitProcessResult } from "./process.ts"
 import { createProgressReporter } from "./progress.ts"
 import { shellQuote } from "./shell-command.ts"
+import type { NotCompared } from "./diff.ts"
+import { isSubmoduleExcluded, validateExcludedSubmodules } from "./git.ts"
+import { proveExcludedCheckouts, type ExcludedCheckout } from "./pull.ts"
 import type { GitResultDetail, GitSuperRepositoryResult, GitSuperResult } from "./result.ts"
 
 /**
@@ -172,6 +175,7 @@ export type SuperMergeResult = GitSuperResult &
     /** Added paths have no prior recorded or checkout pin. */
     initializations?: readonly SuperMergeInitializationResult[]
     gitlinks: readonly SuperMergeGitlinkResult[]
+    notCompared?: readonly NotCompared[]
     /**
      * Additive timing evidence: one row per phase that ran, in the order it
      * ran. A merge that stops early ends on the phase that stopped it. Optional
@@ -207,6 +211,7 @@ export type SuperMergeOptions = Readonly<{
   noFetch?: boolean
   /** With noFetch, classify unchanged Equal pins from local main regardless of refresh age. */
   unboundedLocalMain?: boolean
+  excludedSubmodules?: readonly string[]
   preserveConflicts?: boolean
   continue?: boolean
   expectedHead?: string
