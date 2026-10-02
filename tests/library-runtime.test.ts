@@ -12,6 +12,10 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { execFileSync } from "node:child_process"
 import { createLocalGitProcess, delegateNativeGit, nativeGitExecutable, readNativeGit } from "../src/process.ts"
+import { superPull, superPush } from "../src/index.ts"
+import { acquireExclusive } from "../src/exclusive.ts"
+import { createLocalGitWorktreeStore } from "../src/worktree.ts"
+import { advanceRepository, bumpProductSubmodules, canonicalTmpdir, createProductFixture, git } from "./fixture.ts"
 
 const roots: string[] = []
 afterEach(() => {
@@ -165,3 +169,51 @@ setInterval(() => {}, 1000)
   expect(stopped.code).not.toBe(0)
   expect(stopped.failure).toMatch(/abort|SIGTERM/iu)
 })
+
+// A rev-parse probe cannot establish the library's mutation graph or the real flock adapter.
+test("library pulls real submodules, refuses a stale push lease and creates a worktree after lock contention", async () => {
+  const root = mkdtempSync(join(canonicalTmpdir(), "git-super-library-graph-"))
+  roots.push(root)
+  const fixture = createProductFixture(root)
+  const remote = join(root, "remote.git")
+  git(root, "clone", "--bare", fixture.product, remote)
+  const checkout = join(root, "checkout")
+  git(root, "-c", "protocol.file.allow=always", "clone", "--recurse-submodules", remote, checkout)
+  const base = git(checkout, "rev-parse", "HEAD")
+  const target = bumpProductSubmodules(fixture)
+  git(fixture.product, "push", remote, "main:main")
+  const pulled = await superPull({ repo: checkout, repository: "origin", refspecs: ["main"], ffOnly: true })
+  expect(pulled.state, JSON.stringify(pulled)).toBe("updated")
+  expect(git(checkout, "rev-parse", "HEAD")).toBe(target)
+  expect(git(join(checkout, "packages/alpha"), "rev-parse", "HEAD")).toBe(git(fixture.alpha, "rev-parse", "HEAD"))
+  const wanted = advanceRepository(checkout, "local.txt", "local\n")
+  const rejected = await superPush({
+    repo: checkout,
+    remote: "origin",
+    refspecs: ["HEAD:refs/heads/main"],
+    recurseSubmodules: "check",
+    forceWithLease: [`refs/heads/main:${base}`],
+  })
+  expect(rejected.state, JSON.stringify(rejected)).toBe("failed")
+  expect(git(remote, "rev-parse", "main")).toBe(target)
+  const common = git(checkout, "rev-parse", "--path-format=absolute", "--git-common-dir")
+  const holder = await acquireExclusive(join(common, "yrd-worktree-mutations"), { timeoutMs: 0 }, "test holder")
+  const reports: string[] = []
+  const store = createLocalGitWorktreeStore({ repo: checkout, report: (line) => reports.push(line) })
+  const linked = join(root, "linked")
+  const adding = store.add({ kind: "detached", path: linked, ref: "HEAD" }).then(
+    () => ({ ok: true as const }),
+    (error: unknown) => ({ ok: false as const, error }),
+  )
+  try {
+    const deadline = Date.now() + 1000
+    while (!reports.join("").includes("test holder") && Date.now() < deadline) await delay(5)
+    expect(reports.join(""), "worktree did not reach the contended real flock").toContain("test holder")
+  } finally {
+    holder.release()
+  }
+  const added = await adding
+  if (!added.ok) throw added.error
+  expect(git(linked, "rev-parse", "HEAD")).toBe(wanted)
+  expect(git(checkout, "worktree", "list", "--porcelain")).toContain(linked)
+}, 15000)

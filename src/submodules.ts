@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process"
+import { setTimeout as delay } from "node:timers/promises"
 import { existsSync, realpathSync } from "node:fs"
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises"
 import { isAbsolute, join, resolve } from "node:path"
@@ -1367,7 +1368,7 @@ function adaptGitProcess(
       result.code !== 0 && result.stderr.includes("could not lock config file") && attempt < 20;
       attempt += 1
     ) {
-      await Bun.sleep(attempt * 5)
+      await delay(attempt * 5)
       result = await run(repo, args, true)
     }
     return result

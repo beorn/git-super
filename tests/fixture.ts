@@ -2,6 +2,7 @@ import { mkdirSync, realpathSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { expect } from "vitest"
+import { spawnSync } from "node:child_process"
 import type { GitProcessRequest } from "../src/process.ts"
 
 /** Git reports physical repository roots; Darwin's tmpdir is commonly a /var alias for /private/var. */
@@ -10,7 +11,7 @@ export function canonicalTmpdir(): string {
 }
 
 export function git(cwd: string, ...args: string[]): string {
-  const result = Bun.spawnSync(["git", "-C", cwd, ...args], {
+  const result = spawnSync("git", ["-C", cwd, ...args], {
     env: {
       ...process.env,
       GIT_AUTHOR_NAME: "Git Super Test",
@@ -19,11 +20,12 @@ export function git(cwd: string, ...args: string[]): string {
       GIT_COMMITTER_EMAIL: "git-super@example.test",
       GIT_TERMINAL_PROMPT: "0",
     },
-    stdout: "pipe",
-    stderr: "pipe",
+    encoding: "utf8",
   })
-  if (result.exitCode !== 0) {
-    throw new Error(`git ${args.join(" ")} failed in ${cwd}: ${result.stderr.toString().trim()}`)
+  if (result.status !== 0) {
+    throw new Error(
+      `git ${args.join(" ")} failed in ${cwd}: ${result.error?.message ?? result.stderr?.trim() ?? result.signal}`,
+    )
   }
   return result.stdout.toString().trim()
 }
