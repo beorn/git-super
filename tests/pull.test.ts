@@ -51,6 +51,48 @@ function outputSink(): { output: string; write(value: string): void } {
 
 describe("git super pull --ff-only", () => {
   /**
+   * @failure Pull follows a selected checkout's symlink ancestor while checking private directory emptiness (27058 AC3/AC5).
+   * @level l1
+   * @consumer git-super pull
+   * @testonly none
+   */
+  test("refuses an excluded symlink ancestor before fetching", async () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-pull-private-ancestor-"))
+    roots.push(root)
+    const owner = join(root, "owner")
+    createRepository(owner, "README.md", "parent\n")
+    const outside = join(root, "outside")
+    mkdirSync(join(outside, "item"), { recursive: true })
+    symlinkSync(outside, join(owner, "private"), "dir")
+    git(owner, "remote", "add", "origin", owner)
+    const before = git(owner, "rev-parse", "HEAD")
+    const requests: GitProcessRequest[] = []
+    const local = createLocalGitProcess()
+    const result = await superPull({
+      repo: owner,
+      repository: "origin",
+      refspecs: ["main"],
+      ffOnly: true,
+      excludedSubmodules: ["private/item"],
+      git: {
+        run(request) {
+          requests.push(request)
+          return local.run(request)
+        },
+      },
+    })
+    expect(result).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: { code: "excluded-submodule-unsafe", paths: ["private/item"] },
+    })
+    expect(result.detail?.message).toContain("unsafe-ancestor")
+    expect(requests.some((request) => request.args[0] === "fetch")).toBe(false)
+    expect(requests.every((request) => request.repo === owner)).toBe(true)
+    expect(git(owner, "rev-parse", "HEAD")).toBe(before)
+  })
+
+  /**
    * @failure Pull loses private selection beneath an included addition, or scans private content there before refusing (27058 AC3/AC5).
    * @level l1
    * @consumer git-super pull

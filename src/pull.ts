@@ -5,7 +5,7 @@ import { readCommitGitlinks } from "./commit-graph.ts"
 import { createExclusive, type Exclusive } from "./exclusive.ts"
 import { isSubmoduleExcluded, probeRepository, validateExcludedSubmodules } from "./git.ts"
 import type { NotCompared } from "./diff.ts"
-import { inspectUninitializedCheckout } from "./status.ts"
+import { inspectExcludedCheckout } from "./status.ts"
 import { ensureCommitObject } from "./objects.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
 import { materializeSubmodulesWithProcess, type SubmoduleMaterializationResult } from "./submodules.ts"
@@ -67,9 +67,9 @@ function excludedObservations(checkouts: readonly ExcludedCheckout[]): NotCompar
   return checkouts.map(({ path }) => ({ path, reason: "excluded", message: "component excluded, not compared" }))
 }
 
-function proveExcludedCheckouts(checkouts: readonly ExcludedCheckout[]): void {
+function proveExcludedCheckouts(root: string, checkouts: readonly ExcludedCheckout[]): void {
   for (const checkout of checkouts) {
-    const state = inspectUninitializedCheckout(checkout.repository)
+    const { state } = inspectExcludedCheckout(root, checkout.path)
     if (state === "empty" || (state === "absent" && checkout.allowAbsent)) continue
     throw Object.assign(new Error(`Excluded submodule ${checkout.path} has an unsafe ${state} checkout.`), {
       resultDetail: detail(
@@ -236,7 +236,7 @@ async function planPull(
     repository: join(root, path),
     allowAbsent: true,
   }))
-  proveExcludedCheckouts(declaredCheckouts)
+  proveExcludedCheckouts(root, declaredCheckouts)
   const { repository, refspecs, remoteRef, exactTarget } = await resolvePullTarget(git, root, options)
   phase("fetch-root-target")
   await required(
@@ -514,7 +514,7 @@ async function freezeRepositoryGraph(
         repository: join(repository, entry.path),
         allowAbsent: !recordedBefore.has(entry.path),
       }
-      proveExcludedCheckouts([checkout])
+      proveExcludedCheckouts(root, [checkout])
       excludedCheckouts.push(checkout)
     }
     for (const entry of entries) {
@@ -982,8 +982,8 @@ export async function superPull(options: SuperPullOptions): Promise<PullResult> 
             }
           }
           phase("apply-preflight")
-          proveExcludedCheckouts(plan.declaredCheckouts)
-          proveExcludedCheckouts(plan.excludedCheckouts)
+          proveExcludedCheckouts(plan.root, plan.declaredCheckouts)
+          proveExcludedCheckouts(plan.root, plan.excludedCheckouts)
           await proveRepositoryTransitions(git, plan.repositories, plan.excludedCheckouts)
           const root = plan.repositories[0]
           if (root === undefined) throw new Error("git-super: pull plan contained no root repository")
