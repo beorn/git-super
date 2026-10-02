@@ -85,6 +85,7 @@ describe("createGitWorktreeStore", () => {
     "absent-checkout",
     "absent-content",
     "absent-owned-store",
+    "absent-included-store",
   ] as const)("shares inspection and removal admission for private %s checkout", async (kind) => {
     const root = await mkdtemp(join(canonicalTmpdir(), "git-super-removal-inspection-"))
     try {
@@ -103,19 +104,27 @@ describe("createGitWorktreeStore", () => {
         component,
         excluded,
       ])
-      if (kind === "uninitialized-public") {
+      if (kind === "uninitialized-public" || kind === "absent-included-store") {
         git(repo, ["-c", "protocol.file.allow=always", "submodule", "add", component, "vendor/public"])
       }
       git(repo, ["commit", "-q", "-am", "add private fixture"])
       if (kind.startsWith("absent") && kind !== "absent-owned-store") {
         git(repo, ["update-index", "--force-remove", excluded])
-        git(repo, ["rm", ".gitmodules"])
+        if (kind === "absent-included-store") {
+          git(repo, ["config", "-f", ".gitmodules", "--remove-section", "submodule.private-store"])
+          git(repo, ["add", ".gitmodules"])
+        } else {
+          git(repo, ["rm", ".gitmodules"])
+        }
         git(repo, ["commit", "-q", "-m", "remove private identity, retain common store"])
       }
       const linked = join(root, "linked")
       // Native fixture preparation creates no mechanics writer lock; inspection must not create one either.
       git(repo, ["worktree", "add", "--detach", linked, "HEAD"])
       const checkout = join(linked, excluded)
+      if (kind === "absent-included-store") {
+        git(linked, ["-c", "protocol.file.allow=always", "submodule", "update", "--init", "vendor/public"])
+      }
       if (kind === "absent-owned-store") {
         git(linked, ["-c", "protocol.file.allow=always", "submodule", "update", "--init", excluded])
         git(linked, ["submodule", "deinit", "-f", "--", excluded])
@@ -215,7 +224,7 @@ describe("createGitWorktreeStore", () => {
         expect(existsSync(privateStore)).toBe(true)
       }
       expect(objectStoreSnapshot(privateStore)).toEqual(privateBefore)
-      if (kind === "absent" || kind === "absent-empty") {
+      if (kind === "absent" || kind === "absent-empty" || kind === "absent-included-store") {
         expect(inspection.error).toBeUndefined()
         expect(inspection.result?.notCompared).toContainEqual(
           expect.objectContaining({
@@ -224,7 +233,7 @@ describe("createGitWorktreeStore", () => {
             message: expect.stringContaining("absent at HEAD and on disk, nothing to protect"),
             exclusion: expect.objectContaining({
               classification: "absent",
-              checkout: kind === "absent" ? "absent" : "empty",
+              checkout: kind === "absent-empty" ? "empty" : "absent",
             }),
           }),
         )
