@@ -1,4 +1,4 @@
-# vendor-kit: source-siblings@15105bd9d19d — generated; edit km/packages/km-infra/vendor-kit/templates/source-siblings-action.yml in km, then re-sync
+# vendor-kit: source-siblings@964db320a79d — generated; edit km/packages/km-infra/vendor-kit/templates/source-siblings-action.yml in km, then re-sync
 name: Install named source siblings
 description: Test against public sibling commits without requiring a new npm release
 
@@ -11,6 +11,30 @@ inputs:
 runs:
   using: composite
   steps:
+    # The consumer's own lock installs first, frozen, before any override (hh 27110, @cto 468f5ce5): a missing or stale
+    # lock fails here by Bun's own semantics, with the one cure, instead of as a raw ENOENT or a registry refusal later.
+    - name: Install the committed lock
+      shell: bash
+      run: |
+        set -euo pipefail
+        cure="keep each sibling's published range in package.json until it releases, and commit the bun.lock that resolves it; source-siblings.json's commit is what CI tests"
+        if [ ! -f bun.lock ]; then
+          echo "source-siblings: $PWD commits no bun.lock; $cure" >&2
+          exit 1
+        fi
+        for attempt in 1 2 3; do
+          if bun install --frozen-lockfile; then
+            exit 0
+          else
+            status=$?
+            echo "source-siblings: bun install --frozen-lockfile attempt ${attempt}/3 failed (exit ${status})" >&2
+            if [ "$attempt" -eq 3 ]; then
+              echo "source-siblings: the committed bun.lock does not install as committed; $cure" >&2
+              exit "$status"
+            fi
+            sleep $((attempt * 2))
+          fi
+        done
     - name: Check out public sibling commits
       shell: bash
       env:
