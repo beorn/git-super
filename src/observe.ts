@@ -2,7 +2,13 @@ import { createHash } from "node:crypto"
 import { readCommitSubmodules, resolveSubmoduleBranch } from "./commit-graph.ts"
 import { ensureCommitObject } from "./objects.ts"
 import { createLocalGitProcess, type GitProcess } from "./process.ts"
-import { hostedRemoteIdentity, readFrozenPushIntent, sameHostedOwner, sameHostedRepository } from "./push-intent.ts"
+import {
+  frozenExclusionPaths,
+  hostedRemoteIdentity,
+  readFrozenPushIntent,
+  sameHostedOwner,
+  sameHostedRepository,
+} from "./push-intent.ts"
 import { superSubmodulePrepare, type PreparedSubmodule } from "./submodule-prepare.ts"
 import type { OutputSink } from "./cli.ts"
 
@@ -164,8 +170,9 @@ async function prepared(
   repo: string,
   commit: string,
   remote: string,
+  excludedSubmodules: readonly string[],
 ): Promise<readonly PreparedSubmodule[]> {
-  const result = await superSubmodulePrepare({ repo, commit, remote, git })
+  const result = await superSubmodulePrepare({ repo, commit, remote, git, excludedSubmodules })
   if (result.state !== "updated" && result.state !== "unchanged") {
     throw new Error(
       result.detail?.message ?? `Root ${commit}: submodule store preparation ended ${result.state} in ${repo}`,
@@ -193,7 +200,16 @@ export async function observe(repo: string, value: unknown, process?: GitProcess
     const input = parseInput(value)
     const git = observationGit(process ?? createLocalGitProcess(globalThis.process.env, { attempts: 1 }))
     await validateFence(git, repo, input)
-    const modules = await prepared(git, repo, input.root.targetOid, input.root.remote)
+    // 27147: a child a frozen merge excluded is never prepared or read. The root target's exclusions are the ones its
+    // own frozen intent carries (a queue landing); a target without one is observed whole, as before.
+    const rootIntent = await readFrozenPushIntent(git, repo, input.root.targetOid)
+    const modules = await prepared(
+      git,
+      repo,
+      input.root.targetOid,
+      input.root.remote,
+      await frozenExclusionPaths(git, repo, input.root.targetOid, rootIntent),
+    )
     const descriptors = await readCommitSubmodules(git, repo, input.root.targetOid)
     const explained = new Set<string>()
     const identity = (remote: string, ref: string, source: string) =>
@@ -206,7 +222,13 @@ export async function observe(repo: string, value: unknown, process?: GitProcess
           `Checked merge ${checked.mergeOid}: frozen root ${intent.rootRemote} differs from ${input.root.remote}`,
         )
       }
-      const selected = await prepared(git, repo, checked.mergeOid, intent.rootRemote)
+      const selected = await prepared(
+        git,
+        repo,
+        checked.mergeOid,
+        intent.rootRemote,
+        await frozenExclusionPaths(git, repo, checked.mergeOid, intent),
+      )
       for (const module of selected) {
         const row = intent.children.find((entry) => entry.path === module.path && entry.pin === module.gitlink)
         if (row === undefined || !sameHostedRepository(row.remote, module.url)) {

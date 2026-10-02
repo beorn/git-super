@@ -87,7 +87,10 @@ it("finished merge and root merge-base never access an excluded populated store 
     const base = git(root, "rev-parse", "HEAD")
     const remote = join(fixture, "root-remote.git")
     git(fixture, "clone", "--bare", "-q", root, remote)
-    git(root, "remote", "add", "origin", remote)
+    // A merge that excludes freezes its exclusion into the push intent (27147), and an intent names a hosted root.
+    const hosted = "https://git-super.test/owned/native-exclusion-root.git"
+    git(root, "config", `url.${remote}.insteadOf`, hosted)
+    git(root, "remote", "add", "origin", hosted)
     git(root, "fetch", "-q", "origin")
     const pin = git(root, "rev-parse", `HEAD:${selected}`)
     const store = git(root, "rev-parse", "--path-format=absolute", "--git-path", `modules/${selected}`)
