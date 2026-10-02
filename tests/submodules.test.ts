@@ -31,6 +31,7 @@ import { createLocalGitProcess, type GitProcessRequest } from "../src/process.ts
 import { createLocalGitWorktreeStore } from "../src/worktree.ts"
 import { cleanGitRepositoryEnvironment } from "../src/git.ts"
 import { prepareSubmoduleTreeUnderLock } from "../src/submodule-prepare.ts"
+import { parseCommitSubmoduleConfig } from "../src/commit-graph.ts"
 
 const success = (): SubmoduleGitResult => ({ code: 0, stdout: "", stderr: "" })
 const roots: string[] = []
@@ -143,6 +144,59 @@ afterEach(async () => {
 })
 
 describe("materializeSubmodules", () => {
+  /**
+   * @failure Whitespace enumeration silently names a different path, while unsafe native control bytes reach checkout/reference probes (27058).
+   * @level l1
+   * @consumer worktree and pull materialization
+   * @testonly none
+   */
+  // CTO 8be6a4fe: these are intended corrections to the old projection, not compatibility requirements.
+  it.each([
+    { path: " apps/leading", oldProjection: "apps/leading", unsafe: false },
+    { path: "\tapps/tab", oldProjection: "apps/tab", unsafe: true },
+    { path: "apps/new\nline", oldProjection: "apps/new", unsafe: true },
+  ])(
+    "preserves native path $path instead of old projection $oldProjection",
+    async ({ path, oldProjection, unsafe }) => {
+      const root = await mkdtemp(join(tmpdir(), "git-super-native-materializer-config-"))
+      roots.push(root)
+      const fixture = createProductFixture(root)
+      git(fixture.product, ["config", "--file", ".gitmodules", "submodule.packages/alpha.path", path])
+      git(fixture.product, ["update-index", "--force-remove", "packages/alpha"])
+      git(fixture.product, ["update-index", "--add", "--cacheinfo", `160000,${fixture.alphaBase},${path}`])
+      git(fixture.product, ["add", ".gitmodules"])
+      git(fixture.product, ["commit", "-q", "-m", "native manifest path"])
+      const raw = git(fixture.product, ["config", "--blob", "HEAD:.gitmodules", "--null", "--list"])
+      expect(parseCommitSubmoduleConfig(raw, "HEAD").get("packages/alpha")?.path).toBe(path)
+      expect(path).not.toBe(oldProjection)
+      if (!unsafe) await mkdir(join(fixture.product, path), { recursive: true })
+      const local = createLocalGitProcess()
+      const childRequests: GitProcessRequest[] = []
+      const result = await materializeSubmodulesWithProcess(
+        {
+          run(request) {
+            if (request.repo !== fixture.product) {
+              childRequests.push(request)
+              throw new Error(`manifest path reached a child probe: ${JSON.stringify(request.repo)}`)
+            }
+            return local.run(request)
+          },
+        },
+        { worktree: fixture.product, paths: [path], ...(unsafe ? {} : { excludedSubmodules: [path] }) },
+      )
+      if (unsafe) {
+        // No control-byte check exists in the old materializer; native enumeration must make this refusal reachable.
+        expect(result.code).not.toBe(0)
+        expect(result.stderr).toContain("unsafe submodule path")
+        expect(result.stderr).toContain(JSON.stringify(path))
+      } else {
+        expect(result.code, result.stderr).toBe(0)
+        expect(result.notCompared).toMatchObject([{ path, reason: "excluded" }])
+      }
+      expect(childRequests).toEqual([])
+    },
+  )
+
   /**
    * @failure A later included checkout failure makes the synchronous host boundary lose known private skips (27058 AC3).
    * @level l1
@@ -622,7 +676,7 @@ describe("materializeSubmodules", () => {
           return repo === worktree ? success() : { ...success(), code: 1 }
         }
         if (args[0] === "config" && args[1] === "--blob") {
-          return { ...success(), stdout: "submodule.maddoc.path apps/maddoc" }
+          return { ...success(), stdout: "submodule.maddoc.path\napps/maddoc\u0000" }
         }
         if (args[0] === "ls-tree") {
           return { ...success(), stdout: `160000 commit ${"a".repeat(40)}\tapps/maddoc\n` }
@@ -669,7 +723,7 @@ describe("materializeSubmodules", () => {
           return repo === worktree ? success() : { ...success(), code: 1 }
         }
         if (args[0] === "config" && args[1] === "--blob") {
-          return { ...success(), stdout: "submodule.maddoc.path apps/maddoc" }
+          return { ...success(), stdout: "submodule.maddoc.path\napps/maddoc\u0000" }
         }
         if (args[0] === "ls-tree") return { ...success(), stdout: `160000 commit ${"a".repeat(40)}\tapps/maddoc\n` }
         if (args[0] === "config" && args[1] === "--get") {
@@ -719,7 +773,7 @@ describe("materializeSubmodules", () => {
         if (args[0] === "config" && args[1] === "--blob") {
           return {
             ...success(),
-            stdout: paths.map((path, index) => `submodule.s${index}.path ${path}`).join("\n"),
+            stdout: paths.map((path, index) => `submodule.s${index}.path\n${path}\0`).join(""),
           }
         }
         if (args[0] === "ls-tree") {
@@ -776,7 +830,7 @@ describe("materializeSubmodules", () => {
           return repo === worktree ? success() : { ...success(), code: 1 }
         }
         if (args[0] === "config" && args[1] === "--blob") {
-          return { ...success(), stdout: "submodule.maddoc.path apps/maddoc" }
+          return { ...success(), stdout: "submodule.maddoc.path\napps/maddoc\u0000" }
         }
         if (args[0] === "ls-tree") return { ...success(), stdout: `160000 commit ${"f".repeat(40)}\tapps/maddoc\n` }
         if (args[0] === "config" && args[1] === "--get") {
@@ -818,7 +872,7 @@ describe("materializeSubmodules", () => {
           return repo === worktree ? success() : { ...success(), code: 1 }
         }
         if (args[0] === "config" && args[1] === "--blob") {
-          return { ...success(), stdout: "submodule.maddoc.path apps/maddoc" }
+          return { ...success(), stdout: "submodule.maddoc.path\napps/maddoc\u0000" }
         }
         if (args[0] === "ls-tree") return { ...success(), stdout: `160000 commit ${"e".repeat(40)}\tapps/maddoc\n` }
         if (args[0] === "config" && args[1] === "--get") {
@@ -854,7 +908,7 @@ describe("materializeSubmodules", () => {
           return repo === worktree ? success() : { ...success(), code: 1 }
         }
         if (args[0] === "config" && args[1] === "--blob") {
-          return { ...success(), stdout: "submodule.maddoc.path apps/maddoc" }
+          return { ...success(), stdout: "submodule.maddoc.path\napps/maddoc\u0000" }
         }
         if (args[0] === "ls-tree") return { ...success(), stdout: `160000 commit ${"b".repeat(40)}\tapps/maddoc\n` }
         if (args[0] === "config" && args[1] === "--get-regexp") return { ...success(), code: 1 }
@@ -905,7 +959,7 @@ describe("materializeSubmodules", () => {
         return repo === worktree ? success() : { ...success(), code: 1 }
       }
       if (args[0] === "config" && args[1] === "--blob") {
-        return { ...success(), stdout: "submodule.hh-web.path hh-web" }
+        return { ...success(), stdout: "submodule.hh-web.path\nhh-web\u0000" }
       }
       if (args[0] === "ls-tree") {
         // THE WHOLE DISCRIMINATOR. The candidate still carries the gitlink; the
@@ -1012,7 +1066,7 @@ describe("materializeSubmodules", () => {
           return repo === worktree ? success() : { ...success(), code: 1 }
         }
         if (args[0] === "config" && args[1] === "--blob") {
-          return { ...success(), stdout: "submodule.hh-web.path hh-web\nsubmodule.ag.path ag" }
+          return { ...success(), stdout: "submodule.hh-web.path\nhh-web\u0000submodule.ag.path\nag\u0000" }
         }
         if (args[0] === "ls-tree") {
           treeReads.push(repo)
@@ -1066,7 +1120,7 @@ describe("materializeSubmodules", () => {
           return repo === worktree ? success() : { ...success(), code: 1 }
         }
         if (args[0] === "config" && args[1] === "--blob") {
-          return { ...success(), stdout: "submodule.maddoc.path apps/maddoc" }
+          return { ...success(), stdout: "submodule.maddoc.path\napps/maddoc\u0000" }
         }
         if (args[0] === "ls-tree") return { ...success(), stdout: `160000 commit ${"c".repeat(40)}\tapps/maddoc\n` }
         if (args[0] === "config" && args[1] === "--get-regexp") return { ...success(), code: 1 }
@@ -1121,7 +1175,7 @@ describe("materializeSubmodules", () => {
           return repo === worktree ? success() : { ...success(), code: 1 }
         }
         if (args[0] === "config" && args[1] === "--blob") {
-          return { ...success(), stdout: "submodule.maddoc.path apps/maddoc" }
+          return { ...success(), stdout: "submodule.maddoc.path\napps/maddoc\u0000" }
         }
         if (args[0] === "ls-tree") return { ...success(), stdout: `160000 commit ${required}\tapps/maddoc\n` }
         if (args[0] === "config" && args[1] === "--get-regexp") return { ...success(), code: 1 }
@@ -1180,7 +1234,7 @@ describe("materializeSubmodules", () => {
           return repo === worktree ? success() : { ...success(), code: 1 }
         }
         if (args[0] === "config" && args[1] === "--blob") {
-          return { ...success(), stdout: "submodule.maddoc.path apps/maddoc" }
+          return { ...success(), stdout: "submodule.maddoc.path\napps/maddoc\u0000" }
         }
         if (args[0] === "ls-tree") return { ...success(), stdout: `160000 commit ${required}\tapps/maddoc\n` }
         if (args[0] === "config" && args[1] === "--get-regexp") return { ...success(), code: 1 }
@@ -1284,7 +1338,7 @@ describe("materializeSubmodules", () => {
           return repo === worktree ? success() : { ...success(), code: 1 }
         }
         if (args[0] === "config" && args[1] === "--blob") {
-          return { ...success(), stdout: "submodule.maddoc.path apps/maddoc" }
+          return { ...success(), stdout: "submodule.maddoc.path\napps/maddoc\u0000" }
         }
         if (args[0] === "ls-tree") return { ...success(), stdout: `160000 commit ${"e".repeat(40)}\tapps/maddoc\n` }
         if (args[0] === "config" && args[1] === "--get-regexp") {
@@ -1329,7 +1383,7 @@ describe("materializeSubmodules", () => {
         if (args[0] === "config" && args[1] === "--blob") {
           return {
             ...success(),
-            stdout: paths.map((path, index) => `submodule.module-${index}.path ${path}`).join("\n"),
+            stdout: paths.map((path, index) => `submodule.module-${index}.path\n${path}\0`).join(""),
           }
         }
         if (args[0] === "ls-tree") {
@@ -1407,7 +1461,7 @@ describe("materializeSubmodules", () => {
         if (args[0] === "config" && args[1] === "--blob") {
           return {
             ...success(),
-            stdout: paths.map((path, index) => `submodule.module-${index}.path ${path}`).join("\n"),
+            stdout: paths.map((path, index) => `submodule.module-${index}.path\n${path}\0`).join(""),
           }
         }
         if (args[0] === "ls-tree") {
@@ -1949,7 +2003,7 @@ describe("materializeSubmodules", () => {
           return repo === worktree ? success() : { ...success(), code: 1 }
         }
         if (args[0] === "config" && args[1] === "--blob") {
-          return { ...success(), stdout: "submodule.maddoc.path apps/maddoc" }
+          return { ...success(), stdout: "submodule.maddoc.path\napps/maddoc\u0000" }
         }
         if (args[0] === "ls-tree") return { ...success(), stdout: `160000 commit ${"f".repeat(40)}\tapps/maddoc\n` }
         if (args[0] === "config" && args[1] === "--get") {
@@ -2462,7 +2516,7 @@ describe("materializeSubmodules", () => {
           return repo === worktree ? success() : { ...success(), code: 1 }
         }
         if (args[0] === "config" && args[1] === "--blob") {
-          return { ...success(), stdout: "submodule.dep.path vendor/dep" }
+          return { ...success(), stdout: "submodule.dep.path\nvendor/dep\u0000" }
         }
         if (args[0] === "ls-tree") {
           return { ...success(), stdout: `160000 commit ${missingSha}\tvendor/dep\n` }

@@ -1,28 +1,17 @@
 import { spawnSync } from "node:child_process"
+import { parseIndexEntries } from "./index-entries.ts"
 
 export type IndexGitlink = Readonly<{ path: string; indexPin: string | undefined }>
 
-export type IndexEntry = Readonly<{ path: string; mode: string; objectId: string; stage: number }>
-
-/** The native NUL index format shared by comparison and frozen parent evidence. */
-export function parseIndexEntries(raw: string): IndexEntry[] {
-  return raw
-    .split("\0")
-    .filter(Boolean)
-    .map((field) => {
-      const match = /^([0-7]{6}) ([0-9a-f]{40,64}) ([0-3])\t(.+)$/su.exec(field)
-      if (match?.[1] === undefined || match[2] === undefined || match[3] === undefined || match[4] === undefined) {
-        throw new Error(`git super: malformed native index entry ${JSON.stringify(field)}; reread ls-files --stage -z`)
-      }
-      return { mode: match[1], objectId: match[2], stage: Number(match[3]), path: match[4] }
-    })
-}
-
 /** Parent index metadata only; shared by status and comparisons. */
 export function indexGitlinks(root: string, indexFile?: string): IndexGitlink[] {
-  return parseIndexEntries(runGit(root, ["ls-files", "--stage", "-z"], indexFile))
+  return parseIndexEntries(
+    runGit(root, ["ls-files", "--stage", "-z"], indexFile),
+    (field) =>
+      new Error(`git super: malformed native index entry ${JSON.stringify(field)}; reread ls-files --stage -z`),
+  )
     .filter((entry) => entry.mode === "160000")
-    .map((entry) => ({ path: entry.path, indexPin: entry.stage === 0 ? entry.objectId : undefined }))
+    .map((entry) => ({ path: entry.path, indexPin: entry.stage === 0 ? entry.oid : undefined }))
     .sort((left, right) => left.path.localeCompare(right.path))
 }
 
@@ -31,6 +20,7 @@ export function validateExcludedSubmodules(paths: readonly string[] = []): void 
     if (
       path.includes("\\") ||
       path.includes("\0") ||
+      /[\u0000-\u001f\u007f]/u.test(path) ||
       path.split("/").some((part) => part === "" || part === "." || part === "..")
     ) {
       throw new Error(

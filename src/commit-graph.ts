@@ -1,6 +1,7 @@
 import type { GitProcess, GitProcessResult } from "./process.ts"
 import type { GitResultDetail } from "./result.ts"
-import { parseIndexEntries, validateExcludedSubmodules, type IndexEntry } from "./git.ts"
+import { validateExcludedSubmodules } from "./git.ts"
+import { parseIndexEntries, type IndexEntry } from "./index-entries.ts"
 
 export type CommitGitlink = Readonly<{ path: string; target: string }>
 export type CommitSubmodule = CommitGitlink & Readonly<{ name: string; url?: string; branch?: string }>
@@ -202,7 +203,13 @@ async function readIndexSubmodules(
   const args = ["ls-files", "--stage", "-z"]
   const output = await git.run({ repo: repository, args })
   if (gitProcessFailed(output)) throw operationError(repository, "read-target-index", args, output)
-  const entries = parseIndexEntries(output.stdout)
+  const entries = parseIndexEntries(
+    output.stdout,
+    (record) =>
+      new Error(
+        `Stage-0 index in ${repository} has a malformed native record ${JSON.stringify(record)}; reread ls-files --stage -z`,
+      ),
+  )
   const unmerged = entries.filter((entry) => entry.stage !== 0)
   if (unmerged.length > 0) {
     const message = `Index in ${repository} has unmerged entries; resolve every named path to stage 0 before classification.`
@@ -221,7 +228,7 @@ async function readIndexSubmodules(
     const literalArgs = ["--literal-pathspecs", "ls-files", "--stage", "-z", "--", entry.path]
     const literal = await git.run({ repo: repository, args: literalArgs })
     if (gitProcessFailed(literal)) throw operationError(repository, "read-target-index", literalArgs, literal)
-    if (literal.stdout !== `${entry.mode} ${entry.objectId} ${entry.stage}\t${entry.path}\0`) {
+    if (literal.stdout !== `${entry.mode} ${entry.oid} ${entry.stage}\t${entry.path}\0`) {
       const message = `Stage-0 index in ${repository}: ${JSON.stringify(entry.path)} does not match its captured native UTF-8 path.`
       throw Object.assign(new Error(message), {
         resultDetail: detail("invalid-target-gitlink-path", "read-target-index", message, {
@@ -254,7 +261,7 @@ async function readIndexSubmodules(
         resultDetail: {
           ...original,
           message,
-          objectIds: manifest === undefined ? [] : [manifest.objectId],
+          objectIds: manifest === undefined ? [] : [manifest.oid],
           remedy: "Repair the named staged gitlink or .gitmodules metadata, then rerun materialization.",
         },
       })
@@ -263,7 +270,7 @@ async function readIndexSubmodules(
   const configuration = new Map<string, ConfiguredSubmodule>()
   if (manifest !== undefined) {
     // Read the captured blob oid rather than a later index state; HEAD remains a separate identity.
-    const configuredArgs = ["config", "--null", "--blob", manifest.objectId, "--list"]
+    const configuredArgs = ["config", "--null", "--blob", manifest.oid, "--list"]
     const configured = await git.run({ repo: repository, args: configuredArgs })
     if (gitProcessFailed(configured)) {
       throw operationError(repository, "read-target-submodules", configuredArgs, configured)
@@ -280,9 +287,7 @@ async function readIndexSubmodules(
       configuration.set(name, value)
     }
   }
-  const gitlinks = new Map(
-    entries.filter((entry) => entry.mode === "160000").map((entry) => [entry.path, entry.objectId]),
-  )
+  const gitlinks = new Map(entries.filter((entry) => entry.mode === "160000").map((entry) => [entry.path, entry.oid]))
   validateExcludedSubmodules([...gitlinks.keys()])
   return {
     selectedPaths: selected.map((path) => {
@@ -292,13 +297,13 @@ async function readIndexSubmodules(
         treeEntry:
           entry === undefined
             ? null
-            : { mode: entry.mode, type: entry.mode === "160000" ? "commit" : "blob", objectId: entry.objectId },
+            : { mode: entry.mode, type: entry.mode === "160000" ? "commit" : "blob", objectId: entry.oid },
         declarations: [...configuration]
           .filter(([, configured]) => configured.path === path)
           .map(([name]) => ({ name, path })),
         index: {
           source: "index",
-          manifestObjectId: manifest?.objectId ?? null,
+          manifestObjectId: manifest?.oid ?? null,
           entries: entries.filter((candidate) => candidate.path === path || candidate.path.startsWith(`${path}/`)),
         },
       }

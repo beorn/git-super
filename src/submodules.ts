@@ -11,6 +11,8 @@ import { inspectUninitializedCheckout } from "./status.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessRequest, type GitProcessResult } from "./process.ts"
 import { shellQuote } from "./shell-command.ts"
 import { preparedSubmoduleStore } from "./submodule-prepare.ts"
+import { parseCommitSubmoduleConfig } from "./commit-graph.ts"
+import { parseIndexEntries } from "./index-entries.ts"
 
 export const SUBMODULE_ALTERNATE_LOCATION = "superproject"
 export const SUBMODULE_ALTERNATE_ERROR_STRATEGY = "info"
@@ -184,17 +186,15 @@ async function submodules(
   const blob = source === "index" ? ":0:.gitmodules" : "HEAD:.gitmodules"
   const tracked = await git.run(repo, ["cat-file", "-e", blob], true)
   if (tracked.code !== 0) return []
-  const configured = await git.run(repo, ["config", "--blob", blob, "--get-regexp", "^submodule\\..*\\.path$"], true)
-  if (configured.code === 1 && configured.stdout === "" && configured.stderr === "") return []
+  const configured = await git.run(repo, ["config", "--blob", blob, "--null", "--list"], true)
   if (configured.code !== 0) return configured
-  return configured.stdout
-    .split(/\r?\n/u)
-    .filter((row) => row !== "")
-    .map((row): Submodule | undefined => {
-      const match = /^(submodule\.(.+)\.path)\s+(.+)$/u.exec(row)
-      return match?.[2] === undefined || match[3] === undefined ? undefined : { name: match[2], path: match[3] }
-    })
-    .filter((submodule): submodule is Submodule => submodule !== undefined)
+  const raw = configured.stdout
+    .split("\0")
+    .filter((row) => /^submodule\..*\.(path|url|branch)\n/u.test(row))
+    .join("\0")
+  return [...parseCommitSubmoduleConfig(raw, blob)].flatMap(([name, entry]) =>
+    entry.path === undefined ? [] : [{ name, path: entry.path }],
+  )
 }
 
 /**
@@ -248,14 +248,14 @@ async function requiredGitlink(
     if (index.code !== 0) {
       return { ...index, stderr: `could not read index gitlink '${path}' in ${repo}\n${index.stderr}` }
     }
-    const rows = index.stdout.split("\0").flatMap((row) => {
-      const entry = /^(\d{6}) ([0-9a-f]+) ([0-3])\t(.+)$/su.exec(row)
-      return entry?.[4] === path ? [entry] : []
-    })
-    if (rows.some((row) => row[3] !== "0")) {
+    const rows = parseIndexEntries(
+      index.stdout,
+      (record) => new Error(`malformed index record for ${JSON.stringify(path)} in ${repo}: ${JSON.stringify(record)}`),
+    ).filter((entry) => entry.path === path)
+    if (rows.some((row) => row.stage !== 0)) {
       return { code: 1, stdout: "", stderr: `unmerged index gitlink '${path}' in ${repo}; stage 0 is required` }
     }
-    const pin = rows.find((row) => row[1] === "160000" && row[3] === "0")?.[2]
+    const pin = rows.find((row) => row.mode === "160000" && row.stage === 0)?.oid
     return pin ?? { code: 1, stdout: "", stderr: `selected path '${path}' has no stage-0 gitlink in ${repo}` }
   }
   const tree = await git.run(repo, ["ls-tree", "HEAD", "--", path], true)
@@ -788,6 +788,17 @@ export async function materializeSubmodules(
     }
     const entries = await submodules(git, worktree, source)
     if (!Array.isArray(entries)) return entries
+    for (const entry of entries) {
+      try {
+        validateExcludedSubmodules([entry.path])
+      } catch {
+        return {
+          code: 1,
+          stdout: "",
+          stderr: `unsafe submodule path ${JSON.stringify(entry.path)} in ${worktree}; use a normalized relative path without control bytes before materialization`,
+        }
+      }
+    }
     if (source === "index" && selectedPaths !== undefined) {
       for (const path of selectedPaths) {
         if (!entries.some((entry) => entry.path === path)) {
