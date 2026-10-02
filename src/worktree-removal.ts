@@ -116,11 +116,13 @@ export async function assertExcludedRemovalCustody(
     }
     const state = unsafeAncestor === undefined ? inspectUninitializedCheckout(join(checkout, path)) : "unsafe-ancestor"
     const disk: NonNullable<NotCompared["exclusion"]>["checkout"] =
-      state === "nonempty" || state === "non-directory"
-        ? lstatSync(join(checkout, path, ".git"), { throwIfNoEntry: false }) === undefined
-          ? "content"
-          : "checkout"
-        : state
+      state === "non-directory"
+        ? "content"
+        : state === "nonempty"
+          ? lstatSync(join(checkout, path, ".git"), { throwIfNoEntry: false }) === undefined
+            ? "content"
+            : "checkout"
+          : state
     const evidence = parents.map((parent) => {
       const selected = parent.metadata.selectedPaths.find((entry) => entry.path === path)
       if (selected === undefined) {

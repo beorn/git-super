@@ -63,7 +63,7 @@ function objectStoreSnapshot(objects: string) {
 
 describe("createGitWorktreeStore", () => {
   /**
-   * @failure Caller inspection admits a private checkout that removal refuses, or changes Git state before admission (27058).
+   * @failure Caller inspection admits a private checkout that removal refuses, loses file-content evidence, or changes Git state before admission (27058).
    * @level l1
    * @consumer Bearly worktree admission and Git-super removal
    * @testonly none
@@ -73,6 +73,7 @@ describe("createGitWorktreeStore", () => {
     "empty",
     "uninitialized-public",
     "nonempty",
+    "non-directory",
     "symlink",
     "unsafe-ancestor",
     "retained-borrower",
@@ -84,6 +85,7 @@ describe("createGitWorktreeStore", () => {
     "absent-empty",
     "absent-checkout",
     "absent-content",
+    "absent-file",
     "absent-owned-store",
     "absent-included-store",
   ] as const)("shares inspection and removal admission for private %s checkout", async (kind) => {
@@ -150,6 +152,11 @@ describe("createGitWorktreeStore", () => {
         git(linked, ["submodule", "deinit", "-f", "--", excluded])
       }
       if (kind === "nonempty") await writeFile(join(checkout, "keep.txt"), "keep\n")
+      if (kind === "non-directory" || kind === "absent-file") {
+        await rm(checkout, { recursive: true, force: true })
+        await mkdir(dirname(checkout), { recursive: true })
+        await writeFile(checkout, "private file content; preserve me\n")
+      }
       if (kind === "symlink") {
         await rm(checkout, { recursive: true })
         await symlink(component, checkout, "dir")
@@ -260,13 +267,14 @@ describe("createGitWorktreeStore", () => {
           kind === "missing-identity" ||
           kind === "borrower-missing-identity" ||
           kind === "absent-checkout" ||
-          kind === "absent-content"
+          kind === "absent-content" ||
+          kind === "absent-file"
         ) {
           expect(inspection.error).toBeUndefined()
           const observation = inspection.result?.notCompared.find((entry) => entry.reason === "inconsistent")
           expect(observation).toMatchObject({ path: excluded, exclusion: { classification: "unclassified" } })
           expect(removal).toMatchObject({ notCompared: expect.arrayContaining([observation]) })
-          if (kind === "absent-checkout" || kind === "absent-content") {
+          if (kind === "absent-checkout" || kind === "absent-content" || kind === "absent-file") {
             expect(observation).toMatchObject({
               exclusion: { checkout: kind === "absent-checkout" ? "checkout" : "content" },
             })
@@ -279,6 +287,11 @@ describe("createGitWorktreeStore", () => {
           expect((removal as Error).message).toBe((inspection.error as Error).message)
         }
         if (kind === "deletion-store") expect((removal as Error).message).toContain("inside deletion custody")
+        if (kind === "non-directory") expect((removal as Error).message).toContain("checkout is non-directory")
+        if (kind === "non-directory" || kind === "absent-file") {
+          expect(await readFile(checkout, "utf8")).toBe("private file content; preserve me\n")
+          expect(git(repo, ["worktree", "list", "--porcelain"])).toBe(registration)
+        }
         expect((removal as Error).message).toContain(excluded)
         expect(existsSync(linked)).toBe(true)
       }
