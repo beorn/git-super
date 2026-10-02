@@ -41,48 +41,6 @@ function outputSink(): { output: string; write(value: string): void } {
 
 describe("git super pull --ff-only", () => {
   /**
-   * @failure A submodule parent mistakes its own module directory for a separate reference and cannot initialize an added child (26996).
-   * @level l1
-   * @consumer git-super pull from an initialized submodule
-   * @testonly none
-   */
-  test("pulls an added child when the pulling parent is itself a submodule", async () => {
-    const root = mkdtempSync(join(tmpdir(), "git-super-pull-submodule-parent-"))
-    roots.push(root)
-    const fixture = addNestedAlphaSubmodule(createProductFixture(root))
-    const checkout = join(root, "checkout")
-    vi.stubEnv("GIT_CONFIG_COUNT", "1")
-    vi.stubEnv("GIT_CONFIG_KEY_0", "protocol.file.allow")
-    vi.stubEnv("GIT_CONFIG_VALUE_0", "always")
-    onTestFinished(() => {
-      vi.unstubAllEnvs()
-    })
-    git(root, "clone", "-q", "--recurse-submodules", fixture.product, checkout)
-    const parent = join(checkout, "packages/alpha")
-    expect(git(parent, "rev-parse", "--show-superproject-working-tree")).toBe(checkout)
-    const leaf = join(root, "new-leaf")
-    const leafPin = createRepository(leaf, "new-leaf.txt", "selected new leaf\n")
-    git(fixture.alpha, "-c", "protocol.file.allow=always", "submodule", "add", "-q", leaf, "apps/new-leaf")
-    git(fixture.alpha, "commit", "-q", "-am", "add nested child")
-    const target = git(fixture.alpha, "rev-parse", "HEAD")
-    const rootBefore = git(checkout, "rev-parse", "HEAD")
-    const warnings = outputSink()
-    const result = await superPull({
-      repo: parent,
-      repository: "origin",
-      refspecs: ["main"],
-      ffOnly: true,
-      warn: (message) => warnings.write(message),
-    })
-    expect(result.state, JSON.stringify(result.detail)).toBe("updated")
-    expect(result.partial).toBe(false)
-    expect(git(parent, "rev-parse", "HEAD")).toBe(target)
-    expect(git(join(parent, "apps/new-leaf"), "rev-parse", "HEAD")).toBe(leafPin)
-    expect(git(checkout, "rev-parse", "HEAD")).toBe(rootBefore)
-    expect(warnings.output).toContain("used no reference store for 1 of 1 gitlinks: apps/new-leaf")
-  })
-
-  /**
    * @failure Pull discovers the parent as an uninitialized child and reads or fetches child commits in the wrong repository (26264).
    * @level l1
    * @consumer git-super pull

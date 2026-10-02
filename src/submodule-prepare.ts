@@ -5,8 +5,6 @@ import { createExclusive, type Exclusive } from "./exclusive.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
 import { gitSuperResult, type GitResultDetail, type GitSuperRepositoryResult, type GitSuperResult } from "./result.ts"
 import { resolveSubmoduleOrigin } from "./submodule-origin.ts"
-import { pinRef } from "./objects.ts"
-import { shellQuote } from "./shell-command.ts"
 
 const OBJECT_ID = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/iu
 const REMOTE_URL = /^(?:[a-z][a-z\d+.-]*:|(?:[^/@:\s]+@)?[^/:\s]+:.+)/iu
@@ -41,66 +39,6 @@ type FrozenSubmodule = Readonly<{
   gitlink: string
   url: string
 }>
-
-/** Internal command owner shared by performed warming and printed store repairs. */
-export function preparedPinFetchArgs(commit: string): readonly string[] {
-  return [
-    "fetch",
-    "--no-tags",
-    "--no-recurse-submodules",
-    "--no-write-fetch-head",
-    "origin",
-    `${commit}:${pinRef(commit)}`,
-  ]
-}
-
-/** Internal refusal renderer; preparation owns the logical-name store path. */
-export function nestedStoreMissingDetail(
-  rows: readonly Readonly<{
-    path: string
-    name: string
-    parentStore: string
-    parentCommit: string
-    parentRemote?: string
-    commit: string
-  }>[],
-): GitResultDetail {
-  const prepared = new Set<string>()
-  const commands: string[] = []
-  for (const row of rows) {
-    if (row.parentRemote === undefined) continue
-    const key = `${row.parentStore}\0${row.parentCommit}\0${row.parentRemote}`
-    if (!prepared.has(key)) {
-      commands.push(
-        `  git super --repo ${shellQuote(row.parentStore)} submodule prepare ${shellQuote(row.parentCommit)} --remote ${shellQuote(row.parentRemote)} --json`,
-      )
-      prepared.add(key)
-    }
-    commands.push(
-      `  git -C ${shellQuote(safeStorePath(row.parentStore, row.name))} ${preparedPinFetchArgs(row.commit).map(shellQuote).join(" ")}`,
-    )
-  }
-  return detail(
-    "nested-store-missing",
-    "read-push-graph",
-    `Prepared parents have no store for ${rows.length} nested gitlink(s):\n` +
-      rows
-        .map(
-          (row) =>
-            `  ${row.path} needs ${row.commit}; parent ${row.parentCommit} in ${row.parentStore}; declared remote ${row.parentRemote === undefined ? "unavailable" : row.parentRemote}`,
-        )
-        .join("\n"),
-    {
-      paths: rows.map((row) => row.path),
-      objectIds: rows.map((row) => row.commit),
-      remedy:
-        (rows.some((row) => row.parentRemote === undefined)
-          ? "Supply the named parent's declared remote before preparing its checkout-free stores.\n"
-          : "Prepare the named checkout-free parents, fetch the exact pins, then retry the same operation.\n") +
-        commands.join("\n"),
-    },
-  )
-}
 
 /** Prepare durable checkout-free stores for direct gitlinks from one frozen root commit. */
 export async function superSubmodulePrepare(
