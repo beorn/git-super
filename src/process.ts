@@ -1,8 +1,17 @@
 import { cleanGitEnvironment, cleanGitRepositoryEnvironment } from "./git.ts"
-import { appendFileSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs"
+import {
+  accessSync,
+  appendFileSync,
+  constants,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+} from "node:fs"
 import { Blob } from "node:buffer"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { delimiter, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { fullJitter } from "@bearly/pacing"
 
@@ -12,8 +21,22 @@ export type ProcessOutputSink = Readonly<{ write(value: string | Uint8Array): un
 
 /** Resolve the native executable separately; selecting this binary must not recurse. */
 export function nativeGitExecutable(): string {
-  const executable = Bun.which("git")
-  if (executable === null) throw new Error("git-super: native Git executable 'git' was not found on PATH")
+  let executable: string | undefined
+  for (const directory of process.env.PATH?.split(delimiter) ?? []) {
+    const candidate = resolve(directory, "git")
+    try {
+      if (!statSync(candidate).isFile()) continue
+      accessSync(candidate, constants.X_OK)
+      executable = candidate
+      break
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (code !== "ENOENT" && code !== "ENOTDIR" && code !== "EACCES") {
+        throw new Error(`git-super: cannot inspect native Git candidate ${candidate}`, { cause: error })
+      }
+    }
+  }
+  if (executable === undefined) throw new Error("git-super: native Git executable 'git' was not found on PATH")
   if (realpathSync(executable) === realpathSync(fileURLToPath(new URL("../bin/git-super", import.meta.url)))) {
     throw new Error(`git-super: native Git resolves to git-super itself: ${executable}`)
   }
@@ -51,6 +74,9 @@ export async function delegateNativeGit(
   stderr: ProcessOutputSink,
   replaceProcess: boolean,
 ): Promise<number> {
+  if (typeof Bun === "undefined") {
+    throw new Error("git-super: native delegation is a Bun CLI operation; Bun CLI requires Bun >=1.3.14")
+  }
   if (replaceProcess) {
     if (process.execve === undefined) {
       throw new Error(`git-super: Bun ${Bun.version} lacks process.execve; use Bun >=1.3.14 for native Git delegation`)
