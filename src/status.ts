@@ -14,6 +14,17 @@ import {
 
 export type SuperStatusOptions = Readonly<{ repo: string; indexFile?: string; excludedSubmodules?: readonly string[] }>
 
+/** Checkout metadata only: never follow a symlink or read a Git pointer/store. */
+export function inspectUninitializedCheckout(
+  path: string,
+): "absent" | "empty" | "nonempty" | "symlink" | "non-directory" {
+  const state = lstatSync(path, { throwIfNoEntry: false })
+  if (state === undefined) return "absent"
+  if (state.isSymbolicLink()) return "symlink"
+  if (!state.isDirectory()) return "non-directory"
+  return readdirSync(path).length === 0 ? "empty" : "nonempty"
+}
+
 export type SuperStatusResult = Readonly<{
   records: readonly string[]
   consultedRepositories: readonly ConsultedRepository[]
@@ -180,7 +191,7 @@ function statusRepository(
         continue
       }
       if (probe.kind === "absent") {
-        if (readdirSync(child).length > 0) {
+        if (inspectUninitializedCheckout(child) !== "empty") {
           throw new Error(
             `directory ${child} is not empty and has no repository of its own; preserve its files before removal`,
           )

@@ -2,11 +2,20 @@
  * @reach fs-walk <fixture-only: superPull and git-super CLI use mkdtempSync(canonicalTmpdir()) repos>
  */
 import { afterEach, describe, expect, onTestFinished, test, vi } from "vitest"
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { runCli } from "../src/cli.ts"
-import { acquireExclusive, createExclusive } from "../src/exclusive.ts"
+import { acquireExclusive, createExclusive, type Exclusive } from "../src/exclusive.ts"
 import { adaptProcessGit, createLocalGitProcess, type GitProcess, type GitProcessRequest } from "../src/process.ts"
 import { superPull } from "../src/pull.ts"
 import { materializeSubmodulesWithProcess } from "../src/submodules.ts"
@@ -40,6 +49,136 @@ function outputSink(): { output: string; write(value: string): void } {
 }
 
 describe("git super pull --ff-only", () => {
+  /**
+   * @failure A declared private empty checkout is probed as a repository or blocks included updates (27058 AC3/AC5).
+   * @level l1
+   * @consumer git-super pull
+   * @testonly none
+   */
+  test("excludes an empty private checkout without probing or consuming its retained store", async () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-pull-excluded-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const checkout = join(root, "checkout")
+    git(root, "-c", "protocol.file.allow=always", "clone", "-q", "--recurse-submodules", fixture.product, checkout)
+    const excluded = "packages/alpha"
+    const privateCheckout = join(checkout, excluded)
+    const store = git(checkout, "rev-parse", "--path-format=absolute", "--git-path", `modules/${excluded}`)
+    git(checkout, "submodule", "deinit", "-f", "--", excluded)
+    expect(readdirSync(privateCheckout)).toEqual([])
+    expect(existsSync(store)).toBe(true)
+    const target = bumpProductSubmodules(fixture)
+    const includedTarget = git(fixture.product, "rev-parse", `${target}:vendor/beta`)
+    const local = createLocalGitProcess()
+    const privateRequests: GitProcessRequest[] = []
+    const process: GitProcess = {
+      run(request) {
+        if (request.args.includes("--others") && request.args.includes(excluded)) {
+          throw new Error(`parent attempted to enumerate excluded private content: ${excluded}`)
+        }
+        if (
+          request.repo === privateCheckout ||
+          request.repo.startsWith(`${privateCheckout}/`) ||
+          request.repo === store ||
+          request.repo.startsWith(`${store}/`)
+        ) {
+          privateRequests.push(request)
+          throw new Error(`excluded private repository was probed: ${request.repo}`)
+        }
+        return local.run(request)
+      },
+    }
+    const warnings = outputSink()
+    const options = {
+      repo: checkout,
+      repository: "origin",
+      refspecs: ["main"],
+      ffOnly: true,
+      excludedSubmodules: [excluded],
+      git: process,
+      warn: (message: string) => warnings.write(message),
+    }
+    const result = await superPull(options)
+    expect(privateRequests).toEqual([])
+    expect(result).toMatchObject({
+      state: "updated",
+      partial: false,
+      notCompared: [{ path: excluded, reason: "excluded" }],
+    })
+    expect(warnings.output).toContain(excluded)
+    expect(git(checkout, "rev-parse", "HEAD")).toBe(target)
+    expect(git(join(checkout, "vendor/beta"), "rev-parse", "HEAD")).toBe(includedTarget)
+    expect(readdirSync(privateCheckout)).toEqual([])
+    expect(git(checkout, "rev-parse", "--path-format=absolute", "--git-path", `modules/${excluded}`)).toBe(store)
+    expect(existsSync(store)).toBe(true)
+  })
+
+  /**
+   * @failure Exclusion must not let pull move the root over a checkout with private content (27058 AC5).
+   * @level l1
+   * @consumer git-super pull
+   * @testonly none
+   */
+  test.each(["initialized", "nonempty", "symlink", "changed-under-lock"])(
+    "refuses an excluded private checkout that is %s before moving the root",
+    async (condition) => {
+      const root = mkdtempSync(join(tmpdir(), "git-super-pull-private-unsafe-"))
+      roots.push(root)
+      const fixture = createProductFixture(root)
+      const checkout = join(root, "checkout")
+      git(root, "-c", "protocol.file.allow=always", "clone", "-q", "--recurse-submodules", fixture.product, checkout)
+      const excluded = "packages/alpha"
+      const privateCheckout = join(checkout, excluded)
+      if (condition !== "initialized") git(checkout, "submodule", "deinit", "-f", "--", excluded)
+      if (condition === "nonempty") writeFileSync(join(privateCheckout, "private.txt"), "preserve me\n")
+      if (condition === "symlink") {
+        rmSync(privateCheckout, { recursive: true })
+        symlinkSync(fixture.alpha, privateCheckout, "dir")
+      }
+      advanceRepository(fixture.product, "README.md", "next\n")
+      const before = git(checkout, "rev-parse", "HEAD")
+      const local = createLocalGitProcess()
+      const privateRequests: GitProcessRequest[] = []
+      const process: GitProcess = {
+        run(request) {
+          if (request.repo === privateCheckout || request.repo.startsWith(`${privateCheckout}/`)) {
+            privateRequests.push(request)
+            throw new Error(`private checkout was probed: ${request.repo}`)
+          }
+          return local.run(request)
+        },
+      }
+      let lockEntered = false
+      const exclusive: Exclusive = {
+        async run(operation) {
+          lockEntered = true
+          if (condition === "changed-under-lock") writeFileSync(join(privateCheckout, "private.txt"), "preserve me\n")
+          return operation()
+        },
+      }
+      const warnings = outputSink()
+      const options = {
+        repo: checkout,
+        repository: "origin",
+        refspecs: ["main"],
+        ffOnly: true,
+        excludedSubmodules: [excluded],
+        git: process,
+        exclusive,
+        warn: (message: string) => warnings.write(message),
+      }
+      const result = await superPull(options)
+      expect(privateRequests).toEqual([])
+      expect(result).toMatchObject({
+        state: "failed",
+        partial: false,
+        detail: { code: "excluded-submodule-unsafe", paths: [excluded] },
+      })
+      expect(git(checkout, "rev-parse", "HEAD")).toBe(before)
+      expect(lockEntered).toBe(condition === "changed-under-lock")
+    },
+  )
+
   /**
    * @failure Pull discovers the parent as an uninitialized child and reads or fetches child commits in the wrong repository (26264).
    * @level l1
@@ -339,6 +478,7 @@ describe("git super pull --ff-only", () => {
     expect(stderr.output).toBe("")
     expect(git(checkout, "rev-parse", "HEAD")).toBe(target)
     expect(JSON.parse(stdout.output)).toEqual({
+      notCompared: [],
       partial: false,
       repositories: [
         {

@@ -3,7 +3,9 @@ import { tmpdir } from "node:os"
 import { isAbsolute, join, resolve } from "node:path"
 import { readCommitGitlinks } from "./commit-graph.ts"
 import { createExclusive, type Exclusive } from "./exclusive.ts"
-import { probeRepository } from "./git.ts"
+import { isSubmoduleExcluded, probeRepository, validateExcludedSubmodules } from "./git.ts"
+import type { NotCompared } from "./diff.ts"
+import { inspectUninitializedCheckout } from "./status.ts"
 import { ensureCommitObject } from "./objects.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
 import { materializeSubmodulesWithProcess, type SubmoduleMaterializationResult } from "./submodules.ts"
@@ -17,7 +19,8 @@ type PullRepositoryResult = GitSuperRepositoryResult &
       "considered" | "borrowed" | "remoteFallbacks" | "unreferenced" | "timedOut" | "failure"
     >
   }>
-type PullResult = Omit<GitSuperResult, "repositories"> & Readonly<{ repositories: readonly PullRepositoryResult[] }>
+type PullResult = Omit<GitSuperResult, "repositories"> &
+  Readonly<{ repositories: readonly PullRepositoryResult[]; notCompared: readonly NotCompared[] }>
 
 export type SuperPullOptions = Readonly<{
   repo: string
@@ -25,6 +28,7 @@ export type SuperPullOptions = Readonly<{
   refspecs?: readonly string[]
   ffOnly: boolean
   dryRun?: boolean
+  excludedSubmodules?: readonly string[]
   timeoutMs?: number
   git?: GitProcess
   exclusive?: Exclusive
@@ -51,7 +55,30 @@ type PullPlan = Readonly<{
   observedRemoteTarget?: string
   detail?: GitResultDetail
   repositories: readonly PullRepositoryPlan[]
+  excludedCheckouts: readonly ExcludedCheckout[]
+  notCompared: readonly NotCompared[]
 }>
+
+type ExcludedCheckout = Readonly<{ path: string; repository: string; allowAbsent: boolean }>
+
+function proveExcludedCheckouts(checkouts: readonly ExcludedCheckout[]): void {
+  for (const checkout of checkouts) {
+    const state = inspectUninitializedCheckout(checkout.repository)
+    if (state === "empty" || (state === "absent" && checkout.allowAbsent)) continue
+    throw Object.assign(new Error(`Excluded submodule ${checkout.path} has an unsafe ${state} checkout.`), {
+      resultDetail: detail(
+        "excluded-submodule-unsafe",
+        "preflight-excluded-checkouts",
+        `Excluded submodule ${checkout.path} has a ${state} checkout; only an empty uninitialized checkout or an absent added checkout can be skipped.`,
+        {
+          paths: [checkout.path],
+          remedy:
+            "Preserve the private checkout and its Git store before rerunning pull; exclusion does not authorize accessing or replacing private content.",
+        },
+      ),
+    })
+  }
+}
 
 type PullRepositoryPlan = Readonly<{
   repository: string
@@ -183,6 +210,7 @@ function resultError(error: unknown, phase: string): GitResultDetail {
 }
 
 async function planPull(git: GitProcess, options: SuperPullOptions, phase: Phase): Promise<PullPlan> {
+  validateExcludedSubmodules(options.excludedSubmodules)
   if (!options.ffOnly) {
     throw Object.assign(new Error("git super pull requires --ff-only"), {
       resultDetail: detail("ff-only-required", "validate", "git super pull requires --ff-only"),
@@ -258,9 +286,18 @@ async function planPull(git: GitProcess, options: SuperPullOptions, phase: Phase
     }
   }
   phase("freeze-target-graph")
-  const repositories = await freezeRepositoryGraph(git, root, current, target, phase)
+  const excludedCheckouts: ExcludedCheckout[] = []
+  const repositories = await freezeRepositoryGraph(
+    git,
+    root,
+    current,
+    target,
+    phase,
+    options.excludedSubmodules ?? [],
+    excludedCheckouts,
+  )
   phase("preflight-tree-transitions")
-  await proveRepositoryTransitions(git, repositories)
+  await proveRepositoryTransitions(git, repositories, excludedCheckouts)
   return {
     root,
     repository,
@@ -269,6 +306,12 @@ async function planPull(git: GitProcess, options: SuperPullOptions, phase: Phase
     ...(observedRemoteTarget === undefined ? {} : { observedRemoteTarget }),
     ...(rootDetail === undefined ? {} : { detail: rootDetail }),
     repositories,
+    excludedCheckouts,
+    notCompared: excludedCheckouts.map(({ path }) => ({
+      path,
+      reason: "excluded",
+      message: "component excluded, not compared",
+    })),
   }
 }
 
@@ -436,14 +479,30 @@ async function freezeRepositoryGraph(
   current: string,
   target: string,
   phase: Phase,
+  excludedSubmodules: readonly string[],
+  excludedCheckouts: ExcludedCheckout[],
 ): Promise<PullRepositoryPlan[]> {
   const repositories: PullRepositoryPlan[] = []
   const walk = async (repository: string, path: string, from: string, to: string): Promise<void> => {
     repositories.push({ repository, path, current: from, target: to })
     const entries = await readCommitGitlinks(git, repository, to)
-    const recordedBefore = new Set((await readCommitGitlinks(git, repository, from)).map((entry) => entry.path))
+    const before = await readCommitGitlinks(git, repository, from)
+    const recordedBefore = new Set(before.map((entry) => entry.path))
+    const allEntries = [...entries, ...before.filter((entry) => !entries.some((next) => next.path === entry.path))]
+    for (const entry of allEntries) {
+      const childPath = path === "." ? entry.path : `${path}/${entry.path}`
+      if (!isSubmoduleExcluded(childPath, excludedSubmodules)) continue
+      const checkout = {
+        path: childPath,
+        repository: join(repository, entry.path),
+        allowAbsent: !recordedBefore.has(entry.path),
+      }
+      proveExcludedCheckouts([checkout])
+      excludedCheckouts.push(checkout)
+    }
     for (const entry of entries) {
       const childPath = path === "." ? entry.path : `${path}/${entry.path}`
+      if (isSubmoduleExcluded(childPath, excludedSubmodules)) continue
       const childRepository = join(repository, entry.path)
       const discovered = await run(git, childRepository, ["rev-parse", "--show-toplevel"])
       const probe =
@@ -491,10 +550,21 @@ async function freezeRepositoryGraph(
   return repositories
 }
 
-async function proveRepositoryTransitions(git: GitProcess, repositories: readonly PullRepositoryPlan[]): Promise<void> {
+async function proveRepositoryTransitions(
+  git: GitProcess,
+  repositories: readonly PullRepositoryPlan[],
+  excludedCheckouts: readonly ExcludedCheckout[],
+): Promise<void> {
   for (const repository of repositories) {
     if (repository.added !== undefined) continue
-    await proveTreeTransition(git, repository.repository, repository.current, repository.target)
+    const excludedPaths = excludedCheckouts.flatMap(({ path }) =>
+      repository.path === "."
+        ? [path]
+        : path.startsWith(`${repository.path}/`)
+          ? [path.slice(repository.path.length + 1)]
+          : [],
+    )
+    await proveTreeTransition(git, repository.repository, repository.current, repository.target, excludedPaths)
   }
 }
 
@@ -503,9 +573,10 @@ async function proveTreeTransition(
   repository: string,
   current: string,
   target: string,
+  excludedSubmodules: readonly string[],
 ): Promise<void> {
   if (current === target) return
-  await refuseIgnoredIncomingCollisions(git, repository, current, target)
+  await refuseIgnoredIncomingCollisions(git, repository, current, target, excludedSubmodules)
   const index = await required(git, repository, ["rev-parse", "--git-path", "index"], "locate-index")
   const sourceIndex = isAbsolute(index) ? index : resolve(repository, index)
   const scratch = mkdtempSync(join(tmpdir(), "git-super-index-"))
@@ -537,6 +608,7 @@ async function refuseIgnoredIncomingCollisions(
   repository: string,
   current: string,
   target: string,
+  excludedSubmodules: readonly string[],
 ): Promise<void> {
   const changed = await run(git, repository, [
     "diff",
@@ -551,7 +623,7 @@ async function refuseIgnoredIncomingCollisions(
   if (changed.code !== 0) {
     throw operationError(repository, "preflight-ignored-paths", ["diff", current, target], changed)
   }
-  const incoming = nulPaths(changed.stdout)
+  const incoming = nulPaths(changed.stdout).filter((path) => !isSubmoduleExcluded(path, excludedSubmodules))
   if (incoming.length === 0) return
   const ignored = new Set<string>()
   for (let offset = 0; offset < incoming.length; offset += 128) {
@@ -634,7 +706,7 @@ async function applyRepositories(
   hooksDir: string,
   phase: Phase,
   warn: (message: string) => void,
-): Promise<PullResult> {
+): Promise<GitSuperResult> {
   const results: PullRepositoryResult[] = []
   for (const [index, repository] of plan.repositories.entries()) {
     if (repository.current === repository.target) {
@@ -771,7 +843,10 @@ export async function superPull(options: SuperPullOptions): Promise<PullResult> 
   const timeoutMs = options.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
     const failure = detail("invalid-timeout", "validate", "Git command timeout must be a positive finite number.")
-    return gitSuperResult([{ repository: resolve(options.repo), state: "failed", detail: failure, refs: [] }], failure)
+    return {
+      ...gitSuperResult([{ repository: resolve(options.repo), state: "failed", detail: failure, refs: [] }], failure),
+      notCompared: [],
+    }
   }
   const process = options.git ?? createLocalGitProcess()
   const git: GitProcess = {
@@ -789,16 +864,23 @@ export async function superPull(options: SuperPullOptions): Promise<PullResult> 
     plan = await planPull(git, options, phase)
   } catch (error) {
     const failure = resultError(error, "plan")
-    return gitSuperResult([{ repository: resolve(options.repo), state: "failed", detail: failure, refs: [] }], failure)
+    return {
+      ...gitSuperResult([{ repository: resolve(options.repo), state: "failed", detail: failure, refs: [] }], failure),
+      notCompared: [],
+    }
   }
+  for (const observation of plan.notCompared) warn(`${observation.path}: ${observation.message}\n`)
   const changed = plan.repositories.some((repository) => repository.current !== repository.target)
   if (!changed || options.dryRun) {
-    return gitSuperResult(
-      plan.repositories.map((repository) =>
-        repositoryResult(repository, repository.current === repository.target ? "unchanged" : "updated"),
+    return {
+      ...gitSuperResult(
+        plan.repositories.map((repository) =>
+          repositoryResult(repository, repository.current === repository.target ? "unchanged" : "updated"),
+        ),
+        plan.detail,
       ),
-      plan.detail,
-    )
+      notCompared: plan.notCompared,
+    }
   }
   const exclusive =
     options.exclusive ??
@@ -807,89 +889,96 @@ export async function superPull(options: SuperPullOptions): Promise<PullResult> 
     })
   phase("lock-wait")
   try {
-    return await exclusive.run(
-      async () => {
-        phase("lock-acquired")
-        if (plan.remoteRef !== undefined && plan.observedRemoteTarget !== undefined) {
-          const observed = await observeRemoteTarget(
-            git,
-            plan.root,
-            plan.repository,
-            plan.remoteRef,
-            "recheck-root-target",
-          )
-          if (observed !== plan.observedRemoteTarget) {
-            throw Object.assign(new Error(`requested remote target changed after planning`), {
-              resultDetail: detail(
-                "target-changed",
-                "recheck-root-target",
-                `${plan.remoteRef} changed after planning.`,
-                {
-                  objectIds: [plan.observedRemoteTarget, observed],
-                  remedy: "Rerun git super pull so it can freeze and preflight the new target.",
-                },
-              ),
-            })
-          }
-        }
-        for (const repository of plan.repositories) {
-          if (repository.added !== undefined) continue
-          const current = await required(
-            git,
-            repository.repository,
-            ["rev-parse", "HEAD^{commit}"],
-            "recheck-repository-current",
-          )
-          if (current !== repository.current) {
-            throw Object.assign(
-              new Error(`repository HEAD changed after planning: expected ${repository.current}, found ${current}`),
-              {
+    return {
+      ...(await exclusive.run(
+        async () => {
+          phase("lock-acquired")
+          if (plan.remoteRef !== undefined && plan.observedRemoteTarget !== undefined) {
+            const observed = await observeRemoteTarget(
+              git,
+              plan.root,
+              plan.repository,
+              plan.remoteRef,
+              "recheck-root-target",
+            )
+            if (observed !== plan.observedRemoteTarget) {
+              throw Object.assign(new Error(`requested remote target changed after planning`), {
                 resultDetail: detail(
-                  "repository-changed",
-                  "recheck-repository-current",
-                  `${repository.path} HEAD changed after planning.`,
+                  "target-changed",
+                  "recheck-root-target",
+                  `${plan.remoteRef} changed after planning.`,
                   {
-                    paths: [repository.path],
-                    objectIds: [repository.current, current],
-                    remedy: "Rerun git super pull so it can plan against the new repository state.",
+                    objectIds: [plan.observedRemoteTarget, observed],
+                    remedy: "Rerun git super pull so it can freeze and preflight the new target.",
                   },
                 ),
-              },
-            )
+              })
+            }
           }
-        }
-        phase("apply-preflight")
-        await proveRepositoryTransitions(git, plan.repositories)
-        const root = plan.repositories[0]
-        if (root === undefined) throw new Error("git-super: pull plan contained no root repository")
-        const hooks = await hooksWithoutPostMerge(git, root.repository)
-        // From the first write until every repository is at the target, no signal stops the apply (24907).
-        deferral = deferApplySignals(warn)
-        let applied: PullResult
-        let deferred: DeferredSignal | undefined
-        try {
-          applied = await applyRepositories(git, plan, hooks.dir, phase, warn)
-        } finally {
-          deferred = deferral.release()
-          deferral = undefined
-          hooks.remove()
-        }
-        if (deferred === undefined) return applied
-        warn(`git-super pull: the apply is complete; exiting for the deferred ${deferred.signal}\n`)
-        return { ...applied, deferredSignal: deferred }
-      },
-      { holder: "git super pull --ff-only" },
-    )
+          for (const repository of plan.repositories) {
+            if (repository.added !== undefined) continue
+            const current = await required(
+              git,
+              repository.repository,
+              ["rev-parse", "HEAD^{commit}"],
+              "recheck-repository-current",
+            )
+            if (current !== repository.current) {
+              throw Object.assign(
+                new Error(`repository HEAD changed after planning: expected ${repository.current}, found ${current}`),
+                {
+                  resultDetail: detail(
+                    "repository-changed",
+                    "recheck-repository-current",
+                    `${repository.path} HEAD changed after planning.`,
+                    {
+                      paths: [repository.path],
+                      objectIds: [repository.current, current],
+                      remedy: "Rerun git super pull so it can plan against the new repository state.",
+                    },
+                  ),
+                },
+              )
+            }
+          }
+          phase("apply-preflight")
+          await proveRepositoryTransitions(git, plan.repositories, plan.excludedCheckouts)
+          proveExcludedCheckouts(plan.excludedCheckouts)
+          const root = plan.repositories[0]
+          if (root === undefined) throw new Error("git-super: pull plan contained no root repository")
+          const hooks = await hooksWithoutPostMerge(git, root.repository)
+          // From the first write until every repository is at the target, no signal stops the apply (24907).
+          deferral = deferApplySignals(warn)
+          let applied: GitSuperResult
+          let deferred: DeferredSignal | undefined
+          try {
+            applied = await applyRepositories(git, plan, hooks.dir, phase, warn)
+          } finally {
+            deferred = deferral.release()
+            deferral = undefined
+            hooks.remove()
+          }
+          if (deferred === undefined) return applied
+          warn(`git-super pull: the apply is complete; exiting for the deferred ${deferred.signal}\n`)
+          return { ...applied, deferredSignal: deferred }
+        },
+        { holder: "git super pull --ff-only" },
+      )),
+      notCompared: plan.notCompared,
+    }
   } catch (error) {
     const failure = resultError(error, "apply")
     const root = plan.repositories[0]
     if (root === undefined) throw new Error("git-super: pull plan contained no root repository")
-    return gitSuperResult(
-      [
-        repositoryResult(root, "failed", failure),
-        ...plan.repositories.slice(1).map((repository) => repositoryResult(repository, "not-run", failure)),
-      ],
-      failure,
-    )
+    return {
+      ...gitSuperResult(
+        [
+          repositoryResult(root, "failed", failure),
+          ...plan.repositories.slice(1).map((repository) => repositoryResult(repository, "not-run", failure)),
+        ],
+        failure,
+      ),
+      notCompared: plan.notCompared,
+    }
   }
 }

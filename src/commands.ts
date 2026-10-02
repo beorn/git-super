@@ -196,6 +196,7 @@ const pull = commandNode<CommandContext, PullParams, GitSuperResult>({
     const input = record(value)
     return {
       ffOnly: input.ffOnly === true,
+      excludedSubmodules: stringArray(input.excludedSubmodules, "excludedSubmodules"),
       ...(typeof input.repository === "string" ? { repository: input.repository } : {}),
       refspecs: stringArray(input.refspecs, "refspecs"),
       ...(input.dryRun === true ? { dryRun: true } : {}),

@@ -393,6 +393,12 @@ async function runInvocation(
   program
     .command("pull")
     .description(commands.pull.description ?? commands.pull.title)
+    .option(
+      "--exclude-submodule <path>",
+      "exclude an empty uninitialized literal root-relative submodule and its descendants before content access",
+      (value: string, previous: string[]) => [...previous, value],
+      [],
+    )
     .option("--ff-only", "refuse merge, rebase, stash, force, or conflict resolution")
     .option("--dry-run", "fetch and show the frozen plan without changing a checkout or local branch")
     .argument("[repository]", "remote repository to fetch")
@@ -405,6 +411,7 @@ async function runInvocation(
           ...(typeof repository === "string" ? { repository } : {}),
           refspecs,
           ffOnly: options.ffOnly === true,
+          excludedSubmodules: options.excludeSubmodule,
           ...(options.dryRun === true ? { dryRun: true } : {}),
           // GIT_SUPER_PROGRESS=1 reports each phase to stderr as it starts. An environment switch, not a flag: a
           // caller that sets it still works against an older git-super, which ignores it, so a half-landed update
