@@ -233,7 +233,13 @@ worktree add /work/candidate at 0123456789abcdef0123456789abcdef01234567 (main):
 
 The CLI requires Bun 1.3.14 or newer. Native Git delegation uses `process.execve` to preserve the process ID, streams, and signals. Invoking the executable with Node prints the Bun requirement before loading CLI dependencies.
 
-The library supports Node 24 or newer and Bun 1.3.14 or newer. Node consumers need the built npm package and a built Node-compatible `@bearly/flock` dependency; installing TypeScript source beneath `node_modules` does not provide that distribution. Node library operations and flock contention have been exercised on Linux. Node flock behavior on macOS remains unmeasured.
+The library supports Node 24 or newer and Bun 1.3.14 or newer.
+
+Node consumers need the built npm package and a built Node-compatible `@bearly/flock` dependency. Installing TypeScript source beneath `node_modules` does not provide that distribution.
+
+Node library operations have been exercised on Linux. Node transport and graph operations on macOS remain unmeasured.
+
+The built flock artifact passes Node 24 acquire, contention, release and reacquire checks on Linux and macOS; see the [CI run](https://github.com/beorn/git-super/actions/runs/36963859423).
 
 The package name is reserved; this first source release is not yet on npm. Clone it, install its public dependencies, and put its executable on `PATH` for one command:
 
