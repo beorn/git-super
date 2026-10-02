@@ -7,7 +7,7 @@ import { createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS } from "./exclusive.ts"
 import {
   acquireRemovalWriterLeases,
   assertExcludedRemovalCustody,
-  rehomeBorrowers,
+  prepareRemovalBorrowers,
   retainWorktreeModules,
   type WorktreeRetention,
 } from "./worktree-removal.ts"
@@ -424,6 +424,15 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         }
         const gitDir = realpathSync(await git.text(path, ["rev-parse", "--absolute-git-dir"]))
         await assertExcludedRemovalCustody(git, configuredProcess(), path, gitDir, removeOptions.excludedSubmodules)
+        const common = realpathSync(await git.text(path, ["rev-parse", "--path-format=absolute", "--git-common-dir"]))
+        const rehome = await prepareRemovalBorrowers(
+          git,
+          configuredProcess(),
+          path,
+          common,
+          gitDir,
+          removeOptions.excludedSubmodules,
+        )
         const writerLeases = acquireRemovalWriterLeases(gitDir)
         try {
           if (removeOptions.retention !== undefined) {
@@ -435,13 +444,12 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
               (repository, target) => inspectWorktree(git, repository, target),
               writerLeases.proof,
               writerLeases.created,
+              rehome,
+              removeOptions.excludedSubmodules,
             )
           } else {
             if (removeOptions.unlock === true) await unlockWorktree(git, repo, path)
-            const common = realpathSync(
-              await git.text(path, ["rev-parse", "--path-format=absolute", "--git-common-dir"]),
-            )
-            rehomeBorrowers(common, gitDir, join(gitDir, "modules"))
+            rehome()
           }
           await git.run(repo, ["worktree", "remove", "--force", path], false, timeouts.cleanup)
           if (existsSync(path) || (await inspectWorktree(git, repo, path)).registered) {

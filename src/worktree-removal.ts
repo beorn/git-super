@@ -15,6 +15,7 @@ import {
   symlinkSync,
   unlinkSync,
   writeFileSync,
+  type Dirent,
 } from "node:fs"
 import { tryAcquireFlock, type FlockHandle } from "@bearly/flock"
 import { fileLockHolders, formatLockHolders } from "@bearly/flock/holders"
@@ -138,18 +139,16 @@ export interface RehomeBorrowersOptions {
   readonly spawn?: typeof spawnSync
 }
 
-export function rehomeBorrowers(
-  commonDir: string,
-  lenderGitDir: string,
-  lenderModules: string,
-  options?: RehomeBorrowersOptions,
-): readonly string[] {
-  guardRetainedBorrowers(commonDir, lenderGitDir)
-  const hasLenderModules = present(lenderModules)
-  const canonicalCommon = realpathSync(commonDir)
+type RemovalBorrower = Readonly<{
+  adminDir: string
+  name: string
+  excludedStores?: readonly Readonly<{ path: string; store: string }>[]
+}>
 
+/** One candidate inventory for metadata admission and the actual borrower walk. */
+function removalBorrowers(commonDir: string, lenderGitDir: string): RemovalBorrower[] {
   const worktreesDir = join(commonDir, "worktrees")
-  const candidates: Array<{ adminDir: string; name: string }> = []
+  const candidates: RemovalBorrower[] = []
   if (existsSync(worktreesDir)) {
     for (const entry of readdirSync(worktreesDir, { withFileTypes: true })) {
       if (entry.isDirectory()) {
@@ -163,6 +162,108 @@ export function rehomeBorrowers(
   if (toCanonical(commonDir) !== toCanonical(lenderGitDir)) {
     candidates.push({ adminDir: commonDir, name: "primary" })
   }
+  return candidates
+}
+
+/** Protected roots are pruned before entry, including symlinks. */
+function* borrowerEntries(root: string, excludedStores: RemovalBorrower["excludedStores"]): Generator<Dirent> {
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    const path = join(root, entry.name)
+    if (excludedStores?.some((excluded) => within(excluded.store, path))) continue
+    yield entry
+    if (entry.isDirectory()) yield* borrowerEntries(path, excludedStores)
+  }
+}
+
+/** Resolve each public parent independently; current-worktree names cannot stand for another HEAD. */
+export async function prepareRemovalBorrowers(
+  git: Git,
+  process: GitProcess,
+  checkout: string,
+  commonDir: string,
+  lenderGitDir: string,
+  excludedSubmodules: readonly string[] = [],
+): Promise<() => readonly string[]> {
+  const lenderModules = join(lenderGitDir, "modules")
+  if (excludedSubmodules.length === 0) {
+    return () => rehomeBorrowers(commonDir, lenderGitDir, lenderModules)
+  }
+  if (present(join(commonDir, "git-super-retained-borrowers"))) {
+    throw new Error(
+      `worktree ${checkout} has retained borrower registrations with unresolved excluded-store identities; resolve their custody before removal`,
+    )
+  }
+  const candidates: RemovalBorrower[] = []
+  for (const candidate of removalBorrowers(commonDir, lenderGitDir)) {
+    const parentProcess: GitProcess = {
+      run: (request) =>
+        process.run({
+          ...request,
+          repo: checkout,
+          args: ["--git-dir", candidate.adminDir, ...request.args],
+        }),
+    }
+    const head = await git.text(checkout, ["--git-dir", candidate.adminDir, "rev-parse", "--verify", "HEAD"])
+    const declarations = await readCommitSubmodules(parentProcess, checkout, head)
+    const excludedStores: { path: string; store: string }[] = []
+    for (const path of excludedSubmodules) {
+      const declaration = declarations.find((entry) => entry.path === path)
+      if (declaration === undefined) {
+        throw new Error(
+          `borrower ${candidate.name} at ${candidate.adminDir} has no parent metadata identity for excluded submodule ${path} at ${head}; resolve that identity before removal`,
+        )
+      }
+      validateExcludedSubmodules([declaration.name])
+      const store = await git.text(checkout, [
+        "--git-dir",
+        candidate.adminDir,
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        `modules/${declaration.name}`,
+      ])
+      if (!isAbsolute(store) || !within(join(candidate.adminDir, "modules"), store)) {
+        throw new Error(
+          `borrower ${candidate.name} excluded submodule ${path} has invalid parent-resolved store ${JSON.stringify(store)}; resolve its metadata before removal`,
+        )
+      }
+      if (present(lenderModules) && present(store)) {
+        throw new Error(
+          `excluded borrower ${candidate.name} submodule ${path} store ${store} cannot be proved independent of deletion custody ${lenderModules} without inspecting it; preserve or resolve that custody before removal`,
+        )
+      }
+      excludedStores.push({ path, store })
+    }
+    candidates.push({ ...candidate, excludedStores })
+  }
+  return () => rehomeBorrowerCandidates(commonDir, lenderGitDir, lenderModules, candidates)
+}
+
+export function rehomeBorrowers(
+  commonDir: string,
+  lenderGitDir: string,
+  lenderModules: string,
+  options?: RehomeBorrowersOptions,
+): readonly string[] {
+  return rehomeBorrowerCandidates(
+    commonDir,
+    lenderGitDir,
+    lenderModules,
+    removalBorrowers(commonDir, lenderGitDir),
+    options,
+  )
+}
+
+function rehomeBorrowerCandidates(
+  commonDir: string,
+  lenderGitDir: string,
+  lenderModules: string,
+  candidates: readonly RemovalBorrower[],
+  options?: RehomeBorrowersOptions,
+): readonly string[] {
+  guardRetainedBorrowers(commonDir, lenderGitDir)
+  const hasLenderModules = present(lenderModules)
+  const canonicalCommon = realpathSync(commonDir)
 
   const rehomedBorrowers = new Set<string>()
 
@@ -183,7 +284,7 @@ export function rehomeBorrowers(
     }
 
     try {
-      for (const entry of readdirSync(candidateModules, { recursive: true, withFileTypes: true })) {
+      for (const entry of borrowerEntries(candidateModules, candidate.excludedStores)) {
         if (entry.isSymbolicLink() && entry.name === "objects") {
           const objects = join(entry.parentPath, entry.name)
           let target: string
@@ -269,8 +370,9 @@ async function cleanSnapshot(
   git: Git,
   path: string,
   inspect: (repository: string, path: string) => Promise<WorktreeInspection>,
+  excludedSubmodules: readonly string[] = [],
 ): Promise<readonly Readonly<{ path: string; head: string }>[]> {
-  const status = superStatus({ repo: path })
+  const status = superStatus({ repo: path, excludedSubmodules })
   if (status.submoduleProblems.length > 0) {
     throw new Error(
       `worktree ${path} has unknown submodule state: ${status.submoduleProblems.map((problem) => `${problem.path}: ${problem.reason}${problem.gitDir === undefined ? "" : ` (gitdir ${problem.gitDir})`}`).join("; ")}; preserve and resolve it before removal`,
@@ -297,7 +399,14 @@ async function cleanSnapshot(
     if (state.locked !== undefined) {
       throw new Error(`worktree ${entry.root} is locked: ${state.locked}; resolve its holder before removal`)
     }
-    const checked = superStatus({ repo: entry.root })
+    const prefix = relative(path, entry.root).split(sep).join("/")
+    const localExclusions =
+      prefix === ""
+        ? excludedSubmodules
+        : excludedSubmodules
+            .filter((excluded) => excluded.startsWith(`${prefix}/`))
+            .map((excluded) => excluded.slice(prefix.length + 1))
+    const checked = superStatus({ repo: entry.root, excludedSubmodules: localExclusions })
     if (checked.submoduleProblems.length > 0) {
       throw new Error(
         `worktree ${entry.root} has unknown submodule state: ${checked.submoduleProblems.map((problem) => `${problem.path}: ${problem.reason}`).join("; ")}; preserve and resolve it before removal`,
@@ -619,6 +728,8 @@ export async function retainWorktreeModules(
   inspect: (repository: string, path: string) => Promise<WorktreeInspection>,
   writerLocks: readonly WriterLockProof[],
   createdWriterLocks: readonly WriterLockProof[],
+  rehome?: () => readonly string[],
+  excludedSubmodules: readonly string[] = [],
 ): Promise<WorktreeRemovalProof> {
   const path = realpathSync(requested)
   const registered = await inspect(repo, path)
@@ -637,7 +748,7 @@ export async function retainWorktreeModules(
   const custody = { common, checkout: path, gitDir, modules }
   // Diagnose metadata links before Git discovery can hide their source and target in an object lookup failure.
   manifest(gitDir, custody, false)
-  const before = await cleanSnapshot(git, path, inspect)
+  const before = await cleanSnapshot(git, path, inspect, excludedSubmodules)
   // Check metadata locks before copying. The modules subtree includes every store,
   // even one left by an earlier gitlink that the current tree no longer records.
   const metadata = manifest(gitDir, custody)
@@ -696,8 +807,8 @@ export async function retainWorktreeModules(
       )
     }
   }
-  const rehomedBorrowers = rehomeBorrowers(common, gitDir, modules)
-  const after = await cleanSnapshot(git, path, inspect)
+  const rehomedBorrowers = rehome === undefined ? rehomeBorrowers(common, gitDir, modules) : rehome()
+  const after = await cleanSnapshot(git, path, inspect, excludedSubmodules)
   if (JSON.stringify(after) !== JSON.stringify(before)) {
     throw new Error(`worktree ${path} changed during retention; preserved, retry after its writer stops`)
   }
