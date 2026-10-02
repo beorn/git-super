@@ -23,7 +23,13 @@ import {
   type FrozenPushIntent,
 } from "./push-intent.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
-import { superSubmodulePrepare, type PreparedSubmodule } from "./submodule-prepare.ts"
+import { resolveSubmoduleOrigin } from "./submodule-origin.ts"
+import {
+  nestedStoreMissingDetail,
+  preparedSubmoduleStore,
+  superSubmodulePrepare,
+  type PreparedSubmodule,
+} from "./submodule-prepare.ts"
 import {
   gitSuperResult,
   type ExpectedDestination,
@@ -1310,7 +1316,17 @@ async function collectCommitRequirements(
   const completed = new Set<string>()
   const visiting = new Set<string>()
   const requirements: CommitRequirement[] = []
-  const walk = async (repository: string, path: string, commit: string): Promise<void> => {
+  const missing: Parameters<typeof nestedStoreMissingDetail>[0][number][] = []
+  let missingDepth = Infinity
+  const walk = async (
+    repository: string,
+    path: string,
+    commit: string,
+    preparedParent = false,
+    depth = 0,
+    declaredRemote?: string,
+  ): Promise<void> => {
+    if (depth > missingDepth) return
     const key = `${repository}\0${commit}`
     if (completed.has(key)) return
     if (visiting.has(key)) {
@@ -1329,13 +1345,26 @@ async function collectCommitRequirements(
       const entry = target === undefined ? recorded : { ...recorded, target }
       const childPath = path === "." ? entry.path : `${path}/${entry.path}`
       const store = stores?.get(entry.path)
-      if (stores !== undefined && store === undefined) {
-        throw new Error(`No prepared store for frozen child ${childPath}`)
-      }
       // A PREPARED store is deliberately somewhere else, so its toplevel is not
       // expected to be the gitlink's path and the guard below does not apply to
       // it. The guard is for the fallback, where the path IS the claim.
-      const prepared = store?.gitdir ?? (path === "." ? rootStores?.get(entry.path) : undefined)
+      const nestedStore = preparedParent ? await preparedSubmoduleStore(git, repository, entry.name) : undefined
+      if ((preparedParent && nestedStore === undefined) || (stores !== undefined && store === undefined)) {
+        if (depth < missingDepth) {
+          missing.length = 0
+          missingDepth = depth
+        }
+        missing.push({
+          path: childPath,
+          name: entry.name,
+          parentStore: repository,
+          parentCommit: commit,
+          ...(declaredRemote === undefined ? {} : { parentRemote: declaredRemote }),
+          commit: entry.target,
+        })
+        continue
+      }
+      const prepared = store?.gitdir ?? nestedStore ?? (path === "." ? rootStores?.get(entry.path) : undefined)
       const child = prepared ?? join(repository, entry.path)
       const discovered = await discoverRepository(git, child, "discover-submodule", prepared === undefined)
       const retention: RefUpdate[] = []
@@ -1389,7 +1418,14 @@ async function collectCommitRequirements(
         }
       }
       await verifyOrRecoverSubmoduleCommit(git, discovered, childPath, entry.target)
-      await walk(discovered, childPath, entry.target)
+      await walk(
+        discovered,
+        childPath,
+        entry.target,
+        prepared !== undefined,
+        depth + 1,
+        entry.url === undefined ? undefined : resolveSubmoduleOrigin(repository, declaredRemote, entry.url),
+      )
       requirements.push({
         superproject: repository,
         entry,
@@ -1403,6 +1439,10 @@ async function collectCommitRequirements(
     completed.add(key)
   }
   for (const commit of new Set(commits)) await walk(root, ".", commit)
+  if (missing.length > 0) {
+    const resultDetail = nestedStoreMissingDetail(missing)
+    throw Object.assign(new Error(resultDetail.message), { resultDetail })
+  }
   return requirements.filter(
     (requirement, index, all) =>
       all.findIndex(
