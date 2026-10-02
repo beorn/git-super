@@ -5,6 +5,13 @@
       "name": "gitomic",
       "repository": "beorn/gitomic",
       "commit": "c104848faf0426cb554728d802b669290b37e643"
+    },
+    {
+      "name": "@bearly/flock",
+      "repository": "beorn/bearly",
+      "commit": "aa472ea64d456144a4a041ded4541fadbdc56879",
+      "directory": "packages/flock",
+      "pack": true
     }
   ]
 }
