@@ -3,7 +3,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, test } from "vitest"
 
-import { changedCommitGitlinks, readCommitSubmodules } from "../src/commit-graph.ts"
+import { changedCommitGitlinks, readCommitSubmodules, readPrivateSubmodulePaths } from "../src/commit-graph.ts"
 import { superDiff } from "../src/diff.ts"
 import { classifyExcludedPath } from "../src/status.ts"
 import { createLocalGitProcess, type GitProcess } from "../src/process.ts"
@@ -16,6 +16,60 @@ afterEach(() => {
 })
 
 describe("commit submodule graph", () => {
+  /**
+   * @failure A repository's `private = true` declaration is invisible to every consumer, so each tool keeps its own list of private children (27147).
+   * @level l1
+   * @consumer Yrd env open and hh's private-submodule declaration
+   */
+  test("reads the declared private paths from .gitmodules alone, without joining gitlinks", async () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-private-paths-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const local = createLocalGitProcess()
+    expect(await readPrivateSubmodulePaths(local, fixture.product, fixture.productBase)).toEqual([])
+    // A declared section with no recorded gitlink would refuse readCommitSubmodules; the declaration reader only reads.
+    git(fixture.product, "config", "--file", ".gitmodules", "submodule.ghost.path", "vendor/ghost")
+    git(fixture.product, "config", "--file", ".gitmodules", "submodule.ghost.private", "true")
+    git(fixture.product, "config", "--file", ".gitmodules", "submodule.vendor/beta.private", "true")
+    git(fixture.product, "commit", "-q", "-am", "declare two private children")
+    const declared = git(fixture.product, "rev-parse", "HEAD")
+    expect(await readPrivateSubmodulePaths(local, fixture.product, declared)).toEqual(["vendor/beta", "vendor/ghost"])
+
+    git(fixture.product, "config", "--file", ".gitmodules", "submodule.pathless.private", "true")
+    git(fixture.product, "commit", "-q", "-am", "a private flag with no path")
+    const pathless = git(fixture.product, "rev-parse", "HEAD")
+    await expect(readPrivateSubmodulePaths(local, fixture.product, pathless)).rejects.toMatchObject({
+      resultDetail: { code: "invalid-target-submodule-config" },
+    })
+  })
+
+  test("reports a submodule declared private = true, and refuses any other private value by name", async () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-private-declaration-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    git(fixture.product, "config", "--file", ".gitmodules", "submodule.vendor/beta.private", "true")
+    git(fixture.product, "commit", "-q", "-am", "declare vendor/beta private")
+    const declared = await readCommitSubmodules(
+      createLocalGitProcess(),
+      fixture.product,
+      git(fixture.product, "rev-parse", "HEAD"),
+    )
+    expect(declared.map(({ path, private: isPrivate }) => [path, isPrivate === true])).toEqual([
+      ["packages/alpha", false],
+      ["vendor/beta", true],
+    ])
+
+    git(fixture.product, "config", "--file", ".gitmodules", "submodule.vendor/beta.private", "yes")
+    git(fixture.product, "commit", "-q", "-am", "an unsupported spelling")
+    const invalid = git(fixture.product, "rev-parse", "HEAD")
+    await expect(readCommitSubmodules(createLocalGitProcess(), fixture.product, invalid)).rejects.toMatchObject({
+      resultDetail: {
+        code: "invalid-target-submodule-config",
+        message: `Target ${invalid} declares submodule vendor/beta private = "yes"; write true or false.`,
+      },
+    })
+  })
+
   /**
    * @failure Create loses staged identity, attributes staged defects to HEAD, or invents absence despite staged content (27058).
    * @level l1

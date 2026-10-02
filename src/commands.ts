@@ -311,6 +311,9 @@ const worktreeAdd = commandNode<CommandContext, WorktreeAddParams, GitSuperResul
         path: input.path,
         commit: input.commit,
         ...(input.reference === undefined ? {} : { reference: input.reference }),
+        ...(input.excludedSubmodules === undefined
+          ? {}
+          : { excludedSubmodules: stringArray(input.excludedSubmodules, "excludedSubmodules") }),
       }
     },
     (value) => {
