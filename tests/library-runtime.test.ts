@@ -1,17 +1,32 @@
 /**
- * @failure Node library consumers cannot resolve Git or receive the named Bun CLI refusal.
+ * @failure Library consumers lose Git resolution, mutation/lock behavior, or detached-process cleanup across runtimes.
  * @level l2
  * @consumer Git-super library users on Node and Bun.
  * @testonly none
  * process.test.ts owns the Bun CLI/fd3 lifecycle; its Bun launch helpers cannot run under Node.
  */
 import { afterEach, expect, test, vi } from "vitest"
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs"
 import { setTimeout as delay } from "node:timers/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { execFileSync, spawnSync } from "node:child_process"
-import { createLocalGitProcess, delegateNativeGit, nativeGitExecutable, readNativeGit } from "../src/process.ts"
+import {
+  APPLY_GROUPS_ENV,
+  createLocalGitProcess,
+  delegateNativeGit,
+  nativeGitExecutable,
+  readNativeGit,
+} from "../src/process.ts"
 import { superPull, superPush } from "../src/index.ts"
 import { acquireExclusive } from "../src/exclusive.ts"
 import { createLocalGitWorktreeStore } from "../src/worktree.ts"
@@ -99,6 +114,86 @@ function installGit(body: string): string {
   vi.stubEnv("PATH", root)
   return root
 }
+
+// Bun's pull/CLI suite cannot witness Node's detached spawn or the library's group-record ownership.
+test("detached library commands establish and record their actual process group", async () => {
+  const root = installGit(`
+import { execFileSync } from "node:child_process"
+const group = Number(execFileSync("/bin/ps", ["-o", "pgid=", "-p", String(process.pid)], { encoding: "utf8" }).trim())
+process.stdout.write(JSON.stringify({ pid: process.pid, group }))
+`)
+  const record = join(root, "caller-groups")
+  vi.stubEnv(APPLY_GROUPS_ENV, record)
+  const result = await createLocalGitProcess().run({ repo: root, args: ["opaque"], detached: true, timeoutMs: 2000 })
+  expect(result.code, JSON.stringify(result)).toBe(0)
+  const child = JSON.parse(result.stdout) as { pid: number; group: number }
+  expect(child.pid).toBeGreaterThan(1)
+  expect(child.group).toBe(child.pid)
+  expect(readFileSync(record, "utf8")).toBe(`${child.pid}\n`)
+})
+
+// A leader can exit on SIGTERM while an escaped descendant keeps its output pipes open.
+// The backstop must survive that exit, read the descendant record, and finish draining under either runtime.
+test("library backstop kills a recorded escaped group after the leader exits and removes its record", async () => {
+  const root = installGit(`
+import { appendFileSync, writeFileSync } from "node:fs"
+import { spawn } from "node:child_process"
+import { join } from "node:path"
+const root = process.argv[3]
+process.on("SIGTERM", () => { process.stdout.write("leader terminated\\n"); process.exit(0) })
+const escaped = spawn(process.execPath, [join(root, "escaped.js")], { detached: true, stdio: "inherit" })
+appendFileSync(process.env.GIT_SUPER_APPLY_GROUPS, String(escaped.pid) + "\\n")
+writeFileSync(join(root, "children.json"), JSON.stringify({ leader: process.pid, escaped: escaped.pid, record: process.env.GIT_SUPER_APPLY_GROUPS }))
+// Bound fixture lifetime even if the implementation regresses and never fires its backstop.
+setTimeout(() => process.exit(99), 9000)
+setInterval(() => {}, 600000)
+`)
+  writeFileSync(
+    join(root, "escaped.js"),
+    'process.stdout.write("escaped ready\\n"); setTimeout(() => process.exit(99), 9000); setInterval(() => {}, 600000)\n',
+  )
+  const result = await createLocalGitProcess().run({
+    repo: root,
+    args: [root],
+    timeoutMs: 1500,
+    backstopMs: 3000,
+  })
+  const children = JSON.parse(readFileSync(join(root, "children.json"), "utf8")) as {
+    leader: number
+    escaped: number
+    record: string
+  }
+  try {
+    expect(result.code, JSON.stringify(result)).toBe(0)
+    expect(result.stdout).toContain("escaped ready\n")
+    expect(result.stdout).toContain("leader terminated\n")
+    expect(result.timedOut).toBe(true)
+    expect(result.backstop).toBe(
+      `backstop at 3000ms: SIGKILL to process group(s) ${children.leader}, ${children.escaped} (1 recorded by the command)`,
+    )
+    expect(existsSync(children.record)).toBe(false)
+    // ps rather than a mocked kill report proves every named group has no remaining members.
+    await vi.waitFor(
+      () => {
+        for (const group of [children.leader, children.escaped]) {
+          const members = spawnSync("/bin/ps", ["-o", "pid=", "-g", String(group)], { encoding: "utf8" })
+          if (members.error) throw members.error
+          expect([0, 1]).toContain(members.status)
+          expect(members.stdout.trim()).toBe("")
+        }
+      },
+      { timeout: 5000, interval: 20 },
+    )
+  } finally {
+    for (const group of [children.leader, children.escaped]) {
+      try {
+        process.kill(-group, "SIGKILL")
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error
+      }
+    }
+  }
+}, 12000)
 
 // The existing Bun-only CLI suite cannot execute the library transport on Node.
 // Real children witness pipe capacity, async exec failure and process settlement without a test-only port.
