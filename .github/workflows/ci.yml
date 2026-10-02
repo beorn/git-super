@@ -6,6 +6,68 @@ on:
   pull_request:
 
 jobs:
+  node-sibling-artifact:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - uses: ./.github/actions/source-siblings
+      - name: Node loads the pinned built sibling and acquires its native flock
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from "node:assert/strict"
+          import { createHash } from "node:crypto"
+          import { mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync } from "node:fs"
+          import { tmpdir } from "node:os"
+          import { dirname, join } from "node:path"
+          import { fileURLToPath } from "node:url"
+
+          assert.match(process.version, /^v24\./)
+          const config = JSON.parse(readFileSync("source-siblings.json", "utf8"))
+          const index = config.siblings.findIndex((sibling) => sibling.name === "@bearly/flock")
+          assert.ok(index >= 0, "flock source sibling is missing")
+          const sibling = config.siblings[index]
+          assert.equal(sibling.pack, true)
+          const resolved = fileURLToPath(import.meta.resolve(sibling.name))
+          assert.match(resolved, /node_modules\/@bearly\/flock\/dist\/index\.mjs$/)
+          assert.match(realpathSync(resolved), /node_modules/)
+          const holders = fileURLToPath(import.meta.resolve(`${sibling.name}/holders`))
+          assert.match(holders, /node_modules\/@bearly\/flock\/dist\/holders\.mjs$/)
+          await import(`${sibling.name}/holders`)
+          const pkg = JSON.parse(readFileSync(join(dirname(resolved), "../package.json"), "utf8"))
+          const packDir = `.ci-siblings/${index}-packed`
+          const artifacts = readdirSync(packDir).filter((name) => name.endsWith(".tgz"))
+          assert.equal(artifacts.length, 1)
+          const sha256 = createHash("sha256").update(readFileSync(join(packDir, artifacts[0]))).digest("hex")
+          const flock = await import(sibling.name)
+          const scratch = mkdtempSync(join(tmpdir(), "git-super-node-sibling-"))
+          try {
+            const lock = join(scratch, "owner.lock")
+            const handle = flock.acquireFlockBlocking(lock, { body: "node-sibling-ci" })
+            try {
+              assert.equal(flock.tryAcquireFlock(lock), null)
+            } finally {
+              handle.release()
+            }
+            assert.equal(flock.isFlockHeld(lock), false)
+            const again = flock.tryAcquireFlock(lock)
+            assert.ok(again)
+            again.release()
+          } finally {
+            rmSync(scratch, { recursive: true, force: true })
+          }
+          console.log(JSON.stringify({ package: sibling.name, commit: sibling.commit, version: pkg.version, sha256, node: process.version, resolved, nativeFlock: "PASS" }))
+          NODE
+
   check:
     strategy:
       fail-fast: false
