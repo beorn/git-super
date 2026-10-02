@@ -5,7 +5,8 @@
  * @reach fs-walk <fixture-only: superMerge uses Git repos under mkdtempSync(canonicalTmpdir())>
  */
 import { chmodSync, existsSync, readFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
-import { dirname, isAbsolute, join, relative } from "node:path"
+import { delimiter, dirname, isAbsolute, join, relative } from "node:path"
+import { fileURLToPath } from "node:url"
 import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest"
 import { runCli } from "../src/cli.ts"
 import { acquireExclusive } from "../src/exclusive.ts"
@@ -104,6 +105,108 @@ function candidateWithRootChange(fixture: ProductFixture, name: string): string 
 }
 
 describe("git super merge", () => {
+  /**
+   * @failure A newly added checkout-free parent hides missing descendants behind a generic error and an unusable repair (26996).
+   * @level l1
+   * @consumer merge preparation and its printed store repair
+   * @testonly none
+   */
+  it("names every missing nested store before root writes and executes its printed repair", async () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-merge-nested-store-repair-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const parent = join(root, "parent")
+    const primary = join(root, "primary")
+    const checkout = join(root, "checkout")
+    createRepository(parent, "parent.txt", "parent\n")
+    const leaves = ["one", "two"].map((name) => {
+      const repository = join(root, name)
+      return { name, repository, pin: createRepository(repository, "leaf.txt", `${name}\n`) }
+    })
+    writeFileSync(
+      join(parent, ".gitmodules"),
+      leaves
+        .map(
+          ({ name }) =>
+            `[submodule "${name}-store"]\n path = children/${name}\n url = https://git-super.test/owned/${name}.git\n`,
+        )
+        .join(""),
+    )
+    git(parent, "add", ".gitmodules")
+    for (const { name, pin } of leaves) {
+      git(parent, "update-index", "--add", "--cacheinfo", `160000,${pin},children/${name}`)
+    }
+    git(parent, "commit", "-q", "-m", "add two nested gitlinks")
+    const parentPin = git(parent, "rev-parse", "HEAD")
+    const baseUrl = "https://git-super.test/owned/"
+    const config = [
+      ["protocol.file.allow", "always"],
+      [`url.${fixture.product}.insteadOf`, `${baseUrl}product.git`],
+      [`url.${fixture.alpha}.insteadOf`, `${baseUrl}alpha.git`],
+      [`url.${fixture.beta}.insteadOf`, `${baseUrl}beta.git`],
+      [`url.${parent}.insteadOf`, `${baseUrl}parent.git`],
+      ...leaves.map(({ name, repository }) => [`url.${repository}.insteadOf`, `${baseUrl}${name}.git`]),
+    ]
+    vi.stubEnv("GIT_CONFIG_COUNT", String(config.length))
+    for (const [index, [key, value]] of config.entries()) {
+      vi.stubEnv(`GIT_CONFIG_KEY_${index}`, key)
+      vi.stubEnv(`GIT_CONFIG_VALUE_${index}`, value)
+    }
+    onTestFinished(() => {
+      vi.unstubAllEnvs()
+    })
+    git(root, "clone", "-q", "--recurse-submodules", `${baseUrl}product.git`, primary)
+    git(primary, "worktree", "add", "-q", "-b", "task/nested-repair", checkout, "HEAD")
+    const initialized = await materializeSubmodulesWithProcess(createLocalGitProcess(), {
+      worktree: checkout,
+      referenceWorktree: primary,
+    })
+    expect(initialized.code, initialized.stderr).toBe(0)
+    const before = git(checkout, "rev-parse", "HEAD")
+    const indexBefore = git(checkout, "write-tree")
+    git(fixture.product, "config", "--file", ".gitmodules", "submodule.parent-store.path", "added-parent")
+    git(fixture.product, "config", "--file", ".gitmodules", "submodule.parent-store.url", `${baseUrl}parent.git`)
+    git(fixture.product, "add", ".gitmodules")
+    git(fixture.product, "update-index", "--add", "--cacheinfo", `160000,${parentPin},added-parent`)
+    git(fixture.product, "commit", "-q", "-m", "add parent with nested stores")
+    const target = git(fixture.product, "rev-parse", "HEAD")
+    git(checkout, "fetch", "-q", "origin")
+    const refused = await superMerge({ repo: checkout, commit: target })
+    expect(refused.detail?.code, JSON.stringify(refused.detail)).toBe("nested-store-missing")
+    expect(refused).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: { code: "nested-store-missing", paths: ["added-parent/children/one", "added-parent/children/two"] },
+    })
+    expect(git(checkout, "rev-parse", "HEAD")).toBe(before)
+    expect(git(checkout, "write-tree")).toBe(indexBefore)
+    expect(existsSync(git(checkout, "rev-parse", "--git-path", "MERGE_HEAD"))).toBe(false)
+    const parentStore = join(primary, ".git/modules/parent-store")
+    expect(existsSync(join(primary, "added-parent/.git"))).toBe(false)
+    expect(refused.detail?.message).toContain(parentPin)
+    expect(refused.detail?.message).toContain(parentStore)
+    const commands = refused.detail?.remedy?.split("\n").filter((line) => /^\s+git /u.test(line)) ?? []
+    expect(commands.length).toBeGreaterThanOrEqual(3)
+    for (const command of commands) {
+      const executed = Bun.spawnSync(["sh", "-c", command.trim()], {
+        cwd: root,
+        env: {
+          ...process.env,
+          PATH: `${fileURLToPath(new URL("../bin", import.meta.url))}${delimiter}${process.env.PATH}`,
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      })
+      expect(executed.exitCode, `${command}\n${executed.stderr}`).toBe(0)
+    }
+    const repaired = await superMerge({ repo: checkout, commit: target })
+    expect(repaired.state, JSON.stringify(repaired.detail)).toBe("updated")
+    expect(repaired.partial).toBe(false)
+    for (const { name, pin } of leaves) {
+      expect(git(join(checkout, "added-parent/children", name), "rev-parse", "HEAD")).toBe(pin)
+    }
+  })
+
   /**
    * @failure A merge adds a gitlink but leaves its prepared store without a checkout before the concluding commit hook (26988).
    * @level l1
