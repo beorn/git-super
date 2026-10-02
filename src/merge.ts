@@ -3258,6 +3258,12 @@ async function fetchSubmoduleMain(
   report?: (line: string) => void,
 ): Promise<SubmoduleMain> {
   if (entry.url === undefined) throw new Error(`Submodule ${entry.path} has no declared URL while reading its main`)
+  // THE STORE MUST BE ITS OWN REPOSITORY BEFORE ANY READ OR WRITE BELOW (27179).
+  // An uninitialized gitlink is an empty directory, so Git discovery answers with
+  // the superproject: the refresh fetch then force-updated the ROOT's
+  // refs/remotes/origin/main to the child's main (shared main, 2026-10-02 13:15
+  // and 14:54, vendor/brain8). Refuse as gitlink-store-absent instead.
+  await discoverRepository(git, submodule, "read-submodule-main", true)
   const branch = await resolveSubmoduleBranch(
     { run: (request) => git.run({ ...request, timeoutMs }) },
     superproject,
