@@ -42,6 +42,12 @@ function withPrimaryWorktree(git: SubmoduleGit, primary: string): SubmoduleGit {
       if (repo === primary && args[0] === "worktree" && args[1] === "list") {
         return { ...success(), stdout: `worktree ${primary}\n\n` }
       }
+      if (args[0] === "rev-parse" && args.includes("--show-toplevel")) {
+        return { ...success(), stdout: `${repo}\n` }
+      }
+      if (args[0] === "rev-parse" && args.includes("--absolute-git-dir")) {
+        return { ...success(), stdout: `${join(repo, ".git")}\n` }
+      }
       return git.run(repo, args, allowFailure)
     },
   }
@@ -142,131 +148,172 @@ describe("materializeSubmodules", () => {
    * @level l1
    * @consumer superMerge's staged-submodule initialization
    */
-  it.each(["present", "missing", "partial", "invalid", "history-failed", "nested"] as const)(
-    "materializes staged linked-worktree additions with a %s prepared pin",
-    async (pinState) => {
-      const root = await mkdtemp(join(tmpdir(), "git-super-staged-store-"))
-      roots.push(root)
-      const dependency = join(root, "dependency")
-      const owner = join(root, "owner")
-      const candidate = join(root, "candidate")
-      createRepository(dependency, "dependency.txt", "old pin\n")
-      let required = advanceRepository(dependency, "dependency.txt", "selected pin\n")
-      let nestedPin: string | undefined
-      const nested = join(root, "nested")
-      if (pinState === "nested") {
-        nestedPin = createRepository(nested, "nested.txt", "nested selected pin\n")
-        writeFileSync(join(dependency, ".gitmodules"), `[submodule "nested-store"]\n path = nested\n url = ${nested}\n`)
-        git(dependency, ["add", ".gitmodules"])
-        git(dependency, ["update-index", "--add", "--cacheinfo", `160000,${nestedPin},nested`])
-        git(dependency, ["commit", "-q", "-m", "add nested gitlink"])
-        required = git(dependency, ["rev-parse", "HEAD"]).trim()
+  it.each([
+    "present",
+    "missing",
+    "partial",
+    "invalid",
+    "history-failed",
+    "nested",
+    "nested-missing",
+    "nested-invalid",
+    "nested-unreadable",
+  ] as const)("materializes staged linked-worktree additions with a %s prepared pin", async (pinState) => {
+    const root = await mkdtemp(join(tmpdir(), "git-super-staged-store-"))
+    roots.push(root)
+    const dependency = join(root, "dependency")
+    const owner = join(root, "owner")
+    const candidate = join(root, "candidate")
+    createRepository(dependency, "dependency.txt", "old pin\n")
+    let required = advanceRepository(dependency, "dependency.txt", "selected pin\n")
+    let nestedPin: string | undefined
+    let nestedStore: string | undefined
+    const nested = join(root, "nested")
+    if (pinState.startsWith("nested")) {
+      nestedPin = createRepository(nested, "nested.txt", "nested selected pin\n")
+      writeFileSync(join(dependency, ".gitmodules"), `[submodule "nested-store"]\n path = nested\n url = ../nested\n`)
+      git(dependency, ["add", ".gitmodules"])
+      git(dependency, ["update-index", "--add", "--cacheinfo", `160000,${nestedPin},nested`])
+      git(dependency, ["commit", "-q", "-m", "add nested gitlink"])
+      required = git(dependency, ["rev-parse", "HEAD"]).trim()
+    }
+    createRepository(owner, ".gitmodules", "")
+    git(owner, ["remote", "add", "origin", owner])
+    git(owner, ["worktree", "add", "-q", "--detach", candidate, "HEAD"])
+    writeFileSync(
+      join(candidate, ".gitmodules"),
+      `[submodule "gamma-store"]\n  path = gamma\n  url = ${pinState === "nested-missing" ? "../dependency" : dependency}\n`,
+    )
+    git(candidate, ["add", ".gitmodules"])
+    git(candidate, ["update-index", "--add", "--cacheinfo", `160000,${required},gamma`])
+    const prepared = await prepareSubmoduleTreeUnderLock(
+      { repo: candidate, commit: git(candidate, ["write-tree"]).trim(), remote: owner },
+      new Set(["gamma"]),
+    )
+    expect(prepared.state, JSON.stringify(prepared.detail)).toBe("updated")
+    const descriptor = prepared.submodules[0]
+    if (descriptor === undefined) throw new Error("prepare returned no gamma descriptor")
+    expect(descriptor.path).toBe("gamma")
+    const store = descriptor.gitdir
+    expect(existsSync(join(owner, "gamma", ".git"))).toBe(false)
+    if (pinState !== "missing") git(store, ["fetch", "-q", dependency, `${required}:refs/heads/main`])
+    if (pinState === "nested" || pinState === "nested-invalid" || pinState === "nested-unreadable") {
+      const nestedPrepared = await prepareSubmoduleTreeUnderLock(
+        { repo: store, commit: git(store, ["rev-parse", `${required}^{tree}`]).trim(), remote: dependency },
+        new Set(["nested"]),
+      )
+      expect(nestedPrepared.state, JSON.stringify(nestedPrepared.detail)).toBe("updated")
+      nestedStore = nestedPrepared.submodules[0]?.gitdir
+      if (nestedStore === undefined || nestedPin === undefined) {
+        throw new Error("prepare returned no nested descriptor")
       }
-      createRepository(owner, ".gitmodules", "")
-      git(owner, ["worktree", "add", "-q", "--detach", candidate, "HEAD"])
-      writeFileSync(
-        join(candidate, ".gitmodules"),
-        `[submodule "gamma-store"]\n  path = gamma\n  url = ${dependency}\n`,
-      )
-      git(candidate, ["add", ".gitmodules"])
-      git(candidate, ["update-index", "--add", "--cacheinfo", `160000,${required},gamma`])
-      const prepared = await prepareSubmoduleTreeUnderLock(
-        { repo: candidate, commit: git(candidate, ["write-tree"]).trim(), remote: owner },
-        new Set(["gamma"]),
-      )
-      expect(prepared.state, JSON.stringify(prepared.detail)).toBe("updated")
-      const descriptor = prepared.submodules[0]
-      if (descriptor === undefined) throw new Error("prepare returned no gamma descriptor")
-      expect(descriptor.path).toBe("gamma")
-      const store = descriptor.gitdir
-      expect(existsSync(join(owner, "gamma", ".git"))).toBe(false)
-      if (pinState !== "missing") git(store, ["fetch", "-q", dependency, `${required}:refs/heads/main`])
-      if (pinState === "nested") {
-        const nestedPrepared = await prepareSubmoduleTreeUnderLock(
-          { repo: store, commit: git(store, ["rev-parse", `${required}^{tree}`]).trim(), remote: dependency },
-          new Set(["nested"]),
-        )
-        expect(nestedPrepared.state, JSON.stringify(nestedPrepared.detail)).toBe("updated")
-        const nestedStore = nestedPrepared.submodules[0]?.gitdir
-        if (nestedStore === undefined || nestedPin === undefined) {
-          throw new Error("prepare returned no nested descriptor")
+      git(nestedStore, ["fetch", "-q", nested, `${nestedPin}:refs/heads/main`])
+      if (pinState === "nested-invalid") git(nestedStore, ["config", "core.bare", "true"])
+    }
+    if (pinState === "partial") git(store, ["config", "remote.origin.promisor", "true"])
+    if (pinState === "invalid") git(store, ["config", "core.bare", "true"])
+    const process = createLocalGitProcess()
+    const requests: GitProcessRequest[] = []
+    const selectedProcess = {
+      async run(request: GitProcessRequest) {
+        requests.push(request)
+        if (pinState === "nested-unreadable" && request.repo === nestedStore && request.args[0] === "rev-parse") {
+          return { code: 128, stdout: "", stderr: "nested store unreadable", timedOut: false }
         }
-        git(nestedStore, ["fetch", "-q", nested, `${nestedPin}:refs/heads/main`])
-      }
-      if (pinState === "partial") git(store, ["config", "remote.origin.promisor", "true"])
-      if (pinState === "invalid") git(store, ["config", "core.bare", "true"])
-      const process = createLocalGitProcess()
-      const requests: GitProcessRequest[] = []
-      const selectedProcess = {
-        async run(request: GitProcessRequest) {
-          requests.push(request)
-          if (pinState === "history-failed" && request.repo === owner && request.args[0] === "log") {
-            return { code: 128, stdout: "", stderr: "removal history unreadable", timedOut: false }
-          }
-          if (request.args[0] === "fetch") {
-            return { code: 128, stdout: "", stderr: "prepared pin unavailable in this test", timedOut: false }
-          }
-          return process.run(request)
-        },
-      }
-      // HEAD intentionally lacks the addition; existing callers retain their default census.
-      const head = await materializeSubmodulesWithProcess(selectedProcess, {
-        worktree: candidate,
-        referenceWorktree: owner,
-        paths: ["gamma"],
-      })
-      expect(head).toMatchObject({ code: 0, considered: 0 })
-      requests.length = 0
-      const result = await materializeSubmodulesWithProcess(selectedProcess, {
-        worktree: candidate,
-        referenceWorktree: owner,
-        paths: ["gamma"],
-        source: "index",
-      })
-      if (pinState === "nested") expect(result.code, result.stderr).toBe(0)
-      expect(result.considered).toBe(
-        pinState === "invalid" || pinState === "history-failed" ? 0 : pinState === "nested" ? 2 : 1,
-      )
-      if (pinState === "present" || pinState === "nested") {
-        expect(result).toMatchObject({
-          code: 0,
-          borrowed: pinState === "nested" ? 2 : 1,
-          remoteFallbacks: 0,
-          unreferenced: 0,
-          warmed: 0,
-        })
-        expect(git(join(candidate, "gamma"), ["rev-parse", "HEAD"]).trim()).toBe(required)
-        const gitdir = git(join(candidate, "gamma"), ["rev-parse", "--path-format=absolute", "--git-dir"]).trim()
-        expect(gitdir).toContain("/worktrees/candidate/modules/gamma-store")
-        expect(readFileSync(join(gitdir, "objects/info/alternates"), "utf8").trim().split("\n")).toContain(
-          join(store, "objects"),
-        )
-        expect(requests.some(({ args }) => args[0] === "fetch")).toBe(false)
-        if (pinState === "nested") {
-          expect(git(join(candidate, "gamma", "nested"), ["rev-parse", "HEAD"]).trim()).toBe(nestedPin)
-          expect(requests.filter(({ args }) => args.includes("submodule") && args.includes("update"))).toHaveLength(2)
+        if (pinState === "history-failed" && request.repo === owner && request.args[0] === "log") {
+          return { code: 128, stdout: "", stderr: "removal history unreadable", timedOut: false }
         }
-      } else if (pinState === "invalid" || pinState === "history-failed") {
-        expect(result.code).not.toBe(0)
-        expect(result.stderr).toContain(pinState === "invalid" ? "core.bare=false" : "removal history unreadable")
-        expect(requests.some(({ args }) => args[0] === "fetch")).toBe(false)
-        expect(requests.some(({ args }) => args.includes("submodule") && args.includes("update"))).toBe(false)
-        expect(existsSync(join(candidate, "gamma", ".git"))).toBe(false)
-      } else {
-        expect(result.code).not.toBe(0)
-        expect(result.stderr).toContain("gamma")
-        expect(result.stderr).toContain(required)
-        expect(result.stderr).toContain("limit 0")
-        expect(result).toMatchObject({ borrowed: 0, remoteFallbacks: 1, unreferenced: 0, warmed: 0 })
-        const fetches = requests.filter(({ args }) => args[0] === "fetch")
-        expect(fetches).toHaveLength(pinState === "missing" ? 1 : 0)
-        if (pinState === "missing") expect(fetches[0]!.repo).toBe(store)
-        else expect(result.stderr).toContain("partial clone")
-        expect(existsSync(join(candidate, "gamma", ".git"))).toBe(false)
-        expect(requests.some(({ args }) => args.includes("update") && args.includes("submodule"))).toBe(false)
+        if (request.args[0] === "fetch") {
+          return { code: 128, stdout: "", stderr: "prepared pin unavailable in this test", timedOut: false }
+        }
+        return process.run(request)
+      },
+    }
+    // HEAD intentionally lacks the addition; existing callers retain their default census.
+    const head = await materializeSubmodulesWithProcess(selectedProcess, {
+      worktree: candidate,
+      referenceWorktree: owner,
+      paths: ["gamma"],
+    })
+    expect(head).toMatchObject({ code: 0, considered: 0 })
+    requests.length = 0
+    if (pinState === "nested-missing") {
+      git(root, ["clone", "-q", dependency, join(root, "stale-parent")])
+      git(candidate, ["config", "submodule.gamma-store.url", join(root, "stale-parent")])
+    }
+    const result = await materializeSubmodulesWithProcess(selectedProcess, {
+      worktree: candidate,
+      referenceWorktree: owner,
+      paths: ["gamma"],
+      source: "index",
+    })
+    if (pinState === "nested") expect(result.code, result.stderr).toBe(0)
+    expect(result.considered, result.stderr).toBe(
+      pinState === "invalid" || pinState === "history-failed"
+        ? 0
+        : pinState === "nested" || pinState === "nested-missing"
+          ? 2
+          : 1,
+    )
+    if (pinState === "present" || pinState === "nested") {
+      expect(result).toMatchObject({
+        code: 0,
+        borrowed: pinState === "nested" ? 2 : 1,
+        remoteFallbacks: 0,
+        unreferenced: 0,
+        warmed: 0,
+      })
+      expect(git(join(candidate, "gamma"), ["rev-parse", "HEAD"]).trim()).toBe(required)
+      const gitdir = git(join(candidate, "gamma"), ["rev-parse", "--path-format=absolute", "--git-dir"]).trim()
+      expect(gitdir).toContain("/worktrees/candidate/modules/gamma-store")
+      expect(readFileSync(join(gitdir, "objects/info/alternates"), "utf8").trim().split("\n")).toContain(
+        join(store, "objects"),
+      )
+      expect(requests.some(({ args }) => args[0] === "fetch")).toBe(false)
+      if (pinState === "nested") {
+        expect(git(join(candidate, "gamma", "nested"), ["rev-parse", "HEAD"]).trim()).toBe(nestedPin)
+        expect(requests.filter(({ args }) => args.includes("submodule") && args.includes("update"))).toHaveLength(2)
       }
-    },
-  )
+    } else if (pinState === "nested-missing") {
+      // The existing nested capability arm supplies both stores explicitly;
+      // this arm proves the absent-store diagnosis uses the real parent pin.
+      expect(result.code).not.toBe(0)
+      expect(result.stderr).toContain("nested-store-missing")
+      expect(result.stderr).toContain(store)
+      expect(result.stderr).toContain(required)
+      expect(result.stderr).toContain(nestedPin)
+      expect(result.stderr).toContain("submodule prepare")
+      expect(result.stderr).toContain(dependency)
+      expect(result.stderr).not.toContain("stale-parent")
+      expect(result.stderr).not.toContain(`git -C ${store} submodule update`)
+    } else if (pinState === "nested-invalid" || pinState === "nested-unreadable") {
+      // CTO's absence-only remedy contract: existing invalid children keep
+      // their cause, rather than receiving prepare/fetch recreation commands.
+      expect(result.code).not.toBe(0)
+      expect(result.stderr).toContain(pinState === "nested-invalid" ? "core.bare=false" : "nested store unreadable")
+      expect(result.stderr).not.toContain("nested-store-missing")
+      expect(result.stderr).not.toContain("submodule prepare")
+      expect(existsSync(join(candidate, "gamma", "nested", ".git"))).toBe(false)
+    } else if (pinState === "invalid" || pinState === "history-failed") {
+      expect(result.code).not.toBe(0)
+      expect(result.stderr).toContain(pinState === "invalid" ? "core.bare=false" : "removal history unreadable")
+      expect(requests.some(({ args }) => args[0] === "fetch")).toBe(false)
+      expect(requests.some(({ args }) => args.includes("submodule") && args.includes("update"))).toBe(false)
+      expect(existsSync(join(candidate, "gamma", ".git"))).toBe(false)
+    } else {
+      expect(result.code).not.toBe(0)
+      expect(result.stderr).toContain("gamma")
+      expect(result.stderr).toContain(required)
+      expect(result.stderr).toContain("limit 0")
+      expect(result).toMatchObject({ borrowed: 0, remoteFallbacks: 1, unreferenced: 0, warmed: 0 })
+      const fetches = requests.filter(({ args }) => args[0] === "fetch")
+      expect(fetches).toHaveLength(pinState === "missing" ? 1 : 0)
+      if (pinState === "missing") expect(fetches[0]!.repo).toBe(store)
+      else expect(result.stderr).toContain("partial clone")
+      expect(existsSync(join(candidate, "gamma", ".git"))).toBe(false)
+      expect(requests.some(({ args }) => args.includes("update") && args.includes("submodule"))).toBe(false)
+    }
+  })
 
   /**
    * @failure A retained prepared store resurrects a path deliberately removed by reference HEAD.
@@ -1344,91 +1391,110 @@ describe("materializeSubmodules", () => {
     })
   })
 
-  it("borrows only from the primary submodule store when given a linked reference worktree (hh 26528)", async () => {
-    const root = await mkdtemp(join(tmpdir(), "git-super-primary-reference-"))
-    roots.push(root)
-    const dependency = join(root, "dependency")
-    const owner = join(root, "owner")
-    const linked = join(root, "linked")
-    const candidate = join(root, "candidate")
+  // A linked target must borrow from the physical primary checkout even when
+  // Git registers that primary at its separate submodule Git directory (26996).
+  // Ordinary top-level primary fixtures cannot expose that path distinction.
+  it.each([false, true])(
+    "borrows only from the primary submodule store; submodule parent=%s",
+    async (submoduleParent) => {
+      const root = await mkdtemp(join(tmpdir(), "git-super-primary-reference-"))
+      roots.push(root)
+      const dependency = join(root, "dependency")
+      let owner = join(root, "owner")
+      const linked = join(root, "linked")
+      const candidate = join(root, "candidate")
 
-    git(root, ["init", "-q", "-b", "main", dependency])
-    git(dependency, ["config", "user.name", "Git Super Test"])
-    git(dependency, ["config", "user.email", "git-super@example.invalid"])
-    writeFileSync(join(dependency, "dependency.txt"), "dependency\n")
-    git(dependency, ["add", "dependency.txt"])
-    git(dependency, ["commit", "-qm", "dependency"])
+      git(root, ["init", "-q", "-b", "main", dependency])
+      git(dependency, ["config", "user.name", "Git Super Test"])
+      git(dependency, ["config", "user.email", "git-super@example.invalid"])
+      writeFileSync(join(dependency, "dependency.txt"), "dependency\n")
+      git(dependency, ["add", "dependency.txt"])
+      git(dependency, ["commit", "-qm", "dependency"])
 
-    git(root, ["init", "-q", "-b", "main", owner])
-    git(owner, ["config", "user.name", "Git Super Test"])
-    git(owner, ["config", "user.email", "git-super@example.invalid"])
-    git(owner, ["config", "protocol.file.allow", "always"])
-    writeFileSync(join(owner, "README.md"), "owner\n")
-    git(owner, ["add", "README.md"])
-    git(owner, ["commit", "-qm", "owner"])
-    git(owner, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", dependency, "vendor/dependency"])
-    git(owner, ["commit", "-qam", "add dependency"])
+      git(root, ["init", "-q", "-b", "main", owner])
+      git(owner, ["config", "user.name", "Git Super Test"])
+      git(owner, ["config", "user.email", "git-super@example.invalid"])
+      git(owner, ["config", "protocol.file.allow", "always"])
+      writeFileSync(join(owner, "README.md"), "owner\n")
+      git(owner, ["add", "README.md"])
+      git(owner, ["commit", "-qm", "owner"])
+      git(owner, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", dependency, "vendor/dependency"])
+      git(owner, ["commit", "-qam", "add dependency"])
 
-    git(owner, ["worktree", "add", "-q", "--detach", linked, "HEAD"])
-    git(linked, ["-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive"])
-    const linkedDependency = join(linked, "vendor/dependency")
-    writeFileSync(join(linkedDependency, "dependency.txt"), "private linked commit\n")
-    git(linkedDependency, ["add", "dependency.txt"])
-    git(linkedDependency, ["commit", "-qm", "private linked commit"])
-    const privatePin = git(linkedDependency, ["rev-parse", "HEAD"]).trim()
-    expect(
-      spawnSync("git", ["-C", join(owner, "vendor/dependency"), "cat-file", "-e", `${privatePin}^{commit}`], {
-        encoding: "utf8",
-      }).status,
-    ).not.toBe(0)
-    git(owner, ["worktree", "add", "-q", "--detach", candidate, "HEAD"])
+      if (submoduleParent) {
+        const outer = join(root, "outer")
+        createRepository(outer, "README.md", "outer\n")
+        git(outer, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", owner, "km"])
+        git(outer, ["commit", "-qam", "add parent"])
+        owner = join(outer, "km")
+        git(owner, ["-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive"])
+        const directory = git(owner, ["rev-parse", "--absolute-git-dir"]).trim()
+        expect(git(owner, ["worktree", "list", "--porcelain"])).toContain(`worktree ${directory}\n`)
+        expect(directory).not.toBe(owner)
+      }
 
-    const previousGitAllowProtocol = process.env.GIT_ALLOW_PROTOCOL
-    process.env.GIT_ALLOW_PROTOCOL = "file"
-    let materialized: Awaited<ReturnType<typeof materializeSubmodulesWithProcess>>
-    try {
-      materialized = await materializeSubmodulesWithProcess(createLocalGitProcess(), {
-        worktree: candidate,
-        referenceWorktree: linked,
-      })
-    } finally {
-      if (previousGitAllowProtocol === undefined) delete process.env.GIT_ALLOW_PROTOCOL
-      else process.env.GIT_ALLOW_PROTOCOL = previousGitAllowProtocol
-    }
-    expect(materialized, materialized.stderr).toMatchObject({ code: 0, borrowed: 1, remoteFallbacks: 0 })
+      git(owner, ["worktree", "add", "-q", "--detach", linked, "HEAD"])
+      git(linked, ["-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive"])
+      const linkedDependency = join(linked, "vendor/dependency")
+      writeFileSync(join(linkedDependency, "dependency.txt"), "private linked commit\n")
+      git(linkedDependency, ["add", "dependency.txt"])
+      git(linkedDependency, ["commit", "-qm", "private linked commit"])
+      const privatePin = git(linkedDependency, ["rev-parse", "HEAD"]).trim()
+      expect(
+        spawnSync("git", ["-C", join(owner, "vendor/dependency"), "cat-file", "-e", `${privatePin}^{commit}`], {
+          encoding: "utf8",
+        }).status,
+      ).not.toBe(0)
+      git(owner, ["worktree", "add", "-q", "--detach", candidate, "HEAD"])
 
-    const candidateDependency = join(candidate, "vendor/dependency")
-    const alternatesFile = git(candidateDependency, [
-      "rev-parse",
-      "--path-format=absolute",
-      "--git-path",
-      "objects/info/alternates",
-    ]).trim()
-    const primaryGitDir = git(join(owner, "vendor/dependency"), [
-      "rev-parse",
-      "--path-format=absolute",
-      "--git-dir",
-    ]).trim()
-    // Acceptance criterion 1: A worktree or environment created now has alternates only into the shared store
-    expect(readFileSync(alternatesFile, "utf8").trim()).toBe(join(primaryGitDir, "objects"))
+      const previousGitAllowProtocol = process.env.GIT_ALLOW_PROTOCOL
+      process.env.GIT_ALLOW_PROTOCOL = "file"
+      let materialized: Awaited<ReturnType<typeof materializeSubmodulesWithProcess>>
+      try {
+        materialized = await materializeSubmodulesWithProcess(
+          createLocalGitProcess(),
+          { worktree: candidate, referenceWorktree: linked },
+          { resolveReferenceWorktree: true },
+        )
+      } finally {
+        if (previousGitAllowProtocol === undefined) delete process.env.GIT_ALLOW_PROTOCOL
+        else process.env.GIT_ALLOW_PROTOCOL = previousGitAllowProtocol
+      }
+      expect(materialized, materialized.stderr).toMatchObject({ code: 0, borrowed: 1, remoteFallbacks: 0 })
 
-    const defaultCandidate = join(root, "default-candidate")
-    git(owner, ["worktree", "add", "-q", "--detach", defaultCandidate, "HEAD"])
-    const ordinary = await materializeSubmodulesFromLocalWorktreeParallel({ worktree: defaultCandidate })
-    expect(ordinary, ordinary.stderr).toMatchObject({ exitCode: 0, borrowed: 1 })
-    const defaultAlternates = git(join(defaultCandidate, "vendor/dependency"), [
-      "rev-parse",
-      "--path-format=absolute",
-      "--git-path",
-      "objects/info/alternates",
-    ]).trim()
-    expect(readFileSync(defaultAlternates, "utf8").trim()).toBe(join(primaryGitDir, "objects"))
+      const candidateDependency = join(candidate, "vendor/dependency")
+      const alternatesFile = git(candidateDependency, [
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        "objects/info/alternates",
+      ]).trim()
+      const primaryGitDir = git(join(owner, "vendor/dependency"), [
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-dir",
+      ]).trim()
+      // Acceptance criterion 1: A worktree or environment created now has alternates only into the shared store
+      expect(readFileSync(alternatesFile, "utf8").trim()).toBe(join(primaryGitDir, "objects"))
 
-    // Acceptance criterion 2: Removing any worktree leaves every other worktree's objects intact
-    git(owner, ["worktree", "remove", "--force", linked])
-    expect(git(candidateDependency, ["fsck", "--connectivity-only"]).trim()).toBe("")
-    expect(git(candidateDependency, ["cat-file", "-e", "HEAD^{commit}"])).toBe("")
-  })
+      const defaultCandidate = join(root, "default-candidate")
+      git(owner, ["worktree", "add", "-q", "--detach", defaultCandidate, "HEAD"])
+      const ordinary = await materializeSubmodulesFromLocalWorktreeParallel({ worktree: defaultCandidate })
+      expect(ordinary, ordinary.stderr).toMatchObject({ exitCode: 0, borrowed: 1 })
+      const defaultAlternates = git(join(defaultCandidate, "vendor/dependency"), [
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        "objects/info/alternates",
+      ]).trim()
+      expect(readFileSync(defaultAlternates, "utf8").trim()).toBe(join(primaryGitDir, "objects"))
+
+      // Acceptance criterion 2: Removing any worktree leaves every other worktree's objects intact
+      git(owner, ["worktree", "remove", "--force", linked])
+      expect(git(candidateDependency, ["fsck", "--connectivity-only"]).trim()).toBe("")
+      expect(git(candidateDependency, ["cat-file", "-e", "HEAD^{commit}"])).toBe("")
+    },
+  )
 
   it("treats a reference naming the worktree itself as no reference, not as its primary (hh 26528)", async () => {
     // hh's base-root pool retries a cold `--no-checkout` queue clone's refusal
@@ -1609,6 +1675,63 @@ describe("materializeSubmodules", () => {
       "nesting too deep",
     )
   })
+
+  /**
+   * @failure Reference discovery borrows from the enclosing repository or assumes self when target identity cannot be proven (26996).
+   * @level l1
+   * @consumer process materialization adapters
+   * @testonly none
+   */
+  it.each(["unreadable", "parent-ascent", "missing-primary", "mismatched-primary", "synthetic-mismatch"] as const)(
+    "refuses reference identity %s by name",
+    async (failure) => {
+      const root = await mkdtemp(join(tmpdir(), "git-super-reference-identity-"))
+      roots.push(root)
+      const owner = join(root, "owner")
+      const candidate = join(owner, "candidate")
+      createRepository(owner, "README.md", "owner\n")
+      const other = join(root, "other")
+      if (failure === "mismatched-primary" || failure === "synthetic-mismatch") {
+        createRepository(other, "README.md", "other\n")
+      }
+      if (failure === "parent-ascent") {
+        await mkdir(candidate)
+      } else {
+        git(owner, ["worktree", "add", "-q", "--detach", candidate, "HEAD"])
+      }
+      const local = createLocalGitProcess()
+      const synthetic = withPrimaryWorktree({ run: async () => success() }, owner)
+      const requests: GitProcessRequest[] = []
+      const result = await materializeSubmodulesWithProcess(
+        {
+          run(request) {
+            requests.push(request)
+            if (
+              request.repo === owner &&
+              request.args.includes("--show-toplevel") &&
+              (failure.endsWith("primary") || failure === "synthetic-mismatch")
+            ) {
+              return Promise.resolve({ code: 0, stdout: `${other}\n`, stderr: "" })
+            }
+            if (failure === "unreadable" && request.repo === candidate && request.args.includes("--absolute-git-dir")) {
+              return Promise.resolve({ code: 128, stdout: "", stderr: "injected unreadable Git directory" })
+            }
+            return failure === "synthetic-mismatch" ? synthetic.run(request.repo, request.args) : local.run(request)
+          },
+        },
+        { worktree: candidate, ...(failure === "synthetic-mismatch" ? { referenceWorktree: owner } : {}) },
+        { resolveReferenceWorktree: true },
+      )
+      expect(result.code).not.toBe(0)
+      expect(result).toMatchObject({ considered: 0, borrowed: 0, remoteFallbacks: 0, unreferenced: 0, warmed: 0 })
+      expect(result.stderr).toContain("cannot prove reference identity")
+      expect(result.stderr).toContain(candidate)
+      if (failure === "unreadable") expect(result.stderr).toContain("injected unreadable Git directory")
+      else expect(result.stderr).toContain(owner)
+      if (failure.endsWith("primary") || failure === "synthetic-mismatch") expect(result.stderr).toContain(other)
+      expect(requests.some(({ args }) => args.includes("update"))).toBe(false)
+    },
+  )
 
   it("refuses an explicit reference whose primary worktree cannot be proven", async () => {
     const result = await materializeSubmodules(

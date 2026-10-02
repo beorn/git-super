@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Missing nested stores beneath prepared parents produce `nested-store-missing` with full paths, exact pins, and executable checkout-free prepare and fetch commands using frozen declared URLs. Merge planning collects absent stores at the first failing depth before moving the root; deeper levels are repaired in later rounds. Invalid stores retain their failure causes.
+- Primary submodule checkouts are recognized as self by their absolute Git directory after binding the requested checkout. Failed identity reads and probes that ascend into enclosing repositories refuse explicitly.
+
 ## 0.4.0 — 2026-10-01
 
 - New `git-super/status` subpath exports the recursive inventory (`superStatus`) so consumers such as bearly's worktree tool can import it without the CLI.
