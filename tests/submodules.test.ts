@@ -156,17 +156,18 @@ describe("materializeSubmodules", () => {
       const nested = join(root, "nested")
       if (pinState === "nested" || pinState === "nested-missing") {
         nestedPin = createRepository(nested, "nested.txt", "nested selected pin\n")
-        writeFileSync(join(dependency, ".gitmodules"), `[submodule "nested-store"]\n path = nested\n url = ${nested}\n`)
+        writeFileSync(join(dependency, ".gitmodules"), `[submodule "nested-store"]\n path = nested\n url = ../nested\n`)
         git(dependency, ["add", ".gitmodules"])
         git(dependency, ["update-index", "--add", "--cacheinfo", `160000,${nestedPin},nested`])
         git(dependency, ["commit", "-q", "-m", "add nested gitlink"])
         required = git(dependency, ["rev-parse", "HEAD"]).trim()
       }
       createRepository(owner, ".gitmodules", "")
+      git(owner, ["remote", "add", "origin", owner])
       git(owner, ["worktree", "add", "-q", "--detach", candidate, "HEAD"])
       writeFileSync(
         join(candidate, ".gitmodules"),
-        `[submodule "gamma-store"]\n  path = gamma\n  url = ${dependency}\n`,
+        `[submodule "gamma-store"]\n  path = gamma\n  url = ${pinState === "nested-missing" ? "../dependency" : dependency}\n`,
       )
       git(candidate, ["add", ".gitmodules"])
       git(candidate, ["update-index", "--add", "--cacheinfo", `160000,${required},gamma`])
@@ -1364,91 +1365,110 @@ describe("materializeSubmodules", () => {
     })
   })
 
-  it("borrows only from the primary submodule store when given a linked reference worktree (hh 26528)", async () => {
-    const root = await mkdtemp(join(tmpdir(), "git-super-primary-reference-"))
-    roots.push(root)
-    const dependency = join(root, "dependency")
-    const owner = join(root, "owner")
-    const linked = join(root, "linked")
-    const candidate = join(root, "candidate")
+  // A linked target must borrow from the physical primary checkout even when
+  // Git registers that primary at its separate submodule Git directory (26996).
+  // Ordinary top-level primary fixtures cannot expose that path distinction.
+  it.each([false, true])(
+    "borrows only from the primary submodule store; submodule parent=%s",
+    async (submoduleParent) => {
+      const root = await mkdtemp(join(tmpdir(), "git-super-primary-reference-"))
+      roots.push(root)
+      const dependency = join(root, "dependency")
+      let owner = join(root, "owner")
+      const linked = join(root, "linked")
+      const candidate = join(root, "candidate")
 
-    git(root, ["init", "-q", "-b", "main", dependency])
-    git(dependency, ["config", "user.name", "Git Super Test"])
-    git(dependency, ["config", "user.email", "git-super@example.invalid"])
-    writeFileSync(join(dependency, "dependency.txt"), "dependency\n")
-    git(dependency, ["add", "dependency.txt"])
-    git(dependency, ["commit", "-qm", "dependency"])
+      git(root, ["init", "-q", "-b", "main", dependency])
+      git(dependency, ["config", "user.name", "Git Super Test"])
+      git(dependency, ["config", "user.email", "git-super@example.invalid"])
+      writeFileSync(join(dependency, "dependency.txt"), "dependency\n")
+      git(dependency, ["add", "dependency.txt"])
+      git(dependency, ["commit", "-qm", "dependency"])
 
-    git(root, ["init", "-q", "-b", "main", owner])
-    git(owner, ["config", "user.name", "Git Super Test"])
-    git(owner, ["config", "user.email", "git-super@example.invalid"])
-    git(owner, ["config", "protocol.file.allow", "always"])
-    writeFileSync(join(owner, "README.md"), "owner\n")
-    git(owner, ["add", "README.md"])
-    git(owner, ["commit", "-qm", "owner"])
-    git(owner, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", dependency, "vendor/dependency"])
-    git(owner, ["commit", "-qam", "add dependency"])
+      git(root, ["init", "-q", "-b", "main", owner])
+      git(owner, ["config", "user.name", "Git Super Test"])
+      git(owner, ["config", "user.email", "git-super@example.invalid"])
+      git(owner, ["config", "protocol.file.allow", "always"])
+      writeFileSync(join(owner, "README.md"), "owner\n")
+      git(owner, ["add", "README.md"])
+      git(owner, ["commit", "-qm", "owner"])
+      git(owner, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", dependency, "vendor/dependency"])
+      git(owner, ["commit", "-qam", "add dependency"])
 
-    git(owner, ["worktree", "add", "-q", "--detach", linked, "HEAD"])
-    git(linked, ["-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive"])
-    const linkedDependency = join(linked, "vendor/dependency")
-    writeFileSync(join(linkedDependency, "dependency.txt"), "private linked commit\n")
-    git(linkedDependency, ["add", "dependency.txt"])
-    git(linkedDependency, ["commit", "-qm", "private linked commit"])
-    const privatePin = git(linkedDependency, ["rev-parse", "HEAD"]).trim()
-    expect(
-      spawnSync("git", ["-C", join(owner, "vendor/dependency"), "cat-file", "-e", `${privatePin}^{commit}`], {
-        encoding: "utf8",
-      }).status,
-    ).not.toBe(0)
-    git(owner, ["worktree", "add", "-q", "--detach", candidate, "HEAD"])
+      if (submoduleParent) {
+        const outer = join(root, "outer")
+        createRepository(outer, "README.md", "outer\n")
+        git(outer, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", owner, "km"])
+        git(outer, ["commit", "-qam", "add parent"])
+        owner = join(outer, "km")
+        git(owner, ["-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive"])
+        const directory = git(owner, ["rev-parse", "--absolute-git-dir"]).trim()
+        expect(git(owner, ["worktree", "list", "--porcelain"])).toContain(`worktree ${directory}\n`)
+        expect(directory).not.toBe(owner)
+      }
 
-    const previousGitAllowProtocol = process.env.GIT_ALLOW_PROTOCOL
-    process.env.GIT_ALLOW_PROTOCOL = "file"
-    let materialized: Awaited<ReturnType<typeof materializeSubmodulesWithProcess>>
-    try {
-      materialized = await materializeSubmodulesWithProcess(createLocalGitProcess(), {
-        worktree: candidate,
-        referenceWorktree: linked,
-      })
-    } finally {
-      if (previousGitAllowProtocol === undefined) delete process.env.GIT_ALLOW_PROTOCOL
-      else process.env.GIT_ALLOW_PROTOCOL = previousGitAllowProtocol
-    }
-    expect(materialized, materialized.stderr).toMatchObject({ code: 0, borrowed: 1, remoteFallbacks: 0 })
+      git(owner, ["worktree", "add", "-q", "--detach", linked, "HEAD"])
+      git(linked, ["-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive"])
+      const linkedDependency = join(linked, "vendor/dependency")
+      writeFileSync(join(linkedDependency, "dependency.txt"), "private linked commit\n")
+      git(linkedDependency, ["add", "dependency.txt"])
+      git(linkedDependency, ["commit", "-qm", "private linked commit"])
+      const privatePin = git(linkedDependency, ["rev-parse", "HEAD"]).trim()
+      expect(
+        spawnSync("git", ["-C", join(owner, "vendor/dependency"), "cat-file", "-e", `${privatePin}^{commit}`], {
+          encoding: "utf8",
+        }).status,
+      ).not.toBe(0)
+      git(owner, ["worktree", "add", "-q", "--detach", candidate, "HEAD"])
 
-    const candidateDependency = join(candidate, "vendor/dependency")
-    const alternatesFile = git(candidateDependency, [
-      "rev-parse",
-      "--path-format=absolute",
-      "--git-path",
-      "objects/info/alternates",
-    ]).trim()
-    const primaryGitDir = git(join(owner, "vendor/dependency"), [
-      "rev-parse",
-      "--path-format=absolute",
-      "--git-dir",
-    ]).trim()
-    // Acceptance criterion 1: A worktree or environment created now has alternates only into the shared store
-    expect(readFileSync(alternatesFile, "utf8").trim()).toBe(join(primaryGitDir, "objects"))
+      const previousGitAllowProtocol = process.env.GIT_ALLOW_PROTOCOL
+      process.env.GIT_ALLOW_PROTOCOL = "file"
+      let materialized: Awaited<ReturnType<typeof materializeSubmodulesWithProcess>>
+      try {
+        materialized = await materializeSubmodulesWithProcess(
+          createLocalGitProcess(),
+          { worktree: candidate, referenceWorktree: linked },
+          { resolveReferenceWorktree: true },
+        )
+      } finally {
+        if (previousGitAllowProtocol === undefined) delete process.env.GIT_ALLOW_PROTOCOL
+        else process.env.GIT_ALLOW_PROTOCOL = previousGitAllowProtocol
+      }
+      expect(materialized, materialized.stderr).toMatchObject({ code: 0, borrowed: 1, remoteFallbacks: 0 })
 
-    const defaultCandidate = join(root, "default-candidate")
-    git(owner, ["worktree", "add", "-q", "--detach", defaultCandidate, "HEAD"])
-    const ordinary = await materializeSubmodulesFromLocalWorktreeParallel({ worktree: defaultCandidate })
-    expect(ordinary, ordinary.stderr).toMatchObject({ exitCode: 0, borrowed: 1 })
-    const defaultAlternates = git(join(defaultCandidate, "vendor/dependency"), [
-      "rev-parse",
-      "--path-format=absolute",
-      "--git-path",
-      "objects/info/alternates",
-    ]).trim()
-    expect(readFileSync(defaultAlternates, "utf8").trim()).toBe(join(primaryGitDir, "objects"))
+      const candidateDependency = join(candidate, "vendor/dependency")
+      const alternatesFile = git(candidateDependency, [
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        "objects/info/alternates",
+      ]).trim()
+      const primaryGitDir = git(join(owner, "vendor/dependency"), [
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-dir",
+      ]).trim()
+      // Acceptance criterion 1: A worktree or environment created now has alternates only into the shared store
+      expect(readFileSync(alternatesFile, "utf8").trim()).toBe(join(primaryGitDir, "objects"))
 
-    // Acceptance criterion 2: Removing any worktree leaves every other worktree's objects intact
-    git(owner, ["worktree", "remove", "--force", linked])
-    expect(git(candidateDependency, ["fsck", "--connectivity-only"]).trim()).toBe("")
-    expect(git(candidateDependency, ["cat-file", "-e", "HEAD^{commit}"])).toBe("")
-  })
+      const defaultCandidate = join(root, "default-candidate")
+      git(owner, ["worktree", "add", "-q", "--detach", defaultCandidate, "HEAD"])
+      const ordinary = await materializeSubmodulesFromLocalWorktreeParallel({ worktree: defaultCandidate })
+      expect(ordinary, ordinary.stderr).toMatchObject({ exitCode: 0, borrowed: 1 })
+      const defaultAlternates = git(join(defaultCandidate, "vendor/dependency"), [
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        "objects/info/alternates",
+      ]).trim()
+      expect(readFileSync(defaultAlternates, "utf8").trim()).toBe(join(primaryGitDir, "objects"))
+
+      // Acceptance criterion 2: Removing any worktree leaves every other worktree's objects intact
+      git(owner, ["worktree", "remove", "--force", linked])
+      expect(git(candidateDependency, ["fsck", "--connectivity-only"]).trim()).toBe("")
+      expect(git(candidateDependency, ["cat-file", "-e", "HEAD^{commit}"])).toBe("")
+    },
+  )
 
   it("treats a reference naming the worktree itself as no reference, not as its primary (hh 26528)", async () => {
     // hh's base-root pool retries a cold `--no-checkout` queue clone's refusal
@@ -1636,39 +1656,48 @@ describe("materializeSubmodules", () => {
    * @consumer process materialization adapters
    * @testonly none
    */
-  it.each(["unreadable", "parent-ascent"] as const)("refuses reference identity %s by name", async (failure) => {
-    const root = await mkdtemp(join(tmpdir(), "git-super-reference-identity-"))
-    roots.push(root)
-    const owner = join(root, "owner")
-    const candidate = join(owner, "candidate")
-    createRepository(owner, "README.md", "owner\n")
-    if (failure === "parent-ascent") {
-      await mkdir(candidate)
-    } else {
-      git(owner, ["worktree", "add", "-q", "--detach", candidate, "HEAD"])
-    }
-    const local = createLocalGitProcess()
-    const requests: GitProcessRequest[] = []
-    const result = await materializeSubmodulesWithProcess(
-      {
-        run(request) {
-          requests.push(request)
-          if (failure === "unreadable" && request.repo === candidate && request.args.includes("--absolute-git-dir")) {
-            return Promise.resolve({ code: 128, stdout: "", stderr: "injected unreadable Git directory" })
-          }
-          return local.run(request)
+  it.each(["unreadable", "parent-ascent", "missing-primary", "mismatched-primary"] as const)(
+    "refuses reference identity %s by name",
+    async (failure) => {
+      const root = await mkdtemp(join(tmpdir(), "git-super-reference-identity-"))
+      roots.push(root)
+      const owner = join(root, "owner")
+      const candidate = join(owner, "candidate")
+      createRepository(owner, "README.md", "owner\n")
+      const other = join(root, "other")
+      if (failure === "mismatched-primary") createRepository(other, "README.md", "other\n")
+      if (failure === "parent-ascent") {
+        await mkdir(candidate)
+      } else {
+        git(owner, ["worktree", "add", "-q", "--detach", candidate, "HEAD"])
+      }
+      const local = createLocalGitProcess()
+      const requests: GitProcessRequest[] = []
+      const result = await materializeSubmodulesWithProcess(
+        {
+          run(request) {
+            requests.push(request)
+            if (request.repo === owner && request.args.includes("--show-toplevel") && failure.endsWith("primary")) {
+              return Promise.resolve({ code: 0, stdout: `${other}\n`, stderr: "" })
+            }
+            if (failure === "unreadable" && request.repo === candidate && request.args.includes("--absolute-git-dir")) {
+              return Promise.resolve({ code: 128, stdout: "", stderr: "injected unreadable Git directory" })
+            }
+            return local.run(request)
+          },
         },
-      },
-      { worktree: candidate },
-      { resolveReferenceWorktree: true },
-    )
-    expect(result.code).not.toBe(0)
-    expect(result.stderr).toContain("cannot prove reference identity")
-    expect(result.stderr).toContain(candidate)
-    if (failure === "unreadable") expect(result.stderr).toContain("injected unreadable Git directory")
-    else expect(result.stderr).toContain(owner)
-    expect(requests.some(({ args }) => args.includes("update"))).toBe(false)
-  })
+        { worktree: candidate },
+        { resolveReferenceWorktree: true },
+      )
+      expect(result.code).not.toBe(0)
+      expect(result.stderr).toContain("cannot prove reference identity")
+      expect(result.stderr).toContain(candidate)
+      if (failure === "unreadable") expect(result.stderr).toContain("injected unreadable Git directory")
+      else expect(result.stderr).toContain(owner)
+      if (failure.endsWith("primary")) expect(result.stderr).toContain(other)
+      expect(requests.some(({ args }) => args.includes("update"))).toBe(false)
+    },
+  )
 
   it("refuses an explicit reference whose primary worktree cannot be proven", async () => {
     const result = await materializeSubmodules(

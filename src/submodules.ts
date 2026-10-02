@@ -1544,25 +1544,65 @@ async function discoverReferenceWorktree(
   const identityFailure = (result: SubmoduleGitResult, reason: string): SubmoduleGitResult => ({
     ...result,
     code: result.code === 0 ? 1 : result.code,
-    stderr: `git-super: cannot prove reference identity for '${options.worktree}' against '${discovered}': ${reason}\n${result.stderr}`,
+    stderr: `git-super: cannot prove reference identity for '${options.worktree}' against '${discovered}': ${reason}\n${result.failure ?? result.stderr}`,
   })
   try {
     const target = await git.run(options.worktree, ["rev-parse", "--show-toplevel"], true)
-    if (target.code !== 0 || target.stdout.trim() === "") {
+    if (target.code !== 0 || target.timedOut || target.failure !== undefined || target.stdout.trim() === "") {
       return identityFailure(target, "cannot read the selected checkout's top-level directory")
     }
     if (canonical(target.stdout.trim()) !== canonical(options.worktree)) {
       return identityFailure(target, `the probe selected '${target.stdout.trim()}', not the requested checkout`)
     }
     const targetGitdir = await git.run(options.worktree, ["rev-parse", "--absolute-git-dir"], true)
-    if (targetGitdir.code !== 0 || targetGitdir.stdout.trim() === "") {
+    if (
+      targetGitdir.code !== 0 ||
+      targetGitdir.timedOut ||
+      targetGitdir.failure !== undefined ||
+      targetGitdir.stdout.trim() === ""
+    ) {
       return identityFailure(targetGitdir, "cannot read the selected checkout's Git directory")
     }
     const primaryGitdir = await git.run(discovered, ["rev-parse", "--absolute-git-dir"], true)
-    if (primaryGitdir.code !== 0 || primaryGitdir.stdout.trim() === "") {
+    if (
+      primaryGitdir.code !== 0 ||
+      primaryGitdir.timedOut ||
+      primaryGitdir.failure !== undefined ||
+      primaryGitdir.stdout.trim() === ""
+    ) {
       return identityFailure(primaryGitdir, "cannot read the discovered primary's Git directory")
     }
-    return canonical(targetGitdir.stdout.trim()) === canonical(primaryGitdir.stdout.trim()) ? undefined : discovered
+    if (canonical(targetGitdir.stdout.trim()) === canonical(primaryGitdir.stdout.trim())) return undefined
+
+    const primaryTop = await git.run(discovered, ["rev-parse", "--show-toplevel"], true)
+    const checkout = primaryTop.stdout.trim()
+    const primaryDirectory = primaryGitdir.stdout.trim()
+    if (
+      primaryTop.code !== 0 ||
+      primaryTop.timedOut ||
+      primaryTop.failure !== undefined ||
+      checkout === "" ||
+      !existsSync(checkout)
+    ) {
+      return identityFailure(
+        primaryTop,
+        `primary show-toplevel '${checkout}' is not a readable existing checkout; primary Git directory '${primaryDirectory}', checkout Git directory unproven`,
+      )
+    }
+    const checkoutGitdir = await git.run(checkout, ["rev-parse", "--absolute-git-dir"], true)
+    if (
+      checkoutGitdir.code !== 0 ||
+      checkoutGitdir.timedOut ||
+      checkoutGitdir.failure !== undefined ||
+      checkoutGitdir.stdout.trim() === "" ||
+      canonical(checkoutGitdir.stdout.trim()) !== canonical(primaryDirectory)
+    ) {
+      return identityFailure(
+        checkoutGitdir,
+        `primary show-toplevel '${checkout}' has Git directory '${checkoutGitdir.stdout.trim()}', different or unproven against primary Git directory '${primaryDirectory}'`,
+      )
+    }
+    return canonical(checkout)
   } catch (error) {
     return identityFailure(
       { code: 1, stdout: "", stderr: error instanceof Error ? error.message : String(error) },
