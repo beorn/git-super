@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+## 0.5.0 — 2026-10-02
+
+- Export `readPrivateSubmodulePaths` from `git-super/commit-graph` to read sorted private-submodule declarations from a frozen commit without joining gitlinks. A private declaration without a path and invalid private values refuse explicitly.
 - Missing nested stores beneath prepared parents produce `nested-store-missing` with full paths, exact pins, and executable checkout-free prepare and fetch commands using frozen declared URLs. Merge planning collects absent stores at the first failing depth before moving the root; deeper levels are repaired in later rounds. Invalid stores retain their failure causes.
 - Primary submodule checkouts are recognized as self by their absolute Git directory after binding the requested checkout. Failed identity reads and probes that ascend into enclosing repositories refuse explicitly.
 
