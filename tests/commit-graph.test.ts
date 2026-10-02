@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs"
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, test } from "vitest"
@@ -15,6 +15,78 @@ afterEach(() => {
 })
 
 describe("commit submodule graph", () => {
+  /**
+   * @failure Removal cannot distinguish absent private identity from a tree/config disagreement without opening the child (27058).
+   * @level l1
+   * @consumer Git-super removal classification
+   */
+  // Strict graph tests only prove rejection; removal needs selected evidence for each inconsistent shape.
+  test.each([
+    "absent",
+    "absent-no-manifest",
+    "absent-empty-manifest",
+    "declared",
+    "blob",
+    "tree",
+    "metadata-only",
+    "gitlink-only",
+  ] as const)("retains selected frozen parent evidence for %s without probing a child", async (kind) => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-selected-parent-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const path = "vendor/private"
+    const noSubmodules = kind === "absent-no-manifest" || kind === "absent-empty-manifest"
+    if (noSubmodules) {
+      git(fixture.product, "update-index", "--force-remove", "packages/alpha", "vendor/beta")
+      if (kind === "absent-no-manifest") git(fixture.product, "rm", "-q", ".gitmodules")
+      else writeFileSync(join(fixture.product, ".gitmodules"), "")
+    }
+    if (kind === "blob") writeFileSync(join(fixture.product, path), "parent blob\n")
+    if (kind === "tree") {
+      mkdirSync(join(fixture.product, path))
+      writeFileSync(join(fixture.product, path, "file.txt"), "parent tree\n")
+    }
+    if (kind === "declared" || kind === "metadata-only") {
+      git(fixture.product, "config", "--file", ".gitmodules", "submodule.private-store.path", path)
+      git(fixture.product, "config", "--file", ".gitmodules", "submodule.private-store.url", fixture.alpha)
+    }
+    // A parent with no declarations may still have leftover fixture child checkouts;
+    // only the public manifest is staged, never their content or gitlinks.
+    if (kind === "absent-empty-manifest") git(fixture.product, "add", ".gitmodules")
+    else if (!noSubmodules) git(fixture.product, "add", ".")
+    if (kind === "declared" || kind === "gitlink-only") {
+      git(fixture.product, "update-index", "--add", "--cacheinfo", `160000,${fixture.alphaBase},${path}`)
+    }
+    git(fixture.product, "commit", "--allow-empty", "-q", "-m", "selected parent shape")
+    const head = git(fixture.product, "rev-parse", "HEAD")
+    const local = createLocalGitProcess()
+    const process: GitProcess = {
+      run(request) {
+        if (request.repo !== fixture.product) throw new Error(`child repository was probed: ${request.repo}`)
+        return local.run(request)
+      },
+    }
+    const result = await readCommitSubmodules(process, fixture.product, head, { excludedSubmodules: [path] })
+    expect(result.selectedPaths).toEqual([
+      {
+        path,
+        treeEntry:
+          kind === "absent" || noSubmodules || kind === "metadata-only"
+            ? null
+            : {
+                mode: kind === "blob" ? "100644" : kind === "tree" ? "040000" : "160000",
+                type: kind === "blob" ? "blob" : kind === "tree" ? "tree" : "commit",
+                objectId:
+                  kind === "declared" || kind === "gitlink-only"
+                    ? fixture.alphaBase
+                    : git(fixture.product, "rev-parse", `${head}:${path}`),
+              },
+        declarations: kind === "declared" || kind === "metadata-only" ? [{ name: "private-store", path }] : [],
+      },
+    ])
+    expect(result.submodules.map((entry) => entry.path)).toEqual(noSubmodules ? [] : ["packages/alpha", "vendor/beta"])
+  })
+
   /**
    * @failure Forwarding loses a declared branch or takes ambiguous metadata from a different tree.
    * @level l1
