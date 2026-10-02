@@ -217,6 +217,10 @@ describe("materializeSubmodules", () => {
       })
       expect(head).toMatchObject({ code: 0, considered: 0 })
       requests.length = 0
+      if (pinState === "nested-missing") {
+        git(root, ["clone", "-q", dependency, join(root, "stale-parent")])
+        git(candidate, ["config", "submodule.gamma-store.url", join(root, "stale-parent")])
+      }
       const result = await materializeSubmodulesWithProcess(selectedProcess, {
         worktree: candidate,
         referenceWorktree: owner,
@@ -224,7 +228,7 @@ describe("materializeSubmodules", () => {
         source: "index",
       })
       if (pinState === "nested") expect(result.code, result.stderr).toBe(0)
-      expect(result.considered).toBe(
+      expect(result.considered, result.stderr).toBe(
         pinState === "invalid" || pinState === "history-failed"
           ? 0
           : pinState === "nested" || pinState === "nested-missing"
@@ -259,6 +263,8 @@ describe("materializeSubmodules", () => {
         expect(result.stderr).toContain(required)
         expect(result.stderr).toContain(nestedPin)
         expect(result.stderr).toContain("submodule prepare")
+        expect(result.stderr).toContain(dependency)
+        expect(result.stderr).not.toContain("stale-parent")
         expect(result.stderr).not.toContain(`git -C ${store} submodule update`)
       } else if (pinState === "invalid" || pinState === "history-failed") {
         expect(result.code).not.toBe(0)

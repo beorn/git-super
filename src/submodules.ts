@@ -8,6 +8,7 @@ import { cleanGitRepositoryEnvironment } from "./git.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessRequest, type GitProcessResult } from "./process.ts"
 import { shellQuote } from "./shell-command.ts"
 import { nestedStoreMissingDetail, preparedPinFetchArgs, preparedSubmoduleStore } from "./submodule-prepare.ts"
+import { resolveSubmoduleOrigin } from "./submodule-origin.ts"
 
 export const SUBMODULE_ALTERNATE_LOCATION = "superproject"
 export const SUBMODULE_ALTERNATE_ERROR_STRATEGY = "info"
@@ -1072,6 +1073,37 @@ export async function materializeSubmodules(
         }
       }
       const borrowFrom = referenceHasIt && referenceSubmodule !== undefined ? referenceSubmodule : undefined
+      let selectedRemote = configuredUrl.stdout.trim()
+      if (referenceIsPrepared) {
+        const blob = source === "index" ? ":.gitmodules" : "HEAD:.gitmodules"
+        const declared = await git.run(worktree, ["config", "--blob", blob, "--get", `submodule.${name}.url`], true)
+        if (
+          declared.code !== 0 ||
+          declared.timedOut ||
+          declared.failure !== undefined ||
+          declared.stdout.trim() === ""
+        ) {
+          return {
+            ...declared,
+            code: declared.code === 0 ? 1 : declared.code,
+            stderr: `cannot read selected parent URL for '${name}' from ${blob} in ${worktree}; checkout-free repair requires its declared remote\n${declared.failure ?? declared.stderr}`,
+          }
+        }
+        const declaredUrl = declared.stdout.trim()
+        let base = parentIdentity?.remote
+        if ((declaredUrl.startsWith("./") || declaredUrl.startsWith("../")) && base === undefined) {
+          const origin = await git.run(worktree, ["remote", "get-url", "origin"], true)
+          if (origin.code !== 0 || origin.timedOut || origin.failure !== undefined || origin.stdout.trim() === "") {
+            return {
+              ...origin,
+              code: origin.code === 0 ? 1 : origin.code,
+              stderr: `cannot resolve selected relative URL for '${name}' in ${worktree}; provide its parent remote\n${origin.failure ?? origin.stderr}`,
+            }
+          }
+          base = origin.stdout.trim()
+        }
+        selectedRemote = resolveSubmoduleOrigin(worktree, base, declaredUrl)
+      }
       const isLocal = canBorrow
       const args = [
         "-c",
@@ -1122,7 +1154,7 @@ export async function materializeSubmodules(
           (referenceSubmodule !== undefined && existsSync(referenceSubmodule) ? referenceSubmodule : undefined),
         path,
         required,
-        remote: configuredUrl.stdout.trim(),
+        remote: selectedRemote,
       })
     }
     span?.lap("prepare")
