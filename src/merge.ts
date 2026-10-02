@@ -489,12 +489,22 @@ async function mergeObserved(
   steps: StepClock,
   initializations: SuperMergeInitializationResult[],
 ): Promise<SuperMergeResult> {
-  const statusArgs = ["status", "--porcelain=v1", "-z", "--untracked-files=all"]
-  const status = await run(git, root, statusArgs, timeoutMs)
-  if (status.code !== 0) {
-    return failed(root, [], resultDetailFromGit("git-failed", "verify-clean", root, statusArgs, status))
+  const excludedSubmodules = options.excludedSubmodules ?? []
+  try {
+    validateExcludedSubmodules(excludedSubmodules)
+  } catch (error) {
+    return failed(
+      root,
+      [],
+      obviousDetail(
+        "excluded-submodule-invalid",
+        messageOf(error),
+        "validate excluded submodule paths",
+        "Use literal normalized root-relative gitlink paths.",
+        "the caller",
+      ),
+    )
   }
-
   const head = await required(git, root, ["rev-parse", "HEAD^{commit}"], "resolve-head", timeoutMs)
   let target: string
   try {
@@ -502,9 +512,96 @@ async function mergeObserved(
   } catch (error) {
     return failed(root, [], resultError(error, "resolve-merge-target"))
   }
+  const continuationTree = options.continue
+    ? await required(git, root, ["write-tree"], "read-resolved-index", timeoutMs)
+    : undefined
+  let admittedExclusions: readonly NotCompared[] = []
+  let alreadyContained = false
+  if (excludedSubmodules.length > 0) {
+    const refuseExcluded = (path: string, reason: string): SuperMergeResult =>
+      failed(
+        root,
+        [],
+        obviousDetail(
+          "excluded-submodule-unproven",
+          `Cannot exclude ${path}: ${reason}`,
+          `git -C ${shellQuote(root)} show HEAD:${shellQuote(path)}`,
+          "Only exclude a root gitlink whose pin is identical in HEAD, the target, and their single merge base.",
+          "the caller",
+          { paths: [path], phase: "preflight-excluded-checkouts" },
+        ),
+      )
+    const headEntries = await readCommitSubmodules(git, root, head)
+    const headPins = new Map(headEntries.map((entry) => [entry.path, entry.target]))
+    for (const path of excludedSubmodules) {
+      if (headPins.has(path)) continue
+      if (headEntries.some((entry) => path.startsWith(`${entry.path}/`))) {
+        return refuseExcluded(path, "nested exclusions under an included owner cannot be proved from root commits")
+      }
+      return refuseExcluded(path, "the selected path is not a root gitlink in HEAD")
+    }
+    const baseArgs = ["merge-base", "--all", head, target]
+    const baseResult = await run(git, root, baseArgs, timeoutMs)
+    const bases = baseResult.code === 0 ? baseResult.stdout.trim().split(/\r?\n/u).filter(Boolean) : []
+    if (bases.length !== 1) {
+      return refuseExcluded(
+        excludedSubmodules[0] ?? "<unknown>",
+        `HEAD and target have ${bases.length === 0 ? "no readable" : "multiple"} merge bases`,
+      )
+    }
+    const base = bases[0]
+    if (base === undefined) {
+      return refuseExcluded(excludedSubmodules[0] ?? "<unknown>", "HEAD and target have no readable merge base")
+    }
+    const baseEntries = await readCommitSubmodules(git, root, base)
+    const targetEntries = await readCommitSubmodules(git, root, target)
+    const basePins = new Map(baseEntries.map((entry) => [entry.path, entry.target]))
+    const targetPins = new Map(targetEntries.map((entry) => [entry.path, entry.target]))
+    const stagedPins =
+      continuationTree === undefined
+        ? undefined
+        : new Map((await readCommitSubmodules(git, root, continuationTree)).map((entry) => [entry.path, entry.target]))
+    for (const path of excludedSubmodules) {
+      const coveredByExcludedRoot = excludedSubmodules.some(
+        (parent) => parent !== path && headPins.has(parent) && path.startsWith(`${parent}/`),
+      )
+      if (coveredByExcludedRoot) continue
+      const pin = headPins.get(path)
+      if (pin === undefined || targetPins.get(path) !== pin || basePins.get(path) !== pin) {
+        return refuseExcluded(path, "its HEAD, target, and merge-base gitlink pins are not identical")
+      }
+      if (stagedPins !== undefined) {
+        if (stagedPins.get(path) !== pin) return refuseExcluded(path, "the staged continuation pin differs from HEAD")
+      }
+    }
+    try {
+      const checkouts: ExcludedCheckout[] = excludedSubmodules
+        .filter((path) => headPins.has(path))
+        .map((path) => ({
+          path,
+          repository: join(root, path),
+          allowAbsent: false,
+        }))
+      proveExcludedCheckouts(root, checkouts, "merge")
+    } catch (error) {
+      const detail = (error as Error & { resultDetail?: GitResultDetail }).resultDetail
+      return failed(root, [], detail ?? resultError(error, "preflight-excluded-checkouts"))
+    }
+    admittedExclusions = excludedSubmodules.map((path) => ({
+      path,
+      reason: "excluded",
+      message: "component excluded, not compared",
+    }))
+    alreadyContained = target === base
+  }
+  const statusArgs = ["status", "--porcelain=v1", "-z", "--untracked-files=all"]
+  const status = await run(git, root, statusArgs, timeoutMs)
+  if (status.code !== 0) {
+    return failed(root, [], resultDetailFromGit("git-failed", "verify-clean", root, statusArgs, status))
+  }
   const containmentArgs = ["merge-base", "--is-ancestor", target, head]
-  const containment = await run(git, root, containmentArgs, timeoutMs)
-  if (containment.code === 0) {
+  const containment = excludedSubmodules.length > 0 ? undefined : await run(git, root, containmentArgs, timeoutMs)
+  if (alreadyContained || containment?.code === 0) {
     return failed(
       root,
       [],
@@ -518,7 +615,7 @@ async function mergeObserved(
       ),
     )
   }
-  if (containment.code !== 1) {
+  if (containment !== undefined && containment.code !== 1) {
     return failed(
       root,
       [],
@@ -537,7 +634,7 @@ async function mergeObserved(
     )
   }
   if (options.continue) {
-    const checkoutFailure = await verifyRestingCheckouts(git, root, head, timeoutMs)
+    const checkoutFailure = await verifyRestingCheckouts(git, root, head, timeoutMs, excludedSubmodules)
     if (checkoutFailure !== undefined) return failed(root, [], checkoutFailure)
     const unstaged = await required(
       git,
@@ -577,8 +674,21 @@ async function mergeObserved(
   let composed: ReadonlyMap<string, ComposedGitlink> = new Map()
   let forkComposed: ReadonlyMap<string, ComposedGitlink> = new Map()
   if (options.continue) {
-    tree = await required(git, root, ["write-tree"], "read-resolved-index", timeoutMs)
-    const pinFailure = await validateContinuationPins(git, root, tree, prospective, timeoutMs)
+    if (continuationTree === undefined) {
+      return failed(
+        root,
+        [],
+        obviousDetail(
+          "merge-continuation-tree-unavailable",
+          "The resolved continuation index has no tree.",
+          "git write-tree",
+          "Resolve the pending index before continuing.",
+          "the caller",
+        ),
+      )
+    }
+    tree = continuationTree
+    const pinFailure = await validateContinuationPins(git, root, tree, prospective, timeoutMs, excludedSubmodules)
     if (pinFailure !== undefined) return failed(root, [], pinFailure)
   } else if ("failure" in prospective) {
     if (
@@ -589,7 +699,7 @@ async function mergeObserved(
       if (status.stdout !== "") {
         return failed(root, [], dirtyWorktreeDetail(root, options.commit, nulRecords(status.stdout)))
       }
-      const checkoutFailure = await verifyRestingCheckouts(git, root, head, timeoutMs)
+      const checkoutFailure = await verifyRestingCheckouts(git, root, head, timeoutMs, excludedSubmodules)
       if (checkoutFailure !== undefined) return failed(root, [], checkoutFailure)
       const branch = await required(git, root, ["symbolic-ref", "HEAD"], "observe-merge-branch", timeoutMs)
       steps.begin("merge")
@@ -670,6 +780,7 @@ async function mergeObserved(
       options.noFetch,
       options.unboundedLocalMain,
       options.report,
+      excludedSubmodules,
     )
   } catch (error) {
     return failed(root, [], resultError(error, "inspect-gitlinks"))
@@ -696,6 +807,7 @@ async function mergeObserved(
         options.noFetch,
         options.unboundedLocalMain,
         options.report,
+        excludedSubmodules,
       )
     } catch (error) {
       return failed(root, [], resultError(error, "inspect-gitlinks"))
@@ -800,6 +912,7 @@ async function mergeObserved(
       timeoutMs,
       planned.stores,
       planned.mains,
+      excludedSubmodules,
     )
     if (frozen !== undefined) trailers.push(`${PUSH_INTENT_TRAILER}: ${frozen}`)
   } catch (error) {
@@ -1230,6 +1343,7 @@ async function mergeObserved(
     ...(settledCheckouts.rows.length === 0 ? {} : { checkouts: settledCheckouts.rows }),
     ...(planned.descents.length === 0 ? {} : { descents: planned.descents }),
     ...(planned.unboundedLocalMains.length === 0 ? {} : { unboundedLocalMains: planned.unboundedLocalMains }),
+    ...(admittedExclusions.length === 0 ? {} : { notCompared: admittedExclusions }),
     repositories: [{ repository: root, state: "updated", refs: [] }],
   }
 }
@@ -1396,8 +1510,10 @@ async function verifyRestingCheckouts(
   root: string,
   head: string,
   timeoutMs: number,
+  excludedSubmodules: readonly string[] = [],
 ): Promise<GitResultDetail | undefined> {
   for (const entry of await readCommitSubmodules(git, root, head)) {
+    if (isSubmoduleExcluded(entry.path, excludedSubmodules)) continue
     const child = join(root, entry.path)
     if (!existsSync(join(child, ".git"))) continue // No checkout exists to move; materialization keeps its existing owner.
     const observed = await required(git, child, ["rev-parse", "HEAD^{commit}"], "observe-resting-checkout", timeoutMs)
@@ -1428,6 +1544,7 @@ async function validateContinuationPins(
   stagedTree: string,
   prospective: Readonly<{ tree: string }> | ProspectiveFailure,
   timeoutMs: number,
+  excludedSubmodules: readonly string[] = [],
 ): Promise<GitResultDetail | undefined> {
   if ("failure" in prospective && prospective.conflict?.tree === undefined) return prospective.failure
   let referenceTree = "failure" in prospective ? prospective.conflict?.tree : prospective.tree
@@ -1465,7 +1582,9 @@ async function validateContinuationPins(
     referenceTree = resolved.tree
   }
   const requiredPins = new Map(
-    (await readCommitSubmodules(git, root, referenceTree)).map((entry) => [entry.path, [entry.target]]),
+    (await readCommitSubmodules(git, root, referenceTree))
+      .filter((entry) => !isSubmoduleExcluded(entry.path, excludedSubmodules))
+      .map((entry) => [entry.path, [entry.target]]),
   )
   if ("failure" in prospective) {
     for (const entry of prospective.conflict?.entries ?? []) {
@@ -1502,7 +1621,11 @@ async function validateContinuationPins(
       if (!contained) return refusal(path, entry.target, pins)
     }
   }
-  for (const [path, entry] of staged) if (!requiredPins.has(path)) return refusal(path, entry.target, [])
+  for (const [path, entry] of staged) {
+    if (!isSubmoduleExcluded(path, excludedSubmodules) && !requiredPins.has(path)) {
+      return refusal(path, entry.target, [])
+    }
+  }
   return undefined
 }
 
@@ -2608,6 +2731,7 @@ async function planGitlinks(
   noFetch?: boolean,
   unboundedLocalMain?: boolean,
   report?: (line: string) => void,
+  excludedSubmodules: readonly string[] = [],
 ): Promise<GitlinkPlans> {
   const plans: GitlinkPlan[] = []
   const descents: SuperMergeDescentResult[] = []
@@ -2624,7 +2748,11 @@ async function planGitlinks(
   }
   const rootRemote = await rootPushIdentity(git, root)
   const rootBefore = new Map((await readCommitSubmodules(git, root, head)).map((entry) => [entry.path, entry.target]))
-  const added = new Set(rootMerged.filter((entry) => !rootBefore.has(entry.path)).map((entry) => entry.path))
+  const added = new Set(
+    rootMerged
+      .filter((entry) => !rootBefore.has(entry.path) && !isSubmoduleExcluded(entry.path, excludedSubmodules))
+      .map((entry) => entry.path),
+  )
   if (added.size > 0) {
     const prepared = await prepareSubmoduleTreeUnderLock({ repo: root, commit: tree, remote: rootRemote, git }, added)
     if (prepared.state === "failed" || prepared.state === "unknown") {
@@ -2767,7 +2895,12 @@ async function planGitlinks(
     // Nested rungs are rare (one Ahead parent) and keep the sequential fetch.
     const prefetched = new Map<string, { ok: true; main: SubmoduleMain } | { ok: false; error: unknown }>()
     if (!nested) {
-      const owned = entries.filter((entry) => entry.url !== undefined && sameHostedOwner(rootRemote, entry.url))
+      const owned = entries.filter(
+        (entry) =>
+          !isSubmoduleExcluded(entry.path, excludedSubmodules) &&
+          entry.url !== undefined &&
+          sameHostedOwner(rootRemote, entry.url),
+      )
       const outcomes = await mapInOrder(owned, MAIN_FETCH_CONCURRENCY, (entry) =>
         fetchSubmoduleMain(
           git,
@@ -2787,6 +2920,10 @@ async function planGitlinks(
     }
     for (const entry of entries) {
       const path = nested ? `${prefix}/${entry.path}` : entry.path
+      if (!nested && isSubmoduleExcluded(path, excludedSubmodules)) {
+        plans.push({ path, from: entry.target, to: entry.target, state: "as-written", changedByMerge: false })
+        continue
+      }
       const submodule = nested
         ? await discoverRepository(git, join(repository, entry.path), "discover-nested-submodule", true)
         : (stores.get(path) ?? join(repository, entry.path))
