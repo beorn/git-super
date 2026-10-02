@@ -41,6 +41,7 @@ beforeAll(() => {
 afterAll(() => {
   if (previousGlobal === undefined) delete process.env.GIT_CONFIG_GLOBAL
   else process.env.GIT_CONFIG_GLOBAL = previousGlobal
+  // raw-delete-allow: the fixture trees this test made under its own mkdtemp roots
   for (const fixture of fixtures) rmSync(fixture, { recursive: true, force: true })
 })
 
@@ -97,6 +98,8 @@ function excludedFixture(): Readonly<{
   git(root, "submodule", "update", "-q", "--", "child")
   advanceRepository(root, "main.txt", "main moved\n")
   git(root, "submodule", "deinit", "-q", "-f", "--", "secret")
+  // raw-delete-allow: the excluded child's store inside this test's own mkdtemp fixture, removed to model a seat that
+  // never held it
   rmSync(join(root, ".git", "modules", "secret"), { recursive: true, force: true })
   renameSync(secret.remote, `${secret.remote}.gone`)
   return { fixture, root, rootRemote, childRemote: child.remote, secretPin: secret.head, rootBefore, candidate }
