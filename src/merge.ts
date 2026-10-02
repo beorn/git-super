@@ -356,7 +356,9 @@ async function mergeUnderLock(
           code,
           message,
           `git -C ${shellQuote(root)} status --short`,
-          pending === undefined ? "Use one merge mode with its required expectations." : pendingRemedy(root, pending, options.excludedSubmodules),
+          pending === undefined
+            ? "Use one merge mode with its required expectations."
+            : pendingRemedy(root, pending, options.excludedSubmodules),
           undefined,
         ),
       )
@@ -442,7 +444,10 @@ async function mergeUnderLock(
         const heads = await nativeMergeHeads(git, root, timeoutMs)
         if (heads === undefined) throw new Error(`Rejected commit at ${root}: expected native MERGE_HEAD is missing`)
         const observed = await observePending(git, root, heads, timeoutMs)
-        const detail = { ...result.detail, next: `Inspect the named Git failure. ${pendingRemedy(root, observed, options.excludedSubmodules)}` }
+        const detail = {
+          ...result.detail,
+          next: `Inspect the named Git failure. ${pendingRemedy(root, observed, options.excludedSubmodules)}`,
+        }
         return {
           ...result,
           pending: observed,
@@ -1466,7 +1471,11 @@ async function observePending(
   return { branch, head, target: heads[0] ?? "", unmergedPaths: paths }
 }
 
-function pendingRemedy(root: string, pending: NonNullable<SuperMergeResult["pending"]>, excludedSubmodules: readonly string[] = []): string {
+function pendingRemedy(
+  root: string,
+  pending: NonNullable<SuperMergeResult["pending"]>,
+  excludedSubmodules: readonly string[] = [],
+): string {
   const command = [
     "git",
     "super",

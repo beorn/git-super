@@ -52,7 +52,9 @@ describe("git super merge — excluded admission (27058)", () => {
     const childRequests: GitProcessRequest[] = []
     const recording: GitProcess = {
       run(request) {
-        if ([checkout, store].some((selected) => request.repo === selected || request.repo.startsWith(`${selected}/`))) {
+        if (
+          [checkout, store].some((selected) => request.repo === selected || request.repo.startsWith(`${selected}/`))
+        ) {
           childRequests.push(request)
           throw new Error(`excluded child request: ${request.repo}`)
         }
@@ -64,7 +66,11 @@ describe("git super merge — excluded admission (27058)", () => {
     expect(result).toMatchObject({ state: "updated", partial: false, notCompared: [{ path, reason: "excluded" }] })
     expect(result.gitlinks).toContainEqual(expect.objectContaining({ path, state: "as-written" }))
     expect(git(fixture.product, "rev-parse", `HEAD:${path}`)).toBe(pin)
-    expect(git(fixture.product, "show", "-s", "--format=%B", "HEAD").split("\n").filter((line) => line.startsWith(`Settled: ${path}@`))).toEqual([`Settled: ${path}@${pin}`])
+    expect(
+      git(fixture.product, "show", "-s", "--format=%B", "HEAD")
+        .split("\n")
+        .filter((line) => line.startsWith(`Settled: ${path}@`)),
+    ).toEqual([`Settled: ${path}@${pin}`])
     expect(childRequests).toEqual([])
   })
 
@@ -74,7 +80,16 @@ describe("git super merge — excluded admission (27058)", () => {
    * @consumer git-super merge admission before native Git composition
    * @testonly none
    */
-  it.each(["target-moved", "head-moved", "both-moved", "both-same", "target-removed", "head-removed", "base-absent", "multiple-bases"])("refuses %s excluded identity before any merge-tree or merge request", async (shape) => {
+  it.each([
+    "target-moved",
+    "head-moved",
+    "both-moved",
+    "both-same",
+    "target-removed",
+    "head-removed",
+    "base-absent",
+    "multiple-bases",
+  ])("refuses %s excluded identity before any merge-tree or merge request", async (shape) => {
     const root = mkdtempSync(join(tmpdir(), "git-super-merge-excluded-moved-"))
     roots.push(root)
     const fixture = createProductFixture(root)
@@ -100,7 +115,8 @@ describe("git super merge — excluded admission (27058)", () => {
     const target = git(fixture.product, "rev-parse", "HEAD")
     git(fixture.product, "switch", "-q", "main")
     if (["head-moved", "both-moved", "both-same"].includes(shape)) {
-      const headPin = shape === "both-moved" ? advanceRepository(fixture.alpha, "excluded-head.txt", "head advance\n") : moved
+      const headPin =
+        shape === "both-moved" ? advanceRepository(fixture.alpha, "excluded-head.txt", "head advance\n") : moved
       git(fixture.product, "update-index", "--cacheinfo", `160000,${headPin},${path}`)
       git(fixture.product, "commit", "-q", "-m", "move excluded HEAD pin")
     } else if (shape === "head-removed") {
@@ -118,11 +134,20 @@ describe("git super merge — excluded admission (27058)", () => {
       run(request) {
         // Distinct merge-base multiplicity, supplied at the existing process seam;
         // the other table rows use real parent trees and their actual merge base.
-        if (shape === "multiple-bases" && request.repo === fixture.product && request.args[0] === "merge-base" && request.args.includes("--all")) {
+        if (
+          shape === "multiple-bases" &&
+          request.repo === fixture.product &&
+          request.args[0] === "merge-base" &&
+          request.args.includes("--all")
+        ) {
           bases.fire("multiple merge bases")
           return Promise.resolve({ code: 0, stdout: `${head}\n${target}\n`, stderr: "" })
         }
-        if (request.args[0] === "merge-tree" || request.args[0] === "merge" || request.repo.startsWith(`${fixture.product}/${path}`)) {
+        if (
+          request.args[0] === "merge-tree" ||
+          request.args[0] === "merge" ||
+          request.repo.startsWith(`${fixture.product}/${path}`)
+        ) {
           unsafe.push(request)
           throw new Error(`admission must precede ${request.args[0]}`)
         }
@@ -151,13 +176,15 @@ describe("git super merge — excluded admission (27058)", () => {
     const path = "packages/alpha/apps/maddoc"
     const local = createLocalGitProcess()
     const unsafe: GitProcessRequest[] = []
-    const recording: GitProcess = { run(request) {
-      if (request.repo !== fixture.product || request.args[0] === "merge-tree" || request.args[0] === "merge") {
-        unsafe.push(request)
-        throw new Error(`nested exclusion must refuse before ${request.repo}: ${request.args[0]}`)
-      }
-      return local.run(request)
-    } }
+    const recording: GitProcess = {
+      run(request) {
+        if (request.repo !== fixture.product || request.args[0] === "merge-tree" || request.args[0] === "merge") {
+          unsafe.push(request)
+          throw new Error(`nested exclusion must refuse before ${request.repo}: ${request.args[0]}`)
+        }
+        return local.run(request)
+      },
+    }
     const options = { repo: fixture.product, commit: target, excludedSubmodules: [path], git: recording }
     const result = await superMerge(options)
     expect(result).toMatchObject({ state: "failed", detail: { paths: [path] } })
@@ -187,14 +214,24 @@ describe("git super merge — excluded admission (27058)", () => {
     const index = git(fixture.product, "write-tree")
     const local = createLocalGitProcess()
     const unsafe: GitProcessRequest[] = []
-    const recording: GitProcess = { run(request) {
-      if (request.repo !== fixture.product || request.args[0] === "merge-tree" || request.args[0] === "merge") {
-        unsafe.push(request)
-        throw new Error(`continue admission must precede ${request.repo}: ${request.args[0]}`)
-      }
-      return local.run(request)
-    } }
-    const options = { repo: fixture.product, commit: target, continue: true, expectedHead: head, expectedBranch: branch, excludedSubmodules: [path, "vendor/beta"], git: recording }
+    const recording: GitProcess = {
+      run(request) {
+        if (request.repo !== fixture.product || request.args[0] === "merge-tree" || request.args[0] === "merge") {
+          unsafe.push(request)
+          throw new Error(`continue admission must precede ${request.repo}: ${request.args[0]}`)
+        }
+        return local.run(request)
+      },
+    }
+    const options = {
+      repo: fixture.product,
+      commit: target,
+      continue: true,
+      expectedHead: head,
+      expectedBranch: branch,
+      excludedSubmodules: [path, "vendor/beta"],
+      git: recording,
+    }
     const result = await superMerge(options)
     expect(result).toMatchObject({ state: "failed", detail: { paths: [path] } })
     expect(result.detail?.message).toContain(`'--exclude-submodule' '${path}' '--exclude-submodule' 'vendor/beta'`)
