@@ -10,7 +10,7 @@ import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, 
 import { setTimeout as delay } from "node:timers/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { execFileSync } from "node:child_process"
+import { execFileSync, spawnSync } from "node:child_process"
 import { createLocalGitProcess, delegateNativeGit, nativeGitExecutable, readNativeGit } from "../src/process.ts"
 import { superPull, superPush } from "../src/index.ts"
 import { acquireExclusive } from "../src/exclusive.ts"
@@ -21,6 +21,21 @@ const roots: string[] = []
 afterEach(() => {
   vi.unstubAllEnvs()
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
+})
+
+// The CLI's static imports can fail before delegateNativeGit's library-level refusal.
+test("the executable names its Bun requirement before loading CLI dependencies on Node", () => {
+  const child = spawnSync(process.execPath, [join(import.meta.dirname, "../bin/git-super"), "--version"], {
+    encoding: "utf8",
+  })
+  if (typeof Bun === "undefined") {
+    expect(child.status).toBe(2)
+    expect(child.stdout).toBe("")
+    expect(child.stderr).toBe("git-super: Bun CLI requires Bun >=1.3.14\n")
+  } else {
+    expect(child.status).toBe(0)
+    expect(child.stdout).toMatch(/git version/u)
+  }
 })
 
 test("library resolves executable Git on the inherited PATH, skipping non-executable entries", () => {
