@@ -747,9 +747,14 @@ export async function materializeSubmodules(
       prefix === "" ? [path] : path.startsWith(`${prefix}/`) ? [path.slice(prefix.length + 1)] : [],
     )
     let metadata: SelectedCommitSubmodules
+    let failedRead: SubmoduleGitResult | undefined
     try {
       metadata = await readCommitSubmodules(
-        { run: (request) => git.run(request.repo, request.args, true) },
+        { run: async (request) => {
+          const result = await git.run(request.repo, request.args, true)
+          if (result.code !== 0 || result.timedOut || result.failure !== undefined) failedRead = result
+          return result
+        } },
         worktree,
         head,
         { excludedSubmodules: excluded, source },
@@ -757,8 +762,9 @@ export async function materializeSubmodules(
     } catch (error) {
       const resultDetail = (error as { resultDetail?: { paths?: readonly string[]; remedy?: string } }).resultDetail
       return {
-        code: 1,
-        stdout: "",
+        ...failedRead,
+        code: failedRead === undefined || failedRead.code === 0 ? 1 : failedRead.code,
+        stdout: failedRead?.stdout ?? "",
         stderr: `${error instanceof Error ? error.message : String(error)}${resultDetail?.paths === undefined ? "" : `\nPaths: ${resultDetail.paths.join(", ")}`}${resultDetail?.remedy === undefined ? "" : `\n${resultDetail.remedy}`}`,
       }
     }

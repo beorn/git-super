@@ -154,6 +154,7 @@ describe("materializeSubmodules", () => {
     "absent",
     "declared-absent",
     "declared-empty",
+    "declared-local",
     "orphan",
     "blob",
     "tree",
@@ -197,6 +198,7 @@ describe("materializeSubmodules", () => {
       expect(updated.status, updated.stderr).toBe(0)
     }
     if (state === "declared-empty") await mkdir(join(owner, path), { recursive: true })
+    if (state === "declared-local") git(owner, ["config", "--local", "submodule.private.url", "/never-fetch"])
     if (state === "content") {
       await mkdir(join(owner, "private"), { recursive: true })
       writeFileSync(join(owner, path), "preserve\n")
@@ -207,6 +209,7 @@ describe("materializeSubmodules", () => {
     }
     const local = createLocalGitProcess()
     const requests: GitProcessRequest[] = []
+    const messages: string[] = []
     const result = await materializeSubmodulesWithProcess(
       {
         run(request) {
@@ -215,9 +218,10 @@ describe("materializeSubmodules", () => {
           return local.run(request)
         },
       },
-      { worktree: owner, excludedSubmodules: [path], ...(index ? { source: "index" as const } : {}) },
+      { worktree: owner, excludedSubmodules: [path], log: capturingLogger(messages), ...(index ? { source: "index" as const } : {}) },
     )
-    const accepted = ["absent", "declared-absent", "declared-empty", "index-add", "index-remove"].includes(state)
+    const accepted = ["absent", "declared-absent", "declared-empty", "declared-local", "index-add", "index-remove"].includes(state)
+    if (state === "declared-local") expect(messages.join("\n")).not.toMatch(/stale.*submodule\.private|submodule\.private.*stale/iu)
     expect(result.code, result.stderr).toBe(accepted ? 0 : 1)
     expect(result.considered).toBe(0)
     expect(requests.every((request) => request.repo === owner)).toBe(true)
@@ -658,8 +662,8 @@ describe("materializeSubmodules", () => {
         state === "unmerged"
           ? "unmerged"
           : state === "undeclared"
-            ? "not declared in stage-0 .gitmodules"
-            : "stage-0 gitlink",
+            ? "without submodule metadata"
+            : "as a gitlink",
       )
       expect(existsSync(join(owner, "gamma", ".git"))).toBe(false)
     },
@@ -712,7 +716,9 @@ describe("materializeSubmodules", () => {
       {
         async run(request) {
           requests.push(request)
-          if (request.args[0] === "cat-file") return { code: 1, stdout: "", stderr: "", timedOut: false }
+          if (request.args[0] === "rev-parse" && request.args.includes("--verify")) {
+            return { code: 0, stdout: "7".repeat(40), stderr: "", timedOut: false }
+          }
           return { code: 0, stdout: "", stderr: "", timedOut: false }
         },
       },
@@ -728,21 +734,33 @@ describe("materializeSubmodules", () => {
    * @level l1
    * @consumer merge's lock-bound initialization and pull's detached apply
    */
-  it.each([false, true])(
-    "preserves process bounds and failure details with reference discovery %s",
-    async (discover) => {
+  it.each([false, true].flatMap((discover) => ["policy", "collector"].map((phase) => ({ discover, phase }))))(
+    "preserves process bounds and $phase failure details with reference discovery $discover",
+    async ({ discover, phase }) => {
+      const worktree = await mkdtemp(join(tmpdir(), "git-super-bounds-"))
+      roots.push(worktree)
       const requests: GitProcessRequest[] = []
       const result = await materializeSubmodulesWithProcess(
         {
           async run(request) {
             requests.push(request)
+            if (phase === "collector") {
+              if (request.args[0] === "config") return { code: 0, stdout: "", stderr: "", timedOut: false }
+              if (request.args[0] === "rev-parse" && request.args.includes("--verify")) {
+                return { code: 0, stdout: "7".repeat(40), stderr: "", timedOut: false }
+              }
+              if (request.args[0] === "worktree") {
+                return { code: 0, stdout: `worktree ${worktree}\n\n`, stderr: "", timedOut: false }
+              }
+            }
             return { code: 143, stdout: "", stderr: "initialization timed out", timedOut: true, failure: "timeout" }
           },
         },
-        { worktree: "/worktree" },
+        { worktree },
         { timeoutMs: 45, detached: true, resolveReferenceWorktree: discover },
       )
-      expect(requests[0]).toMatchObject({ timeoutMs: 45, detached: true })
+      expect(requests.every((request) => request.timeoutMs === 45 && request.detached === true)).toBe(true)
+      if (phase === "collector") expect(requests.some((request) => request.args[0] === "ls-tree")).toBe(true)
       expect(result).toMatchObject({ code: 143, timedOut: true, failure: "timeout" })
     },
   )
@@ -767,10 +785,17 @@ describe("materializeSubmodules", () => {
     const git: SubmoduleGit = {
       async run(repo, args) {
         commands.push({ repo, args })
-        if (args[0] === "cat-file" && args.at(-1) === "HEAD:.gitmodules") {
-          return repo === worktree ? success() : { ...success(), code: 1 }
+        if (args[0] === "rev-parse" && args.includes("--verify") && args.at(-1) === "HEAD") {
+          return { ...success(), stdout: "7".repeat(40) }
         }
-        if (args[0] === "config" && args[1] === "--blob") {
+        if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
+          if (repo !== worktree) return success()
+          const rows = [[`160000 commit ${"a".repeat(40)}\tapps/maddoc\0`].flat(), `100644 blob ${"8".repeat(40)}\t.gitmodules\0`].flat()
+          const wanted = args.at(-1)
+          return { ...success(), stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
+            ? rows.filter((row) => row.endsWith(`\t${wanted}\0`)) : rows).join("") }
+        }
+        if (args[0] === "config" && args.includes("--blob")) {
           return { ...success(), stdout: "submodule.maddoc.path\napps/maddoc\u0000" }
         }
         if (args[0] === "ls-tree") {
@@ -814,10 +839,17 @@ describe("materializeSubmodules", () => {
     const git: SubmoduleGit = {
       async run(repo, args) {
         commands.push({ repo, args })
-        if (args[0] === "cat-file" && args.at(-1) === "HEAD:.gitmodules") {
-          return repo === worktree ? success() : { ...success(), code: 1 }
+        if (args[0] === "rev-parse" && args.includes("--verify") && args.at(-1) === "HEAD") {
+          return { ...success(), stdout: "7".repeat(40) }
         }
-        if (args[0] === "config" && args[1] === "--blob") {
+        if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
+          if (repo !== worktree) return success()
+          const rows = [[`160000 commit ${"a".repeat(40)}\tapps/maddoc\0`].flat(), `100644 blob ${"8".repeat(40)}\t.gitmodules\0`].flat()
+          const wanted = args.at(-1)
+          return { ...success(), stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
+            ? rows.filter((row) => row.endsWith(`\t${wanted}\0`)) : rows).join("") }
+        }
+        if (args[0] === "config" && args.includes("--blob")) {
           return { ...success(), stdout: "submodule.maddoc.path\napps/maddoc\u0000" }
         }
         if (args[0] === "ls-tree") return { ...success(), stdout: `160000 commit ${"a".repeat(40)}\tapps/maddoc\n` }
@@ -862,10 +894,17 @@ describe("materializeSubmodules", () => {
 
     const git: SubmoduleGit = {
       async run(repo, args) {
-        if (args[0] === "cat-file" && args.at(-1) === "HEAD:.gitmodules") {
-          return repo === worktree ? success() : { ...success(), code: 1 }
+        if (args[0] === "rev-parse" && args.includes("--verify") && args.at(-1) === "HEAD") {
+          return { ...success(), stdout: "7".repeat(40) }
         }
-        if (args[0] === "config" && args[1] === "--blob") {
+        if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
+          if (repo !== worktree) return success()
+          const rows = [paths.map((path) => `160000 commit ${"1".repeat(40)}\t${path}\0`).flat(), `100644 blob ${"8".repeat(40)}\t.gitmodules\0`].flat()
+          const wanted = args.at(-1)
+          return { ...success(), stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
+            ? rows.filter((row) => row.endsWith(`\t${wanted}\0`)) : rows).join("") }
+        }
+        if (args[0] === "config" && args.includes("--blob")) {
           return {
             ...success(),
             stdout: paths.map((path, index) => `submodule.s${index}.path\n${path}\0`).join(""),
@@ -921,10 +960,17 @@ describe("materializeSubmodules", () => {
     const messages: string[] = []
     const git: SubmoduleGit = {
       async run(repo, args) {
-        if (args[0] === "cat-file" && args.at(-1) === "HEAD:.gitmodules") {
-          return repo === worktree ? success() : { ...success(), code: 1 }
+        if (args[0] === "rev-parse" && args.includes("--verify") && args.at(-1) === "HEAD") {
+          return { ...success(), stdout: "7".repeat(40) }
         }
-        if (args[0] === "config" && args[1] === "--blob") {
+        if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
+          if (repo !== worktree) return success()
+          const rows = [[`160000 commit ${"f".repeat(40)}\tapps/maddoc\0`].flat(), `100644 blob ${"8".repeat(40)}\t.gitmodules\0`].flat()
+          const wanted = args.at(-1)
+          return { ...success(), stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
+            ? rows.filter((row) => row.endsWith(`\t${wanted}\0`)) : rows).join("") }
+        }
+        if (args[0] === "config" && args.includes("--blob")) {
           return { ...success(), stdout: "submodule.maddoc.path\napps/maddoc\u0000" }
         }
         if (args[0] === "ls-tree") return { ...success(), stdout: `160000 commit ${"f".repeat(40)}\tapps/maddoc\n` }
@@ -963,10 +1009,17 @@ describe("materializeSubmodules", () => {
     roots.push(referenceWorktree)
     const git: SubmoduleGit = {
       async run(repo, args) {
-        if (args[0] === "cat-file" && args.at(-1) === "HEAD:.gitmodules") {
-          return repo === worktree ? success() : { ...success(), code: 1 }
+        if (args[0] === "rev-parse" && args.includes("--verify") && args.at(-1) === "HEAD") {
+          return { ...success(), stdout: "7".repeat(40) }
         }
-        if (args[0] === "config" && args[1] === "--blob") {
+        if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
+          if (repo !== worktree) return success()
+          const rows = [[`160000 commit ${"e".repeat(40)}\tapps/maddoc\0`].flat(), `100644 blob ${"8".repeat(40)}\t.gitmodules\0`].flat()
+          const wanted = args.at(-1)
+          return { ...success(), stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
+            ? rows.filter((row) => row.endsWith(`\t${wanted}\0`)) : rows).join("") }
+        }
+        if (args[0] === "config" && args.includes("--blob")) {
           return { ...success(), stdout: "submodule.maddoc.path\napps/maddoc\u0000" }
         }
         if (args[0] === "ls-tree") return { ...success(), stdout: `160000 commit ${"e".repeat(40)}\tapps/maddoc\n` }
@@ -999,10 +1052,17 @@ describe("materializeSubmodules", () => {
     await mkdir(join(referenceWorktree, "apps/maddoc"), { recursive: true })
     const git: SubmoduleGit = {
       async run(repo, args) {
-        if (args[0] === "cat-file" && args.at(-1) === "HEAD:.gitmodules") {
-          return repo === worktree ? success() : { ...success(), code: 1 }
+        if (args[0] === "rev-parse" && args.includes("--verify") && args.at(-1) === "HEAD") {
+          return { ...success(), stdout: "7".repeat(40) }
         }
-        if (args[0] === "config" && args[1] === "--blob") {
+        if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
+          if (repo !== worktree) return success()
+          const rows = [[`160000 commit ${"b".repeat(40)}\tapps/maddoc\0`].flat(), `100644 blob ${"8".repeat(40)}\t.gitmodules\0`].flat()
+          const wanted = args.at(-1)
+          return { ...success(), stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
+            ? rows.filter((row) => row.endsWith(`\t${wanted}\0`)) : rows).join("") }
+        }
+        if (args[0] === "config" && args.includes("--blob")) {
           return { ...success(), stdout: "submodule.maddoc.path\napps/maddoc\u0000" }
         }
         if (args[0] === "ls-tree") return { ...success(), stdout: `160000 commit ${"b".repeat(40)}\tapps/maddoc\n` }
@@ -1050,10 +1110,17 @@ describe("materializeSubmodules", () => {
   ): SubmoduleGit => ({
     async run(repo, args) {
       commands.push({ repo, args })
-      if (args[0] === "cat-file" && args.at(-1) === "HEAD:.gitmodules") {
-        return repo === worktree ? success() : { ...success(), code: 1 }
+      if (args[0] === "rev-parse" && args.includes("--verify") && args.at(-1) === "HEAD") {
+        return { ...success(), stdout: "7".repeat(40) }
       }
-      if (args[0] === "config" && args[1] === "--blob") {
+      if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
+        if (repo !== worktree) return success()
+        const rows = [[`160000 commit ${"9".repeat(40)}\thh-web\0`].flat(), `100644 blob ${"8".repeat(40)}\t.gitmodules\0`].flat()
+        const wanted = args.at(-1)
+        return { ...success(), stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
+          ? rows.filter((row) => row.endsWith(`\t${wanted}\0`)) : rows).join("") }
+      }
+      if (args[0] === "config" && args.includes("--blob")) {
         return { ...success(), stdout: "submodule.hh-web.path\nhh-web\u0000" }
       }
       if (args[0] === "ls-tree") {
@@ -1157,10 +1224,17 @@ describe("materializeSubmodules", () => {
     const treeReads: string[] = []
     const git: SubmoduleGit = {
       async run(repo, args) {
-        if (args[0] === "cat-file" && args.at(-1) === "HEAD:.gitmodules") {
-          return repo === worktree ? success() : { ...success(), code: 1 }
+        if (args[0] === "rev-parse" && args.includes("--verify") && args.at(-1) === "HEAD") {
+          return { ...success(), stdout: "7".repeat(40) }
         }
-        if (args[0] === "config" && args[1] === "--blob") {
+        if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
+          if (repo !== worktree) return success()
+          const rows = [[`160000 commit ${removed}\thh-web\0`, `160000 commit ${cold}\tag\0`].flat(), `100644 blob ${"8".repeat(40)}\t.gitmodules\0`].flat()
+          const wanted = args.at(-1)
+          return { ...success(), stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
+            ? rows.filter((row) => row.endsWith(`\t${wanted}\0`)) : rows).join("") }
+        }
+        if (args[0] === "config" && args.includes("--blob")) {
           return { ...success(), stdout: "submodule.hh-web.path\nhh-web\u0000submodule.ag.path\nag\u0000" }
         }
         if (args[0] === "ls-tree") {
@@ -1211,10 +1285,17 @@ describe("materializeSubmodules", () => {
     const messages: string[] = []
     const git: SubmoduleGit = {
       async run(repo, args) {
-        if (args[0] === "cat-file" && args.at(-1) === "HEAD:.gitmodules") {
-          return repo === worktree ? success() : { ...success(), code: 1 }
+        if (args[0] === "rev-parse" && args.includes("--verify") && args.at(-1) === "HEAD") {
+          return { ...success(), stdout: "7".repeat(40) }
         }
-        if (args[0] === "config" && args[1] === "--blob") {
+        if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
+          if (repo !== worktree) return success()
+          const rows = [[`160000 commit ${"c".repeat(40)}\tapps/maddoc\0`].flat(), `100644 blob ${"8".repeat(40)}\t.gitmodules\0`].flat()
+          const wanted = args.at(-1)
+          return { ...success(), stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
+            ? rows.filter((row) => row.endsWith(`\t${wanted}\0`)) : rows).join("") }
+        }
+        if (args[0] === "config" && args.includes("--blob")) {
           return { ...success(), stdout: "submodule.maddoc.path\napps/maddoc\u0000" }
         }
         if (args[0] === "ls-tree") return { ...success(), stdout: `160000 commit ${"c".repeat(40)}\tapps/maddoc\n` }
@@ -1266,10 +1347,17 @@ describe("materializeSubmodules", () => {
     const git: SubmoduleGit = {
       async run(repo, args) {
         commands.push({ repo, args })
-        if (args[0] === "cat-file" && args.at(-1) === "HEAD:.gitmodules") {
-          return repo === worktree ? success() : { ...success(), code: 1 }
+        if (args[0] === "rev-parse" && args.includes("--verify") && args.at(-1) === "HEAD") {
+          return { ...success(), stdout: "7".repeat(40) }
         }
-        if (args[0] === "config" && args[1] === "--blob") {
+        if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
+          if (repo !== worktree) return success()
+          const rows = [[`160000 commit ${required}\tapps/maddoc\0`].flat(), `100644 blob ${"8".repeat(40)}\t.gitmodules\0`].flat()
+          const wanted = args.at(-1)
+          return { ...success(), stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
+            ? rows.filter((row) => row.endsWith(`\t${wanted}\0`)) : rows).join("") }
+        }
+        if (args[0] === "config" && args.includes("--blob")) {
           return { ...success(), stdout: "submodule.maddoc.path\napps/maddoc\u0000" }
         }
         if (args[0] === "ls-tree") return { ...success(), stdout: `160000 commit ${required}\tapps/maddoc\n` }
@@ -1325,10 +1413,17 @@ describe("materializeSubmodules", () => {
 
     const git: SubmoduleGit = {
       async run(repo, args) {
-        if (args[0] === "cat-file" && args.at(-1) === "HEAD:.gitmodules") {
-          return repo === worktree ? success() : { ...success(), code: 1 }
+        if (args[0] === "rev-parse" && args.includes("--verify") && args.at(-1) === "HEAD") {
+          return { ...success(), stdout: "7".repeat(40) }
         }
-        if (args[0] === "config" && args[1] === "--blob") {
+        if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
+          if (repo !== worktree) return success()
+          const rows = [[`160000 commit ${required}\tapps/maddoc\0`].flat(), `100644 blob ${"8".repeat(40)}\t.gitmodules\0`].flat()
+          const wanted = args.at(-1)
+          return { ...success(), stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
+            ? rows.filter((row) => row.endsWith(`\t${wanted}\0`)) : rows).join("") }
+        }
+        if (args[0] === "config" && args.includes("--blob")) {
           return { ...success(), stdout: "submodule.maddoc.path\napps/maddoc\u0000" }
         }
         if (args[0] === "ls-tree") return { ...success(), stdout: `160000 commit ${required}\tapps/maddoc\n` }
@@ -1429,10 +1524,17 @@ describe("materializeSubmodules", () => {
 
     const git: SubmoduleGit = {
       async run(repo, args) {
-        if (args[0] === "cat-file" && args.at(-1) === "HEAD:.gitmodules") {
-          return repo === worktree ? success() : { ...success(), code: 1 }
+        if (args[0] === "rev-parse" && args.includes("--verify") && args.at(-1) === "HEAD") {
+          return { ...success(), stdout: "7".repeat(40) }
         }
-        if (args[0] === "config" && args[1] === "--blob") {
+        if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
+          if (repo !== worktree) return success()
+          const rows = [[`160000 commit ${"e".repeat(40)}\tapps/maddoc\0`].flat(), `100644 blob ${"8".repeat(40)}\t.gitmodules\0`].flat()
+          const wanted = args.at(-1)
+          return { ...success(), stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
+            ? rows.filter((row) => row.endsWith(`\t${wanted}\0`)) : rows).join("") }
+        }
+        if (args[0] === "config" && args.includes("--blob")) {
           return { ...success(), stdout: "submodule.maddoc.path\napps/maddoc\u0000" }
         }
         if (args[0] === "ls-tree") return { ...success(), stdout: `160000 commit ${"e".repeat(40)}\tapps/maddoc\n` }
@@ -1472,10 +1574,17 @@ describe("materializeSubmodules", () => {
     const git: SubmoduleGit = {
       async run(repo, args) {
         commands.push({ args, mutation: false })
-        if (args[0] === "cat-file" && args.at(-1) === "HEAD:.gitmodules") {
-          return repo === worktree ? success() : { ...success(), code: 1 }
+        if (args[0] === "rev-parse" && args.includes("--verify") && args.at(-1) === "HEAD") {
+          return { ...success(), stdout: "7".repeat(40) }
         }
-        if (args[0] === "config" && args[1] === "--blob") {
+        if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
+          if (repo !== worktree) return success()
+          const rows = [paths.map((path) => `160000 commit ${"a".repeat(40)}\t${path}\0`).flat(), `100644 blob ${"8".repeat(40)}\t.gitmodules\0`].flat()
+          const wanted = args.at(-1)
+          return { ...success(), stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
+            ? rows.filter((row) => row.endsWith(`\t${wanted}\0`)) : rows).join("") }
+        }
+        if (args[0] === "config" && args.includes("--blob")) {
           return {
             ...success(),
             stdout: paths.map((path, index) => `submodule.module-${index}.path\n${path}\0`).join(""),
@@ -1543,8 +1652,15 @@ describe("materializeSubmodules", () => {
     const storeProbes: string[] = []
     const git: SubmoduleGit = {
       async run(repo, args) {
-        if (args[0] === "cat-file" && args.at(-1) === "HEAD:.gitmodules") {
-          return repo === worktree ? success() : { ...success(), code: 1 }
+        if (args[0] === "rev-parse" && args.includes("--verify") && args.at(-1) === "HEAD") {
+          return { ...success(), stdout: "7".repeat(40) }
+        }
+        if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
+          if (repo !== worktree) return success()
+          const rows = [paths.map((path) => `160000 commit ${"a".repeat(40)}\t${path}\0`).flat(), `100644 blob ${"8".repeat(40)}\t.gitmodules\0`].flat()
+          const wanted = args.at(-1)
+          return { ...success(), stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
+            ? rows.filter((row) => row.endsWith(`\t${wanted}\0`)) : rows).join("") }
         }
         if (args[0] === "cat-file" && args[1] === "-e") {
           storeProbes.push(repo)
@@ -1553,7 +1669,7 @@ describe("materializeSubmodules", () => {
             ? success()
             : { ...success(), code: 1 }
         }
-        if (args[0] === "config" && args[1] === "--blob") {
+        if (args[0] === "config" && args.includes("--blob")) {
           return {
             ...success(),
             stdout: paths.map((path, index) => `submodule.module-${index}.path\n${path}\0`).join(""),
@@ -2094,10 +2210,17 @@ describe("materializeSubmodules", () => {
         if (args[0] === "rev-parse" && args.includes("--git-common-dir")) {
           return { code: 128, stdout: "", stderr: "fatal: this operation must be run in a work tree" }
         }
-        if (args[0] === "cat-file" && args.at(-1) === "HEAD:.gitmodules") {
-          return repo === worktree ? success() : { ...success(), code: 1 }
+        if (args[0] === "rev-parse" && args.includes("--verify") && args.at(-1) === "HEAD") {
+          return { ...success(), stdout: "7".repeat(40) }
         }
-        if (args[0] === "config" && args[1] === "--blob") {
+        if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
+          if (repo !== worktree) return success()
+          const rows = [[`160000 commit ${"f".repeat(40)}\tapps/maddoc\0`].flat(), `100644 blob ${"8".repeat(40)}\t.gitmodules\0`].flat()
+          const wanted = args.at(-1)
+          return { ...success(), stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
+            ? rows.filter((row) => row.endsWith(`\t${wanted}\0`)) : rows).join("") }
+        }
+        if (args[0] === "config" && args.includes("--blob")) {
           return { ...success(), stdout: "submodule.maddoc.path\napps/maddoc\u0000" }
         }
         if (args[0] === "ls-tree") return { ...success(), stdout: `160000 commit ${"f".repeat(40)}\tapps/maddoc\n` }
@@ -2607,10 +2730,17 @@ describe("materializeSubmodules", () => {
     const git: SubmoduleGit = {
       async run(repo, args) {
         commands.push({ repo, args })
-        if (args[0] === "cat-file" && args.at(-1) === "HEAD:.gitmodules") {
-          return repo === worktree ? success() : { ...success(), code: 1 }
+        if (args[0] === "rev-parse" && args.includes("--verify") && args.at(-1) === "HEAD") {
+          return { ...success(), stdout: "7".repeat(40) }
         }
-        if (args[0] === "config" && args[1] === "--blob") {
+        if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
+          if (repo !== worktree) return success()
+          const rows = [[`160000 commit ${missingSha}\tvendor/dep\0`].flat(), `100644 blob ${"8".repeat(40)}\t.gitmodules\0`].flat()
+          const wanted = args.at(-1)
+          return { ...success(), stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
+            ? rows.filter((row) => row.endsWith(`\t${wanted}\0`)) : rows).join("") }
+        }
+        if (args[0] === "config" && args.includes("--blob")) {
           return { ...success(), stdout: "submodule.dep.path\nvendor/dep\u0000" }
         }
         if (args[0] === "ls-tree") {
