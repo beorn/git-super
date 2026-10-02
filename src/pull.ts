@@ -75,11 +75,10 @@ export function proveExcludedCheckouts(root: string, checkouts: readonly Exclude
       resultDetail: detail(
         "excluded-submodule-unsafe",
         "preflight-excluded-checkouts",
-          `Excluded submodule ${checkout.path} has a ${state} checkout; only an empty uninitialized checkout${checkout.allowAbsent ? " or an absent added checkout" : ""} can be skipped by ${verb}.`,
+        `Excluded submodule ${checkout.path} has a ${state} checkout; only an empty uninitialized checkout${checkout.allowAbsent ? " or an absent added checkout" : ""} can be skipped by ${verb}.`,
         {
           paths: [checkout.path],
-          remedy:
-            `Preserve the private checkout and its Git store before rerunning ${verb}; exclusion does not authorize accessing or replacing private content.`,
+          remedy: `Preserve the private checkout and its Git store before rerunning ${verb}; exclusion does not authorize accessing or replacing private content.`,
         },
       ),
     })
