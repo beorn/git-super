@@ -26,6 +26,28 @@ export function inspectUninitializedCheckout(
   return readdirSync(path).length === 0 ? "empty" : "nonempty"
 }
 
+/** Classify parent identity from frozen native evidence and checkout metadata, without any Git or filesystem reads. */
+export function classifyExcludedPath(
+  path: string,
+  parents: NonNullable<NotCompared["exclusion"]>["parents"],
+  checkout: NonNullable<NotCompared["exclusion"]>["checkout"],
+): NonNullable<NotCompared["exclusion"]> {
+  validateExcludedSubmodules([path])
+  if (parents.length === 0 || parents.some((parent) => parent.path !== path)) {
+    throw new Error(
+      `missing selected parent evidence for excluded ${path}; collect its frozen parent identity before classification`,
+    )
+  }
+  const declared = parents.every(
+    (parent) =>
+      parent.treeEntry?.mode === "160000" && parent.treeEntry.type === "commit" && parent.declarations.length === 1,
+  )
+  const absent =
+    parents.every((parent) => parent.treeEntry === null && parent.declarations.length === 0) &&
+    (checkout === "absent" || checkout === "empty")
+  return { classification: declared ? "declared" : absent ? "absent" : "unclassified", parents, checkout }
+}
+
 export type SuperStatusResult = Readonly<{
   records: readonly string[]
   consultedRepositories: readonly ConsultedRepository[]

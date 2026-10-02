@@ -21,7 +21,7 @@ import { tryAcquireFlock, type FlockHandle } from "@bearly/flock"
 import { fileLockHolders, formatLockHolders } from "@bearly/flock/holders"
 import { spawnSync } from "node:child_process"
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
-import { inspectUninitializedCheckout, superStatus, type SuperStatusResult } from "./status.ts"
+import { classifyExcludedPath, inspectUninitializedCheckout, superStatus, type SuperStatusResult } from "./status.ts"
 import { readCommitSubmodules, type SelectedCommitSubmodules } from "./commit-graph.ts"
 import { validateExcludedSubmodules } from "./git.ts"
 import type { GitProcess } from "./process.ts"
@@ -130,15 +130,9 @@ export async function assertExcludedRemovalCustody(
       }
       return { ...selected, repository: parent.adminDir, head: parent.head }
     })
-    const declared = evidence.every(
-      (entry) =>
-        entry.treeEntry?.mode === "160000" && entry.treeEntry.type === "commit" && entry.declarations.length === 1,
-    )
-    const absent =
-      evidence.every((entry) => entry.treeEntry === null && entry.declarations.length === 0) &&
-      (disk === "absent" || disk === "empty")
-    const classification = declared ? "declared" : absent ? "absent" : "unclassified"
-    const exclusion: NonNullable<NotCompared["exclusion"]> = { classification, parents: evidence, checkout: disk }
+    const exclusion = classifyExcludedPath(path, evidence, disk)
+    const declared = exclusion.classification === "declared"
+    const absent = exclusion.classification === "absent"
     if (!declared) {
       notCompared.push({
         path,
