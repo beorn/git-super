@@ -23,6 +23,7 @@ import {
   type FrozenPushIntent,
 } from "./push-intent.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
+import { resolveSubmoduleOrigin } from "./submodule-origin.ts"
 import {
   nestedStoreMissingDetail,
   preparedSubmoduleStore,
@@ -1323,6 +1324,7 @@ async function collectCommitRequirements(
     commit: string,
     preparedParent = false,
     depth = 0,
+    declaredRemote?: string,
   ): Promise<void> => {
     if (depth > missingDepth) return
     const key = `${repository}\0${commit}`
@@ -1348,11 +1350,6 @@ async function collectCommitRequirements(
       // it. The guard is for the fallback, where the path IS the claim.
       const nestedStore = preparedParent ? await preparedSubmoduleStore(git, repository, entry.name) : undefined
       if ((preparedParent && nestedStore === undefined) || (stores !== undefined && store === undefined)) {
-        const originArgs = ["remote", "get-url", "origin"]
-        const origin = await git.run({ repo: repository, args: originArgs })
-        if (origin.code !== 0 || origin.timedOut === true || origin.failure !== undefined) {
-          throw operationError(repository, originArgs, "resolve-nested-parent-remote", origin)
-        }
         if (depth < missingDepth) {
           missing.length = 0
           missingDepth = depth
@@ -1362,7 +1359,7 @@ async function collectCommitRequirements(
           name: entry.name,
           parentStore: repository,
           parentCommit: commit,
-          ...(origin.stdout.trim() === "" ? {} : { parentRemote: origin.stdout.trim() }),
+          ...(declaredRemote === undefined ? {} : { parentRemote: declaredRemote }),
           commit: entry.target,
         })
         continue
@@ -1421,7 +1418,14 @@ async function collectCommitRequirements(
         }
       }
       await verifyOrRecoverSubmoduleCommit(git, discovered, childPath, entry.target)
-      await walk(discovered, childPath, entry.target, prepared !== undefined, depth + 1)
+      await walk(
+        discovered,
+        childPath,
+        entry.target,
+        prepared !== undefined,
+        depth + 1,
+        entry.url === undefined ? undefined : resolveSubmoduleOrigin(repository, declaredRemote, entry.url),
+      )
       requirements.push({
         superproject: repository,
         entry,

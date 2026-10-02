@@ -7,7 +7,7 @@ import { createLogger, type ConditionalLogger, type LogLevel } from "loggily"
 import { cleanGitRepositoryEnvironment } from "./git.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessRequest, type GitProcessResult } from "./process.ts"
 import { shellQuote } from "./shell-command.ts"
-import { preparedPinFetchArgs, preparedSubmoduleStore } from "./submodule-prepare.ts"
+import { nestedStoreMissingDetail, preparedPinFetchArgs, preparedSubmoduleStore } from "./submodule-prepare.ts"
 
 export const SUBMODULE_ALTERNATE_LOCATION = "superproject"
 export const SUBMODULE_ALTERNATE_ERROR_STRATEGY = "info"
@@ -763,6 +763,8 @@ export async function materializeSubmodules(
     selectedPaths?: ReadonlySet<string>,
     depth = 0,
     preparedReference = false,
+    parentIdentity?: Readonly<{ commit: string; remote: string }>,
+    logicalPath = "",
   ): Promise<SubmoduleGitResult> => {
     const policy = await configureSubmoduleAlternatePolicy(git, worktree)
     if (policy.code !== 0) return policy
@@ -857,8 +859,7 @@ export async function materializeSubmodules(
                 (preparedReference ||
                   (depth === 0 &&
                     selectedPaths?.has(path) === true &&
-                    detached !== undefined &&
-                    detached.removedBy === undefined)) &&
+                    (detached === undefined || detached.removedBy === undefined))) &&
                 referenceSubmodule !== undefined &&
                 !(await referenceStoreAt(git, referenceSubmodule))
               ) {
@@ -1054,6 +1055,8 @@ export async function materializeSubmodules(
         nestedReference: string | undefined
         referenceIsPrepared: boolean
         path: string
+        required: string
+        remote: string
       }>
     > = []
     for (const [
@@ -1118,6 +1121,8 @@ export async function materializeSubmodules(
           borrowFrom ??
           (referenceSubmodule !== undefined && existsSync(referenceSubmodule) ? referenceSubmodule : undefined),
         path,
+        required,
+        remote: configuredUrl.stdout.trim(),
       })
     }
     span?.lap("prepare")
@@ -1165,6 +1170,30 @@ export async function materializeSubmodules(
     // for four hours. Refuse it whatever the budget says.
     const absentStores = misses.filter(({ absentStore }) => absentStore)
     if (reference !== undefined && (absentStores.length > 0 || viaRemote.length > maxRemoteFallbacks)) {
+      if (preparedReference && absentStores.length > 0) {
+        if (parentIdentity === undefined) {
+          return {
+            code: 1,
+            stdout: "",
+            stderr: `nested-store-missing: checkout-free parent ${reference} has no selected commit and declared remote identity; supply that prerequisite before preparing its nested stores.`,
+          }
+        }
+        const diagnostic = nestedStoreMissingDetail(
+          absentStores.map(({ path, required }) => {
+            const entry = entries.find((candidate) => candidate.path === path)
+            if (entry === undefined) throw new Error(`missing nested store '${path}' has no selected declaration`)
+            return {
+              path: logicalPath === "" ? path : `${logicalPath}/${path}`,
+              name: entry.name,
+              parentStore: reference,
+              parentCommit: parentIdentity.commit,
+              parentRemote: parentIdentity.remote,
+              commit: required,
+            }
+          }),
+        )
+        return { code: 1, stdout: "", stderr: `${diagnostic.code}: ${diagnostic.message}\n${diagnostic.remedy}` }
+      }
       const detail = misses
         // `reference` is always defined here — every misses.push sits inside
         // `referenceSubmodule !== undefined`. It used to render
@@ -1194,7 +1223,6 @@ export async function materializeSubmodules(
       // dropped; a pin genuinely missing everywhere must not prescribe fetching
       // from origin and must name submitting the component change.
       const removed = misses.filter(({ detached }) => detached !== undefined)
-      const absentStores = misses.filter(({ absentStore }) => absentStore)
       const missingEverywhere = misses.filter(
         ({ absentStore, detached, originRejected }) =>
           !absentStore && detached === undefined && Boolean(originRejected),
@@ -1270,6 +1298,8 @@ export async function materializeSubmodules(
       nestedReference,
       referenceIsPrepared,
       path,
+      required,
+      remote,
     }: Readonly<{
       args: readonly string[]
       isLocal: boolean
@@ -1277,6 +1307,8 @@ export async function materializeSubmodules(
       nestedReference: string | undefined
       referenceIsPrepared: boolean
       path: string
+      required: string
+      remote: string
     }>) => {
       const source = isLocal ? "local" : "remote"
       const submoduleDir = join(worktree, path)
@@ -1310,6 +1342,8 @@ export async function materializeSubmodules(
         undefined,
         depth + 1,
         referenceIsPrepared,
+        { commit: required, remote },
+        logicalPath === "" ? path : `${logicalPath}/${path}`,
       )
     }
     for (let start = 0; start < local.length; start += MAX_CONCURRENT_SUBMODULE_UPDATES) {

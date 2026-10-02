@@ -142,7 +142,7 @@ describe("materializeSubmodules", () => {
    * @level l1
    * @consumer superMerge's staged-submodule initialization
    */
-  it.each(["present", "missing", "partial", "invalid", "history-failed", "nested"] as const)(
+  it.each(["present", "missing", "partial", "invalid", "history-failed", "nested", "nested-missing"] as const)(
     "materializes staged linked-worktree additions with a %s prepared pin",
     async (pinState) => {
       const root = await mkdtemp(join(tmpdir(), "git-super-staged-store-"))
@@ -154,7 +154,7 @@ describe("materializeSubmodules", () => {
       let required = advanceRepository(dependency, "dependency.txt", "selected pin\n")
       let nestedPin: string | undefined
       const nested = join(root, "nested")
-      if (pinState === "nested") {
+      if (pinState === "nested" || pinState === "nested-missing") {
         nestedPin = createRepository(nested, "nested.txt", "nested selected pin\n")
         writeFileSync(join(dependency, ".gitmodules"), `[submodule "nested-store"]\n path = nested\n url = ${nested}\n`)
         git(dependency, ["add", ".gitmodules"])
@@ -225,7 +225,11 @@ describe("materializeSubmodules", () => {
       })
       if (pinState === "nested") expect(result.code, result.stderr).toBe(0)
       expect(result.considered).toBe(
-        pinState === "invalid" || pinState === "history-failed" ? 0 : pinState === "nested" ? 2 : 1,
+        pinState === "invalid" || pinState === "history-failed"
+          ? 0
+          : pinState === "nested" || pinState === "nested-missing"
+            ? 2
+            : 1,
       )
       if (pinState === "present" || pinState === "nested") {
         expect(result).toMatchObject({
@@ -246,6 +250,16 @@ describe("materializeSubmodules", () => {
           expect(git(join(candidate, "gamma", "nested"), ["rev-parse", "HEAD"]).trim()).toBe(nestedPin)
           expect(requests.filter(({ args }) => args.includes("submodule") && args.includes("update"))).toHaveLength(2)
         }
+      } else if (pinState === "nested-missing") {
+        // The existing nested capability arm supplies both stores explicitly;
+        // this arm proves the absent-store diagnosis uses the real parent pin.
+        expect(result.code).not.toBe(0)
+        expect(result.stderr).toContain("nested-store-missing")
+        expect(result.stderr).toContain(store)
+        expect(result.stderr).toContain(required)
+        expect(result.stderr).toContain(nestedPin)
+        expect(result.stderr).toContain("submodule prepare")
+        expect(result.stderr).not.toContain(`git -C ${store} submodule update`)
       } else if (pinState === "invalid" || pinState === "history-failed") {
         expect(result.code).not.toBe(0)
         expect(result.stderr).toContain(pinState === "invalid" ? "core.bare=false" : "removal history unreadable")
