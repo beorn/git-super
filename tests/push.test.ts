@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { afterEach, describe, expect, test, vi } from "vitest"
@@ -2936,77 +2936,143 @@ describe("one frozen merge to main is published by leased pushes alone (25303 it
 })
 
 describe("a nested gitlink counts as moved only when its own pin moved (25303, review of P1)", () => {
-  test("capture freezes no publication for a nested child whose parent moved but whose own pin did not", async () => {
-    const fixture = mkdtempSync(join(tmpdir(), "git-super-push-25303-nested-"))
-    roots.push(fixture)
-    const hosted = (repo: string) => `https://git-super.test/owned/${repo}.git`
-    const remotes = {
-      root: join(fixture, "root.git"),
-      child: join(fixture, "child.git"),
-      leaf: join(fixture, "leaf.git"),
-    }
-    const allow = ["-c", "protocol.file.allow=always"]
-
-    git(fixture, "init", "--bare", "-q", "-b", "main", remotes.leaf)
-    const leafSeed = join(fixture, "leaf-seed")
-    const leafFirst = createRepository(leafSeed, "leaf.txt", "zero\n")
-    const leafPin = advanceRepository(leafSeed, "leaf.txt", "one\n")
-    git(leafSeed, "push", "-q", remotes.leaf, "main")
-
-    git(fixture, "init", "--bare", "-q", "-b", "main", remotes.child)
-    const childSeed = join(fixture, "child-seed")
-    createRepository(childSeed, "child.txt", "one\n")
-    git(childSeed, ...allow, "submodule", "add", "-q", remotes.leaf, "leaf")
-    git(childSeed, "commit", "-q", "-am", "add leaf")
-    git(childSeed, "push", "-q", remotes.child, "main")
-
-    git(fixture, "init", "--bare", "-q", "-b", "main", remotes.root)
-    const root = join(fixture, "root")
-    mkdirSync(root, { recursive: true })
-    git(root, "init", "-q", "-b", "main")
-    git(root, ...allow, "submodule", "add", "-q", remotes.child, "child")
-    git(root, ...allow, "submodule", "update", "-q", "--init", "--recursive")
-    git(root, "commit", "-q", "-am", "root one")
-    const rootBefore = git(root, "rev-parse", "HEAD")
-    git(root, "remote", "add", "origin", remotes.root)
-    git(root, "push", "-q", "-u", "origin", "main")
-
-    const child = join(root, "child")
-    const leaf = join(child, "leaf")
-    for (const repo of [root, child, leaf]) {
-      for (const target of ["root", "child", "leaf"] as const) {
-        git(repo, "config", `url.${remotes[target]}.insteadOf`, hosted(target))
+  /** @failure A prepared parent may discover as a checkout, and frozen preparation remains authoritative.
+   * @level l3 @consumer merge intent capture and Yrd's frozen component publication
+   * Preserve an unchanged nested pin behind its main through both entry paths (26996).
+   */
+  test.each(["capture prepared parent", "publish frozen parent"] as const)(
+    "%s keeps an unchanged nested pin when the prepared store has a physical checkout",
+    async (route) => {
+      const fixture = mkdtempSync(join(tmpdir(), "git-super-push-25303-nested-"))
+      roots.push(fixture)
+      const hosted = (repo: string) => `https://git-super.test/owned/${repo}.git`
+      const remotes = {
+        root: join(fixture, "root.git"),
+        child: join(fixture, "child.git"),
+        leaf: join(fixture, "leaf.git"),
       }
-    }
-    git(root, "remote", "set-url", "origin", hosted("root"))
-    git(child, "remote", "set-url", "origin", hosted("child"))
-    git(leaf, "remote", "set-url", "origin", hosted("leaf"))
-    // The child moves (a file and its declared leaf identity); the leaf's own pin does not.
-    git(child, "config", "--file", ".gitmodules", "submodule.leaf.url", hosted("leaf"))
-    advanceRepository(child, "child.txt", "two\n")
-    git(child, "commit", "-q", "-am", "declare the hosted leaf")
-    git(root, "config", "--file", ".gitmodules", "submodule.child.url", hosted("child"))
-    git(root, "add", "child", ".gitmodules")
-    git(root, "commit", "-q", "-m", "move child only")
-    expect(git(root, "rev-parse", "HEAD:child")).not.toBe(git(root, "rev-parse", `${rootBefore}:child`))
-    expect(git(child, "rev-parse", "HEAD:leaf")).toBe(leafPin)
+      const allow = ["-c", "protocol.file.allow=always"]
 
-    // The leaf's main diverged from its pin: a sibling of the pin, not in its history.
-    const elsewhere = join(fixture, "leaf-elsewhere")
-    git(fixture, "clone", "-q", remotes.leaf, elsewhere)
-    git(elsewhere, "checkout", "-q", "-b", "sibling", leafFirst)
-    const diverged = advanceRepository(elsewhere, "leaf.txt", "sibling\n")
-    git(elsewhere, "push", "-q", "--force", "origin", `${diverged}:refs/heads/main`)
+      git(fixture, "init", "--bare", "-q", "-b", "main", remotes.leaf)
+      const leafSeed = join(fixture, "leaf-seed")
+      const leafFirst = createRepository(leafSeed, "leaf.txt", "zero\n")
+      const leafPin = advanceRepository(leafSeed, "leaf.txt", "one\n")
+      git(leafSeed, "push", "-q", remotes.leaf, "main")
 
-    const tree = git(root, "rev-parse", "HEAD^{tree}")
-    const encoded = await capturePushIntent(createLocalGitProcess(), root, rootBefore, tree, new Map(), 30_000)
+      git(fixture, "init", "--bare", "-q", "-b", "main", remotes.child)
+      const childSeed = join(fixture, "child-seed")
+      createRepository(childSeed, "child.txt", "one\n")
+      git(childSeed, ...allow, "submodule", "add", "-q", remotes.leaf, "leaf")
+      git(childSeed, "commit", "-q", "-am", "add leaf")
+      git(childSeed, "push", "-q", remotes.child, "main")
 
-    const intent = decodePushIntent(encoded ?? "")
-    expect(intent.children.find((row) => row.path === "child/leaf")).toEqual({
-      path: "child/leaf",
-      remote: hosted("leaf"),
-      pin: leafPin,
-    })
-    expect(intent.children.find((row) => row.path === "child")?.publication).toBeDefined()
-  })
+      git(fixture, "init", "--bare", "-q", "-b", "main", remotes.root)
+      const root = join(fixture, "root")
+      mkdirSync(root, { recursive: true })
+      git(root, "init", "-q", "-b", "main")
+      git(root, ...allow, "submodule", "add", "-q", remotes.child, "child")
+      git(root, ...allow, "submodule", "update", "-q", "--init", "--recursive")
+      git(root, "commit", "-q", "-am", "root one")
+      const rootBefore = git(root, "rev-parse", "HEAD")
+      git(root, "remote", "add", "origin", remotes.root)
+      git(root, "push", "-q", "-u", "origin", "main")
+
+      const child = join(root, "child")
+      const leaf = join(child, "leaf")
+      for (const repo of [root, child, leaf]) {
+        for (const target of ["root", "child", "leaf"] as const) {
+          git(repo, "config", `url.${remotes[target]}.insteadOf`, hosted(target))
+        }
+      }
+      git(root, "remote", "set-url", "origin", hosted("root"))
+      git(child, "remote", "set-url", "origin", hosted("child"))
+      git(leaf, "remote", "set-url", "origin", hosted("leaf"))
+      // The child moves (a file and its declared leaf identity); the leaf's own pin does not.
+      git(child, "config", "--file", ".gitmodules", "submodule.leaf.url", hosted("leaf"))
+      advanceRepository(child, "child.txt", "two\n")
+      git(child, "commit", "-q", "-am", "declare the hosted leaf")
+      git(root, "config", "--file", ".gitmodules", "submodule.child.url", hosted("child"))
+      git(root, "add", "child", ".gitmodules")
+      git(root, "commit", "-q", "-m", "move child only")
+      expect(git(root, "rev-parse", "HEAD:child")).not.toBe(git(root, "rev-parse", `${rootBefore}:child`))
+      expect(git(child, "rev-parse", "HEAD:leaf")).toBe(leafPin)
+
+      // The leaf's main diverged from its pin: a sibling of the pin, not in its history.
+      const elsewhere = join(fixture, "leaf-elsewhere")
+      git(fixture, "clone", "-q", remotes.leaf, elsewhere)
+      git(elsewhere, "checkout", "-q", "-b", "sibling", leafFirst)
+      const diverged = advanceRepository(elsewhere, "leaf.txt", "sibling\n")
+      git(elsewhere, "push", "-q", "--force", "origin", `${diverged}:refs/heads/main`)
+
+      const tree = git(root, "rev-parse", "HEAD^{tree}")
+      const encoded = await capturePushIntent(
+        createLocalGitProcess(),
+        root,
+        rootBefore,
+        tree,
+        new Map(),
+        30_000,
+        route === "capture prepared parent"
+          ? new Map([["child", git(child, "rev-parse", "--path-format=absolute", "--git-common-dir")]])
+          : undefined,
+      )
+
+      const intent = decodePushIntent(encoded ?? "")
+      expect(intent.children.find((row) => row.path === "child/leaf")).toEqual({
+        path: "child/leaf",
+        remote: hosted("leaf"),
+        pin: leafPin,
+      })
+      expect(intent.children.find((row) => row.path === "child")?.publication).toBeDefined()
+      if (route === "capture prepared parent") {
+        const parentStore = git(child, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        const leafStore = git(leaf, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        renameSync(leafStore, `${leafStore}-held`)
+        try {
+          await expect(
+            capturePushIntent(
+              createLocalGitProcess(),
+              root,
+              rootBefore,
+              tree,
+              new Map(),
+              30_000,
+              new Map([["child", parentStore]]),
+            ),
+          ).rejects.toMatchObject({
+            resultDetail: {
+              code: "nested-store-missing",
+              paths: ["child/leaf"],
+              remedy: expect.stringContaining(parentStore),
+            },
+          })
+        } finally {
+          renameSync(`${leafStore}-held`, leafStore)
+        }
+      }
+      if (route === "publish frozen parent") {
+        const merge = git(
+          root,
+          "commit-tree",
+          tree,
+          "-p",
+          rootBefore,
+          "-p",
+          "HEAD",
+          "-m",
+          `checked nested merge\n\n${PUSH_INTENT_TRAILER}: ${encoded}`,
+        )
+        const result = await superPush({
+          repo: root,
+          remote: "origin",
+          refspecs: [`${merge}:refs/heads/main`],
+          recurseSubmodules: "only",
+        })
+        expect(result).toMatchObject({ state: "updated", partial: false })
+        expect(git(remotes.child, "rev-parse", "refs/heads/main")).toBe(git(child, "rev-parse", "HEAD"))
+        expect(git(remotes.leaf, "rev-parse", "refs/heads/main")).toBe(diverged)
+        expect(git(remotes.root, "rev-parse", "refs/heads/main")).toBe(rootBefore)
+      }
+    },
+  )
 })

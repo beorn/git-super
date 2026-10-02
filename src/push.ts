@@ -1340,6 +1340,18 @@ async function collectCommitRequirements(
     }
     visiting.add(key)
     const stores = frozen === undefined ? undefined : await prepareFrozenChildren(git, repository, path, commit, frozen)
+    const parentStore =
+      preparedParent && stores === undefined
+        ? await required(
+            git,
+            repository,
+            ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            "locate-submodule-store",
+          )
+        : undefined
+    if (parentStore !== undefined && !isAbsolute(parentStore)) {
+      throw new Error(`Git returned an invalid common directory for prepared parent ${repository}: ${parentStore}`)
+    }
     for (const recorded of await readCommitSubmodules(git, repository, commit)) {
       const target = path === "." ? rootPins?.get(recorded.path) : undefined
       const entry = target === undefined ? recorded : { ...recorded, target }
@@ -1348,8 +1360,9 @@ async function collectCommitRequirements(
       // A PREPARED store is deliberately somewhere else, so its toplevel is not
       // expected to be the gitlink's path and the guard below does not apply to
       // it. The guard is for the fallback, where the path IS the claim.
-      const nestedStore = preparedParent ? await preparedSubmoduleStore(git, repository, entry.name) : undefined
-      if ((preparedParent && nestedStore === undefined) || (stores !== undefined && store === undefined)) {
+      const nestedStore =
+        parentStore === undefined ? undefined : await preparedSubmoduleStore(git, parentStore, entry.name)
+      if ((parentStore !== undefined && nestedStore === undefined) || (stores !== undefined && store === undefined)) {
         if (depth < missingDepth) {
           missing.length = 0
           missingDepth = depth
@@ -1357,7 +1370,7 @@ async function collectCommitRequirements(
         missing.push({
           path: childPath,
           name: entry.name,
-          parentStore: repository,
+          parentStore: parentStore ?? repository,
           parentCommit: commit,
           ...(declaredRemote === undefined ? {} : { parentRemote: declaredRemote }),
           commit: entry.target,
