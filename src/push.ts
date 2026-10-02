@@ -1619,6 +1619,7 @@ async function advertisedTips(
         "fetch",
         "--no-tags",
         "--no-write-fetch-head",
+        "--refmap=",
         remote,
         ...absent.slice(start, start + ADVERTISED_FETCH_BATCH).map((row) => row.ref),
       ],
