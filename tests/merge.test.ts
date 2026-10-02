@@ -4410,6 +4410,31 @@ describe("git super merge — bounded reuse of untouched Equal child mains (2562
    * @level l1
    * @consumer Yrd submit candidate verification
    */
+  /**
+   * @failure An uninitialized gitlink lets the main refresh fetch into the superproject and force-update ITS
+   *          refs/remotes/origin/main to the child's main (27179: shared main, vendor/brain8, 2026-10-02).
+   * @level l1
+   * @consumer Yrd queue verify merges and hand-run merges in environments that leave a private child out
+   */
+  it("refuses an uninitialized gitlink before its main refresh writes anything in the superproject", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-27179-empty-gitlink-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const candidate = candidateWithRootChange(fixture, "candidate-empty-gitlink")
+    git(fixture.product, "submodule", "deinit", "-q", "-f", "packages/alpha")
+    // In shared main the child's URL resolves from the superproject too; the rewrite keeps that true here.
+    git(fixture.product, "config", `url.${fixture.alpha}.insteadOf`, "https://git-super.test/owned/alpha.git")
+    expect(existsSync(join(fixture.product, "packages/alpha"))).toBe(true)
+    const rootRefs = (): string =>
+      git(fixture.product, "for-each-ref", "--format=%(refname) %(objectname)", "refs/remotes")
+
+    const before = rootRefs()
+    const result = await superMerge({ repo: fixture.product, commit: candidate })
+
+    expect(rootRefs()).toBe(before)
+    expect(result).toMatchObject({ state: "failed", detail: { code: "gitlink-store-absent" } })
+  })
+
   it("reads unchanged Equal mains locally without an age bound or a refresh stamp when requested", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-25626-local-main-"))
     roots.push(fixtureRoot)
