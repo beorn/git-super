@@ -411,7 +411,7 @@ async function runInvocation(
           ...(typeof repository === "string" ? { repository } : {}),
           refspecs,
           ffOnly: options.ffOnly === true,
-          excludedSubmodules: options.excludeSubmodule,
+          ...(options.excludeSubmodule === undefined ? {} : { excludedSubmodules: options.excludeSubmodule }),
           ...(options.dryRun === true ? { dryRun: true } : {}),
           // GIT_SUPER_PROGRESS=1 reports each phase to stderr as it starts. An environment switch, not a flag: a
           // caller that sets it still works against an older git-super, which ignores it, so a half-landed update
