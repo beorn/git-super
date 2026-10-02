@@ -1471,7 +1471,39 @@ async function discoverReferenceWorktree(
     ? undefined
     : await primaryWorktree(git, options.referenceWorktree ?? options.worktree)
   if (discovered !== undefined && typeof discovered !== "string") return discovered
-  return discovered !== undefined && canonical(discovered) !== canonical(options.worktree) ? discovered : undefined
+  if (discovered === undefined || canonical(discovered) === canonical(options.worktree)) return undefined
+
+  // A submodule's primary path can name its Git directory, while its actual
+  // checkout is selected by core.worktree. Bind the target first: rev-parse
+  // in an empty directory can otherwise ascend into its enclosing repository.
+  const identityFailure = (result: SubmoduleGitResult, reason: string): SubmoduleGitResult => ({
+    ...result,
+    code: result.code === 0 ? 1 : result.code,
+    stderr: `git-super: cannot prove reference identity for '${options.worktree}' against '${discovered}': ${reason}\n${result.stderr}`,
+  })
+  try {
+    const target = await git.run(options.worktree, ["rev-parse", "--show-toplevel"], true)
+    if (target.code !== 0 || target.stdout.trim() === "") {
+      return identityFailure(target, "cannot read the selected checkout's top-level directory")
+    }
+    if (canonical(target.stdout.trim()) !== canonical(options.worktree)) {
+      return identityFailure(target, `the probe selected '${target.stdout.trim()}', not the requested checkout`)
+    }
+    const targetGitdir = await git.run(options.worktree, ["rev-parse", "--absolute-git-dir"], true)
+    if (targetGitdir.code !== 0 || targetGitdir.stdout.trim() === "") {
+      return identityFailure(targetGitdir, "cannot read the selected checkout's Git directory")
+    }
+    const primaryGitdir = await git.run(discovered, ["rev-parse", "--absolute-git-dir"], true)
+    if (primaryGitdir.code !== 0 || primaryGitdir.stdout.trim() === "") {
+      return identityFailure(primaryGitdir, "cannot read the discovered primary's Git directory")
+    }
+    return canonical(targetGitdir.stdout.trim()) === canonical(primaryGitdir.stdout.trim()) ? undefined : discovered
+  } catch (error) {
+    return identityFailure(
+      { code: 1, stdout: "", stderr: error instanceof Error ? error.message : String(error) },
+      "the identity probe failed",
+    )
+  }
 }
 
 /** Host adapter for callers that need git-super to supply the Git process. */

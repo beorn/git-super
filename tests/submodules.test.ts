@@ -1610,6 +1610,46 @@ describe("materializeSubmodules", () => {
     )
   })
 
+  /**
+   * @failure Reference discovery borrows from the enclosing repository or assumes self when target identity cannot be proven (26996).
+   * @level l1
+   * @consumer process materialization adapters
+   * @testonly none
+   */
+  it.each(["unreadable", "parent-ascent"] as const)("refuses reference identity %s by name", async (failure) => {
+    const root = await mkdtemp(join(tmpdir(), "git-super-reference-identity-"))
+    roots.push(root)
+    const owner = join(root, "owner")
+    const candidate = join(owner, "candidate")
+    createRepository(owner, "README.md", "owner\n")
+    if (failure === "parent-ascent") {
+      await mkdir(candidate)
+    } else {
+      git(owner, ["worktree", "add", "-q", "--detach", candidate, "HEAD"])
+    }
+    const local = createLocalGitProcess()
+    const requests: GitProcessRequest[] = []
+    const result = await materializeSubmodulesWithProcess(
+      {
+        run(request) {
+          requests.push(request)
+          if (failure === "unreadable" && request.repo === candidate && request.args.includes("--absolute-git-dir")) {
+            return Promise.resolve({ code: 128, stdout: "", stderr: "injected unreadable Git directory" })
+          }
+          return local.run(request)
+        },
+      },
+      { worktree: candidate },
+      { resolveReferenceWorktree: true },
+    )
+    expect(result.code).not.toBe(0)
+    expect(result.stderr).toContain("cannot prove reference identity")
+    expect(result.stderr).toContain(candidate)
+    if (failure === "unreadable") expect(result.stderr).toContain("injected unreadable Git directory")
+    else expect(result.stderr).toContain(owner)
+    expect(requests.some(({ args }) => args.includes("update"))).toBe(false)
+  })
+
   it("refuses an explicit reference whose primary worktree cannot be proven", async () => {
     const result = await materializeSubmodules(
       {
