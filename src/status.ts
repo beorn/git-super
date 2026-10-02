@@ -1,36 +1,96 @@
 import { lstatSync, readFileSync, readdirSync, statSync } from "node:fs"
 import { isAbsolute, join, posix, resolve } from "node:path"
-import { recursiveNameStatusDiff, type ConsultedRepository } from "./diff.ts"
+import { recursiveNameStatusDiff, type ConsultedRepository, type NotCompared } from "./diff.ts"
 export type { ConsultedRepository } from "./diff.ts"
-import { gitError, probeRepository, repositoryRoot, runGit, tryGit } from "./git.ts"
+import {
+  gitError,
+  indexGitlinks,
+  isSubmoduleExcluded,
+  probeRepository,
+  repositoryRoot,
+  runGit,
+  tryGit,
+  validateExcludedSubmodules,
+} from "./git.ts"
 
-export type SuperStatusOptions = Readonly<{ repo: string; indexFile?: string }>
+export type SuperStatusOptions = Readonly<{ repo: string; indexFile?: string; excludedSubmodules?: readonly string[] }>
+
+/** Checkout metadata only: never follow a symlink or read a Git pointer/store. */
+export function inspectUninitializedCheckout(
+  path: string,
+): "absent" | "empty" | "nonempty" | "symlink" | "non-directory" {
+  const state = lstatSync(path, { throwIfNoEntry: false })
+  if (state === undefined) return "absent"
+  if (state.isSymbolicLink()) return "symlink"
+  if (!state.isDirectory()) return "non-directory"
+  return readdirSync(path).length === 0 ? "empty" : "nonempty"
+}
+
+/** Inspect selected checkout metadata without following an ancestor or reading Git pointer/store bytes. */
+export function inspectExcludedCheckout(root: string, path: string) {
+  validateExcludedSubmodules([path])
+  let ancestor = root
+  let unsafeAncestor: string | undefined
+  for (const part of path.split("/").slice(0, -1)) {
+    ancestor = join(ancestor, part)
+    const metadata = lstatSync(ancestor, { throwIfNoEntry: false })
+    if (metadata === undefined) break
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+      unsafeAncestor = ancestor
+      break
+    }
+  }
+  const state = unsafeAncestor === undefined ? inspectUninitializedCheckout(join(root, path)) : "unsafe-ancestor"
+  const checkout: NonNullable<NotCompared["exclusion"]>["checkout"] =
+    state === "non-directory"
+      ? "content"
+      : state === "nonempty"
+        ? lstatSync(join(root, path, ".git"), { throwIfNoEntry: false }) === undefined
+          ? "content"
+          : "checkout"
+        : state
+  return { state, checkout, unsafeAncestor }
+}
+
+/** Classify parent identity from frozen native evidence and checkout metadata, without any Git or filesystem reads. */
+export function classifyExcludedPath(
+  path: string,
+  parents: NonNullable<NotCompared["exclusion"]>["parents"],
+  checkout: NonNullable<NotCompared["exclusion"]>["checkout"],
+): NonNullable<NotCompared["exclusion"]> {
+  validateExcludedSubmodules([path])
+  if (parents.length === 0 || parents.some((parent) => parent.path !== path)) {
+    throw new Error(
+      `missing selected parent evidence for excluded ${path}; collect its frozen parent identity before classification`,
+    )
+  }
+  const declared = parents.every(
+    (parent) =>
+      parent.treeEntry?.mode === "160000" && parent.treeEntry.type === "commit" && parent.declarations.length === 1,
+  )
+  const absent =
+    parents.every(
+      (parent) =>
+        parent.treeEntry === null &&
+        parent.declarations.length === 0 &&
+        (parent.index === undefined || parent.index.entries.length === 0),
+    ) &&
+    (checkout === "absent" || checkout === "empty")
+  return { classification: declared ? "declared" : absent ? "absent" : "unclassified", parents, checkout }
+}
 
 export type SuperStatusResult = Readonly<{
   records: readonly string[]
   consultedRepositories: readonly ConsultedRepository[]
+  notCompared: readonly NotCompared[]
   /** Existing empty gitlink directories with no repository of their own; these are not dirty records. */
   uninitializedSubmodules: readonly string[]
   /** Named uncertainty is observable, but never sufficient evidence for worktree removal. */
   submoduleProblems: readonly Readonly<{ path: string; reason: string; gitDir?: string }>[]
 }>
 
-type Gitlink = Readonly<{ path: string; indexPin: string | undefined }>
-
 function nulFields(value: string): string[] {
   return value.split("\0").filter(Boolean)
-}
-
-function indexGitlinks(root: string, indexFile?: string): Gitlink[] {
-  const fields = nulFields(runGit(root, ["ls-files", "--stage", "-z"], indexFile))
-  return fields
-    .map((field) => {
-      const match = /^160000 ([0-9a-f]{40}) ([0-3])\t(.+)$/u.exec(field)
-      const path = match?.[3]
-      return path === undefined ? undefined : { indexPin: match?.[2] === "0" ? match[1] : undefined, path }
-    })
-    .filter((value): value is Gitlink => value !== undefined)
-    .sort((left, right) => left.path.localeCompare(right.path))
 }
 
 function headGitlinks(root: string): Map<string, string> {
@@ -64,17 +124,29 @@ function prefixPorcelain(record: string, prefix: string): string {
   return `${record.slice(0, 3)}${posix.join(prefix, record.slice(3))}`
 }
 
-function diffRecords(root: string, from: string, to: string, column: "index" | "worktree", prefix: string): string[] {
-  if (from === to) return []
-  return recursiveNameStatusDiff({
+function diffRecords(
+  root: string,
+  from: string,
+  to: string,
+  column: "index" | "worktree",
+  prefix: string,
+  excludedSubmodules: readonly string[],
+): Readonly<{ records: string[]; notCompared: readonly NotCompared[] }> {
+  if (from === to) return { records: [], notCompared: [] }
+  const result = recursiveNameStatusDiff({
     repo: root,
     prefix,
     refs: [`${from}..${to}`],
     consulted: { path: prefix, root, from, to },
-  }).entries.map(({ status, path }) => {
-    const code = status[0] ?? "M"
-    return `${column === "index" ? code : " "}${column === "worktree" ? code : " "} ${path}`
+    excludedSubmodules,
   })
+  return {
+    notCompared: result.notCompared,
+    records: result.entries.map(({ status, path }) => {
+      const code = status[0] ?? "M"
+      return `${column === "index" ? code : " "}${column === "worktree" ? code : " "} ${path}`
+    }),
+  }
 }
 
 function statusRepository(
@@ -82,6 +154,7 @@ function statusRepository(
   prefix: string,
   consulted: ConsultedRepository,
   indexFile?: string,
+  excludedSubmodules: readonly string[] = [],
 ): SuperStatusResult {
   const gitlinks = indexGitlinks(root, indexFile)
   const indexed = new Map(gitlinks.map(({ path, indexPin }) => [path, indexPin]))
@@ -92,6 +165,7 @@ function statusRepository(
     runGit(
       root,
       [
+        "--no-optional-locks",
         "-c",
         "status.renames=false",
         "status",
@@ -105,7 +179,18 @@ function statusRepository(
   ).map((record) => prefixPorcelain(record, prefix))
   // --ignore-submodules=all suppresses staged pins too. Read the index without consulting child checkouts.
   const staged = nulFields(
-    runGit(root, ["diff", "--cached", "--name-status", "-z", "--no-renames", "--ignore-submodules=none"], indexFile),
+    runGit(
+      root,
+      [
+        "diff",
+        "--cached",
+        "--name-status",
+        "-z",
+        "--no-renames",
+        excludedSubmodules.length ? "--ignore-submodules=dirty" : "--ignore-submodules=none",
+      ],
+      indexFile,
+    ),
   )
   for (let index = 0; index < staged.length; index += 2) {
     const code = staged[index]
@@ -124,10 +209,15 @@ function statusRepository(
   const nestedRecords: string[] = []
   const uninitializedSubmodules: string[] = []
   const submoduleProblems: SuperStatusResult["submoduleProblems"][number][] = []
+  const notCompared: NotCompared[] = []
 
   for (const path of paths) {
     const child = join(root, path)
     const nestedPrefix = posix.join(prefix, path)
+    if (isSubmoduleExcluded(nestedPrefix, excludedSubmodules)) {
+      notCompared.push({ path: nestedPrefix, reason: "excluded", message: "component excluded, not compared" })
+      continue
+    }
     let gitDir: string | undefined
     let symbolicCheckout = false
     if (indexed.has(path) && indexed.get(path) === undefined) {
@@ -156,9 +246,9 @@ function statusRepository(
         continue
       }
       if (probe.kind === "absent") {
-        if (readdirSync(child).length > 0) {
+        if (inspectUninitializedCheckout(child) !== "empty") {
           throw new Error(
-            `directory ${child} is not empty and has no repository of its own; preserve its files before removal`,
+            `uninitialized directory ${child} is not empty and has no repository of its own; preserve its files and initialize the submodule before removal`,
           )
         }
         uninitializedSubmodules.push(nestedPrefix)
@@ -168,22 +258,41 @@ function statusRepository(
       const headPin = head.get(path)
       const indexPin = indexed.get(path)
       if (headPin !== undefined && indexPin !== undefined) {
-        const indexRecords = diffRecords(nestedRoot, headPin, indexPin, "index", nestedPrefix)
+        const indexDiff = diffRecords(nestedRoot, headPin, indexPin, "index", nestedPrefix, excludedSubmodules)
+        const indexRecords = indexDiff.records
+        for (const observation of indexDiff.notCompared) {
+          notCompared.push(observation)
+          if (observation.reason === "unreadable") {
+            submoduleProblems.push({
+              path: observation.path,
+              reason: `${observation.message}${observation.remedy ? `; ${observation.remedy}` : ""}`,
+            })
+          }
+        }
         // A pointer move can have an unchanged tree; its commit identity is still dirt.
         nestedRecords.push(...indexRecords)
-        if (headPin !== indexPin && indexRecords.length === 0) nestedRecords.push(`M  ${nestedPrefix}`)
+        if (headPin !== indexPin && indexRecords.length === 0 && indexDiff.notCompared.length === 0) {
+          nestedRecords.push(`M  ${nestedPrefix}`)
+        }
         if (indexPin !== checkoutPin) nestedRecords.push(` M ${nestedPrefix}`)
       }
-      const nested = statusRepository(nestedRoot, nestedPrefix, {
-        path: nestedPrefix,
-        root: nestedRoot,
-        ...(indexPin === undefined ? {} : { from: indexPin }),
-        to: checkoutPin,
-      })
+      const nested = statusRepository(
+        nestedRoot,
+        nestedPrefix,
+        {
+          path: nestedPrefix,
+          root: nestedRoot,
+          ...(indexPin === undefined ? {} : { from: indexPin }),
+          to: checkoutPin,
+        },
+        undefined,
+        excludedSubmodules,
+      )
       nestedRecords.push(...nested.records)
       consultedRepositories.push(...nested.consultedRepositories)
       uninitializedSubmodules.push(...nested.uninitializedSubmodules)
       submoduleProblems.push(...nested.submoduleProblems)
+      notCompared.push(...nested.notCompared)
       if (headPin !== undefined && indexPin !== undefined) checkedOutGitlinks.add(nestedPrefix)
     } catch (error) {
       submoduleProblems.push({
@@ -196,15 +305,23 @@ function statusRepository(
 
   return {
     records: [
-      ...new Set([...rootRecords.filter((record) => !checkedOutGitlinks.has(record.slice(3))), ...nestedRecords]),
+      ...new Set([
+        ...rootRecords.filter(
+          (record) =>
+            !checkedOutGitlinks.has(record.slice(3)) && !isSubmoduleExcluded(record.slice(3), excludedSubmodules),
+        ),
+        ...nestedRecords,
+      ]),
     ].sort((left, right) => left.slice(3).localeCompare(right.slice(3))),
     consultedRepositories,
     uninitializedSubmodules,
     submoduleProblems,
+    notCompared: [...new Map(notCompared.map((entry) => [`${entry.path}\0${entry.reason}`, entry])).values()],
   }
 }
 
 export function superStatus(options: SuperStatusOptions): SuperStatusResult {
+  validateExcludedSubmodules(options.excludedSubmodules)
   const root = repositoryRoot(options.repo)
   const indexFile = options.indexFile
   if (indexFile !== undefined) {
@@ -215,5 +332,11 @@ export function superStatus(options: SuperStatusOptions): SuperStatusResult {
       throw new Error(`git super status: --index-file is not a readable file: ${indexFile}`, { cause: error })
     }
   }
-  return statusRepository(root, "", { path: ".", root, ...(indexFile === undefined ? {} : { indexFile }) }, indexFile)
+  return statusRepository(
+    root,
+    "",
+    { path: ".", root, ...(indexFile === undefined ? {} : { indexFile }) },
+    indexFile,
+    options.excludedSubmodules,
+  )
 }

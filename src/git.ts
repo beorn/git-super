@@ -1,4 +1,38 @@
 import { spawnSync } from "node:child_process"
+import { parseIndexEntries } from "./index-entries.ts"
+
+export type IndexGitlink = Readonly<{ path: string; indexPin: string | undefined }>
+
+/** Parent index metadata only; shared by status and comparisons. */
+export function indexGitlinks(root: string, indexFile?: string): IndexGitlink[] {
+  return parseIndexEntries(
+    runGit(root, ["ls-files", "--stage", "-z"], indexFile),
+    (field) =>
+      new Error(`git super: malformed native index entry ${JSON.stringify(field)}; reread ls-files --stage -z`),
+  )
+    .filter((entry) => entry.mode === "160000")
+    .map((entry) => ({ path: entry.path, indexPin: entry.stage === 0 ? entry.oid : undefined }))
+    .sort((left, right) => left.path.localeCompare(right.path))
+}
+
+export function validateExcludedSubmodules(paths: readonly string[] = []): void {
+  for (const path of paths) {
+    if (
+      path.includes("\\") ||
+      path.includes("\0") ||
+      /[\u0000-\u001f\u007f]/u.test(path) ||
+      path.split("/").some((part) => part === "" || part === "." || part === "..")
+    ) {
+      throw new Error(
+        `git super: excluded submodule must be a literal normalized root-relative path: ${JSON.stringify(path)}`,
+      )
+    }
+  }
+}
+
+export function isSubmoduleExcluded(path: string, exclusions: readonly string[] = []): boolean {
+  return exclusions.some((excluded) => path === excluded || path.startsWith(`${excluded}/`))
+}
 
 export function cleanGitEnvironment(environment: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   return {

@@ -40,6 +40,10 @@ Use `--repo` to name the superproject explicitly for enriched operations. `diff`
 
 Normal path or porcelain output stays on stdout. A rendered report of the repositories consulted goes to stderr, so existing pipelines stay composable. `--json` puts the result and the consulted repositories together on stdout.
 
+`diff` reports removed components in `notCompared` with `reason: "removed"` and continues comparing readable repositories. It does not open a removed component. Missing component objects are collected as `reason: "unreadable"`, with the repository, object IDs and fetch remedy; the CLI prints every observation before exiting `2`. Readable paths remain available in the partial result. Consumers must inspect `notCompared` before treating a comparison as complete.
+
+`diff`, `status`, `merge-base`, `pull` and `worktree remove` accept repeated `--exclude-submodule <path>` options after the command. Each path is literal and relative to the superproject root; its descendants are excluded too. JSON results name excluded paths in `notCompared`, and human output explains each skip on stderr. Comparison exclusions skip component content without declaring it clean. Pull admits empty uninitialized excluded checkouts and absent additions; unsafe checkouts refuse. Removal also requires parent identity and surviving store custody: stores within either deletion path refuse, and external stores remain untouched.
+
 ```json
 {
   "consultedRepositories": [
@@ -52,13 +56,14 @@ Normal path or porcelain output stays on stdout. A rendered report of the reposi
     }
   ],
   "deletedPaths": [],
+  "notCompared": [],
   "paths": ["vendor/tool/src/index.ts"]
 }
 ```
 
 Status reports an existing empty submodule directory as `path: not checked out` on stderr and in the JSON `uninitializedSubmodules` list (always present, empty when all checkouts exist). It does not consult the parent repository as that child or invent a dirty record. A staged gitlink change remains a native dirty record, and clean worktree removal can proceed when submodules have never been checked out. A nonempty uninitialized directory refuses with its path, so ignored files cannot be discarded.
 
-Missing or unreadable checkout directories, missing commit objects, added or removed gitlinks without a resolvable commit range, and ambiguous commit ownership all fail loudly. Pull, push and merge refuse uninitialized child repositories already recorded before the operation. Newly added gitlinks are initialized by pull and merge at their exact selected pins. **The tool never turns an unresolved repository boundary into an empty success** — that is the failure it exists to prevent, so it may not commit it itself.
+Missing or unreadable checkout directories, missing commit objects and ambiguous commit ownership fail loudly. Removed gitlinks are named skips rather than fabricated empty comparisons. Pull, push and merge refuse included uninitialized child repositories already recorded before the operation. Newly added included gitlinks are initialized by pull and merge at their exact selected pins.
 
 ### Merge and settle gitlinks
 
@@ -239,6 +244,8 @@ The CLI requires Bun 1.3.14 or newer. Native Git delegation uses `process.execve
 
 The library supports Node 24 or newer and Bun 1.3.14 or newer.
 
+The CLI runs under Bun; the library imports from Node 24 and Bun. `verifyPublishable.bunOnlyBins` declares this, so release verification runs the CLI under Bun and records its Node row as not asked.
+
 Node consumers need the built npm package and a built Node-compatible `@bearly/flock` dependency. Installing TypeScript source beneath `node_modules` does not provide that distribution.
 
 Node library operations have been exercised on Linux. Node transport and graph operations on macOS remain unmeasured.
@@ -285,7 +292,11 @@ The package depends only on published packages: `@bearly/flock`, `@silvery/comma
 
 Library consumers may import the root `git-super` surface, or `git-super/gitlink` for exact index-pin writes, `git-super/commit-graph` for frozen submodule descriptors, `git-super/objects` for exact-object loading, `git-super/submodule-origin` for remote resolution, `git-super/worktree` for injected worktree mechanics, `git-super/status` for recursive repository inventory and status, and `git-super/submodules` for recursive materialization.
 
+`GitWorktreeStore.inspectRemoval(path, { excludedSubmodules? })` checks excluded checkout and store custody without writer leases, retention or rehoming, and returns `notCompared`, `consultedRepositories` and `uninitializedSubmodules` from the existing status population. This read-only inspection is a snapshot, not permission: `remove` rechecks admission under its mutation lock. Uninitialized included components remain observations; a caller such as Bearly may require initialization before it can classify their ignored content. Exclusions select skipped components and do not change the store's default removal policy.
+
 The recursive materializer's `source` option defaults to `"head"`, reading top-level `.gitmodules` and pins from HEAD. Merge passes `"index"` to read stage-0 declarations and pins from its staged merge; named paths without a declared stage-0 gitlink refuse. Nested levels always read their checked-out parent HEAD. Host adapters expose HEAD materialization only and omit `source` from their options.
+
+Materialization classifies `excludedSubmodules` from frozen parent evidence before probing child repositories, including when no submodules remain. Declared absent or empty checkouts and actual absence produce explicit skipped observations. Conflicting declarations, file content, symlinks and unsafe ancestors refuse. Stage-0 observations retain the captured manifest object and index entries separately from the actual parent HEAD; unmerged entries refuse before classification.
 
 `materializeSubmodulesWithProcess(process, options, processOptions)` accepts `resolveReferenceWorktree: true` to discover the primary worktree through the same resolver as the host adapters. Merge and pull enable it: linked worktrees borrow validated durable prepared stores, including prepared nested stores, with `--reference` and `--no-fetch`. A reference that deliberately removed a path refuses; an unreadable removal history refuses before admission or fetching. When the caller is the primary worktree, discovery supplies no separate reference, so an absent pin uses ordinary submodule initialization and its configured remote. This includes a primary submodule checkout whose registered primary path spells its Git directory: discovery binds the actual target checkout and compares absolute Git directories to recognize self. Failed identity reads or a probe ascending into an enclosing repository refuse by name. The result counts initialized paths without a separate reference as `unreferenced`, and merge and pull report them.
 

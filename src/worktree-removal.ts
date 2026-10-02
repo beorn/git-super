@@ -15,12 +15,17 @@ import {
   symlinkSync,
   unlinkSync,
   writeFileSync,
+  type Dirent,
 } from "node:fs"
 import { tryAcquireFlock, type FlockHandle } from "@bearly/flock"
 import { fileLockHolders, formatLockHolders } from "@bearly/flock/holders"
 import { spawnSync } from "node:child_process"
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
-import { superStatus } from "./status.ts"
+import { classifyExcludedPath, inspectExcludedCheckout, superStatus, type SuperStatusResult } from "./status.ts"
+import { readCommitSubmodules, type SelectedCommitSubmodules } from "./commit-graph.ts"
+import { validateExcludedSubmodules } from "./git.ts"
+import type { GitProcess } from "./process.ts"
+import type { NotCompared } from "./diff.ts"
 import type { Git, WorktreeInspection } from "./worktree.ts"
 
 export type WorktreeRemovalProof = Readonly<{
@@ -35,6 +40,7 @@ export type WorktreeRemovalProof = Readonly<{
   rehomedBorrowers?: readonly string[]
   writerLocks: readonly WriterLockProof[]
   createdWriterLocks: readonly WriterLockProof[]
+  notCompared: readonly NotCompared[]
 }>
 
 export type WriterLockProof = Readonly<{ path: string; body: string; lease: "free" }>
@@ -64,6 +70,135 @@ function toCanonical(path: string): string {
   }
 }
 
+/** Parent metadata must establish excluded custody before leases inspect any store. */
+type RemovalParent = Readonly<{ adminDir: string; name: string; head: string; metadata: SelectedCommitSubmodules }>
+type ExcludedRemovalCustody = Readonly<{
+  notCompared: readonly NotCompared[]
+  declaredPaths: readonly string[]
+  borrowers: readonly RemovalParent[]
+}>
+
+export async function assertExcludedRemovalCustody(
+  git: Git,
+  process: GitProcess,
+  requested: string,
+  gitDir: string,
+  commonDir: string,
+  excludedSubmodules: readonly string[] = [],
+): Promise<ExcludedRemovalCustody> {
+  validateExcludedSubmodules(excludedSubmodules)
+  if (excludedSubmodules.length === 0) return { notCompared: [], declaredPaths: [], borrowers: [] }
+  const checkout = realpathSync(requested)
+  const parents: RemovalParent[] = []
+  for (const candidate of [{ adminDir: gitDir, name: "target" }, ...removalBorrowers(commonDir, gitDir)]) {
+    const parentProcess: GitProcess = {
+      run: (request) =>
+        process.run({ ...request, repo: checkout, args: ["--git-dir", candidate.adminDir, ...request.args] }),
+    }
+    const head = await git.text(checkout, ["--git-dir", candidate.adminDir, "rev-parse", "--verify", "HEAD"])
+    const metadata = await readCommitSubmodules(parentProcess, checkout, head, { excludedSubmodules })
+    parents.push({ ...candidate, head, metadata })
+  }
+  const notCompared: NotCompared[] = []
+  const declaredPaths: string[] = []
+  for (const path of new Set(excludedSubmodules)) {
+    const { state, checkout: disk, unsafeAncestor } = inspectExcludedCheckout(checkout, path)
+    const evidence = parents.map((parent) => {
+      const selected = parent.metadata.selectedPaths.find((entry) => entry.path === path)
+      if (selected === undefined) {
+        throw new Error(`missing selected parent evidence for excluded ${path} at ${parent.head}`)
+      }
+      return { ...selected, repository: parent.adminDir, head: parent.head }
+    })
+    const exclusion = classifyExcludedPath(path, evidence, disk)
+    const declared = exclusion.classification === "declared"
+    const absent = exclusion.classification === "absent"
+    if (!declared) {
+      notCompared.push({
+        path,
+        reason: absent ? "excluded" : "inconsistent",
+        message: absent
+          ? `excluded ${path}: absent at HEAD and on disk, nothing to protect`
+          : `excluded ${path}: inconsistent parent identity; ${evidence.map((entry) => `${entry.repository} HEAD ${entry.head}: tree ${entry.treeEntry?.mode ?? "absent"}, declarations ${entry.declarations.map(({ name }) => name).join(",") || "none"}`).join("; ")}; checkout ${disk}; preserve and resolve the disagreement before removal`,
+        exclusion,
+      })
+      continue
+    }
+    if (unsafeAncestor !== undefined) {
+      throw new Error(
+        `excluded submodule ${path} has unsafe checkout ancestor ${unsafeAncestor}; worktree preserved; resolve that ancestor before retrying removal`,
+      )
+    }
+    const declaration = evidence[0]?.declarations[0]
+    if (declaration === undefined) throw new Error(`missing declared exclusion identity for ${path}`)
+    validateExcludedSubmodules([declaration.name])
+    if (state !== "absent" && state !== "empty") {
+      throw new Error(
+        `excluded submodule ${path} checkout is ${state}; worktree preserved; preserve its content and resolve its checkout before retrying removal`,
+      )
+    }
+    const store = await git.text(checkout, [
+      "rev-parse",
+      "--path-format=absolute",
+      "--git-path",
+      `modules/${declaration.name}`,
+    ])
+    if (store === "" || !isAbsolute(store)) {
+      throw new Error(
+        `excluded submodule ${path} has an invalid parent-resolved store path ${JSON.stringify(store)}; inspect its declaration in parent ${checkout} before retrying removal`,
+      )
+    }
+    if ((within(checkout, store) || within(gitDir, store)) && present(store)) {
+      throw new Error(
+        `excluded submodule ${path} (section ${declaration.name}) store ${store} is inside deletion custody ${checkout} or ${gitDir}; worktree preserved before store inspection; preserve the store outside both deletion paths before retrying removal`,
+      )
+    }
+    notCompared.push({
+      path,
+      reason: "excluded",
+      message: `excluded checkout is ${state}; not checked out, nothing to preserve in the checkout; Git store custody is reported separately`,
+      exclusion,
+    })
+    declaredPaths.push(path)
+  }
+  const absentPaths = notCompared
+    .filter((entry) => entry.exclusion?.classification === "absent")
+    .map((entry) => entry.path)
+  const modules = join(gitDir, "modules")
+  if (absentPaths.length > 0 && present(modules)) {
+    const target = parents.find((parent) => parent.name === "target")
+    if (target === undefined) throw new Error(`missing target parent identity for ${checkout}`)
+    const includedStores: Array<{ path: string; store: string }> = []
+    for (const declaration of target.metadata.submodules) {
+      validateExcludedSubmodules([declaration.name])
+      const store = await git.text(checkout, [
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        `modules/${declaration.name}`,
+      ])
+      if (!isAbsolute(store) || !within(modules, store)) {
+        throw new Error(`included submodule ${declaration.path} has invalid parent-resolved store identity ${store}`)
+      }
+      includedStores.push({ path: declaration.path, store })
+    }
+    const refuse = (store: string): never => {
+      throw new Error(
+        `excluded ${absentPaths.join(", ")}: target-owned store ${store} has no included parent identity; worktree preserved before store inspection; preserve the store outside ${checkout} and ${gitDir} before retrying removal`,
+      )
+    }
+    const moduleState = lstatSync(modules)
+    if (!moduleState.isDirectory() || moduleState.isSymbolicLink()) refuse(modules)
+    for (const entry of borrowerEntries(modules, includedStores)) {
+      const store = join(entry.parentPath, entry.name)
+      // Only namespace ancestors of known included stores may be descended into.
+      // The existing walker prunes each known store and yields unknown entries before descent.
+      if (!entry.isDirectory() || !includedStores.some((included) => within(store, included.store))) refuse(store)
+    }
+  }
+  return { notCompared, declaredPaths, borrowers: parents.filter((entry) => entry.name !== "target") }
+}
+
 /**
  * Any live worktree in the superproject whose submodule alternates point into `lenderModules`
  * is dissociated using git repack -a -d while alternates still resolve, and its alternates are updated
@@ -76,18 +211,17 @@ export interface RehomeBorrowersOptions {
   readonly spawn?: typeof spawnSync
 }
 
-export function rehomeBorrowers(
-  commonDir: string,
-  lenderGitDir: string,
-  lenderModules: string,
-  options?: RehomeBorrowersOptions,
-): readonly string[] {
-  guardRetainedBorrowers(commonDir, lenderGitDir)
-  const hasLenderModules = present(lenderModules)
-  const canonicalCommon = realpathSync(commonDir)
+type RemovalBorrower = Readonly<{
+  adminDir: string
+  name: string
+  excludedStores?: readonly Readonly<{ path: string; store: string }>[]
+  includedStores?: readonly string[]
+}>
 
+/** One candidate inventory for metadata admission and the actual borrower walk. */
+function removalBorrowers(commonDir: string, lenderGitDir: string): RemovalBorrower[] {
   const worktreesDir = join(commonDir, "worktrees")
-  const candidates: Array<{ adminDir: string; name: string }> = []
+  const candidates: RemovalBorrower[] = []
   if (existsSync(worktreesDir)) {
     for (const entry of readdirSync(worktreesDir, { withFileTypes: true })) {
       if (entry.isDirectory()) {
@@ -101,6 +235,122 @@ export function rehomeBorrowers(
   if (toCanonical(commonDir) !== toCanonical(lenderGitDir)) {
     candidates.push({ adminDir: commonDir, name: "primary" })
   }
+  return candidates
+}
+
+/** Protected roots are pruned before entry, including symlinks. */
+function* borrowerEntries(root: string, excludedStores: RemovalBorrower["excludedStores"]): Generator<Dirent> {
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    const path = join(root, entry.name)
+    if (excludedStores?.some((excluded) => within(excluded.store, path))) continue
+    yield entry
+    if (entry.isDirectory()) yield* borrowerEntries(path, excludedStores)
+  }
+}
+
+/** Resolve each public parent independently; current-worktree names cannot stand for another HEAD. */
+export async function prepareRemovalBorrowers(
+  git: Git,
+  checkout: string,
+  commonDir: string,
+  lenderGitDir: string,
+  custody: ExcludedRemovalCustody,
+  excludedSubmodules: readonly string[] = [],
+): Promise<Readonly<{ run: () => readonly string[]; notCompared: readonly NotCompared[] }>> {
+  const lenderModules = join(lenderGitDir, "modules")
+  if (excludedSubmodules.length === 0) {
+    return { run: () => rehomeBorrowers(commonDir, lenderGitDir, lenderModules), notCompared: [] }
+  }
+  if (custody.declaredPaths.length > 0 && present(join(commonDir, "git-super-retained-borrowers"))) {
+    throw new Error(
+      `worktree ${checkout} has retained borrower registrations with unresolved excluded-store identities for ${excludedSubmodules.map((path) => JSON.stringify(path)).join(", ")}; resolve their custody before removal`,
+    )
+  }
+  const candidates: RemovalBorrower[] = []
+  const notCompared: NotCompared[] = []
+  for (const candidate of custody.borrowers) {
+    const excludedStores: { path: string; store: string }[] = []
+    for (const path of custody.declaredPaths) {
+      const declaration = candidate.metadata.selectedPaths.find((entry) => entry.path === path)?.declarations[0]
+      if (declaration === undefined) {
+        throw new Error(
+          `borrower ${candidate.name} at ${candidate.adminDir} has no parent metadata identity for excluded submodule ${path} at ${candidate.head}; resolve that identity before removal`,
+        )
+      }
+      validateExcludedSubmodules([declaration.name])
+      const store = await git.text(checkout, [
+        "--git-dir",
+        candidate.adminDir,
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        `modules/${declaration.name}`,
+      ])
+      if (!isAbsolute(store) || !within(join(candidate.adminDir, "modules"), store)) {
+        throw new Error(
+          `borrower ${candidate.name} excluded submodule ${path} has invalid parent-resolved store ${JSON.stringify(store)}; resolve its metadata before removal`,
+        )
+      }
+      if (present(lenderModules) && present(store)) {
+        throw new Error(
+          `excluded borrower ${candidate.name} submodule ${path} store ${store} cannot be proved independent of deletion custody ${lenderModules} without inspecting it; preserve or resolve that custody before removal`,
+        )
+      }
+      excludedStores.push({ path, store })
+      notCompared.push({
+        path,
+        reason: "excluded",
+        message: present(store)
+          ? `excluded borrower ${candidate.name} Git store ${store} preserved untouched outside deletion custody`
+          : `excluded borrower ${candidate.name} parent-resolved Git store ${store} is absent; no store content inspected`,
+      })
+    }
+    const includedStores: string[] = []
+    for (const declaration of candidate.metadata.submodules) {
+      validateExcludedSubmodules([declaration.name])
+      const store = await git.text(checkout, [
+        "--git-dir",
+        candidate.adminDir,
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        `modules/${declaration.name}`,
+      ])
+      if (!isAbsolute(store) || !within(join(candidate.adminDir, "modules"), store)) {
+        throw new Error(`borrower ${candidate.name} has invalid included store identity ${store}`)
+      }
+      includedStores.push(store)
+    }
+    candidates.push({ ...candidate, excludedStores, includedStores })
+  }
+  return { run: () => rehomeBorrowerCandidates(commonDir, lenderGitDir, lenderModules, candidates), notCompared }
+}
+
+export function rehomeBorrowers(
+  commonDir: string,
+  lenderGitDir: string,
+  lenderModules: string,
+  options?: RehomeBorrowersOptions,
+): readonly string[] {
+  return rehomeBorrowerCandidates(
+    commonDir,
+    lenderGitDir,
+    lenderModules,
+    removalBorrowers(commonDir, lenderGitDir),
+    options,
+  )
+}
+
+function rehomeBorrowerCandidates(
+  commonDir: string,
+  lenderGitDir: string,
+  lenderModules: string,
+  candidates: readonly RemovalBorrower[],
+  options?: RehomeBorrowersOptions,
+): readonly string[] {
+  guardRetainedBorrowers(commonDir, lenderGitDir)
+  const hasLenderModules = present(lenderModules)
+  const canonicalCommon = realpathSync(commonDir)
 
   const rehomedBorrowers = new Set<string>()
 
@@ -121,75 +371,80 @@ export function rehomeBorrowers(
     }
 
     try {
-      for (const entry of readdirSync(candidateModules, { recursive: true, withFileTypes: true })) {
-        if (entry.isSymbolicLink() && entry.name === "objects") {
-          const objects = join(entry.parentPath, entry.name)
-          let target: string
-          try {
-            target = realpathSync(objects)
-            if (!statSync(target).isDirectory()) throw new Error("target is not a directory")
-          } catch (error) {
+      for (const includedStore of candidate.includedStores ?? [candidateModules]) {
+        if (!existsSync(includedStore)) continue
+        for (const entry of borrowerEntries(includedStore, candidate.excludedStores)) {
+          if (entry.isSymbolicLink() && entry.name === "objects") {
+            const objects = join(entry.parentPath, entry.name)
+            let target: string
+            try {
+              target = realpathSync(objects)
+              if (!statSync(target).isDirectory()) throw new Error("target is not a directory")
+            } catch (error) {
+              throw new Error(
+                `borrower ${borrowerIdentity} has an unresolved objects link ${objects}; resolve it before removing ${lenderGitDir}`,
+                { cause: error },
+              )
+            }
+            if (!within(canonicalCommon, target)) {
+              throw new Error(
+                `borrower ${borrowerIdentity} objects link ${objects} targets ${target} outside common-store custody ${canonicalCommon}; resolve it before removing ${lenderGitDir}`,
+              )
+            }
+            if (within(realpathSync(lenderGitDir), target)) {
+              throw new Error(
+                `borrower ${borrowerIdentity} submodule ${relative(candidateModules, entry.parentPath)} still links objects ${objects} to ${target}; preserve its objects before removing ${lenderGitDir}`,
+              )
+            }
+            continue
+          }
+          if (!hasLenderModules || !entry.isFile() || entry.name !== "alternates") continue
+          const alternatesPath = join(entry.parentPath, entry.name)
+          const objectsDir = dirname(entry.parentPath)
+          const content = readFileSync(alternatesPath, "utf8")
+          const lines = content
+            .split(/\r?\n/u)
+            .map((l) => l.trim())
+            .filter((l) => l !== "" && !l.startsWith("#"))
+
+          const hasLender = lines.some((line) => {
+            const abs = isAbsolute(line) ? line : resolve(objectsDir, line)
+            return within(lenderModules, toCanonical(abs))
+          })
+          if (!hasLender) continue
+
+          rehomedBorrowers.add(borrowerIdentity)
+
+          const subGitDir = dirname(objectsDir)
+          const subRel = relative(candidateModules, subGitDir)
+          const timeoutMs = options?.repackTimeoutMs ?? 120_000
+          const runSpawn = options?.spawn ?? spawnSync
+          const repacked = runSpawn("git", ["--git-dir", subGitDir, "repack", "-a", "-d"], {
+            encoding: "utf8",
+            timeout: timeoutMs,
+          })
+          if (repacked.error || repacked.status !== 0) {
+            const timeoutDetail =
+              (repacked.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT"
+                ? `timed out after ${timeoutMs / 1000}s bound`
+                : undefined
+            const detail =
+              timeoutDetail ??
+              (repacked.error?.message || repacked.stderr || repacked.stdout || `exit ${String(repacked.status)}`)
             throw new Error(
-              `borrower ${borrowerIdentity} has an unresolved objects link ${objects}; resolve it before removing ${lenderGitDir}`,
-              { cause: error },
+              `git repack -a -d failed for submodule ${subRel} in borrower ${borrowerIdentity}: ${detail}`,
             )
           }
-          if (!within(canonicalCommon, target)) {
-            throw new Error(
-              `borrower ${borrowerIdentity} objects link ${objects} targets ${target} outside common-store custody ${canonicalCommon}; resolve it before removing ${lenderGitDir}`,
-            )
-          }
-          if (within(realpathSync(lenderGitDir), target)) {
-            throw new Error(
-              `borrower ${borrowerIdentity} submodule ${relative(candidateModules, entry.parentPath)} still links objects ${objects} to ${target}; preserve its objects before removing ${lenderGitDir}`,
-            )
-          }
-          continue
+
+          const updated = lines.filter((line) => {
+            const abs = isAbsolute(line) ? line : resolve(objectsDir, line)
+            return !within(lenderModules, toCanonical(abs))
+          })
+
+          const staged = `${alternatesPath}.rehome-${process.pid}`
+          writeFileSync(staged, updated.length > 0 ? `${updated.join("\n")}\n` : "", "utf8")
+          renameSync(staged, alternatesPath)
         }
-        if (!hasLenderModules || !entry.isFile() || entry.name !== "alternates") continue
-        const alternatesPath = join(entry.parentPath, entry.name)
-        const objectsDir = dirname(entry.parentPath)
-        const content = readFileSync(alternatesPath, "utf8")
-        const lines = content
-          .split(/\r?\n/u)
-          .map((l) => l.trim())
-          .filter((l) => l !== "" && !l.startsWith("#"))
-
-        const hasLender = lines.some((line) => {
-          const abs = isAbsolute(line) ? line : resolve(objectsDir, line)
-          return within(lenderModules, toCanonical(abs))
-        })
-        if (!hasLender) continue
-
-        rehomedBorrowers.add(borrowerIdentity)
-
-        const subGitDir = dirname(objectsDir)
-        const subRel = relative(candidateModules, subGitDir)
-        const timeoutMs = options?.repackTimeoutMs ?? 120_000
-        const runSpawn = options?.spawn ?? spawnSync
-        const repacked = runSpawn("git", ["--git-dir", subGitDir, "repack", "-a", "-d"], {
-          encoding: "utf8",
-          timeout: timeoutMs,
-        })
-        if (repacked.error || repacked.status !== 0) {
-          const timeoutDetail =
-            (repacked.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT"
-              ? `timed out after ${timeoutMs / 1000}s bound`
-              : undefined
-          const detail =
-            timeoutDetail ??
-            (repacked.error?.message || repacked.stderr || repacked.stdout || `exit ${String(repacked.status)}`)
-          throw new Error(`git repack -a -d failed for submodule ${subRel} in borrower ${borrowerIdentity}: ${detail}`)
-        }
-
-        const updated = lines.filter((line) => {
-          const abs = isAbsolute(line) ? line : resolve(objectsDir, line)
-          return !within(lenderModules, toCanonical(abs))
-        })
-
-        const staged = `${alternatesPath}.rehome-${process.pid}`
-        writeFileSync(staged, updated.length > 0 ? `${updated.join("\n")}\n` : "", "utf8")
-        renameSync(staged, alternatesPath)
       }
     } catch (error) {
       throw new Error(
@@ -202,18 +457,25 @@ export function rehomeBorrowers(
   return [...rehomedBorrowers]
 }
 
-/** The existing status walker owns repository discovery; every native status is exact, including gitlink changes. */
-async function cleanSnapshot(
-  git: Git,
-  path: string,
-  inspect: (repository: string, path: string) => Promise<WorktreeInspection>,
-): Promise<readonly Readonly<{ path: string; head: string }>[]> {
-  const status = superStatus({ repo: path })
+/** Removal never treats an unreadable included repository as an absent population member. */
+export function inspectRemovalStatus(path: string, excludedSubmodules: readonly string[] = []): SuperStatusResult {
+  const status = superStatus({ repo: path, excludedSubmodules })
   if (status.submoduleProblems.length > 0) {
     throw new Error(
       `worktree ${path} has unknown submodule state: ${status.submoduleProblems.map((problem) => `${problem.path}: ${problem.reason}${problem.gitDir === undefined ? "" : ` (gitdir ${problem.gitDir})`}`).join("; ")}; preserve and resolve it before removal`,
     )
   }
+  return status
+}
+
+/** The existing status walker owns repository discovery; every native status is exact, including gitlink changes. */
+async function cleanSnapshot(
+  git: Git,
+  path: string,
+  inspect: (repository: string, path: string) => Promise<WorktreeInspection>,
+  excludedSubmodules: readonly string[] = [],
+): Promise<readonly Readonly<{ path: string; head: string }>[]> {
+  const status = inspectRemovalStatus(path, excludedSubmodules)
   if (status.records.length > 0) {
     throw new Error(`worktree ${path} is dirty: ${status.records.join("; ")}; preserve its changes before removal`)
   }
@@ -235,7 +497,14 @@ async function cleanSnapshot(
     if (state.locked !== undefined) {
       throw new Error(`worktree ${entry.root} is locked: ${state.locked}; resolve its holder before removal`)
     }
-    const checked = superStatus({ repo: entry.root })
+    const prefix = relative(path, entry.root).split(sep).join("/")
+    const localExclusions =
+      prefix === ""
+        ? excludedSubmodules
+        : excludedSubmodules
+            .filter((excluded) => excluded.startsWith(`${prefix}/`))
+            .map((excluded) => excluded.slice(prefix.length + 1))
+    const checked = superStatus({ repo: entry.root, excludedSubmodules: localExclusions })
     if (checked.submoduleProblems.length > 0) {
       throw new Error(
         `worktree ${entry.root} has unknown submodule state: ${checked.submoduleProblems.map((problem) => `${problem.path}: ${problem.reason}`).join("; ")}; preserve and resolve it before removal`,
@@ -557,6 +826,9 @@ export async function retainWorktreeModules(
   inspect: (repository: string, path: string) => Promise<WorktreeInspection>,
   writerLocks: readonly WriterLockProof[],
   createdWriterLocks: readonly WriterLockProof[],
+  rehome?: () => readonly string[],
+  excludedSubmodules: readonly string[] = [],
+  notCompared: readonly NotCompared[] = [],
 ): Promise<WorktreeRemovalProof> {
   const path = realpathSync(requested)
   const registered = await inspect(repo, path)
@@ -575,7 +847,7 @@ export async function retainWorktreeModules(
   const custody = { common, checkout: path, gitDir, modules }
   // Diagnose metadata links before Git discovery can hide their source and target in an object lookup failure.
   manifest(gitDir, custody, false)
-  const before = await cleanSnapshot(git, path, inspect)
+  const before = await cleanSnapshot(git, path, inspect, excludedSubmodules)
   // Check metadata locks before copying. The modules subtree includes every store,
   // even one left by an earlier gitlink that the current tree no longer records.
   const metadata = manifest(gitDir, custody)
@@ -634,8 +906,8 @@ export async function retainWorktreeModules(
       )
     }
   }
-  const rehomedBorrowers = rehomeBorrowers(common, gitDir, modules)
-  const after = await cleanSnapshot(git, path, inspect)
+  const rehomedBorrowers = rehome === undefined ? rehomeBorrowers(common, gitDir, modules) : rehome()
+  const after = await cleanSnapshot(git, path, inspect, excludedSubmodules)
   if (JSON.stringify(after) !== JSON.stringify(before)) {
     throw new Error(`worktree ${path} changed during retention; preserved, retry after its writer stops`)
   }
@@ -651,6 +923,7 @@ export async function retainWorktreeModules(
     ...(rehomedBorrowers.length === 0 ? {} : { rehomedBorrowers }),
     writerLocks,
     createdWriterLocks,
+    notCompared,
   }
   writeFileSync(
     proof.manifest,

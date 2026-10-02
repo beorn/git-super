@@ -18,7 +18,7 @@ import {
 } from "node:fs"
 import { setTimeout as delay } from "node:timers/promises"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { delimiter, join } from "node:path"
 import { execFileSync, spawnSync } from "node:child_process"
 import {
   APPLY_GROUPS_ENV,
@@ -51,6 +51,32 @@ test("the executable names its Bun requirement before loading CLI dependencies o
     expect(child.status).toBe(0)
     expect(child.stdout).toMatch(/git version/u)
   }
+})
+
+/**
+ * The first `node` on PATH that is really Node. `bunx --bun` puts a `node` that runs Bun first on PATH, so a bare
+ * `node` there proves nothing about Node; each candidate is asked whether `Bun` is defined.
+ */
+function realNode(): string | undefined {
+  for (const dir of (process.env.PATH ?? "").split(delimiter)) {
+    const candidate = join(dir, "node")
+    if (dir === "" || !existsSync(candidate)) continue
+    const probe = spawnSync(candidate, ["-e", "process.stdout.write(typeof Bun)"], { encoding: "utf8" })
+    if (probe.status === 0 && probe.stdout === "undefined") return candidate
+  }
+  return undefined
+}
+
+// 27074 (@cto 240b6f1e): the bin is declared Bun-only for release verification, so its refusal under Node must stay
+// loud and name the cure whatever runtime runs this suite.
+test("under Node the executable exits 2 and names its Bun requirement", () => {
+  const node = realNode()
+  expect(node, `a real Node (not Bun's node shim) is required on PATH=${process.env.PATH}`).toBeDefined()
+  const child = spawnSync(node!, [join(import.meta.dirname, "../bin/git-super"), "--help"], { encoding: "utf8" })
+  expect(child.error).toBeUndefined()
+  expect(child.status).toBe(2)
+  expect(child.stdout).toBe("")
+  expect(child.stderr).toBe("git-super: Bun CLI requires Bun >=1.3.14\n")
 })
 
 test("library resolves executable Git on the inherited PATH, skipping non-executable entries", () => {

@@ -393,6 +393,12 @@ async function runInvocation(
   program
     .command("pull")
     .description(commands.pull.description ?? commands.pull.title)
+    .option(
+      "--exclude-submodule <path>",
+      "exclude an empty uninitialized literal root-relative submodule and its descendants before content access",
+      (value: string, previous: string[]) => [...previous, value],
+      [],
+    )
     .option("--ff-only", "refuse merge, rebase, stash, force, or conflict resolution")
     .option("--dry-run", "fetch and show the frozen plan without changing a checkout or local branch")
     .argument("[repository]", "remote repository to fetch")
@@ -405,6 +411,7 @@ async function runInvocation(
           ...(typeof repository === "string" ? { repository } : {}),
           refspecs,
           ffOnly: options.ffOnly === true,
+          ...(options.excludeSubmodule === undefined ? {} : { excludedSubmodules: options.excludeSubmodule }),
           ...(options.dryRun === true ? { dryRun: true } : {}),
           // GIT_SUPER_PROGRESS=1 reports each phase to stderr as it starts. An environment switch, not a flag: a
           // caller that sets it still works against an older git-super, which ignores it, so a half-landed update
@@ -541,13 +548,23 @@ async function runInvocation(
     .command("remove")
     .description(commands.worktree.remove.description ?? commands.worktree.remove.title)
     .requiredOption("--retain <directory>", "durable directory outside the worktree and its Git directory")
+    .option(
+      "--exclude-submodule <path>",
+      "exclude a literal root-relative submodule and descendants before content access",
+      (value: string, previous: string[]) => [...previous, value],
+      [],
+    )
     .argument("<path>", "registered clean worktree to remove")
     .action((path, _options, command) => {
       const globals = command.optsWithGlobals() as { repo: string; json?: boolean }
-      const options = command.opts() as { retain: string }
+      const options = command.opts() as { retain: string; excludeSubmodule?: string[] }
       captured = {
         node: commands.worktree.remove,
-        params: { path, retain: options.retain },
+        params: {
+          path,
+          retain: options.retain,
+          ...(options.excludeSubmodule?.length ? { excludedSubmodules: options.excludeSubmodule } : {}),
+        },
         json: globals.json === true,
         nul: false,
       }
@@ -556,6 +573,12 @@ async function runInvocation(
   program
     .command("diff")
     .description(commands.diff.description ?? commands.diff.title)
+    .option(
+      "--exclude-submodule <path>",
+      "exclude a literal root-relative submodule and its descendants before content access",
+      (value: string, previous: string[]) => [...previous, value],
+      [],
+    )
     .option("--name-only", "emit root-relative changed paths")
     .option("-z, --null", "terminate paths with NUL instead of newline")
     .option("--cached", "compare the index instead of the working tree")
@@ -569,6 +592,7 @@ async function runInvocation(
         node: commands.diff,
         params: {
           refs,
+          ...(options.excludeSubmodule?.length ? { excludedSubmodules: options.excludeSubmodule } : {}),
           ...(options.cached ? { cached: true } : {}),
           ...(options.diffFilter === undefined ? {} : { diffFilter: options.diffFilter }),
           ...(options.stat === true ? { stat: true } : {}),
@@ -582,6 +606,12 @@ async function runInvocation(
   program
     .command("status")
     .description(commands.status.description ?? commands.status.title)
+    .option(
+      "--exclude-submodule <path>",
+      "exclude a literal root-relative submodule and descendants before content access",
+      (value: string, previous: string[]) => [...previous, value],
+      [],
+    )
     .option("--porcelain", "emit stable machine-readable status")
     .option("-z, --null", "terminate records with NUL instead of newline")
     .option("--index-file <absolute-path>", "hook context: the index git will commit (root repository only)")
@@ -589,7 +619,10 @@ async function runInvocation(
       const globals = command.optsWithGlobals() as { repo: string; json?: boolean }
       captured = {
         node: commands.status,
-        params: options.indexFile === undefined ? {} : { indexFile: options.indexFile },
+        params: {
+          ...(options.indexFile === undefined ? {} : { indexFile: options.indexFile }),
+          ...(options.excludeSubmodule?.length ? { excludedSubmodules: options.excludeSubmodule } : {}),
+        },
         json: globals.json === true,
         nul: options.null === true,
       }
@@ -598,14 +631,24 @@ async function runInvocation(
   program
     .command("merge-base")
     .description(commands["merge-base"].description ?? commands["merge-base"].title)
+    .option(
+      "--exclude-submodule <path>",
+      "exclude a literal root-relative submodule and descendants before content access",
+      (value: string, previous: string[]) => [...previous, value],
+      [],
+    )
     .requiredOption("--is-ancestor", "test whether the first commit is an ancestor of the second")
     .argument("<ancestor>", "commit whose owning repository should be discovered")
     .argument("<descendant>", "commit or superproject ref to compare")
-    .action((ancestor, descendant, _options, command) => {
+    .action((ancestor, descendant, options, command) => {
       const globals = command.optsWithGlobals() as { repo: string; json?: boolean }
       captured = {
         node: commands["merge-base"],
-        params: { ancestor, descendant },
+        params: {
+          ancestor,
+          descendant,
+          ...(options.excludeSubmodule?.length ? { excludedSubmodules: options.excludeSubmodule } : {}),
+        },
         json: globals.json === true,
         nul: false,
       }
@@ -644,6 +687,16 @@ async function runInvocation(
     return 2
   }
   await writeResult(captured, result, stdout, stderr, commands)
+  if (
+    captured.node === commands.diff &&
+    (result as SuperDiffResult).notCompared.some(({ reason }) => reason === "unreadable")
+  ) {
+    await protocol?.refuse(
+      "unjudged",
+      "Comparison contains unreadable components; see each named observation and remedy.",
+    )
+    return 2
+  }
 
   if (captured.node === commands["merge-base"] && !(result as SuperIsAncestorResult).isAncestor) return 1
   if (captured.node === commands.merge) {
@@ -686,6 +739,17 @@ async function writeResult(
   stderr: OutputSink,
   nodes: typeof commands,
 ): Promise<void> {
+  if (
+    captured.node === nodes.diff ||
+    captured.node === nodes.status ||
+    captured.node === nodes["merge-base"] ||
+    captured.node === nodes.worktree.remove
+  ) {
+    for (const observation of (result as SuperDiffResult | SuperStatusResult | SuperIsAncestorResult).notCompared) {
+      stderr.write(`${observation.path}: ${observation.message}\n`)
+      if (observation.remedy !== undefined) stderr.write(`${observation.remedy}\n`)
+    }
+  }
   if (captured.node === nodes.status) {
     for (const problem of (result as SuperStatusResult).submoduleProblems) {
       stderr.write(

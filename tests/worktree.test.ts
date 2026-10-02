@@ -5,7 +5,7 @@
  * @reach fs-walk <fixture-only: worktree stores and retention checks read isolated mkdtemp Git repositories>
  */
 import { existsSync, readdirSync, readFileSync } from "node:fs"
-import { mkdtemp, readFile, readlink, rename, rm, symlink, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, readlink, rename, rm, symlink, writeFile } from "node:fs/promises"
 import { spawnSync } from "node:child_process"
 import { tmpdir } from "node:os"
 import { dirname, join, relative } from "node:path"
@@ -19,10 +19,15 @@ import {
 } from "../src/worktree.ts"
 import { rehomeBorrowers, type WorktreeRemovalProof } from "../src/worktree-removal.ts"
 import type { GitProcessRequest } from "../src/process.ts"
-import { canonicalTmpdir, createProductFixture } from "./fixture.ts"
+import { canonicalTmpdir, createProductFixture, createRepository } from "./fixture.ts"
 import { runCli } from "../src/cli.ts"
 import { discoverRepository } from "../src/push.ts"
 import { createLocalGitProcess } from "../src/process.ts"
+
+vi.mock("node:fs", async (importOriginal) => {
+  const fs = await importOriginal<typeof import("node:fs")>()
+  return { ...fs, readdirSync: vi.fn(fs.readdirSync), readFileSync: vi.fn(fs.readFileSync) }
+})
 
 function git(repo: string, args: readonly string[]): string {
   const result = spawnSync("git", ["-C", repo, ...args], { encoding: "utf8" })
@@ -57,6 +62,493 @@ function objectStoreSnapshot(objects: string) {
 }
 
 describe("createGitWorktreeStore", () => {
+  /**
+   * @failure Caller inspection admits a private checkout that removal refuses, loses file-content evidence, or changes Git state before admission (27058).
+   * @level l1
+   * @consumer Bearly worktree admission and Git-super removal
+   * @testonly none
+   */
+  // Removal-only tests cannot prove a read-only caller preflight or matching refusal diagnostics.
+  it.each([
+    "empty",
+    "uninitialized-public",
+    "nonempty",
+    "non-directory",
+    "symlink",
+    "unsafe-ancestor",
+    "retained-borrower",
+    "missing-identity",
+    "borrower-missing-identity",
+    "deletion-store",
+    "snapshot-race",
+    "absent",
+    "absent-empty",
+    "absent-checkout",
+    "absent-content",
+    "absent-file",
+    "absent-owned-store",
+    "absent-included-store",
+  ] as const)("shares inspection and removal admission for private %s checkout", async (kind) => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-removal-inspection-"))
+    try {
+      const repo = join(root, "product")
+      const component = join(root, "component")
+      createRepository(repo, "root.txt", "root\n")
+      createRepository(component, "component.txt", "component\n")
+      const excluded = "vendor/private"
+      git(repo, [
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "--name",
+        "private-store",
+        component,
+        excluded,
+      ])
+      if (kind === "uninitialized-public" || kind === "absent-included-store") {
+        git(repo, ["-c", "protocol.file.allow=always", "submodule", "add", component, "vendor/public"])
+      }
+      git(repo, ["commit", "-q", "-am", "add private fixture"])
+      if (kind.startsWith("absent") && kind !== "absent-owned-store") {
+        git(repo, ["update-index", "--force-remove", excluded])
+        if (kind === "absent-included-store") {
+          git(repo, ["config", "-f", ".gitmodules", "--remove-section", "submodule.private-store"])
+          git(repo, ["add", ".gitmodules"])
+        } else {
+          git(repo, ["rm", ".gitmodules"])
+        }
+        git(repo, ["commit", "-q", "-m", "remove private identity, retain common store"])
+      }
+      const linked = join(root, "linked")
+      // Native fixture preparation creates no mechanics writer lock; inspection must not create one either.
+      git(repo, ["worktree", "add", "--detach", linked, "HEAD"])
+      const checkout = join(linked, excluded)
+      if (kind === "absent-included-store") {
+        git(linked, ["-c", "protocol.file.allow=always", "submodule", "update", "--init", "vendor/public"])
+      }
+      if (kind === "absent-owned-store") {
+        git(linked, ["-c", "protocol.file.allow=always", "submodule", "update", "--init", excluded])
+        git(linked, ["submodule", "deinit", "-f", "--", excluded])
+        for (const parent of [repo, linked]) {
+          git(parent, ["update-index", "--force-remove", excluded])
+          git(parent, ["rm", ".gitmodules"])
+          git(parent, ["commit", "-q", "-m", "remove private identity, retain owned store"])
+        }
+      }
+      if (kind === "absent-empty" || kind === "absent-checkout" || kind === "absent-content") {
+        await mkdir(checkout, { recursive: true })
+        if (kind === "absent-checkout") await writeFile(join(checkout, ".git"), "private pointer; do not read\n")
+        if (kind === "absent-content") await writeFile(join(checkout, "keep.txt"), "private content; do not read\n")
+      }
+      if (kind === "missing-identity" || kind === "borrower-missing-identity") {
+        const parent = kind === "missing-identity" ? linked : repo
+        git(parent, ["update-index", "--force-remove", excluded])
+        git(parent, ["rm", "--cached", ".gitmodules"])
+        git(parent, ["commit", "-q", "-m", "remove private parent identity"])
+      }
+      if (kind === "deletion-store") {
+        git(linked, ["-c", "protocol.file.allow=always", "submodule", "update", "--init", excluded])
+        git(linked, ["submodule", "deinit", "-f", "--", excluded])
+      }
+      if (kind === "nonempty") await writeFile(join(checkout, "keep.txt"), "keep\n")
+      if (kind === "non-directory" || kind === "absent-file") {
+        await rm(checkout, { recursive: true, force: true })
+        await mkdir(dirname(checkout), { recursive: true })
+        await writeFile(checkout, "private file content; preserve me\n")
+      }
+      if (kind === "symlink") {
+        await rm(checkout, { recursive: true })
+        await symlink(component, checkout, "dir")
+      }
+      if (kind === "unsafe-ancestor") {
+        await rm(join(linked, "vendor"), { recursive: true })
+        await symlink(component, join(linked, "vendor"), "dir")
+      }
+      const common = git(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim()
+      if (kind === "retained-borrower") {
+        await writeFile(join(common, "git-super-retained-borrowers"), "unresolved fixture\n")
+      }
+      const directory = git(linked, ["rev-parse", "--absolute-git-dir"]).trim()
+      const privateStore = git(kind === "deletion-store" || kind === "absent-owned-store" ? linked : repo, [
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        "modules/private-store",
+      ]).trim()
+      expect(existsSync(privateStore)).toBe(true)
+      const privateBefore = objectStoreSnapshot(privateStore)
+      const storeBefore = objectStoreSnapshot(common)
+      const registration = git(repo, ["worktree", "list", "--porcelain"])
+      const local = createLocalGitProcess()
+      const requests: GitProcessRequest[] = []
+      const store = createGitWorktreeStore({
+        repo,
+        gitProcess: {
+          run(request) {
+            requests.push(request)
+            if (
+              [checkout, join(repo, excluded)].some(
+                (privateCheckout) => request.repo === privateCheckout || request.repo.startsWith(`${privateCheckout}/`),
+              )
+            ) {
+              throw new Error(`private checkout was probed: ${request.repo}`)
+            }
+            return local.run(request)
+          },
+        },
+      })
+      const selection = { excludedSubmodules: [excluded] }
+      const inspection = await store.inspectRemoval(linked, selection).then(
+        (result) => ({ result, error: undefined }),
+        (error: unknown) => ({ result: undefined, error }),
+      )
+      expect(objectStoreSnapshot(common)).toEqual(storeBefore)
+      expect(existsSync(join(directory, "yrd-worktree-mutations"))).toBe(false)
+      expect(existsSync(join(common, "yrd-worktree-mutations"))).toBe(false)
+      expect(git(repo, ["worktree", "list", "--porcelain"])).toBe(registration)
+      expect(requests.every((request) => !request.args.includes("worktree") && !request.args.includes("repack"))).toBe(
+        true,
+      )
+      if (kind === "snapshot-race") {
+        expect(inspection.error).toBeUndefined()
+        await writeFile(join(checkout, "arrived-after-inspection.txt"), "preserve me\n")
+      }
+      const enumerationsBefore = vi.mocked(readdirSync).mock.calls.length
+      const removal = await store.remove(linked, selection).then(
+        () => undefined,
+        (error: unknown) => error,
+      )
+      if (kind === "absent-owned-store") {
+        expect(
+          vi
+            .mocked(readdirSync)
+            .mock.calls.slice(enumerationsBefore)
+            .some(
+              ([directory]) => String(directory) === privateStore || String(directory).startsWith(`${privateStore}/`),
+            ),
+        ).toBe(false)
+        expect(existsSync(privateStore)).toBe(true)
+      }
+      expect(objectStoreSnapshot(privateStore)).toEqual(privateBefore)
+      if (kind === "absent" || kind === "absent-empty" || kind === "absent-included-store") {
+        expect(inspection.error).toBeUndefined()
+        expect(inspection.result?.notCompared).toContainEqual(
+          expect.objectContaining({
+            path: excluded,
+            reason: "excluded",
+            message: expect.stringContaining("absent at HEAD and on disk, nothing to protect"),
+            exclusion: expect.objectContaining({
+              classification: "absent",
+              checkout: kind === "absent-empty" ? "empty" : "absent",
+            }),
+          }),
+        )
+        expect(removal).toBeUndefined()
+        expect(existsSync(linked)).toBe(false)
+      } else if (kind === "empty" || kind === "uninitialized-public") {
+        expect(inspection.error).toBeUndefined()
+        expect(inspection.result?.consultedRepositories).toEqual([{ path: ".", root: linked }])
+        expect(inspection.result?.notCompared).toContainEqual(
+          expect.objectContaining({
+            path: excluded,
+            reason: "excluded",
+            message: expect.stringContaining("nothing to preserve in the checkout"),
+          }),
+        )
+        expect(inspection.result?.uninitializedSubmodules).toEqual(
+          kind === "uninitialized-public" ? ["vendor/public"] : [],
+        )
+        expect(removal).toBeUndefined()
+        expect(existsSync(linked)).toBe(false)
+      } else {
+        expect(removal).toBeInstanceOf(Error)
+        if (
+          kind === "missing-identity" ||
+          kind === "borrower-missing-identity" ||
+          kind === "absent-checkout" ||
+          kind === "absent-content" ||
+          kind === "absent-file"
+        ) {
+          expect(inspection.error).toBeUndefined()
+          const observation = inspection.result?.notCompared.find((entry) => entry.reason === "inconsistent")
+          expect(observation).toMatchObject({ path: excluded, exclusion: { classification: "unclassified" } })
+          expect(removal).toMatchObject({ notCompared: expect.arrayContaining([observation]) })
+          if (kind === "absent-checkout" || kind === "absent-content" || kind === "absent-file") {
+            expect(observation).toMatchObject({
+              exclusion: { checkout: kind === "absent-checkout" ? "checkout" : "content" },
+            })
+          }
+        } else if (kind === "snapshot-race") {
+          expect((removal as Error).message).toContain("checkout is nonempty")
+          expect(await readFile(join(checkout, "arrived-after-inspection.txt"), "utf8")).toBe("preserve me\n")
+        } else {
+          expect(inspection.error).toBeInstanceOf(Error)
+          expect((removal as Error).message).toBe((inspection.error as Error).message)
+        }
+        if (kind === "deletion-store") expect((removal as Error).message).toContain("inside deletion custody")
+        if (kind === "non-directory") expect((removal as Error).message).toContain("checkout is non-directory")
+        if (kind === "non-directory" || kind === "absent-file") {
+          expect(await readFile(checkout, "utf8")).toBe("private file content; preserve me\n")
+          expect(git(repo, ["worktree", "list", "--porcelain"])).toBe(registration)
+        }
+        expect((removal as Error).message).toContain(excluded)
+        expect(existsSync(linked)).toBe(true)
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  /**
+   * @failure The removal CLI drops the shared exclusion or omits named preserved-store observations (27058 AC3/AC5).
+   * @level l1
+   * @consumer git-super worktree remove CLI and JSON readers
+   * @testonly none
+   */
+  // Engine-only removal cannot prove command parsing, forwarding or the operator-facing receipt.
+  it.each([false, true])("routes removal exclusions and names the untouched store; json=%s", async (json) => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-private-remove-cli-"))
+    try {
+      const fixture = createProductFixture(root)
+      const excluded = "vendor/private"
+      const name = "sensitive-store"
+      git(fixture.product, [
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "--name",
+        name,
+        "-q",
+        fixture.alpha,
+        excluded,
+      ])
+      git(fixture.product, ["commit", "-q", "-m", "add fixture private component"])
+      const privateStore = git(fixture.product, [
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        `modules/${name}`,
+      ]).trim()
+      const before = objectStoreSnapshot(privateStore)
+      const linked = join(root, "linked")
+      await createLocalGitWorktreeStore({ repo: fixture.product }).add({
+        kind: "detached",
+        path: linked,
+        ref: "HEAD",
+      })
+      let stdout = ""
+      let stderr = ""
+      const code = await runCli(
+        [
+          "--repo",
+          fixture.product,
+          ...(json ? ["--json"] : []),
+          "worktree",
+          "remove",
+          linked,
+          "--retain",
+          join(root, "retained"),
+          "--exclude-submodule",
+          excluded,
+          "--exclude-submodule",
+          excluded,
+        ],
+        {
+          write: (text) => {
+            stdout += text
+          },
+        },
+        {
+          write: (text) => {
+            stderr += text
+          },
+        },
+      )
+      expect(code).toBe(0)
+      expect(existsSync(linked)).toBe(false)
+      expect(objectStoreSnapshot(privateStore)).toEqual(before)
+      expect(stderr).toContain(excluded)
+      expect(stderr).toContain(privateStore)
+      expect(stderr).toMatch(/preserved.*untouched|untouched.*preserv/u)
+      if (json) {
+        const result = JSON.parse(stdout) as {
+          state: string
+          notCompared: Array<{ path: string; reason: string; message: string }>
+          proof: { notCompared: unknown }
+        }
+        expect(result.state).toBe("updated")
+        expect(result.notCompared).toContainEqual({
+          path: excluded,
+          reason: "excluded",
+          message: expect.stringContaining(privateStore),
+        })
+        expect(result.proof.notCompared).toEqual(result.notCompared)
+      } else {
+        expect(stdout).toContain("updated")
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  /**
+   * @failure Removal walks private stores in surviving common custody despite an empty excluded checkout (27058 AC3/AC5).
+   * @level l1
+   * @consumer git-super retained worktree removal
+   * @testonly none
+   */
+  // In-deletion refusal cannot prove the distinct success case or detect a forbidden recursive parent enumeration.
+  it("leaves an excluded common store untouched and never enumerates it during removal", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-private-common-custody-"))
+    try {
+      const fixture = createProductFixture(root)
+      const excluded = "vendor/private"
+      const name = "sensitive-store"
+      git(fixture.product, [
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "--name",
+        name,
+        "-q",
+        fixture.alpha,
+        excluded,
+      ])
+      git(fixture.product, ["commit", "-q", "-m", "add fixture private component"])
+      const privateStore = git(fixture.product, [
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        `modules/${name}`,
+      ]).trim()
+      const before = objectStoreSnapshot(privateStore)
+      const store = createLocalGitWorktreeStore({ repo: fixture.product })
+      const linked = join(root, "linked")
+      await store.add({ kind: "detached", path: linked, ref: "HEAD" })
+      expect(readdirSync(join(linked, excluded))).toEqual([])
+      const proofs: WorktreeRemovalProof[] = []
+      const options = {
+        excludedSubmodules: [excluded],
+        retention: {
+          root: join(root, "retained"),
+          report: (proof: WorktreeRemovalProof) => {
+            proofs.push(proof)
+          },
+        },
+      }
+      vi.mocked(readdirSync).mockClear()
+      vi.mocked(readFileSync).mockClear()
+      await store.remove(linked, options)
+      const privateQueries = [
+        ...vi
+          .mocked(readFileSync)
+          .mock.calls.filter(([path]) => String(path) === privateStore || String(path).startsWith(`${privateStore}/`)),
+        ...vi.mocked(readdirSync).mock.calls.filter(([path, options]) => {
+          const queried = String(path)
+          const recursive =
+            typeof options === "object" && options !== null && "recursive" in options && options.recursive === true
+          return (
+            queried === privateStore ||
+            queried.startsWith(`${privateStore}/`) ||
+            (recursive && privateStore.startsWith(`${queried}/`))
+          )
+        }),
+      ]
+      expect(privateQueries).toEqual([])
+      expect(existsSync(linked)).toBe(false)
+      expect(objectStoreSnapshot(privateStore)).toEqual(before)
+      expect(proofs).toHaveLength(1)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  /**
+   * @failure Excluded empty checkout hides a private Git store that native removal deletes or retention reads/copies (27058 AC3/AC5).
+   * @level l1
+   * @consumer git-super worktree removal
+   * @testonly none
+   */
+  // Public retention tests authorize hashing/copying; empty-checkout tests do not carry a private owned store.
+  it.each([false, true])(
+    "refuses an excluded store inside deletion custody before touching it; retain=%s",
+    async (retain) => {
+      const root = await mkdtemp(join(canonicalTmpdir(), "git-super-private-removal-custody-"))
+      try {
+        const fixture = createProductFixture(root)
+        const excluded = "vendor/private"
+        const name = "sensitive-store"
+        git(fixture.product, [
+          "-c",
+          "protocol.file.allow=always",
+          "submodule",
+          "add",
+          "--name",
+          name,
+          "-q",
+          fixture.alpha,
+          excluded,
+        ])
+        git(fixture.product, ["commit", "-q", "-m", "add fixture private component"])
+        const linked = join(root, "linked")
+        const privateCheckout = join(linked, excluded)
+        const requests: GitProcessRequest[] = []
+        const local = createLocalGitProcess()
+        const store = createGitWorktreeStore({
+          repo: fixture.product,
+          gitProcess: {
+            run(request) {
+              if (request.repo === privateCheckout || request.repo.startsWith(`${privateCheckout}/`)) {
+                requests.push(request)
+                throw new Error(`private checkout was probed: ${request.repo}`)
+              }
+              return local.run(request)
+            },
+          },
+        })
+        await store.add({ kind: "detached", path: linked, ref: "HEAD" })
+        // Fixture preparation may initialize its own data; the exclusion boundary starts at removal below.
+        git(linked, ["-c", "protocol.file.allow=always", "submodule", "update", "--init", excluded])
+        const privateStore = git(linked, [
+          "rev-parse",
+          "--path-format=absolute",
+          "--git-path",
+          `modules/${name}`,
+        ]).trim()
+        expect(git(privateCheckout, ["rev-parse", "--absolute-git-dir"]).trim()).toBe(privateStore)
+        git(linked, ["submodule", "deinit", "-f", "--", excluded])
+        expect(readdirSync(privateCheckout)).toEqual([])
+        const lease = join(privateStore, "yrd-worktree-mutations", "writer.lock")
+        expect(existsSync(lease)).toBe(false)
+        const retained = join(root, "retained")
+        const options = {
+          excludedSubmodules: [excluded],
+          ...(retain ? { retention: { root: retained, report: () => {} } } : {}),
+        }
+        const failure = await store.remove(linked, options).then(
+          () => undefined,
+          (error: unknown) => error,
+        )
+        expect(failure).toBeInstanceOf(Error)
+        expect((failure as Error).message).toContain(excluded)
+        expect((failure as Error).message).toContain(privateStore)
+        expect((failure as Error).message).toMatch(/custody|deletion/u)
+        expect(requests).toEqual([])
+        expect(existsSync(linked)).toBe(true)
+        expect(readdirSync(privateCheckout)).toEqual([])
+        expect(existsSync(privateStore)).toBe(true)
+        expect(existsSync(lease)).toBe(false)
+        expect(existsSync(retained)).toBe(false)
+        expect(git(fixture.product, ["worktree", "list", "--porcelain"])).toContain(linked)
+      } finally {
+        await rm(root, { recursive: true, force: true })
+      }
+    },
+  )
+
   /**
    * @failure Retained removal rejects a shared objects symlink or follows it and changes another store (26270).
    * @level l1
