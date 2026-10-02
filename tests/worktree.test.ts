@@ -84,6 +84,7 @@ describe("createGitWorktreeStore", () => {
     "absent-empty",
     "absent-checkout",
     "absent-content",
+    "absent-owned-store",
   ] as const)("shares inspection and removal admission for private %s checkout", async (kind) => {
     const root = await mkdtemp(join(canonicalTmpdir(), "git-super-removal-inspection-"))
     try {
@@ -106,7 +107,7 @@ describe("createGitWorktreeStore", () => {
         git(repo, ["-c", "protocol.file.allow=always", "submodule", "add", component, "vendor/public"])
       }
       git(repo, ["commit", "-q", "-am", "add private fixture"])
-      if (kind.startsWith("absent")) {
+      if (kind.startsWith("absent") && kind !== "absent-owned-store") {
         git(repo, ["update-index", "--force-remove", excluded])
         git(repo, ["rm", ".gitmodules"])
         git(repo, ["commit", "-q", "-m", "remove private identity, retain common store"])
@@ -115,6 +116,15 @@ describe("createGitWorktreeStore", () => {
       // Native fixture preparation creates no mechanics writer lock; inspection must not create one either.
       git(repo, ["worktree", "add", "--detach", linked, "HEAD"])
       const checkout = join(linked, excluded)
+      if (kind === "absent-owned-store") {
+        git(linked, ["-c", "protocol.file.allow=always", "submodule", "update", "--init", excluded])
+        git(linked, ["submodule", "deinit", "-f", "--", excluded])
+        for (const parent of [repo, linked]) {
+          git(parent, ["update-index", "--force-remove", excluded])
+          git(parent, ["rm", ".gitmodules"])
+          git(parent, ["commit", "-q", "-m", "remove private identity, retain owned store"])
+        }
+      }
       if (kind === "absent-empty" || kind === "absent-checkout" || kind === "absent-content") {
         await mkdir(checkout, { recursive: true })
         if (kind === "absent-checkout") await writeFile(join(checkout, ".git"), "private pointer; do not read\n")
@@ -144,12 +154,13 @@ describe("createGitWorktreeStore", () => {
         await writeFile(join(common, "git-super-retained-borrowers"), "unresolved fixture\n")
       }
       const directory = git(linked, ["rev-parse", "--absolute-git-dir"]).trim()
-      const privateStore = git(kind === "deletion-store" ? linked : repo, [
+      const privateStore = git(kind === "deletion-store" || kind === "absent-owned-store" ? linked : repo, [
         "rev-parse",
         "--path-format=absolute",
         "--git-path",
         "modules/private-store",
       ]).trim()
+      expect(existsSync(privateStore)).toBe(true)
       const privateBefore = objectStoreSnapshot(privateStore)
       const storeBefore = objectStoreSnapshot(common)
       const registration = git(repo, ["worktree", "list", "--porcelain"])
@@ -187,10 +198,22 @@ describe("createGitWorktreeStore", () => {
         expect(inspection.error).toBeUndefined()
         await writeFile(join(checkout, "arrived-after-inspection.txt"), "preserve me\n")
       }
+      const enumerationsBefore = vi.mocked(readdirSync).mock.calls.length
       const removal = await store.remove(linked, selection).then(
         () => undefined,
         (error: unknown) => error,
       )
+      if (kind === "absent-owned-store") {
+        expect(
+          vi
+            .mocked(readdirSync)
+            .mock.calls.slice(enumerationsBefore)
+            .some(
+              ([directory]) => String(directory) === privateStore || String(directory).startsWith(`${privateStore}/`),
+            ),
+        ).toBe(false)
+        expect(existsSync(privateStore)).toBe(true)
+      }
       expect(objectStoreSnapshot(privateStore)).toEqual(privateBefore)
       if (kind === "absent" || kind === "absent-empty") {
         expect(inspection.error).toBeUndefined()
