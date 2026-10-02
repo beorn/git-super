@@ -218,10 +218,24 @@ describe("materializeSubmodules", () => {
           return local.run(request)
         },
       },
-      { worktree: owner, excludedSubmodules: [path], log: capturingLogger(messages), ...(index ? { source: "index" as const } : {}) },
+      {
+        worktree: owner,
+        excludedSubmodules: [path],
+        log: capturingLogger(messages),
+        ...(index ? { source: "index" as const } : {}),
+      },
     )
-    const accepted = ["absent", "declared-absent", "declared-empty", "declared-local", "index-add", "index-remove"].includes(state)
-    if (state === "declared-local") expect(messages.join("\n")).not.toMatch(/stale.*submodule\.private|submodule\.private.*stale/iu)
+    const accepted = [
+      "absent",
+      "declared-absent",
+      "declared-empty",
+      "declared-local",
+      "index-add",
+      "index-remove",
+    ].includes(state)
+    if (state === "declared-local") {
+      expect(messages.join("\n")).not.toMatch(/stale.*submodule\.private|submodule\.private.*stale/iu)
+    }
     expect(result.code, result.stderr).toBe(accepted ? 0 : 1)
     expect(result.considered).toBe(0)
     expect(requests.every((request) => request.repo === owner)).toBe(true)
@@ -659,11 +673,7 @@ describe("materializeSubmodules", () => {
       expect(result.code).not.toBe(0)
       expect(result.stderr).toContain("gamma")
       expect(result.stderr).toContain(
-        state === "unmerged"
-          ? "unmerged"
-          : state === "undeclared"
-            ? "without submodule metadata"
-            : "as a gitlink",
+        state === "unmerged" ? "unmerged" : state === "undeclared" ? "without submodule metadata" : "as a gitlink",
       )
       expect(existsSync(join(owner, "gamma", ".git"))).toBe(false)
     },
@@ -790,10 +800,18 @@ describe("materializeSubmodules", () => {
         }
         if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
           if (repo !== worktree) return success()
-          const rows = [[`160000 commit ${"a".repeat(40)}\tapps/maddoc\0`].flat(), `100644 blob ${"8".repeat(40)}\t.gitmodules\0`].flat()
+          const rows = [
+            [`160000 commit ${"a".repeat(40)}\tapps/maddoc\0`].flat(),
+            `100644 blob ${"8".repeat(40)}\t.gitmodules\0`,
+          ].flat()
           const wanted = args.at(-1)
-          return { ...success(), stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
-            ? rows.filter((row) => row.endsWith(`\t${wanted}\0`)) : rows).join("") }
+          return {
+            ...success(),
+            stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
+              ? rows.filter((row) => row.endsWith(`\t${wanted}\0`))
+              : rows
+            ).join(""),
+          }
         }
         if (args[0] === "config" && args.includes("--blob")) {
           return { ...success(), stdout: "submodule.maddoc.path\napps/maddoc\u0000" }
@@ -844,10 +862,18 @@ describe("materializeSubmodules", () => {
         }
         if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
           if (repo !== worktree) return success()
-          const rows = [[`160000 commit ${"a".repeat(40)}\tapps/maddoc\0`].flat(), `100644 blob ${"8".repeat(40)}\t.gitmodules\0`].flat()
+          const rows = [
+            [`160000 commit ${"a".repeat(40)}\tapps/maddoc\0`].flat(),
+            `100644 blob ${"8".repeat(40)}\t.gitmodules\0`,
+          ].flat()
           const wanted = args.at(-1)
-          return { ...success(), stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
-            ? rows.filter((row) => row.endsWith(`\t${wanted}\0`)) : rows).join("") }
+          return {
+            ...success(),
+            stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
+              ? rows.filter((row) => row.endsWith(`\t${wanted}\0`))
+              : rows
+            ).join(""),
+          }
         }
         if (args[0] === "config" && args.includes("--blob")) {
           return { ...success(), stdout: "submodule.maddoc.path\napps/maddoc\u0000" }
@@ -899,10 +925,18 @@ describe("materializeSubmodules", () => {
         }
         if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
           if (repo !== worktree) return success()
-          const rows = [paths.map((path) => `160000 commit ${"1".repeat(40)}\t${path}\0`).flat(), `100644 blob ${"8".repeat(40)}\t.gitmodules\0`].flat()
+          const rows = [
+            paths.map((path) => `160000 commit ${"1".repeat(40)}\t${path}\0`).flat(),
+            `100644 blob ${"8".repeat(40)}\t.gitmodules\0`,
+          ].flat()
           const wanted = args.at(-1)
-          return { ...success(), stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
-            ? rows.filter((row) => row.endsWith(`\t${wanted}\0`)) : rows).join("") }
+          return {
+            ...success(),
+            stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
+              ? rows.filter((row) => row.endsWith(`\t${wanted}\0`))
+              : rows
+            ).join(""),
+          }
         }
         if (args[0] === "config" && args.includes("--blob")) {
           return {
@@ -965,10 +999,18 @@ describe("materializeSubmodules", () => {
         }
         if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
           if (repo !== worktree) return success()
-          const rows = [[`160000 commit ${"f".repeat(40)}\tapps/maddoc\0`].flat(), `100644 blob ${"8".repeat(40)}\t.gitmodules\0`].flat()
+          const rows = [
+            [`160000 commit ${"f".repeat(40)}\tapps/maddoc\0`].flat(),
+            `100644 blob ${"8".repeat(40)}\t.gitmodules\0`,
+          ].flat()
           const wanted = args.at(-1)
-          return { ...success(), stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
-            ? rows.filter((row) => row.endsWith(`\t${wanted}\0`)) : rows).join("") }
+          return {
+            ...success(),
+            stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
+              ? rows.filter((row) => row.endsWith(`\t${wanted}\0`))
+              : rows
+            ).join(""),
+          }
         }
         if (args[0] === "config" && args.includes("--blob")) {
           return { ...success(), stdout: "submodule.maddoc.path\napps/maddoc\u0000" }
@@ -1014,10 +1056,18 @@ describe("materializeSubmodules", () => {
         }
         if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
           if (repo !== worktree) return success()
-          const rows = [[`160000 commit ${"e".repeat(40)}\tapps/maddoc\0`].flat(), `100644 blob ${"8".repeat(40)}\t.gitmodules\0`].flat()
+          const rows = [
+            [`160000 commit ${"e".repeat(40)}\tapps/maddoc\0`].flat(),
+            `100644 blob ${"8".repeat(40)}\t.gitmodules\0`,
+          ].flat()
           const wanted = args.at(-1)
-          return { ...success(), stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
-            ? rows.filter((row) => row.endsWith(`\t${wanted}\0`)) : rows).join("") }
+          return {
+            ...success(),
+            stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
+              ? rows.filter((row) => row.endsWith(`\t${wanted}\0`))
+              : rows
+            ).join(""),
+          }
         }
         if (args[0] === "config" && args.includes("--blob")) {
           return { ...success(), stdout: "submodule.maddoc.path\napps/maddoc\u0000" }
@@ -1057,10 +1107,18 @@ describe("materializeSubmodules", () => {
         }
         if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
           if (repo !== worktree) return success()
-          const rows = [[`160000 commit ${"b".repeat(40)}\tapps/maddoc\0`].flat(), `100644 blob ${"8".repeat(40)}\t.gitmodules\0`].flat()
+          const rows = [
+            [`160000 commit ${"b".repeat(40)}\tapps/maddoc\0`].flat(),
+            `100644 blob ${"8".repeat(40)}\t.gitmodules\0`,
+          ].flat()
           const wanted = args.at(-1)
-          return { ...success(), stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
-            ? rows.filter((row) => row.endsWith(`\t${wanted}\0`)) : rows).join("") }
+          return {
+            ...success(),
+            stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
+              ? rows.filter((row) => row.endsWith(`\t${wanted}\0`))
+              : rows
+            ).join(""),
+          }
         }
         if (args[0] === "config" && args.includes("--blob")) {
           return { ...success(), stdout: "submodule.maddoc.path\napps/maddoc\u0000" }
@@ -1115,10 +1173,18 @@ describe("materializeSubmodules", () => {
       }
       if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
         if (repo !== worktree) return success()
-        const rows = [[`160000 commit ${"9".repeat(40)}\thh-web\0`].flat(), `100644 blob ${"8".repeat(40)}\t.gitmodules\0`].flat()
+        const rows = [
+          [`160000 commit ${"9".repeat(40)}\thh-web\0`].flat(),
+          `100644 blob ${"8".repeat(40)}\t.gitmodules\0`,
+        ].flat()
         const wanted = args.at(-1)
-        return { ...success(), stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
-          ? rows.filter((row) => row.endsWith(`\t${wanted}\0`)) : rows).join("") }
+        return {
+          ...success(),
+          stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
+            ? rows.filter((row) => row.endsWith(`\t${wanted}\0`))
+            : rows
+          ).join(""),
+        }
       }
       if (args[0] === "config" && args.includes("--blob")) {
         return { ...success(), stdout: "submodule.hh-web.path\nhh-web\u0000" }
@@ -1229,10 +1295,18 @@ describe("materializeSubmodules", () => {
         }
         if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
           if (repo !== worktree) return success()
-          const rows = [[`160000 commit ${removed}\thh-web\0`, `160000 commit ${cold}\tag\0`].flat(), `100644 blob ${"8".repeat(40)}\t.gitmodules\0`].flat()
+          const rows = [
+            [`160000 commit ${removed}\thh-web\0`, `160000 commit ${cold}\tag\0`].flat(),
+            `100644 blob ${"8".repeat(40)}\t.gitmodules\0`,
+          ].flat()
           const wanted = args.at(-1)
-          return { ...success(), stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
-            ? rows.filter((row) => row.endsWith(`\t${wanted}\0`)) : rows).join("") }
+          return {
+            ...success(),
+            stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
+              ? rows.filter((row) => row.endsWith(`\t${wanted}\0`))
+              : rows
+            ).join(""),
+          }
         }
         if (args[0] === "config" && args.includes("--blob")) {
           return { ...success(), stdout: "submodule.hh-web.path\nhh-web\u0000submodule.ag.path\nag\u0000" }
@@ -1290,10 +1364,18 @@ describe("materializeSubmodules", () => {
         }
         if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
           if (repo !== worktree) return success()
-          const rows = [[`160000 commit ${"c".repeat(40)}\tapps/maddoc\0`].flat(), `100644 blob ${"8".repeat(40)}\t.gitmodules\0`].flat()
+          const rows = [
+            [`160000 commit ${"c".repeat(40)}\tapps/maddoc\0`].flat(),
+            `100644 blob ${"8".repeat(40)}\t.gitmodules\0`,
+          ].flat()
           const wanted = args.at(-1)
-          return { ...success(), stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
-            ? rows.filter((row) => row.endsWith(`\t${wanted}\0`)) : rows).join("") }
+          return {
+            ...success(),
+            stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
+              ? rows.filter((row) => row.endsWith(`\t${wanted}\0`))
+              : rows
+            ).join(""),
+          }
         }
         if (args[0] === "config" && args.includes("--blob")) {
           return { ...success(), stdout: "submodule.maddoc.path\napps/maddoc\u0000" }
@@ -1352,10 +1434,18 @@ describe("materializeSubmodules", () => {
         }
         if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
           if (repo !== worktree) return success()
-          const rows = [[`160000 commit ${required}\tapps/maddoc\0`].flat(), `100644 blob ${"8".repeat(40)}\t.gitmodules\0`].flat()
+          const rows = [
+            [`160000 commit ${required}\tapps/maddoc\0`].flat(),
+            `100644 blob ${"8".repeat(40)}\t.gitmodules\0`,
+          ].flat()
           const wanted = args.at(-1)
-          return { ...success(), stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
-            ? rows.filter((row) => row.endsWith(`\t${wanted}\0`)) : rows).join("") }
+          return {
+            ...success(),
+            stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
+              ? rows.filter((row) => row.endsWith(`\t${wanted}\0`))
+              : rows
+            ).join(""),
+          }
         }
         if (args[0] === "config" && args.includes("--blob")) {
           return { ...success(), stdout: "submodule.maddoc.path\napps/maddoc\u0000" }
@@ -1418,10 +1508,18 @@ describe("materializeSubmodules", () => {
         }
         if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
           if (repo !== worktree) return success()
-          const rows = [[`160000 commit ${required}\tapps/maddoc\0`].flat(), `100644 blob ${"8".repeat(40)}\t.gitmodules\0`].flat()
+          const rows = [
+            [`160000 commit ${required}\tapps/maddoc\0`].flat(),
+            `100644 blob ${"8".repeat(40)}\t.gitmodules\0`,
+          ].flat()
           const wanted = args.at(-1)
-          return { ...success(), stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
-            ? rows.filter((row) => row.endsWith(`\t${wanted}\0`)) : rows).join("") }
+          return {
+            ...success(),
+            stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
+              ? rows.filter((row) => row.endsWith(`\t${wanted}\0`))
+              : rows
+            ).join(""),
+          }
         }
         if (args[0] === "config" && args.includes("--blob")) {
           return { ...success(), stdout: "submodule.maddoc.path\napps/maddoc\u0000" }
@@ -1529,10 +1627,18 @@ describe("materializeSubmodules", () => {
         }
         if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
           if (repo !== worktree) return success()
-          const rows = [[`160000 commit ${"e".repeat(40)}\tapps/maddoc\0`].flat(), `100644 blob ${"8".repeat(40)}\t.gitmodules\0`].flat()
+          const rows = [
+            [`160000 commit ${"e".repeat(40)}\tapps/maddoc\0`].flat(),
+            `100644 blob ${"8".repeat(40)}\t.gitmodules\0`,
+          ].flat()
           const wanted = args.at(-1)
-          return { ...success(), stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
-            ? rows.filter((row) => row.endsWith(`\t${wanted}\0`)) : rows).join("") }
+          return {
+            ...success(),
+            stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
+              ? rows.filter((row) => row.endsWith(`\t${wanted}\0`))
+              : rows
+            ).join(""),
+          }
         }
         if (args[0] === "config" && args.includes("--blob")) {
           return { ...success(), stdout: "submodule.maddoc.path\napps/maddoc\u0000" }
@@ -1579,10 +1685,18 @@ describe("materializeSubmodules", () => {
         }
         if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
           if (repo !== worktree) return success()
-          const rows = [paths.map((path) => `160000 commit ${"a".repeat(40)}\t${path}\0`).flat(), `100644 blob ${"8".repeat(40)}\t.gitmodules\0`].flat()
+          const rows = [
+            paths.map((path) => `160000 commit ${"a".repeat(40)}\t${path}\0`).flat(),
+            `100644 blob ${"8".repeat(40)}\t.gitmodules\0`,
+          ].flat()
           const wanted = args.at(-1)
-          return { ...success(), stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
-            ? rows.filter((row) => row.endsWith(`\t${wanted}\0`)) : rows).join("") }
+          return {
+            ...success(),
+            stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
+              ? rows.filter((row) => row.endsWith(`\t${wanted}\0`))
+              : rows
+            ).join(""),
+          }
         }
         if (args[0] === "config" && args.includes("--blob")) {
           return {
@@ -1657,10 +1771,18 @@ describe("materializeSubmodules", () => {
         }
         if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
           if (repo !== worktree) return success()
-          const rows = [paths.map((path) => `160000 commit ${"a".repeat(40)}\t${path}\0`).flat(), `100644 blob ${"8".repeat(40)}\t.gitmodules\0`].flat()
+          const rows = [
+            paths.map((path) => `160000 commit ${"a".repeat(40)}\t${path}\0`).flat(),
+            `100644 blob ${"8".repeat(40)}\t.gitmodules\0`,
+          ].flat()
           const wanted = args.at(-1)
-          return { ...success(), stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
-            ? rows.filter((row) => row.endsWith(`\t${wanted}\0`)) : rows).join("") }
+          return {
+            ...success(),
+            stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
+              ? rows.filter((row) => row.endsWith(`\t${wanted}\0`))
+              : rows
+            ).join(""),
+          }
         }
         if (args[0] === "cat-file" && args[1] === "-e") {
           storeProbes.push(repo)
@@ -2215,10 +2337,18 @@ describe("materializeSubmodules", () => {
         }
         if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
           if (repo !== worktree) return success()
-          const rows = [[`160000 commit ${"f".repeat(40)}\tapps/maddoc\0`].flat(), `100644 blob ${"8".repeat(40)}\t.gitmodules\0`].flat()
+          const rows = [
+            [`160000 commit ${"f".repeat(40)}\tapps/maddoc\0`].flat(),
+            `100644 blob ${"8".repeat(40)}\t.gitmodules\0`,
+          ].flat()
           const wanted = args.at(-1)
-          return { ...success(), stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
-            ? rows.filter((row) => row.endsWith(`\t${wanted}\0`)) : rows).join("") }
+          return {
+            ...success(),
+            stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
+              ? rows.filter((row) => row.endsWith(`\t${wanted}\0`))
+              : rows
+            ).join(""),
+          }
         }
         if (args[0] === "config" && args.includes("--blob")) {
           return { ...success(), stdout: "submodule.maddoc.path\napps/maddoc\u0000" }
@@ -2735,10 +2865,18 @@ describe("materializeSubmodules", () => {
         }
         if ((args[0] === "ls-tree" || args[0] === "--literal-pathspecs") && args.includes("-z")) {
           if (repo !== worktree) return success()
-          const rows = [[`160000 commit ${missingSha}\tvendor/dep\0`].flat(), `100644 blob ${"8".repeat(40)}\t.gitmodules\0`].flat()
+          const rows = [
+            [`160000 commit ${missingSha}\tvendor/dep\0`].flat(),
+            `100644 blob ${"8".repeat(40)}\t.gitmodules\0`,
+          ].flat()
           const wanted = args.at(-1)
-          return { ...success(), stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
-            ? rows.filter((row) => row.endsWith(`\t${wanted}\0`)) : rows).join("") }
+          return {
+            ...success(),
+            stdout: (args[0] === "--literal-pathspecs" || wanted === ".gitmodules"
+              ? rows.filter((row) => row.endsWith(`\t${wanted}\0`))
+              : rows
+            ).join(""),
+          }
         }
         if (args[0] === "config" && args.includes("--blob")) {
           return { ...success(), stdout: "submodule.dep.path\nvendor/dep\u0000" }

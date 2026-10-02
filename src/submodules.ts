@@ -750,11 +750,13 @@ export async function materializeSubmodules(
     let failedRead: SubmoduleGitResult | undefined
     try {
       metadata = await readCommitSubmodules(
-        { run: async (request) => {
-          const result = await git.run(request.repo, request.args, true)
-          if (result.code !== 0 || result.timedOut || result.failure !== undefined) failedRead = result
-          return result
-        } },
+        {
+          run: async (request) => {
+            const result = await git.run(request.repo, request.args, true)
+            if (result.code !== 0 || result.timedOut || result.failure !== undefined) failedRead = result
+            return result
+          },
+        },
         worktree,
         head,
         { excludedSubmodules: excluded, source },
