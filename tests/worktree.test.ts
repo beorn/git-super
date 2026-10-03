@@ -1162,6 +1162,100 @@ describe("createGitWorktreeStore", () => {
     }
   })
 
+  /**
+   * @failure A sibling's custody refusal releases the parent while another native Git child is alive (27143).
+   * @level l2
+   * @consumer Parallel materialization and private projection lifetime
+   */
+  it("retains parent and child custody through native sibling settlement after another child refuses", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-sibling-settlement-"))
+    const fixture = createProductFixture(root)
+    const alpha = join(fixture.product, "packages/alpha")
+    const beta = join(fixture.product, "vendor/beta")
+    const alphaCommon = git(alpha, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim()
+    const betaCommon = git(beta, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim()
+    const entered = join(root, "entered")
+    const release = join(root, "release")
+    const worker = join(root, "pause.ts")
+    await writeFile(
+      worker,
+      `import { existsSync, writeFileSync } from "node:fs"
+writeFileSync(${JSON.stringify(entered)}, String(process.pid))
+const deadline = Date.now() + 20000
+while (!existsSync(${JSON.stringify(release)})) {
+  if (Date.now() >= deadline) throw new Error("Native sibling was not released")
+  await Bun.sleep(5)
+}
+`,
+    )
+    const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`
+    git(fixture.product, ["config", "submodule.vendor/beta.update", `!${quote(process.execPath)} ${quote(worker)}`])
+    const held = await acquireExclusive(join(alphaCommon, "yrd-worktree-mutations"), { timeoutMs: 0 })
+    const native = createLocalGitProcess()
+    const nativeChildren: Array<ReturnType<typeof native.run>> = []
+    vi.mocked(readFileSync).mockClear()
+    const pending = materializeSubmodulesWithProcess(
+      {
+        async run(request) {
+          if (request.repo === alpha && request.args.includes("--git-common-dir")) {
+            // Schedule the real alpha refusal only after native beta is alive.
+            await vi.waitFor(() => expect(existsSync(entered)).toBe(true), { timeout: 10_000 })
+          }
+          const result = native.run(request)
+          if (request.repo === beta && request.args.includes("git-super-submodule-update")) nativeChildren.push(result)
+          return result
+        },
+      },
+      { worktree: fixture.product, force: true, mutationLockTimeoutMs: 0 },
+    ).then(
+      (result) => result,
+      (error: unknown) => error,
+    )
+    try {
+      try {
+        const alphaLock = join(alphaCommon, "yrd-worktree-mutations", "writer.lock")
+        // The existing diagnostic read occurs only after the real flock acquire failed.
+        await vi.waitFor(
+          () => expect(vi.mocked(readFileSync).mock.calls.some(([path]) => path === alphaLock)).toBe(true),
+          { timeout: 10_000 },
+        )
+        const pid = Number(await readFile(entered, "utf8"))
+        expect(nativeChildren).toHaveLength(1)
+        expect(Number.isSafeInteger(pid) && pid > 0).toBe(true)
+        expect(() => process.kill(pid, 0)).not.toThrow()
+        for (const common of [join(fixture.product, ".git"), betaCommon]) {
+          const contender = await acquireExclusive(join(common, "yrd-worktree-mutations"), { timeoutMs: 0 }).then(
+            (lock) => {
+              lock.release()
+              return "free"
+            },
+            (error: unknown) => {
+              expect(error).toBeInstanceOf(Error)
+              expect((error as Error).message).toContain("lock is busy")
+              return "busy"
+            },
+          )
+          expect(contender).toBe("busy")
+        }
+      } finally {
+        await writeFile(release, "released")
+        await pending
+        // The intentional Promise.all mutant rejects before this native child.
+        await Promise.allSettled(nativeChildren)
+        held.release()
+      }
+      const result = await pending
+      expect(result).toBeInstanceOf(Error)
+      expect((result as Error).message).toContain("lock is busy")
+      for (const common of [join(fixture.product, ".git"), alphaCommon, betaCommon]) {
+        const next = await acquireExclusive(join(common, "yrd-worktree-mutations"), { timeoutMs: 0 })
+        next.release()
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 30_000)
+
   it("checks the heal guards before locking and still takes the lock when repair is required", async () => {
     const repo = await mkdtemp(join(tmpdir(), "git-super-config-heal-lock-"))
     const commonDir = join(repo, ".git")
