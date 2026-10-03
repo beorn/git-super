@@ -643,6 +643,10 @@ export function acquireRemovalWriterLeases(gitDir: string, onAcquired?: (path: s
 }
 
 /** Inspect link identities without walking their objects; only common-store objects directories may be borrowed. */
+export function metadataFileDigest(path: string): string {
+  return createHash("sha256").update(readFileSync(path)).digest("hex")
+}
+
 function manifest(root: string, custody: StoreCustody, hashFiles = true): StoreManifest {
   const entries: Record<string, ManifestEntry> = {}
   const files: Record<string, string> = {}
@@ -684,7 +688,7 @@ function manifest(root: string, custody: StoreCustody, hashFiles = true): StoreM
       throw new Error(`Git store ${path} is not a regular file; preserve and resolve it before removal`)
     }
     if (!hashFiles) continue
-    const sha256 = createHash("sha256").update(readFileSync(path)).digest("hex")
+    const sha256 = metadataFileDigest(path)
     files[key] = sha256
     entries[key] = { kind: "file", sha256 }
   }

@@ -6,17 +6,66 @@
  * @testonly none
  */
 import { spawnSync } from "node:child_process"
-import { existsSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs"
+import { existsSync, readdirSync, readFileSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs"
 import { mkdtemp, rm } from "node:fs/promises"
 import { join } from "node:path"
 import { afterEach, expect, it } from "vitest"
 import * as GitSuper from "../src/index.ts"
 import { createExclusive } from "../src/exclusive.ts"
+import { shellQuote } from "../src/shell-command.ts"
 import { addNestedAlphaSubmodule, advanceRepository, canonicalTmpdir, createProductFixture, git } from "./fixture.ts"
 
 const roots: string[] = []
 afterEach(async () => {
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true })
+})
+
+it("refuses seat-configured native Git helpers before host custody can execute them", async () => {
+  const root = await mkdtemp(join(canonicalTmpdir(), "git-super-hostile-config-"))
+  roots.push(root)
+  const fixture = createProductFixture(root)
+  const destination = join(root, "seat")
+  const projected = await GitSuper.projectPrivateGitWorktree({
+    sourceCheckout: fixture.product,
+    commit: fixture.productBase,
+    branch: "task/seat",
+    destination,
+    excludedSubmodules: [],
+  })
+  expect(projected.state, JSON.stringify(projected.detail)).toBe("updated")
+  if (projected.projection === undefined) throw new Error("projection omitted its durable record")
+  const marker = join(root, "helper-executed")
+  const helper = join(root, "fsmonitor.ts")
+  writeFileSync(
+    helper,
+    `import { writeFileSync } from "node:fs"; writeFileSync(process.argv[2], "executed"); process.stdout.write("token\\0");`,
+  )
+  const command = [process.execPath, helper, marker].map(shellQuote).join(" ")
+  const included = join(root, "included.config")
+  git(root, "config", "--file", included, "core.fsmonitor", command)
+  for (const repository of projected.projection.repositories) {
+    const configuration = join(repository.gitDirectory, "config")
+    const original = readFileSync(configuration)
+    for (const mode of ["direct", "include", "symlink"] as const) {
+      if (mode === "direct") git(repository.checkout, "config", "core.fsmonitor", command)
+      else if (mode === "include") git(repository.checkout, "config", "include.path", included)
+      else {
+        unlinkSync(configuration)
+        symlinkSync(included, configuration)
+      }
+      // Positive control: native Git really follows this configuration and launches the helper.
+      git(repository.checkout, "status", "--porcelain")
+      expect(existsSync(marker), `${repository.path}: ${mode} native positive control`).toBe(true)
+      unlinkSync(marker)
+      const retained = await GitSuper.retainPrivateGitProjection(projected.projection, join(root, "retained"))
+      expect(existsSync(marker), `${repository.path}: host custody executed ${mode} helper configuration`).toBe(false)
+      expect(retained.state).toBe("failed")
+      expect(retained.detail?.message).toContain("config")
+      expect(existsSync(destination)).toBe(true)
+      if (mode === "symlink") unlinkSync(configuration)
+      writeFileSync(configuration, original)
+    }
+  }
 })
 
 it("isolates native root and nested-child authoring and retires from a durable record in another process", async () => {

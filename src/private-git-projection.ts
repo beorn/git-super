@@ -9,7 +9,12 @@ import { pinRef } from "./objects.ts"
 import { createExclusive } from "./exclusive.ts"
 import { safeStorePath } from "./submodule-prepare.ts"
 import { createGit, createGitWorktreeStore } from "./worktree.ts"
-import { acquireRemovalWriterLeases, retainWorktreeModules, type WorktreeRemovalProof } from "./worktree-removal.ts"
+import {
+  acquireRemovalWriterLeases,
+  metadataFileDigest,
+  retainWorktreeModules,
+  type WorktreeRemovalProof,
+} from "./worktree-removal.ts"
 import type { NotCompared } from "./diff.ts"
 import type { GitSuperResult } from "./result.ts"
 
@@ -17,7 +22,13 @@ export type PrivateGitProjection = Readonly<{
   checkout: string
   base: string
   branch: string
-  repositories: readonly Readonly<{ path: string; checkout: string; gitDirectory: string; head: string }>[]
+  repositories: readonly Readonly<{
+    path: string
+    checkout: string
+    gitDirectory: string
+    head: string
+    configurationSha256: string
+  }>[]
   mounts: readonly Readonly<{ source: string; target: string; mode: "ro" | "rw" }>[]
   excluded: readonly NotCompared[]
 }>
@@ -69,6 +80,16 @@ async function preserveProjection(
       }
       if ((await metadata(repository.checkout)) !== repository.gitDirectory) {
         throw new Error(`private metadata pointer changed at ${repository.checkout}`)
+      }
+      const configuration = join(repository.gitDirectory, "config")
+      if (
+        (await lstat(configuration)).isSymbolicLink() ||
+        !/^[0-9a-f]{64}$/u.test(repository.configurationSha256) ||
+        metadataFileDigest(configuration) !== repository.configurationSha256
+      ) {
+        throw new Error(
+          `private Git configuration changed or is unknown: ${configuration}; preserve the checkout and inspect its configuration before custody`,
+        )
       }
       const objects = join(repository.gitDirectory, "objects")
       await alternatesLineage([objects], "", { allowedObjects: new Set([...allowedObjects, objects]) })
@@ -321,7 +342,10 @@ export async function projectPrivateGitWorktree(
       checkout: destination,
       base: options.commit,
       branch: options.branch,
-      repositories,
+      repositories: repositories.map((repository) => ({
+        ...repository,
+        configurationSha256: metadataFileDigest(join(repository.gitDirectory, "config")),
+      })),
       mounts: [
         { source: destination, target: destination, mode: "rw" },
         ...[...stores].map((store) => ({ source: store, target: store, mode: "ro" as const })),
