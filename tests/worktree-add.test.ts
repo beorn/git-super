@@ -844,6 +844,8 @@ describe("git super worktree add", () => {
     expect(code).toBe(2)
     expect(stdout.output).toBe("failed\n")
     expect(stderr.output).toContain("vendor/dep")
+    expect(stderr.output).toContain(fixture.dependency)
+    expect(stderr.output).toContain("Could not read from remote repository")
     expect(stderr.output).toContain("the worktree was removed")
     expect(existsSync(worktree)).toBe(false)
     expect(git(fixture.product, ["worktree", "list", "--porcelain"])).not.toContain(worktree)

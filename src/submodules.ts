@@ -1515,7 +1515,12 @@ export async function materializeSubmodules(
         }
         return result
       })()
-      if (updated.code !== 0) return updated
+      if (updated.code !== 0) {
+        return {
+          ...updated,
+          stderr: `submodule '${logicalPath === "" ? path : `${logicalPath}/${path}`}' at ${required}: materialization failed\n${updated.stderr}`,
+        }
+      }
       if (freshClone && nestedReference !== undefined) {
         const synced = await syncOriginTrackingRefs(git, submoduleDir, nestedReference, log)
         if (synced.code !== 0) return synced
