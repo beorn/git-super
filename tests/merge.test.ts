@@ -793,6 +793,23 @@ function corruptNativeApply(local: GitProcess, product: string, unreadable: stri
   }
 }
 
+/**
+ * A git process whose root native APPLY times out: the preflight composed the
+ * gitlinks, and the apply returns a supervisory timeout rather than the
+ * wrong-store read abort. A timeout is not an admission to settle anything
+ * (27268 review 656d81df).
+ */
+function timedOutNativeApply(local: GitProcess, product: string): GitProcess {
+  return {
+    run: (request) => {
+      if (request.repo === product && request.args.includes("merge") && request.args.includes("--no-commit")) {
+        return Promise.resolve({ code: 1, stdout: "", stderr: "", timedOut: true })
+      }
+      return local.run(request)
+    },
+  }
+}
+
 describe("git super merge", () => {
   /**
    * @failure A newly added checkout-free parent hides missing descendants behind a generic error and an unusable repair (26996).
@@ -3621,12 +3638,12 @@ describe("git super merge", () => {
   })
 
   /**
-   * @failure The wrong-store 128 aborts the preflight AND the native apply, so a composition that was fully proven still comes back as the ordinary application failure and the merge never lands (27268 918).
+   * @failure The wrong-store 128 aborts the preflight AND the native apply; settling it from the proven tree needs a whole-tree root writer that the carrier-only rulings do not authorize, so the application failure must stay loud and named (27268 918, CTO 1a8894cb).
    * @level l1
    * @consumer Yrd settled candidate preparation and landing
    * @testonly none; both wrong-store failures are simulated, every composition step is native
    */
-  it("settles the proven composition when the native apply also aborts and leaves the index unchanged", async () => {
+  it("keeps the loud named application failure when the native apply also aborts", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-wrong-store-apply-918-"))
     roots.push(fixtureRoot)
     const fixture = createProductFixture(fixtureRoot)
@@ -3644,22 +3661,34 @@ describe("git super merge", () => {
       repo: fixture.product,
     })
 
-    expect(result.state, JSON.stringify(result)).toBe("updated")
-    // Final parents are the real HEAD and the merged target, never the carrier.
-    const parents = git(fixture.product, "rev-list", "--parents", "-n", "1", "HEAD").trim().split(/\s+/u).slice(1)
-    expect(parents).toEqual([diverged.head, diverged.candidate])
-    // Both diverged gitlinks landed as the component merge of BOTH sides.
-    const alphaPin = git(fixture.product, "ls-tree", "HEAD", "packages/alpha").trim().split(/\s+/u)[2] ?? ""
-    expect(git(fixture.alpha, "rev-list", "--parents", "-n", "1", alphaPin).trim().split(/\s+/u).slice(1)).toEqual([
-      diverged.alphaOurs,
-      diverged.alphaTheirs,
-    ])
-    expect(git(fixture.alpha, "rev-parse", "HEAD")).toBe(diverged.alphaOurs)
-    // Ordinary root edits from BOTH sides survive the settled merge.
-    expect(git(fixture.product, "show", `HEAD:${diverged.oursRoot}`).trim()).toBe("ours")
-    expect(git(fixture.product, "show", `HEAD:${diverged.theirsRoot}`).trim()).toBe("theirs")
-    // Nothing user-visible names a carrier commit, and the tree is left clean.
-    expect(git(fixture.product, "log", "-1", "--format=%B")).not.toContain("carrier")
+    expect(result.state, JSON.stringify(result)).toBe("failed")
+    expect(result.partial).toBe(false)
+    expect(result.detail?.code).not.toBeUndefined()
+    // Nothing was written: HEAD, the index and the worktree are the pre-merge state.
+    expect(git(fixture.product, "rev-parse", "HEAD")).toBe(diverged.head)
+    expect(git(fixture.product, "status", "--porcelain").trim()).toBe("")
+  })
+
+  /**
+   * @failure A native apply that timed out or hit a transport failure is not the wrong-store abort; settling it from a proven tree would turn a timeout into a commit (27268 review 656d81df).
+   * @level l1
+   * @consumer Yrd settled candidate preparation and landing
+   * @testonly none; only the native apply outcome is simulated
+   */
+  it("never commits when the native apply times out with a clean index", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-wrong-store-apply-timeout-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const diverged = divergeBothProductComponentsWithRootEdits(fixture)
+    const local = createLocalGitProcess()
+    const result = await superMerge({
+      commit: diverged.candidate,
+      git: timedOutNativeApply(wrongStoreFirstMerge(local, fixture.product, diverged.alphaOurs), fixture.product),
+      repo: fixture.product,
+    })
+
+    expect(result.state, JSON.stringify(result)).toBe("failed")
+    expect(git(fixture.product, "rev-parse", "HEAD")).toBe(diverged.head)
     expect(git(fixture.product, "status", "--porcelain").trim()).toBe("")
   })
 
