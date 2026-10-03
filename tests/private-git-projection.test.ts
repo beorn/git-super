@@ -176,6 +176,68 @@ it.each([
   )
 })
 
+// CTOa6e10f22: custody must bind inspected entries, even when replacement resolves to the same paths.
+// Read-boundary mutation cases miss replacement between trusted preparation and owner acquisition.
+it.each(["commondir", "alternates"] as const)(
+  "refuses same-byte metadata replacement during owner acquisition: %s",
+  async (kind) => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-prepared-identity-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const pointer = join(fixture.product, ".git", kind === "commondir" ? "commondir" : "objects/info/alternates")
+    writeFileSync(pointer, kind === "commondir" ? ".\n" : "")
+    const bytes = readFileSync(pointer)
+    const replacement = join(root, "replacement")
+    writeFileSync(replacement, bytes)
+    const inspected = statSync(pointer)
+    const refs = git(fixture.product, "for-each-ref", "--format=%(refname) %(objectname)")
+    const flock = await vi.importActual<typeof import("@bearly/flock")>("@bearly/flock")
+    let changed = false
+    const acquiring = vi.mocked(tryAcquireFlock).mockImplementation((path, options) => {
+      const lease = flock.tryAcquireFlock(path, options)
+      if (lease !== null && !changed) {
+        try {
+          renameSync(replacement, pointer)
+          changed = true
+        } catch (error) {
+          lease.release()
+          throw error
+        }
+      }
+      return lease
+    })
+    const transport = createLocalGitProcess()
+    const afterReplacement: string[][] = []
+    const destination = join(root, "seat")
+    try {
+      const result = await GitSuper.projectPrivateGitWorktree({
+        sourceCheckout: fixture.product,
+        commit: fixture.productBase,
+        branch: "task/seat",
+        destination,
+        excludedSubmodules: [],
+        git: {
+          run: (request) => {
+            if (changed) afterReplacement.push([...request.args])
+            return transport.run(request)
+          },
+        },
+      })
+      expect(changed, "replacement did not occur at native owner acquisition").toBe(true)
+      expect(readFileSync(pointer)).toEqual(bytes)
+      expect(statSync(pointer).ino).not.toBe(inspected.ino)
+      expect(result.state, JSON.stringify(result.detail)).toBe("failed")
+      expect(result.detail?.message).toContain(pointer)
+      expect(afterReplacement, "changed prepared identity reached request Git").toEqual([])
+      expect(git(fixture.product, "for-each-ref", "--format=%(refname) %(objectname)")).toBe(refs)
+      expect(existsSync(join(destination, ".git", "HEAD"))).toBe(false)
+    } finally {
+      acquiring.mockImplementation(flock.tryAcquireFlock)
+      acquiring.mockClear()
+    }
+  },
+)
+
 // Schedule real filesystem replacement at the existing open boundary, after the creator inspected the entry.
 // The syscall spy only changes fixture timing; all reads, inode comparisons and refusals remain production-owned.
 it.each(["removed", "regular replacement", "symlink replacement"] as const)(
