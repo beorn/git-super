@@ -1,8 +1,9 @@
 import { spawnSync } from "node:child_process"
+import { alternateEntries, alternatesLineage } from "./alternates.ts"
 import { setTimeout as delay } from "node:timers/promises"
 import { existsSync, realpathSync } from "node:fs"
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises"
-import { isAbsolute, join, relative, resolve } from "node:path"
+import { join, relative, resolve } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 import { createLogger, type ConditionalLogger, type LogLevel } from "loggily"
 import { cleanGitRepositoryEnvironment, validateExcludedSubmodules } from "./git.ts"
@@ -12,7 +13,7 @@ import { createLocalGitProcess, type GitProcess, type GitProcessRequest, type Gi
 import { shellQuote } from "./shell-command.ts"
 import { nestedStoreMissingDetail, preparedPinFetchArgs, preparedSubmoduleStore } from "./submodule-prepare.ts"
 import { resolveSubmoduleOrigin } from "./submodule-origin.ts"
-import { readCommitSubmodules, type SelectedCommitSubmodules } from "./commit-graph.ts"
+import { readCommitSubmodules, type CommitSubmodule, type SelectedCommitSubmodules } from "./commit-graph.ts"
 
 export const SUBMODULE_ALTERNATE_LOCATION = "superproject"
 export const SUBMODULE_ALTERNATE_ERROR_STRATEGY = "info"
@@ -580,45 +581,6 @@ export async function syncOriginTrackingRefs(
   return success()
 }
 
-/** The canonical object directories an alternates file names, relative lines resolved against its own store. */
-function alternateEntries(content: string, objects: string): string[] {
-  return content
-    .split(/\r?\n/u)
-    .map((line) => line.trim())
-    .filter((entry) => entry !== "" && !entry.startsWith("#"))
-    .map((entry) => canonical(isAbsolute(entry) ? entry : resolve(objects, entry)))
-}
-
-/**
- * Every existing object directory reachable through the alternates of `stores`, transitively and without `own`,
- * each AFTER the directories it borrows from (post-order), so git reading them in this order finds every
- * borrow already registered. A directory that no longer exists (its worktree was recycled) ends that branch: git
- * skips it too.
- */
-async function alternatesLineage(stores: readonly string[], own: string): Promise<string[]> {
-  // Seeded with the own store only: a listed ancestor must still be placed ahead of the store that borrows from it,
-  // or a file an earlier release wrote ancestor-last reads as complete and is never healed (review2 f11cfb14).
-  const seen = new Set([own])
-  const lineage: string[] = []
-  const visit = async (store: string): Promise<void> => {
-    let content: string
-    try {
-      content = await readFile(join(store, "info", "alternates"), "utf8")
-    } catch {
-      // silent-fallback-allow: a store with no alternates file borrows nothing; it ends its branch of the lineage
-      return
-    }
-    for (const entry of alternateEntries(content, store)) {
-      if (seen.has(entry) || !existsSync(entry)) continue
-      seen.add(entry)
-      await visit(entry)
-      lineage.push(entry)
-    }
-  }
-  for (const store of stores) await visit(store)
-  return lineage
-}
-
 /**
  * Materialize isolated submodule checkouts while borrowing object history from
  * the matching checkout in the source repository. Git's documented
@@ -639,13 +601,25 @@ async function alternatesLineage(stores: readonly string[], own: string): Promis
 export async function materializeSubmodules(
   git: SubmoduleGit,
   options: SubmoduleMaterializationOptions,
+  privateProjection?: Readonly<{
+    validate(
+      worktree: string,
+      head: string,
+      excluded: readonly string[],
+      metadata: SelectedCommitSubmodules,
+    ): Promise<void>
+    materialize(parent: string, entry: CommitSubmodule): Promise<void>
+  }>,
 ): Promise<SubmoduleMaterializationResult> {
   validateExcludedSubmodules(options.excludedSubmodules)
   const log = options.log
-  const referenceRoot = await discoverReferenceWorktree(git, {
-    worktree: options.worktree,
-    referenceWorktree: options.referenceWorktree ?? options.worktree,
-  })
+  const referenceRoot =
+    privateProjection === undefined
+      ? await discoverReferenceWorktree(git, {
+          worktree: options.worktree,
+          referenceWorktree: options.referenceWorktree ?? options.worktree,
+        })
+      : options.referenceWorktree
   if (referenceRoot !== undefined && typeof referenceRoot !== "string") {
     return {
       ...referenceRoot,
@@ -787,6 +761,7 @@ export async function materializeSubmodules(
         stderr: `${error instanceof Error ? error.message : String(error)}${resultDetail?.paths === undefined ? "" : `\nPaths: ${resultDetail.paths.join(", ")}`}${resultDetail?.remedy === undefined ? "" : `\n${resultDetail.remedy}`}`,
       }
     }
+    await privateProjection?.validate(worktree, head, excluded, metadata)
     const entries = [...metadata.submodules]
     for (const entry of entries) {
       try {
@@ -861,6 +836,16 @@ export async function materializeSubmodules(
     // always has submodules, so the one enumerate measurement worth reading
     // (24ms of 402ms on the measured run) still lands on the depth-0 span.
     if (entries.length === 0) return success()
+    if (privateProjection !== undefined) {
+      for (const entry of entries) {
+        await privateProjection.materialize(worktree, entry)
+        considered += 1
+        borrowed += 1
+        const nested = await walk(join(worktree, entry.path), undefined, durableLevel, undefined, depth + 1)
+        if (nested.code !== 0) return nested
+      }
+      return success()
+    }
     // Laps rather than nested spans: the phases below are sequential and always
     // run in the same order, so one record with five deltas reads better than
     // five span lines per level of recursion. `gitlinks` is on the span so a
