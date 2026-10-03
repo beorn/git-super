@@ -2243,12 +2243,60 @@ async function composeDivergedGitlinks(
  * already settled and merges the ordinary root paths natively.
  *
  * The trigger is narrow. The 128 must name an exact EXPECTED pin of this merge,
- * and every diverged component must compose cleanly in its own store; the real
- * conflicting component earns its own named refusal instead. A carrier that
+ * or — when the root merge-tree walked a component's history through the wrong
+ * module store — an INTERNAL commit that exactly ONE involved component store
+ * holds and its head or target pin reaches, and then only with every pin the
+ * composition uses proven present in its owning store and a component advancing
+ * on BOTH sides of the base. Every diverged component must compose cleanly in
+ * its own store; the real conflicting component earns its own named refusal
+ * instead. A carrier that
  * disagrees with the composed tree, or a carrier merge that still conflicts,
  * refuses by evidence rather than mutating. The carrier is scratch: it is never
  * retained, published, or named by a user-visible marker.
  */
+async function admitOwningStoreInternalCommit(
+  git: GitProcess,
+  root: string,
+  diverged: readonly string[],
+  headPins: ReadonlyMap<string, string>,
+  targetPins: ReadonlyMap<string, string>,
+  basePins: ReadonlyMap<string, string>,
+  unreadable: string,
+  timeoutMs: number,
+): Promise<boolean> {
+  const advancesBothSides = diverged.some((path) => {
+    const base = basePins.get(path)
+    return base !== undefined && base !== headPins.get(path) && base !== targetPins.get(path)
+  })
+  if (!advancesBothSides) return false
+  let holder: string | undefined
+  for (const path of diverged) {
+    const store = join(root, path)
+    const head = headPins.get(path)
+    const target = targetPins.get(path)
+    const base = basePins.get(path)
+    if (head === undefined || target === undefined || base === undefined) return false
+    for (const pin of [base, head, target]) {
+      const present = await run(git, store, ["cat-file", "-e", `${pin}^{commit}`], timeoutMs)
+      if (present.code !== 0 || present.failure !== undefined) return false
+    }
+    const held = await run(git, store, ["cat-file", "-e", `${unreadable}^{commit}`], timeoutMs)
+    if (held.code !== 0 || held.failure !== undefined) continue
+    if (holder !== undefined) return false
+    holder = path
+    let reachable = false
+    for (const pin of [head, target]) {
+      const ancestor = await run(git, store, ["merge-base", "--is-ancestor", unreadable, pin], timeoutMs)
+      if (ancestor.code === 0 && ancestor.failure === undefined) {
+        reachable = true
+        break
+      }
+    }
+    if (!reachable) return false
+  }
+  return holder !== undefined
+}
+
 async function composeWrongStoreGitlinks(
   git: GitProcess,
   root: string,
@@ -2289,9 +2337,25 @@ async function composeWrongStoreGitlinks(
       return ours !== undefined && theirs !== undefined && ours !== theirs && basePins.get(path) !== undefined
     })
     .toSorted((left, right) => (left < right ? -1 : left > right ? 1 : 0))
-  // The 128 must name a pin this merge actually carries, or another 128's refusal stands unchanged.
   if (diverged.length === 0) return undefined
-  if (!diverged.some((path) => headPins.get(path) === unreadable || targetPins.get(path) === unreadable)) {
+  /**
+   * THE 128 MUST NAME A PIN THIS MERGE CARRIES (27268), OR THE COMPOSITION
+   * MUST BE FULLY PROVEN BEFORE IT IS ADMITTED (27315).
+   *
+   * The pin is the ordinary shape: the composer substitutes it directly. A
+   * two-sided merge can instead fail on an INTERNAL commit that only the
+   * advancing component's own store holds, because the root merge-tree reads
+   * that submodule's history through one module store. Admitting that shape
+   * assumes nothing: a component must advance on BOTH sides of the base, every
+   * pin the composition uses must exist in its owning store, and the unreadable
+   * object must live in exactly ONE involved store and be reachable from that
+   * component's head or target pin. Anything less keeps the original refusal.
+   */
+  const namesPin = diverged.some((path) => headPins.get(path) === unreadable || targetPins.get(path) === unreadable)
+  if (
+    !namesPin &&
+    !(await admitOwningStoreInternalCommit(git, root, diverged, headPins, targetPins, basePins, unreadable, timeoutMs))
+  ) {
     return undefined
   }
   const conflicts = diverged.map((path) => {

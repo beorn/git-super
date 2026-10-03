@@ -659,6 +659,46 @@ function divergeBothProductComponents(
   return { alphaOurs, alphaTheirs, candidate, head: git(fixture.product, "rev-parse", "HEAD") }
 }
 
+/**
+ * Two components diverged two-sided (the 128 trigger) PLUS a clean,
+ * non-overlapping ordinary root edit on EACH side. Composing the gitlinks must
+ * preserve both root files, not only settle the gitlinks (27315).
+ */
+function divergeBothProductComponentsWithRootEdits(fixture: ProductFixture): Readonly<{
+  alphaOurs: string
+  alphaTheirs: string
+  candidate: string
+  head: string
+  oursRoot: string
+  theirsRoot: string
+}> {
+  git(fixture.alpha, "checkout", "-q", "-b", "diverge", fixture.alphaBase)
+  const alphaTheirs = advanceRepository(fixture.alpha, "alpha-theirs.ts", "export const alpha = 'theirs'\n")
+  git(fixture.alpha, "checkout", "-q", "main")
+  const alphaOurs = advanceRepository(fixture.alpha, "alpha-ours.ts", "export const alpha = 'ours'\n")
+  git(fixture.beta, "checkout", "-q", "-b", "diverge", fixture.betaBase)
+  const betaTheirs = advanceRepository(fixture.beta, "beta-theirs.ts", "export const beta = 'theirs'\n")
+  git(fixture.beta, "checkout", "-q", "main")
+  const betaOurs = advanceRepository(fixture.beta, "beta-ours.ts", "export const beta = 'ours'\n")
+
+  git(fixture.product, "switch", "-q", "-c", "diverge-both")
+  checkoutPin(fixture.product, "packages/alpha", alphaTheirs)
+  checkoutPin(fixture.product, "vendor/beta", betaTheirs)
+  const theirsRoot = "theirs-root.txt"
+  writeFileSync(join(fixture.product, theirsRoot), "theirs\n")
+  git(fixture.product, "add", "packages/alpha", "vendor/beta", theirsRoot)
+  git(fixture.product, "commit", "-q", "-m", "candidate diverges both components and adds a root file")
+  const candidate = git(fixture.product, "rev-parse", "HEAD")
+  git(fixture.product, "switch", "-q", "main")
+  checkoutPin(fixture.product, "packages/alpha", alphaOurs)
+  checkoutPin(fixture.product, "vendor/beta", betaOurs)
+  const oursRoot = "ours-root.txt"
+  writeFileSync(join(fixture.product, oursRoot), "ours\n")
+  git(fixture.product, "add", "packages/alpha", "vendor/beta", oursRoot)
+  git(fixture.product, "commit", "-q", "-m", "main diverges both components and adds another root file")
+  return { alphaOurs, alphaTheirs, candidate, head: git(fixture.product, "rev-parse", "HEAD"), oursRoot, theirsRoot }
+}
+
 function checkoutPin(product: string, path: string, sha: string): void {
   const store = join(product, path)
   git(store, "fetch", "-q", "origin")
@@ -3357,6 +3397,73 @@ describe("git super merge", () => {
     expect(git(fixture.alpha, "rev-parse", "HEAD")).toBe(diverged.alphaOurs)
     // Nothing user-visible names a carrier commit.
     expect(git(fixture.product, "log", "-1", "--format=%B")).not.toContain("carrier")
+  })
+
+  /**
+   * @failure A wrong-store 128 that names an INTERNAL component commit (reachable from a pin, but no pin itself) keeps the refusal and blocks a mergeable two-component change, dropping ordinary root edits with it (27315).
+   * @level l1
+   * @consumer Yrd settled candidate preparation and landing
+   * @testonly none; the wrong-store 128 itself is simulated, every composition step is native
+   */
+  it("composes both cleanly diverged gitlinks when the wrong-store 128 names an internal commit of one component", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-wrong-store-internal-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const diverged = divergeBothProductComponentsWithRootEdits(fixture)
+    // `alphaBase` is an ancestor of BOTH alpha pins: reachable from the component's pin history, but no pin itself.
+    const internal = fixture.alphaBase
+    const local = createLocalGitProcess()
+    const result = await superMerge({
+      commit: diverged.candidate,
+      git: wrongStoreFirstMerge(local, fixture.product, internal),
+      repo: fixture.product,
+    })
+
+    expect(result.state, JSON.stringify(result)).toBe("updated")
+    const parents = git(fixture.product, "rev-list", "--parents", "-n", "1", "HEAD").trim().split(/\s+/u).slice(1)
+    expect(parents).toEqual([diverged.head, diverged.candidate])
+    const alphaPin = git(fixture.product, "ls-tree", "HEAD", "packages/alpha").trim().split(/\s+/u)[2] ?? ""
+    expect(git(fixture.alpha, "rev-list", "--parents", "-n", "1", alphaPin).trim().split(/\s+/u).slice(1)).toEqual([
+      diverged.alphaOurs,
+      diverged.alphaTheirs,
+    ])
+    expect(git(fixture.alpha, "rev-parse", "HEAD")).toBe(diverged.alphaOurs)
+    // Ordinary root edits from BOTH sides survive the composed merge.
+    expect(git(fixture.product, "show", `HEAD:${diverged.oursRoot}`).trim()).toBe("ours")
+    expect(git(fixture.product, "show", `HEAD:${diverged.theirsRoot}`).trim()).toBe("theirs")
+    // Nothing user-visible names a carrier commit.
+    expect(git(fixture.product, "log", "-1", "--format=%B")).not.toContain("carrier")
+  })
+
+  /**
+   * @failure An internal-commit wrong-store 128 whose component genuinely conflicts must still come back as the NAMED component conflict and touch nothing (27315).
+   * @level l1
+   * @consumer Yrd settled candidate preparation and landing
+   * @testonly none; the component conflict is native, only the 128 is simulated
+   */
+  it("keeps the named component conflict when the wrong-store 128 names an internal commit", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-wrong-store-internal-conflict-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const diverged = divergeBothProductComponents(
+      fixture,
+      { content: "export const alpha = 'ours'\n", file: "alpha.ts" },
+      { content: "export const alpha = 'theirs'\n", file: "alpha.ts" },
+    )
+    const local = createLocalGitProcess()
+    const result = await superMerge({
+      commit: diverged.candidate,
+      git: wrongStoreFirstMerge(local, fixture.product, fixture.alphaBase),
+      repo: fixture.product,
+    })
+
+    expect(result.state, JSON.stringify(result)).toBe("failed")
+    expect(result.partial).toBe(false)
+    expect(result.detail?.code).toBe("gitlink-compose-refused")
+    expect(result.detail?.message).toContain("packages/alpha")
+    expect(result.detail?.message).toContain("alpha.ts")
+    expect(git(fixture.product, "rev-parse", "HEAD")).toBe(diverged.head)
+    expect(git(fixture.product, "status", "--porcelain").trim()).toBe("")
   })
 
   /**
