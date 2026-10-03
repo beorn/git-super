@@ -24,6 +24,7 @@ import { mkdtemp, rm } from "node:fs/promises"
 import * as filesystem from "node:fs/promises"
 import { join } from "node:path"
 import { afterEach, expect, it, vi } from "vitest"
+import { tryAcquireFlock } from "@bearly/flock"
 import * as GitSuper from "../src/index.ts"
 import { createExclusive } from "../src/exclusive.ts"
 import { cleanGitEnvironment, withGitEnvironment } from "../src/git.ts"
@@ -526,8 +527,8 @@ it.each([
       expect(projected.projection?.mounts).toContainEqual({ source: leafObjects, target: leafObjects, mode: "ro" })
     }
     if (removeDonor) {
-      // A retained private root has a free writer lease, not an active Git lock.
-      // Existing retention journeys never remove its linked-source donor afterwards.
+      // Custody is the kernel lease, not the diagnostic bytes left by materialization.
+      // The retained inode must be available before removing its linked-source donor.
       if (projected.projection === undefined) throw new Error("projection omitted its custody record")
       const retained = await GitSuper.retainPrivateGitProjection(projected.projection, join(root, "retained-seat"))
       expect(retained.state, JSON.stringify(retained.detail)).toBe("updated")
@@ -540,7 +541,14 @@ it.each([
       for (const dependency of proof.externalObjectStores) {
         expect(dependency.target === donorGit || dependency.target.startsWith(`${donorGit}/`)).toBe(false)
       }
-      expect(statSync(join(proof.retained, "yrd-worktree-mutations/writer.lock")).size).toBe(0)
+      const retainedLock = join(proof.retained, "yrd-worktree-mutations/writer.lock")
+      expect(statSync(retainedLock).isFile()).toBe(true)
+      const retainedLease = tryAcquireFlock(retainedLock)
+      try {
+        expect(retainedLease, "retained private root still has an active writer lease").not.toBeNull()
+      } finally {
+        retainedLease?.release()
+      }
       const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true)
       try {
         await store.remove(source, {
