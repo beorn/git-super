@@ -84,6 +84,41 @@ describe("GitProcess", () => {
     }
   })
 
+  // @failure: enriched CLI reads ambient decoy objects or lets them override selected argv.
+  // @level l2; @consumer ordinary and contained submit; refusal-only rows cannot prove a real object read.
+  test("enriched CLI scrubs ambient objects and gives explicit object flags precedence", () => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-object-cli-decoy-"))
+    roots.push(root)
+    const repo = join(root, "repo")
+    const head = createRepository(repo, "own.txt", "own objects\n")
+    const decoy = join(root, "decoy")
+    mkdirSync(decoy)
+    for (const flags of [[], ["--object-directory", join(repo, ".git", "objects")]]) {
+      const child = Bun.spawnSync(
+        [
+          process.execPath,
+          join(import.meta.dirname, "../bin/git-super"),
+          "--repo",
+          repo,
+          ...flags,
+          "--json",
+          "merge-base",
+          "--is-ancestor",
+          head,
+          head,
+        ],
+        {
+          cwd: root,
+          env: { ...process.env, GIT_OBJECT_DIRECTORY: decoy, GIT_ALTERNATE_OBJECT_DIRECTORIES: decoy },
+          stdout: "pipe",
+          stderr: "pipe",
+        },
+      )
+      expect(child.exitCode, `${child.stdout}${child.stderr}`).toBe(0)
+      expect(JSON.parse(child.stdout.toString())).toMatchObject({ isAncestor: true })
+    }
+  })
+
   // Gate A: graph-process tests intentionally scrub Git variables and decode text.
   // They cannot prove a selected executable preserves the caller's raw request.
   test.each([false, true])(
