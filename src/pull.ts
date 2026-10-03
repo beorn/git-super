@@ -600,6 +600,14 @@ async function proveTreeTransition(
   const temporaryIndex = join(scratch, "index")
   try {
     copyFileSync(sourceIndex, temporaryIndex)
+    // A file rewritten with identical bytes (bun writes its bin symlink targets and chmods them after the index was
+    // written) leaves a stale stat entry, and read-tree -m -u then refuses a transition the working tree is clean
+    // for. Refresh the COPY, never the repository own index: exit 1 only means a path needs update, which the
+    // read-tree below still decides on, and a larger exit is a real failure worth naming (27246).
+    const refresh = await run(git, repository, ["update-index", "-q", "--refresh"], { GIT_INDEX_FILE: temporaryIndex })
+    if (refresh.code > 1) {
+      throw operationError(repository, "preflight-tree-transition", ["update-index", "--refresh"], refresh)
+    }
     const transition = await run(
       git,
       repository,

@@ -11,6 +11,7 @@ import {
   readdirSync,
   rmSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs"
 import { join } from "node:path"
@@ -1895,6 +1896,39 @@ describe("git super pull --ff-only", () => {
       expect(readFileSync(join(planned, path), "utf8")).toBe("local\n")
     },
   )
+
+  /**
+   * @failure A file rewritten with identical bytes leaves a stale index stat, and the transition preflight refuses a pull whose working tree is clean (27246).
+   * @level l1
+   * @consumer git-super pull --ff-only from the shared-main updater
+   * @testonly none
+   */
+  test("a stale index stat does not stop the transition preflight", async () => {
+    const fixture = mkdtempSync(join(tmpdir(), "git-super-pull-stale-stat-"))
+    roots.push(fixture)
+    const upstream = join(fixture, "upstream")
+    const checkout = join(fixture, "checkout")
+    createRepository(upstream, "bin.ts", "one\n")
+    git(fixture, "clone", "-q", upstream, checkout)
+    // Bun writes and chmods its bin symlink targets after the index is written, so the entry stat goes stale while
+    // the bytes stay identical - the shape that stopped ff-main four times on 2026-10-03.
+    const bin = join(checkout, "bin.ts")
+    writeFileSync(bin, "one\n")
+    utimesSync(bin, new Date(978_307_200_000), new Date(978_307_200_000))
+    expect(readFileSync(bin, "utf8")).toBe("one\n")
+    const target = advanceRepository(upstream, "bin.ts", "two\n")
+
+    const result = await superPull({
+      repo: checkout,
+      repository: "origin",
+      refspecs: ["main"],
+      ffOnly: true,
+    })
+
+    expect(result).toMatchObject({ state: "updated", partial: false })
+    expect(git(checkout, "rev-parse", "HEAD")).toBe(target)
+    expect(readFileSync(bin, "utf8")).toBe("two\n")
+  })
 
   test("the real executable emits stable JSON for success and operational failure", () => {
     const fixture = mkdtempSync(join(tmpdir(), "git-super-pull-bin-"))
