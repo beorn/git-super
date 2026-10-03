@@ -5,6 +5,15 @@ export * from "./pull.ts"
 export * from "./push.ts"
 export * from "./result.ts"
 export {
+  projectPrivateGitWorktree,
+  retainPrivateGitProjection,
+  retirePrivateGitProjection,
+  type PrivateGitProjection,
+  type PrivateGitStopCertificate,
+  type PrivateGitProjectionOptions,
+  type PrivateGitProjectionResult,
+} from "./private-git-projection.ts"
+export {
   superSubmodulePrepare,
   prepareSubmoduleTreeUnderLock,
   type PreparedSubmodule,
