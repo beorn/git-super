@@ -48,6 +48,47 @@ afterEach(async () => {
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true })
 })
 
+// CTOa6e10f22: only lstat-proven absence permits standalone metadata.
+// Existing creator fixtures have no commondir fault, so ENOENT from a dangling link reached Git unnoticed.
+it.each(["absent", "dangling symlink", "live symlink", "directory"] as const)(
+  "checks commondir entry before projection Git: %s",
+  async (entry) => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-commondir-entry-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const common = join(fixture.product, ".git", "commondir")
+    const head = readFileSync(join(fixture.product, ".git", "refs", "heads", "main"), "utf8")
+    if (entry === "dangling symlink") symlinkSync(join(root, "missing"), common)
+    if (entry === "live symlink") {
+      const target = join(root, "pointer")
+      writeFileSync(target, ".\n")
+      symlinkSync(target, common)
+    }
+    if (entry === "directory") mkdirSync(common)
+    const transport = createLocalGitProcess()
+    const run = vi.fn(transport.run.bind(transport))
+    const destination = join(root, "seat")
+    const result = await GitSuper.projectPrivateGitWorktree({
+      sourceCheckout: fixture.product,
+      commit: fixture.productBase,
+      branch: "task/seat",
+      destination,
+      excludedSubmodules: [],
+      git: { run },
+    })
+    if (entry === "absent") {
+      expect(result.state, JSON.stringify(result.detail)).toBe("updated")
+      expect(run.mock.calls.length).toBeGreaterThan(0)
+    } else {
+      expect(result.state, JSON.stringify(result.detail)).toBe("failed")
+      expect(run).not.toHaveBeenCalled()
+      expect(result.detail?.message).toContain(common)
+      expect(existsSync(destination)).toBe(false)
+    }
+    expect(readFileSync(join(fixture.product, ".git", "refs", "heads", "main"), "utf8")).toBe(head)
+  },
+)
+
 // CTO63d0a344: retirement needs the sandbox lifetime proof; existing lifecycle tests lacked this gate.
 it("refuses retirement without a unit stop certificate", async () => {
   const root = await mkdtemp(join(canonicalTmpdir(), "git-super-stop-certificate-"))

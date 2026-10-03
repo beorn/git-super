@@ -1,5 +1,5 @@
-import { lstat, mkdir, readFile, realpath, writeFile } from "node:fs/promises"
-import { rmSync } from "node:fs"
+import { lstat, mkdir, open, realpath, writeFile } from "node:fs/promises"
+import { constants, rmSync, type Stats } from "node:fs"
 import { dirname, join, relative, resolve, sep } from "node:path"
 import { alternatesLineage } from "./alternates.ts"
 import { readPrivateSubmodulePaths } from "./commit-graph.ts"
@@ -237,28 +237,65 @@ export function retirePrivateGitProjection(
 }
 
 /** Resolve host-selected repository metadata without asking Git to follow an object path. */
+async function readMetadataFile(pointer: string, inspected: Stats): Promise<string> {
+  if (!inspected.isFile()) throw new Error(`unsupported Git metadata file: ${pointer}`)
+  if (typeof constants.O_NOFOLLOW !== "number") {
+    throw new Error(`no-follow Git metadata reading is unavailable: ${pointer}`)
+  }
+  const same = (observed: Stats): boolean =>
+    observed.isFile() &&
+    observed.dev === inspected.dev &&
+    observed.ino === inspected.ino &&
+    observed.size === inspected.size &&
+    observed.mtimeMs === inspected.mtimeMs &&
+    observed.ctimeMs === inspected.ctimeMs
+  try {
+    const handle = await open(pointer, constants.O_RDONLY | constants.O_NOFOLLOW)
+    try {
+      if (!same(await handle.stat())) throw new Error("opened metadata identity changed")
+      const content = await handle.readFile("utf8")
+      if (!same(await handle.stat()) || !same(await lstat(pointer))) {
+        throw new Error("metadata identity changed during reading")
+      }
+      return content
+    } finally {
+      await handle.close()
+    }
+  } catch (error) {
+    throw new Error(`cannot read Git metadata file: ${pointer}`, { cause: error })
+  }
+}
+
 async function metadata(checkout: string): Promise<string> {
   const pointer = join(checkout, ".git")
   const stat = await lstat(pointer)
   if (stat.isDirectory()) return realpath(pointer)
   if (!stat.isFile()) throw new Error(`unsupported Git metadata pointer: ${pointer}`)
-  const match = /^gitdir: ([^\r\n]+)\r?\n?$/u.exec(await readFile(pointer, "utf8"))
+  const match = /^gitdir: ([^\r\n]+)\r?\n?$/u.exec(await readMetadataFile(pointer, stat))
   if (match?.[1] === undefined) throw new Error(`invalid Git metadata pointer: ${pointer}`)
   return realpath(resolve(checkout, match[1]))
 }
 
 async function commonDirectory(gitDirectory: string): Promise<string> {
-  let content: string
+  const pointer = join(gitDirectory, "commondir")
+  let inspected: Stats
   try {
-    content = await readFile(join(gitDirectory, "commondir"), "utf8")
+    inspected = await lstat(pointer)
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
-    // silent-fallback-allow: absent commondir identifies a standalone repository, not a missing store
-    return gitDirectory
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      // silent-fallback-allow: only lstat-proven entry absence identifies a standalone repository
+      return gitDirectory
+    }
+    throw new Error(`cannot inspect Git metadata file: ${pointer}`, { cause: error })
   }
+  const content = await readMetadataFile(pointer, inspected)
   const selected = content.trim()
-  if (selected === "") throw new Error(`empty commondir under ${gitDirectory}`)
-  return realpath(resolve(gitDirectory, selected))
+  if (selected === "" || /[\r\n\u0000]/u.test(selected)) throw new Error(`invalid commondir pointer: ${pointer}`)
+  try {
+    return await realpath(resolve(gitDirectory, selected))
+  } catch (error) {
+    throw new Error(`cannot resolve commondir pointer: ${pointer}`, { cause: error })
+  }
 }
 
 /** Make private metadata while the existing materializer owns recursive frozen declaration selection. */
