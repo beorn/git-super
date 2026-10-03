@@ -6,7 +6,6 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path"
 import { fileURLToPath } from "node:url"
 import { createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS } from "./exclusive.ts"
 import {
-  acquireRemovalWriterLeases,
   assertExcludedRemovalCustody,
   inspectRemovalStatus,
   prepareRemovalBorrowers,
@@ -455,7 +454,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         if (removeOptions.retention !== undefined && removeOptions.unlock === true) {
           throw new Error(`retained worktree removal cannot unlock ${path}; resolve its holder first`)
         }
-        const { gitDir, rehome, notCompared } = await prepareRemoval(path, removeOptions.excludedSubmodules)
+        const { rehome, notCompared } = await prepareRemoval(path, removeOptions.excludedSubmodules)
         if (notCompared.some((entry) => entry.reason !== "excluded")) {
           throw Object.assign(
             new Error(
@@ -468,8 +467,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
           )
         }
         if (rehome === undefined) throw new Error(`worktree ${path} has no prepared borrower custody`)
-        const writerLeases = acquireRemovalWriterLeases(gitDir)
-        try {
+        await rehome.run(async (writerLeases, rehomeBorrowers) => {
           if (removeOptions.retention !== undefined) {
             await retainWorktreeModules(
               git,
@@ -479,23 +477,19 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
               (repository, target) => inspectWorktree(git, repository, target),
               writerLeases.proof,
               writerLeases.created,
-              rehome.run,
+              rehomeBorrowers,
               removeOptions.excludedSubmodules,
               notCompared,
             )
           } else {
             if (removeOptions.unlock === true) await unlockWorktree(git, repo, path)
-            await rehome.run()
+            await rehomeBorrowers()
           }
           await git.run(repo, ["worktree", "remove", "--force", path], false, timeouts.cleanup)
           if (existsSync(path) || (await inspectWorktree(git, repo, path)).registered) {
             throw new Error(`git reported success but did not fully remove worktree '${path}'`)
           }
-        } catch (error) {
-          throw writerLeases.refusal(error)
-        } finally {
-          writerLeases.release()
-        }
+        })
       })
     },
     async prune(

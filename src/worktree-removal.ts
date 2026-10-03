@@ -260,10 +260,35 @@ export async function prepareRemovalBorrowers(
   lenderGitDir: string,
   custody: ExcludedRemovalCustody,
   excludedSubmodules: readonly string[] = [],
-): Promise<Readonly<{ run: () => Promise<readonly string[]>; notCompared: readonly NotCompared[] }>> {
+): Promise<
+  Readonly<{
+    run<Result>(
+      consume: (leases: RemovalWriterLeases, rehome: () => Promise<readonly string[]>) => Promise<Result>,
+    ): Promise<Result>
+    notCompared: readonly NotCompared[]
+  }>
+> {
   const lenderModules = join(lenderGitDir, "modules")
+  const prepare = async (candidates: readonly RemovalBorrower[], notCompared: readonly NotCompared[]) => {
+    const borrowers = await prepareBorrowerRehome(commonDir, lenderGitDir, lenderModules, candidates)
+    return {
+      notCompared,
+      async run<Result>(
+        consume: (leases: RemovalWriterLeases, rehome: () => Promise<readonly string[]>) => Promise<Result>,
+      ): Promise<Result> {
+        const leases = acquireRemovalWriterLeases(lenderGitDir, undefined, borrowers.owners)
+        try {
+          return await consume(leases, borrowers.run)
+        } catch (error) {
+          throw leases.refusal(error)
+        } finally {
+          leases.release()
+        }
+      },
+    }
+  }
   if (excludedSubmodules.length === 0) {
-    return { run: () => rehomeBorrowers(commonDir, lenderGitDir, lenderModules), notCompared: [] }
+    return prepare(removalBorrowers(commonDir, lenderGitDir), [])
   }
   if (custody.declaredPaths.length > 0 && present(join(commonDir, "git-super-retained-borrowers"))) {
     throw new Error(
@@ -327,7 +352,7 @@ export async function prepareRemovalBorrowers(
     }
     candidates.push({ ...candidate, excludedStores, includedStores })
   }
-  return { run: () => rehomeBorrowerCandidates(commonDir, lenderGitDir, lenderModules, candidates), notCompared }
+  return prepare(candidates, notCompared)
 }
 
 export async function rehomeBorrowers(
@@ -336,22 +361,30 @@ export async function rehomeBorrowers(
   lenderModules: string,
   options?: RehomeBorrowersOptions,
 ): Promise<readonly string[]> {
-  return rehomeBorrowerCandidates(
+  const borrowers = await prepareBorrowerRehome(
     commonDir,
     lenderGitDir,
     lenderModules,
     removalBorrowers(commonDir, lenderGitDir),
     options,
   )
+  const run = async (index: number): Promise<readonly string[]> => {
+    const owner = borrowers.owners[index]
+    if (owner === undefined) return borrowers.run()
+    return createExclusive(join(owner, "yrd-worktree-mutations"), { timeoutMs: 0 }).run(() => run(index + 1), {
+      holder: `rehome borrowers before removing ${lenderGitDir}`,
+    })
+  }
+  return run(0)
 }
 
-async function rehomeBorrowerCandidates(
+async function prepareBorrowerRehome(
   commonDir: string,
   lenderGitDir: string,
   lenderModules: string,
   candidates: readonly RemovalBorrower[],
   options?: RehomeBorrowersOptions,
-): Promise<readonly string[]> {
+): Promise<Readonly<{ owners: readonly string[]; run: () => Promise<readonly string[]> }>> {
   guardRetainedBorrowers(commonDir, lenderGitDir)
   const hasLenderModules = present(lenderModules)
   const canonicalCommon = realpathSync(commonDir)
@@ -486,18 +519,13 @@ async function rehomeBorrowerCandidates(
   }
 
   const owners = [...new Set(mutations.map((mutation) => mutation.owner))].sort()
-  const run = async (index: number): Promise<void> => {
-    const owner = owners[index]
-    if (owner === undefined) {
+  return {
+    owners,
+    run: async () => {
       for (const mutation of mutations) await mutation.run()
-      return
-    }
-    await createExclusive(join(owner, "yrd-worktree-mutations"), { timeoutMs: 0 }).run(() => run(index + 1), {
-      holder: `rehome borrowers before removing ${lenderGitDir}`,
-    })
+      return [...rehomedBorrowers]
+    },
   }
-  await run(0)
-  return [...rehomedBorrowers]
 }
 
 /** Removal never treats an unreadable included repository as an absent population member. */
@@ -600,7 +628,11 @@ function isWriterLeasePath(path: string, root: string, rootIsGitDir: boolean): b
 }
 
 /** Take every in-custody Git directory's writer lease before retention; callers hold them through native removal. */
-export function acquireRemovalWriterLeases(gitDir: string, onAcquired?: (path: string) => void): RemovalWriterLeases {
+export function acquireRemovalWriterLeases(
+  gitDir: string,
+  onAcquired?: (path: string) => void,
+  borrowerOwners: readonly string[] = [],
+): RemovalWriterLeases {
   const handles: FlockHandle[] = []
   const proof: WriterLockProof[] = []
   const created: WriterLockProof[] = []
@@ -637,8 +669,14 @@ export function acquireRemovalWriterLeases(gitDir: string, onAcquired?: (path: s
       gitDir,
       ...entries.filter((entry) => entry.isDirectory()).map((entry) => join(entry.parentPath, entry.name)),
     ]
-    const paths = directories
-      .filter((directory) => isGitDirectory(directory, gitDir, true))
+    for (const owner of borrowerOwners) {
+      if (realpathSync(owner) !== owner || !lstatSync(owner).isDirectory()) {
+        throw new Error(`nonphysical borrower writer owner before removal: ${owner}`)
+      }
+    }
+    const paths = [
+      ...new Set([...directories.filter((directory) => isGitDirectory(directory, gitDir, true)), ...borrowerOwners]),
+    ]
       .sort()
       .map((directory) => join(directory, "yrd-worktree-mutations", "writer.lock"))
     const existing = paths.filter((path) => present(path))

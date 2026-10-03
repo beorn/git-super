@@ -26,6 +26,21 @@ import { tryAcquireFlock } from "@bearly/flock"
 
 const roots: string[] = []
 
+// Materialization creates a released writer path. These removal journeys need
+// an absent-path fixture to prove creation receipts, not an unleased materializer.
+function makeWriterPathAbsent(path: string): void {
+  if (existsSync(path)) {
+    const released = tryAcquireFlock(path)
+    try {
+      expect(released, "fixture writer is still held after materialization").not.toBeNull()
+    } finally {
+      released?.release()
+    }
+    unlinkSync(path)
+  }
+  expect(existsSync(path)).toBe(false)
+}
+
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
 })
@@ -300,7 +315,7 @@ describe("git super worktree add", () => {
     ).toBe(0)
     const childGitDir = git(join(worktree, "vendor/dep"), ["rev-parse", "--absolute-git-dir"])
     const lockPath = join(childGitDir, "yrd-worktree-mutations", "writer.lock")
-    expect(existsSync(lockPath)).toBe(false)
+    makeWriterPathAbsent(lockPath)
     let contender: string | undefined
     const output = outputSink()
     const diagnostic = {
@@ -410,7 +425,7 @@ describe("git super worktree add", () => {
     const firstPath = join(adminGitDir, "yrd-worktree-mutations", "writer.lock")
     const laterPath = join(childGitDir, "yrd-worktree-mutations", "writer.lock")
     expect(existsSync(firstPath)).toBe(false)
-    expect(existsSync(laterPath)).toBe(false)
+    makeWriterPathAbsent(laterPath)
     const ready = join(fixtureRoot, "later-holder-ready")
     let holder: ReturnType<typeof Bun.spawn> | undefined
     const sleeper = new Int32Array(new SharedArrayBuffer(4))
@@ -493,7 +508,7 @@ describe("git super worktree add", () => {
     const adminGitDir = git(worktree, ["rev-parse", "--absolute-git-dir"])
     const childGitDir = git(join(worktree, "vendor/dep"), ["rev-parse", "--absolute-git-dir"])
     const lockPath = join(childGitDir, "yrd-worktree-mutations", "writer.lock")
-    expect(existsSync(lockPath)).toBe(false)
+    makeWriterPathAbsent(lockPath)
     let refusal: unknown
     try {
       const unexpectedlyAcquired = acquireRemovalWriterLeases(adminGitDir, (path) => {
@@ -723,7 +738,7 @@ describe("git super worktree add", () => {
     ).toBe(0)
     const childGitDir = git(join(worktree, "vendor/dep"), ["rev-parse", "--absolute-git-dir"])
     const lockPath = join(childGitDir, "yrd-worktree-mutations", "writer.lock")
-    expect(existsSync(lockPath)).toBe(false)
+    makeWriterPathAbsent(lockPath)
     const out = outputSink()
     expect(
       await runCli(
