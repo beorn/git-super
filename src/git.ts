@@ -15,24 +15,36 @@ export function validateGitObjectContext(objects: GitObjectContext): void {
   ] as const) {
     for (const path of paths) {
       if (!isAbsolute(path) || path.includes(delimiter) || /[\r\n]/u.test(path) || seen.has(path)) {
-        throw new Error(`git super: public object ${label} ${path} must be an absolute, unique path without delimiters or newlines`)
+        throw new Error(
+          `git super: public object ${label} ${path} must be an absolute, unique path without delimiters or newlines`,
+        )
       }
       seen.add(path)
       try {
         if (!statSync(path).isDirectory()) throw new Error("expected a directory")
         accessSync(path, constants.R_OK | constants.X_OK)
       } catch (cause) {
-        throw new Error(`git super: public object ${label} ${path} is missing or unreadable; restore the selected store before Git runs`, { cause })
+        throw new Error(
+          `git super: public object ${label} ${path} is missing or unreadable; restore the selected store before Git runs`,
+          { cause },
+        )
       }
     }
   }
 }
 
 /** Apply only typed selection, after the owning boundary has scrubbed ambient routing. */
-export function applyGitObjectContext(environment: NodeJS.ProcessEnv, objects: GitObjectContext | undefined = executionEnvironment.getStore()?.objects): NodeJS.ProcessEnv {
+export function applyGitObjectContext(
+  environment: NodeJS.ProcessEnv,
+  objects: GitObjectContext | undefined = executionEnvironment.getStore()?.objects,
+): NodeJS.ProcessEnv {
   if (objects === undefined) return environment
   validateGitObjectContext(objects)
-  return { ...environment, GIT_OBJECT_DIRECTORY: objects.directory, GIT_ALTERNATE_OBJECT_DIRECTORIES: (objects.alternates ?? []).join(delimiter) }
+  return {
+    ...environment,
+    GIT_OBJECT_DIRECTORY: objects.directory,
+    GIT_ALTERNATE_OBJECT_DIRECTORIES: (objects.alternates ?? []).join(delimiter),
+  }
 }
 
 export type IndexGitlink = Readonly<{ path: string; indexPin: string | undefined }>
@@ -77,7 +89,10 @@ export function cleanGitEnvironment(environment: NodeJS.ProcessEnv = process.env
   }
 }
 
-export function cleanGitRepositoryEnvironment(environment: NodeJS.ProcessEnv = executionEnvironment.getStore()?.environment ?? process.env, objects?: GitObjectContext): NodeJS.ProcessEnv {
+export function cleanGitRepositoryEnvironment(
+  environment: NodeJS.ProcessEnv = executionEnvironment.getStore()?.environment ?? process.env,
+  objects?: GitObjectContext,
+): NodeJS.ProcessEnv {
   const clean: NodeJS.ProcessEnv = { ...environment, KM_NO_AUTO_SUBMODULE_UPDATE: "1" }
   for (const key of Object.keys(clean)) {
     if (
@@ -110,7 +125,9 @@ export type GitResult = Readonly<{
   stderr: string
 }>
 
-const executionEnvironment = new AsyncLocalStorage<Readonly<{ environment: NodeJS.ProcessEnv; objects?: GitObjectContext }>>()
+const executionEnvironment = new AsyncLocalStorage<
+  Readonly<{ environment: NodeJS.ProcessEnv; objects?: GitObjectContext }>
+>()
 
 /** Internal custody scope: synchronous status shares the controlled private environment. */
 export function withGitEnvironment<T>(environment: NodeJS.ProcessEnv, run: () => T, objects?: GitObjectContext): T {

@@ -1,4 +1,9 @@
-import { applyGitObjectContext, cleanGitEnvironment, cleanGitRepositoryEnvironment, type GitObjectContext } from "./git.ts"
+import {
+  applyGitObjectContext,
+  cleanGitEnvironment,
+  cleanGitRepositoryEnvironment,
+  type GitObjectContext,
+} from "./git.ts"
 import {
   accessSync,
   appendFileSync,
@@ -496,13 +501,16 @@ export type GitProcessDefaults = Readonly<{
 export function adaptProcessGit(process: SupervisedProcess, defaults: GitProcessDefaults = {}): GitProcess {
   return {
     async run(request) {
-      const env = applyGitObjectContext({
-        ...cleanGitEnvironment(defaults.env ?? globalThis.process.env),
-        ...request.env,
-        GIT_TERMINAL_PROMPT: "0",
-        LC_ALL: "C",
-        TZ: "UTC",
-      }, defaults.objects)
+      const env = applyGitObjectContext(
+        {
+          ...cleanGitEnvironment(defaults.env ?? globalThis.process.env),
+          ...request.env,
+          GIT_TERMINAL_PROMPT: "0",
+          LC_ALL: "C",
+          TZ: "UTC",
+        },
+        defaults.objects,
+      )
       const result = await process.run({
         argv: ["git", "-C", request.repo, ...request.args],
         cwd: request.repo,
@@ -528,10 +536,7 @@ export function adaptProcessGit(process: SupervisedProcess, defaults: GitProcess
   }
 }
 
-export function createLocalGitProcess(
-  environment?: NodeJS.ProcessEnv,
-  options: StallRetryOptions = {},
-): GitProcess {
+export function createLocalGitProcess(environment?: NodeJS.ProcessEnv, options: StallRetryOptions = {}): GitProcess {
   // Local callers own Git policy (for example GIT_ALLOW_PROTOCOL and GIT_CONFIG_*),
   // so only inherited repository pointers are removed; the supervised port uses the full scrubber.
   const baseEnvironment = cleanGitRepositoryEnvironment(environment, options.objects)
@@ -547,11 +552,14 @@ export function createLocalGitProcess(
       const groupsFile = groupsDir === undefined ? undefined : join(groupsDir, "groups")
       try {
         child = spawnGit(["-C", request.repo, ...request.args], {
-          env: applyGitObjectContext({
-            ...baseEnvironment,
-            ...request.env,
-            ...(groupsFile === undefined ? {} : { [APPLY_GROUPS_ENV]: groupsFile }),
-          }, options.objects),
+          env: applyGitObjectContext(
+            {
+              ...baseEnvironment,
+              ...request.env,
+              ...(groupsFile === undefined ? {} : { [APPLY_GROUPS_ENV]: groupsFile }),
+            },
+            options.objects,
+          ),
           stdin: request.stdin === undefined ? "ignore" : "pipe",
           ...(request.stdin === undefined ? {} : { input: request.stdin }),
           ...(request.signal === undefined ? {} : { signal: request.signal }),
