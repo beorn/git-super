@@ -1,7 +1,12 @@
 import { existsSync, readFileSync, statSync } from "node:fs"
 import { rm } from "node:fs/promises"
 import { dirname, isAbsolute, join, resolve } from "node:path"
-import { readCommitSubmodules, resolveSubmoduleBranch, type CommitSubmodule } from "./commit-graph.ts"
+import {
+  readCommitSubmodules,
+  readPrivateSubmodulePaths,
+  resolveSubmoduleBranch,
+  type CommitSubmodule,
+} from "./commit-graph.ts"
 import {
   composeSubmoduleCommits,
   findSubmoduleCompositionOverlaps,
@@ -28,6 +33,7 @@ import { createLocalGitProcess, type GitProcess, type GitProcessRequest, type Gi
 import { createProgressReporter } from "./progress.ts"
 import { shellQuote } from "./shell-command.ts"
 import type { NotCompared } from "./diff.ts"
+import { inspectExcludedCheckout } from "./status.ts"
 import { isSubmoduleExcluded, validateExcludedSubmodules } from "./git.ts"
 import { proveExcludedCheckouts, type ExcludedCheckout } from "./pull.ts"
 import type { GitResultDetail, GitSuperRepositoryResult, GitSuperResult } from "./result.ts"
@@ -494,9 +500,9 @@ async function mergeObserved(
   steps: StepClock,
   initializations: SuperMergeInitializationResult[],
 ): Promise<SuperMergeResult> {
-  const excludedSubmodules = options.excludedSubmodules ?? []
+  const requestedExclusions = options.excludedSubmodules ?? []
   try {
-    validateExcludedSubmodules(excludedSubmodules)
+    validateExcludedSubmodules(requestedExclusions)
   } catch (error) {
     return failed(
       root,
@@ -511,6 +517,21 @@ async function mergeObserved(
     )
   }
   const head = await required(git, root, ["rev-parse", "HEAD^{commit}"], "resolve-head", timeoutMs)
+  // 27162: `.gitmodules private = true` is the declaration's one home. A declared-private child this environment
+  // intentionally leaves out (empty or absent checkout, by construction) is excluded by its declaration, so a
+  // root-only merge does not need its store. A changed private pin still refuses by name through the same
+  // preflight a caller's `--exclude-submodule` uses, and no routine refresh cure recommends initializing it.
+  let declaredPrivateExclusions: readonly string[] = []
+  try {
+    declaredPrivateExclusions = (await readPrivateSubmodulePaths(git, root, head)).filter((path) => {
+      const state = inspectExcludedCheckout(root, path).state
+      return state === "empty" || state === "absent"
+    })
+  } catch (error) {
+    const declarationDetail = (error as Error & { resultDetail?: GitResultDetail }).resultDetail
+    return failed(root, [], declarationDetail ?? resultError(error, "read-private-submodules"))
+  }
+  const excludedSubmodules = [...new Set([...requestedExclusions, ...declaredPrivateExclusions])].sort()
   let target: string
   try {
     target = await required(git, root, ["rev-parse", `${options.commit}^{commit}`], "resolve-merge-target", timeoutMs)
@@ -540,6 +561,9 @@ async function mergeObserved(
     const headPins = new Map(headEntries.map((entry) => [entry.path, entry.target]))
     for (const path of excludedSubmodules) {
       if (headPins.has(path)) continue
+      // A declared-private path HEAD does not carry as a root gitlink is not an exclusion here (27162); only a
+      // caller-requested path refuses for shape.
+      if (!requestedExclusions.includes(path)) continue
       if (headEntries.some((entry) => path.startsWith(`${entry.path}/`))) {
         return refuseExcluded(path, "nested exclusions under an included owner cannot be proved from root commits")
       }

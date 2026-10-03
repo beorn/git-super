@@ -75,6 +75,81 @@ describe("git super merge — excluded admission (27058)", () => {
   })
 
   /**
+   * @failure A declared-private child's absent store makes a root-only merge refuse with a routine
+   *          "initialize" cure, instead of honoring the `.gitmodules private = true` declaration (27162).
+   * @level l1
+   * @consumer git-super merge callers in environments that intentionally leave a private child out
+   * @testonly none; the GitProcess recording is the native access evidence
+   */
+  it("excludes a declared-private absent child by its declaration with no child requests", async () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-merge-declared-private-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const path = "packages/alpha"
+    git(fixture.product, "config", "--file", ".gitmodules", `submodule.${path}.private`, "true")
+    git(fixture.product, "add", ".gitmodules")
+    git(fixture.product, "commit", "-q", "-m", "declare packages/alpha private")
+    const target = candidateWithRootChange(fixture, "declared-private-target")
+    const checkout = join(fixture.product, path)
+    const pin = git(fixture.product, "rev-parse", `HEAD:${path}`)
+    const store = git(fixture.product, "rev-parse", "--path-format=absolute", "--git-path", `modules/${path}`)
+    git(fixture.product, "submodule", "deinit", "-f", "--", path)
+    const local = createLocalGitProcess()
+    const childRequests: GitProcessRequest[] = []
+    const recording: GitProcess = {
+      run(request) {
+        if (
+          [checkout, store].some((selected) => request.repo === selected || request.repo.startsWith(`${selected}/`))
+        ) {
+          childRequests.push(request)
+          throw new Error(`declared-private child request: ${request.repo}`)
+        }
+        return local.run(request)
+      },
+    }
+    const result = await superMerge({ repo: fixture.product, commit: target, git: recording })
+    expect(result, JSON.stringify(result.detail)).toMatchObject({
+      state: "updated",
+      partial: false,
+      notCompared: [{ path, reason: "excluded" }],
+    })
+    expect(result.gitlinks).toContainEqual(expect.objectContaining({ path, state: "as-written" }))
+    expect(git(fixture.product, "rev-parse", `HEAD:${path}`)).toBe(pin)
+    expect(childRequests).toEqual([])
+  })
+
+  /**
+   * @failure A changed declared-private pin is refused with the routine "initialize" cure instead of by name (27162).
+   * @level l1
+   * @consumer git-super merge callers where a private gitlink should not move
+   * @testonly none
+   */
+  it("refuses a moved declared-private pin by name and never recommends initializing it", async () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-merge-declared-private-moved-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const path = "packages/alpha"
+    git(fixture.product, "config", "--file", ".gitmodules", `submodule.${path}.private`, "true")
+    git(fixture.product, "add", ".gitmodules")
+    git(fixture.product, "commit", "-q", "-m", "declare packages/alpha private")
+    const moved = advanceRepository(fixture.alpha, "private-move.txt", "private move\n")
+    git(fixture.product, "switch", "-q", "-c", "declared-private-moved-target")
+    git(fixture.product, "update-index", "--cacheinfo", `160000,${moved},${path}`)
+    writeFileSync(join(fixture.product, "declared-private-moved-root.txt"), "root change\n")
+    git(fixture.product, "add", "declared-private-moved-root.txt")
+    git(fixture.product, "commit", "-q", "-m", "move declared-private pin")
+    const target = git(fixture.product, "rev-parse", "HEAD")
+    git(fixture.product, "switch", "-q", "main")
+    git(fixture.product, "submodule", "deinit", "-f", "--", path)
+    const result = await superMerge({ repo: fixture.product, commit: target })
+    expect(result, JSON.stringify(result.detail)).toMatchObject({
+      state: "failed",
+      detail: { code: "excluded-submodule-unproven", paths: [path] },
+    })
+    expect(JSON.stringify(result.detail)).not.toContain("initialize")
+  })
+
+  /**
    * @failure Native merge-tree reads the excluded store before a moved-pin refusal is decided.
    * @level l1
    * @consumer git-super merge admission before native Git composition
