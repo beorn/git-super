@@ -227,6 +227,66 @@ it.each(["removed", "regular replacement", "symlink replacement", "regular repla
   },
 )
 
+// CTOa6e10f22: private descendants retain their own and ancestor routing custody through recursive traversal.
+// Ordinary materializer contention does not execute the private creator callback or private nested policy writes.
+it("holds private child and ancestor custody through checkout and recursive routing", async () => {
+  const root = await mkdtemp(join(canonicalTmpdir(), "git-super-private-child-custody-"))
+  roots.push(root)
+  const fixture = addNestedAlphaSubmodule(createProductFixture(root))
+  const destination = join(root, "seat")
+  const alpha = join(destination, "packages/alpha")
+  const leaf = join(alpha, "apps/maddoc")
+  const rootGit = join(destination, ".git")
+  const alphaGit = join(rootGit, "modules/packages/alpha")
+  const leafGit = join(alphaGit, "modules/apps/maddoc")
+  const transport = createLocalGitProcess()
+  const observations: Array<{ checkout: string; phase: string; owners: readonly boolean[] }> = []
+  const result = await GitSuper.projectPrivateGitWorktree({
+    sourceCheckout: fixture.product,
+    commit: git(fixture.product, "rev-parse", "HEAD"),
+    branch: "task/seat",
+    destination,
+    excludedSubmodules: [],
+    git: {
+      async run(request) {
+        const phase = request.args.includes("checkout")
+          ? "checkout"
+          : request.args.includes("submodule.alternateLocation")
+            ? "routing"
+            : undefined
+        if ((request.repo === alpha || request.repo === leaf) && phase !== undefined) {
+          const owners = request.repo === alpha ? [rootGit, alphaGit] : [rootGit, alphaGit, leafGit]
+          observations.push({
+            checkout: request.repo,
+            phase,
+            owners: owners.map((owner) => {
+              const contender = tryAcquireFlock(join(owner, "yrd-worktree-mutations/writer.lock"))
+              contender?.release()
+              return contender === null
+            }),
+          })
+        }
+        return transport.run(request)
+      },
+    },
+  })
+  expect(result.state, JSON.stringify(result.detail)).toBe("updated")
+  expect(observations).toEqual([
+    { checkout: alpha, phase: "checkout", owners: [true, true] },
+    { checkout: alpha, phase: "routing", owners: [true, true] },
+    { checkout: leaf, phase: "checkout", owners: [true, true, true] },
+    { checkout: leaf, phase: "routing", owners: [true, true, true] },
+  ])
+  for (const owner of [rootGit, alphaGit, leafGit]) {
+    const available = tryAcquireFlock(join(owner, "yrd-worktree-mutations/writer.lock"))
+    try {
+      expect(available).not.toBeNull()
+    } finally {
+      available?.release()
+    }
+  }
+})
+
 // CTO63d0a344: retirement needs the sandbox lifetime proof; existing lifecycle tests lacked this gate.
 it("refuses retirement without a unit stop certificate", async () => {
   const root = await mkdtemp(join(canonicalTmpdir(), "git-super-stop-certificate-"))

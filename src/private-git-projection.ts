@@ -326,14 +326,15 @@ export async function projectPrivateGitWorktree(
     if (destination === source || destination.startsWith(`${source}${sep}`)) {
       throw new Error(`projection destination is inside its source: ${destination}`)
     }
-    const createRepository = async (
+    const createRepository = async <T>(
       checkout: string,
       sourceCheckout: string,
       head: string,
       root: boolean,
+      consume: () => Promise<T>,
       privateGitDirectory?: string,
       publicGitDirectory?: string,
-    ): Promise<void> => {
+    ): Promise<T> => {
       const sourceGit = await metadata(sourceCheckout)
       const common = await commonDirectory(sourceGit)
       const objects = join(common, "objects")
@@ -356,45 +357,55 @@ export async function projectPrivateGitWorktree(
         options.branch,
       ])
       const gitDirectory = privateGitDirectory ?? join(checkout, ".git")
-      await writeFile(join(gitDirectory, "objects", "info", "alternates"), `${[...lineage, objects].join("\n")}\n`, {
-        flag: "wx",
-      })
-      await run(checkout, ["cat-file", "-e", `${head}^{commit}`])
-      // A ref in the borrower cannot protect objects from a lender's own GC.
-      // Every validated lender must hold the selected commit under the existing exact-object pin.
-      for (const directory of new Set([common, ...lineage.map((lender) => dirname(lender))])) {
-        await createExclusive(join(directory, "yrd-worktree-mutations")).run(
-          async () => {
-            // A linked source may own a newer commit than its public lenders.
-            // Reuse exact-object transfer before anchoring it in every GC owner.
-            await ensureCommitObject({
-              repository: checkout,
-              remote: common,
-              commit: head,
-              git: {
-                run: (request) =>
-                  git.run({
-                    ...request,
-                    args: [
-                      "--git-dir",
-                      directory,
-                      ...(request.args[0] === "fetch" ? ["-c", "protocol.file.allow=always"] : []),
-                      ...request.args,
-                    ],
-                  }),
-              },
-            })
-            await run(checkout, ["--git-dir", directory, "update-ref", pinRef(head), head])
-          },
-          { holder: `private projection ${destination}` },
-        )
+      const populate = async (): Promise<T> => {
+        await writeFile(join(gitDirectory, "objects", "info", "alternates"), `${[...lineage, objects].join("\n")}\n`, {
+          flag: "wx",
+        })
+        await run(checkout, ["cat-file", "-e", `${head}^{commit}`])
+        // A ref in the borrower cannot protect objects from a lender's own GC.
+        // Every validated lender must hold the selected commit under the existing exact-object pin.
+        for (const directory of new Set([common, ...lineage.map((lender) => dirname(lender))])) {
+          await createExclusive(join(directory, "yrd-worktree-mutations")).run(
+            async () => {
+              // A linked source may own a newer commit than its public lenders.
+              // Reuse exact-object transfer before anchoring it in every GC owner.
+              await ensureCommitObject({
+                repository: checkout,
+                remote: common,
+                commit: head,
+                git: {
+                  run: (request) =>
+                    git.run({
+                      ...request,
+                      args: [
+                        "--git-dir",
+                        directory,
+                        ...(request.args[0] === "fetch" ? ["-c", "protocol.file.allow=always"] : []),
+                        ...request.args,
+                      ],
+                    }),
+                },
+              })
+              await run(checkout, ["--git-dir", directory, "update-ref", pinRef(head), head])
+            },
+            { holder: `private projection ${destination}` },
+          )
+        }
+        stores.add(objects)
+        for (const lender of lineage) stores.add(lender)
+        await run(checkout, ["checkout", "--no-recurse-submodules", "-B", options.branch, head])
+        repositories.push({ path: relative(destination, checkout).split(sep).join("/"), checkout, gitDirectory, head })
+        return consume()
       }
-      stores.add(objects)
-      for (const lender of lineage) stores.add(lender)
-      await run(checkout, ["checkout", "--no-recurse-submodules", "-B", options.branch, head])
-      repositories.push({ path: relative(destination, checkout).split(sep).join("/"), checkout, gitDirectory, head })
+      // New child metadata is initialized under its parent's existing custody.
+      // Its own owner then covers population and the materializer's entire recursive walk.
+      return root
+        ? populate()
+        : createExclusive(join(gitDirectory, "yrd-worktree-mutations")).run(populate, {
+            holder: `private projection child ${checkout}`,
+          })
     }
-    await createRepository(destination, source, options.commit, true)
+    await createRepository(destination, source, options.commit, true, () => Promise.resolve())
     const materialized = await materializeSubmodules(
       { run: (repo, args) => git.run({ repo, args }) },
       {
@@ -420,18 +431,19 @@ export async function projectPrivateGitWorktree(
             )
           }
         },
-        materialize: async (parent, entry) => {
+        materialize: async (parent, entry, descend) => {
           const checkout = join(parent, entry.path)
           const directory = safeStorePath(await metadata(parent), entry.name)
           const publicParent = publicDirectories.get(parent)
           if (publicParent === undefined) throw new Error(`missing declared public metadata for ${parent}`)
           const publicDirectory = safeStorePath(publicParent, entry.name)
           await mkdir(dirname(directory), { recursive: true })
-          await createRepository(
+          return createRepository(
             checkout,
             join(source, relative(destination, checkout)),
             entry.target,
             false,
+            descend,
             directory,
             publicDirectory,
           )

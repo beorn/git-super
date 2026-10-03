@@ -635,7 +635,11 @@ async function materializeSubmodulesUnderLock(
       excluded: readonly string[],
       metadata: SelectedCommitSubmodules,
     ): Promise<void>
-    materialize(parent: string, entry: CommitSubmodule): Promise<void>
+    materialize(
+      parent: string,
+      entry: CommitSubmodule,
+      descend: () => Promise<SubmoduleGitResult>,
+    ): Promise<SubmoduleGitResult>
   }>,
 ): Promise<SubmoduleMaterializationResult> {
   validateExcludedSubmodules(options.excludedSubmodules)
@@ -865,10 +869,11 @@ async function materializeSubmodulesUnderLock(
     if (entries.length === 0) return success()
     if (privateProjection !== undefined) {
       for (const entry of entries) {
-        await privateProjection.materialize(worktree, entry)
+        const nested = await privateProjection.materialize(worktree, entry, () =>
+          walk(join(worktree, entry.path), undefined, durableLevel, undefined, depth + 1),
+        )
         considered += 1
         borrowed += 1
-        const nested = await walk(join(worktree, entry.path), undefined, durableLevel, undefined, depth + 1)
         if (nested.code !== 0) return nested
       }
       return success()
