@@ -1666,10 +1666,14 @@ describe("git super pull --ff-only", () => {
       const fs = require('node:fs');
       const path = process.argv[1];
       const fd = fs.openSync(path, 'wx');
+      ${where === "persistent-child" ? `const rootPath = process.argv[2]; const rootFd = fs.openSync(rootPath, 'wx'); setTimeout(() => { fs.closeSync(rootFd); fs.unlinkSync(rootPath); }, 3000);` : ""}
       process.stdout.write('held\\n');
       setTimeout(() => { fs.closeSync(fd); fs.unlinkSync(path); }, ${where === "persistent-child" ? 10_000 : 3_000});
     `,
           lock,
+          ...(where === "persistent-child"
+            ? [git(checkout, "rev-parse", "--path-format=absolute", "--git-path", "index.lock")]
+            : []),
         ],
         { stdio: ["ignore", "pipe", "pipe"] },
       )
