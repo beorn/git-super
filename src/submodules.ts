@@ -1607,9 +1607,12 @@ async function materializeSubmodulesUnderLock(
       const firstRejection = rejected[0]
       if (rejected.length === 1 && firstRejection !== undefined) throw firstRejection.reason
       if (rejected.length > 1) {
-        throw new AggregateError(rejected.map((result) => result.reason as unknown), `child materialization failed in ${worktree}`)
+        throw new AggregateError(
+          rejected.map((result) => result.reason as unknown),
+          `child materialization failed in ${worktree}`,
+        )
       }
-      const results = settled.flatMap((result) => result.status === "fulfilled" ? [result.value] : [])
+      const results = settled.flatMap((result) => (result.status === "fulfilled" ? [result.value] : []))
       const failed = results.find((result) => result.code !== 0)
       if (failed !== undefined) return failed
     }
