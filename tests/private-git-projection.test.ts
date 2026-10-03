@@ -22,7 +22,7 @@ import {
 } from "node:fs"
 import { mkdtemp, rm } from "node:fs/promises"
 import * as filesystem from "node:fs/promises"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 import { afterEach, expect, it, vi } from "vitest"
 import { tryAcquireFlock } from "@bearly/flock"
 import * as GitSuper from "../src/index.ts"
@@ -37,6 +37,11 @@ import { addNestedAlphaSubmodule, advanceRepository, canonicalTmpdir, createProd
 vi.mock("node:fs/promises", async (importOriginal) => {
   const fs = await importOriginal<typeof import("node:fs/promises")>()
   return { ...fs, open: vi.fn(fs.open), readFile: vi.fn(fs.readFile) }
+})
+
+vi.mock("@bearly/flock", async (importOriginal) => {
+  const flock = await importOriginal<typeof import("@bearly/flock")>()
+  return { ...flock, tryAcquireFlock: vi.fn(flock.tryAcquireFlock) }
 })
 
 const roots: string[] = []
@@ -241,47 +246,80 @@ it("holds private root creation, child and ancestor custody through checkout and
   const leafGit = join(alphaGit, "modules/apps/maddoc")
   const transport = createLocalGitProcess()
   const observations: Array<{ checkout: string; phase: string; owners: readonly boolean[] }> = []
-  const result = await GitSuper.projectPrivateGitWorktree({
-    sourceCheckout: fixture.product,
-    commit: git(fixture.product, "rev-parse", "HEAD"),
-    branch: "task/seat",
-    destination,
-    excludedSubmodules: [],
-    git: {
-      async run(request) {
-        const phase =
-          request.repo === destination && request.args.includes("check-ref-format")
-            ? "branch validation"
-            : request.repo === destination && request.args.includes("init")
-              ? "init"
-              : request.args.includes("checkout")
-                ? "checkout"
-                : request.args.includes("submodule.alternateLocation")
-                  ? "routing"
-                  : undefined
-        if ((request.repo === destination || request.repo === alpha || request.repo === leaf) && phase !== undefined) {
-          const owners =
-            request.repo === destination
-              ? [rootGit]
-              : request.repo === alpha
-                ? [rootGit, alphaGit]
-                : [rootGit, alphaGit, leafGit]
-          observations.push({
-            checkout: request.repo,
-            phase,
-            owners: owners.map((owner) => {
-              const lock = join(owner, "yrd-worktree-mutations/writer.lock")
-              if (!existsSync(lock)) return false
-              const contender = tryAcquireFlock(lock)
-              contender?.release()
-              return contender === null
-            }),
-          })
-        }
-        return transport.run(request)
+  // CTOa6e10f22: acquiring a public lender below a held private owner must obey
+  // the same canonical ordering as every other writer, including nested paths.
+  const nativeAcquire = (await vi.importActual<typeof import("@bearly/flock")>("@bearly/flock")).tryAcquireFlock
+  const heldOwners = new Set<string>()
+  const orderViolations: Array<{ held: string[]; next: string }> = []
+  const acquiring = vi.mocked(tryAcquireFlock).mockImplementation((path, options) => {
+    const handle = nativeAcquire(path, options)
+    if (handle === null) return null
+    const owner = dirname(dirname(path))
+    const enclosing = [...heldOwners]
+    if (enclosing.some((prior) => prior > owner)) orderViolations.push({ held: enclosing, next: owner })
+    heldOwners.add(owner)
+    const release = () => {
+      handle.release()
+      heldOwners.delete(owner)
+    }
+    return {
+      ...handle,
+      get held() {
+        return handle.held
       },
-    },
+      release,
+      [Symbol.dispose]: release,
+    }
   })
+  let result: Awaited<ReturnType<typeof GitSuper.projectPrivateGitWorktree>>
+  try {
+    result = await GitSuper.projectPrivateGitWorktree({
+      sourceCheckout: fixture.product,
+      commit: git(fixture.product, "rev-parse", "HEAD"),
+      branch: "task/seat",
+      destination,
+      excludedSubmodules: [],
+      git: {
+        async run(request) {
+          const phase =
+            request.repo === destination && request.args.includes("check-ref-format")
+              ? "branch validation"
+              : request.repo === destination && request.args.includes("init")
+                ? "init"
+                : request.args.includes("checkout")
+                  ? "checkout"
+                  : request.args.includes("submodule.alternateLocation")
+                    ? "routing"
+                    : undefined
+          if (
+            (request.repo === destination || request.repo === alpha || request.repo === leaf) &&
+            phase !== undefined
+          ) {
+            const owners =
+              request.repo === destination
+                ? [rootGit]
+                : request.repo === alpha
+                  ? [rootGit, alphaGit]
+                  : [rootGit, alphaGit, leafGit]
+            observations.push({
+              checkout: request.repo,
+              phase,
+              owners: owners.map((owner) => {
+                const lock = join(owner, "yrd-worktree-mutations/writer.lock")
+                if (!existsSync(lock)) return false
+                const contender = tryAcquireFlock(lock)
+                contender?.release()
+                return contender === null
+              }),
+            })
+          }
+          return transport.run(request)
+        },
+      },
+    })
+  } finally {
+    acquiring.mockRestore()
+  }
   expect(result.state, JSON.stringify(result.detail)).toBe("updated")
   expect(observations).toEqual([
     { checkout: destination, phase: "branch validation", owners: [true] },
@@ -301,6 +339,8 @@ it("holds private root creation, child and ancestor custody through checkout and
       available?.release()
     }
   }
+  expect(heldOwners.size, "projection leaked native owner custody").toBe(0)
+  expect(orderViolations, "public lender acquisition reverses order beneath private custody").toEqual([])
 })
 
 // CTO63d0a344: retirement needs the sandbox lifetime proof; existing lifecycle tests lacked this gate.
