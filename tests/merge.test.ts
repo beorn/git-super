@@ -214,7 +214,9 @@ describe("git super merge — excluded admission (27058)", () => {
     const childRequests: GitProcessRequest[] = []
     const recording: GitProcess = {
       run(request) {
-        if ([checkout, store].some((selected) => request.repo === selected || request.repo.startsWith(selected + "/"))) {
+        if (
+          [checkout, store].some((selected) => request.repo === selected || request.repo.startsWith(selected + "/"))
+        ) {
           childRequests.push(request)
           throw new Error("declared-private child request: " + request.repo)
         }
@@ -265,7 +267,9 @@ describe("git super merge — excluded admission (27058)", () => {
     const childRequests: GitProcessRequest[] = []
     const recording: GitProcess = {
       run(request) {
-        if ([checkout, store].some((selected) => request.repo === selected || request.repo.startsWith(selected + "/"))) {
+        if (
+          [checkout, store].some((selected) => request.repo === selected || request.repo.startsWith(selected + "/"))
+        ) {
           childRequests.push(request)
           throw new Error("declared-private child request: " + request.repo)
         }
