@@ -4,6 +4,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  renameSync,
   rmSync,
   symlinkSync,
   write,
@@ -117,6 +118,75 @@ describe("GitProcess", () => {
       expect(child.exitCode, `${child.stdout}${child.stderr}`).toBe(0)
       expect(JSON.parse(child.stdout.toString())).toMatchObject({ isAncestor: true })
     }
+  })
+
+  // @failure: cancellation loses the selected object stores or poisons the next native read.
+  // @level l2; @consumer contained submit; fake-executable cancellation cannot witness object reach.
+  test("cancellation retains the explicit public object context for native Git", async () => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-object-cancel-"))
+    roots.push(root)
+    const repo = join(root, "repo")
+    const head = createRepository(repo, "own.txt", "selected objects\n")
+    const primary = join(root, "public-primary")
+    const alternate = join(root, "public-alternate")
+    const decoy = join(root, "decoy")
+    renameSync(join(repo, ".git", "objects"), alternate)
+    for (const path of [primary, decoy, join(repo, ".git", "objects")]) mkdirSync(path)
+    const entered = join(root, "entered.json")
+    const release = join(root, "release")
+    const fixture = join(root, "pause.ts")
+    writeFileSync(
+      fixture,
+      `import { existsSync, writeFileSync } from "node:fs"
+const read = Bun.spawnSync(["git", "cat-file", "-t", ${JSON.stringify(head)}], { stdout: "pipe", stderr: "pipe" })
+writeFileSync(${JSON.stringify(entered)}, JSON.stringify({
+  directory: process.env.GIT_OBJECT_DIRECTORY,
+  alternates: process.env.GIT_ALTERNATE_OBJECT_DIRECTORIES,
+  code: read.exitCode, type: read.stdout.toString().trim(), stderr: read.stderr.toString()
+}))
+const deadline = Date.now() + 2000
+while (!existsSync(${JSON.stringify(release)})) {
+  if (Date.now() >= deadline) throw new Error("Cancellation fixture was not released")
+  await Bun.sleep(1)
+}
+`,
+    )
+    const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`
+    const runner = createLocalGitProcess(
+      { ...process.env, GIT_OBJECT_DIRECTORY: decoy, GIT_ALTERNATE_OBJECT_DIRECTORIES: decoy },
+      { objects: { directory: primary, alternates: [alternate] } },
+    )
+    const controller = new AbortController()
+    const pending = runner.run({
+      repo,
+      args: ["-c", `alias.pause=!${quote(process.execPath)} ${quote(fixture)}`, "pause"],
+      signal: controller.signal,
+    })
+    try {
+      const deadline = Date.now() + 2000
+      while (!existsSync(entered) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 1))
+      expect(existsSync(entered), "Native Git did not reach the cancellation fixture").toBe(true)
+      expect(JSON.parse(readFileSync(entered, "utf8"))).toEqual({
+        directory: primary,
+        alternates: alternate,
+        code: 0,
+        type: "commit",
+        stderr: "",
+      })
+    } finally {
+      controller.abort()
+      // Native Git's alias child owns these pipes; release it before awaiting capture.
+      writeFileSync(release, "released")
+    }
+    const cancelled = await pending
+    expect(cancelled.code).not.toBe(0)
+    expect(cancelled.failure).toContain("abort")
+    const read = await runner.run({ repo, args: ["cat-file", "-t", head] })
+    expect({ code: read.code, type: read.stdout.trim(), stderr: read.stderr }).toEqual({
+      code: 0,
+      type: "commit",
+      stderr: "",
+    })
   })
 
   // Gate A: graph-process tests intentionally scrub Git variables and decode text.
