@@ -766,6 +766,33 @@ function wrongStoreFirstMerge(local: GitProcess, product: string, unreadable: st
   }
 }
 
+/**
+ * A git process whose root native APPLY reproduces the wrong-store corruption
+ * (27268): the preflight `merge-tree` succeeds — merge-tree never reads
+ * submodule interiors — but `git merge --no-ff --no-commit` cannot read an
+ * object that only another component's store holds, so Git reports the
+ * submodule as "repository corrupt" and names no owner. Every other call is
+ * native; only the apply failure is simulated.
+ */
+function corruptNativeApply(local: GitProcess, product: string, unreadable: string, submodule: string): GitProcess {
+  return {
+    run: (request) => {
+      if (request.repo === product && request.args.includes("merge") && request.args.includes("--no-commit")) {
+        return Promise.resolve({
+          code: 2,
+          stdout: "",
+          stderr:
+            `error: Could not read ${unreadable}\n` +
+            `error: could not parse commit ${unreadable}\n` +
+            `error: failed to merge submodule ${submodule} (repository corrupt)\n` +
+            `Merge with strategy ort failed.\n`,
+        })
+      }
+      return local.run(request)
+    },
+  }
+}
+
 describe("git super merge", () => {
   /**
    * @failure A newly added checkout-free parent hides missing descendants behind a generic error and an unusable repair (26996).
@@ -3557,6 +3584,40 @@ describe("git super merge", () => {
     expect(result.detail?.code).toBe("submodule-history-unreadable")
     expect(result.detail?.objectIds).toContain(foreign)
     expect(git(fixture.product, "rev-parse", "HEAD")).toBe(diverged.head)
+  })
+
+  /**
+   * @failure The native apply names no owner when Git cannot read a submodule object: the caller gets a raw "repository corrupt" that names neither the object nor the store that holds it (27268).
+   * @level l1
+   * @consumer Yrd settled candidate preparation and landing
+   * @testonly none; only the apply-phase git failure is simulated
+   */
+  it("names the unreadable object and the store that holds it when the native apply reports a corrupt submodule", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-apply-wrong-store-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const diverged = divergeBothProductComponents(
+      fixture,
+      { content: "export const alpha = 'ours'\n", file: "alpha-ours.ts" },
+      { content: "export const alpha = 'theirs'\n", file: "alpha-theirs.ts" },
+    )
+    const heldByBeta = git(fixture.beta, "rev-parse", "HEAD")
+    const local = createLocalGitProcess()
+    const result = await superMerge({
+      commit: diverged.candidate,
+      git: corruptNativeApply(local, fixture.product, heldByBeta, "packages/alpha"),
+      repo: fixture.product,
+    })
+
+    expect(result.state, JSON.stringify(result)).toBe("failed")
+    expect(result.partial).toBe(false)
+    expect(result.detail?.code).toBe("submodule-object-unreadable-in-store")
+    expect(result.detail?.subject).toContain(heldByBeta)
+    expect(result.detail?.subject).toContain("packages/alpha")
+    expect(result.detail?.subject).toContain("vendor/beta")
+    expect(result.detail?.objectIds).toContain(heldByBeta)
+    expect(git(fixture.product, "rev-parse", "HEAD")).toBe(diverged.head)
+    expect(git(fixture.product, "status", "--porcelain").trim()).toBe("")
   })
 
   /**

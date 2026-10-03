@@ -1029,7 +1029,10 @@ async function mergeObserved(
      */
     const applied = await applyComposedResolutions(git, root, composed, timeoutMs)
     if (applied === "unsettled") {
-      return mergeApplicationFailure(git, root, head, target, mergeArgs, merged, timeoutMs)
+      const unreadable = await applyPhaseUnreadable(git, root, tree, mergeArgs, merged, timeoutMs)
+      return unreadable === undefined
+        ? mergeApplicationFailure(git, root, head, target, mergeArgs, merged, timeoutMs)
+        : failed(root, [], unreadable, preparedRows)
     }
     if (applied !== "settled") return partial(root, undefined, [], applied.detail)
   }
@@ -3417,6 +3420,73 @@ async function planGitlinks(
     mains,
     unboundedLocalMains,
   }
+}
+
+/**
+ * NAME THE OBJECT AND THE STORE WHEN A NATIVE APPLY CALLS A SUBMODULE CORRUPT (27268).
+ *
+ * `merge-tree` never reads submodule interiors, so a wrong-store gitlink can pass
+ * the preflight probe and fail only when Git applies the merge. Git then reports
+ * the submodule as "repository corrupt" and names no owner, which leaves the
+ * caller nothing to act on. Every component store this merge planned over is
+ * asked whether it holds the named object: the stores that hold it, and the one
+ * Git could not read it in, are the whole diagnosis. The raw Git failure stays in
+ * the message as evidence; the subject and the remedy name the owner.
+ */
+async function applyPhaseUnreadable(
+  git: GitProcess,
+  root: string,
+  tree: string,
+  args: readonly string[],
+  result: GitProcessResult,
+  timeoutMs: number,
+): Promise<GitResultDetail | undefined> {
+  const text = `${result.stdout}\n${result.stderr}`
+  const unreadable = /(?:^|\n)error: Could not read ([0-9a-f]{40,64})(?:\r?$|\s)/iu.exec(text)?.[1]
+  if (unreadable === undefined) return undefined
+  const submodule = /failed to merge submodule (.+?) \(repository corrupt\)/u.exec(text)?.[1]?.trim()
+  if (submodule === undefined || submodule === "") return undefined
+  const paths = [...new Set([...(await readCommitSubmodules(git, root, tree)).map((entry) => entry.path), submodule])]
+  const common = (
+    await required(git, root, ["rev-parse", "--git-common-dir"], "locate-submodule-stores", timeoutMs)
+  ).trim()
+  const commonDir = resolve(root, common)
+  const holders: string[] = []
+  for (const path of paths) {
+    for (const candidate of [join(commonDir, "modules", path), join(root, path)]) {
+      const held = await run(git, candidate, ["cat-file", "-e", `${unreadable}^{commit}`], timeoutMs)
+      if (held.code === 0 && held.failure === undefined) {
+        holders.push(path)
+        break
+      }
+    }
+  }
+  const owning = holders.filter((path) => path !== submodule)
+  const store = join(commonDir, "modules", submodule)
+  const remedy =
+    owning.length === 1
+      ? `${unreadable} is readable in the ${owning[0]} store but not in the ${submodule} store; repair the ${submodule} store or re-cut that gitlink, then rerun the same git super merge command.`
+      : owning.length === 0
+        ? `${unreadable} is readable in no component store this merge planned over; restore the object, then rerun the same git super merge command.`
+        : `${unreadable} is readable in more than one component store (${owning.join(", ")}); resolve the ownership, then rerun the same git super merge command.`
+  return resultDetailFromGit(
+    "submodule-object-unreadable-in-store",
+    "apply-merge",
+    root,
+    args,
+    result,
+    `Merge cannot read ${unreadable} in the ${submodule} store${
+      owning.length === 1
+        ? `; ${owning[0]} holds it`
+        : owning.length === 0
+          ? "; no planned component store holds it"
+          : `; ${owning.join(", ")} hold it`
+    }.`,
+    `git -C ${shellQuote(store)} cat-file -t ${unreadable}`,
+    remedy,
+    "the submodule writer",
+    { paths: [submodule], objectIds: [unreadable] },
+  )
 }
 
 async function mergeApplicationFailure(
