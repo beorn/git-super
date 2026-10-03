@@ -611,6 +611,9 @@ export async function materializeSubmodules(
   privateProjection?: Parameters<typeof materializeSubmodulesUnderLock>[2],
 ): Promise<SubmoduleMaterializationResult> {
   validateExcludedSubmodules(options.excludedSubmodules)
+  if (privateProjection?.prepareCommit !== undefined) {
+    return materializeSubmodulesUnderLock(git, options, privateProjection)
+  }
   const discovered = await git.run(options.worktree, ["rev-parse", "--path-format=absolute", "--git-common-dir"], true)
   if (discovered.code !== 0 || discovered.timedOut || discovered.failure !== undefined) {
     throw new Error(`cannot establish materializer writer owner for ${options.worktree}: ${discovered.stderr}`)
@@ -629,6 +632,8 @@ async function materializeSubmodulesUnderLock(
   git: SubmoduleGit,
   options: SubmoduleMaterializationOptions,
   privateProjection?: Readonly<{
+    /** Trusted read-only preparation uses the same selection walk before private construction. */
+    prepareCommit?: string
     validate(
       worktree: string,
       head: string,
@@ -749,12 +754,18 @@ async function materializeSubmodulesUnderLock(
     preparedReference = false,
     parentIdentity?: Readonly<{ commit: string; remote: string }>,
     logicalPath = "",
+    frozenHead?: string,
   ): Promise<SubmoduleGitResult> => {
-    const policy = await configureSubmoduleAlternatePolicy(git, worktree)
-    if (policy.code !== 0) return policy
+    if (privateProjection?.prepareCommit === undefined) {
+      const policy = await configureSubmoduleAlternatePolicy(git, worktree)
+      if (policy.code !== 0) return policy
+    }
 
     const source = depth === 0 ? (options.source ?? "head") : "head"
-    const headResult = await git.run(worktree, ["rev-parse", "--verify", "HEAD"], true)
+    const headResult =
+      frozenHead === undefined
+        ? await git.run(worktree, ["rev-parse", "--verify", "HEAD"], true)
+        : { code: 0, stdout: frozenHead, stderr: "" }
     if (headResult.code !== 0 || headResult.timedOut || headResult.failure !== undefined) return headResult
     const head = headResult.stdout.trim()
     if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(head)) {
@@ -806,6 +817,25 @@ async function materializeSubmodulesUnderLock(
       }
     }
     const selectedPins = new Map(entries.map(({ path, target }) => [path, target]))
+    if (privateProjection?.prepareCommit !== undefined) {
+      for (const entry of entries) {
+        const nested = await privateProjection.materialize(worktree, entry, () =>
+          walk(
+            join(worktree, entry.path),
+            undefined,
+            durableLevel,
+            undefined,
+            depth + 1,
+            false,
+            undefined,
+            "",
+            entry.target,
+          ),
+        )
+        if (nested.code !== 0) return nested
+      }
+      return success()
+    }
     for (const evidence of metadata.selectedPaths) {
       // A selector beneath an included gitlink belongs to that child's existing walk.
       if (entries.some((entry) => evidence.path.startsWith(`${entry.path}/`))) continue
@@ -1632,7 +1662,17 @@ async function materializeSubmodulesUnderLock(
 
   const selectedPaths = options.paths === undefined ? undefined : new Set(options.paths)
   using span = log?.span?.("materialize", { worktree: options.worktree, reference: referenceRoot })
-  const result = await walk(options.worktree, referenceRoot, resolveDurableRoot, selectedPaths)
+  const result = await walk(
+    options.worktree,
+    referenceRoot,
+    resolveDurableRoot,
+    selectedPaths,
+    0,
+    false,
+    undefined,
+    "",
+    privateProjection?.prepareCommit,
+  )
   // ONE record carrying the totals AND what they are totals of. The counters
   // existed before this and were printed into a log with no reader; a reader
   // that gets `remoteFallbacks: 16` still cannot tell a broken reference store

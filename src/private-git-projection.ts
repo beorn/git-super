@@ -305,15 +305,28 @@ export async function projectPrivateGitWorktree(
     if (destination === source || destination.startsWith(`${source}${sep}`)) {
       throw new Error(`projection destination is inside its source: ${destination}`)
     }
-    const createRepository = async <T>(
+    const prepared = new Map<
+      string,
+      {
+        sourceCheckout: string
+        sourceGit: string
+        common: string
+        objects: string
+        publicDirectory: string
+        publicCommon: string
+        lineage: string[]
+        owners: Set<string>
+        head: string
+      }
+    >()
+    const privateDirectories = new Map<string, string>([[destination, join(destination, ".git")]])
+    const heldLocks = new Map<string, WriterLock>()
+    const prepareRepository = async (
       checkout: string,
       sourceCheckout: string,
       head: string,
-      root: boolean,
-      consume: (writerLock: WriterLock) => Promise<T>,
-      privateGitDirectory?: string,
       publicGitDirectory?: string,
-    ): Promise<T> => {
+    ): Promise<void> => {
       const sourceGit = await metadata(sourceCheckout)
       const common = await commonDirectory(sourceGit)
       const objects = join(common, "objects")
@@ -335,10 +348,85 @@ export async function projectPrivateGitWorktree(
         if (owner === undefined) throw new Error(`unproven object-store owner: ${store}`)
         owners.add(owner)
       }
-      if (root) await mkdir(checkout)
-      else await mkdir(checkout, { recursive: true })
+      prepared.set(checkout, {
+        sourceCheckout,
+        sourceGit,
+        common,
+        objects,
+        publicDirectory,
+        publicCommon,
+        lineage,
+        owners,
+        head,
+      })
+      stores.add(objects)
+      for (const lender of lineage) stores.add(lender)
+    }
+    await prepareRepository(destination, source, options.commit)
+    const validateExclusions = async (
+      checkout: string,
+      head: string,
+      excluded: readonly string[],
+      metadata: import("./commit-graph.ts").SelectedCommitSubmodules,
+    ) => {
+      const declared = await readPrivateSubmodulePaths(git, checkout, head)
+      const direct = excluded.filter((path) => declared.includes(path))
+      const unexpected = excluded.filter(
+        (path) => !declared.includes(path) && !metadata.submodules.some((entry) => path.startsWith(`${entry.path}/`)),
+      )
+      if (
+        declared.length !== direct.length ||
+        unexpected.length > 0 ||
+        declared.some((path) => !excluded.includes(path))
+      ) {
+        throw new Error(
+          `frozen private exclusions disagree at ${checkout}@${head}: declared ${declared.join(", ")}; supplied ${excluded.join(", ")}`,
+        )
+      }
+    }
+    const preparation = await materializeSubmodules(
+      { run: (repo, args) => git.run({ repo, args }) },
+      { worktree: source, excludedSubmodules: options.excludedSubmodules },
+      {
+        prepareCommit: options.commit,
+        validate: async (checkout, head, excluded, metadata) => {
+          await validateExclusions(checkout, head, excluded, metadata)
+          const target = join(destination, relative(source, checkout))
+          if (target !== destination) await prepareRepository(target, checkout, head, publicDirectories.get(target))
+        },
+        materialize: async (parent, entry, descend) => {
+          const targetParent = join(destination, relative(source, parent))
+          const target = join(targetParent, entry.path)
+          const publicParent = publicDirectories.get(targetParent)
+          const privateParent = privateDirectories.get(targetParent)
+          if (publicParent === undefined || privateParent === undefined) {
+            throw new Error(`missing prepared metadata parent: ${targetParent}`)
+          }
+          publicDirectories.set(target, safeStorePath(publicParent, entry.name))
+          privateDirectories.set(target, safeStorePath(privateParent, entry.name))
+          return descend()
+        },
+      },
+    )
+    if (preparation.code !== 0) throw new Error(preparation.stderr)
+    const createRepository = async <T>(
+      checkout: string,
+      sourceCheckout: string,
+      head: string,
+      root: boolean,
+      consume: (writerLock: WriterLock) => Promise<T>,
+      privateGitDirectory?: string,
+    ): Promise<T> => {
+      const selected = prepared.get(checkout)
+      if (selected === undefined || selected.sourceCheckout !== sourceCheckout || selected.head !== head) {
+        throw new Error(`private repository differs from frozen preparation: ${checkout}`)
+      }
+      const { objects, lineage } = selected
+      if (!root) await mkdir(checkout, { recursive: true })
       retainedPaths.push(checkout)
       const gitDirectory = privateGitDirectory ?? join(checkout, ".git")
+      const held = heldLocks.get(gitDirectory)
+      if (held === undefined) throw new Error(`missing prepared private writer custody: ${gitDirectory}`)
       // The existing lease creates this new metadata directory and owns its first Git initialization.
       return createExclusive(join(gitDirectory, "yrd-worktree-mutations")).run(
         async (writerLock) => {
@@ -360,37 +448,6 @@ export async function projectPrivateGitWorktree(
             },
           )
           await run(checkout, ["cat-file", "-e", `${head}^{commit}`])
-          // A ref in the borrower cannot protect objects from a lender's own GC.
-          // Every validated lender must hold the selected commit under the existing exact-object pin.
-          for (const directory of owners) {
-            await createExclusive(join(directory, "yrd-worktree-mutations")).run(
-              async () => {
-                // A linked source may own a newer commit than its public lenders.
-                // Reuse exact-object transfer before anchoring it in every GC owner.
-                await ensureCommitObject({
-                  repository: checkout,
-                  remote: common,
-                  commit: head,
-                  git: {
-                    run: (request) =>
-                      git.run({
-                        ...request,
-                        args: [
-                          "--git-dir",
-                          directory,
-                          ...(request.args[0] === "fetch" ? ["-c", "protocol.file.allow=always"] : []),
-                          ...request.args,
-                        ],
-                      }),
-                  },
-                })
-                await run(checkout, ["--git-dir", directory, "update-ref", pinRef(head), head])
-              },
-              { holder: `private projection ${destination}` },
-            )
-          }
-          stores.add(objects)
-          for (const lender of lineage) stores.add(lender)
           await run(checkout, ["checkout", "--no-recurse-submodules", "-B", options.branch, head])
           repositories.push({
             path: relative(destination, checkout).split(sep).join("/"),
@@ -400,81 +457,135 @@ export async function projectPrivateGitWorktree(
           })
           return consume(writerLock)
         },
-        { holder: `private projection ${checkout}` },
+        { holder: `private projection ${checkout}`, held },
       )
     }
-    const materialized = await createRepository(destination, source, options.commit, true, (writerLock) =>
-      materializeSubmodules(
-        { run: (repo, args) => git.run({ repo, args }) },
-        {
-          worktree: destination,
-          writerLock,
-          referenceWorktree: source,
-          excludedSubmodules: options.excludedSubmodules,
-        },
-        {
-          validate: async (checkout, head, excluded, metadata) => {
-            const declared = await readPrivateSubmodulePaths(git, checkout, head)
-            const direct = excluded.filter((path) => declared.includes(path))
-            const unexpected = excluded.filter(
-              (path) =>
-                !declared.includes(path) && !metadata.submodules.some((entry) => path.startsWith(`${entry.path}/`)),
-            )
-            if (
-              declared.length !== direct.length ||
-              unexpected.length > 0 ||
-              declared.some((path) => !excluded.includes(path))
-            ) {
-              throw new Error(
-                `frozen private exclusions disagree at ${checkout}@${head}: declared ${declared.join(", ")}; supplied ${excluded.join(", ")}`,
+    const execute = async (): Promise<PrivateGitProjectionResult> => {
+      const materialized = await createRepository(destination, source, options.commit, true, (writerLock) =>
+        materializeSubmodules(
+          { run: (repo, args) => git.run({ repo, args }) },
+          {
+            worktree: destination,
+            writerLock,
+            referenceWorktree: source,
+            excludedSubmodules: options.excludedSubmodules,
+          },
+          {
+            validate: validateExclusions,
+            materialize: async (parent, entry, descend) => {
+              const checkout = join(parent, entry.path)
+              const directory = safeStorePath(await metadata(parent), entry.name)
+              await mkdir(dirname(directory), { recursive: true })
+              return createRepository(
+                checkout,
+                join(source, relative(destination, checkout)),
+                entry.target,
+                false,
+                descend,
+                directory,
               )
+            },
+          },
+        ),
+      )
+      if (materialized.code !== 0) throw new Error(materialized.stderr)
+      const projection: PrivateGitProjection = {
+        checkout: destination,
+        base: options.commit,
+        branch: options.branch,
+        createdAt: new Date().toISOString(),
+        repositories: repositories.map((repository) => ({
+          ...repository,
+          configurationSha256: metadataFileDigest(join(repository.gitDirectory, "config")),
+        })),
+        mounts: [
+          { source: destination, target: destination, mode: "rw" },
+          ...[...stores].map((store) => ({ source: store, target: store, mode: "ro" as const })),
+        ],
+        excluded: materialized.notCompared,
+      }
+      const result: PrivateGitProjectionResult = {
+        state: "updated",
+        partial: false,
+        repositories: [],
+        projection,
+        retainedPaths,
+      }
+      options.report?.(result)
+      return result
+    }
+    await mkdir(destination)
+    retainedPaths.push(destination)
+    const owners = [
+      ...new Set([
+        ...privateDirectories.values(),
+        ...[...prepared.values()].flatMap((selected) => [...selected.owners]),
+      ]),
+    ].sort()
+    const acquire = async (index: number): Promise<PrivateGitProjectionResult> => {
+      const owner = owners[index]
+      if (owner !== undefined) {
+        return createExclusive(join(owner, "yrd-worktree-mutations")).run(
+          async (held) => {
+            if (held === undefined) throw new Error(`missing issued projection custody: ${owner}`)
+            heldLocks.set(owner, held)
+            try {
+              return await acquire(index + 1)
+            } finally {
+              heldLocks.delete(owner)
             }
           },
-          materialize: async (parent, entry, descend) => {
-            const checkout = join(parent, entry.path)
-            const directory = safeStorePath(await metadata(parent), entry.name)
-            const publicParent = publicDirectories.get(parent)
-            if (publicParent === undefined) throw new Error(`missing declared public metadata for ${parent}`)
-            const publicDirectory = safeStorePath(publicParent, entry.name)
-            await mkdir(dirname(directory), { recursive: true })
-            return createRepository(
-              checkout,
-              join(source, relative(destination, checkout)),
-              entry.target,
-              false,
-              descend,
-              directory,
-              publicDirectory,
-            )
-          },
-        },
-      ),
-    )
-    if (materialized.code !== 0) throw new Error(materialized.stderr)
-    const projection: PrivateGitProjection = {
-      checkout: destination,
-      base: options.commit,
-      branch: options.branch,
-      createdAt: new Date().toISOString(),
-      repositories: repositories.map((repository) => ({
-        ...repository,
-        configurationSha256: metadataFileDigest(join(repository.gitDirectory, "config")),
-      })),
-      mounts: [
-        { source: destination, target: destination, mode: "rw" },
-        ...[...stores].map((store) => ({ source: store, target: store, mode: "ro" as const })),
-      ],
-      excluded: materialized.notCompared,
+          { holder: `private projection ${destination}` },
+        )
+      }
+      for (const selected of prepared.values()) {
+        if (
+          (await metadata(selected.sourceCheckout)) !== selected.sourceGit ||
+          (await commonDirectory(selected.sourceGit)) !== selected.common ||
+          (await commonDirectory(selected.publicDirectory)) !== selected.publicCommon
+        ) {
+          throw new Error(`public metadata changed before projection: ${selected.sourceCheckout}`)
+        }
+        const lineage = await alternatesLineage([selected.objects], "", { allowedObjects: new Set(stores) })
+        if (
+          lineage.length !== selected.lineage.length ||
+          lineage.some((store, index) => store !== selected.lineage[index])
+        ) {
+          throw new Error(`public object closure changed before projection: ${selected.sourceCheckout}`)
+        }
+      }
+      // Trusted preparation pins every selected baseline in its actual GC owner before private Git.
+      for (const selected of prepared.values()) {
+        for (const directory of selected.owners) {
+          await ensureCommitObject({
+            repository: selected.sourceCheckout,
+            remote: selected.common,
+            commit: selected.head,
+            git: {
+              run: (request) =>
+                git.run({
+                  ...request,
+                  args: [
+                    "--git-dir",
+                    directory,
+                    ...(request.args[0] === "fetch" ? ["-c", "protocol.file.allow=always"] : []),
+                    ...request.args,
+                  ],
+                }),
+            },
+          })
+          await run(selected.sourceCheckout, [
+            "--git-dir",
+            directory,
+            "update-ref",
+            pinRef(selected.head),
+            selected.head,
+          ])
+        }
+      }
+      return execute()
     }
-    const result: PrivateGitProjectionResult = {
-      state: "updated",
-      partial: false,
-      repositories: [],
-      projection,
-      retainedPaths,
-    }
-    options.report?.(result)
-    return result
+    return await acquire(0)
   } catch (error) {
     const result: PrivateGitProjectionResult = {
       state: "failed",

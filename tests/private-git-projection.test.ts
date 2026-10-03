@@ -707,22 +707,19 @@ it.each([
     const original = readFileSync(alternates, "utf8")
     for (const unapproved of [privateObjects, join(root, "missing-public-lender")]) {
       writeFileSync(alternates, `${original}${unapproved}\n`)
+      const destination = join(root, unapproved === privateObjects ? "rejected-private" : "rejected-missing")
       const rejected = await GitSuper.projectPrivateGitWorktree({
         sourceCheckout: source,
         commit: base,
         branch: "task/rejected-seat",
-        destination: join(root, unapproved === privateObjects ? "rejected-private" : "rejected-missing"),
+        destination,
         excludedSubmodules: ["vendor/beta"],
       })
       expect(rejected.state, JSON.stringify(rejected)).toBe("failed")
       expect(rejected.detail?.message).toContain(unapproved)
+      expect(rejected.retainedPaths).toEqual([])
+      expect(existsSync(destination)).toBe(false)
       writeFileSync(alternates, original)
-      // Each failed attempt preserves its partial tree at its own destination.
-      if (unapproved === privateObjects) {
-        const rootRecord = rejected.retainedPaths[0]
-        if (rootRecord === undefined) throw new Error("failed projection omitted partial root")
-        expect(existsSync(rootRecord)).toBe(true)
-      }
     }
   },
 )
