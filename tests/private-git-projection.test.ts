@@ -7,12 +7,27 @@
  */
 import { spawn, spawnSync } from "node:child_process"
 import { once } from "node:events"
-import { existsSync, readdirSync, readFileSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs"
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs"
 import { mkdtemp, rm } from "node:fs/promises"
 import { join } from "node:path"
 import { afterEach, expect, it } from "vitest"
 import * as GitSuper from "../src/index.ts"
 import { createExclusive } from "../src/exclusive.ts"
+import { cleanGitEnvironment, withGitEnvironment } from "../src/git.ts"
+import { createLocalGitProcess } from "../src/process.ts"
+import { createGit, createGitWorktreeStore } from "../src/worktree.ts"
+import { acquireRemovalWriterLeases, retainWorktreeModules } from "../src/worktree-removal.ts"
 import { shellQuote } from "../src/shell-command.ts"
 import { addNestedAlphaSubmodule, advanceRepository, canonicalTmpdir, createProductFixture, git } from "./fixture.ts"
 
@@ -210,6 +225,126 @@ it("refuses seat-configured native Git helpers before host custody can execute t
       if (mode === "symlink") unlinkSync(configuration)
       writeFileSync(configuration, original)
     }
+  }
+})
+
+// CTO63d0a344: copied metadata outside the host baseline must refuse before native Git.
+// Existing direct/include/symlink cases cover known configurations, not undeclared stores or hooks.
+it.each(["unknown-store", "unknown-hook"] as const)(
+  "refuses copied %s metadata before executing native helpers",
+  async (kind) => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-unknown-metadata-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const destination = join(root, "seat")
+    const projected = await GitSuper.projectPrivateGitWorktree({
+      sourceCheckout: fixture.product,
+      commit: fixture.productBase,
+      branch: "task/seat",
+      destination,
+      excludedSubmodules: [],
+    })
+    if (projected.projection === undefined) throw new Error(JSON.stringify(projected.detail))
+    const marker = join(root, "helper-executed")
+    const script = `#!${process.execPath}\nimport { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(marker)}, "executed"); process.stdout.write("token\\0");\n`
+    if (kind === "unknown-store") {
+      const checkout = join(root, "unknown-checkout")
+      const store = join(destination, ".git/modules/unknown")
+      git(root, "init", "--template=", "--separate-git-dir", store, checkout)
+      const helper = join(root, "unknown-helper.ts")
+      writeFileSync(helper, script)
+      git(checkout, "config", "core.fsmonitor", [process.execPath, helper].map(shellQuote).join(" "))
+      git(checkout, "status", "--porcelain")
+    } else {
+      const hooks = join(destination, ".git/hooks")
+      mkdirSync(hooks)
+      const hook = join(hooks, "post-checkout")
+      writeFileSync(hook, script)
+      chmodSync(hook, 0o700)
+      git(destination, "checkout", "task/seat")
+    }
+    expect(existsSync(marker), `${kind}: native helper positive control`).toBe(true)
+    unlinkSync(marker)
+    const retained = await GitSuper.retainPrivateGitProjection(projected.projection, join(root, "retained"))
+    expect(retained.state, JSON.stringify(retained)).toBe("failed")
+    expect(retained.detail?.message).toContain(kind === "unknown-store" ? "config" : "metadata")
+    expect(existsSync(marker), `${kind}: host custody executed an undeclared helper`).toBe(false)
+    expect(existsSync(destination)).toBe(true)
+    expect(retained.retainedPaths.length).toBeGreaterThan(0)
+  },
+)
+
+// CTO63d0a344 step 5: publication must not separate the final equality check from removal.
+// The helper-config race mutates at lease acquisition, before snapshot; this writes after proof publication.
+it("keeps the original when another process writes after custody proof publication", async () => {
+  const root = await mkdtemp(join(canonicalTmpdir(), "git-super-final-custody-write-"))
+  roots.push(root)
+  const fixture = createProductFixture(root)
+  const destination = join(root, "seat")
+  const projected = await GitSuper.projectPrivateGitWorktree({
+    sourceCheckout: fixture.product,
+    commit: fixture.productBase,
+    branch: "task/seat",
+    destination,
+    excludedSubmodules: [],
+  })
+  if (projected.projection === undefined) throw new Error(JSON.stringify(projected.detail))
+  const projection = projected.projection
+  const environment = {
+    ...cleanGitEnvironment(),
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_NO_LAZY_FETCH: "1",
+    GIT_NO_REPLACE_OBJECTS: "1",
+  }
+  const transport = createLocalGitProcess(environment)
+  const driver = createGit(transport, environment, 30_000)
+  const leases = acquireRemovalWriterLeases(join(destination, ".git"))
+  const authored = join(destination, "after-publication.ts")
+  let manifestPath: string | undefined
+  try {
+    await expect(
+      withGitEnvironment(environment, () =>
+        retainWorktreeModules(
+          driver,
+          destination,
+          destination,
+          {
+            root: join(root, "retained"),
+            report: (proof) => {
+              manifestPath = proof.manifest
+              const writer = spawnSync(
+                process.execPath,
+                [
+                  "-e",
+                  'import { writeFileSync } from "node:fs"; writeFileSync(process.argv[1], "authored after publication\\n");',
+                  authored,
+                ],
+                { encoding: "utf8" },
+              )
+              expect(writer.status, writer.stderr).toBe(0)
+            },
+          },
+          (repository, path) =>
+            createGitWorktreeStore({ repo: repository, gitProcess: transport, env: environment }).inspect(path),
+          leases.proof,
+          leases.created,
+          undefined,
+          [],
+          [],
+          projection,
+          undefined,
+          () => rmSync(destination, { recursive: true }),
+        ),
+      ),
+    ).rejects.toThrow("changed during retention")
+    expect(manifestPath).toBeDefined()
+    if (manifestPath === undefined) throw new Error("custody did not reach proof publication")
+    expect(existsSync(manifestPath)).toBe(true)
+    expect(readFileSync(authored, "utf8")).toBe("authored after publication\n")
+    expect(existsSync(destination)).toBe(true)
+  } finally {
+    leases.release()
   }
 })
 
