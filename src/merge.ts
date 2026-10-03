@@ -18,6 +18,7 @@ import {
   type SubmoduleTreeConflict,
 } from "./composition.ts"
 import { ensureCommitObject, pinRef } from "./objects.ts"
+import { composeGitlinkCarrier, type GitlinkCarrier } from "./gitlink-carrier.ts"
 import {
   materializeSubmodulesWithProcess,
   type SubmoduleMaterializationResult,
@@ -794,7 +795,7 @@ async function mergeObserved(
     }
     const composition =
       prospective.conflict === undefined
-        ? undefined
+        ? await composeWrongStoreGitlinks(git, root, head, target, prospective.failure, options.message, timeoutMs)
         : await composeDivergedGitlinks(git, root, head, target, prospective.conflict, options.message, timeoutMs)
     if (composition === undefined) {
       const gitlinkPaths = [
@@ -2081,7 +2082,17 @@ async function prospectiveTree(
 /** One gitlink this merge composed: the commit it created and the evidence that admitted it. */
 type ComposedGitlink = Readonly<{ sha: string; evidence: SuperMergeCompositionResult }>
 
-type ComposedGitlinks = Readonly<{ tree: string; composed: ReadonlyMap<string, ComposedGitlink> }>
+type ComposedGitlinks = Readonly<{
+  tree: string
+  composed: ReadonlyMap<string, ComposedGitlink>
+  /**
+   * EVERY gitlink path this composition stated, composed or fast-forwarded
+   * pin alike. The root conflict caller only needs `composed` to settle the
+   * native merge, but the wrong-store carrier must reproduce the whole head
+   * side of the gitlink divergence, so it reads this map instead.
+   */
+  substituted: ReadonlyMap<string, string>
+}>
 
 /** The scratch index the composed pins are staged into; the repository lock makes one name enough. */
 const COMPOSE_INDEX = "git-super-compose.index"
@@ -2217,6 +2228,138 @@ async function composeDivergedGitlinks(
     message,
     timeoutMs,
   )
+}
+
+/**
+ * COMPOSE A WRONG-STORE GITLINK DIVERGENCE (27268).
+ *
+ * Native `merge-tree --write-tree` resolves a diverged gitlink by reading the
+ * component commit from the ROOT repository, so with two components that each
+ * moved it can look for one component's commit in the other's store and exit
+ * 128 (`Could not read <oid>`). `prospectiveTree` then has no tree and no stages
+ * to compose from. The whole merge is instead re-stated over a scratch CARRIER:
+ * a one-parent commit whose only change from HEAD is the cleanly composed pin of
+ * each diverged component. `merge-tree(carrier, target)` then sees the gitlinks
+ * already settled and merges the ordinary root paths natively.
+ *
+ * The trigger is narrow. The 128 must name an exact EXPECTED pin of this merge,
+ * and every diverged component must compose cleanly in its own store; the real
+ * conflicting component earns its own named refusal instead. A carrier that
+ * disagrees with the composed tree, or a carrier merge that still conflicts,
+ * refuses by evidence rather than mutating. The carrier is scratch: it is never
+ * retained, published, or named by a user-visible marker.
+ */
+async function composeWrongStoreGitlinks(
+  git: GitProcess,
+  root: string,
+  head: string,
+  target: string,
+  failure: GitResultDetail,
+  message: string | undefined,
+  timeoutMs: number,
+): Promise<ComposedGitlinks | Readonly<{ failure: GitResultDetail }> | undefined> {
+  if (failure.code !== "submodule-history-unreadable") return undefined
+  const unreadable = failure.objectIds?.filter((oid) => oid !== head && oid !== target).at(-1)
+  if (unreadable === undefined) return undefined
+
+  const reader = { run: (request: GitProcessRequest) => git.run({ timeoutMs, ...request }) }
+  let headSubs: readonly CommitSubmodule[]
+  let targetSubs: readonly CommitSubmodule[]
+  let baseSubs: readonly CommitSubmodule[]
+  try {
+    headSubs = await readCommitSubmodules(reader, root, head)
+    targetSubs = await readCommitSubmodules(reader, root, target)
+    const base = await required(git, root, ["merge-base", head, target], "compose-gitlinks", timeoutMs)
+    baseSubs = await readCommitSubmodules(reader, root, base)
+  } catch (error) {
+    return { failure: composeUnavailable(root, [], "read the diverged gitlinks", messageOf(error)) }
+  }
+  const headPins = new Map(headSubs.map((entry) => [entry.path, entry.target] as const))
+  const targetPins = new Map(targetSubs.map((entry) => [entry.path, entry.target] as const))
+  const basePins = new Map(baseSubs.map((entry) => [entry.path, entry.target] as const))
+  const declared = new Map(
+    [...headSubs, ...targetSubs]
+      .filter((entry) => entry.url !== undefined)
+      .map((entry) => [entry.path, entry.url as string] as const),
+  )
+  const diverged = [...headPins.keys()]
+    .filter((path) => {
+      const ours = headPins.get(path)
+      const theirs = targetPins.get(path)
+      return ours !== undefined && theirs !== undefined && ours !== theirs && basePins.get(path) !== undefined
+    })
+    .toSorted((left, right) => (left < right ? -1 : left > right ? 1 : 0))
+  // The 128 must name a pin this merge actually carries, or another 128's refusal stands unchanged.
+  if (diverged.length === 0) return undefined
+  if (!diverged.some((path) => headPins.get(path) === unreadable || targetPins.get(path) === unreadable)) {
+    return undefined
+  }
+  const conflicts = diverged.map((path) => {
+    const stages = [
+      { stage: 1, mode: "160000", oid: basePins.get(path) as string },
+      { stage: 2, mode: "160000", oid: headPins.get(path) as string },
+      { stage: 3, mode: "160000", oid: targetPins.get(path) as string },
+    ]
+    const origin = declared.get(path)
+    return origin === undefined ? { path, stages } : { path, origin, stages }
+  })
+  const composed = await composeGitlinks(
+    git,
+    root,
+    conflicts,
+    head,
+    {
+      componentMerge: (path) => `git -C ${join(root, path)} merge-tree --write-tree --name-only <main> <pin>`,
+      entries: [],
+      head,
+      rootConflict: false,
+      stageEvidence: diverged
+        .map(
+          (path) =>
+            `Component ${path}: head ${headPins.get(path)} and target ${targetPins.get(path)} both move from base ${basePins.get(path)}.`,
+        )
+        .join(" "),
+      target,
+    },
+    message,
+    timeoutMs,
+  )
+  if (composed === undefined) return undefined
+  if ("failure" in composed) return composed
+  let carrier: GitlinkCarrier
+  try {
+    carrier = await composeGitlinkCarrier({
+      base: head,
+      git,
+      lock: "held",
+      message: "git-super: scratch carrier for a wrong-store gitlink merge",
+      pins: [...composed.substituted].map(([path, commit]) => ({ commit, path })),
+      repo: root,
+    })
+  } catch (error) {
+    return { failure: composeUnavailable(root, diverged, "build the wrong-store carrier", messageOf(error)) }
+  }
+  // The carrier must state exactly the tree the composition proved; a disagreement is evidence, not a retry.
+  if (carrier.tree !== composed.tree) {
+    return {
+      failure: composeUnavailable(
+        root,
+        diverged,
+        "verify the wrong-store carrier against the composed tree",
+        `carrier tree ${carrier.tree} disagrees with the composed tree ${composed.tree}`,
+      ),
+    }
+  }
+  const merged = await prospectiveTree(git, root, carrier.commit, target, timeoutMs)
+  if ("failure" in merged) {
+    return {
+      failure: {
+        ...merged.failure,
+        message: `The wrong-store carrier could not merge ${target} cleanly over the composed gitlinks: ${merged.failure.message}`,
+      },
+    }
+  }
+  return { composed: composed.composed, substituted: composed.substituted, tree: merged.tree }
 }
 
 /**
@@ -2541,7 +2684,7 @@ async function composeGitlinks(
       }
     }
   }
-  return { composed, tree: resolvedTree.tree }
+  return { composed, substituted, tree: resolvedTree.tree }
 }
 
 /**

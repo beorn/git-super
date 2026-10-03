@@ -14,6 +14,12 @@ export type ComposeGitlinkCarrierOptions = Readonly<{
   pins: readonly GitlinkCarrierPin[]
   message: string
   git?: GitProcess
+  /**
+   * Forwarded to every pin write. A caller that already holds this repository's
+   * writer lock (the root merge does) passes `held`, or the carrier deadlocks
+   * against the lock it is running under.
+   */
+  lock?: "acquire" | "held"
 }>
 
 export type GitlinkCarrier = Readonly<{ commit: string; tree: string; base: string }>
@@ -57,7 +63,13 @@ export async function composeGitlinkCarrier(options: ComposeGitlinkCarrierOption
     await required(["cat-file", "-e", `${options.base}^{commit}`])
     await required(["read-tree", options.base])
     for (const pin of [...options.pins].sort((a, b) => a.path.localeCompare(b.path))) {
-      const written = await writeGitlink({ repo: options.repo, path: pin.path, commit: pin.commit, git })
+      const written = await writeGitlink({
+        commit: pin.commit,
+        git,
+        ...(options.lock === undefined ? {} : { lock: options.lock }),
+        path: pin.path,
+        repo: options.repo,
+      })
       if (written.state !== "updated") {
         throw new Error(
           `git-super carrier: ${pin.path}@${pin.commit} ${written.state}: ${written.detail?.message ?? "no diagnostic"}`,

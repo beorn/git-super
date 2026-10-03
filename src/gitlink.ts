@@ -1,6 +1,6 @@
 import { isAbsolute, join, resolve } from "node:path"
 
-import { createExclusive } from "./exclusive.ts"
+import { createExclusive, type Exclusive } from "./exclusive.ts"
 import { parseIndexEntries, type IndexEntry } from "./index-entries.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
 import { gitSuperResult, type GitResultDetail, type GitSuperResult } from "./result.ts"
@@ -10,6 +10,13 @@ export type WriteGitlinkOptions = Readonly<{
   path: string
   commit: string
   git?: GitProcess
+  /**
+   * `held` states that the caller already owns this repository's writer lock,
+   * so the write must not try to take it again. `git super merge` holds the
+   * lock across its whole operation, and a carrier it builds inside that window
+   * would otherwise deadlock against itself. Defaults to `acquire`.
+   */
+  lock?: "acquire" | "held"
 }>
 
 type SubmoduleRepository = Readonly<{ repo: string; env?: NodeJS.ProcessEnv }>
@@ -68,7 +75,10 @@ export async function writeGitlink(options: WriteGitlinkOptions): Promise<GitSup
   let wrote = false
   let postWriteResult: GitSuperResult | undefined
   try {
-    const exclusive = createExclusive(await lockDirectory(git, repository))
+    const exclusive: Exclusive =
+      options.lock === "held"
+        ? { run: (operation) => operation() }
+        : createExclusive(await lockDirectory(git, repository))
     return await exclusive.run(
       async () => {
         const before = await indexEntries(git, repository, options.path)

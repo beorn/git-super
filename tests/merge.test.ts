@@ -624,6 +624,69 @@ function candidateWithRootChange(fixture: ProductFixture, name: string): string 
   return candidate
 }
 
+/**
+ * One product whose TWO hosted components each diverged two-sided from one base:
+ * `packages/alpha` and `vendor/beta` both moved on main (HEAD) and on the
+ * candidate to commits that neither contains. That is the shape that makes
+ * native `merge-tree --write-tree` look for a component commit in the other
+ * component's store and exit 128 (`Could not read <oid>`).
+ */
+function divergeBothProductComponents(
+  fixture: ProductFixture,
+  ours: Readonly<{ file: string; content: string }>,
+  theirs: Readonly<{ file: string; content: string }>,
+): Readonly<{ alphaOurs: string; alphaTheirs: string; candidate: string; head: string }> {
+  git(fixture.alpha, "checkout", "-q", "-b", "diverge", fixture.alphaBase)
+  const alphaTheirs = advanceRepository(fixture.alpha, theirs.file, theirs.content)
+  git(fixture.alpha, "checkout", "-q", "main")
+  const alphaOurs = advanceRepository(fixture.alpha, ours.file, ours.content)
+  git(fixture.beta, "checkout", "-q", "-b", "diverge", fixture.betaBase)
+  const betaTheirs = advanceRepository(fixture.beta, "beta-theirs.ts", "export const beta = 'theirs'\n")
+  git(fixture.beta, "checkout", "-q", "main")
+  const betaOurs = advanceRepository(fixture.beta, "beta-ours.ts", "export const beta = 'ours'\n")
+
+  git(fixture.product, "switch", "-q", "-c", "diverge-both")
+  checkoutPin(fixture.product, "packages/alpha", alphaTheirs)
+  checkoutPin(fixture.product, "vendor/beta", betaTheirs)
+  git(fixture.product, "add", "packages/alpha", "vendor/beta")
+  git(fixture.product, "commit", "-q", "-m", "candidate diverges both components")
+  const candidate = git(fixture.product, "rev-parse", "HEAD")
+  git(fixture.product, "switch", "-q", "main")
+  checkoutPin(fixture.product, "packages/alpha", alphaOurs)
+  checkoutPin(fixture.product, "vendor/beta", betaOurs)
+  git(fixture.product, "add", "packages/alpha", "vendor/beta")
+  git(fixture.product, "commit", "-q", "-m", "main diverges both components")
+  return { alphaOurs, alphaTheirs, candidate, head: git(fixture.product, "rev-parse", "HEAD") }
+}
+
+function checkoutPin(product: string, path: string, sha: string): void {
+  const store = join(product, path)
+  git(store, "fetch", "-q", "origin")
+  git(store, "checkout", "-q", sha)
+}
+
+/**
+ * A git process whose FIRST root `merge-tree` reproduces the wrong-store 128.
+ * The real trigger needs a component object that lives only in the other
+ * component's store, which no single-repository fixture can hold; every later
+ * call (the carrier merge included) runs natively, so the branch under test is
+ * the only thing simulated.
+ */
+function wrongStoreFirstMerge(local: GitProcess, product: string, unreadable: string): GitProcess {
+  let calls = 0
+  return {
+    run: (request) => {
+      if (request.repo === product && request.args.includes("merge-tree")) {
+        calls += 1
+        if (calls === 1) {
+          return Promise.resolve({ code: 128, stdout: "", stderr: `error: Could not read ${unreadable}\n` })
+        }
+      }
+      return local.run(request)
+    },
+  }
+}
+
 describe("git super merge", () => {
   /**
    * @failure A newly added checkout-free parent hides missing descendants behind a generic error and an unusable repair (26996).
@@ -3218,6 +3281,136 @@ describe("git super merge", () => {
     expect(result.detail?.message).toContain(`error: Could not read ${unreadable}`)
     expect(result.detail?.objectIds).toContain(unreadable)
     expect(result.detail?.message).not.toContain("merge-conflict")
+  })
+
+  /**
+   * @failure Root merge with two diverged components searches the wrong object store and refuses a mergeable change (27268).
+   * @level l1
+   * @consumer Yrd settled candidate preparation and landing
+   * @testonly none; the wrong-store 128 itself is simulated, every composition step is native
+   */
+  it("composes both cleanly diverged gitlinks over a scratch carrier when the wrong-store 128 names a real pin", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-wrong-store-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const diverged = divergeBothProductComponents(
+      fixture,
+      { content: "export const alpha = 'ours'\n", file: "alpha-ours.ts" },
+      { content: "export const alpha = 'theirs'\n", file: "alpha-theirs.ts" },
+    )
+    const local = createLocalGitProcess()
+    const result = await superMerge({
+      commit: diverged.candidate,
+      git: wrongStoreFirstMerge(local, fixture.product, diverged.alphaOurs),
+      repo: fixture.product,
+    })
+
+    expect(result.state, JSON.stringify(result)).toBe("updated")
+    // Final parents are the real HEAD and the merged target, never the carrier.
+    const parents = git(fixture.product, "rev-list", "--parents", "-n", "1", "HEAD").trim().split(/\s+/u).slice(1)
+    expect(parents).toEqual([diverged.head, diverged.candidate])
+    // The recorded pin is the component merge of BOTH sides, and the component branch did not move.
+    const alphaPin = git(fixture.product, "ls-tree", "HEAD", "packages/alpha").trim().split(/\s+/u)[2] ?? ""
+    expect(git(fixture.alpha, "rev-list", "--parents", "-n", "1", alphaPin).trim().split(/\s+/u).slice(1)).toEqual([
+      diverged.alphaOurs,
+      diverged.alphaTheirs,
+    ])
+    expect(git(fixture.alpha, "rev-parse", "HEAD")).toBe(diverged.alphaOurs)
+    // Nothing user-visible names a carrier commit.
+    expect(git(fixture.product, "log", "-1", "--format=%B")).not.toContain("carrier")
+  })
+
+  /**
+   * @failure --preserve-conflicts on the wrong-store shape must not bypass the composed pins or leak the carrier (27268).
+   * @level l1
+   * @consumer Yrd settled candidate preparation and landing
+   * @testonly none; the wrong-store 128 is simulated, composition and application are native
+   */
+  it("keeps the composed pins under --preserve-conflicts on the wrong-store shape", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-wrong-store-preserve-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const diverged = divergeBothProductComponents(
+      fixture,
+      { content: "export const alpha = 'ours'\n", file: "alpha-ours.ts" },
+      { content: "export const alpha = 'theirs'\n", file: "alpha-theirs.ts" },
+    )
+    const local = createLocalGitProcess()
+    const result = await superMerge({
+      commit: diverged.candidate,
+      git: wrongStoreFirstMerge(local, fixture.product, diverged.alphaOurs),
+      preserveConflicts: true,
+      repo: fixture.product,
+    })
+
+    expect(result.state, JSON.stringify(result)).toBe("updated")
+    expect(result.partial).toBe(false)
+    const alphaPin = git(fixture.product, "ls-tree", "HEAD", "packages/alpha").trim().split(/\s+/u)[2] ?? ""
+    expect(git(fixture.alpha, "rev-list", "--parents", "-n", "1", alphaPin).trim().split(/\s+/u).slice(1)).toEqual([
+      diverged.alphaOurs,
+      diverged.alphaTheirs,
+    ])
+    expect(git(fixture.product, "log", "-1", "--format=%B")).not.toContain("carrier")
+  })
+
+  /**
+   * @failure A wrong-store divergence with a real component conflict must name the component and touch nothing (27268).
+   * @level l1
+   * @consumer Yrd settled candidate preparation and landing
+   * @testonly none; the component conflict is native, only the 128 is simulated
+   */
+  it("names the conflicting component and refuses before mutation when the wrong-store piece will not compose", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-wrong-store-conflict-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const diverged = divergeBothProductComponents(
+      fixture,
+      { content: "export const alpha = 'ours'\n", file: "alpha.ts" },
+      { content: "export const alpha = 'theirs'\n", file: "alpha.ts" },
+    )
+    const local = createLocalGitProcess()
+    const result = await superMerge({
+      commit: diverged.candidate,
+      git: wrongStoreFirstMerge(local, fixture.product, diverged.alphaOurs),
+      repo: fixture.product,
+    })
+
+    expect(result.state, JSON.stringify(result)).toBe("failed")
+    expect(result.partial).toBe(false)
+    expect(result.detail?.code).toBe("gitlink-compose-refused")
+    expect(result.detail?.message).toContain("packages/alpha")
+    expect(result.detail?.message).toContain("alpha.ts")
+    expect(git(fixture.product, "rev-parse", "HEAD")).toBe(diverged.head)
+    expect(git(fixture.product, "status", "--porcelain").trim()).toBe("")
+  })
+
+  /**
+   * @failure A 128 that names something this merge does not carry must keep the existing refusal (27268).
+   * @level l1
+   * @consumer Yrd settled candidate preparation and landing
+   * @testonly none
+   */
+  it("keeps the existing unreadable refusal when the wrong-store 128 names a foreign object", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-wrong-store-foreign-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const diverged = divergeBothProductComponents(
+      fixture,
+      { content: "export const alpha = 'ours'\n", file: "alpha-ours.ts" },
+      { content: "export const alpha = 'theirs'\n", file: "alpha-theirs.ts" },
+    )
+    const foreign = "a".repeat(40)
+    const local = createLocalGitProcess()
+    const result = await superMerge({
+      commit: diverged.candidate,
+      git: wrongStoreFirstMerge(local, fixture.product, foreign),
+      repo: fixture.product,
+    })
+
+    expect(result.state, JSON.stringify(result)).toBe("failed")
+    expect(result.detail?.code).toBe("submodule-history-unreadable")
+    expect(result.detail?.objectIds).toContain(foreign)
+    expect(git(fixture.product, "rev-parse", "HEAD")).toBe(diverged.head)
   })
 
   it("refuses an unreadable submodule main before merging and names the resource", async () => {
