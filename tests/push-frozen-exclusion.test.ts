@@ -7,7 +7,7 @@
  * @reach fs-walk <fixture-only: temporary repositories>
  * @testonly none
  */
-import { existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { afterAll, beforeAll, describe, expect, test } from "vitest"
 import { superMerge } from "../src/merge.ts"
@@ -35,7 +35,7 @@ beforeAll(() => {
   const home = mkdtempSync(join(canonicalTmpdir(), "git-super-frozen-exclusion-config-"))
   fixtures.push(home)
   config = join(home, "gitconfig")
-  writeFileSync(config, "[protocol \"file\"]\n\tallow = always\n")
+  writeFileSync(config, '[protocol "file"]\n\tallow = always\n')
   process.env.GIT_CONFIG_GLOBAL = config
 })
 afterAll(() => {
@@ -76,7 +76,7 @@ function excludedFixture(): Readonly<{
   const rootRemote = join(fixture, "root.git")
   git(fixture, "init", "--bare", "-q", "-b", "main", rootRemote)
   // One fixture's hosted names at a time: an earlier fixture's mapping for the same URL would win.
-  writeFileSync(config, "[protocol \"file\"]\n\tallow = always\n")
+  writeFileSync(config, '[protocol "file"]\n\tallow = always\n')
   git(fixture, "config", "--file", config, `url.${rootRemote}.insteadOf`, ROOT_URL)
   git(fixture, "config", "--file", config, `url.${child.remote}.insteadOf`, CHILD_URL)
   const root = join(fixture, "root")
