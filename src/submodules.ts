@@ -13,7 +13,7 @@ import { createLocalGitProcess, type GitProcess, type GitProcessRequest, type Gi
 import { shellQuote } from "./shell-command.ts"
 import { nestedStoreMissingDetail, preparedPinFetchArgs, preparedSubmoduleStore } from "./submodule-prepare.ts"
 import { resolveSubmoduleOrigin } from "./submodule-origin.ts"
-import { readCommitSubmodules, type SelectedCommitSubmodules } from "./commit-graph.ts"
+import { readCommitSubmodules, type CommitSubmodule, type SelectedCommitSubmodules } from "./commit-graph.ts"
 
 export const SUBMODULE_ALTERNATE_LOCATION = "superproject"
 export const SUBMODULE_ALTERNATE_ERROR_STRATEGY = "info"
@@ -601,13 +601,25 @@ export async function syncOriginTrackingRefs(
 export async function materializeSubmodules(
   git: SubmoduleGit,
   options: SubmoduleMaterializationOptions,
+  privateProjection?: Readonly<{
+    validate(
+      worktree: string,
+      head: string,
+      excluded: readonly string[],
+      metadata: SelectedCommitSubmodules,
+    ): Promise<void>
+    materialize(parent: string, entry: CommitSubmodule): Promise<void>
+  }>,
 ): Promise<SubmoduleMaterializationResult> {
   validateExcludedSubmodules(options.excludedSubmodules)
   const log = options.log
-  const referenceRoot = await discoverReferenceWorktree(git, {
-    worktree: options.worktree,
-    referenceWorktree: options.referenceWorktree ?? options.worktree,
-  })
+  const referenceRoot =
+    privateProjection === undefined
+      ? await discoverReferenceWorktree(git, {
+          worktree: options.worktree,
+          referenceWorktree: options.referenceWorktree ?? options.worktree,
+        })
+      : options.referenceWorktree
   if (referenceRoot !== undefined && typeof referenceRoot !== "string") {
     return {
       ...referenceRoot,
@@ -749,6 +761,7 @@ export async function materializeSubmodules(
         stderr: `${error instanceof Error ? error.message : String(error)}${resultDetail?.paths === undefined ? "" : `\nPaths: ${resultDetail.paths.join(", ")}`}${resultDetail?.remedy === undefined ? "" : `\n${resultDetail.remedy}`}`,
       }
     }
+    await privateProjection?.validate(worktree, head, excluded, metadata)
     const entries = [...metadata.submodules]
     for (const entry of entries) {
       try {
@@ -823,6 +836,16 @@ export async function materializeSubmodules(
     // always has submodules, so the one enumerate measurement worth reading
     // (24ms of 402ms on the measured run) still lands on the depth-0 span.
     if (entries.length === 0) return success()
+    if (privateProjection !== undefined) {
+      for (const entry of entries) {
+        await privateProjection.materialize(worktree, entry)
+        considered += 1
+        borrowed += 1
+        const nested = await walk(join(worktree, entry.path), undefined, durableLevel, undefined, depth + 1)
+        if (nested.code !== 0) return nested
+      }
+      return success()
+    }
     // Laps rather than nested spans: the phases below are sequential and always
     // run in the same order, so one record with five deltas reads better than
     // five span lines per level of recursion. `gitlinks` is on the span so a
