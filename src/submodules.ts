@@ -1421,150 +1421,195 @@ async function materializeSubmodulesUnderLock(
       const freshClone = !existsSync(join(submoduleDir, ".git"))
       const level = await durableLevel()
       if (typeof level !== "string") return level
-      // The span closes over the `git.run` ALONE. Letting it wrap the recursive
-      // walk below would bill every nested submodule to its parent, so the one
-      // submodule at the root of a deep tree would appear to be the slow one
-      // and the actually-slow leaf would never show up in the ranking.
-      const updated = await (async () => {
-        using updateSpan = log?.span?.("update", { path, source })
-        // Run the standard creator directly through this process owner. Native
-        // submodule--helper clears the object context on its clone child.
-        let result: SubmoduleGitResult = success()
-        if (freshClone) {
-          try {
-            validateExcludedSubmodules([name])
-          } catch {
-            return {
-              code: 1,
-              stdout: "",
-              stderr: `unsafe submodule name ${JSON.stringify(name)} in ${worktree}; use a normalized module store name before materialization`,
-            }
+      let moduleDir: string | undefined
+      let initialized = false
+      if (freshClone) {
+        try {
+          validateExcludedSubmodules([name])
+        } catch {
+          return {
+            code: 1,
+            stdout: "",
+            stderr: `unsafe submodule name ${JSON.stringify(name)} in ${worktree}; use a normalized module store name before materialization`,
           }
-          const parentDir = await git.run(worktree, ["rev-parse", "--absolute-git-dir"], true)
-          if (parentDir.code !== 0 || parentDir.stdout.trim() === "") {
-            return {
-              ...parentDir,
-              code: parentDir.code || 1,
-              stderr: `cannot resolve module metadata in ${worktree}; preserve its checkout before materialization\n${parentDir.stderr}`,
-            }
+        }
+        const parentDir = await git.run(worktree, ["rev-parse", "--absolute-git-dir"], true)
+        if (parentDir.code !== 0 || parentDir.stdout.trim() === "") {
+          return {
+            ...parentDir,
+            code: parentDir.code || 1,
+            stderr: `cannot resolve module metadata in ${worktree}; preserve its checkout before materialization\n${parentDir.stderr}`,
           }
-          const moduleDir = join(parentDir.stdout.trim(), "modules", name)
-          if (existsSync(moduleDir)) {
-            await mkdir(submoduleDir, { recursive: true })
-            await writeFile(
-              join(submoduleDir, ".git"),
-              `gitdir: ${relative(submoduleDir, moduleDir).split("\\").join("/")}\n`,
-            )
-            result = await git.run(
-              submoduleDir,
-              ["config", "--local", "core.worktree", relative(moduleDir, submoduleDir)],
-              true,
-            )
-          } else {
-            await mkdir(dirname(moduleDir), { recursive: true })
-            // Native clone's --reference writes into GIT_OBJECT_DIRECTORY.
-            // Initialize normal metadata and apply the existing physical
-            // borrowing policy to that metadata, never to the selected store.
-            result = await git.run(worktree, ["init", "--quiet", "--separate-git-dir", moduleDir, submoduleDir], true)
-            if (result.code !== 0) return result
-            for (const config of [
-              ["remote.origin.url", remote],
-              ["remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"],
-            ]) {
-              result = await git.run(submoduleDir, ["config", "--local", ...config], true)
-              if (result.code !== 0) return result
-            }
-            if (nestedReference === undefined) {
-              // Populate the configured origin head refspec just as clone does;
-              // a later SHA-only fetch fills FETCH_HEAD, not tracking refs.
-              result = await git.run(submoduleDir, ["fetch", "origin"], true)
-              if (result.code !== 0) return result
-            }
-            if (nestedReference !== undefined) {
-              const referenceDir = await git.run(
-                nestedReference,
-                ["rev-parse", "--path-format=absolute", "--git-common-dir"],
-                true,
-              )
-              if (referenceDir.code !== 0 || referenceDir.stdout.trim() === "") {
-                return {
-                  ...referenceDir,
-                  code: referenceDir.code || 1,
-                  stderr: `cannot resolve reference metadata in ${nestedReference}\n${referenceDir.stderr}`,
+        }
+        moduleDir = join(parentDir.stdout.trim(), "modules", name)
+        if (!existsSync(moduleDir)) {
+          // The parent lease owns creating its absent child. Do not create a
+          // lease directory that would make an uninitialized store look present.
+          await mkdir(dirname(moduleDir), { recursive: true })
+          const created = await git.run(
+            worktree,
+            ["init", "--quiet", "--separate-git-dir", moduleDir, submoduleDir],
+            true,
+          )
+          if (created.code !== 0) return created
+          initialized = true
+        }
+      }
+      const owner = await git.run(
+        moduleDir ?? submoduleDir,
+        ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        true,
+      )
+      const childCommon = owner.stdout.trim()
+      if (owner.code !== 0 || owner.timedOut || owner.failure !== undefined || !isAbsolute(childCommon)) {
+        return {
+          ...owner,
+          code: owner.code || 1,
+          stderr: `cannot establish child materializer writer owner for ${submoduleDir}\n${owner.stderr}`,
+        }
+      }
+      return createExclusive(join(childCommon, "yrd-worktree-mutations"), {
+        timeoutMs: options.mutationLockTimeoutMs ?? DEFAULT_MUTATION_LOCK_WAIT_MS,
+      }).run(
+        async () => {
+          // The span closes over the `git.run` ALONE. Letting it wrap the recursive
+          // walk below would bill every nested submodule to its parent, so the one
+          // submodule at the root of a deep tree would appear to be the slow one
+          // and the actually-slow leaf would never show up in the ranking.
+          const updated = await (async () => {
+            using updateSpan = log?.span?.("update", { path, source })
+            // Run the standard creator directly through this process owner. Native
+            // submodule--helper clears the object context on its clone child.
+            let result: SubmoduleGitResult = success()
+            if (freshClone) {
+              if (moduleDir === undefined) {
+                throw new Error(`fresh child ${submoduleDir} has no selected module directory`)
+              }
+              if (!initialized) {
+                await mkdir(submoduleDir, { recursive: true })
+                await writeFile(
+                  join(submoduleDir, ".git"),
+                  `gitdir: ${relative(submoduleDir, moduleDir).split("\\").join("/")}\n`,
+                )
+                result = await git.run(
+                  submoduleDir,
+                  ["config", "--local", "core.worktree", relative(moduleDir, submoduleDir)],
+                  true,
+                )
+              } else {
+                // Native clone's --reference writes into GIT_OBJECT_DIRECTORY.
+                // Initialize normal metadata and apply the existing physical
+                // borrowing policy to that metadata, never to the selected store.
+                for (const config of [
+                  ["remote.origin.url", remote],
+                  ["remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"],
+                ]) {
+                  result = await git.run(submoduleDir, ["config", "--local", ...config], true)
+                  if (result.code !== 0) return result
+                }
+                if (nestedReference === undefined) {
+                  // Populate the configured origin head refspec just as clone does;
+                  // a later SHA-only fetch fills FETCH_HEAD, not tracking refs.
+                  result = await git.run(submoduleDir, ["fetch", "origin"], true)
+                  if (result.code !== 0) return result
+                }
+                if (nestedReference !== undefined) {
+                  const referenceDir = await git.run(
+                    nestedReference,
+                    ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                    true,
+                  )
+                  if (referenceDir.code !== 0 || referenceDir.stdout.trim() === "") {
+                    return {
+                      ...referenceDir,
+                      code: referenceDir.code || 1,
+                      stderr: `cannot resolve reference metadata in ${nestedReference}\n${referenceDir.stderr}`,
+                    }
+                  }
+                  result = await anchorDurableAlternates(git, submoduleDir, referenceDir.stdout.trim(), log)
+                  if (result.code !== 0) return result
+                  const heads = await git.run(
+                    nestedReference,
+                    ["for-each-ref", "--format=%(objectname) %(refname)", "refs/heads"],
+                    true,
+                  )
+                  if (heads.code !== 0) return heads
+                  const updates = heads.stdout
+                    .trim()
+                    .split("\n")
+                    .filter(Boolean)
+                    .map((line) => {
+                      const [oid, ref] = line.split(" ")
+                      return `update refs/remotes/origin/${ref?.slice("refs/heads/".length)} ${oid}\n`
+                    })
+                    .join("")
+                  if (updates !== "") {
+                    result = await git.run(submoduleDir, ["update-ref", "--stdin"], true, { stdin: updates })
+                  }
                 }
               }
-              result = await anchorDurableAlternates(git, submoduleDir, referenceDir.stdout.trim(), log)
               if (result.code !== 0) return result
-              const heads = await git.run(
-                nestedReference,
-                ["for-each-ref", "--format=%(objectname) %(refname)", "refs/heads"],
-                true,
-              )
-              if (heads.code !== 0) return heads
-              const updates = heads.stdout
-                .trim()
-                .split("\n")
-                .filter(Boolean)
-                .map((line) => {
-                  const [oid, ref] = line.split(" ")
-                  return `update refs/remotes/origin/${ref?.slice("refs/heads/".length)} ${oid}\n`
-                })
-                .join("")
-              if (updates !== "") {
-                result = await git.run(submoduleDir, ["update-ref", "--stdin"], true, { stdin: updates })
+            }
+            if (!isLocal) {
+              const present = await git.run(submoduleDir, ["cat-file", "-e", `${required}^{commit}`], true)
+              if (present.code !== 0) {
+                result = await git.run(submoduleDir, ["fetch", "origin", required], true)
+                if (result.code !== 0) return result
               }
             }
+            const current = await git.run(submoduleDir, ["rev-parse", "--verify", "HEAD"], true)
+            if (freshClone || options.force || current.code !== 0 || current.stdout.trim() !== required) {
+              const args =
+                (freshClone && !policy.startsWith("!")) || policy === "checkout"
+                  ? ["checkout", "--quiet", "--detach", ...(options.force ? ["--force"] : []), required]
+                  : policy.startsWith("!")
+                    ? ["-c", `alias.git-super-submodule-update=${policy}`, "git-super-submodule-update", required]
+                    : [policy, required]
+              result = await git.run(submoduleDir, args, true)
+            }
+            if (updateSpan !== undefined) {
+              Object.assign(updateSpan.spanData, { outcome: result.code === 0 ? "ok" : "failed" })
+            }
+            return result
+          })()
+          if (updated.code !== 0) {
+            return {
+              ...updated,
+              stderr: `submodule '${logicalPath === "" ? path : `${logicalPath}/${path}`}' at ${required}: materialization failed\n${updated.stderr}`,
+            }
           }
-          if (result.code !== 0) return result
-        }
-        if (!isLocal) {
-          const present = await git.run(submoduleDir, ["cat-file", "-e", `${required}^{commit}`], true)
-          if (present.code !== 0) {
-            result = await git.run(submoduleDir, ["fetch", "origin", required], true)
-            if (result.code !== 0) return result
+          if (freshClone && nestedReference !== undefined) {
+            const synced = await syncOriginTrackingRefs(git, submoduleDir, nestedReference, log)
+            if (synced.code !== 0) return synced
           }
-        }
-        const current = await git.run(submoduleDir, ["rev-parse", "--verify", "HEAD"], true)
-        if (freshClone || options.force || current.code !== 0 || current.stdout.trim() !== required) {
-          const args =
-            (freshClone && !policy.startsWith("!")) || policy === "checkout"
-              ? ["checkout", "--quiet", "--detach", ...(options.force ? ["--force"] : []), required]
-              : policy.startsWith("!")
-                ? ["-c", `alias.git-super-submodule-update=${policy}`, "git-super-submodule-update", required]
-                : [policy, required]
-          result = await git.run(submoduleDir, args, true)
-        }
-        if (updateSpan !== undefined) {
-          Object.assign(updateSpan.spanData, { outcome: result.code === 0 ? "ok" : "failed" })
-        }
-        return result
-      })()
-      if (updated.code !== 0) {
-        return {
-          ...updated,
-          stderr: `submodule '${logicalPath === "" ? path : `${logicalPath}/${path}`}' at ${required}: materialization failed\n${updated.stderr}`,
-        }
-      }
-      if (freshClone && nestedReference !== undefined) {
-        const synced = await syncOriginTrackingRefs(git, submoduleDir, nestedReference, log)
-        if (synced.code !== 0) return synced
-      }
-      const durableGitDir = join(level, "modules", name)
-      const anchored = await anchorDurableAlternates(git, submoduleDir, durableGitDir, log)
-      if (anchored.code !== 0) return anchored
-      return walk(
-        submoduleDir,
-        nestedReference,
-        () => Promise.resolve(durableGitDir),
-        undefined,
-        depth + 1,
-        referenceIsPrepared,
-        { commit: required, remote },
-        logicalPath === "" ? path : `${logicalPath}/${path}`,
+          const durableGitDir = join(level, "modules", name)
+          const anchored = await anchorDurableAlternates(git, submoduleDir, durableGitDir, log)
+          if (anchored.code !== 0) return anchored
+          return walk(
+            submoduleDir,
+            nestedReference,
+            () => Promise.resolve(durableGitDir),
+            undefined,
+            depth + 1,
+            referenceIsPrepared,
+            { commit: required, remote },
+            logicalPath === "" ? path : `${logicalPath}/${path}`,
+          )
+        },
+        { holder: `materialize child ${submoduleDir}` },
       )
     }
     for (let start = 0; start < local.length; start += MAX_CONCURRENT_SUBMODULE_UPDATES) {
-      const results = await Promise.all(local.slice(start, start + MAX_CONCURRENT_SUBMODULE_UPDATES).map(update))
+      // A thrown custody refusal must not release the parent while a sibling
+      // writer or its Git child is still running under that parent.
+      const settled = await Promise.allSettled(local.slice(start, start + MAX_CONCURRENT_SUBMODULE_UPDATES).map(update))
+      const rejected = settled.filter((result) => result.status === "rejected")
+      const firstRejection = rejected[0]
+      if (rejected.length === 1 && firstRejection !== undefined) throw firstRejection.reason
+      if (rejected.length > 1) {
+        throw new AggregateError(rejected.map((result) => result.reason as unknown), `child materialization failed in ${worktree}`)
+      }
+      const results = settled.flatMap((result) => result.status === "fulfilled" ? [result.value] : [])
       const failed = results.find((result) => result.code !== 0)
       if (failed !== undefined) return failed
     }

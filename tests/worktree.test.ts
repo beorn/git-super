@@ -1126,6 +1126,42 @@ describe("createGitWorktreeStore", () => {
     }
   })
 
+  /**
+   * @failure Parent materialization rewrites child routing metadata while the child's actual writer lease is held (27143).
+   * @level l1
+   * @consumer Yrd materialization and private projection custody
+   */
+  it("refuses child materialization under an independently held child writer lease", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-child-custody-"))
+    const fixture = createProductFixture(root)
+    const child = join(fixture.product, "packages", "alpha")
+    const childCommon = git(child, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim()
+    const config = await readFile(join(childCommon, "config"))
+    const held = await acquireExclusive(join(childCommon, "yrd-worktree-mutations"), { timeoutMs: 0 })
+    try {
+      await expect(
+        materializeSubmodulesWithProcess(createLocalGitProcess(), {
+          worktree: fixture.product,
+          paths: ["packages/alpha"],
+          mutationLockTimeoutMs: 0,
+        }),
+      ).rejects.toThrow(/worktree mutation lock is busy/u)
+      expect(await readFile(join(childCommon, "config"))).toEqual(config)
+      held.release()
+      const result = await materializeSubmodulesWithProcess(createLocalGitProcess(), {
+        worktree: fixture.product,
+        paths: ["packages/alpha"],
+        mutationLockTimeoutMs: 0,
+      })
+      expect(result.code, result.stderr).toBe(0)
+      const next = await acquireExclusive(join(childCommon, "yrd-worktree-mutations"), { timeoutMs: 0 })
+      next.release()
+    } finally {
+      held.release()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it("checks the heal guards before locking and still takes the lock when repair is required", async () => {
     const repo = await mkdtemp(join(tmpdir(), "git-super-config-heal-lock-"))
     const commonDir = join(repo, ".git")
