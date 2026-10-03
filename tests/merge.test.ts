@@ -869,8 +869,9 @@ describe("git super merge", () => {
             }
             if (
               (failure === "exit" || failure === "throw" || failure === "timeout" || failure === "unknown-pin") &&
-              request.args.includes("update") &&
-              request.args.includes("vendor/gamma")
+              request.repo === checkout &&
+              request.args[0] === "init" &&
+              request.args.at(-1) === join(checkout, "vendor/gamma")
             ) {
               if (failure === "throw") throw new Error("injected thrown initialization failure")
               if (failure === "timeout") {
@@ -958,11 +959,14 @@ describe("git super merge", () => {
           return
         }
         // The caller must borrow on its OWN call; a second explicit-reference call masked the regression.
-        const update = requests.find(
-          (request) => request.args.includes("update") && request.args.includes("vendor/gamma"),
+        const checkoutRequest = requests.find(
+          (request) => request.repo === join(checkout, "vendor/gamma") && request.args[0] === "checkout",
         )
-        expect(update?.args).toEqual(expect.arrayContaining(["--reference", "--no-fetch"]))
-        expect(update?.timeoutMs).toBe(12345)
+        expect(checkoutRequest?.args).toEqual(["checkout", "--quiet", "--detach", gammaPin])
+        expect(checkoutRequest?.timeoutMs).toBe(12345)
+        expect(
+          requests.some((request) => request.repo === join(checkout, "vendor/gamma") && request.args[0] === "fetch"),
+        ).toBe(false)
         expect(result.initializations).toContainEqual(
           expect.objectContaining({
             path: "vendor/gamma",
