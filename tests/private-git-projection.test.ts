@@ -21,7 +21,7 @@ import {
 } from "node:fs"
 import { mkdtemp, rm } from "node:fs/promises"
 import { join } from "node:path"
-import { afterEach, expect, it } from "vitest"
+import { afterEach, expect, it, vi } from "vitest"
 import * as GitSuper from "../src/index.ts"
 import { createExclusive } from "../src/exclusive.ts"
 import { cleanGitEnvironment, withGitEnvironment } from "../src/git.ts"
@@ -363,13 +363,21 @@ it.each([
         expect(dependency.target === donorGit || dependency.target.startsWith(`${donorGit}/`)).toBe(false)
       }
       expect(statSync(join(proof.retained, "yrd-worktree-mutations/writer.lock")).size).toBe(0)
-      await store.remove(source, {
-        retention: {
-          root: join(root, "retained-donor"),
-          report: (removed) => expect(existsSync(removed.manifest)).toBe(true),
-        },
-        excludedSubmodules,
-      })
+      const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true)
+      try {
+        await store.remove(source, {
+          retention: {
+            root: join(root, "retained-donor"),
+            report: (removed) => expect(existsSync(removed.manifest)).toBe(true),
+          },
+          excludedSubmodules,
+        })
+        expect(stderr.mock.calls.map(([line]) => String(line)).join("")).toContain(
+          `retained borrower ${proof.retained} has no objects links into removable linked stores; dropped registry entry `,
+        )
+      } finally {
+        stderr.mockRestore()
+      }
       expect(existsSync(source)).toBe(false)
       expect(existsSync(proof.retained)).toBe(true)
       git(fixture.product, "--git-dir", proof.retained, "cat-file", "-e", `${base}^{commit}`)
