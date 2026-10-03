@@ -545,8 +545,8 @@ describe("git super pull --ff-only", () => {
           requests.push(request)
           if (
             (failure === "throw" || failure === "timeout") &&
-            request.args.includes("update") &&
-            request.args.includes("vendor/gamma")
+            request.repo === join(checkout, "vendor/gamma") &&
+            request.args[0] === "checkout"
           ) {
             if (failure === "throw") throw new Error("injected thrown pull initialization failure")
             return Promise.resolve({
@@ -579,10 +579,10 @@ describe("git super pull --ff-only", () => {
         git: process,
         warn: (message) => warnings.write(message),
       })
-      const update = requests.find(
-        (request) => request.args.includes("update") && request.args.includes("vendor/gamma"),
+      const checkoutRequest = requests.find(
+        (request) => request.repo === join(checkout, "vendor/gamma") && request.args[0] === "checkout",
       )
-      expect(update?.detached).toBe(true)
+      expect(checkoutRequest?.detached).toBe(true)
       if (failure !== "none") {
         expect(result).toMatchObject({
           state: "failed",
@@ -614,16 +614,19 @@ describe("git super pull --ff-only", () => {
         expect(addition?.materialization).toEqual({ considered: 1, borrowed: 1, remoteFallbacks: 0, unreferenced: 0 })
         // HEAD is now the incoming root; admission must use its declaration and the primary's durable store.
         expect(existsSync(join(primary, "vendor/gamma/.git"))).toBe(false)
-        expect(update?.args).toEqual(
-          expect.arrayContaining(["--reference", join(primary, ".git/modules/vendor/gamma"), "--no-fetch"]),
+        const alternates = git(join(checkout, "vendor/gamma"), "rev-parse", "--git-path", "objects/info/alternates")
+        expect(readFileSync(alternates, "utf8").trim().split("\n")).toContain(
+          join(primary, ".git/modules/vendor/gamma/objects"),
         )
+        expect(
+          requests.some((request) => request.repo === join(checkout, "vendor/gamma") && request.args[0] === "fetch"),
+        ).toBe(false)
         // The shared materializer reads the captured incoming commit, avoiding a later mutable HEAD read.
         expect(
           requests.some((request) => request.repo === checkout && request.args.includes(`${target}:.gitmodules`)),
         ).toBe(true)
         expect(warnings.output).toBe("")
       } else {
-        expect(update?.args).not.toContain("--reference")
         expect(warnings.output).toContain("used no reference store for 1 of 1 gitlinks: vendor/gamma")
       }
       expect(result.detail).toBeUndefined()
