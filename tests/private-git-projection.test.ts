@@ -6,11 +6,12 @@
  * @testonly none
  */
 import { spawnSync } from "node:child_process"
-import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs"
+import { existsSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs"
 import { mkdtemp, rm } from "node:fs/promises"
 import { join } from "node:path"
 import { afterEach, expect, it } from "vitest"
 import * as GitSuper from "../src/index.ts"
+import { createExclusive } from "../src/exclusive.ts"
 import { addNestedAlphaSubmodule, advanceRepository, canonicalTmpdir, createProductFixture, git } from "./fixture.ts"
 
 const roots: string[] = []
@@ -63,10 +64,38 @@ it("isolates native root and nested-child authoring and retires from a durable r
   expect(git(join(fixture.product, "packages/alpha/apps/maddoc"), "rev-parse", "HEAD")).toBe(fixture.leafBase)
   expect(readFileSync(join(fixture.product, ".git", "config"), "utf8")).toBe(sourceConfig)
 
+  // Retirement must preserve originals when native state or a live kernel lease makes proof unsafe.
+  const retentionRoot = join(root, "retained")
+  const dirtyPath = join(destination, "uncommitted.ts")
+  writeFileSync(dirtyPath, "uncommitted work\n")
+  const dirty = await GitSuper.retirePrivateGitProjection(projection, retentionRoot)
+  expect(dirty.state).toBe("failed")
+  expect(dirty.detail?.message).toContain("dirty")
+  expect(existsSync(destination)).toBe(true)
+  unlinkSync(dirtyPath)
+  const leafRecord = projection.repositories.find((repository) => repository.checkout === leaf)
+  if (leafRecord === undefined) throw new Error("projection omitted its native leaf repository")
+  const indexLock = join(leafRecord.gitDirectory, "index.lock")
+  writeFileSync(indexLock, "native writer\n")
+  const locked = await GitSuper.retirePrivateGitProjection(projection, retentionRoot)
+  expect(locked.state).toBe("failed")
+  expect(locked.detail?.message).toContain(indexLock)
+  expect(existsSync(destination)).toBe(true)
+  unlinkSync(indexLock)
+  const held = await createExclusive(join(destination, ".git", "yrd-worktree-mutations")).run(() =>
+    GitSuper.retirePrivateGitProjection(projection, retentionRoot),
+  )
+  expect(held.state).toBe("failed")
+  expect(held.detail?.message).toContain("held")
+  expect(existsSync(destination)).toBe(true)
+  const preserved = await GitSuper.retainPrivateGitProjection(projection, retentionRoot)
+  expect(preserved.state, JSON.stringify(preserved.detail)).toBe("updated")
+  expect(preserved.manifest).toBeDefined()
+  expect(existsSync(destination)).toBe(true)
+
   // No creator closure or methods survive this JSON boundary. A different process owns retirement.
   const record = join(root, "projection.json")
   writeFileSync(record, JSON.stringify(projection))
-  const retentionRoot = join(root, "retained")
   const entry = new URL("../src/index.ts", import.meta.url).href
   const retiring = spawnSync(
     process.execPath,

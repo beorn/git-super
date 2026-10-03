@@ -1,4 +1,4 @@
-import { lstat, mkdir, readFile, realpath, writeFile } from "node:fs/promises"
+import { lstat, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises"
 import { dirname, join, relative, resolve, sep } from "node:path"
 import { alternatesLineage } from "./alternates.ts"
 import { readPrivateSubmodulePaths } from "./commit-graph.ts"
@@ -7,6 +7,9 @@ import { createLocalGitProcess, type GitProcess } from "./process.ts"
 import { materializeSubmodules } from "./submodules.ts"
 import { pinRef } from "./objects.ts"
 import { createExclusive } from "./exclusive.ts"
+import { safeStorePath } from "./submodule-prepare.ts"
+import { createGit, createGitWorktreeStore } from "./worktree.ts"
+import { acquireRemovalWriterLeases, retainWorktreeModules, type WorktreeRemovalProof } from "./worktree-removal.ts"
 import type { NotCompared } from "./diff.ts"
 import type { GitSuperResult } from "./result.ts"
 
@@ -33,6 +36,128 @@ export type PrivateGitProjectionResult = GitSuperResult &
     projection?: PrivateGitProjection
     retainedPaths: readonly string[]
   }>
+
+export type PrivateGitRetentionResult = GitSuperResult &
+  Readonly<{ retainedPaths: readonly string[]; manifest?: string }>
+
+async function preserveProjection(
+  projection: PrivateGitProjection,
+  retentionRoot: string,
+  retire: boolean,
+): Promise<PrivateGitRetentionResult> {
+  const retainedPaths: string[] = []
+  let leases: ReturnType<typeof acquireRemovalWriterLeases> | undefined
+  try {
+    const checkout = await realpath(projection.checkout)
+    if (checkout !== projection.checkout || projection.repositories.length === 0) {
+      throw new Error("invalid private projection checkout or repository record")
+    }
+    const rootGit = join(checkout, ".git")
+    if ((await metadata(checkout)) !== rootGit) throw new Error(`private root metadata changed at ${checkout}`)
+    const allowedObjects = new Set(
+      projection.mounts
+        .filter((mount) => mount.mode === "ro" && mount.source === mount.target)
+        .map((mount) => mount.source),
+    )
+    for (const repository of projection.repositories) {
+      validateExcludedSubmodules(repository.path === "" ? [] : [repository.path])
+      if (
+        repository.checkout !== join(checkout, repository.path) ||
+        (!repository.gitDirectory.startsWith(`${rootGit}${sep}`) && repository.gitDirectory !== rootGit)
+      ) {
+        throw new Error(`private repository escapes its recorded checkout: ${repository.checkout}`)
+      }
+      if ((await metadata(repository.checkout)) !== repository.gitDirectory) {
+        throw new Error(`private metadata pointer changed at ${repository.checkout}`)
+      }
+      const objects = join(repository.gitDirectory, "objects")
+      await alternatesLineage([objects], "", { allowedObjects: new Set([...allowedObjects, objects]) })
+    }
+    leases = acquireRemovalWriterLeases(rootGit, (path) => retainedPaths.push(path))
+    const environment = {
+      ...cleanGitEnvironment(),
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_NO_LAZY_FETCH: "1",
+      GIT_NO_REPLACE_OBJECTS: "1",
+    }
+    const transport = createLocalGitProcess(environment)
+    const process: GitProcess = {
+      run: (request) =>
+        transport.run({
+          ...request,
+          env: environment,
+          args: [
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "protocol.allow=never",
+            ...request.args,
+          ],
+        }),
+    }
+    const git = createGit(process, environment, 30_000)
+    const excluded = projection.excluded.map((entry) => entry.path)
+    const proof = await retainWorktreeModules(
+      git,
+      checkout,
+      checkout,
+      { root: retentionRoot, report: (_proof: WorktreeRemovalProof) => {} },
+      (repository, path) =>
+        createGitWorktreeStore({ repo: repository, gitProcess: process, env: environment }).inspect(path),
+      leases.proof,
+      leases.created,
+      undefined,
+      excluded,
+      projection.excluded,
+      projection,
+      (path) => retainedPaths.push(path),
+    )
+    if (retire) await rm(checkout, { recursive: true })
+    return {
+      state: "updated",
+      partial: false,
+      repositories: [],
+      retainedPaths: retire
+        ? retainedPaths.filter((path) => path !== checkout && !path.startsWith(`${checkout}${sep}`))
+        : retainedPaths,
+      manifest: proof.manifest,
+    }
+  } catch (error) {
+    return {
+      state: "failed",
+      partial: retainedPaths.length > 0,
+      repositories: [],
+      retainedPaths,
+      detail: {
+        code: "private-projection-retention-failed",
+        phase: retire ? "retire" : "retain",
+        message: String(error),
+        paths: [projection.checkout, ...retainedPaths],
+      },
+    }
+  } finally {
+    leases?.release()
+  }
+}
+
+/** Preserve the private root, every child store and unreferenced objects under existing manifest custody. */
+export function retainPrivateGitProjection(
+  projection: PrivateGitProjection,
+  retentionRoot: string,
+): Promise<PrivateGitRetentionResult> {
+  return preserveProjection(projection, retentionRoot, false)
+}
+
+/** Retire only after the existing custody owner has proved a durable copy from this plain record. */
+export function retirePrivateGitProjection(
+  projection: PrivateGitProjection,
+  retentionRoot: string,
+): Promise<PrivateGitRetentionResult> {
+  return preserveProjection(projection, retentionRoot, true)
+}
 
 /** Resolve host-selected repository metadata without asking Git to follow an object path. */
 async function metadata(checkout: string): Promise<string> {
@@ -120,6 +245,7 @@ export async function projectPrivateGitWorktree(
       sourceCheckout: string,
       head: string,
       root: boolean,
+      privateGitDirectory?: string,
     ): Promise<void> => {
       const sourceGit = await metadata(sourceCheckout)
       const common = await commonDirectory(sourceGit)
@@ -132,11 +258,12 @@ export async function projectPrivateGitWorktree(
       await run(checkout, [
         "init",
         "--template=",
+        ...(privateGitDirectory === undefined ? [] : ["--separate-git-dir", privateGitDirectory]),
         `--object-format=${head.length === 64 ? "sha256" : "sha1"}`,
         "-b",
         options.branch,
       ])
-      const gitDirectory = join(checkout, ".git")
+      const gitDirectory = privateGitDirectory ?? join(checkout, ".git")
       await writeFile(join(gitDirectory, "objects", "info", "alternates"), `${objects}\n`, { flag: "wx" })
       await run(checkout, ["cat-file", "-e", `${head}^{commit}`])
       await createExclusive(join(common, "yrd-worktree-mutations")).run(
@@ -177,7 +304,15 @@ export async function projectPrivateGitWorktree(
         },
         materialize: async (parent, entry) => {
           const checkout = join(parent, entry.path)
-          await createRepository(checkout, join(source, relative(destination, checkout)), entry.target, false)
+          const directory = safeStorePath(await metadata(parent), entry.name)
+          await mkdir(dirname(directory), { recursive: true })
+          await createRepository(
+            checkout,
+            join(source, relative(destination, checkout)),
+            entry.target,
+            false,
+            directory,
+          )
         },
       },
     )

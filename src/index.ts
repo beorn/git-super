@@ -6,6 +6,8 @@ export * from "./push.ts"
 export * from "./result.ts"
 export {
   projectPrivateGitWorktree,
+  retainPrivateGitProjection,
+  retirePrivateGitProjection,
   type PrivateGitProjection,
   type PrivateGitProjectionOptions,
   type PrivateGitProjectionResult,
