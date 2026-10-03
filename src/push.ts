@@ -15,6 +15,8 @@ import { mapInOrder } from "./map-in-order.ts"
 import { ensureCommitObject } from "./objects.ts"
 import { createProgressReporter } from "./progress.ts"
 import {
+  frozenExclusionPaths,
+  hasHostedIdentity,
   readFrozenPushIntent,
   readFrozenPushIntents,
   encodePushIntent,
@@ -1056,8 +1058,24 @@ export async function capturePushIntent(
     rootStores,
     excludedSubmodules,
   )
-  if (requirements.length === 0) return undefined
+  // 27147: an admitted exclusion is frozen as its own disposition, with the pin the merge tree holds, so the push
+  // replays the merge's list and never prepares, reads or demands a row for that child.
+  const excluded: { path: string; pin: string }[] = []
+  if (excludedSubmodules.length > 0) {
+    const pins = new Map((await readCommitSubmodules(git, root, tree)).map((entry) => [entry.path, entry.target]))
+    for (const path of [...excludedSubmodules].sort()) {
+      const pin = pins.get(path)
+      if (pin === undefined) {
+        throw new Error(`Excluded submodule ${path} is not a root gitlink of the merge tree ${tree}`)
+      }
+      excluded.push({ path, pin })
+    }
+  }
+  if (requirements.length === 0 && excluded.length === 0) return undefined
   const rootRemote = await logicalPushUrl(git, root, await configuredPushRemote(git, root))
+  // A merge that only excludes, on a root with no hosted identity, freezes nothing, exactly as before 27147: an intent
+  // names a hosted root, and a local-root merge must keep working (@chief 62bf860d). Its push walks unfrozen.
+  if (requirements.length === 0 && !hasHostedIdentity(rootRemote)) return undefined
   const changed = await changedRowPaths(
     git,
     await readCommitGitlinks(git, root, head),
@@ -1117,7 +1135,7 @@ export async function capturePushIntent(
       },
     })
   }
-  return encodePushIntent({ version: 1, rootRemote, children })
+  return encodePushIntent({ version: 1, rootRemote, children, ...(excluded.length === 0 ? {} : { excluded }) })
 }
 
 /** Read logical root identity before transport rewrites, using the ordinary push selection. */
@@ -1249,11 +1267,12 @@ async function prepareFrozenChildren(
   path: string,
   commit: string,
   frozen: FrozenPushIntent,
+  excludedSubmodules: readonly string[],
 ): Promise<ReadonlyMap<string, PreparedSubmodule>> {
   const remote =
     path === "." ? frozen.rootRemote : frozen.children.find((row) => row.path === path && row.pin === commit)?.remote
   if (remote === undefined) throw new Error(`Frozen merge has no repository identity for ${path}@${commit}`)
-  const prepared = await superSubmodulePrepare({ repo: repository, commit, remote, git })
+  const prepared = await superSubmodulePrepare({ repo: repository, commit, remote, git, excludedSubmodules })
   if (prepared.state === "failed" || prepared.state === "unknown") {
     const failure =
       prepared.detail ??
@@ -1323,6 +1342,12 @@ async function collectCommitRequirements(
   rootStores?: ReadonlyMap<string, string>,
   excludedSubmodules: readonly string[] = [],
 ): Promise<CommitRequirement[]> {
+  // A frozen merge carries its own exclusions (27147); the capture passes them directly. Never both, so a push can
+  // neither widen nor narrow the list its merge froze.
+  if (frozen?.excluded !== undefined && excludedSubmodules.length > 0) {
+    throw new Error("A frozen push intent carries its own exclusions; the caller must not pass a second list")
+  }
+  const excluded = frozen?.excluded?.map((row) => row.path) ?? excludedSubmodules
   const completed = new Set<string>()
   const visiting = new Set<string>()
   const requirements: CommitRequirement[] = []
@@ -1349,7 +1374,11 @@ async function collectCommitRequirements(
       })
     }
     visiting.add(key)
-    const stores = frozen === undefined ? undefined : await prepareFrozenChildren(git, repository, path, commit, frozen)
+    if (path === "." && frozen !== undefined) await frozenExclusionPaths(git, repository, commit, frozen)
+    const stores =
+      frozen === undefined
+        ? undefined
+        : await prepareFrozenChildren(git, repository, path, commit, frozen, path === "." ? excluded : [])
     const parentStore =
       preparedParent && stores === undefined
         ? await required(
@@ -1363,7 +1392,7 @@ async function collectCommitRequirements(
       throw new Error(`Git returned an invalid common directory for prepared parent ${repository}: ${parentStore}`)
     }
     for (const recorded of await readCommitSubmodules(git, repository, commit)) {
-      if (path === "." && isSubmoduleExcluded(recorded.path, excludedSubmodules)) continue
+      if (path === "." && isSubmoduleExcluded(recorded.path, excluded)) continue
       const target = path === "." ? rootPins?.get(recorded.path) : undefined
       const entry = target === undefined ? recorded : { ...recorded, target }
       const childPath = path === "." ? entry.path : `${path}/${entry.path}`

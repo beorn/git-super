@@ -1,6 +1,7 @@
 import { lstat, mkdir } from "node:fs/promises"
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { readCommitSubmodules } from "./commit-graph.ts"
+import { isSubmoduleExcluded, validateExcludedSubmodules } from "./git.ts"
 import { createExclusive, type Exclusive } from "./exclusive.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
 import { gitSuperResult, type GitResultDetail, type GitSuperRepositoryResult, type GitSuperResult } from "./result.ts"
@@ -28,6 +29,11 @@ export type SuperSubmodulePrepareOptions = Readonly<{
   repo: string
   commit: string
   remote: string
+  /**
+   * Root-relative gitlinks left out before anything about them is read, resolved or prepared: no URL, no store, no
+   * lock-time comparison (27147). A frozen push passes the exclusions its merge froze.
+   */
+  excludedSubmodules?: readonly string[]
   git?: GitProcess
   exclusive?: Exclusive
 }>
@@ -137,9 +143,11 @@ async function prepareSubmodules(
         detail("invalid-root-commit", "validate-root-commit", `Root commit ${options.commit} is not a full object ID.`),
       )
     }
+    validateExcludedSubmodules(options.excludedSubmodules)
     await requireObject(frozenGit, repository, options.commit, objectType)
     const selectedOrigin = await rootRemote(git, repository, options.remote)
-    const frozen = (await frozenSubmodules(frozenGit, repository, options.commit, selectedOrigin)).filter(
+    const excluded = options.excludedSubmodules ?? []
+    const frozen = (await frozenSubmodules(frozenGit, repository, options.commit, selectedOrigin, excluded)).filter(
       (submodule) => paths === undefined || paths.has(submodule.path),
     )
     if (frozen.length === 0) return result(repositories, [])
@@ -149,7 +157,7 @@ async function prepareSubmodules(
     await exclusive.run(
       async () => {
         const lockedOrigin = await rootRemote(git, repository, options.remote)
-        const locked = (await frozenSubmodules(frozenGit, repository, options.commit, lockedOrigin)).filter(
+        const locked = (await frozenSubmodules(frozenGit, repository, options.commit, lockedOrigin, excluded)).filter(
           (submodule) => paths === undefined || paths.has(submodule.path),
         )
         if (lockedOrigin !== selectedOrigin || !sameFrozen(frozen, locked)) {
@@ -287,8 +295,12 @@ async function frozenSubmodules(
   repository: string,
   commit: string,
   rootOrigin: string,
+  excluded: readonly string[],
 ): Promise<FrozenSubmodule[]> {
-  return (await readCommitSubmodules(git, repository, commit)).map((submodule) => {
+  const submodules = (await readCommitSubmodules(git, repository, commit)).filter(
+    (submodule) => !isSubmoduleExcluded(submodule.path, excluded),
+  )
+  return submodules.map((submodule) => {
     if (submodule.url === undefined || submodule.url.trim() === "") {
       fail(
         detail(

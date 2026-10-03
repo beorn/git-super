@@ -1,3 +1,4 @@
+import { readCommitSubmodules } from "./commit-graph.ts"
 import type { GitProcess } from "./process.ts"
 import type { ExpectedDestination } from "./result.ts"
 
@@ -17,6 +18,13 @@ export type FrozenPushIntent = Readonly<{
       expectedDestination: ExpectedDestination
     }>
   }>[]
+  /**
+   * Root gitlinks the merge admitted as excluded (`merge --exclude-submodule`, 27147): their own disposition, never a
+   * pin row, because a pin row is verified in the child's store and an excluded child has none. Each names the
+   * gitlink target the merge saw. Absent when the merge excluded nothing, so every intent without exclusions keeps
+   * its exact bytes; a reader that predates the field refuses it as unknown.
+   */
+  excluded?: readonly Readonly<{ path: string; pin: string }>[]
 }>
 
 const OID = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/u
@@ -70,6 +78,19 @@ export function hostedRemoteIdentity(
     return invalid(`remote ${remote} does not name a hosted namespace and repository`)
   }
   return { host, namespace: parts.slice(0, -1).join("/"), repository: path }
+}
+
+/** Whether `remote` names a hosted repository; a local path or file URL does not, and nothing else is swallowed. */
+export function hasHostedIdentity(remote: string): boolean {
+  try {
+    hostedRemoteIdentity(remote)
+    return true
+  } catch (error) {
+    if ((error as { resultDetail?: { code?: string } }).resultDetail?.code === "invalid-frozen-push-intent") {
+      return false
+    }
+    throw error
+  }
 }
 
 export function sameHostedOwner(left: string, right: string): boolean {
@@ -167,9 +188,71 @@ export function decodePushIntent(encoded: string): FrozenPushIntent {
       publication: { destination: publication.destination, source: publication.source, expectedDestination },
     }
   })
-  const intent: FrozenPushIntent = { version: 1, rootRemote, children }
+  let excluded: { path: string; pin: string }[] | undefined
+  if (value.excluded !== undefined) {
+    if (!Array.isArray(value.excluded) || value.excluded.length === 0) {
+      invalid("excluded must be a nonempty array when present")
+    }
+    excluded = value.excluded.map((item: unknown) => {
+      if (typeof item !== "object" || item === null || Array.isArray(item)) invalid("excluded row must be an object")
+      const row = item as Record<string, unknown>
+      if (typeof row.path !== "string" || typeof row.pin !== "string" || !OID.test(row.pin)) {
+        invalid("excluded row requires path and a full pin OID")
+      }
+      if (
+        row.path.includes("\0") ||
+        row.path.includes("\\") ||
+        row.path.split("/").some((part) => part === "" || part === "." || part === "..") ||
+        paths.has(row.path)
+      ) {
+        invalid(`excluded path ${row.path} is not unique and root-relative`)
+      }
+      for (const other of paths) {
+        if (row.path.startsWith(`${other}/`) || other.startsWith(`${row.path}/`)) {
+          invalid(`excluded path ${row.path} overlaps ${other}`)
+        }
+      }
+      paths.add(row.path)
+      return { path: row.path, pin: row.pin }
+    })
+  }
+  const intent: FrozenPushIntent = { version: 1, rootRemote, children, ...(excluded === undefined ? {} : { excluded }) }
   if (JSON.stringify(intent) !== json) invalid("payload has duplicate, unknown or noncanonical fields")
   return intent
+}
+
+/**
+ * The root paths a frozen merge excludes, after proving agreement both ways (27147, @cto 361c4071): each is a root
+ * gitlink of `commit` at the pin the merge saw. A disagreement is refused by name before any child is read. Every
+ * reader of an intent (push, observe) takes its exclusions here and nowhere else.
+ */
+export async function frozenExclusionPaths(
+  git: GitProcess,
+  root: string,
+  commit: string,
+  intent: FrozenPushIntent | undefined,
+): Promise<readonly string[]> {
+  const excluded = intent?.excluded ?? []
+  if (excluded.length === 0) return []
+  const pins = new Map((await readCommitSubmodules(git, root, commit)).map((entry) => [entry.path, entry.target]))
+  for (const row of excluded) {
+    const recorded = pins.get(row.path)
+    if (recorded === row.pin) continue
+    const message =
+      `Frozen merge ${commit} excludes ${row.path}@${row.pin}, but the commit records ` +
+      (recorded === undefined ? "no such root gitlink" : `${row.path}@${recorded}`)
+    throw Object.assign(new Error(message), {
+      resultDetail: {
+        code: "frozen-exclusion-disagrees",
+        phase: "read-frozen-push-intent",
+        message,
+        paths: [row.path],
+        objectIds: [commit, row.pin],
+        remedy: "Preserve the merge; recompose it so its frozen exclusions match its own gitlinks.",
+      },
+    })
+  }
+  return excluded.map((row) => row.path)
 }
 
 export function encodePushIntent(intent: FrozenPushIntent): string {
