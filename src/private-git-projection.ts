@@ -1,4 +1,5 @@
-import { lstat, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises"
+import { lstat, mkdir, readFile, realpath, writeFile } from "node:fs/promises"
+import { rmSync } from "node:fs"
 import { dirname, join, relative, resolve, sep } from "node:path"
 import { alternatesLineage } from "./alternates.ts"
 import { readPrivateSubmodulePaths } from "./commit-graph.ts"
@@ -22,6 +23,7 @@ export type PrivateGitProjection = Readonly<{
   checkout: string
   base: string
   branch: string
+  createdAt: string
   repositories: readonly Readonly<{
     path: string
     checkout: string
@@ -32,6 +34,49 @@ export type PrivateGitProjection = Readonly<{
   mounts: readonly Readonly<{ source: string; target: string; mode: "ro" | "rw" }>[]
   excluded: readonly NotCompared[]
 }>
+
+/** Neutral host attestation; GitSuper validates binding, while the sandbox owns stop truth. */
+export type PrivateGitStopCertificate = Readonly<{
+  schema: "hab-sandbox/stop-certificate/1"
+  subject: string
+  container: string
+  projection: Readonly<Pick<PrivateGitProjection, "checkout" | "base" | "branch" | "createdAt">>
+  certifiedAt: string
+  certifier: string
+}>
+
+function validateStopCertificate(projection: PrivateGitProjection, certificate: unknown): void {
+  if (typeof projection.createdAt !== "string" || !Number.isFinite(Date.parse(projection.createdAt))) {
+    throw new Error("record predates createdAt; re-create the projection")
+  }
+  if (typeof certificate !== "object" || certificate === null) throw new Error("missing unit stop certificate")
+  const fields = certificate as Record<string, unknown>
+  if (!("schema" in certificate) || certificate.schema !== "hab-sandbox/stop-certificate/1") {
+    throw new Error("invalid unit stop certificate schema")
+  }
+  for (const field of ["subject", "container", "certifier", "certifiedAt"] as const) {
+    const value = fields[field]
+    if (typeof value !== "string" || value.trim() === "") {
+      throw new Error(`unit stop certificate has missing or empty ${field}`)
+    }
+  }
+  if (!("projection" in certificate) || typeof certificate.projection !== "object" || certificate.projection === null) {
+    throw new Error("unit stop certificate has missing projection identity")
+  }
+  const identity = certificate.projection as Record<string, unknown>
+  for (const field of ["checkout", "base", "branch", "createdAt"] as const) {
+    if (identity[field] !== projection[field]) {
+      throw new Error(`unit stop certificate projection mismatch: ${field}`)
+    }
+  }
+  if (!("certifiedAt" in certificate) || typeof certificate.certifiedAt !== "string") {
+    throw new Error("unit stop certificate has missing certifiedAt")
+  }
+  const certifiedAt = Date.parse(certificate.certifiedAt)
+  if (!Number.isFinite(certifiedAt) || certifiedAt < Date.parse(projection.createdAt)) {
+    throw new Error("unit stop certificate predates projection createdAt")
+  }
+}
 
 export type PrivateGitProjectionOptions = Readonly<{
   sourceCheckout: string
@@ -55,10 +100,12 @@ async function preserveProjection(
   projection: PrivateGitProjection,
   retentionRoot: string,
   retire: boolean,
+  stopCertificate?: PrivateGitStopCertificate,
 ): Promise<PrivateGitRetentionResult> {
   const retainedPaths: string[] = []
   let leases: ReturnType<typeof acquireRemovalWriterLeases> | undefined
   try {
+    if (retire) validateStopCertificate(projection, stopCertificate)
     const checkout = await realpath(projection.checkout)
     if (checkout !== projection.checkout || projection.repositories.length === 0) {
       throw new Error("invalid private projection checkout or repository record")
@@ -137,9 +184,14 @@ async function preserveProjection(
         projection.excluded,
         projection,
         (path) => retainedPaths.push(path),
+        retire
+          ? () => {
+              validateStopCertificate(projection, stopCertificate)
+              rmSync(checkout, { recursive: true })
+            }
+          : undefined,
       ),
     )
-    if (retire) await rm(checkout, { recursive: true })
     return {
       state: "updated",
       partial: false,
@@ -175,12 +227,13 @@ export function retainPrivateGitProjection(
   return preserveProjection(projection, retentionRoot, false)
 }
 
-/** Retire only after the existing custody owner has proved a durable copy from this plain record. */
+/** Retire after explicit sandbox stop attestation and the custody owner's final manifest equality. */
 export function retirePrivateGitProjection(
   projection: PrivateGitProjection,
   retentionRoot: string,
+  stopCertificate?: PrivateGitStopCertificate,
 ): Promise<PrivateGitRetentionResult> {
-  return preserveProjection(projection, retentionRoot, true)
+  return preserveProjection(projection, retentionRoot, true, stopCertificate)
 }
 
 /** Resolve host-selected repository metadata without asking Git to follow an object path. */
@@ -345,6 +398,7 @@ export async function projectPrivateGitWorktree(
       checkout: destination,
       base: options.commit,
       branch: options.branch,
+      createdAt: new Date().toISOString(),
       repositories: repositories.map((repository) => ({
         ...repository,
         configurationSha256: metadataFileDigest(join(repository.gitDirectory, "config")),

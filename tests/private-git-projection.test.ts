@@ -17,6 +17,18 @@ import { shellQuote } from "../src/shell-command.ts"
 import { addNestedAlphaSubmodule, advanceRepository, canonicalTmpdir, createProductFixture, git } from "./fixture.ts"
 
 const roots: string[] = []
+// Binding-only fixture: sandbox stop truth is proved separately by its native lifecycle tests.
+function certificateFor(projection: GitSuper.PrivateGitProjection): GitSuper.PrivateGitStopCertificate {
+  const { checkout, base, branch, createdAt } = projection
+  return {
+    schema: "hab-sandbox/stop-certificate/1",
+    subject: "fixture-unit",
+    container: "fixture-stopped-container",
+    projection: { checkout, base, branch, createdAt },
+    certifiedAt: new Date().toISOString(),
+    certifier: "fixture-binding-validator",
+  }
+}
 afterEach(async () => {
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true })
 })
@@ -38,6 +50,58 @@ it("refuses retirement without a unit stop certificate", async () => {
   const retired = await GitSuper.retirePrivateGitProjection(projected.projection, join(root, "retained"))
   expect(retired.state, "retirement accepted an absent unit stop certificate").toBe("failed")
   expect(retired.detail?.message).toContain("stop certificate")
+  expect(existsSync(destination)).toBe(true)
+})
+
+// CTOf929e937 + 2dc978d4: durable JSON identity and age prevent reuse across projection lifetimes.
+// The missing-certificate test does not exercise malformed fields or older same-path certificates.
+it("refuses malformed, mismatched and stale stop certificates without removing native state", async () => {
+  const root = await mkdtemp(join(canonicalTmpdir(), "git-super-certificate-binding-"))
+  roots.push(root)
+  const fixture = createProductFixture(root)
+  const destination = join(root, "seat")
+  const projected = await GitSuper.projectPrivateGitWorktree({
+    sourceCheckout: fixture.product,
+    commit: fixture.productBase,
+    branch: "task/seat",
+    destination,
+    excludedSubmodules: [],
+  })
+  if (projected.projection === undefined) throw new Error(JSON.stringify(projected.detail))
+  const projection = projected.projection
+  const certificate = certificateFor(projection)
+  const earlier = new Date(Date.parse(projection.createdAt) - 1).toISOString()
+  const cases = [
+    [{ ...certificate, schema: "wrong/1" }, "schema"],
+    ...(["subject", "container", "certifier", "certifiedAt"] as const).map(
+      (field) => [{ ...certificate, [field]: "" }, field] as const,
+    ),
+    ...(["checkout", "base", "branch"] as const).map(
+      (field) => [{ ...certificate, projection: { ...certificate.projection, [field]: "wrong" } }, field] as const,
+    ),
+    [{ ...certificate, projection: { ...certificate.projection, createdAt: earlier } }, "createdAt"],
+    [{ ...certificate, certifiedAt: earlier }, "predates"],
+    [{ ...certificate, certifiedAt: "invalid-date" }, "predates"],
+  ] as const
+  for (const [input, message] of cases) {
+    // Exercise malformed durable input deliberately at the public JSON boundary.
+    const result = await GitSuper.retirePrivateGitProjection(
+      projection,
+      join(root, "retained"),
+      input as GitSuper.PrivateGitStopCertificate,
+    )
+    expect(result.state, JSON.stringify(result)).toBe("failed")
+    expect(result.detail?.message).toContain(message)
+    expect(existsSync(destination)).toBe(true)
+  }
+  const { createdAt: _createdAt, ...oldRecord } = projection
+  const old = await GitSuper.retirePrivateGitProjection(
+    oldRecord as GitSuper.PrivateGitProjection,
+    join(root, "retained"),
+    certificate,
+  )
+  expect(old.state).toBe("failed")
+  expect(old.detail?.message).toContain("record predates createdAt; re-create the projection")
   expect(existsSync(destination)).toBe(true)
 })
 
@@ -196,9 +260,10 @@ it("isolates native root and nested-child authoring and retires from a durable r
 
   // Retirement must preserve originals when native state or a live kernel lease makes proof unsafe.
   const retentionRoot = join(root, "retained")
+  const stopCertificate = certificateFor(projection)
   const dirtyPath = join(destination, "uncommitted.ts")
   writeFileSync(dirtyPath, "uncommitted work\n")
-  const dirty = await GitSuper.retirePrivateGitProjection(projection, retentionRoot)
+  const dirty = await GitSuper.retirePrivateGitProjection(projection, retentionRoot, stopCertificate)
   expect(dirty.state).toBe("failed")
   expect(dirty.detail?.message).toContain("dirty")
   expect(existsSync(destination)).toBe(true)
@@ -207,13 +272,13 @@ it("isolates native root and nested-child authoring and retires from a durable r
   if (leafRecord === undefined) throw new Error("projection omitted its native leaf repository")
   const indexLock = join(leafRecord.gitDirectory, "index.lock")
   writeFileSync(indexLock, "native writer\n")
-  const locked = await GitSuper.retirePrivateGitProjection(projection, retentionRoot)
+  const locked = await GitSuper.retirePrivateGitProjection(projection, retentionRoot, stopCertificate)
   expect(locked.state).toBe("failed")
   expect(locked.detail?.message).toContain(indexLock)
   expect(existsSync(destination)).toBe(true)
   unlinkSync(indexLock)
   const held = await createExclusive(join(destination, ".git", "yrd-worktree-mutations")).run(() =>
-    GitSuper.retirePrivateGitProjection(projection, retentionRoot),
+    GitSuper.retirePrivateGitProjection(projection, retentionRoot, stopCertificate),
   )
   expect(held.state).toBe("failed")
   expect(held.detail?.message).toContain("held")
@@ -226,6 +291,8 @@ it("isolates native root and nested-child authoring and retires from a durable r
   // No creator closure or methods survive this JSON boundary. A different process owns retirement.
   const record = join(root, "projection.json")
   writeFileSync(record, JSON.stringify(projection))
+  const certificateRecord = join(root, "stop-certificate.json")
+  writeFileSync(certificateRecord, JSON.stringify(stopCertificate))
   const entry = new URL("../src/index.ts", import.meta.url).href
   const retiring = spawnSync(
     process.execPath,
@@ -234,11 +301,13 @@ it("isolates native root and nested-child authoring and retires from a durable r
       `import { readFileSync } from "node:fs";
        const { retirePrivateGitProjection } = await import(process.argv[1]);
        const projection = JSON.parse(readFileSync(process.argv[2], "utf8"));
-       const result = await retirePrivateGitProjection(projection, process.argv[3]);
+       const certificate = JSON.parse(readFileSync(process.argv[4], "utf8"));
+       const result = await retirePrivateGitProjection(projection, process.argv[3], certificate);
        process.stdout.write(JSON.stringify(result));`,
       entry,
       record,
       retentionRoot,
+      certificateRecord,
     ],
     { encoding: "utf8" },
   )

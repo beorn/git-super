@@ -9,6 +9,7 @@ export {
   retainPrivateGitProjection,
   retirePrivateGitProjection,
   type PrivateGitProjection,
+  type PrivateGitStopCertificate,
   type PrivateGitProjectionOptions,
   type PrivateGitProjectionResult,
 } from "./private-git-projection.ts"

@@ -657,7 +657,11 @@ function manifest(root: string, custody: StoreCustody, hashFiles = true, working
     const path = join(entry.parentPath, entry.name)
     const key = relative(root, path)
     const metadata = within(custody.gitDir, path)
-    if ((!workingTree || metadata) && entry.name.endsWith(".lock") && !isWriterLeasePath(path, custody.gitDir, true)) {
+    if (
+      (!workingTree || metadata) &&
+      entry.name.endsWith(".lock") &&
+      !isWriterLeasePath(path, workingTree ? custody.gitDir : root, workingTree || root === custody.gitDir)
+    ) {
       throw new Error(`Git lock ${path} prevents worktree removal; resolve its holder`)
     }
     if (entry.isDirectory()) continue
@@ -844,6 +848,7 @@ export async function retainWorktreeModules(
   notCompared: readonly NotCompared[] = [],
   privateProjection?: PrivateGitProjection,
   onRetainedPath?: (path: string) => void,
+  retirePrivate?: () => void,
 ): Promise<WorktreeRemovalProof> {
   const path = realpathSync(requested)
   if (privateProjection === undefined) {
@@ -1025,15 +1030,18 @@ export async function retainWorktreeModules(
   }
   const rehomedBorrowers =
     privateProjection === undefined ? (rehome === undefined ? rehomeBorrowers(common, gitDir, modules) : rehome()) : []
-  const inspectedPath = copiedCheckout ?? path
+  const inspectedPath = copiedCheckout
   const after = await cleanSnapshot(git, inspectedPath, inspect, excludedSubmodules)
-  if (
-    privateProjection !== undefined &&
-    (JSON.stringify(manifest(path, custody, true, true).entries) !== JSON.stringify(retainedManifest.entries) ||
-      JSON.stringify(manifest(copiedCheckout, copiedCustody, true, true).entries) !== JSON.stringify(expectedCopy))
-  ) {
-    throw new Error(`worktree ${path} changed during retention; preserved, retry after its writer stops`)
+  const verifyPrivateManifest = (): void => {
+    if (
+      privateProjection !== undefined &&
+      (JSON.stringify(manifest(path, custody, true, true).entries) !== JSON.stringify(retainedManifest.entries) ||
+        JSON.stringify(manifest(copiedCheckout, copiedCustody, true, true).entries) !== JSON.stringify(expectedCopy))
+    ) {
+      throw new Error(`worktree ${path} changed during retention; preserved, retry after its writer stops`)
+    }
   }
+  verifyPrivateManifest()
   if (JSON.stringify(after) !== JSON.stringify(before)) {
     throw new Error(`worktree ${path} changed during retention; preserved, retry after its writer stops`)
   }
@@ -1066,5 +1074,10 @@ export async function retainWorktreeModules(
     }
   }
   retention.report(proof)
+  if (retirePrivate !== undefined) {
+    if (privateProjection === undefined) throw new Error("private retirement requires its projection record")
+    verifyPrivateManifest()
+    retirePrivate()
+  }
   return proof
 }
