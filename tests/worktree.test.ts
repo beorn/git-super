@@ -4,12 +4,13 @@
  * @consumer Yrd worktree and deployment stores
  * @reach fs-walk <fixture-only: worktree stores and retention checks read isolated mkdtemp Git repositories>
  */
-import { existsSync, readdirSync, readFileSync } from "node:fs"
+import { existsSync, readdirSync, readFileSync, renameSync } from "node:fs"
 import { mkdir, mkdtemp, readFile, readlink, rename, rm, symlink, writeFile } from "node:fs/promises"
 import { spawnSync } from "node:child_process"
 import { tmpdir } from "node:os"
 import { dirname, join, relative } from "node:path"
 import { describe, expect, it, vi } from "vitest"
+import { tryAcquireFlock } from "@bearly/flock"
 import { acquireExclusive, createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS } from "../src/exclusive.ts"
 import { materializeSubmodulesWithProcess } from "../src/submodules.ts"
 import {
@@ -27,7 +28,12 @@ import { createLocalGitProcess } from "../src/process.ts"
 
 vi.mock("node:fs", async (importOriginal) => {
   const fs = await importOriginal<typeof import("node:fs")>()
-  return { ...fs, readdirSync: vi.fn(fs.readdirSync), readFileSync: vi.fn(fs.readFileSync) }
+  return {
+    ...fs,
+    readdirSync: vi.fn(fs.readdirSync),
+    readFileSync: vi.fn(fs.readFileSync),
+    renameSync: vi.fn(fs.renameSync),
+  }
 })
 
 function git(repo: string, args: readonly string[]): string {
@@ -1429,12 +1435,33 @@ while (!existsSync(${JSON.stringify(release)})) {
         return
       }
 
-      await store.remove(lender, {
-        retention: {
-          root: retainedDir,
-          report: () => {},
-        },
+      const nativeRename = (await vi.importActual<typeof import("node:fs")>("node:fs")).renameSync
+      const writerPath = join(borrowerSubAdmin, "yrd-worktree-mutations", "writer.lock")
+      let observedCustody = false
+      const renaming = vi.mocked(renameSync).mockImplementation((from, to) => {
+        if (to === altFile) {
+          const contender = tryAcquireFlock(writerPath)
+          try {
+            expect(contender, "borrower custody released before alternate replacement").toBeNull()
+            observedCustody = true
+          } finally {
+            contender?.release()
+          }
+        }
+        return nativeRename(from, to)
       })
+      try {
+        await store.remove(lender, { retention: { root: retainedDir, report: () => {} } })
+      } finally {
+        renaming.mockRestore()
+      }
+      expect(observedCustody).toBe(true)
+      const released = tryAcquireFlock(writerPath)
+      try {
+        expect(released, "borrower custody remained held after removal settled").not.toBeNull()
+      } finally {
+        released?.release()
+      }
       expect(existsSync(lender)).toBe(false)
 
       const altContent = await readFile(altFile, "utf8")
@@ -1537,6 +1564,7 @@ while (!existsSync(${JSON.stringify(release)})) {
       const lenderModules = join(root, "lender/modules")
       const borrowerModules = join(root, "worktrees/borrower/modules/sub/objects/info")
       const { mkdir } = await import("node:fs/promises")
+      git(root, ["init", "--bare", "-q", dirname(dirname(borrowerModules))])
       await mkdir(borrowerModules, { recursive: true })
       await mkdir(lenderModules, { recursive: true })
       await writeFile(join(borrowerModules, "alternates"), `${join(lenderModules, "sub/objects")}\n`, "utf8")
@@ -1551,7 +1579,7 @@ while (!existsSync(${JSON.stringify(release)})) {
         stderr: "",
       })) as unknown as typeof spawnSync
 
-      expect(() => rehomeBorrowers(root, join(root, "lender"), lenderModules, { spawn: fakeSpawn })).toThrow(
+      await expect(rehomeBorrowers(root, join(root, "lender"), lenderModules, { spawn: fakeSpawn })).rejects.toThrow(
         /timed out after 120s bound/,
       )
     } finally {

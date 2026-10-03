@@ -1,5 +1,6 @@
 import { constants, type Stats } from "node:fs"
-import { lstat, open } from "node:fs/promises"
+import { lstat, open, realpath } from "node:fs/promises"
+import { join, resolve } from "node:path"
 
 /** Read the inspected regular metadata entry without following a replacement or accepting changed bytes. */
 export async function readMetadataFile(pointer: string, inspected: Stats): Promise<string> {
@@ -28,5 +29,28 @@ export async function readMetadataFile(pointer: string, inspected: Stats): Promi
     }
   } catch (error) {
     throw new Error(`cannot read Git metadata file: ${pointer}`, { cause: error })
+  }
+}
+
+/** Resolve common metadata without converting a pointer fault into standalone identity. */
+export async function commonDirectory(gitDirectory: string): Promise<string> {
+  const pointer = join(gitDirectory, "commondir")
+  let inspected: Stats
+  try {
+    inspected = await lstat(pointer)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      // silent-fallback-allow: only lstat-proven entry absence identifies a standalone repository
+      return gitDirectory
+    }
+    throw new Error(`cannot inspect Git metadata file: ${pointer}`, { cause: error })
+  }
+  const content = await readMetadataFile(pointer, inspected)
+  const selected = content.trim()
+  if (selected === "" || /[\r\n\u0000]/u.test(selected)) throw new Error(`invalid commondir pointer: ${pointer}`)
+  try {
+    return await realpath(resolve(gitDirectory, selected))
+  } catch (error) {
+    throw new Error(`cannot resolve commondir pointer: ${pointer}`, { cause: error })
   }
 }

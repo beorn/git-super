@@ -1,8 +1,8 @@
 import { lstat, mkdir, realpath, writeFile } from "node:fs/promises"
-import { rmSync, type Stats } from "node:fs"
+import { rmSync } from "node:fs"
 import { dirname, join, relative, resolve, sep } from "node:path"
 import { alternatesLineage } from "./alternates.ts"
-import { readMetadataFile } from "./git-metadata.ts"
+import { commonDirectory, readMetadataFile } from "./git-metadata.ts"
 import { readPrivateSubmodulePaths } from "./commit-graph.ts"
 import { cleanGitEnvironment, validateExcludedSubmodules, withGitEnvironment } from "./git.ts"
 import { createLocalGitProcess, type GitProcess } from "./process.ts"
@@ -245,28 +245,6 @@ async function metadata(checkout: string): Promise<string> {
   const match = /^gitdir: ([^\r\n]+)\r?\n?$/u.exec(await readMetadataFile(pointer, stat))
   if (match?.[1] === undefined) throw new Error(`invalid Git metadata pointer: ${pointer}`)
   return realpath(resolve(checkout, match[1]))
-}
-
-async function commonDirectory(gitDirectory: string): Promise<string> {
-  const pointer = join(gitDirectory, "commondir")
-  let inspected: Stats
-  try {
-    inspected = await lstat(pointer)
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      // silent-fallback-allow: only lstat-proven entry absence identifies a standalone repository
-      return gitDirectory
-    }
-    throw new Error(`cannot inspect Git metadata file: ${pointer}`, { cause: error })
-  }
-  const content = await readMetadataFile(pointer, inspected)
-  const selected = content.trim()
-  if (selected === "" || /[\r\n\u0000]/u.test(selected)) throw new Error(`invalid commondir pointer: ${pointer}`)
-  try {
-    return await realpath(resolve(gitDirectory, selected))
-  } catch (error) {
-    throw new Error(`cannot resolve commondir pointer: ${pointer}`, { cause: error })
-  }
 }
 
 /** Make private metadata while the existing materializer owns recursive frozen declaration selection. */

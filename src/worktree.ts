@@ -485,7 +485,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
             )
           } else {
             if (removeOptions.unlock === true) await unlockWorktree(git, repo, path)
-            rehome.run()
+            await rehome.run()
           }
           await git.run(repo, ["worktree", "remove", "--force", path], false, timeouts.cleanup)
           if (existsSync(path) || (await inspectWorktree(git, repo, path)).registered) {
