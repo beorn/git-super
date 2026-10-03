@@ -538,7 +538,8 @@ type StoreCustody = Readonly<{ common: string; checkout: string; gitDir: string;
 
 function isGitDirectory(owner: string, root: string, rootIsGitDir: boolean): boolean {
   if (!within(root, owner)) return false
-  if (owner === root) return rootIsGitDir
+  // Retained metadata roots lack the donor's Git-directory context flag.
+  if (owner === root && rootIsGitDir) return true
   return (
     present(join(owner, "HEAD")) &&
     lstatSync(join(owner, "HEAD")).isFile() &&

@@ -277,24 +277,28 @@ it.each(["unknown-store", "unknown-hook"] as const)(
 // CTO343fc3e2/0a13f6da: host-selected linked environments borrow declared public stores transitively.
 // Existing primary-source fixtures have no public alternates and therefore miss real Yrd source closure.
 it.each([
-  [false, false],
-  [true, false],
-  [false, true],
+  [false, false, false],
+  [true, false, false],
+  [false, true, false],
+  [false, false, true],
 ])(
-  "projects a public linked source with its declared child object-store lenders; nested=%s; authored=%s",
-  async (nested, authored) => {
+  "projects a public linked source with its declared child object-store lenders; nested=%s; authored=%s; remove donor=%s",
+  async (nested, authored, removeDonor) => {
     const root = await mkdtemp(join(canonicalTmpdir(), "git-super-linked-source-closure-"))
     roots.push(root)
     const fixture = nested ? addNestedAlphaSubmodule(createProductFixture(root)) : createProductFixture(root)
-    git(fixture.product, "config", "-f", ".gitmodules", "submodule.vendor/beta.private", "true")
-    git(fixture.product, "add", ".gitmodules")
-    git(fixture.product, "commit", "-q", "-m", "declare excluded source child")
+    const excludedSubmodules = removeDonor ? [] : ["vendor/beta"]
+    if (!removeDonor) {
+      git(fixture.product, "config", "-f", ".gitmodules", "submodule.vendor/beta.private", "true")
+      git(fixture.product, "add", ".gitmodules")
+      git(fixture.product, "commit", "-q", "-m", "declare excluded source child")
+    }
     let base = git(fixture.product, "rev-parse", "HEAD")
     const source = join(root, "source")
     const transport = createLocalGitProcess()
     const store = createGitWorktreeStore({ repo: fixture.product, gitProcess: transport })
     await store.add({ kind: "detached", path: source, ref: base })
-    await store.materializeSubmodules(source, { excludedSubmodules: ["vendor/beta"] })
+    await store.materializeSubmodules(source, { excludedSubmodules })
     const alpha = join(source, "packages/alpha")
     const sourceGit = git(alpha, "rev-parse", "--path-format=absolute", "--git-common-dir")
     const durableObjects = join(fixture.product, ".git/modules/packages/alpha/objects")
@@ -314,7 +318,7 @@ it.each([
       commit: base,
       branch: "task/seat",
       destination: join(root, "seat"),
-      excludedSubmodules: ["vendor/beta"],
+      excludedSubmodules,
     })
     expect(projected.state, JSON.stringify(projected.detail)).toBe("updated")
     expect(projected.projection?.mounts).toContainEqual({
@@ -323,8 +327,8 @@ it.each([
       mode: "ro",
     })
     const privateObjects = join(fixture.product, ".git/modules/vendor/beta/objects")
-    expect(projected.projection?.mounts.some((mount) => mount.source === privateObjects)).toBe(false)
-    expect(existsSync(join(source, "vendor/beta/.git"))).toBe(false)
+    expect(projected.projection?.mounts.some((mount) => mount.source === privateObjects)).toBe(removeDonor)
+    expect(existsSync(join(source, "vendor/beta/.git"))).toBe(removeDonor)
     if (authored) {
       const lender = join(fixture.product, "packages/alpha")
       const unrelated = git(lender, "commit-tree", "HEAD^{tree}", "-m", "unrelated lender tip")
@@ -342,6 +346,34 @@ it.each([
     if (nested) {
       const leafObjects = join(fixture.product, ".git/modules/packages/alpha/modules/apps/maddoc/objects")
       expect(projected.projection?.mounts).toContainEqual({ source: leafObjects, target: leafObjects, mode: "ro" })
+    }
+    if (removeDonor) {
+      // A retained private root has a free writer lease, not an active Git lock.
+      // Existing retention journeys never remove its linked-source donor afterwards.
+      if (projected.projection === undefined) throw new Error("projection omitted its custody record")
+      const retained = await GitSuper.retainPrivateGitProjection(projected.projection, join(root, "retained-seat"))
+      expect(retained.state, JSON.stringify(retained.detail)).toBe("updated")
+      if (retained.manifest === undefined) throw new Error("retention omitted its dependency manifest")
+      const proof = JSON.parse(readFileSync(retained.manifest, "utf8")) as {
+        retained: string
+        externalObjectStores: readonly { target: string }[]
+      }
+      const donorGit = git(source, "rev-parse", "--absolute-git-dir")
+      for (const dependency of proof.externalObjectStores) {
+        expect(dependency.target === donorGit || dependency.target.startsWith(`${donorGit}/`)).toBe(false)
+      }
+      expect(statSync(join(proof.retained, "yrd-worktree-mutations/writer.lock")).size).toBe(0)
+      await store.remove(source, {
+        retention: {
+          root: join(root, "retained-donor"),
+          report: (removed) => expect(existsSync(removed.manifest)).toBe(true),
+        },
+        excludedSubmodules,
+      })
+      expect(existsSync(source)).toBe(false)
+      expect(existsSync(proof.retained)).toBe(true)
+      git(fixture.product, "--git-dir", proof.retained, "cat-file", "-e", `${base}^{commit}`)
+      return
     }
     const alternates = join(sourceGit, "objects/info/alternates")
     const original = readFileSync(alternates, "utf8")
