@@ -35,7 +35,7 @@ import { addNestedAlphaSubmodule, advanceRepository, canonicalTmpdir, createProd
 
 vi.mock("node:fs/promises", async (importOriginal) => {
   const fs = await importOriginal<typeof import("node:fs/promises")>()
-  return { ...fs, open: vi.fn(fs.open) }
+  return { ...fs, open: vi.fn(fs.open), readFile: vi.fn(fs.readFile) }
 })
 
 const roots: string[] = []
@@ -155,6 +155,73 @@ it.each(["removed", "regular replacement", "symlink replacement"] as const)(
     } finally {
       opening.mockImplementation(originalOpen)
       opening.mockClear()
+    }
+  },
+)
+
+// CTOa6e10f22: strict closure must bind inspected alternates identity before the first Git call.
+// Static malformed-entry cases miss a replacement at the actual filesystem read boundary.
+it.each(["removed", "regular replacement", "symlink replacement", "regular replacement after reading"] as const)(
+  "refuses alternates changed after inspection before any Git: %s",
+  async (change) => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-alternates-replacement-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const alternates = join(fixture.product, ".git/objects/info/alternates")
+    writeFileSync(alternates, "")
+    const replacement = join(root, "replacement")
+    writeFileSync(replacement, "")
+    const original = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises")
+    let changed = false
+    const replace = (path: unknown): void => {
+      if (path !== alternates || changed) return
+      changed = true
+      if (change === "regular replacement" || change === "regular replacement after reading") {
+        renameSync(replacement, alternates)
+      } else {
+        unlinkSync(alternates)
+        if (change === "symlink replacement") symlinkSync(replacement, alternates)
+      }
+    }
+    const opening = vi.mocked(filesystem.open).mockImplementation(async (...args) => {
+      if (change !== "regular replacement after reading") replace(args[0])
+      const handle = await original.open(...args)
+      if (args[0] === alternates && change === "regular replacement after reading") {
+        const read = handle.readFile.bind(handle)
+        vi.spyOn(handle, "readFile").mockImplementation(async (...readArgs) => {
+          const content = await read(...readArgs)
+          replace(args[0])
+          return content
+        })
+      }
+      return handle
+    })
+    const reading = vi.mocked(filesystem.readFile).mockImplementation(async (...args) => {
+      if (change !== "regular replacement after reading") replace(args[0])
+      return original.readFile(...args)
+    })
+    const transport = createLocalGitProcess()
+    const run = vi.fn(transport.run.bind(transport))
+    const destination = join(root, "seat")
+    try {
+      const result = await GitSuper.projectPrivateGitWorktree({
+        sourceCheckout: fixture.product,
+        commit: fixture.productBase,
+        branch: "task/seat",
+        destination,
+        excludedSubmodules: [],
+        git: { run },
+      })
+      expect(changed, "the native alternates replacement never reached the reader").toBe(true)
+      expect(result.state, JSON.stringify(result.detail)).toBe("failed")
+      expect(result.detail?.message).toContain(alternates)
+      expect(run).not.toHaveBeenCalled()
+      expect(existsSync(destination)).toBe(false)
+    } finally {
+      opening.mockImplementation(original.open)
+      opening.mockClear()
+      reading.mockImplementation(original.readFile)
+      reading.mockClear()
     }
   },
 )

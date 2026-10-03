@@ -1,7 +1,8 @@
-import { lstat, mkdir, open, realpath, writeFile } from "node:fs/promises"
-import { constants, rmSync, type Stats } from "node:fs"
+import { lstat, mkdir, realpath, writeFile } from "node:fs/promises"
+import { rmSync, type Stats } from "node:fs"
 import { dirname, join, relative, resolve, sep } from "node:path"
 import { alternatesLineage } from "./alternates.ts"
+import { readMetadataFile } from "./git-metadata.ts"
 import { readPrivateSubmodulePaths } from "./commit-graph.ts"
 import { cleanGitEnvironment, validateExcludedSubmodules, withGitEnvironment } from "./git.ts"
 import { createLocalGitProcess, type GitProcess } from "./process.ts"
@@ -234,36 +235,6 @@ export function retirePrivateGitProjection(
   stopCertificate?: PrivateGitStopCertificate,
 ): Promise<PrivateGitRetentionResult> {
   return preserveProjection(projection, retentionRoot, true, stopCertificate)
-}
-
-/** Resolve host-selected repository metadata without asking Git to follow an object path. */
-async function readMetadataFile(pointer: string, inspected: Stats): Promise<string> {
-  if (!inspected.isFile()) throw new Error(`unsupported Git metadata file: ${pointer}`)
-  if (typeof constants.O_NOFOLLOW !== "number") {
-    throw new Error(`no-follow Git metadata reading is unavailable: ${pointer}`)
-  }
-  const same = (observed: Stats): boolean =>
-    observed.isFile() &&
-    observed.dev === inspected.dev &&
-    observed.ino === inspected.ino &&
-    observed.size === inspected.size &&
-    observed.mtimeMs === inspected.mtimeMs &&
-    observed.ctimeMs === inspected.ctimeMs
-  try {
-    const handle = await open(pointer, constants.O_RDONLY | constants.O_NOFOLLOW)
-    try {
-      if (!same(await handle.stat())) throw new Error("opened metadata identity changed")
-      const content = await handle.readFile("utf8")
-      if (!same(await handle.stat()) || !same(await lstat(pointer))) {
-        throw new Error("metadata identity changed during reading")
-      }
-      return content
-    } finally {
-      await handle.close()
-    }
-  } catch (error) {
-    throw new Error(`cannot read Git metadata file: ${pointer}`, { cause: error })
-  }
 }
 
 async function metadata(checkout: string): Promise<string> {
