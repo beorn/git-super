@@ -1,7 +1,12 @@
 import { existsSync, readFileSync, statSync } from "node:fs"
 import { rm } from "node:fs/promises"
 import { dirname, isAbsolute, join, resolve } from "node:path"
-import { readCommitSubmodules, resolveSubmoduleBranch, type CommitSubmodule } from "./commit-graph.ts"
+import {
+  readCommitSubmodules,
+  readPrivateSubmodulePaths,
+  resolveSubmoduleBranch,
+  type CommitSubmodule,
+} from "./commit-graph.ts"
 import {
   composeSubmoduleCommits,
   findSubmoduleCompositionOverlaps,
@@ -28,6 +33,7 @@ import { createLocalGitProcess, type GitProcess, type GitProcessRequest, type Gi
 import { createProgressReporter } from "./progress.ts"
 import { shellQuote } from "./shell-command.ts"
 import type { NotCompared } from "./diff.ts"
+import { inspectExcludedCheckout } from "./status.ts"
 import { isSubmoduleExcluded, validateExcludedSubmodules } from "./git.ts"
 import { proveExcludedCheckouts, type ExcludedCheckout } from "./pull.ts"
 import type { GitResultDetail, GitSuperRepositoryResult, GitSuperResult } from "./result.ts"
@@ -494,9 +500,9 @@ async function mergeObserved(
   steps: StepClock,
   initializations: SuperMergeInitializationResult[],
 ): Promise<SuperMergeResult> {
-  const excludedSubmodules = options.excludedSubmodules ?? []
+  const requestedExclusions = options.excludedSubmodules ?? []
   try {
-    validateExcludedSubmodules(excludedSubmodules)
+    validateExcludedSubmodules(requestedExclusions)
   } catch (error) {
     return failed(
       root,
@@ -511,6 +517,21 @@ async function mergeObserved(
     )
   }
   const head = await required(git, root, ["rev-parse", "HEAD^{commit}"], "resolve-head", timeoutMs)
+  // 27162: `.gitmodules private = true` is the declaration's one home. A declared-private child this environment
+  // intentionally leaves out (empty or absent checkout, by construction) is excluded by its declaration, so a
+  // root-only merge does not need its store. A changed private pin still refuses by name through the same
+  // preflight a caller's `--exclude-submodule` uses, and no routine refresh cure recommends initializing it.
+  let declaredPrivateExclusions: readonly string[] = []
+  try {
+    declaredPrivateExclusions = (await readPrivateSubmodulePaths(git, root, head)).filter((path) => {
+      const state = inspectExcludedCheckout(root, path).state
+      return state === "empty" || state === "absent"
+    })
+  } catch (error) {
+    const declarationDetail = (error as Error & { resultDetail?: GitResultDetail }).resultDetail
+    return failed(root, [], declarationDetail ?? resultError(error, "read-private-submodules"))
+  }
+  const excludedSubmodules = [...new Set([...requestedExclusions, ...declaredPrivateExclusions])].sort()
   let target: string
   try {
     target = await required(git, root, ["rev-parse", `${options.commit}^{commit}`], "resolve-merge-target", timeoutMs)
@@ -523,6 +544,7 @@ async function mergeObserved(
   let admittedExclusions: readonly NotCompared[] = []
   let alreadyContained = false
   if (excludedSubmodules.length > 0) {
+    const privatePaths = new Set(declaredPrivateExclusions)
     const refuseExcluded = (path: string, reason: string): SuperMergeResult =>
       failed(
         root,
@@ -531,7 +553,9 @@ async function mergeObserved(
           "excluded-submodule-unproven",
           `Cannot exclude ${path}: ${reason}`,
           `git -C ${shellQuote(root)} show HEAD:${shellQuote(path)}`,
-          "Only exclude a root gitlink whose pin is identical in HEAD, the target, and their single merge base.",
+          privatePaths.has(path)
+            ? "A declared-private gitlink may be excluded only while its pin is identical in HEAD and the target; a pin this merge would change or introduce belongs to the caller."
+            : "Only exclude a root gitlink whose pin is identical in HEAD, the target, and their single merge base.",
           "the caller",
           { paths: [path], phase: "preflight-excluded-checkouts" },
         ),
@@ -540,6 +564,9 @@ async function mergeObserved(
     const headPins = new Map(headEntries.map((entry) => [entry.path, entry.target]))
     for (const path of excludedSubmodules) {
       if (headPins.has(path)) continue
+      // A declared-private path HEAD does not carry as a root gitlink is not an exclusion here (27162); only a
+      // caller-requested path refuses for shape.
+      if (!requestedExclusions.includes(path)) continue
       if (headEntries.some((entry) => path.startsWith(`${entry.path}/`))) {
         return refuseExcluded(path, "nested exclusions under an included owner cannot be proved from root commits")
       }
@@ -548,20 +575,21 @@ async function mergeObserved(
     const baseArgs = ["merge-base", "--all", head, target]
     const baseResult = await run(git, root, baseArgs, timeoutMs)
     const bases = baseResult.code === 0 ? baseResult.stdout.trim().split(/\r?\n/u).filter(Boolean) : []
-    if (bases.length !== 1) {
+    const targetEntries = await readCommitSubmodules(git, root, target)
+    const targetPins = new Map(targetEntries.map((entry) => [entry.path, entry.target]))
+    // A declared-private child's own history is never compared, so its exclusion needs no merge base: an
+    // identical HEAD/target pin already proves the merge leaves that gitlink alone (27162). Every other
+    // exclusion keeps the single merge base the design requires, so its head, target and base pins all compare.
+    const firstComparedPath = excludedSubmodules.find((path) => !privatePaths.has(path))
+    if (firstComparedPath !== undefined && bases.length !== 1) {
       return refuseExcluded(
-        excludedSubmodules[0] ?? "<unknown>",
+        firstComparedPath,
         `HEAD and target have ${bases.length === 0 ? "no readable" : "multiple"} merge bases`,
       )
     }
-    const base = bases[0]
-    if (base === undefined) {
-      return refuseExcluded(excludedSubmodules[0] ?? "<unknown>", "HEAD and target have no readable merge base")
-    }
-    const baseEntries = await readCommitSubmodules(git, root, base)
-    const targetEntries = await readCommitSubmodules(git, root, target)
+    const base = bases.length === 1 ? bases[0] : undefined
+    const baseEntries = base === undefined ? [] : await readCommitSubmodules(git, root, base)
     const basePins = new Map(baseEntries.map((entry) => [entry.path, entry.target]))
-    const targetPins = new Map(targetEntries.map((entry) => [entry.path, entry.target]))
     const stagedPins =
       continuationTree === undefined
         ? undefined
@@ -572,7 +600,17 @@ async function mergeObserved(
       )
       if (coveredByExcludedRoot) continue
       const pin = headPins.get(path)
-      if (pin === undefined || targetPins.get(path) !== pin || basePins.get(path) !== pin) {
+      if (pin === undefined) {
+        // A declared-private path HEAD does not carry is inert only while the target and the staged
+        // continuation also lack it: a merge that would introduce the gitlink needs the same named refusal (27162).
+        if (targetPins.has(path) || stagedPins?.has(path) === true) {
+          return refuseExcluded(path, "the merge would introduce this gitlink that HEAD does not carry")
+        }
+        continue
+      }
+      if (privatePaths.has(path)) {
+        if (targetPins.get(path) !== pin) return refuseExcluded(path, "its HEAD and target gitlink pins differ")
+      } else if (targetPins.get(path) !== pin || basePins.get(path) !== pin) {
         return refuseExcluded(path, "its HEAD, target, and merge-base gitlink pins are not identical")
       }
       if (stagedPins !== undefined) {
@@ -585,7 +623,9 @@ async function mergeObserved(
         .map((path) => ({
           path,
           repository: join(root, path),
-          allowAbsent: false,
+          // 27162: an automatically declared-private path may be absent as well as empty, since this environment
+          // intentionally leaves the private checkout out. A caller-requested non-private exclusion stays strict.
+          allowAbsent: privatePaths.has(path),
         }))
       proveExcludedCheckouts(root, checkouts, "merge")
     } catch (error) {
@@ -604,6 +644,9 @@ async function mergeObserved(
   if (status.code !== 0) {
     return failed(root, [], resultDetailFromGit("git-failed", "verify-clean", root, statusArgs, status))
   }
+  // 27162: an intentionally absent declared-private checkout is a parent-level deletion record, not root worktree
+  // dirt; its unchanged pin was already proved before the exclusion, so the absent path must not block the merge.
+  const observedStatus = withoutDeclaredPrivateDeletions(status.stdout, declaredPrivateExclusions)
   const containmentArgs = ["merge-base", "--is-ancestor", target, head]
   const containment = excludedSubmodules.length > 0 ? undefined : await run(git, root, containmentArgs, timeoutMs)
   if (alreadyContained || containment?.code === 0) {
@@ -701,8 +744,8 @@ async function mergeObserved(
       prospective.conflict !== undefined &&
       prospective.conflict.entries.every((entry) => entry.mode !== "160000")
     ) {
-      if (status.stdout !== "") {
-        return failed(root, [], dirtyWorktreeDetail(root, options.commit, nulRecords(status.stdout)))
+      if (observedStatus !== "") {
+        return failed(root, [], dirtyWorktreeDetail(root, options.commit, nulRecords(observedStatus)))
       }
       const checkoutFailure = await verifyRestingCheckouts(git, root, head, timeoutMs, excludedSubmodules)
       if (checkoutFailure !== undefined) return failed(root, [], checkoutFailure)
@@ -954,7 +997,7 @@ async function mergeObserved(
   const preparedRows = checkoutResults(preparedCheckouts)
   const statusFailure = options.continue
     ? undefined
-    : await validateWorktreeStatus(git, root, options.commit, status.stdout, preparedCheckouts, timeoutMs)
+    : await validateWorktreeStatus(git, root, options.commit, observedStatus, preparedCheckouts, timeoutMs)
   if (statusFailure !== undefined) return failed(root, [], statusFailure, preparedRows)
 
   steps.begin("merge")
@@ -1730,6 +1773,19 @@ async function validateWorktreeStatus(
 
 function nulRecords(output: string): string[] {
   return output.split("\0").filter(Boolean)
+}
+
+/**
+ * 27162: drop a declared-private path's absence from the parent status before the cleanliness gate. The
+ * exclusion already proved its HEAD/target/staged pins identical, so a missing checkout is intended, not dirt.
+ */
+function withoutDeclaredPrivateDeletions(output: string, privatePaths: readonly string[]): string {
+  if (privatePaths.length === 0) return output
+  const declared = new Set(privatePaths)
+  return nulRecords(output)
+    .filter((record) => !(record.startsWith(" D ") && declared.has(record.slice(3))))
+    .map((record) => record + "\0")
+    .join("")
 }
 
 function dirtyWorktreeDetail(root: string, commit: string, paths: readonly string[]): GitResultDetail {
