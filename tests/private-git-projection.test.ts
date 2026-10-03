@@ -353,6 +353,53 @@ it.each(["removed", "regular replacement", "symlink replacement", "regular repla
   },
 )
 
+// CTOa6e10f22: caller inputs are copied at entry before asynchronous trusted preparation.
+// Metadata replacement tests do not mutate the caller's branch, commit or exclusion array.
+it("keeps the entered projection selection when the caller changes its inputs during preparation", async () => {
+  const root = await mkdtemp(join(canonicalTmpdir(), "git-super-frozen-projection-inputs-"))
+  roots.push(root)
+  const fixture = addNestedAlphaSubmodule(createProductFixture(root))
+  const destination = join(root, "seat")
+  const changedDestination = join(root, "changed-seat")
+  const transport = createLocalGitProcess()
+  const options = {
+    sourceCheckout: fixture.product,
+    commit: fixture.productWithNestedBase,
+    branch: "task/seat",
+    destination,
+    excludedSubmodules: [] as string[],
+    git: transport,
+  }
+  let changed = false
+  options.git = {
+    run: (request) => {
+      if (!changed) {
+        options.sourceCheckout = fixture.beta
+        options.commit = fixture.betaBase
+        options.branch = "task/changed-seat"
+        options.destination = changedDestination
+        options.excludedSubmodules.push("vendor/beta")
+        changed = true
+      }
+      return transport.run(request)
+    },
+  }
+  const result = await GitSuper.projectPrivateGitWorktree(options)
+  expect(changed, "caller mutation never reached actual trusted preparation").toBe(true)
+  expect(result.state, JSON.stringify(result.detail)).toBe("updated")
+  expect(result.projection?.checkout).toBe(destination)
+  expect(result.projection?.base).toBe(fixture.productWithNestedBase)
+  expect(result.projection?.branch).toBe("task/seat")
+  expect(result.projection?.repositories.map((entry) => entry.path)).toEqual([
+    "",
+    "packages/alpha",
+    "packages/alpha/apps/maddoc",
+    "vendor/beta",
+  ])
+  expect(git(destination, "symbolic-ref", "HEAD")).toBe("refs/heads/task/seat")
+  expect(existsSync(changedDestination)).toBe(false)
+})
+
 // CTOa6e10f22: private root creation and descendants retain routing custody through recursive traversal.
 // Ordinary materializer contention does not execute the private creator callback or private nested policy writes.
 it("holds private root creation, child and ancestor custody through checkout and recursive routing", async () => {

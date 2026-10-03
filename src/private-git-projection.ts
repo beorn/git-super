@@ -255,8 +255,14 @@ async function metadata(
 
 /** Make private metadata while the existing materializer owns recursive frozen declaration selection. */
 export async function projectPrivateGitWorktree(
-  options: PrivateGitProjectionOptions,
+  requestedOptions: PrivateGitProjectionOptions,
 ): Promise<PrivateGitProjectionResult> {
+  const options: PrivateGitProjectionOptions = {
+    ...requestedOptions,
+    excludedSubmodules: Array.isArray(requestedOptions.excludedSubmodules)
+      ? [...(requestedOptions.excludedSubmodules as readonly string[])]
+      : requestedOptions.excludedSubmodules,
+  }
   const retainedPaths: string[] = []
   const repositories: Array<{ path: string; checkout: string; gitDirectory: string; head: string }> = []
   const stores = new Set<string>()
