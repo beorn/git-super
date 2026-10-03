@@ -342,6 +342,42 @@ it.each([false, true])(
 
 // CTO63d0a344 step 5: publication must not separate the final equality check from removal.
 // The helper-config race mutates at lease acquisition, before snapshot; this writes after proof publication.
+// CTO0a13f6da and projection Pro: borrowed-object registration alone cannot prove GC lifetime.
+// Prior native fsck tests ran while the lender's ordinary refs still held every selected object.
+it("keeps borrowed public child commits readable after the lender collects unrelated objects", async () => {
+  const root = await mkdtemp(join(canonicalTmpdir(), "git-super-public-lender-gc-"))
+  roots.push(root)
+  const fixture = createProductFixture(root)
+  const source = join(root, "source")
+  const store = createGitWorktreeStore({ repo: fixture.product, gitProcess: createLocalGitProcess() })
+  await store.add({ kind: "detached", path: source, ref: fixture.productBase })
+  await store.materializeSubmodules(source)
+  const destination = join(root, "seat")
+  const projected = await GitSuper.projectPrivateGitWorktree({
+    sourceCheckout: source,
+    commit: fixture.productBase,
+    branch: "task/seat",
+    destination,
+    excludedSubmodules: [],
+  })
+  expect(projected.state, JSON.stringify(projected.detail)).toBe("updated")
+  const lender = join(fixture.product, "packages/alpha")
+  const unrelated = git(lender, "commit-tree", "HEAD^{tree}", "-m", "unrelated lender tip")
+  const collectible = git(lender, "commit-tree", "HEAD^{tree}", "-m", "unreferenced positive GC control")
+  git(lender, "update-ref", "--no-deref", "HEAD", unrelated)
+  for (const ref of git(lender, "for-each-ref", "--format=%(refname)").split("\n")) {
+    if (ref !== "" && !ref.startsWith("refs/git-super/pins/")) git(lender, "update-ref", "-d", ref)
+  }
+  git(lender, "reflog", "expire", "--expire=now", "--all")
+  git(lender, "gc", "--prune=now")
+  expect(() => git(lender, "cat-file", "-e", collectible), "GC must actually prune the unreferenced control").toThrow()
+  expect(
+    () => git(join(destination, "packages/alpha"), "cat-file", "-e", `${fixture.alphaBase}^{commit}`),
+    "private child lost a selected commit when its public lender ran GC",
+  ).not.toThrow()
+  git(join(destination, "packages/alpha"), "fsck", "--full", "--no-reflogs")
+})
+
 it("keeps the original when another process writes after custody proof publication", async () => {
   const root = await mkdtemp(join(canonicalTmpdir(), "git-super-final-custody-write-"))
   roots.push(root)

@@ -352,12 +352,16 @@ export async function projectPrivateGitWorktree(
         flag: "wx",
       })
       await run(checkout, ["cat-file", "-e", `${head}^{commit}`])
-      await createExclusive(join(common, "yrd-worktree-mutations")).run(
-        async () => {
-          await run(checkout, ["--git-dir", common, "update-ref", pinRef(head), head])
-        },
-        { holder: `private projection ${destination}` },
-      )
+      // A ref in the borrower cannot protect objects from a lender's own GC.
+      // Every validated lender must hold the selected commit under the existing exact-object pin.
+      for (const directory of new Set([common, ...lineage.map((lender) => dirname(lender))])) {
+        await createExclusive(join(directory, "yrd-worktree-mutations")).run(
+          async () => {
+            await run(checkout, ["--git-dir", directory, "update-ref", pinRef(head), head])
+          },
+          { holder: `private projection ${destination}` },
+        )
+      }
       stores.add(objects)
       for (const lender of lineage) stores.add(lender)
       await run(checkout, ["checkout", "--no-recurse-submodules", "-B", options.branch, head])
