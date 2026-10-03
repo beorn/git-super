@@ -1,5 +1,5 @@
 import { lstat, mkdir, realpath, writeFile } from "node:fs/promises"
-import { rmSync } from "node:fs"
+import { rmSync, type Stats } from "node:fs"
 import { dirname, join, relative, resolve, sep } from "node:path"
 import { alternatesLineage } from "./alternates.ts"
 import { commonDirectory, readMetadataFile } from "./git-metadata.ts"
@@ -237,12 +237,18 @@ export function retirePrivateGitProjection(
   return preserveProjection(projection, retentionRoot, true, stopCertificate)
 }
 
-async function metadata(checkout: string): Promise<string> {
+async function metadata(
+  checkout: string,
+  inspect?: (path: string, stat: Stats | undefined, bytes: Buffer | undefined) => void,
+): Promise<string> {
   const pointer = join(checkout, ".git")
   const stat = await lstat(pointer)
-  if (stat.isDirectory()) return realpath(pointer)
+  if (stat.isDirectory()) {
+    inspect?.(pointer, stat, undefined)
+    return realpath(pointer)
+  }
   if (!stat.isFile()) throw new Error(`unsupported Git metadata pointer: ${pointer}`)
-  const match = /^gitdir: ([^\r\n]+)\r?\n?$/u.exec(await readMetadataFile(pointer, stat))
+  const match = /^gitdir: ([^\r\n]+)\r?\n?$/u.exec(await readMetadataFile(pointer, stat, inspect))
   if (match?.[1] === undefined) throw new Error(`invalid Git metadata pointer: ${pointer}`)
   return realpath(resolve(checkout, match[1]))
 }
@@ -321,26 +327,54 @@ export async function projectPrivateGitWorktree(
     >()
     const privateDirectories = new Map<string, string>([[destination, join(destination, ".git")]])
     const heldLocks = new Map<string, WriterLock>()
+    const inputs = new Map<string, { stat: Stats | undefined; bytes: Buffer | undefined }>()
+    const sameEntry = (before: Stats | undefined, after: Stats | undefined): boolean =>
+      before === undefined
+        ? after === undefined
+        : after !== undefined &&
+          before.dev === after.dev &&
+          before.ino === after.ino &&
+          before.mode === after.mode &&
+          (!before.isFile() ||
+            (before.size === after.size && before.mtimeMs === after.mtimeMs && before.ctimeMs === after.ctimeMs))
+    const inspect = (path: string, stat: Stats | undefined, bytes: Buffer | undefined): void => {
+      const previous = inputs.get(path)
+      if (
+        previous !== undefined &&
+        (!sameEntry(previous.stat, stat) ||
+          (previous.bytes === undefined ? bytes !== undefined : bytes === undefined || !previous.bytes.equals(bytes)))
+      ) {
+        throw new Error(`Git metadata identity changed during preparation: ${path}`)
+      }
+      inputs.set(path, { stat, bytes: bytes === undefined ? undefined : Buffer.from(bytes) })
+    }
     const prepareRepository = async (
       checkout: string,
       sourceCheckout: string,
       head: string,
       publicGitDirectory?: string,
     ): Promise<void> => {
-      const sourceGit = await metadata(sourceCheckout)
-      const common = await commonDirectory(sourceGit)
+      if ((await realpath(sourceCheckout)) !== sourceCheckout) {
+        throw new Error(`redirected source checkout metadata: ${sourceCheckout}`)
+      }
+      const sourceGit = await metadata(sourceCheckout, inspect)
+      const common = await commonDirectory(sourceGit, inspect)
       const objects = join(common, "objects")
       const publicDirectory = publicGitDirectory ?? common
       if (!(await lstat(publicDirectory)).isDirectory() || (await realpath(publicDirectory)) !== publicDirectory) {
         throw new Error(`nonphysical declared public metadata: ${publicDirectory}`)
       }
-      const publicCommon = await commonDirectory(publicDirectory)
+      const publicCommon = await commonDirectory(publicDirectory, inspect)
+      for (const directory of new Set([sourceCheckout, sourceGit, common, publicDirectory, publicCommon])) {
+        inspect(directory, await lstat(directory), undefined)
+      }
       objectOwners.set(objects, common)
       objectOwners.set(join(publicCommon, "objects"), publicCommon)
       publicDirectories.set(checkout, publicDirectory)
       const publicObjects = join(publicDirectory, "objects")
       const lineage = await alternatesLineage([objects], join(checkout, ".git", "objects"), {
         allowedObjects: new Set([...stores, objects, publicObjects]),
+        inspect,
       })
       const owners = new Set<string>()
       for (const store of [objects, ...lineage]) {
@@ -536,6 +570,27 @@ export async function projectPrivateGitWorktree(
           },
           { holder: `private projection ${destination}` },
         )
+      }
+      for (const [path, inspected] of inputs) {
+        let current: Stats | undefined
+        try {
+          current = await lstat(path)
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+            throw new Error(`cannot reinspect prepared Git metadata: ${path}`, { cause: error })
+          }
+        }
+        if (!sameEntry(inspected.stat, current)) throw new Error(`prepared Git metadata identity changed: ${path}`)
+        if (current !== undefined && (await realpath(path)) !== path) {
+          throw new Error(`prepared Git metadata path redirected: ${path}`)
+        }
+        if (inspected.bytes !== undefined && current !== undefined) {
+          await readMetadataFile(path, current, (_path, _stat, bytes) => {
+            if (bytes === undefined || !inspected.bytes?.equals(bytes)) {
+              throw new Error(`prepared Git metadata bytes changed: ${path}`)
+            }
+          })
+        }
       }
       for (const selected of prepared.values()) {
         if (
