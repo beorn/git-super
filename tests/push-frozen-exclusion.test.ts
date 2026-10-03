@@ -28,6 +28,14 @@ const CHILD_URL = "https://git-super.test/owned/child.git"
 /** Never mapped to a local path: any read of the excluded child would leave the machine and fail. */
 const SECRET_URL = "https://git-super.test/owned/secret.git"
 
+/**
+ * The whole global config the fixture's git sees. superMerge makes its merge commit through its own git process,
+ * outside the fixture's git() helper, so the identity lives here: a host where git cannot derive one (hab1 has no
+ * mail domain) refuses the merge with "Committer identity unknown".
+ */
+const GLOBAL_CONFIG =
+  '[protocol "file"]\n\tallow = always\n[user]\n\tname = Git Super Test\n\temail = git-super@example.test\n'
+
 const fixtures: string[] = []
 const previousGlobal = process.env.GIT_CONFIG_GLOBAL
 let config = ""
@@ -35,7 +43,7 @@ beforeAll(() => {
   const home = mkdtempSync(join(canonicalTmpdir(), "git-super-frozen-exclusion-config-"))
   fixtures.push(home)
   config = join(home, "gitconfig")
-  writeFileSync(config, '[protocol "file"]\n\tallow = always\n')
+  writeFileSync(config, GLOBAL_CONFIG)
   process.env.GIT_CONFIG_GLOBAL = config
 })
 afterAll(() => {
@@ -76,7 +84,7 @@ function excludedFixture(): Readonly<{
   const rootRemote = join(fixture, "root.git")
   git(fixture, "init", "--bare", "-q", "-b", "main", rootRemote)
   // One fixture's hosted names at a time: an earlier fixture's mapping for the same URL would win.
-  writeFileSync(config, '[protocol "file"]\n\tallow = always\n')
+  writeFileSync(config, GLOBAL_CONFIG)
   git(fixture, "config", "--file", config, `url.${rootRemote}.insteadOf`, ROOT_URL)
   git(fixture, "config", "--file", config, `url.${child.remote}.insteadOf`, CHILD_URL)
   const root = join(fixture, "root")
