@@ -666,6 +666,45 @@ function checkoutPin(product: string, path: string, sha: string): void {
 }
 
 /**
+ * The wrong-store shape PLUS an ordinary root content conflict: two components
+ * that each diverged two-sided (the 128 trigger) and one root file both sides
+ * changed differently. Composing the gitlinks cannot settle the root conflict,
+ * so the refusal must name the real HEAD and target — never the scratch carrier
+ * built to reveal the conflict (27268).
+ */
+function divergeBothProductComponentsWithRootClash(
+  fixture: ProductFixture,
+): Readonly<{ alphaOurs: string; alphaTheirs: string; candidate: string; head: string }> {
+  git(fixture.alpha, "checkout", "-q", "-b", "diverge", fixture.alphaBase)
+  const alphaTheirs = advanceRepository(fixture.alpha, "alpha-theirs.ts", "export const alpha = 'theirs'\n")
+  git(fixture.alpha, "checkout", "-q", "main")
+  const alphaOurs = advanceRepository(fixture.alpha, "alpha-ours.ts", "export const alpha = 'ours'\n")
+  git(fixture.beta, "checkout", "-q", "-b", "diverge", fixture.betaBase)
+  const betaTheirs = advanceRepository(fixture.beta, "beta-theirs.ts", "export const beta = 'theirs'\n")
+  git(fixture.beta, "checkout", "-q", "main")
+  const betaOurs = advanceRepository(fixture.beta, "beta-ours.ts", "export const beta = 'ours'\n")
+
+  writeFileSync(join(fixture.product, "clash.txt"), "base\n")
+  git(fixture.product, "add", "clash.txt")
+  git(fixture.product, "commit", "-q", "-m", "seed the root clash file")
+
+  git(fixture.product, "switch", "-q", "-c", "diverge-both")
+  checkoutPin(fixture.product, "packages/alpha", alphaTheirs)
+  checkoutPin(fixture.product, "vendor/beta", betaTheirs)
+  writeFileSync(join(fixture.product, "clash.txt"), "theirs\n")
+  git(fixture.product, "add", "packages/alpha", "vendor/beta", "clash.txt")
+  git(fixture.product, "commit", "-q", "-m", "candidate diverges both components and the root clash")
+  const candidate = git(fixture.product, "rev-parse", "HEAD")
+  git(fixture.product, "switch", "-q", "main")
+  checkoutPin(fixture.product, "packages/alpha", alphaOurs)
+  checkoutPin(fixture.product, "vendor/beta", betaOurs)
+  writeFileSync(join(fixture.product, "clash.txt"), "ours\n")
+  git(fixture.product, "add", "packages/alpha", "vendor/beta", "clash.txt")
+  git(fixture.product, "commit", "-q", "-m", "main diverges both components and the root clash")
+  return { alphaOurs, alphaTheirs, candidate, head: git(fixture.product, "rev-parse", "HEAD") }
+}
+
+/**
  * A git process whose FIRST root `merge-tree` reproduces the wrong-store 128.
  * The real trigger needs a component object that lives only in the other
  * component's store, which no single-repository fixture can hold; every later
@@ -3412,6 +3451,63 @@ describe("git super merge", () => {
     expect(result.detail?.objectIds).toContain(foreign)
     expect(git(fixture.product, "rev-parse", "HEAD")).toBe(diverged.head)
   })
+
+  /**
+   * @failure A wrong-store divergence with an ordinary root conflict leaks the scratch carrier into the refusal (27268).
+   * @level l1
+   * @consumer Yrd settled candidate preparation and landing
+   * @testonly none; the wrong-store 128 is simulated, every composition step and the root conflict are native
+   */
+  it.each([false, true])(
+    "refuses an ordinary root conflict on the wrong-store shape naming the real HEAD, preserve=%s",
+    async (preserveConflicts) => {
+      const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-wrong-store-root-conflict-"))
+      roots.push(fixtureRoot)
+      const fixture = createProductFixture(fixtureRoot)
+      const diverged = divergeBothProductComponentsWithRootClash(fixture)
+      const local = createLocalGitProcess()
+      const carriers: string[] = []
+      let mergeCalls = 0
+      const result = await superMerge({
+        commit: diverged.candidate,
+        git: {
+          run: async (request) => {
+            if (request.repo === fixture.product && request.args.includes("merge-tree")) {
+              mergeCalls += 1
+              if (mergeCalls === 1) {
+                return { code: 128, stdout: "", stderr: `error: Could not read ${diverged.alphaOurs}\n` }
+              }
+            }
+            const ran = await local.run(request)
+            if (request.repo === fixture.product && request.args.includes("commit-tree") && ran.code === 0) {
+              carriers.push(ran.stdout.trim())
+            }
+            return ran
+          },
+        },
+        preserveConflicts,
+        repo: fixture.product,
+      })
+
+      expect(result.state, JSON.stringify(result)).toBe("failed")
+      expect(result.partial).toBe(false)
+      // A scratch carrier really was built, and nothing the caller can see names it.
+      expect(carriers.length).toBeGreaterThan(0)
+      const serialized = JSON.stringify(result)
+      for (const carrier of carriers) expect(serialized, `carrier ${carrier} leaked`).not.toContain(carrier)
+      expect(result.detail?.message).not.toContain("carrier")
+      expect(result.detail?.code).toBe("gitlink-compose-conflict")
+      // The refusal names the real HEAD and target and the observed ordinary conflict.
+      expect(result.detail?.message).toContain(diverged.head)
+      expect(result.detail?.message).toContain(diverged.candidate)
+      expect(result.detail?.paths).toContain("clash.txt")
+      expect(result.detail?.objectIds).toContain(diverged.head)
+      expect(result.detail?.objectIds).toContain(diverged.candidate)
+      // The refusal is before mutation: HEAD and the worktree are untouched.
+      expect(git(fixture.product, "rev-parse", "HEAD")).toBe(diverged.head)
+      expect(git(fixture.product, "status", "--porcelain").trim()).toBe("")
+    },
+  )
 
   it("refuses an unreadable submodule main before merging and names the resource", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-unreadable-main-"))

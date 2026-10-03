@@ -2352,11 +2352,34 @@ async function composeWrongStoreGitlinks(
   }
   const merged = await prospectiveTree(git, root, carrier.commit, target, timeoutMs)
   if ("failure" in merged) {
+    // The scratch carrier is an implementation detail. Nothing the caller can see may name it, so the refusal is
+    // rebuilt from the REAL head and target and the ordinary conflict the composed tree revealed.
+    const conflict = merged.conflict
+    if (conflict === undefined) {
+      return {
+        failure: composeUnavailable(
+          root,
+          diverged,
+          "verify the composed gitlinks against the merge target",
+          "the composed-gitlink preflight could not be computed",
+        ),
+      }
+    }
+    const located =
+      conflict.paths.length === 0 ? "" : ` at ${conflict.paths.map((path) => JSON.stringify(path)).join(", ")}`
     return {
-      failure: {
-        ...merged.failure,
-        message: `The wrong-store carrier could not merge ${target} cleanly over the composed gitlinks: ${merged.failure.message}`,
-      },
+      failure: obviousDetail(
+        "gitlink-compose-conflict",
+        `Merge ${target} conflicts with current HEAD ${head}${located}; composing the diverged gitlinks does not settle the conflict, and the non-mutating preflight left HEAD, index, and worktree unchanged. ${conflict.stageEvidence}`,
+        `git -C ${root} status --short`,
+        `Resolve the conflict${located} on the branch you are merging, then rerun the same git super merge command.`,
+        "the caller",
+        {
+          objectIds: [...new Set([head, target, ...conflict.entries.map((entry) => entry.oid)])],
+          paths: conflict.paths,
+          phase: "preflight-merge",
+        },
+      ),
     }
   }
   return { composed: composed.composed, substituted: composed.substituted, tree: merged.tree }
