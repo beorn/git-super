@@ -8,6 +8,7 @@ import { chmodSync, existsSync, readFileSync, mkdirSync, mkdtempSync, renameSync
 import { delimiter, dirname, isAbsolute, join, relative } from "node:path"
 import { fileURLToPath } from "node:url"
 import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest"
+import { tryAcquireFlock } from "@bearly/flock"
 import { runCli } from "../src/cli.ts"
 import { acquireExclusive } from "../src/exclusive.ts"
 import { superPush } from "../src/push.ts"
@@ -1842,6 +1843,8 @@ describe("git super merge", () => {
     expect(git(fixture.product, "status", "--porcelain=v1")).toBe("")
   })
 
+  // #27143: recursive settlement/rollback must exclude actual child routing writers.
+  // Pin coherence alone misses an available native lease during these writes.
   it("restores every settled checkout to its root-recorded pin when the concluding commit is rejected", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-commit-rollback-"))
     roots.push(fixtureRoot)
@@ -1863,7 +1866,41 @@ describe("git super merge", () => {
     writeFileSync(hook, "#!/bin/sh\necho commit-policy-refused >&2\nexit 23\n")
     chmodSync(hook, 0o755)
 
-    const result = await superMerge({ repo: fixture.product, commit: candidate })
+    const owners = new Map<string, string>()
+    for (const checkout of [fixture.product, submodule, leafCheckout, betaSubmodule]) {
+      const common = git(checkout, "rev-parse", "--path-format=absolute", "--git-common-dir")
+      const directory = join(common, "yrd-worktree-mutations")
+      const issued = await acquireExclusive(directory, { timeoutMs: 0 })
+      issued.release()
+      owners.set(checkout, directory)
+    }
+    const custody: Array<{ checkout: string; pin: string; owner: string; busy: boolean }> = []
+    const local = createLocalGitProcess()
+    const recording: GitProcess = {
+      run: async (request) => {
+        if (request.args[0] === "checkout" && request.args.includes("--recurse-submodules")) {
+          const affected = [fixture.product, request.repo]
+          if (request.repo === submodule) affected.push(leafCheckout)
+          for (const checkout of affected) {
+            const directory = owners.get(checkout)
+            if (directory === undefined) throw new Error(`unmapped recursive checkout owner: ${checkout}`)
+            const contender = tryAcquireFlock(join(directory, "writer.lock"))
+            try {
+              custody.push({
+                checkout: request.repo,
+                pin: request.args.at(-1) ?? "",
+                owner: checkout,
+                busy: contender === null,
+              })
+            } finally {
+              contender?.release()
+            }
+          }
+        }
+        return local.run(request)
+      },
+    }
+    const result = await superMerge({ repo: fixture.product, commit: candidate, git: recording })
 
     expect(result).toMatchObject({
       state: "failed",
@@ -1921,6 +1958,7 @@ describe("git super merge", () => {
       continue: true,
       expectedHead: headBefore,
       expectedBranch: "refs/heads/main",
+      git: recording,
     })
     expect(finished).toMatchObject({ state: "updated", partial: false })
     expect(git(fixture.product, "show", "-s", "--format=%P", "HEAD")).toBe(`${headBefore} ${candidate}`)
@@ -1931,6 +1969,20 @@ describe("git super merge", () => {
     expect(existsSync(join(fixture.product, ".git", "refs", "git-super", "receipts", finished.commit ?? ""))).toBe(
       false,
     )
+    for (const pin of [recordedAlpha, newestAlpha]) {
+      expect(custody).toContainEqual({ checkout: submodule, pin, owner: leafCheckout, busy: true })
+    }
+    for (const observation of custody) {
+      expect(observation, "recursive checkout admitted a competing routing writer").toMatchObject({ busy: true })
+    }
+    for (const directory of owners.values()) {
+      const released = tryAcquireFlock(join(directory, "writer.lock"))
+      try {
+        expect(released, "merge retained custody after native settlement").not.toBeNull()
+      } finally {
+        released?.release()
+      }
+    }
   })
 
   it("gives the concluding commit the merge's commit budget rather than one plumbing call's, so a slow hook completes", async () => {
