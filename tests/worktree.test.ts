@@ -1077,6 +1077,28 @@ describe("createGitWorktreeStore", () => {
     }
   })
 
+  // CTOa6e10f22: the real materializer is a routing writer and must share root mutation custody.
+  // Add/remove lock tests miss this entry, which currently creates child stores while that same lease is held.
+  it("refuses native submodule materialization while the actual root writer lease is held", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-materializer-custody-"))
+    const fixture = createProductFixture(root)
+    const path = join(root, "linked")
+    const store = createGitWorktreeStore({
+      repo: fixture.product,
+      gitProcess: createLocalGitProcess(),
+      timeouts: { mutationLock: 0 },
+    })
+    await store.add({ kind: "detached", path, ref: fixture.productBase })
+    const held = await acquireExclusive(join(fixture.product, ".git", "yrd-worktree-mutations"), { timeoutMs: 0 })
+    try {
+      await expect(store.materializeSubmodules(path)).rejects.toThrow(/worktree mutation lock is busy/u)
+      expect(existsSync(join(path, "packages", "alpha", ".git"))).toBe(false)
+    } finally {
+      held.release()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it("checks the heal guards before locking and still takes the lock when repair is required", async () => {
     const repo = await mkdtemp(join(tmpdir(), "git-super-config-heal-lock-"))
     const commonDir = join(repo, ".git")

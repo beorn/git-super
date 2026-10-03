@@ -13,6 +13,7 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -20,6 +21,7 @@ import {
   writeFileSync,
 } from "node:fs"
 import { mkdtemp, rm } from "node:fs/promises"
+import * as filesystem from "node:fs/promises"
 import { join } from "node:path"
 import { afterEach, expect, it, vi } from "vitest"
 import * as GitSuper from "../src/index.ts"
@@ -30,6 +32,11 @@ import { createGit, createGitWorktreeStore } from "../src/worktree.ts"
 import { acquireRemovalWriterLeases, retainWorktreeModules } from "../src/worktree-removal.ts"
 import { shellQuote } from "../src/shell-command.ts"
 import { addNestedAlphaSubmodule, advanceRepository, canonicalTmpdir, createProductFixture, git } from "./fixture.ts"
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const fs = await importOriginal<typeof import("node:fs/promises")>()
+  return { ...fs, open: vi.fn(fs.open) }
+})
 
 const roots: string[] = []
 // Binding-only fixture: sandbox stop truth is proved separately by its native lifecycle tests.
@@ -50,42 +57,105 @@ afterEach(async () => {
 
 // CTOa6e10f22: only lstat-proven absence permits standalone metadata.
 // Existing creator fixtures have no commondir fault, so ENOENT from a dangling link reached Git unnoticed.
-it.each(["absent", "dangling symlink", "live symlink", "directory"] as const)(
-  "checks commondir entry before projection Git: %s",
-  async (entry) => {
-    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-commondir-entry-"))
+it.each([
+  "absent",
+  "regular pointer",
+  "dangling symlink",
+  "live symlink",
+  "directory",
+  "empty",
+  "multiline",
+  "missing target",
+  "unreadable",
+] as const)("checks commondir entry before projection Git: %s", async (entry) => {
+  const root = await mkdtemp(join(canonicalTmpdir(), "git-super-commondir-entry-"))
+  roots.push(root)
+  const fixture = createProductFixture(root)
+  const common = join(fixture.product, ".git", "commondir")
+  const head = readFileSync(join(fixture.product, ".git", "refs", "heads", "main"), "utf8")
+  if (entry === "dangling symlink") symlinkSync(join(root, "missing"), common)
+  if (entry === "live symlink") {
+    const target = join(root, "pointer")
+    writeFileSync(target, ".\n")
+    symlinkSync(target, common)
+  }
+  if (entry === "directory") mkdirSync(common)
+  if (entry === "regular pointer") writeFileSync(common, ".\n")
+  if (entry === "empty") writeFileSync(common, "\n")
+  if (entry === "multiline") writeFileSync(common, ".\nother\n")
+  if (entry === "missing target") writeFileSync(common, "../../missing\n")
+  if (entry === "unreadable") {
+    writeFileSync(common, ".\n")
+    chmodSync(common, 0)
+  }
+  const transport = createLocalGitProcess()
+  const run = vi.fn(transport.run.bind(transport))
+  const destination = join(root, "seat")
+  const result = await GitSuper.projectPrivateGitWorktree({
+    sourceCheckout: fixture.product,
+    commit: fixture.productBase,
+    branch: "task/seat",
+    destination,
+    excludedSubmodules: [],
+    git: { run },
+  })
+  if (entry === "absent" || entry === "regular pointer") {
+    expect(result.state, JSON.stringify(result.detail)).toBe("updated")
+    expect(run.mock.calls.length).toBeGreaterThan(0)
+  } else {
+    expect(result.state, JSON.stringify(result.detail)).toBe("failed")
+    expect(run).not.toHaveBeenCalled()
+    expect(result.detail?.message).toContain(common)
+    expect(existsSync(destination)).toBe(false)
+  }
+  expect(readFileSync(join(fixture.product, ".git", "refs", "heads", "main"), "utf8")).toBe(head)
+})
+
+// Schedule real filesystem replacement at the existing open boundary, after the creator inspected the entry.
+// The syscall spy only changes fixture timing; all reads, inode comparisons and refusals remain production-owned.
+it.each(["removed", "regular replacement", "symlink replacement"] as const)(
+  "refuses commondir changed after inspection before any Git: %s",
+  async (change) => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-commondir-replacement-"))
     roots.push(root)
     const fixture = createProductFixture(root)
     const common = join(fixture.product, ".git", "commondir")
-    const head = readFileSync(join(fixture.product, ".git", "refs", "heads", "main"), "utf8")
-    if (entry === "dangling symlink") symlinkSync(join(root, "missing"), common)
-    if (entry === "live symlink") {
-      const target = join(root, "pointer")
-      writeFileSync(target, ".\n")
-      symlinkSync(target, common)
-    }
-    if (entry === "directory") mkdirSync(common)
+    writeFileSync(common, ".\n")
+    const replacement = join(root, "replacement")
+    writeFileSync(replacement, ".\n")
+    const originalOpen = (await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises")).open
+    let changed = false
+    const opening = vi.mocked(filesystem.open).mockImplementation(async (...args) => {
+      if (args[0] === common && !changed) {
+        changed = true
+        if (change === "regular replacement") renameSync(replacement, common)
+        else {
+          unlinkSync(common)
+          if (change === "symlink replacement") symlinkSync(replacement, common)
+        }
+      }
+      return originalOpen(...args)
+    })
     const transport = createLocalGitProcess()
     const run = vi.fn(transport.run.bind(transport))
-    const destination = join(root, "seat")
-    const result = await GitSuper.projectPrivateGitWorktree({
-      sourceCheckout: fixture.product,
-      commit: fixture.productBase,
-      branch: "task/seat",
-      destination,
-      excludedSubmodules: [],
-      git: { run },
-    })
-    if (entry === "absent") {
-      expect(result.state, JSON.stringify(result.detail)).toBe("updated")
-      expect(run.mock.calls.length).toBeGreaterThan(0)
-    } else {
+    try {
+      const result = await GitSuper.projectPrivateGitWorktree({
+        sourceCheckout: fixture.product,
+        commit: fixture.productBase,
+        branch: "task/seat",
+        destination: join(root, "seat"),
+        excludedSubmodules: [],
+        git: { run },
+      })
+      expect(changed, "the native metadata replacement never reached the reader").toBe(true)
       expect(result.state, JSON.stringify(result.detail)).toBe("failed")
-      expect(run).not.toHaveBeenCalled()
       expect(result.detail?.message).toContain(common)
-      expect(existsSync(destination)).toBe(false)
+      expect(run).not.toHaveBeenCalled()
+      expect(existsSync(join(root, "seat"))).toBe(false)
+    } finally {
+      opening.mockImplementation(originalOpen)
+      opening.mockClear()
     }
-    expect(readFileSync(join(fixture.product, ".git", "refs", "heads", "main"), "utf8")).toBe(head)
   },
 )
 
