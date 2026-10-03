@@ -10,7 +10,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { describe, expect, test, vi } from "vitest"
 import { setTimeout as delay } from "node:timers/promises"
-import { acquireExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS } from "../src/exclusive.ts"
+import { acquireExclusive, createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS, type WriterLock } from "../src/exclusive.ts"
 
 vi.mock("node:timers/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:timers/promises")>()
@@ -18,6 +18,48 @@ vi.mock("node:timers/promises", async (importOriginal) => {
 })
 
 describe("exclusive writer policy", () => {
+  // CTOa6e10f22: nested routing writers must reuse the actual live handle, never skip a busy lease.
+  test("shares an issued live handle with nested writers and refuses stale or invented custody", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "git-super-nested-custody-"))
+    const exclusive = createExclusive(dir, { timeoutMs: 0 })
+    let issued: WriterLock | undefined
+    try {
+      await exclusive.run(async (held) => {
+        expect(held, "the existing owner did not supply its acquired handle").toBeDefined()
+        if (held === undefined) throw new Error("writer owner omitted its held handle")
+        issued = held
+        await expect(exclusive.run(async () => "nested", { held })).resolves.toBe("nested")
+        await expect(acquireExclusive(dir, { timeoutMs: 0 })).rejects.toThrow(/lock is busy/u)
+      })
+      if (issued === undefined) throw new Error("writer owner never supplied its held handle")
+      await expect(exclusive.run(async () => "stale", { held: issued })).rejects.toThrow(/held writer custody/u)
+      await expect(exclusive.run(async () => "invented", { held: { release() {} } })).rejects.toThrow(
+        /held writer custody/u,
+      )
+      const next = await acquireExclusive(dir, { timeoutMs: 0 })
+      next.release()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  // The request deadline must stop lock polling and cannot create custody after cancellation.
+  test("refuses an aborted acquisition and stops a contended acquisition on its signal", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "git-super-acquire-abort-"))
+    const first = await acquireExclusive(dir, { timeoutMs: 0 })
+    try {
+      await expect(acquireExclusive(dir, { signal: AbortSignal.abort(), timeoutMs: 0 })).rejects.toThrow(/aborted/u)
+      const controller = new AbortController()
+      await expect(
+        acquireExclusive(dir, { signal: controller.signal, onContended: () => controller.abort(), timeoutMs: 100 }),
+      ).rejects.toThrow(/aborted/u)
+      await expect(acquireExclusive(dir, { timeoutMs: 0 })).rejects.toThrow(/lock is busy/u)
+    } finally {
+      first.release()
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
   // 25677: a contended writer must use a positive shared-jitter delay without exceeding its poll cap.
   test.each([10, 1.5])("keeps a contended poll within its %s ms delay cap", async (pollIntervalMs) => {
     const dir = await mkdtemp(join(tmpdir(), "git-super-exclusive-"))
