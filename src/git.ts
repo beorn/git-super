@@ -132,7 +132,7 @@ const executionEnvironment = new AsyncLocalStorage<
 /** Internal custody scope: synchronous status shares the controlled private environment. */
 export function withGitEnvironment<T>(environment: NodeJS.ProcessEnv, run: () => T, objects?: GitObjectContext): T {
   if (objects !== undefined) validateGitObjectContext(objects)
-  return executionEnvironment.run({ environment, objects }, run)
+  return executionEnvironment.run(objects === undefined ? { environment } : { environment, objects }, run)
 }
 
 export function tryGit(cwd: string, args: readonly string[], indexFile?: string): GitResult {
