@@ -9,6 +9,8 @@ import {
   tryGit,
   validateExcludedSubmodules,
 } from "./git.ts"
+import { readPrivateSubmodulePaths } from "./commit-graph.ts"
+import { createLocalGitProcess } from "./process.ts"
 
 export type SuperIsAncestorOptions = Readonly<{
   repo: string
@@ -89,7 +91,25 @@ function treeGitlinks(root: string, ref: string): TreeGitlink[] {
     .sort((left, right) => left.path.localeCompare(right.path))
 }
 
-export function superIsAncestor(options: SuperIsAncestorOptions): SuperIsAncestorResult {
+/**
+ * The paths one commit's `.gitmodules` declares `private = true`, read from the commit alone through the single
+ * reader, and only when a refusal must name a cure.
+ *
+ * A manifest that cannot be read leaves the set empty, so the cure list is INCOMPLETE rather than the refusal being
+ * replaced by a manifest-read failure. The empty set never suppresses the refusal; it only narrows which cures the
+ * message can name.
+ */
+async function readDeclaredPrivatePaths(root: string, commit: string): Promise<ReadonlySet<string>> {
+  try {
+    return new Set(await readPrivateSubmodulePaths(createLocalGitProcess(), root, commit))
+  } catch {
+    // silent-fallback-allow: a `.gitmodules` that cannot be read narrows the cure list to "initialize"; the
+    // ancestry refusal still fires, and it never answers a different question or hides the child.
+    return new Set()
+  }
+}
+
+export async function superIsAncestor(options: SuperIsAncestorOptions): Promise<SuperIsAncestorResult> {
   validateExcludedSubmodules(options.excludedSubmodules)
   const root = repositoryRoot(options.repo)
   const consultedRepositories: ConsultedRepository[] = [{ path: ".", root }]
@@ -109,6 +129,11 @@ export function superIsAncestor(options: SuperIsAncestorOptions): SuperIsAncesto
   if (presentAtRoot && reachableFromAnyRef(root, ancestor)) {
     owners.push({ path: ".", root, target: options.descendant })
   }
+  let declaredPrivatePaths: ReadonlySet<string> | undefined
+  const isDeclaredPrivate = async (path: string): Promise<boolean> => {
+    declaredPrivatePaths ??= await readDeclaredPrivatePaths(root, options.descendant)
+    return declaredPrivatePaths.has(path)
+  }
   for (const gitlink of treeGitlinks(root, options.descendant)) {
     if (isSubmoduleExcluded(gitlink.path, options.excludedSubmodules)) {
       notCompared.push({ path: gitlink.path, reason: "excluded", message: "component excluded, not compared" })
@@ -118,7 +143,13 @@ export function superIsAncestor(options: SuperIsAncestorOptions): SuperIsAncesto
       const child = join(root, gitlink.path)
       const nestedRoot = repositoryRoot(child)
       if (probeRepository(nestedRoot, runGit(child, ["rev-parse", "--show-prefix"])).kind === "absent") {
-        throw new Error(`not initialized; initialize ${gitlink.path} before searching its commit ownership`)
+        // A declared-private child must never be initialized, so the refusal the fleet reads must name the
+        // exclusion that works beside the initialize cure this message used to print alone (27272).
+        throw new Error(
+          (await isDeclaredPrivate(gitlink.path))
+            ? `not initialized; ${gitlink.path} is declared private, so exclude it with --exclude-submodule ${gitlink.path}, or initialize it, before searching its commit ownership`
+            : `not initialized; initialize ${gitlink.path} before searching its commit ownership`,
+        )
       }
       if (!objectExists(nestedRoot, gitlink.pin)) {
         throw new Error(`comparison pin ${gitlink.pin} is unreadable in ${nestedRoot}`)

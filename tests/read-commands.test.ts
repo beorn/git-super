@@ -83,7 +83,12 @@ describe("Phase 1 read commands", () => {
       const result =
         kind === "status"
           ? superStatus({ repo: fixture.product, ...selection })
-          : superIsAncestor({ repo: fixture.product, ancestor: fixture.productBase, descendant: "HEAD", ...selection })
+          : await superIsAncestor({
+              repo: fixture.product,
+              ancestor: fixture.productBase,
+              descendant: "HEAD",
+              ...selection,
+            })
       expect(result).toMatchObject({ notCompared: [{ path: "packages/alpha", reason: "excluded" }] })
       expect(result.consultedRepositories.map(({ path }) => path)).toEqual([".", "vendor/beta"])
       if (kind === "status") expect((result as SuperStatusResult).records).toEqual([" M vendor/beta/beta.ts"])
@@ -134,6 +139,35 @@ describe("Phase 1 read commands", () => {
     expect(stderr.output).toContain("packages/alpha")
     expect(stderr.output).toContain("vendor/beta")
     expect(stderr.output).not.toContain("ambiguous")
+  })
+
+  /**
+   * @failure An uninitialized declared-private child makes ancestry print only "initialize <path>" - the one
+   *          cure the fleet forbids - and never names --exclude-submodule <path>, which works (27272).
+   * @level l1
+   * @consumer git super merge-base --is-ancestor in environments that intentionally leave a private child out
+   * @testonly none
+   */
+  test("declared-private ancestry refusal names the exclusion beside the initialize cure", async () => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-declared-private-ancestry-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const path = "packages/alpha"
+    git(fixture.product, "config", "--file", ".gitmodules", "submodule." + path + ".private", "true")
+    git(fixture.product, "add", ".gitmodules")
+    git(fixture.product, "commit", "-q", "-m", "declare packages/alpha private")
+    git(fixture.product, "submodule", "deinit", "-f", "--", path)
+    const stdout = outputSink()
+    const stderr = outputSink()
+    expect(
+      await runCli(
+        ["--repo", fixture.product, "--json", "merge-base", "--is-ancestor", fixture.productBase, "HEAD"],
+        stdout,
+        stderr,
+      ),
+    ).toBe(2)
+    expect(stderr.output).toContain("declared private")
+    expect(stderr.output).toContain("--exclude-submodule " + path)
   })
 
   // Gate A: existing extension calls use --repo/--json and formatted results.
@@ -431,13 +465,13 @@ describe("Phase 1 read commands", () => {
     expect(status.submoduleProblems).toContainEqual({ path: "conflicted", reason: expect.stringContaining("unmerged") })
   })
 
-  test("merge-base finds the repository that owns a sha and compares against the ref's pin", () => {
+  test("merge-base finds the repository that owns a sha and compares against the ref's pin", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-ancestor-"))
     roots.push(fixtureRoot)
     const fixture = createProductFixture(fixtureRoot)
     const productHead = bumpProductSubmodules(fixture)
 
-    const result = superIsAncestor({
+    const result = await superIsAncestor({
       repo: fixture.product,
       ancestor: fixture.alphaBase,
       descendant: productHead,
@@ -545,7 +579,7 @@ describe("Phase 1 read commands", () => {
     }
   })
 
-  test("still answers in the superproject for a commit the superproject's own refs reach", () => {
+  test("still answers in the superproject for a commit the superproject's own refs reach", async () => {
     // The other half of the ownership rule, and the regression the fix could
     // plausibly have caused: tightening "the root has the object" to "the root
     // REACHES the object" must not stop the root answering for its own history.
@@ -554,7 +588,7 @@ describe("Phase 1 read commands", () => {
     const fixture = createProductFixture(fixtureRoot)
     const productHead = bumpProductSubmodules(fixture)
 
-    const result = superIsAncestor({
+    const result = await superIsAncestor({
       repo: fixture.product,
       ancestor: fixture.productBase,
       descendant: productHead,
@@ -565,7 +599,7 @@ describe("Phase 1 read commands", () => {
     expect(result.isAncestor).toBe(true)
   })
 
-  test("does not answer in the superproject when a submodule sha also sits in the root object store", () => {
+  test("does not answer in the superproject when a submodule sha also sits in the root object store", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-leaked-object-"))
     roots.push(fixtureRoot)
     const fixture = createProductFixture(fixtureRoot)
@@ -579,7 +613,7 @@ describe("Phase 1 read commands", () => {
     git(fixture.product, "-c", "protocol.file.allow=always", "fetch", "-q", "--no-tags", fixture.alpha, "main")
     expect(git(fixture.product, "cat-file", "-t", `${fixture.alphaBase}^{commit}`)).toBe("commit")
 
-    const result = superIsAncestor({
+    const result = await superIsAncestor({
       repo: fixture.product,
       ancestor: fixture.alphaBase,
       descendant: productHead,
@@ -593,7 +627,7 @@ describe("Phase 1 read commands", () => {
     expect(result.isAncestor).toBe(true)
   })
 
-  test("merge-base resolves a ref-name ancestor in the --repo root, never by asking each nested store for the name", () => {
+  test("merge-base resolves a ref-name ancestor in the --repo root, never by asking each nested store for the name", async () => {
     // Every fixture repository is `init -b main`, so the NAME main exists in the
     // product and in both submodules. Before the fix the resolver asked each
     // nested store `cat-file -e main` and found it everywhere: "ambiguous across
@@ -605,7 +639,7 @@ describe("Phase 1 read commands", () => {
     const fixture = createProductFixture(fixtureRoot)
     const productHead = bumpProductSubmodules(fixture)
 
-    const result = superIsAncestor({ repo: fixture.product, ancestor: "main", descendant: productHead })
+    const result = await superIsAncestor({ repo: fixture.product, ancestor: "main", descendant: productHead })
 
     expect(result.owningRepository).toBe(".")
     expect(result.comparedTo).toBe(productHead)
@@ -683,18 +717,18 @@ describe("Phase 1 read commands", () => {
     expect(stderr.output).toContain("Consulted repositories")
   }, 30_000)
 
-  test("merge-base refuses when no consulted repository owns the commit", () => {
+  test("merge-base refuses when no consulted repository owns the commit", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-missing-owner-"))
     roots.push(fixtureRoot)
     const fixture = createProductFixture(fixtureRoot)
 
-    expect(() =>
+    await expect(
       superIsAncestor({
         repo: fixture.product,
         ancestor: "f".repeat(40),
         descendant: fixture.productBase,
       }),
-    ).toThrow("no consulted repository owns commit")
+    ).rejects.toThrow("no consulted repository owns commit")
   })
 
   test("dispatches through the Silvery command tree and preserves JSON and NUL output parity", async () => {
