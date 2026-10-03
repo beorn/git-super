@@ -492,6 +492,8 @@ describe("git super merge", () => {
         )
       }
     },
+    // Real Git setup and two printed repair rounds exceeded 5s on CI (5.248s).
+    10_000,
   )
 
   /**
