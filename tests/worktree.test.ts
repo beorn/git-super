@@ -1362,7 +1362,9 @@ while (!existsSync(${JSON.stringify(release)})) {
     }
   })
 
-  it("removes a lender worktree and re-homes borrower alternates cleanly (25908)", async () => {
+  // #27143: the ordinary rehome journey must preserve a borrower whose actual writer owns its store.
+  // The free-writer positive alone cannot detect repack or alternate replacement under another holder.
+  it.each([false, true])("removes a lender only with borrower writer custody; held=%s (25908, 27143)", async (held) => {
     const root = await mkdtemp(join(tmpdir(), "git-super-rehome-"))
     const subRemote = join(root, "sub-remote.git")
     const repo = join(root, "owner")
@@ -1404,6 +1406,27 @@ while (!existsSync(${JSON.stringify(release)})) {
       await store.materializeSubmodules(borrower)
       const altFile = join(borrowerSubAdmin, "objects", "info", "alternates")
       await writeFile(altFile, `${lenderSubObjects}\n${durableSubObjects}\n`, "utf8")
+
+      if (held) {
+        const original = await readFile(altFile, "utf8")
+        const objects = objectStoreSnapshot(join(borrowerSubAdmin, "objects"))
+        const writer = await acquireExclusive(join(borrowerSubAdmin, "yrd-worktree-mutations"), {
+          holder: "native borrower writer",
+          timeoutMs: 0,
+        })
+        try {
+          await expect(store.remove(lender, { retention: { root: retainedDir, report: () => {} } })).rejects.toThrow(
+            /writer (?:lease|lock)/u,
+          )
+          expect(existsSync(lender)).toBe(true)
+          expect(existsSync(lenderSubAdmin)).toBe(true)
+          expect(await readFile(altFile, "utf8")).toBe(original)
+          expect(objectStoreSnapshot(join(borrowerSubAdmin, "objects"))).toEqual(objects)
+        } finally {
+          writer.release()
+        }
+        return
+      }
 
       await store.remove(lender, {
         retention: {
