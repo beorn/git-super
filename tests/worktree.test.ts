@@ -36,6 +36,11 @@ vi.mock("node:fs", async (importOriginal) => {
   }
 })
 
+vi.mock("@bearly/flock", async (importOriginal) => {
+  const flock = await importOriginal<typeof import("@bearly/flock")>()
+  return { ...flock, tryAcquireFlock: vi.fn(flock.tryAcquireFlock) }
+})
+
 function git(repo: string, args: readonly string[]): string {
   const result = spawnSync("git", ["-C", repo, ...args], { encoding: "utf8" })
   if (result.status !== 0) throw new Error(result.stderr || `git ${args.join(" ")} failed`)
@@ -1450,11 +1455,39 @@ while (!existsSync(${JSON.stringify(release)})) {
         }
         return nativeRename(from, to)
       })
+      // #27143 requires one canonical order across enclosing lender and borrower custody.
+      // Delegate actual kernel acquisition and track only handles that remain held;
+      // removal's released preliminary probes are therefore not mistaken for nesting.
+      const nativeAcquire = (await vi.importActual<typeof import("@bearly/flock")>("@bearly/flock")).tryAcquireFlock
+      const heldOwners = new Set<string>()
+      const orderViolations: Array<{ held: string[]; next: string }> = []
+      const acquiring = vi.mocked(tryAcquireFlock).mockImplementation((path, options) => {
+        const handle = nativeAcquire(path, options)
+        if (handle === null) return null
+        const owner = dirname(dirname(path))
+        const enclosing = [...heldOwners]
+        if (enclosing.some((prior) => prior > owner)) orderViolations.push({ held: enclosing, next: owner })
+        heldOwners.add(owner)
+        const release = () => {
+          handle.release()
+          heldOwners.delete(owner)
+        }
+        return {
+          ...handle,
+          get held() {
+            return handle.held
+          },
+          release,
+          [Symbol.dispose]: release,
+        }
+      })
       try {
         await store.remove(lender, { retention: { root: retainedDir, report: () => {} } })
       } finally {
+        acquiring.mockRestore()
         renaming.mockRestore()
       }
+      expect(heldOwners.size, "native owner custody leaked after removal").toBe(0)
       expect(observedCustody).toBe(true)
       const released = tryAcquireFlock(writerPath)
       try {
@@ -1471,6 +1504,7 @@ while (!existsSync(${JSON.stringify(release)})) {
       const fsck = spawnSync("git", ["-C", borrowerSub, "fsck", "--full"], { encoding: "utf8" })
       expect(fsck.status).toBe(0)
       expect(fsck.stderr).toBe("")
+      expect(orderViolations, "borrower acquisition reverses canonical order beneath held lender custody").toEqual([])
     } finally {
       await rm(root, { recursive: true, force: true })
     }
