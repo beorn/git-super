@@ -425,6 +425,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       const materializeProcess = configuredProcess(materializeOptions.hooks)
       const result = await materializeSubmodulesWithProcess(materializeProcess, {
         worktree: path,
+        mutationLockTimeoutMs: timeouts.mutationLock,
         referenceWorktree: repo,
         ...(materializeOptions.force === true ? { force: true } : {}),
         ...(materializeOptions.excludedSubmodules === undefined

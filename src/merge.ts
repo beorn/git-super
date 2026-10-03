@@ -27,7 +27,7 @@ import { prepareSubmoduleTreeUnderLock } from "./submodule-prepare.ts"
 import { mapInOrder } from "./map-in-order.ts"
 import { capturePushIntent, discoverRepository, type ObservedMains, rootPushIdentity } from "./push.ts"
 import { PUSH_INTENT_TRAILER, sameHostedOwner, sameHostedRepository } from "./push-intent.ts"
-import { createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS, type Exclusive } from "./exclusive.ts"
+import { createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS, type Exclusive, type WriterLock } from "./exclusive.ts"
 import { parseIndexEntries, type IndexEntry } from "./index-entries.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessRequest, type GitProcessResult } from "./process.ts"
 import { createProgressReporter } from "./progress.ts"
@@ -302,9 +302,9 @@ async function mergeWithSteps(
         onContended: progress.phase,
       })
     return await exclusive.run(
-      () => {
+      (writerLock) => {
         progress.cancel()
-        return mergeUnderLock(git, root, options, timeoutMs, steps, initializations)
+        return mergeUnderLock(git, root, options, timeoutMs, steps, initializations, writerLock)
       },
       { holder: "git super merge" },
     )
@@ -350,6 +350,7 @@ async function mergeUnderLock(
   timeoutMs: number,
   steps: StepClock,
   initializations: SuperMergeInitializationResult[],
+  writerLock?: WriterLock,
 ): Promise<SuperMergeResult> {
   const nativeHeads = await nativeMergeHeads(git, root, timeoutMs)
   const pending = nativeHeads === undefined ? undefined : await observePending(git, root, nativeHeads, timeoutMs)
@@ -441,7 +442,7 @@ async function mergeUnderLock(
     }
     let result: SuperMergeResult
     try {
-      result = await mergeObserved(git, root, options, timeoutMs, steps, initializations)
+      result = await mergeObserved(git, root, options, timeoutMs, steps, initializations, writerLock)
     } catch (error) {
       result = failed(root, [], resultError(error, "merge"))
     }
@@ -499,6 +500,7 @@ async function mergeObserved(
   timeoutMs: number,
   steps: StepClock,
   initializations: SuperMergeInitializationResult[],
+  writerLock?: WriterLock,
 ): Promise<SuperMergeResult> {
   const requestedExclusions = options.excludedSubmodules ?? []
   try {
@@ -1109,6 +1111,7 @@ async function mergeObserved(
         {
           worktree: root,
           paths: [row.path],
+          ...(writerLock === undefined ? {} : { writerLock }),
           source: "index",
         },
         { resolveReferenceWorktree: true, timeoutMs },

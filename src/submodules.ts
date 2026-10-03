@@ -3,7 +3,7 @@ import { alternateEntries, alternatesLineage } from "./alternates.ts"
 import { setTimeout as delay } from "node:timers/promises"
 import { existsSync, realpathSync } from "node:fs"
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises"
-import { dirname, join, relative, resolve } from "node:path"
+import { dirname, isAbsolute, join, relative, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { createLogger, type ConditionalLogger, type LogLevel } from "loggily"
 import { cleanGitRepositoryEnvironment, validateExcludedSubmodules } from "./git.ts"
@@ -14,6 +14,7 @@ import { shellQuote } from "./shell-command.ts"
 import { nestedStoreMissingDetail, preparedPinFetchArgs, preparedSubmoduleStore } from "./submodule-prepare.ts"
 import { resolveSubmoduleOrigin } from "./submodule-origin.ts"
 import { readCommitSubmodules, type CommitSubmodule, type SelectedCommitSubmodules } from "./commit-graph.ts"
+import { createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS, type WriterLock } from "./exclusive.ts"
 
 export const SUBMODULE_ALTERNATE_LOCATION = "superproject"
 export const SUBMODULE_ALTERNATE_ERROR_STRATEGY = "info"
@@ -61,6 +62,9 @@ export type SubmoduleMaterializationResult = SubmoduleGitResult &
 
 export type SubmoduleMaterializationOptions = Readonly<{
   worktree: string
+  /** Actual live root custody issued by the existing flock owner, when a parent operation already holds it. */
+  writerLock?: WriterLock
+  mutationLockTimeoutMs?: number
   referenceWorktree?: string
   force?: boolean
   /** Restrict only the top-level pass; nested submodules still recurse. */
@@ -602,6 +606,26 @@ export async function syncOriginTrackingRefs(
  *    present (`anchorDurableAlternates` below).
  */
 export async function materializeSubmodules(
+  git: SubmoduleGit,
+  options: SubmoduleMaterializationOptions,
+  privateProjection?: Parameters<typeof materializeSubmodulesUnderLock>[2],
+): Promise<SubmoduleMaterializationResult> {
+  validateExcludedSubmodules(options.excludedSubmodules)
+  const discovered = await git.run(options.worktree, ["rev-parse", "--path-format=absolute", "--git-common-dir"], true)
+  if (discovered.code !== 0 || discovered.timedOut || discovered.failure !== undefined) {
+    throw new Error(`cannot establish materializer writer owner for ${options.worktree}: ${discovered.stderr}`)
+  }
+  const common = discovered.stdout.trim()
+  if (!isAbsolute(common)) throw new Error(`materializer returned no absolute common directory for ${options.worktree}`)
+  return createExclusive(join(common, "yrd-worktree-mutations"), {
+    timeoutMs: options.mutationLockTimeoutMs ?? DEFAULT_MUTATION_LOCK_WAIT_MS,
+  }).run(() => materializeSubmodulesUnderLock(git, options, privateProjection), {
+    holder: `materialize submodules ${options.worktree}`,
+    ...(options.writerLock === undefined ? {} : { held: options.writerLock }),
+  })
+}
+
+async function materializeSubmodulesUnderLock(
   git: SubmoduleGit,
   options: SubmoduleMaterializationOptions,
   privateProjection?: Readonly<{
@@ -1806,6 +1830,8 @@ export async function materializeSubmodulesFromLocalWorktreeParallel(
   }
   const result = await materializeSubmodules(git, {
     worktree: options.worktree,
+    ...(options.writerLock === undefined ? {} : { writerLock: options.writerLock }),
+    ...(options.mutationLockTimeoutMs === undefined ? {} : { mutationLockTimeoutMs: options.mutationLockTimeoutMs }),
     ...(referenceWorktree === undefined ? {} : { referenceWorktree }),
     ...(options.paths === undefined ? {} : { paths: options.paths }),
     ...(options.excludedSubmodules === undefined ? {} : { excludedSubmodules: options.excludedSubmodules }),

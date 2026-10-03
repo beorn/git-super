@@ -10,7 +10,8 @@ import { spawnSync } from "node:child_process"
 import { tmpdir } from "node:os"
 import { dirname, join, relative } from "node:path"
 import { describe, expect, it, vi } from "vitest"
-import { acquireExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS } from "../src/exclusive.ts"
+import { acquireExclusive, createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS } from "../src/exclusive.ts"
+import { materializeSubmodulesWithProcess } from "../src/submodules.ts"
 import {
   createGitWorktreeStore,
   createLocalGitWorktreeStore,
@@ -1092,7 +1093,33 @@ describe("createGitWorktreeStore", () => {
     const held = await acquireExclusive(join(fixture.product, ".git", "yrd-worktree-mutations"), { timeoutMs: 0 })
     try {
       await expect(store.materializeSubmodules(path)).rejects.toThrow(/worktree mutation lock is busy/u)
+      await expect(
+        materializeSubmodulesWithProcess(createLocalGitProcess(), {
+          worktree: path,
+          referenceWorktree: fixture.product,
+          mutationLockTimeoutMs: 0,
+        }),
+      ).rejects.toThrow(/worktree mutation lock is busy/u)
       expect(existsSync(join(path, "packages", "alpha", ".git"))).toBe(false)
+      held.release()
+      await createExclusive(join(fixture.product, ".git", "yrd-worktree-mutations"), { timeoutMs: 0 }).run(
+        async (writerLock) => {
+          if (writerLock === undefined) throw new Error("actual writer owner omitted its handle")
+          const result = await materializeSubmodulesWithProcess(createLocalGitProcess(), {
+            worktree: path,
+            referenceWorktree: fixture.product,
+            mutationLockTimeoutMs: 0,
+            writerLock,
+          })
+          expect(result.code, result.stderr).toBe(0)
+          expect(existsSync(join(path, "packages", "alpha", ".git"))).toBe(true)
+          await expect(
+            acquireExclusive(join(fixture.product, ".git", "yrd-worktree-mutations"), { timeoutMs: 0 }),
+          ).rejects.toThrow(/lock is busy/u)
+        },
+      )
+      const next = await acquireExclusive(join(fixture.product, ".git", "yrd-worktree-mutations"), { timeoutMs: 0 })
+      next.release()
     } finally {
       held.release()
       await rm(root, { recursive: true, force: true })

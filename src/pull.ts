@@ -3,7 +3,7 @@ import { tmpdir } from "node:os"
 import { decorrelatedJitter } from "@bearly/pacing"
 import { isAbsolute, join, relative, resolve } from "node:path"
 import { readCommitGitlinks } from "./commit-graph.ts"
-import { createExclusive, type Exclusive } from "./exclusive.ts"
+import { createExclusive, type Exclusive, type WriterLock } from "./exclusive.ts"
 import { isSubmoduleExcluded, probeRepository, validateExcludedSubmodules } from "./git.ts"
 import type { NotCompared } from "./diff.ts"
 import { inspectExcludedCheckout } from "./status.ts"
@@ -723,6 +723,7 @@ async function applyRepositories(
   hooksDir: string,
   phase: Phase,
   warn: (message: string) => void,
+  writerLock?: WriterLock,
 ): Promise<GitSuperResult> {
   const results: PullRepositoryResult[] = []
   // One elapsed contention allowance for the frozen graph, never a fresh wait for each child (27246).
@@ -744,6 +745,7 @@ async function applyRepositories(
           git,
           {
             worktree: repository.added.parent,
+            ...(writerLock === undefined || repository.added.parent !== plan.root ? {} : { writerLock }),
             paths: [repository.added.path],
             source: "head",
             excludedSubmodules,
@@ -998,7 +1000,7 @@ export async function superPull(options: SuperPullOptions): Promise<PullResult> 
   try {
     return {
       ...(await exclusive.run(
-        async () => {
+        async (writerLock) => {
           phase("lock-acquired")
           if (plan.remoteRef !== undefined && plan.observedRemoteTarget !== undefined) {
             const observed = await observeRemoteTarget(
@@ -1060,7 +1062,7 @@ export async function superPull(options: SuperPullOptions): Promise<PullResult> 
           let applied: GitSuperResult
           let deferred: DeferredSignal | undefined
           try {
-            applied = await applyRepositories(git, plan, hooks.dir, phase, warn)
+            applied = await applyRepositories(git, plan, hooks.dir, phase, warn, writerLock)
           } finally {
             deferred = deferral.release()
             deferral = undefined
