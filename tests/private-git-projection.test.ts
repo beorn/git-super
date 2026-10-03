@@ -21,6 +21,26 @@ afterEach(async () => {
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true })
 })
 
+// CTO63d0a344: retirement needs the sandbox lifetime proof; existing lifecycle tests lacked this gate.
+it("refuses retirement without a unit stop certificate", async () => {
+  const root = await mkdtemp(join(canonicalTmpdir(), "git-super-stop-certificate-"))
+  roots.push(root)
+  const fixture = createProductFixture(root)
+  const destination = join(root, "seat")
+  const projected = await GitSuper.projectPrivateGitWorktree({
+    sourceCheckout: fixture.product,
+    commit: fixture.productBase,
+    branch: "task/seat",
+    destination,
+    excludedSubmodules: [],
+  })
+  if (projected.projection === undefined) throw new Error(JSON.stringify(projected.detail))
+  const retired = await GitSuper.retirePrivateGitProjection(projected.projection, join(root, "retained"))
+  expect(retired.state, "retirement accepted an absent unit stop certificate").toBe("failed")
+  expect(retired.detail?.message).toContain("stop certificate")
+  expect(existsSync(destination)).toBe(true)
+})
+
 it("does not execute configuration changed by another process after preflight", async () => {
   const root = await mkdtemp(join(canonicalTmpdir(), "git-super-config-race-"))
   roots.push(root)

@@ -2,7 +2,7 @@ import { lstat, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promise
 import { dirname, join, relative, resolve, sep } from "node:path"
 import { alternatesLineage } from "./alternates.ts"
 import { readPrivateSubmodulePaths } from "./commit-graph.ts"
-import { cleanGitEnvironment, validateExcludedSubmodules } from "./git.ts"
+import { cleanGitEnvironment, validateExcludedSubmodules, withGitEnvironment } from "./git.ts"
 import { createLocalGitProcess, type GitProcess } from "./process.ts"
 import { materializeSubmodules } from "./submodules.ts"
 import { pinRef } from "./objects.ts"
@@ -95,6 +95,7 @@ async function preserveProjection(
       await alternatesLineage([objects], "", { allowedObjects: new Set([...allowedObjects, objects]) })
     }
     leases = acquireRemovalWriterLeases(rootGit, (path) => retainedPaths.push(path))
+    const heldLeases = leases
     const environment = {
       ...cleanGitEnvironment(),
       GIT_CONFIG_NOSYSTEM: "1",
@@ -121,20 +122,22 @@ async function preserveProjection(
     }
     const git = createGit(process, environment, 30_000)
     const excluded = projection.excluded.map((entry) => entry.path)
-    const proof = await retainWorktreeModules(
-      git,
-      checkout,
-      checkout,
-      { root: retentionRoot, report: (_proof: WorktreeRemovalProof) => {} },
-      (repository, path) =>
-        createGitWorktreeStore({ repo: repository, gitProcess: process, env: environment }).inspect(path),
-      leases.proof,
-      leases.created,
-      undefined,
-      excluded,
-      projection.excluded,
-      projection,
-      (path) => retainedPaths.push(path),
+    const proof = await withGitEnvironment(environment, () =>
+      retainWorktreeModules(
+        git,
+        checkout,
+        checkout,
+        { root: retentionRoot, report: (_proof: WorktreeRemovalProof) => {} },
+        (repository, path) =>
+          createGitWorktreeStore({ repo: repository, gitProcess: process, env: environment }).inspect(path),
+        heldLeases.proof,
+        heldLeases.created,
+        undefined,
+        excluded,
+        projection.excluded,
+        projection,
+        (path) => retainedPaths.push(path),
+      ),
     )
     if (retire) await rm(checkout, { recursive: true })
     return {

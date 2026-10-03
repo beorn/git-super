@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process"
+import { AsyncLocalStorage } from "node:async_hooks"
 import { parseIndexEntries } from "./index-entries.ts"
 
 export type IndexGitlink = Readonly<{ path: string; indexPin: string | undefined }>
@@ -76,8 +77,15 @@ export type GitResult = Readonly<{
   stderr: string
 }>
 
+const executionEnvironment = new AsyncLocalStorage<NodeJS.ProcessEnv>()
+
+/** Internal custody scope: synchronous status shares the controlled private environment. */
+export function withGitEnvironment<T>(environment: NodeJS.ProcessEnv, run: () => T): T {
+  return executionEnvironment.run(environment, run)
+}
+
 export function tryGit(cwd: string, args: readonly string[], indexFile?: string): GitResult {
-  const env = cleanGitRepositoryEnvironment()
+  const env = cleanGitRepositoryEnvironment(executionEnvironment.getStore() ?? process.env)
   if (indexFile !== undefined) env.GIT_INDEX_FILE = indexFile
   const result = spawnSync("git", ["-C", cwd, ...args], {
     encoding: "utf8",
