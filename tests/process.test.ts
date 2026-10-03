@@ -11,7 +11,7 @@ import {
   writeSync,
 } from "node:fs"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { delimiter, join } from "node:path"
 import { createLocalGitProcess } from "../src/process.ts"
 import * as processPort from "git-super/process"
 import type { SupervisedProcess } from "git-super/process"
@@ -32,14 +32,55 @@ describe("GitProcess", () => {
     roots.push(root)
     const directory = join(root, "objects")
     mkdirSync(directory)
+    const invalidPaths = [join(root, `delimiter${delimiter}objects`), join(root, "line\nobjects")]
+    for (const path of invalidPaths) mkdirSync(path)
     for (const objects of [
       { directory: "relative-objects" },
       { directory: join(root, "missing") },
       { directory, alternates: [directory] },
-      { directory, alternates: [join(root, "delimiter:objects")] },
-      { directory, alternates: [join(root, "line\nobjects")] },
+      ...invalidPaths.map((path) => ({ directory, alternates: [path] })),
     ]) {
       expect(() => createLocalGitProcess(process.env, { objects })).toThrow(/public object/u)
+    }
+    for (const path of invalidPaths) {
+      expect(() => createLocalGitProcess(process.env, { objects: { directory, alternates: [path] } })).toThrow(
+        `public object alternate ${path} must be an absolute, unique path without delimiters or newlines`,
+      )
+    }
+  })
+
+  // @failure: the global object carrier resolves a repository or starts Git before checking explicit --repo.
+  // @level l2; @consumer credential-free contained submit; existing validation rows do not cross the CLI boundary.
+  test("refuses public object CLI flags without an absolute explicit repo before any Git spawn", () => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-object-cli-"))
+    roots.push(root)
+    const directory = join(root, "objects")
+    const marker = join(root, "spawned")
+    mkdirSync(directory)
+    writeFileSync(join(root, "git"), `#!${process.execPath}\nBun.write(${JSON.stringify(marker)}, "spawned")\n`, {
+      mode: 0o755,
+    })
+    for (const prefix of [[], ["--repo", "."]]) {
+      const child = Bun.spawnSync(
+        [
+          process.execPath,
+          join(import.meta.dirname, "../bin/git-super"),
+          ...prefix,
+          "--object-directory",
+          directory,
+          "--json",
+          "status",
+        ],
+        {
+          cwd: root,
+          env: { ...process.env, PATH: `${root}${delimiter}${process.env.PATH}` },
+          stdout: "pipe",
+          stderr: "pipe",
+        },
+      )
+      expect(child.exitCode).not.toBe(0)
+      expect(`${child.stdout}${child.stderr}`).toContain("requires --repo <absolute-path>")
+      expect(existsSync(marker)).toBe(false)
     }
   })
 
