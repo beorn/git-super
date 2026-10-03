@@ -15,6 +15,7 @@ import {
 } from "node:fs"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
+import { spawn } from "node:child_process"
 import { runCli } from "../src/cli.ts"
 import { acquireExclusive, createExclusive, type Exclusive } from "../src/exclusive.ts"
 import { adaptProcessGit, createLocalGitProcess, type GitProcess, type GitProcessRequest } from "../src/process.ts"
@@ -1615,6 +1616,68 @@ describe("git super pull --ff-only", () => {
       held.release()
     }
   })
+
+  /**
+   * @failure A brief native index.lock aborts a frozen pull, leaving child pins behind and losing the original hook (27246).
+   * @level l1
+   * @consumer git-super pull and the shared-main updater
+   * @testonly none
+   * Existing injected nonlock failure coverage cannot observe native contention or same-invocation hook completion.
+   */
+  test.each(["root", "child"] as const)("retries a held native index lock in the same frozen pull: %s", async (where) => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-pull-index-lock-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const checkout = join(fixtureRoot, "checkout")
+    git(fixtureRoot, "-c", "protocol.file.allow=always", "clone", "-q", "--recurse-submodules", fixture.product, checkout)
+    const target = bumpProductSubmodules(fixture)
+    const alpha = join(checkout, "packages/alpha")
+    const beta = join(checkout, "vendor/beta")
+    const alphaTarget = git(join(fixture.product, "packages/alpha"), "rev-parse", "HEAD")
+    const betaTarget = git(join(fixture.product, "vendor/beta"), "rev-parse", "HEAD")
+    const marker = join(fixtureRoot, "post-merge-count")
+    const hook = git(checkout, "rev-parse", "--path-format=absolute", "--git-path", "hooks/post-merge")
+    writeFileSync(hook, `#!/bin/sh\nprintf 'ran\\n' >> '${marker}'\n`)
+    chmodSync(hook, 0o755)
+    const lock = git(where === "root" ? checkout : alpha, "rev-parse", "--path-format=absolute", "--git-path", "index.lock")
+    // The child creates/removes only this private fixture lock. Readiness prevents a scheduling race with the pull.
+    const holder = spawn(process.execPath, ["-e", `
+      const fs = require('node:fs');
+      const path = process.argv[1];
+      const fd = fs.openSync(path, 'wx');
+      process.stdout.write('held\\n');
+      setTimeout(() => { fs.closeSync(fd); fs.unlinkSync(path); }, 3000);
+    `, lock], { stdio: ["ignore", "pipe", "pipe"] })
+    const exited = new Promise<number | null>((resolve, reject) => {
+      holder.once("error", reject)
+      holder.once("exit", resolve)
+    })
+    onTestFinished(async () => { await exited })
+    await new Promise<void>((resolve, reject) => {
+      let output = ""
+      holder.stdout.on("data", (chunk) => {
+        output += chunk.toString()
+        if (output.includes("held\n")) resolve()
+      })
+      holder.once("error", reject)
+      holder.once("exit", (code) => { if (!output.includes("held\n")) reject(Error(`Lock holder exited ${code}`)) })
+    })
+    const progress = outputSink()
+    const result = await superPull({
+      repo: checkout,
+      repository: "origin",
+      refspecs: ["main"],
+      ffOnly: true,
+      report: (message) => progress.write(message),
+      warn: (message) => progress.write(message),
+    })
+    expect(result, JSON.stringify(result.detail)).toMatchObject({ state: "updated", partial: false })
+    expect(git(checkout, "rev-parse", "HEAD")).toBe(target)
+    expect(git(alpha, "rev-parse", "HEAD")).toBe(alphaTarget)
+    expect(git(beta, "rev-parse", "HEAD")).toBe(betaTarget)
+    expect(readFileSync(marker, "utf8")).toBe("ran\n")
+    expect(await exited).toBe(0)
+  }, 30_000)
 
   test("returns a loud partial result when a submodule apply fails after the root moved", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-pull-partial-"))

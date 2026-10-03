@@ -1,5 +1,6 @@
 import { chmodSync, copyFileSync, existsSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
+import { decorrelatedJitter } from "@bearly/pacing"
 import { isAbsolute, join, relative, resolve } from "node:path"
 import { readCommitGitlinks } from "./commit-graph.ts"
 import { createExclusive, type Exclusive } from "./exclusive.ts"
@@ -724,6 +725,8 @@ async function applyRepositories(
   warn: (message: string) => void,
 ): Promise<GitSuperResult> {
   const results: PullRepositoryResult[] = []
+  // One elapsed contention allowance for the frozen graph, never a fresh wait for each child (27246).
+  let contentionRemainingMs = 8_000
   for (const [index, repository] of plan.repositories.entries()) {
     if (repository.current === repository.target) {
       results.push(repositoryResult(repository, "unchanged"))
@@ -834,7 +837,33 @@ async function applyRepositories(
             repository.target,
           ]
         : ["-c", "submodule.recurse=false", "checkout", "--detach", repository.target]
-    const applied = await runApply(git, repository.repository, args)
+    let attemptStarted = performance.now()
+    let applied = await runApply(git, repository.repository, args)
+    let retryDelayMs = 100
+    let retries = 0
+    while (
+      applied.code !== 0 &&
+      applied.failure === undefined &&
+      applied.timedOut !== true &&
+      applied.stalled !== true &&
+      applied.backstop === undefined &&
+      applied.signal == null &&
+      /Unable to create '[^\n]*index\.lock': File exists/u.test(applied.stderr)
+    ) {
+      contentionRemainingMs -= performance.now() - attemptStarted
+      if (contentionRemainingMs <= 0) break
+      retryDelayMs = decorrelatedJitter(100, 1_000, retryDelayMs)
+      phase(`index-lock-wait ${repository.path} retry=${++retries} remaining=${Math.ceil(contentionRemainingMs)}ms`)
+      const sleepStarted = performance.now()
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, Math.min(retryDelayMs, contentionRemainingMs))
+      })
+      contentionRemainingMs -= performance.now() - sleepStarted
+      if (contentionRemainingMs <= 0) break
+      // Keep the ordinary native command bound; a timeout/signal is an unknown outcome, never a lock retry.
+      attemptStarted = performance.now()
+      applied = await runApply(git, repository.repository, args)
+    }
     if (applied.code !== 0) {
       const failure = operationError(
         repository.repository,
