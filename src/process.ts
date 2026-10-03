@@ -1,4 +1,4 @@
-import { cleanGitEnvironment, cleanGitRepositoryEnvironment } from "./git.ts"
+import { applyGitObjectContext, cleanGitEnvironment, cleanGitRepositoryEnvironment, type GitObjectContext } from "./git.ts"
 import {
   accessSync,
   appendFileSync,
@@ -16,7 +16,7 @@ import { delimiter, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { fullJitter } from "@bearly/pacing"
 
-export { cleanGitEnvironment } from "./git.ts"
+export { applyGitObjectContext, cleanGitEnvironment, validateGitObjectContext, type GitObjectContext } from "./git.ts"
 
 export type ProcessOutputSink = Readonly<{ write(value: string | Uint8Array): unknown }>
 
@@ -362,7 +362,7 @@ function waitForReadRetry(ms: number, signal: AbortSignal | undefined): Promise<
  * whole point is behaviour under a condition that is expensive and flaky to
  * reproduce, and a retry policy nobody can test is one nobody can change.
  */
-export type StallRetryOptions = Readonly<{ attempts?: 1 | 3 }>
+export type StallRetryOptions = Readonly<{ attempts?: 1 | 3; objects?: GitObjectContext }>
 
 export function withStallRetry(inner: GitProcess, options: StallRetryOptions = {}): GitProcess {
   return withReadRetry(inner, options, globalThis.process.env)
@@ -487,6 +487,7 @@ export type SupervisedProcess = Readonly<{
 
 export type GitProcessDefaults = Readonly<{
   env?: NodeJS.ProcessEnv
+  objects?: GitObjectContext
   signal?: AbortSignal
   timeoutMs?: number
 }>
@@ -495,13 +496,13 @@ export type GitProcessDefaults = Readonly<{
 export function adaptProcessGit(process: SupervisedProcess, defaults: GitProcessDefaults = {}): GitProcess {
   return {
     async run(request) {
-      const env = {
+      const env = applyGitObjectContext({
         ...cleanGitEnvironment(defaults.env ?? globalThis.process.env),
         ...request.env,
         GIT_TERMINAL_PROMPT: "0",
         LC_ALL: "C",
         TZ: "UTC",
-      }
+      }, defaults.objects)
       const result = await process.run({
         argv: ["git", "-C", request.repo, ...request.args],
         cwd: request.repo,
@@ -528,12 +529,12 @@ export function adaptProcessGit(process: SupervisedProcess, defaults: GitProcess
 }
 
 export function createLocalGitProcess(
-  environment: NodeJS.ProcessEnv = process.env,
+  environment?: NodeJS.ProcessEnv,
   options: StallRetryOptions = {},
 ): GitProcess {
   // Local callers own Git policy (for example GIT_ALLOW_PROTOCOL and GIT_CONFIG_*),
   // so only inherited repository pointers are removed; the supervised port uses the full scrubber.
-  const baseEnvironment = cleanGitRepositoryEnvironment(environment)
+  const baseEnvironment = cleanGitRepositoryEnvironment(environment, options.objects)
 
   const runOnce = async (request: GitProcessRequest): Promise<GitProcessResult> => {
     {
@@ -546,11 +547,11 @@ export function createLocalGitProcess(
       const groupsFile = groupsDir === undefined ? undefined : join(groupsDir, "groups")
       try {
         child = spawnGit(["-C", request.repo, ...request.args], {
-          env: {
+          env: applyGitObjectContext({
             ...baseEnvironment,
             ...request.env,
             ...(groupsFile === undefined ? {} : { [APPLY_GROUPS_ENV]: groupsFile }),
-          },
+          }, options.objects),
           stdin: request.stdin === undefined ? "ignore" : "pipe",
           ...(request.stdin === undefined ? {} : { input: request.stdin }),
           ...(request.signal === undefined ? {} : { signal: request.signal }),

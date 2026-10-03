@@ -22,6 +22,8 @@ import type { SuperStatusResult } from "./status.ts"
 import type { SuperSubmodulePrepareResult } from "./submodule-prepare.ts"
 import { delegateNativeGit, readNativeGit, type ProcessOutputSink } from "./process.ts"
 import { openInvocationProtocol, type InvocationProtocol } from "./protocol.ts"
+import { isAbsolute } from "node:path"
+import { validateGitObjectContext, withGitEnvironment, type GitObjectContext } from "./git.ts"
 
 export type OutputSink = ProcessOutputSink &
   Readonly<{
@@ -167,7 +169,7 @@ function inputObjects(command: string, args: readonly string[]): readonly { argu
 
 async function enrichedInvocation(argv: readonly string[]): Promise<readonly string[] | undefined> {
   // Explicit extension calls retain their existing parser and result contract.
-  if (argv.length === 0 || argv[0] === "--repo" || argv[0]?.startsWith("--repo=") || argv[0] === "--json") return argv
+  if (argv.length === 0 || argv[0] === "--repo" || argv[0]?.startsWith("--repo=") || argv[0] === "--json" || argv[0]?.startsWith("--object-directory") || argv[0]?.startsWith("--alternate-object-directory")) return argv
   if (
     argv[0] === "-h" ||
     argv[0] === "--help" ||
@@ -345,6 +347,8 @@ async function runInvocation(
     .description("Git commands that treat superprojects and submodule interiors as one product")
     .option("--repo <path>", "repository to inspect", ".")
     .option("--json", "emit one stable JSON result")
+    .option("--object-directory <absolute-path>", "host-selected object directory; requires explicit absolute --repo")
+    .option("--alternate-object-directory <absolute-path>", "host-selected alternate object directory, in search order; requires --object-directory and explicit --repo", (value: string, previous: string[]) => [...previous, value], [])
     .addHelpText("after", "\nObservation protocol: git-super super observe --protocol=1 < captured-root.json\n")
     .exitOverride()
     .configureOutput({
@@ -683,7 +687,7 @@ async function runInvocation(
   }
   if (captured === undefined) return 0
 
-  const globals = program.opts() as { repo: string }
+  const globals = program.opts() as { repo: string; objectDirectory?: string; alternateObjectDirectory: string[] }
   let result:
     | SuperDiffResult
     | SuperStatusResult
@@ -692,11 +696,20 @@ async function runInvocation(
     | SuperSubmodulePrepareResult
     | GitSuperResult
   try {
-    result = await commandResult(
+    let objects: GitObjectContext | undefined
+    if (globals.objectDirectory !== undefined || globals.alternateObjectDirectory.length > 0) {
+      if (program.getOptionValueSource("repo") !== "cli" || !isAbsolute(globals.repo)) {
+        throw new Error("git super: explicit public object context requires --repo <absolute-path>; select the repository before Git runs")
+      }
+      if (globals.objectDirectory === undefined) throw new Error("git super: alternate public objects require --object-directory <absolute-path>")
+      objects = { directory: globals.objectDirectory, alternates: globals.alternateObjectDirectory }
+      validateGitObjectContext(objects)
+    }
+    result = await withGitEnvironment(process.env, () => commandResult(
       captured.node,
       { repo: globals.repo, report: (message) => stderr.write(message) },
       captured.params,
-    )
+    ), objects)
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     stderr.write(`${message}\n`)

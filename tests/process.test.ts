@@ -24,6 +24,25 @@ afterEach(() => {
 })
 
 describe("GitProcess", () => {
+  // @failure: invalid host-selected stores are accepted and reach a native Git spawn.
+  // @level l1; @consumer callers declaring a closed public object context; @testonly none
+  // Existing graph tests scrub ambient routing but do not validate explicit stores.
+  test("refuses invalid explicit object stores before a Git process can run", () => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-object-context-"))
+    roots.push(root)
+    const directory = join(root, "objects")
+    mkdirSync(directory)
+    for (const objects of [
+      { directory: "relative-objects" },
+      { directory: join(root, "missing") },
+      { directory, alternates: [directory] },
+      { directory, alternates: [join(root, "delimiter:objects")] },
+      { directory, alternates: [join(root, "line\nobjects")] },
+    ]) {
+      expect(() => createLocalGitProcess(process.env, { objects })).toThrow(/public object/u)
+    }
+  })
+
   // Gate A: graph-process tests intentionally scrub Git variables and decode text.
   // They cannot prove a selected executable preserves the caller's raw request.
   test.each([false, true])(
