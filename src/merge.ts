@@ -623,7 +623,9 @@ async function mergeObserved(
         .map((path) => ({
           path,
           repository: join(root, path),
-          allowAbsent: false,
+          // 27162: an automatically declared-private path may be absent as well as empty, since this environment
+          // intentionally leaves the private checkout out. A caller-requested non-private exclusion stays strict.
+          allowAbsent: privatePaths.has(path),
         }))
       proveExcludedCheckouts(root, checkouts, "merge")
     } catch (error) {
@@ -642,6 +644,9 @@ async function mergeObserved(
   if (status.code !== 0) {
     return failed(root, [], resultDetailFromGit("git-failed", "verify-clean", root, statusArgs, status))
   }
+  // 27162: an intentionally absent declared-private checkout is a parent-level deletion record, not root worktree
+  // dirt; its unchanged pin was already proved before the exclusion, so the absent path must not block the merge.
+  const observedStatus = withoutDeclaredPrivateDeletions(status.stdout, declaredPrivateExclusions)
   const containmentArgs = ["merge-base", "--is-ancestor", target, head]
   const containment = excludedSubmodules.length > 0 ? undefined : await run(git, root, containmentArgs, timeoutMs)
   if (alreadyContained || containment?.code === 0) {
@@ -739,8 +744,8 @@ async function mergeObserved(
       prospective.conflict !== undefined &&
       prospective.conflict.entries.every((entry) => entry.mode !== "160000")
     ) {
-      if (status.stdout !== "") {
-        return failed(root, [], dirtyWorktreeDetail(root, options.commit, nulRecords(status.stdout)))
+      if (observedStatus !== "") {
+        return failed(root, [], dirtyWorktreeDetail(root, options.commit, nulRecords(observedStatus)))
       }
       const checkoutFailure = await verifyRestingCheckouts(git, root, head, timeoutMs, excludedSubmodules)
       if (checkoutFailure !== undefined) return failed(root, [], checkoutFailure)
@@ -992,7 +997,7 @@ async function mergeObserved(
   const preparedRows = checkoutResults(preparedCheckouts)
   const statusFailure = options.continue
     ? undefined
-    : await validateWorktreeStatus(git, root, options.commit, status.stdout, preparedCheckouts, timeoutMs)
+    : await validateWorktreeStatus(git, root, options.commit, observedStatus, preparedCheckouts, timeoutMs)
   if (statusFailure !== undefined) return failed(root, [], statusFailure, preparedRows)
 
   steps.begin("merge")
@@ -1768,6 +1773,19 @@ async function validateWorktreeStatus(
 
 function nulRecords(output: string): string[] {
   return output.split("\0").filter(Boolean)
+}
+
+/**
+ * 27162: drop a declared-private path's absence from the parent status before the cleanliness gate. The
+ * exclusion already proved its HEAD/target/staged pins identical, so a missing checkout is intended, not dirt.
+ */
+function withoutDeclaredPrivateDeletions(output: string, privatePaths: readonly string[]): string {
+  if (privatePaths.length === 0) return output
+  const declared = new Set(privatePaths)
+  return nulRecords(output)
+    .filter((record) => !(record.startsWith(" D ") && declared.has(record.slice(3))))
+    .map((record) => record + "\0")
+    .join("")
 }
 
 function dirtyWorktreeDetail(root: string, commit: string, paths: readonly string[]): GitResultDetail {

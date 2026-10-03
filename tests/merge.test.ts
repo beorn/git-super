@@ -4,7 +4,7 @@
  * @consumer Yrd settled candidate preparation and landing
  * @reach fs-walk <fixture-only: superMerge uses Git repos under mkdtempSync(canonicalTmpdir())>
  */
-import { chmodSync, existsSync, readFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { chmodSync, existsSync, readFileSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs"
 import { delimiter, dirname, isAbsolute, join, relative } from "node:path"
 import { fileURLToPath } from "node:url"
 import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest"
@@ -116,6 +116,77 @@ describe("git super merge — excluded admission (27058)", () => {
     expect(result.gitlinks).toContainEqual(expect.objectContaining({ path, state: "as-written" }))
     expect(git(fixture.product, "rev-parse", `HEAD:${path}`)).toBe(pin)
     expect(childRequests).toEqual([])
+  })
+
+  /**
+   * @failure A declared-private child whose checkout directory is genuinely absent rejects a root-only merge,
+   *          even though an empty uninitialized checkout is already admitted (27162).
+   * @level l1
+   * @consumer git-super merge callers in environments that never create a private child's checkout
+   * @testonly none; the GitProcess recording is the native access evidence
+   */
+  it("excludes a declared-private child whose checkout directory is absent with no child requests", async () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-merge-declared-private-gone-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const path = "packages/alpha"
+    git(fixture.product, "config", "--file", ".gitmodules", "submodule." + path + ".private", "true")
+    git(fixture.product, "add", ".gitmodules")
+    git(fixture.product, "commit", "-q", "-m", "declare packages/alpha private")
+    const target = candidateWithRootChange(fixture, "declared-private-gone-target")
+    const checkout = join(fixture.product, path)
+    const pin = git(fixture.product, "rev-parse", "HEAD:" + path)
+    const store = git(fixture.product, "rev-parse", "--path-format=absolute", "--git-path", "modules/" + path)
+    git(fixture.product, "submodule", "deinit", "-f", "--", path)
+    // deinit only empties the checkout; move the empty directory aside so the declared-private path is absent.
+    renameSync(checkout, join(root, "declared-private-gone-checkout"))
+    expect(existsSync(checkout)).toBe(false)
+    const local = createLocalGitProcess()
+    const childRequests: GitProcessRequest[] = []
+    const recording: GitProcess = {
+      run(request) {
+        if (
+          [checkout, store].some((selected) => request.repo === selected || request.repo.startsWith(selected + "/"))
+        ) {
+          childRequests.push(request)
+          throw new Error("declared-private child request: " + request.repo)
+        }
+        return local.run(request)
+      },
+    }
+    const result = await superMerge({ repo: fixture.product, commit: target, git: recording })
+    expect(result, JSON.stringify(result.detail)).toMatchObject({
+      state: "updated",
+      partial: false,
+      notCompared: [{ path, reason: "excluded" }],
+    })
+    expect(result.gitlinks).toContainEqual(expect.objectContaining({ path, state: "as-written" }))
+    expect(git(fixture.product, "rev-parse", "HEAD:" + path)).toBe(pin)
+    expect(childRequests).toEqual([])
+  })
+
+  /**
+   * @failure A caller-requested non-private exclusion with a genuinely absent checkout is admitted silently,
+   *          weakening the explicit --exclude-submodule restriction (27162).
+   * @level l1
+   * @consumer git-super merge callers passing an explicit exclusion for a public child
+   * @testonly none
+   */
+  it("still refuses an explicitly excluded non-private child whose checkout is absent", async () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-merge-excluded-gone-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const target = candidateWithRootChange(fixture, "excluded-gone-target")
+    const path = "packages/alpha"
+    const checkout = join(fixture.product, path)
+    git(fixture.product, "submodule", "deinit", "-f", "--", path)
+    renameSync(checkout, join(root, "excluded-gone-checkout"))
+    expect(existsSync(checkout)).toBe(false)
+    const result = await superMerge({ repo: fixture.product, commit: target, excludedSubmodules: [path] })
+    expect(result, JSON.stringify(result.detail)).toMatchObject({
+      state: "failed",
+      detail: { code: "excluded-submodule-unsafe", paths: [path] },
+    })
   })
 
   /**
