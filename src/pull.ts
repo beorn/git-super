@@ -182,6 +182,21 @@ async function required(git: GitProcess, repository: string, args: readonly stri
   return result.stdout.trim()
 }
 
+/**
+ * True when a preflight refresh result carries a supervised failure rather than the allowed exit codes. Native Git
+ * reports a needs-update copy as exit 1; a timeout, stall, signal or settlement failure must never pass as one
+ * (27246).
+ */
+function refreshFailed(result: GitProcessResult): boolean {
+  return (
+    result.failure !== undefined ||
+    result.timedOut === true ||
+    result.stalled === true ||
+    (result.signal !== undefined && result.signal !== null) ||
+    result.code > 1
+  )
+}
+
 function operationError(
   repository: string,
   phase: string,
@@ -602,10 +617,11 @@ async function proveTreeTransition(
     copyFileSync(sourceIndex, temporaryIndex)
     // A file rewritten with identical bytes (bun writes its bin symlink targets and chmods them after the index was
     // written) leaves a stale stat entry, and read-tree -m -u then refuses a transition the working tree is clean
-    // for. Refresh the COPY, never the repository own index: exit 1 only means a path needs update, which the
-    // read-tree below still decides on, and a larger exit is a real failure worth naming (27246).
+    // for. Refresh the COPY, never the repository own index: exit 0 and exit 1 (a path needs update) are the only
+    // allowed outcomes, and the read-tree below still decides a needs-update copy. A supervised failure, timeout,
+    // stall or signal can settle with those same codes, so it is refused by name rather than publishing the pull (27246).
     const refresh = await run(git, repository, ["update-index", "-q", "--refresh"], { GIT_INDEX_FILE: temporaryIndex })
-    if (refresh.code > 1) {
+    if (refreshFailed(refresh)) {
       throw operationError(repository, "preflight-tree-transition", ["update-index", "--refresh"], refresh)
     }
     const transition = await run(

@@ -19,7 +19,13 @@ import { fileURLToPath } from "node:url"
 import { spawn } from "node:child_process"
 import { runCli } from "../src/cli.ts"
 import { acquireExclusive, createExclusive, type Exclusive } from "../src/exclusive.ts"
-import { adaptProcessGit, createLocalGitProcess, type GitProcess, type GitProcessRequest } from "../src/process.ts"
+import {
+  adaptProcessGit,
+  createLocalGitProcess,
+  type GitProcess,
+  type GitProcessRequest,
+  type GitProcessResult,
+} from "../src/process.ts"
 import { superPull } from "../src/pull.ts"
 import { materializeSubmodulesWithProcess } from "../src/submodules.ts"
 import { superSubmodulePrepare } from "../src/submodule-prepare.ts"
@@ -1928,6 +1934,62 @@ describe("git super pull --ff-only", () => {
     expect(result).toMatchObject({ state: "updated", partial: false })
     expect(git(checkout, "rev-parse", "HEAD")).toBe(target)
     expect(readFileSync(bin, "utf8")).toBe("two\n")
+  })
+
+  /**
+   * @failure A preflight refresh that failed, timed out, stalled or took a signal is not the allowed needs-update exit and must not publish the pull (27246).
+   * @level l1
+   * @consumer git-super pull --ff-only from the shared-main updater
+   * @testonly none
+   */
+  const refreshFailures: readonly (readonly [string, GitProcessResult])[] = [
+    [
+      "settlement failure on exit 0",
+      { code: 0, stdout: "", stderr: "", failure: "injected refresh settlement failure" },
+    ],
+    ["supervised timeout on exit 1", { code: 1, stdout: "", stderr: "", timedOut: true }],
+    ["stalled refresh on exit 1", { code: 1, stdout: "", stderr: "", stalled: true }],
+    [
+      "signalled refresh on exit 1",
+      { code: 1, stdout: "", stderr: "", signal: "SIGKILL", failure: "native Git terminated by signal SIGKILL" },
+    ],
+  ]
+  test.each(refreshFailures)("refuses a refresh supervision failure: %s", async (_label, injected) => {
+    const fixture = mkdtempSync(join(tmpdir(), "git-super-pull-refresh-failure-"))
+    roots.push(fixture)
+    const upstream = join(fixture, "upstream")
+    const checkout = join(fixture, "checkout")
+    createRepository(upstream, "bin.ts", "one\n")
+    git(fixture, "clone", "-q", upstream, checkout)
+    const head = git(checkout, "rev-parse", "HEAD")
+    advanceRepository(upstream, "bin.ts", "two\n")
+
+    const local = createLocalGitProcess()
+    let injectedCount = 0
+    const result = await superPull({
+      repo: checkout,
+      repository: "origin",
+      refspecs: ["main"],
+      ffOnly: true,
+      git: {
+        run(request) {
+          if (request.args[0] === "update-index" && request.args.includes("--refresh")) {
+            injectedCount++
+            return Promise.resolve(injected)
+          }
+          return local.run(request)
+        },
+      },
+    })
+
+    expect(injectedCount).toBe(1)
+    expect(result).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: { phase: "preflight-tree-transition" },
+    })
+    expect(git(checkout, "rev-parse", "HEAD")).toBe(head)
+    expect(readFileSync(join(checkout, "bin.ts"), "utf8")).toBe("one\n")
   })
 
   test("the real executable emits stable JSON for success and operational failure", () => {
