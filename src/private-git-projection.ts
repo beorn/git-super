@@ -268,6 +268,7 @@ export async function projectPrivateGitWorktree(
   const retainedPaths: string[] = []
   const repositories: Array<{ path: string; checkout: string; gitDirectory: string; head: string }> = []
   const stores = new Set<string>()
+  const publicDirectories = new Map<string, string>()
   const destination = resolve(options.destination)
   const environment = {
     ...cleanGitEnvironment(),
@@ -323,11 +324,17 @@ export async function projectPrivateGitWorktree(
       head: string,
       root: boolean,
       privateGitDirectory?: string,
+      publicGitDirectory?: string,
     ): Promise<void> => {
       const sourceGit = await metadata(sourceCheckout)
       const common = await commonDirectory(sourceGit)
       const objects = join(common, "objects")
-      await alternatesLineage([objects], join(checkout, ".git", "objects"), { allowedObjects: new Set([objects]) })
+      const publicDirectory = publicGitDirectory ?? common
+      publicDirectories.set(checkout, publicDirectory)
+      const publicObjects = join(publicDirectory, "objects")
+      const lineage = await alternatesLineage([objects], join(checkout, ".git", "objects"), {
+        allowedObjects: new Set([...stores, objects, publicObjects]),
+      })
       if (root) await mkdir(checkout)
       else await mkdir(checkout, { recursive: true })
       retainedPaths.push(checkout)
@@ -341,7 +348,9 @@ export async function projectPrivateGitWorktree(
         options.branch,
       ])
       const gitDirectory = privateGitDirectory ?? join(checkout, ".git")
-      await writeFile(join(gitDirectory, "objects", "info", "alternates"), `${objects}\n`, { flag: "wx" })
+      await writeFile(join(gitDirectory, "objects", "info", "alternates"), `${[...lineage, objects].join("\n")}\n`, {
+        flag: "wx",
+      })
       await run(checkout, ["cat-file", "-e", `${head}^{commit}`])
       await createExclusive(join(common, "yrd-worktree-mutations")).run(
         async () => {
@@ -350,6 +359,7 @@ export async function projectPrivateGitWorktree(
         { holder: `private projection ${destination}` },
       )
       stores.add(objects)
+      for (const lender of lineage) stores.add(lender)
       await run(checkout, ["checkout", "--no-recurse-submodules", "-B", options.branch, head])
       repositories.push({ path: relative(destination, checkout).split(sep).join("/"), checkout, gitDirectory, head })
     }
@@ -382,6 +392,9 @@ export async function projectPrivateGitWorktree(
         materialize: async (parent, entry) => {
           const checkout = join(parent, entry.path)
           const directory = safeStorePath(await metadata(parent), entry.name)
+          const publicParent = publicDirectories.get(parent)
+          if (publicParent === undefined) throw new Error(`missing declared public metadata for ${parent}`)
+          const publicDirectory = safeStorePath(publicParent, entry.name)
           await mkdir(dirname(directory), { recursive: true })
           await createRepository(
             checkout,
@@ -389,6 +402,7 @@ export async function projectPrivateGitWorktree(
             entry.target,
             false,
             directory,
+            publicDirectory,
           )
         },
       },

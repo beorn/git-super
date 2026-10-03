@@ -276,32 +276,69 @@ it.each(["unknown-store", "unknown-hook"] as const)(
 
 // CTO343fc3e2/0a13f6da: host-selected linked environments borrow declared public stores transitively.
 // Existing primary-source fixtures have no public alternates and therefore miss real Yrd source closure.
-it("projects a public linked source with its declared child object-store lenders", async () => {
-  const root = await mkdtemp(join(canonicalTmpdir(), "git-super-linked-source-closure-"))
-  roots.push(root)
-  const fixture = createProductFixture(root)
-  const source = join(root, "source")
-  const transport = createLocalGitProcess()
-  const store = createGitWorktreeStore({ repo: fixture.product, gitProcess: transport })
-  await store.add({ kind: "detached", path: source, ref: fixture.productBase })
-  await store.materializeSubmodules(source)
-  const alpha = join(source, "packages/alpha")
-  const sourceGit = git(alpha, "rev-parse", "--path-format=absolute", "--git-common-dir")
-  const durableObjects = join(fixture.product, ".git/modules/packages/alpha/objects")
-  expect(readFileSync(join(sourceGit, "objects/info/alternates"), "utf8")).toContain(durableObjects)
-  expect(git(alpha, "rev-parse", "HEAD")).toBe(fixture.alphaBase)
-  const projected = await GitSuper.projectPrivateGitWorktree({
-    sourceCheckout: source,
-    commit: fixture.productBase,
-    branch: "task/seat",
-    destination: join(root, "seat"),
-    excludedSubmodules: [],
-  })
-  expect(projected.state, JSON.stringify(projected.detail)).toBe("updated")
-  expect(projected.projection?.mounts).toContainEqual({
-    source: durableObjects, target: durableObjects, mode: "ro",
-  })
-})
+it.each([false, true])(
+  "projects a public linked source with its declared child object-store lenders; nested=%s",
+  async (nested) => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-linked-source-closure-"))
+    roots.push(root)
+    const fixture = nested ? addNestedAlphaSubmodule(createProductFixture(root)) : createProductFixture(root)
+    git(fixture.product, "config", "-f", ".gitmodules", "submodule.vendor/beta.private", "true")
+    git(fixture.product, "add", ".gitmodules")
+    git(fixture.product, "commit", "-q", "-m", "declare excluded source child")
+    const base = git(fixture.product, "rev-parse", "HEAD")
+    const source = join(root, "source")
+    const transport = createLocalGitProcess()
+    const store = createGitWorktreeStore({ repo: fixture.product, gitProcess: transport })
+    await store.add({ kind: "detached", path: source, ref: base })
+    await store.materializeSubmodules(source, { excludedSubmodules: ["vendor/beta"] })
+    const alpha = join(source, "packages/alpha")
+    const sourceGit = git(alpha, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    const durableObjects = join(fixture.product, ".git/modules/packages/alpha/objects")
+    expect(readFileSync(join(sourceGit, "objects/info/alternates"), "utf8")).toContain(durableObjects)
+    expect(git(alpha, "rev-parse", "HEAD")).toBe(git(join(fixture.product, "packages/alpha"), "rev-parse", "HEAD"))
+    const projected = await GitSuper.projectPrivateGitWorktree({
+      sourceCheckout: source,
+      commit: base,
+      branch: "task/seat",
+      destination: join(root, "seat"),
+      excludedSubmodules: ["vendor/beta"],
+    })
+    expect(projected.state, JSON.stringify(projected.detail)).toBe("updated")
+    expect(projected.projection?.mounts).toContainEqual({
+      source: durableObjects,
+      target: durableObjects,
+      mode: "ro",
+    })
+    const privateObjects = join(fixture.product, ".git/modules/vendor/beta/objects")
+    expect(projected.projection?.mounts.some((mount) => mount.source === privateObjects)).toBe(false)
+    expect(existsSync(join(source, "vendor/beta/.git"))).toBe(false)
+    if (nested) {
+      const leafObjects = join(fixture.product, ".git/modules/packages/alpha/modules/apps/maddoc/objects")
+      expect(projected.projection?.mounts).toContainEqual({ source: leafObjects, target: leafObjects, mode: "ro" })
+    }
+    const alternates = join(sourceGit, "objects/info/alternates")
+    const original = readFileSync(alternates, "utf8")
+    for (const unapproved of [privateObjects, join(root, "missing-public-lender")]) {
+      writeFileSync(alternates, `${original}${unapproved}\n`)
+      const rejected = await GitSuper.projectPrivateGitWorktree({
+        sourceCheckout: source,
+        commit: base,
+        branch: "task/rejected-seat",
+        destination: join(root, unapproved === privateObjects ? "rejected-private" : "rejected-missing"),
+        excludedSubmodules: ["vendor/beta"],
+      })
+      expect(rejected.state, JSON.stringify(rejected)).toBe("failed")
+      expect(rejected.detail?.message).toContain(unapproved)
+      writeFileSync(alternates, original)
+      // Each failed attempt preserves its partial tree at its own destination.
+      if (unapproved === privateObjects) {
+        const rootRecord = rejected.retainedPaths[0]
+        if (rootRecord === undefined) throw new Error("failed projection omitted partial root")
+        expect(existsSync(rootRecord)).toBe(true)
+      }
+    }
+  },
+)
 
 // CTO63d0a344 step 5: publication must not separate the final equality check from removal.
 // The helper-config race mutates at lease acquisition, before snapshot; this writes after proof publication.
