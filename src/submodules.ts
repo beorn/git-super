@@ -1380,14 +1380,19 @@ export async function materializeSubmodules(
       const policies = await git.run(worktree, ["config", "--get-regexp", "^submodule\\..*\\.update$"], true)
       if (policies.code !== 0 && policies.code !== 1) return policies
       const policyPrefix = `submodule.${name}.update `
-      const policy = policies.stdout
-        .split("\n")
-        .filter((line) => line.startsWith(policyPrefix))
-        .at(-1)
-        ?.slice(policyPrefix.length) ?? "checkout"
+      const policy =
+        policies.stdout
+          .split("\n")
+          .filter((line) => line.startsWith(policyPrefix))
+          .at(-1)
+          ?.slice(policyPrefix.length) ?? "checkout"
       if (policy === "none") return success()
       if (!["checkout", "merge", "rebase"].includes(policy) && !policy.startsWith("!")) {
-        return { code: 1, stdout: "", stderr: `invalid update policy ${JSON.stringify(policy)} for submodule ${JSON.stringify(name)} in ${worktree}` }
+        return {
+          code: 1,
+          stdout: "",
+          stderr: `invalid update policy ${JSON.stringify(policy)} for submodule ${JSON.stringify(name)} in ${worktree}`,
+        }
       }
       const freshClone = !existsSync(join(submoduleDir, ".git"))
       const level = await durableLevel()
@@ -1497,16 +1502,13 @@ export async function materializeSubmodules(
         }
         const current = await git.run(submoduleDir, ["rev-parse", "--verify", "HEAD"], true)
         if (freshClone || options.force || current.code !== 0 || current.stdout.trim() !== required) {
-          const args = freshClone || policy === "checkout"
-            ? ["checkout", "--quiet", "--detach", ...(options.force ? ["--force"] : []), required]
-            : policy.startsWith("!")
-              ? ["-c", `alias.git-super-submodule-update=${policy}`, "git-super-submodule-update", required]
-              : [policy, required]
-          result = await git.run(
-            submoduleDir,
-            args,
-            true,
-          )
+          const args =
+            (freshClone && !policy.startsWith("!")) || policy === "checkout"
+              ? ["checkout", "--quiet", "--detach", ...(options.force ? ["--force"] : []), required]
+              : policy.startsWith("!")
+                ? ["-c", `alias.git-super-submodule-update=${policy}`, "git-super-submodule-update", required]
+                : [policy, required]
+          result = await git.run(submoduleDir, args, true)
         }
         if (updateSpan !== undefined) {
           Object.assign(updateSpan.spanData, { outcome: result.code === 0 ? "ok" : "failed" })

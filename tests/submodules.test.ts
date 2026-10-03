@@ -46,7 +46,20 @@ const success = (): SubmoduleGitResult => ({ code: 0, stdout: "", stderr: "" })
 const roots: string[] = []
 
 describe("standard materializer native update parity", () => {
-  it.each(["unreferenced", "none", "none-force", "merge", "rebase", "merge-force", "rebase-force", "custom", "custom-force", "fresh-merge", "fresh-rebase", "fresh-custom"])(
+  it.each([
+    "unreferenced",
+    "none",
+    "none-force",
+    "merge",
+    "rebase",
+    "merge-force",
+    "rebase-force",
+    "custom",
+    "custom-force",
+    "fresh-merge",
+    "fresh-rebase",
+    "fresh-custom",
+  ])(
     "preserves native %s refs and update policy",
     async (policy) => {
       const root = mkdtempSync(join(tmpdir(), "git-super-update-parity-"))
@@ -90,7 +103,8 @@ describe("standard materializer native update parity", () => {
         const checkout = join(root, arm)
         run(root, ["clone", "-q", owner, checkout])
         const child = join(checkout, "child")
-        const custom = '!f() { printf "%s\\n" "$PWD" "$1" "$GIT_OBJECT_DIRECTORY" "$GIT_ALTERNATE_OBJECT_DIRECTORIES" > custom.receipt; git checkout -q --detach "$1"; }; f'
+        const custom =
+          '!f() { printf "%s\\n" "$PWD" "$1" "$GIT_OBJECT_DIRECTORY" "$GIT_ALTERNATE_OBJECT_DIRECTORIES" > custom.receipt; git checkout -q --detach "$1"; }; f'
         if (strategy !== "unreferenced" && !fresh) {
           run(checkout, ["checkout", "-q", "--detach", oldRoot])
           run(checkout, ["submodule", "update", "--init", "--", "child"])
@@ -102,8 +116,13 @@ describe("standard materializer native update parity", () => {
           }
           run(checkout, ["checkout", "-q", "main"])
         }
-        if (strategy !== "unreferenced") run(checkout, ["config", "submodule.child.update", strategy === "custom" ? custom : strategy])
-        const objects = { directory: join(checkout, ".git", "modules", "child", "objects"), alternates: [join(owner, ".git", "objects"), join(dependency, ".git", "objects")] }
+        if (strategy !== "unreferenced") {
+          run(checkout, ["config", "submodule.child.update", strategy === "custom" ? custom : strategy])
+        }
+        const objects = {
+          directory: join(checkout, ".git", "modules", "child", "objects"),
+          alternates: [join(owner, ".git", "objects"), join(dependency, ".git", "objects")],
+        }
         if (arm === "native") {
           run(checkout, ["submodule", "update", "--init", ...(force ? ["--force"] : []), "--", "child"])
         } else {
@@ -115,11 +134,12 @@ describe("standard materializer native update parity", () => {
           expect(result.code, result.stderr).toBe(0)
         }
         if (strategy === "custom") {
-          if (fresh) expect(existsSync(join(child, "custom.receipt"))).toBe(false)
-          else {
-            const receipt = readFileSync(join(child, "custom.receipt"), "utf8").split("\n")
-            expect(receipt.slice(0, 2)).toEqual([child, required])
-            if (arm === "standard") expect(receipt.slice(2, 4)).toEqual([objects.directory, objects.alternates.join(":")])
+          // Native Git runs a locally configured !command on the first update
+          // too; only the built-in merge/rebase policies become checkout.
+          const receipt = readFileSync(join(child, "custom.receipt"), "utf8").split("\n")
+          expect(receipt.slice(0, 2)).toEqual([child, required])
+          if (arm === "standard" && !fresh) {
+            expect(receipt.slice(2, 4)).toEqual([objects.directory, objects.alternates.join(":")])
           }
         }
         const observation = {
