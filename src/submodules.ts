@@ -1377,6 +1377,18 @@ export async function materializeSubmodules(
     }>) => {
       const source = isLocal ? "local" : "remote"
       const submoduleDir = join(worktree, path)
+      const policies = await git.run(worktree, ["config", "--get-regexp", "^submodule\\..*\\.update$"], true)
+      if (policies.code !== 0 && policies.code !== 1) return policies
+      const policyPrefix = `submodule.${name}.update `
+      const policy = policies.stdout
+        .split("\n")
+        .filter((line) => line.startsWith(policyPrefix))
+        .at(-1)
+        ?.slice(policyPrefix.length) ?? "checkout"
+      if (policy === "none") return success()
+      if (!["checkout", "merge", "rebase"].includes(policy) && !policy.startsWith("!")) {
+        return { code: 1, stdout: "", stderr: `invalid update policy ${JSON.stringify(policy)} for submodule ${JSON.stringify(name)} in ${worktree}` }
+      }
       const freshClone = !existsSync(join(submoduleDir, ".git"))
       const level = await durableLevel()
       if (typeof level !== "string") return level
@@ -1433,6 +1445,12 @@ export async function materializeSubmodules(
               result = await git.run(submoduleDir, ["config", "--local", ...config], true)
               if (result.code !== 0) return result
             }
+            if (nestedReference === undefined) {
+              // Populate the configured origin head refspec just as clone does;
+              // a later SHA-only fetch fills FETCH_HEAD, not tracking refs.
+              result = await git.run(submoduleDir, ["fetch", "origin"], true)
+              if (result.code !== 0) return result
+            }
             if (nestedReference !== undefined) {
               const referenceDir = await git.run(
                 nestedReference,
@@ -1479,9 +1497,14 @@ export async function materializeSubmodules(
         }
         const current = await git.run(submoduleDir, ["rev-parse", "--verify", "HEAD"], true)
         if (freshClone || options.force || current.code !== 0 || current.stdout.trim() !== required) {
+          const args = freshClone || policy === "checkout"
+            ? ["checkout", "--quiet", "--detach", ...(options.force ? ["--force"] : []), required]
+            : policy.startsWith("!")
+              ? ["-c", `alias.git-super-submodule-update=${policy}`, "git-super-submodule-update", required]
+              : [policy, required]
           result = await git.run(
             submoduleDir,
-            ["checkout", "--quiet", "--detach", ...(options.force ? ["--force"] : []), required],
+            args,
             true,
           )
         }

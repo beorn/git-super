@@ -45,6 +45,98 @@ import { parseCommitSubmoduleConfig } from "../src/commit-graph.ts"
 const success = (): SubmoduleGitResult => ({ code: 0, stdout: "", stderr: "" })
 const roots: string[] = []
 
+describe("standard materializer native update parity", () => {
+  it.each(["unreferenced", "none", "none-force", "merge", "rebase", "merge-force", "rebase-force", "custom", "custom-force", "fresh-merge", "fresh-rebase", "fresh-custom"])(
+    "preserves native %s refs and update policy",
+    async (policy) => {
+      const root = mkdtempSync(join(tmpdir(), "git-super-update-parity-"))
+      roots.push(root)
+      const env = {
+        ...cleanGitRepositoryEnvironment(process.env),
+        GIT_ALLOW_PROTOCOL: "file",
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_CONFIG_GLOBAL: "/dev/null",
+        GIT_AUTHOR_NAME: "fixture",
+        GIT_AUTHOR_EMAIL: "fixture@example.invalid",
+        GIT_COMMITTER_NAME: "fixture",
+        GIT_COMMITTER_EMAIL: "fixture@example.invalid",
+      }
+      const run = (repo: string, args: string[]) => {
+        const result = spawnSync("git", args, { cwd: repo, env, encoding: "utf8" })
+        if (result.status !== 0) throw new Error(`git ${args.join(" ")}: ${result.stderr}`)
+        return result.stdout.trim()
+      }
+      const dependency = join(root, "dependency")
+      const owner = join(root, "owner")
+      for (const repo of [dependency, owner]) run(root, ["init", "-q", "-b", "main", repo])
+      writeFileSync(join(dependency, "base"), "base\n")
+      run(dependency, ["add", "."])
+      run(dependency, ["commit", "-qm", "base"])
+      const oldPin = run(dependency, ["rev-parse", "HEAD"])
+      run(owner, ["submodule", "add", "-q", dependency, "child"])
+      run(owner, ["commit", "-qam", "old pin"])
+      const oldRoot = run(owner, ["rev-parse", "HEAD"])
+      writeFileSync(join(dependency, "upstream"), "upstream\n")
+      run(dependency, ["add", "."])
+      run(dependency, ["commit", "-qm", "upstream"])
+      const required = run(dependency, ["rev-parse", "HEAD"])
+      run(owner, ["update-index", "--cacheinfo", `160000,${required},child`])
+      run(owner, ["commit", "-qm", "new pin"])
+      const fresh = policy.startsWith("fresh-")
+      const strategy = (fresh ? policy.slice("fresh-".length) : policy).split("-")[0]!
+      const force = policy.endsWith("-force")
+      const observations = []
+      for (const arm of ["native", "standard"]) {
+        const checkout = join(root, arm)
+        run(root, ["clone", "-q", owner, checkout])
+        const child = join(checkout, "child")
+        const custom = '!f() { printf "%s\\n" "$PWD" "$1" "$GIT_OBJECT_DIRECTORY" "$GIT_ALTERNATE_OBJECT_DIRECTORIES" > custom.receipt; git checkout -q --detach "$1"; }; f'
+        if (strategy !== "unreferenced" && !fresh) {
+          run(checkout, ["checkout", "-q", "--detach", oldRoot])
+          run(checkout, ["submodule", "update", "--init", "--", "child"])
+          if (strategy !== "none") {
+            run(child, ["checkout", "-qb", "local"])
+            writeFileSync(join(child, "local"), "local\n")
+            run(child, ["add", "."])
+            run(child, ["commit", "-qm", "local"])
+          }
+          run(checkout, ["checkout", "-q", "main"])
+        }
+        if (strategy !== "unreferenced") run(checkout, ["config", "submodule.child.update", strategy === "custom" ? custom : strategy])
+        const objects = { directory: join(checkout, ".git", "modules", "child", "objects"), alternates: [join(owner, ".git", "objects"), join(dependency, ".git", "objects")] }
+        if (arm === "native") {
+          run(checkout, ["submodule", "update", "--init", ...(force ? ["--force"] : []), "--", "child"])
+        } else {
+          const result = await materializeSubmodulesWithProcess(
+            createLocalGitProcess(env, strategy === "custom" && !fresh ? { objects } : {}),
+            { worktree: checkout, referenceWorktree: checkout, force },
+            { resolveReferenceWorktree: true },
+          )
+          expect(result.code, result.stderr).toBe(0)
+        }
+        if (strategy === "custom") {
+          if (fresh) expect(existsSync(join(child, "custom.receipt"))).toBe(false)
+          else {
+            const receipt = readFileSync(join(child, "custom.receipt"), "utf8").split("\n")
+            expect(receipt.slice(0, 2)).toEqual([child, required])
+            if (arm === "standard") expect(receipt.slice(2, 4)).toEqual([objects.directory, objects.alternates.join(":")])
+          }
+        }
+        const observation = {
+          originMain: run(child, ["rev-parse", "--verify", "refs/remotes/origin/main"]),
+          tree: run(child, ["rev-parse", "HEAD^{tree}"]),
+          branch: run(child, ["branch", "--show-current"]),
+          parents: run(child, ["rev-list", "--parents", "-n", "1", "HEAD"]).split(" ").length - 1,
+        }
+        if (strategy === "none") expect(run(child, ["rev-parse", "HEAD"])).toBe(oldPin)
+        observations.push(observation)
+      }
+      expect(observations[1]).toEqual(observations[0])
+    },
+    30_000,
+  )
+})
+
 function git(repo: string, args: readonly string[]): string {
   const result = spawnSync("git", ["-C", repo, ...args], { encoding: "utf8" })
   if (result.status !== 0) throw new Error(result.stderr || `git ${args.join(" ")} failed`)
