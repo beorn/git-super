@@ -1,8 +1,9 @@
 import { spawnSync } from "node:child_process"
+import { alternateEntries, alternatesLineage } from "./alternates.ts"
 import { setTimeout as delay } from "node:timers/promises"
 import { existsSync, realpathSync } from "node:fs"
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises"
-import { isAbsolute, join, relative, resolve } from "node:path"
+import { join, relative, resolve } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 import { createLogger, type ConditionalLogger, type LogLevel } from "loggily"
 import { cleanGitRepositoryEnvironment, validateExcludedSubmodules } from "./git.ts"
@@ -578,45 +579,6 @@ export async function syncOriginTrackingRefs(
     syncedRefs: targetRefs.size,
   })
   return success()
-}
-
-/** The canonical object directories an alternates file names, relative lines resolved against its own store. */
-function alternateEntries(content: string, objects: string): string[] {
-  return content
-    .split(/\r?\n/u)
-    .map((line) => line.trim())
-    .filter((entry) => entry !== "" && !entry.startsWith("#"))
-    .map((entry) => canonical(isAbsolute(entry) ? entry : resolve(objects, entry)))
-}
-
-/**
- * Every existing object directory reachable through the alternates of `stores`, transitively and without `own`,
- * each AFTER the directories it borrows from (post-order), so git reading them in this order finds every
- * borrow already registered. A directory that no longer exists (its worktree was recycled) ends that branch: git
- * skips it too.
- */
-async function alternatesLineage(stores: readonly string[], own: string): Promise<string[]> {
-  // Seeded with the own store only: a listed ancestor must still be placed ahead of the store that borrows from it,
-  // or a file an earlier release wrote ancestor-last reads as complete and is never healed (review2 f11cfb14).
-  const seen = new Set([own])
-  const lineage: string[] = []
-  const visit = async (store: string): Promise<void> => {
-    let content: string
-    try {
-      content = await readFile(join(store, "info", "alternates"), "utf8")
-    } catch {
-      // silent-fallback-allow: a store with no alternates file borrows nothing; it ends its branch of the lineage
-      return
-    }
-    for (const entry of alternateEntries(content, store)) {
-      if (seen.has(entry) || !existsSync(entry)) continue
-      seen.add(entry)
-      await visit(entry)
-      lineage.push(entry)
-    }
-  }
-  for (const store of stores) await visit(store)
-  return lineage
 }
 
 /**
