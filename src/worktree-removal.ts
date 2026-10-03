@@ -1025,9 +1025,9 @@ export async function retainWorktreeModules(
     before = await cleanSnapshot(git, copiedCheckout, inspect, excludedSubmodules)
     for (const repository of privateProjection.repositories) {
       const copied = join(retained, relative(gitDir, repository.gitDirectory))
-      // Full integrity includes borrowed stores: the real public root takes 62s for 1.98M objects.
-      // Use the existing cleanup allowance rather than the interactive operation deadline.
-      await git.run(copiedCheckout, ["--git-dir", copied, "fsck", "--full", "--no-reflogs"], false, 120_000)
+      // Full integrity includes borrowed stores: the public root takes 62s and a large child 207–239s.
+      // Keep a finite five-minute bound for this full scan rather than the interactive deadline.
+      await git.run(copiedCheckout, ["--git-dir", copied, "fsck", "--full", "--no-reflogs"], false, 300_000)
     }
   }
   const rehomedBorrowers =
