@@ -1,7 +1,8 @@
-import { lstat, mkdir, readFile, realpath, writeFile } from "node:fs/promises"
-import { rmSync } from "node:fs"
+import { lstat, mkdir, realpath, writeFile } from "node:fs/promises"
+import { rmSync, type Stats } from "node:fs"
 import { dirname, join, relative, resolve, sep } from "node:path"
 import { alternatesLineage } from "./alternates.ts"
+import { readMetadataFile } from "./git-metadata.ts"
 import { readPrivateSubmodulePaths } from "./commit-graph.ts"
 import { cleanGitEnvironment, validateExcludedSubmodules, withGitEnvironment } from "./git.ts"
 import { createLocalGitProcess, type GitProcess } from "./process.ts"
@@ -236,29 +237,36 @@ export function retirePrivateGitProjection(
   return preserveProjection(projection, retentionRoot, true, stopCertificate)
 }
 
-/** Resolve host-selected repository metadata without asking Git to follow an object path. */
 async function metadata(checkout: string): Promise<string> {
   const pointer = join(checkout, ".git")
   const stat = await lstat(pointer)
   if (stat.isDirectory()) return realpath(pointer)
   if (!stat.isFile()) throw new Error(`unsupported Git metadata pointer: ${pointer}`)
-  const match = /^gitdir: ([^\r\n]+)\r?\n?$/u.exec(await readFile(pointer, "utf8"))
+  const match = /^gitdir: ([^\r\n]+)\r?\n?$/u.exec(await readMetadataFile(pointer, stat))
   if (match?.[1] === undefined) throw new Error(`invalid Git metadata pointer: ${pointer}`)
   return realpath(resolve(checkout, match[1]))
 }
 
 async function commonDirectory(gitDirectory: string): Promise<string> {
-  let content: string
+  const pointer = join(gitDirectory, "commondir")
+  let inspected: Stats
   try {
-    content = await readFile(join(gitDirectory, "commondir"), "utf8")
+    inspected = await lstat(pointer)
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
-    // silent-fallback-allow: absent commondir identifies a standalone repository, not a missing store
-    return gitDirectory
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      // silent-fallback-allow: only lstat-proven entry absence identifies a standalone repository
+      return gitDirectory
+    }
+    throw new Error(`cannot inspect Git metadata file: ${pointer}`, { cause: error })
   }
+  const content = await readMetadataFile(pointer, inspected)
   const selected = content.trim()
-  if (selected === "") throw new Error(`empty commondir under ${gitDirectory}`)
-  return realpath(resolve(gitDirectory, selected))
+  if (selected === "" || /[\r\n\u0000]/u.test(selected)) throw new Error(`invalid commondir pointer: ${pointer}`)
+  try {
+    return await realpath(resolve(gitDirectory, selected))
+  } catch (error) {
+    throw new Error(`cannot resolve commondir pointer: ${pointer}`, { cause: error })
+  }
 }
 
 /** Make private metadata while the existing materializer owns recursive frozen declaration selection. */
@@ -268,6 +276,7 @@ export async function projectPrivateGitWorktree(
   const retainedPaths: string[] = []
   const repositories: Array<{ path: string; checkout: string; gitDirectory: string; head: string }> = []
   const stores = new Set<string>()
+  const objectOwners = new Map<string, string>()
   const publicDirectories = new Map<string, string>()
   const destination = resolve(options.destination)
   const environment = {
@@ -318,23 +327,36 @@ export async function projectPrivateGitWorktree(
     if (destination === source || destination.startsWith(`${source}${sep}`)) {
       throw new Error(`projection destination is inside its source: ${destination}`)
     }
-    const createRepository = async (
+    const createRepository = async <T>(
       checkout: string,
       sourceCheckout: string,
       head: string,
       root: boolean,
+      consume: () => Promise<T>,
       privateGitDirectory?: string,
       publicGitDirectory?: string,
-    ): Promise<void> => {
+    ): Promise<T> => {
       const sourceGit = await metadata(sourceCheckout)
       const common = await commonDirectory(sourceGit)
       const objects = join(common, "objects")
       const publicDirectory = publicGitDirectory ?? common
+      if (!(await lstat(publicDirectory)).isDirectory() || (await realpath(publicDirectory)) !== publicDirectory) {
+        throw new Error(`nonphysical declared public metadata: ${publicDirectory}`)
+      }
+      const publicCommon = await commonDirectory(publicDirectory)
+      objectOwners.set(objects, common)
+      objectOwners.set(join(publicCommon, "objects"), publicCommon)
       publicDirectories.set(checkout, publicDirectory)
       const publicObjects = join(publicDirectory, "objects")
       const lineage = await alternatesLineage([objects], join(checkout, ".git", "objects"), {
         allowedObjects: new Set([...stores, objects, publicObjects]),
       })
+      const owners = new Set<string>()
+      for (const store of [objects, ...lineage]) {
+        const owner = objectOwners.get(store)
+        if (owner === undefined) throw new Error(`unproven object-store owner: ${store}`)
+        owners.add(owner)
+      }
       if (root) await mkdir(checkout)
       else await mkdir(checkout, { recursive: true })
       retainedPaths.push(checkout)
@@ -348,45 +370,55 @@ export async function projectPrivateGitWorktree(
         options.branch,
       ])
       const gitDirectory = privateGitDirectory ?? join(checkout, ".git")
-      await writeFile(join(gitDirectory, "objects", "info", "alternates"), `${[...lineage, objects].join("\n")}\n`, {
-        flag: "wx",
-      })
-      await run(checkout, ["cat-file", "-e", `${head}^{commit}`])
-      // A ref in the borrower cannot protect objects from a lender's own GC.
-      // Every validated lender must hold the selected commit under the existing exact-object pin.
-      for (const directory of new Set([common, ...lineage.map((lender) => dirname(lender))])) {
-        await createExclusive(join(directory, "yrd-worktree-mutations")).run(
-          async () => {
-            // A linked source may own a newer commit than its public lenders.
-            // Reuse exact-object transfer before anchoring it in every GC owner.
-            await ensureCommitObject({
-              repository: checkout,
-              remote: common,
-              commit: head,
-              git: {
-                run: (request) =>
-                  git.run({
-                    ...request,
-                    args: [
-                      "--git-dir",
-                      directory,
-                      ...(request.args[0] === "fetch" ? ["-c", "protocol.file.allow=always"] : []),
-                      ...request.args,
-                    ],
-                  }),
-              },
-            })
-            await run(checkout, ["--git-dir", directory, "update-ref", pinRef(head), head])
-          },
-          { holder: `private projection ${destination}` },
-        )
+      const populate = async (): Promise<T> => {
+        await writeFile(join(gitDirectory, "objects", "info", "alternates"), `${[...lineage, objects].join("\n")}\n`, {
+          flag: "wx",
+        })
+        await run(checkout, ["cat-file", "-e", `${head}^{commit}`])
+        // A ref in the borrower cannot protect objects from a lender's own GC.
+        // Every validated lender must hold the selected commit under the existing exact-object pin.
+        for (const directory of owners) {
+          await createExclusive(join(directory, "yrd-worktree-mutations")).run(
+            async () => {
+              // A linked source may own a newer commit than its public lenders.
+              // Reuse exact-object transfer before anchoring it in every GC owner.
+              await ensureCommitObject({
+                repository: checkout,
+                remote: common,
+                commit: head,
+                git: {
+                  run: (request) =>
+                    git.run({
+                      ...request,
+                      args: [
+                        "--git-dir",
+                        directory,
+                        ...(request.args[0] === "fetch" ? ["-c", "protocol.file.allow=always"] : []),
+                        ...request.args,
+                      ],
+                    }),
+                },
+              })
+              await run(checkout, ["--git-dir", directory, "update-ref", pinRef(head), head])
+            },
+            { holder: `private projection ${destination}` },
+          )
+        }
+        stores.add(objects)
+        for (const lender of lineage) stores.add(lender)
+        await run(checkout, ["checkout", "--no-recurse-submodules", "-B", options.branch, head])
+        repositories.push({ path: relative(destination, checkout).split(sep).join("/"), checkout, gitDirectory, head })
+        return consume()
       }
-      stores.add(objects)
-      for (const lender of lineage) stores.add(lender)
-      await run(checkout, ["checkout", "--no-recurse-submodules", "-B", options.branch, head])
-      repositories.push({ path: relative(destination, checkout).split(sep).join("/"), checkout, gitDirectory, head })
+      // New child metadata is initialized under its parent's existing custody.
+      // Its own owner then covers population and the materializer's entire recursive walk.
+      return root
+        ? populate()
+        : createExclusive(join(gitDirectory, "yrd-worktree-mutations")).run(populate, {
+            holder: `private projection child ${checkout}`,
+          })
     }
-    await createRepository(destination, source, options.commit, true)
+    await createRepository(destination, source, options.commit, true, () => Promise.resolve())
     const materialized = await materializeSubmodules(
       { run: (repo, args) => git.run({ repo, args }) },
       {
@@ -412,18 +444,19 @@ export async function projectPrivateGitWorktree(
             )
           }
         },
-        materialize: async (parent, entry) => {
+        materialize: async (parent, entry, descend) => {
           const checkout = join(parent, entry.path)
           const directory = safeStorePath(await metadata(parent), entry.name)
           const publicParent = publicDirectories.get(parent)
           if (publicParent === undefined) throw new Error(`missing declared public metadata for ${parent}`)
           const publicDirectory = safeStorePath(publicParent, entry.name)
           await mkdir(dirname(directory), { recursive: true })
-          await createRepository(
+          return createRepository(
             checkout,
             join(source, relative(destination, checkout)),
             entry.target,
             false,
+            descend,
             directory,
             publicDirectory,
           )

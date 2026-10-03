@@ -598,13 +598,14 @@ export function acquireRemovalWriterLeases(gitDir: string, onAcquired?: (path: s
     ]
     const paths = directories
       .filter((directory) => isGitDirectory(directory, gitDir, true))
+      .sort()
       .map((directory) => join(directory, "yrd-worktree-mutations", "writer.lock"))
-    const existing = paths.filter((path) => present(path)).sort()
-    const absent = paths.filter((path) => !present(path)).sort()
-    // Refuse held existing leases before creating any missing path. Missing paths are then
-    // acquired too, so a writer that starts during retention cannot create and take one.
-    for (const path of [...existing, ...absent]) {
+    const existing = paths.filter((path) => present(path))
+    const acquire = (path: string, preflight = false) => {
       const before = present(path) ? lstatSync(path) : null
+      if (preflight && before === null) {
+        throw new Error(`writer lease ${path} disappeared during removal preflight; worktree preserved`)
+      }
       const handle = tryAcquireFlock(path)
       if (handle === null) {
         const note = readFileSync(path, "utf8")
@@ -616,7 +617,7 @@ export function acquireRemovalWriterLeases(gitDir: string, onAcquired?: (path: s
       }
       handles.push(handle)
       if (before === null) createdPaths.push(path)
-      onAcquired?.(path)
+      if (!preflight) onAcquired?.(path)
       const opened = fstatSync(handle.fd)
       const named = lstatSync(path)
       if (
@@ -631,6 +632,14 @@ export function acquireRemovalWriterLeases(gitDir: string, onAcquired?: (path: s
       if (before === null) created.push(entry)
       else proof.push(entry)
     }
+    // Diagnose already-held existing leases before creating missing paths. This
+    // nonblocking preflight is released; final custody always takes ancestors first.
+    for (const path of existing) acquire(path, true)
+    release()
+    proof.length = 0
+    // Sort Git directories, not writer.lock paths: a root's modules directory
+    // sorts before its yrd-worktree-mutations directory, reversing custody order.
+    for (const path of paths) acquire(path)
     return { proof, created, refusal, release }
   } catch (error) {
     try {

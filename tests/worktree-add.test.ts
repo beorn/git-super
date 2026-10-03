@@ -339,6 +339,59 @@ describe("git super worktree add", () => {
   }, 30_000)
 
   /**
+   * @failure Removal holds a descendant while its ancestor remains available to another writer (27143).
+   * @level l1
+   * @consumer Yrd environment close and private projection custody
+   */
+  it("holds the ancestor before descendant custody without creating paths for an already-busy descendant", () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-removal-order-"))
+    roots.push(fixtureRoot)
+    const fixture = createSuperproject(fixtureRoot)
+    const rootGitDir = git(fixture.product, ["rev-parse", "--absolute-git-dir"])
+    const childGitDir = git(join(fixture.product, "vendor/dep"), ["rev-parse", "--absolute-git-dir"])
+    const rootPath = join(rootGitDir, "yrd-worktree-mutations", "writer.lock")
+    const childPath = join(childGitDir, "yrd-worktree-mutations", "writer.lock")
+    const childHolder = tryAcquireFlock(childPath)
+    expect(childHolder).not.toBeNull()
+    try {
+      expect(() => acquireRemovalWriterLeases(rootGitDir)).toThrow("is held")
+      expect(existsSync(rootPath)).toBe(false)
+    } finally {
+      childHolder?.release()
+    }
+    let descendantObserved = false
+    const leases = acquireRemovalWriterLeases(rootGitDir, (path) => {
+      if (path !== childPath) return
+      descendantObserved = true
+      const rootContender = tryAcquireFlock(rootPath)
+      try {
+        expect(rootContender).toBeNull()
+      } finally {
+        rootContender?.release()
+      }
+    })
+    try {
+      expect(descendantObserved).toBe(true)
+      const childContender = tryAcquireFlock(childPath)
+      try {
+        expect(childContender).toBeNull()
+      } finally {
+        childContender?.release()
+      }
+    } finally {
+      leases.release()
+    }
+    for (const path of [rootPath, childPath]) {
+      const released = tryAcquireFlock(path)
+      try {
+        expect(released).not.toBeNull()
+      } finally {
+        released?.release()
+      }
+    }
+  })
+
+  /**
    * @failure A later absent writer path races into a held lease after removal created an earlier path (25714).
    * @level l1
    * @consumer Yrd environment close
@@ -354,8 +407,8 @@ describe("git super worktree add", () => {
     ).toBe(0)
     const adminGitDir = git(worktree, ["rev-parse", "--absolute-git-dir"])
     const childGitDir = git(join(worktree, "vendor/dep"), ["rev-parse", "--absolute-git-dir"])
-    const firstPath = join(childGitDir, "yrd-worktree-mutations", "writer.lock")
-    const laterPath = join(adminGitDir, "yrd-worktree-mutations", "writer.lock")
+    const firstPath = join(adminGitDir, "yrd-worktree-mutations", "writer.lock")
+    const laterPath = join(childGitDir, "yrd-worktree-mutations", "writer.lock")
     expect(existsSync(firstPath)).toBe(false)
     expect(existsSync(laterPath)).toBe(false)
     const ready = join(fixtureRoot, "later-holder-ready")
@@ -452,7 +505,9 @@ describe("git super worktree add", () => {
     }
     expect(refusal).toBeInstanceOf(Error)
     expect((refusal as Error).message).toContain("diagnostic read failed")
-    expect((refusal as Error).message).toContain(`writer lock paths created by this removal (kept): ${lockPath}`)
+    expect((refusal as Error).message).toContain("writer lock paths created by this removal (kept):")
+    expect((refusal as Error).message).toContain(lockPath)
+    expect((refusal as Error).message).toContain(join(adminGitDir, "yrd-worktree-mutations", "writer.lock"))
     expect(existsSync(lockPath)).toBe(true)
     const free = tryAcquireFlock(lockPath)
     expect(free).not.toBeNull()

@@ -1,6 +1,7 @@
 import { existsSync, lstatSync, realpathSync, statSync } from "node:fs"
 import { readFile } from "node:fs/promises"
 import { isAbsolute, join, resolve } from "node:path"
+import { readMetadataFile } from "./git-metadata.ts"
 
 function canonical(pathname: string): string {
   return existsSync(pathname) ? realpathSync(pathname) : resolve(pathname)
@@ -59,8 +60,10 @@ export async function alternatesLineage(
         if (!metadata.isFile() || realpathSync(file) !== file) {
           throw new Error(`redirected or non-file alternates file: ${file}`)
         }
+        content = await readMetadataFile(file, metadata)
+      } else {
+        content = await readFile(file, "utf8")
       }
-      content = await readFile(file, "utf8")
     } catch (error) {
       if (policy !== undefined) {
         throw new Error(`cannot inspect alternates file: ${file}`, { cause: error })
