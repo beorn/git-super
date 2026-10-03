@@ -343,7 +343,7 @@ async function commonDirectory(git: GitProcess, repository: string): Promise<str
   return resolve(common)
 }
 
-function safeStorePath(common: string, name: string): string {
+export function safeStorePath(common: string, name: string): string {
   const parts = name.split("/")
   if (
     name === "" ||
