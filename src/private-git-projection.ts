@@ -391,8 +391,6 @@ export async function projectPrivateGitWorktree(
         prepareCommit: options.commit,
         validate: async (checkout, head, excluded, metadata) => {
           await validateExclusions(checkout, head, excluded, metadata)
-          const target = join(destination, relative(source, checkout))
-          if (target !== destination) await prepareRepository(target, checkout, head, publicDirectories.get(target))
         },
         materialize: async (parent, entry, descend) => {
           const targetParent = join(destination, relative(source, parent))
@@ -404,6 +402,7 @@ export async function projectPrivateGitWorktree(
           }
           publicDirectories.set(target, safeStorePath(publicParent, entry.name))
           privateDirectories.set(target, safeStorePath(privateParent, entry.name))
+          await prepareRepository(target, join(parent, entry.path), entry.target, publicDirectories.get(target))
           return descend()
         },
       },

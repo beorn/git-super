@@ -117,6 +117,65 @@ it.each([
   expect(readFileSync(join(fixture.product, ".git", "refs", "heads", "main"), "utf8")).toBe(head)
 })
 
+// CTOa6e10f22: every included child must prove metadata before its first selection Git command.
+// Root-only preflight faults and valid recursive custody fixtures miss bad descendant metadata.
+it.each([
+  [false, "git pointer"],
+  [true, "git pointer"],
+  [false, "commondir"],
+  [true, "commondir"],
+  [false, "unknown lender"],
+  [true, "unknown lender"],
+] as const)("refuses child metadata before selection Git: nested=%s; fault=%s", async (nested, fault) => {
+  const root = await mkdtemp(join(canonicalTmpdir(), "git-super-child-preflight-"))
+  roots.push(root)
+  const fixture = addNestedAlphaSubmodule(createProductFixture(root))
+  const child = join(fixture.product, "packages/alpha", ...(nested ? ["apps/maddoc"] : []))
+  const childGit = git(child, "rev-parse", "--absolute-git-dir")
+  const rootRefs = git(fixture.product, "for-each-ref", "--format=%(refname) %(objectname)")
+  const childRefs = git(child, "for-each-ref", "--format=%(refname) %(objectname)")
+  let invalid: string
+  if (fault === "git pointer") {
+    invalid = join(child, ".git")
+    const pointer = readFileSync(invalid, "utf8")
+    const replacement = join(root, "redirected-child-pointer")
+    writeFileSync(replacement, pointer)
+    unlinkSync(invalid)
+    symlinkSync(replacement, invalid)
+  } else if (fault === "commondir") {
+    invalid = join(childGit, "commondir")
+    symlinkSync(join(root, "absent-common"), invalid)
+  } else {
+    invalid = join(fixture.alpha, ".git/objects")
+    writeFileSync(join(childGit, "objects/info/alternates"), `${invalid}\n`)
+  }
+  const transport = createLocalGitProcess()
+  const run = vi.fn(transport.run.bind(transport))
+  const destination = join(root, "seat")
+  const result = await GitSuper.projectPrivateGitWorktree({
+    sourceCheckout: fixture.product,
+    commit: fixture.productWithNestedBase,
+    branch: "task/seat",
+    destination,
+    excludedSubmodules: [],
+    git: { run },
+  })
+  expect(result.state, JSON.stringify(result.detail)).toBe("failed")
+  expect(
+    run.mock.calls.filter(([request]) => request.repo === child),
+    "invalid child reached selection Git",
+  ).toEqual([])
+  expect(result.detail?.message).toContain(invalid)
+  expect(run.mock.calls.filter(([request]) => request.repo.startsWith(destination))).toEqual([])
+  expect(existsSync(destination)).toBe(false)
+  expect(git(fixture.product, "for-each-ref", "--format=%(refname) %(objectname)")).toBe(rootRefs)
+  // Remove the fixture's invalid pointer so Git can inspect the unchanged native ref inventory.
+  if (fault === "commondir") unlinkSync(invalid)
+  expect(git(fixture.product, "--git-dir", childGit, "for-each-ref", "--format=%(refname) %(objectname)")).toBe(
+    childRefs,
+  )
+})
+
 // Schedule real filesystem replacement at the existing open boundary, after the creator inspected the entry.
 // The syscall spy only changes fixture timing; all reads, inode comparisons and refusals remain production-owned.
 it.each(["removed", "regular replacement", "symlink replacement"] as const)(
