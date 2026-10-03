@@ -841,6 +841,7 @@ async function applyRepositories(
     let applied = await runApply(git, repository.repository, args)
     let retryDelayMs = 100
     let retries = 0
+    let attempts = 1
     let contentionExhausted = false
     while (
       applied.code !== 0 &&
@@ -869,6 +870,7 @@ async function applyRepositories(
       }
       // Keep the ordinary native command bound; a timeout/signal is an unknown outcome, never a lock retry.
       attemptStarted = performance.now()
+      attempts++
       applied = await runApply(git, repository.repository, args)
     }
     if (applied.code !== 0) {
@@ -879,6 +881,8 @@ async function applyRepositories(
         applied,
       ).resultDetail
       if (contentionExhausted) {
+        const exhausted = `index-lock-exhausted ${repository.path} attempts=${attempts} remaining=${Math.max(0, Math.ceil(contentionRemainingMs))}ms`
+        phase(exhausted)
         const lookupArgs = ["rev-parse", "--path-format=absolute", "--git-path", "index.lock"]
         const lookup = await git.run({ repo: repository.repository, args: lookupArgs, timeoutMs: 1_000 })
         const lock = lookup.stdout.trim()
@@ -903,7 +907,7 @@ async function applyRepositories(
         failure = {
           ...failure,
           ...(readable ? { subject: lock } : {}),
-          message: `${failure.message}\n8000ms contention allowance exhausted across the frozen pull; ${readable ? `path=${lock}; ` : ""}${observation}. No lock was removed.`,
+          message: `${failure.message}\n8000ms contention allowance exhausted across the frozen pull; ${exhausted}; ${readable ? `path=${lock}; ` : ""}${observation}. No lock was removed.`,
         }
       }
       results.push(repositoryResult(repository, "failed", failure))

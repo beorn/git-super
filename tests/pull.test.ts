@@ -1696,6 +1696,8 @@ describe("git super pull --ff-only", () => {
         })
       })
       const progress = outputSink()
+      const local = createLocalGitProcess()
+      let childApplyAttempts = 0
       const result = await superPull({
         repo: checkout,
         repository: "origin",
@@ -1703,6 +1705,12 @@ describe("git super pull --ff-only", () => {
         ffOnly: true,
         report: (message) => progress.write(message),
         warn: (message) => progress.write(message),
+        git: {
+          async run(request) {
+            if (request.repo === alpha && request.args.includes("checkout")) childApplyAttempts++
+            return local.run(request)
+          },
+        },
       })
       if (where === "persistent-child") {
         expect(result).toMatchObject({
@@ -1713,6 +1721,9 @@ describe("git super pull --ff-only", () => {
         })
         expect(result.detail?.message).toContain("File exists")
         expect(result.detail?.message).toMatch(/lock age=\d+ms/u)
+        expect(progress.output).toContain(
+          `index-lock-exhausted packages/alpha attempts=${childApplyAttempts} remaining=0ms`,
+        )
         expect(existsSync(marker)).toBe(false)
         expect(await exited).toBe(0)
         return
