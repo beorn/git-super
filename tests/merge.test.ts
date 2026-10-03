@@ -150,6 +150,45 @@ describe("git super merge — excluded admission (27058)", () => {
   })
 
   /**
+   * @failure A declared-private absent child refuses a root-only merge across a criss-cross history whose pins
+   *          are unchanged, because no single merge base can be read (27162).
+   * @level l1
+   * @consumer git-super merge callers replaying a private child across a criss-cross history
+   * @testonly none
+   */
+  it("excludes a declared-private unchanged child across multiple merge bases", async () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-merge-declared-private-crisscross-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const path = "packages/alpha"
+    git(fixture.product, "config", "--file", ".gitmodules", `submodule.${path}.private`, "true")
+    git(fixture.product, "add", ".gitmodules")
+    git(fixture.product, "commit", "-q", "-m", "declare packages/alpha private")
+    const target = candidateWithRootChange(fixture, "declared-private-crisscross-target")
+    const head = git(fixture.product, "rev-parse", "HEAD")
+    git(fixture.product, "submodule", "deinit", "-f", "--", path)
+    const local = createLocalGitProcess()
+    const bases = injectionProbe()
+    const recording: GitProcess = {
+      run(request) {
+        if (request.repo === fixture.product && request.args[0] === "merge-base" && request.args.includes("--all")) {
+          bases.fire("multiple merge bases")
+          return Promise.resolve({ code: 0, stdout: `${head}\n${target}\n`, stderr: "" })
+        }
+        return local.run(request)
+      },
+    }
+    const result = await superMerge({ repo: fixture.product, commit: target, git: recording })
+    bases.expectFired("multiple merge bases")
+    expect(result, JSON.stringify(result.detail)).toMatchObject({
+      state: "updated",
+      partial: false,
+      notCompared: [{ path, reason: "excluded" }],
+    })
+    expect(result.gitlinks).toContainEqual(expect.objectContaining({ path, state: "as-written" }))
+  })
+
+  /**
    * @failure Native merge-tree reads the excluded store before a moved-pin refusal is decided.
    * @level l1
    * @consumer git-super merge admission before native Git composition

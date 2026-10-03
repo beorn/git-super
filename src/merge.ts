@@ -572,20 +572,22 @@ async function mergeObserved(
     const baseArgs = ["merge-base", "--all", head, target]
     const baseResult = await run(git, root, baseArgs, timeoutMs)
     const bases = baseResult.code === 0 ? baseResult.stdout.trim().split(/\r?\n/u).filter(Boolean) : []
-    if (bases.length !== 1) {
+    const targetEntries = await readCommitSubmodules(git, root, target)
+    const targetPins = new Map(targetEntries.map((entry) => [entry.path, entry.target]))
+    // A declared-private child's own history is never compared, so its exclusion needs no merge base: an
+    // identical HEAD/target pin already proves the merge leaves that gitlink alone (27162). Every other
+    // exclusion keeps the single merge base the design requires, so its head, target and base pins all compare.
+    const privatePaths = new Set(declaredPrivateExclusions)
+    const firstComparedPath = excludedSubmodules.find((path) => !privatePaths.has(path))
+    if (firstComparedPath !== undefined && bases.length !== 1) {
       return refuseExcluded(
-        excludedSubmodules[0] ?? "<unknown>",
+        firstComparedPath,
         `HEAD and target have ${bases.length === 0 ? "no readable" : "multiple"} merge bases`,
       )
     }
-    const base = bases[0]
-    if (base === undefined) {
-      return refuseExcluded(excludedSubmodules[0] ?? "<unknown>", "HEAD and target have no readable merge base")
-    }
-    const baseEntries = await readCommitSubmodules(git, root, base)
-    const targetEntries = await readCommitSubmodules(git, root, target)
+    const base = bases.length === 1 ? bases[0] : undefined
+    const baseEntries = base === undefined ? [] : await readCommitSubmodules(git, root, base)
     const basePins = new Map(baseEntries.map((entry) => [entry.path, entry.target]))
-    const targetPins = new Map(targetEntries.map((entry) => [entry.path, entry.target]))
     const stagedPins =
       continuationTree === undefined
         ? undefined
@@ -596,7 +598,10 @@ async function mergeObserved(
       )
       if (coveredByExcludedRoot) continue
       const pin = headPins.get(path)
-      if (pin === undefined || targetPins.get(path) !== pin || basePins.get(path) !== pin) {
+      if (pin === undefined) continue
+      if (privatePaths.has(path)) {
+        if (targetPins.get(path) !== pin) return refuseExcluded(path, "its HEAD and target gitlink pins differ")
+      } else if (targetPins.get(path) !== pin || basePins.get(path) !== pin) {
         return refuseExcluded(path, "its HEAD, target, and merge-base gitlink pins are not identical")
       }
       if (stagedPins !== undefined) {
