@@ -1410,10 +1410,11 @@ while (!existsSync(${JSON.stringify(release)})) {
       if (held) {
         const original = await readFile(altFile, "utf8")
         const objects = objectStoreSnapshot(join(borrowerSubAdmin, "objects"))
-        const writer = await acquireExclusive(join(borrowerSubAdmin, "yrd-worktree-mutations"), {
-          holder: "native borrower writer",
-          timeoutMs: 0,
-        })
+        const writer = await acquireExclusive(
+          join(borrowerSubAdmin, "yrd-worktree-mutations"),
+          { timeoutMs: 0 },
+          "native borrower writer",
+        )
         try {
           await expect(store.remove(lender, { retention: { root: retainedDir, report: () => {} } })).rejects.toThrow(
             /writer (?:lease|lock)/u,
