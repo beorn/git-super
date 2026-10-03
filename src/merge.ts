@@ -544,6 +544,7 @@ async function mergeObserved(
   let admittedExclusions: readonly NotCompared[] = []
   let alreadyContained = false
   if (excludedSubmodules.length > 0) {
+    const privatePaths = new Set(declaredPrivateExclusions)
     const refuseExcluded = (path: string, reason: string): SuperMergeResult =>
       failed(
         root,
@@ -552,7 +553,9 @@ async function mergeObserved(
           "excluded-submodule-unproven",
           `Cannot exclude ${path}: ${reason}`,
           `git -C ${shellQuote(root)} show HEAD:${shellQuote(path)}`,
-          "Only exclude a root gitlink whose pin is identical in HEAD, the target, and their single merge base.",
+          privatePaths.has(path)
+            ? "A declared-private gitlink may be excluded only while its pin is identical in HEAD and the target; a pin this merge would change or introduce belongs to the caller."
+            : "Only exclude a root gitlink whose pin is identical in HEAD, the target, and their single merge base.",
           "the caller",
           { paths: [path], phase: "preflight-excluded-checkouts" },
         ),
@@ -577,7 +580,6 @@ async function mergeObserved(
     // A declared-private child's own history is never compared, so its exclusion needs no merge base: an
     // identical HEAD/target pin already proves the merge leaves that gitlink alone (27162). Every other
     // exclusion keeps the single merge base the design requires, so its head, target and base pins all compare.
-    const privatePaths = new Set(declaredPrivateExclusions)
     const firstComparedPath = excludedSubmodules.find((path) => !privatePaths.has(path))
     if (firstComparedPath !== undefined && bases.length !== 1) {
       return refuseExcluded(
@@ -598,7 +600,14 @@ async function mergeObserved(
       )
       if (coveredByExcludedRoot) continue
       const pin = headPins.get(path)
-      if (pin === undefined) continue
+      if (pin === undefined) {
+        // A declared-private path HEAD does not carry is inert only while the target and the staged
+        // continuation also lack it: a merge that would introduce the gitlink needs the same named refusal (27162).
+        if (targetPins.has(path) || stagedPins?.has(path) === true) {
+          return refuseExcluded(path, "the merge would introduce this gitlink that HEAD does not carry")
+        }
+        continue
+      }
       if (privatePaths.has(path)) {
         if (targetPins.get(path) !== pin) return refuseExcluded(path, "its HEAD and target gitlink pins differ")
       } else if (targetPins.get(path) !== pin || basePins.get(path) !== pin) {

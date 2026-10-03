@@ -189,6 +189,102 @@ describe("git super merge — excluded admission (27058)", () => {
   })
 
   /**
+   * @failure A declared-private path HEAD no longer carries is excluded as-written when the target
+   *          introduces its gitlink, silently materializing the private child (27162).
+   * @level l1
+   * @consumer git-super merge callers whose HEAD dropped a declared-private gitlink
+   * @testonly none; the GitProcess recording is the native access evidence
+   */
+  it("refuses a declared-private gitlink the target would introduce with no child requests", async () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-merge-declared-private-introduced-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const path = "packages/alpha"
+    git(fixture.product, "config", "--file", ".gitmodules", "submodule." + path + ".private", "true")
+    git(fixture.product, "add", ".gitmodules")
+    git(fixture.product, "commit", "-q", "-m", "declare packages/alpha private")
+    const target = git(fixture.product, "rev-parse", "HEAD")
+    git(fixture.product, "switch", "-q", "-c", "declared-private-no-gitlink")
+    git(fixture.product, "submodule", "deinit", "-f", "--", path)
+    git(fixture.product, "update-index", "--force-remove", "--", path)
+    git(fixture.product, "commit", "-q", "-m", "drop the declared-private gitlink from HEAD")
+    const checkout = join(fixture.product, path)
+    const store = git(fixture.product, "rev-parse", "--path-format=absolute", "--git-path", "modules/" + path)
+    const local = createLocalGitProcess()
+    const childRequests: GitProcessRequest[] = []
+    const recording: GitProcess = {
+      run(request) {
+        if ([checkout, store].some((selected) => request.repo === selected || request.repo.startsWith(selected + "/"))) {
+          childRequests.push(request)
+          throw new Error("declared-private child request: " + request.repo)
+        }
+        return local.run(request)
+      },
+    }
+    const result = await superMerge({ repo: fixture.product, commit: target, git: recording })
+    // HEAD declaring a private path without its root gitlink is refused by readCommitSubmodules(head)
+    // before any exclusion decision, so no merge can silently introduce that gitlink (27162).
+    expect(git(fixture.product, "ls-tree", "HEAD", "--", path)).toBe("")
+    expect(git(fixture.product, "ls-tree", target, "--", path)).not.toBe("")
+    expect(result, JSON.stringify(result.detail)).toMatchObject({
+      state: "failed",
+      detail: { code: "missing-target-gitlink", paths: [path] },
+    })
+    expect(JSON.stringify(result.detail)).not.toContain("initialize")
+    expect(childRequests).toEqual([])
+  })
+
+  /**
+   * @failure A declared-private declaration both trees dropped has its private gitlink silently omitted
+   *          instead of refused (27162).
+   * @level l1
+   * @consumer git-super merge callers merging two trees that both dropped the private gitlink
+   * @testonly none; the GitProcess recording is the native access evidence
+   */
+  it("refuses a declared-private declaration both trees dropped without touching the child", async () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-merge-declared-private-inert-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const path = "packages/alpha"
+    git(fixture.product, "config", "--file", ".gitmodules", "submodule." + path + ".private", "true")
+    git(fixture.product, "add", ".gitmodules")
+    git(fixture.product, "commit", "-q", "-m", "declare packages/alpha private")
+    git(fixture.product, "switch", "-q", "-c", "declared-private-both-absent")
+    git(fixture.product, "submodule", "deinit", "-f", "--", path)
+    git(fixture.product, "update-index", "--force-remove", "--", path)
+    git(fixture.product, "commit", "-q", "-m", "drop the declared-private gitlink from HEAD")
+    git(fixture.product, "switch", "-q", "-c", "declared-private-both-absent-target")
+    writeFileSync(join(fixture.product, "target-root.txt"), "target\n")
+    git(fixture.product, "add", "target-root.txt")
+    git(fixture.product, "commit", "-q", "-m", "target root change without the private gitlink")
+    const target = git(fixture.product, "rev-parse", "HEAD")
+    git(fixture.product, "switch", "-q", "declared-private-both-absent")
+    const checkout = join(fixture.product, path)
+    const store = git(fixture.product, "rev-parse", "--path-format=absolute", "--git-path", "modules/" + path)
+    const local = createLocalGitProcess()
+    const childRequests: GitProcessRequest[] = []
+    const recording: GitProcess = {
+      run(request) {
+        if ([checkout, store].some((selected) => request.repo === selected || request.repo.startsWith(selected + "/"))) {
+          childRequests.push(request)
+          throw new Error("declared-private child request: " + request.repo)
+        }
+        return local.run(request)
+      },
+    }
+    const result = await superMerge({ repo: fixture.product, commit: target, git: recording })
+    // Both trees lacking the declared-private gitlink is likewise refused before an exclusion decision,
+    // so the declaration stays inert only as a refusal, never as a silent skip (27162).
+    expect(git(fixture.product, "ls-tree", "HEAD", "--", path)).toBe("")
+    expect(git(fixture.product, "ls-tree", target, "--", path)).toBe("")
+    expect(result, JSON.stringify(result.detail)).toMatchObject({
+      state: "failed",
+      detail: { code: "missing-target-gitlink", paths: [path] },
+    })
+    expect(childRequests).toEqual([])
+  })
+
+  /**
    * @failure Native merge-tree reads the excluded store before a moved-pin refusal is decided.
    * @level l1
    * @consumer git-super merge admission before native Git composition
