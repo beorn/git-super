@@ -5,7 +5,8 @@
  * @reach fs-walk <fixture-only: isolated native Git product and retention directories>
  * @testonly none
  */
-import { spawnSync } from "node:child_process"
+import { spawn, spawnSync } from "node:child_process"
+import { once } from "node:events"
 import { existsSync, readdirSync, readFileSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs"
 import { mkdtemp, rm } from "node:fs/promises"
 import { join } from "node:path"
@@ -18,6 +19,66 @@ import { addNestedAlphaSubmodule, advanceRepository, canonicalTmpdir, createProd
 const roots: string[] = []
 afterEach(async () => {
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true })
+})
+
+it("does not execute configuration changed by another process after preflight", async () => {
+  const root = await mkdtemp(join(canonicalTmpdir(), "git-super-config-race-"))
+  roots.push(root)
+  const fixture = createProductFixture(root)
+  const destination = join(root, "seat")
+  const projected = await GitSuper.projectPrivateGitWorktree({
+    sourceCheckout: fixture.product,
+    commit: fixture.productBase,
+    branch: "task/seat",
+    destination,
+    excludedSubmodules: [],
+  })
+  expect(projected.state, JSON.stringify(projected.detail)).toBe("updated")
+  if (projected.projection === undefined) throw new Error("projection omitted its durable record")
+  const marker = join(root, "helper-executed")
+  const helper = join(root, "helper.ts")
+  writeFileSync(
+    helper,
+    `import { writeFileSync } from "node:fs"; writeFileSync(process.argv[2], "executed"); process.stdout.write("token\\0");`,
+  )
+  const encoded = join(root, "hostile.config")
+  git(root, "config", "--file", encoded, "core.fsmonitor", [process.execPath, helper, marker].map(shellQuote).join(" "))
+  const raced = join(root, "configuration-mutated")
+  const rootGit = join(destination, ".git")
+  const contender = spawn(
+    process.execPath,
+    [
+      "-e",
+      `
+    import { watch, appendFileSync, readFileSync, writeFileSync } from "node:fs";
+    const watcher = watch(process.argv[1], { recursive: true }, (_event, path) => {
+      if (!String(path).includes("yrd-worktree-mutations")) return;
+      watcher.close();
+      appendFileSync(process.argv[2], "\\n" + readFileSync(process.argv[3], "utf8"));
+      writeFileSync(process.argv[4], "mutated after custody started");
+    });
+    process.stdout.write("ready\\n");`,
+      rootGit,
+      join(rootGit, "config"),
+      encoded,
+      raced,
+    ],
+    { stdio: ["ignore", "pipe", "pipe"] },
+  )
+  const ended = once(contender, "exit")
+  try {
+    const [ready] = await once(contender.stdout, "data")
+    expect(String(ready)).toContain("ready")
+    const retained = await GitSuper.retainPrivateGitProjection(projected.projection, join(root, "retained"))
+    await ended
+    expect(existsSync(raced), "the native contender did not reach the custody window").toBe(true)
+    expect(existsSync(marker), "host custody executed configuration changed after preflight").toBe(false)
+    expect(retained.state).toBe("failed")
+    expect(existsSync(destination)).toBe(true)
+  } finally {
+    contender.kill()
+    await ended
+  }
 })
 
 it("refuses seat-configured native Git helpers before host custody can execute them", async () => {
