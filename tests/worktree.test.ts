@@ -4,13 +4,15 @@
  * @consumer Yrd worktree and deployment stores
  * @reach fs-walk <fixture-only: worktree stores and retention checks read isolated mkdtemp Git repositories>
  */
-import { existsSync, readdirSync, readFileSync } from "node:fs"
+import { existsSync, readdirSync, readFileSync, renameSync } from "node:fs"
 import { mkdir, mkdtemp, readFile, readlink, rename, rm, symlink, writeFile } from "node:fs/promises"
 import { spawnSync } from "node:child_process"
 import { tmpdir } from "node:os"
 import { dirname, join, relative } from "node:path"
 import { describe, expect, it, vi } from "vitest"
-import { acquireExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS } from "../src/exclusive.ts"
+import { tryAcquireFlock } from "@bearly/flock"
+import { acquireExclusive, createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS } from "../src/exclusive.ts"
+import { materializeSubmodulesWithProcess } from "../src/submodules.ts"
 import {
   createGitWorktreeStore,
   createLocalGitWorktreeStore,
@@ -26,7 +28,17 @@ import { createLocalGitProcess } from "../src/process.ts"
 
 vi.mock("node:fs", async (importOriginal) => {
   const fs = await importOriginal<typeof import("node:fs")>()
-  return { ...fs, readdirSync: vi.fn(fs.readdirSync), readFileSync: vi.fn(fs.readFileSync) }
+  return {
+    ...fs,
+    readdirSync: vi.fn(fs.readdirSync),
+    readFileSync: vi.fn(fs.readFileSync),
+    renameSync: vi.fn(fs.renameSync),
+  }
+})
+
+vi.mock("@bearly/flock", async (importOriginal) => {
+  const flock = await importOriginal<typeof import("@bearly/flock")>()
+  return { ...flock, tryAcquireFlock: vi.fn(flock.tryAcquireFlock) }
 })
 
 function git(repo: string, args: readonly string[]): string {
@@ -1077,6 +1089,184 @@ describe("createGitWorktreeStore", () => {
     }
   })
 
+  // CTOa6e10f22: the real materializer is a routing writer and must share root mutation custody.
+  // Add/remove lock tests miss this entry, which currently creates child stores while that same lease is held.
+  it("refuses native submodule materialization while the actual root writer lease is held", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-materializer-custody-"))
+    const fixture = createProductFixture(root)
+    const path = join(root, "linked")
+    const store = createGitWorktreeStore({
+      repo: fixture.product,
+      gitProcess: createLocalGitProcess(),
+      timeouts: { mutationLock: 0 },
+    })
+    await store.add({ kind: "detached", path, ref: fixture.productBase })
+    const held = await acquireExclusive(join(fixture.product, ".git", "yrd-worktree-mutations"), { timeoutMs: 0 })
+    try {
+      await expect(store.materializeSubmodules(path)).rejects.toThrow(/worktree mutation lock is busy/u)
+      await expect(
+        materializeSubmodulesWithProcess(createLocalGitProcess(), {
+          worktree: path,
+          referenceWorktree: fixture.product,
+          mutationLockTimeoutMs: 0,
+        }),
+      ).rejects.toThrow(/worktree mutation lock is busy/u)
+      expect(existsSync(join(path, "packages", "alpha", ".git"))).toBe(false)
+      held.release()
+      await createExclusive(join(fixture.product, ".git", "yrd-worktree-mutations"), { timeoutMs: 0 }).run(
+        async (writerLock) => {
+          if (writerLock === undefined) throw new Error("actual writer owner omitted its handle")
+          const result = await materializeSubmodulesWithProcess(createLocalGitProcess(), {
+            worktree: path,
+            referenceWorktree: fixture.product,
+            mutationLockTimeoutMs: 0,
+            writerLock,
+          })
+          expect(result.code, result.stderr).toBe(0)
+          expect(existsSync(join(path, "packages", "alpha", ".git"))).toBe(true)
+          await expect(
+            acquireExclusive(join(fixture.product, ".git", "yrd-worktree-mutations"), { timeoutMs: 0 }),
+          ).rejects.toThrow(/lock is busy/u)
+        },
+      )
+      const next = await acquireExclusive(join(fixture.product, ".git", "yrd-worktree-mutations"), { timeoutMs: 0 })
+      next.release()
+    } finally {
+      held.release()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  /**
+   * @failure Parent materialization rewrites child routing metadata while the child's actual writer lease is held (27143).
+   * @level l1
+   * @consumer Yrd materialization and private projection custody
+   */
+  it("refuses child materialization under an independently held child writer lease", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-child-custody-"))
+    const fixture = createProductFixture(root)
+    const child = join(fixture.product, "packages", "alpha")
+    const childCommon = git(child, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim()
+    const config = await readFile(join(childCommon, "config"))
+    const held = await acquireExclusive(join(childCommon, "yrd-worktree-mutations"), { timeoutMs: 0 })
+    try {
+      await expect(
+        materializeSubmodulesWithProcess(createLocalGitProcess(), {
+          worktree: fixture.product,
+          paths: ["packages/alpha"],
+          mutationLockTimeoutMs: 0,
+        }),
+      ).rejects.toThrow(/worktree mutation lock is busy/u)
+      expect(await readFile(join(childCommon, "config"))).toEqual(config)
+      held.release()
+      const result = await materializeSubmodulesWithProcess(createLocalGitProcess(), {
+        worktree: fixture.product,
+        paths: ["packages/alpha"],
+        mutationLockTimeoutMs: 0,
+      })
+      expect(result.code, result.stderr).toBe(0)
+      const next = await acquireExclusive(join(childCommon, "yrd-worktree-mutations"), { timeoutMs: 0 })
+      next.release()
+    } finally {
+      held.release()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  /**
+   * @failure A sibling's custody refusal releases the parent while another native Git child is alive (27143).
+   * @level l2
+   * @consumer Parallel materialization and private projection lifetime
+   */
+  it("retains parent and child custody through native sibling settlement after another child refuses", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-sibling-settlement-"))
+    const fixture = createProductFixture(root)
+    const alpha = join(fixture.product, "packages/alpha")
+    const beta = join(fixture.product, "vendor/beta")
+    const alphaCommon = git(alpha, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim()
+    const betaCommon = git(beta, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim()
+    const entered = join(root, "entered")
+    const release = join(root, "release")
+    const worker = join(root, "pause.ts")
+    await writeFile(
+      worker,
+      `import { existsSync, writeFileSync } from "node:fs"
+writeFileSync(${JSON.stringify(entered)}, String(process.pid))
+const deadline = Date.now() + 20000
+while (!existsSync(${JSON.stringify(release)})) {
+  if (Date.now() >= deadline) throw new Error("Native sibling was not released")
+  await Bun.sleep(5)
+}
+`,
+    )
+    const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`
+    git(fixture.product, ["config", "submodule.vendor/beta.update", `!${quote(process.execPath)} ${quote(worker)}`])
+    const held = await acquireExclusive(join(alphaCommon, "yrd-worktree-mutations"), { timeoutMs: 0 })
+    const native = createLocalGitProcess()
+    const nativeChildren: Array<ReturnType<typeof native.run>> = []
+    vi.mocked(readFileSync).mockClear()
+    const pending = materializeSubmodulesWithProcess(
+      {
+        async run(request) {
+          if (request.repo === alpha && request.args.includes("--git-common-dir")) {
+            // Schedule the real alpha refusal only after native beta is alive.
+            await vi.waitFor(() => expect(existsSync(entered)).toBe(true), { timeout: 10_000 })
+          }
+          const result = native.run(request)
+          if (request.repo === beta && request.args.includes("git-super-submodule-update")) nativeChildren.push(result)
+          return result
+        },
+      },
+      { worktree: fixture.product, force: true, mutationLockTimeoutMs: 0 },
+    ).then(
+      (result) => result,
+      (error: unknown) => error,
+    )
+    try {
+      try {
+        const alphaLock = join(alphaCommon, "yrd-worktree-mutations", "writer.lock")
+        // The existing diagnostic read occurs only after the real flock acquire failed.
+        await vi.waitFor(
+          () => expect(vi.mocked(readFileSync).mock.calls.some(([path]) => path === alphaLock)).toBe(true),
+          { timeout: 10_000 },
+        )
+        const pid = Number(await readFile(entered, "utf8"))
+        expect(nativeChildren).toHaveLength(1)
+        expect(Number.isSafeInteger(pid) && pid > 0).toBe(true)
+        expect(() => process.kill(pid, 0)).not.toThrow()
+        for (const common of [join(fixture.product, ".git"), betaCommon]) {
+          const contender = await acquireExclusive(join(common, "yrd-worktree-mutations"), { timeoutMs: 0 }).then(
+            (lock) => {
+              lock.release()
+              return "free"
+            },
+            (error: unknown) => {
+              expect(error).toBeInstanceOf(Error)
+              expect((error as Error).message).toContain("lock is busy")
+              return "busy"
+            },
+          )
+          expect(contender).toBe("busy")
+        }
+      } finally {
+        await writeFile(release, "released")
+        await pending
+        // The intentional Promise.all mutant rejects before this native child.
+        await Promise.allSettled(nativeChildren)
+        held.release()
+      }
+      const result = await pending
+      expect(result).toBeInstanceOf(Error)
+      expect((result as Error).message).toContain("lock is busy")
+      for (const common of [join(fixture.product, ".git"), alphaCommon, betaCommon]) {
+        const next = await acquireExclusive(join(common, "yrd-worktree-mutations"), { timeoutMs: 0 })
+        next.release()
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 30_000)
+
   it("checks the heal guards before locking and still takes the lock when repair is required", async () => {
     const repo = await mkdtemp(join(tmpdir(), "git-super-config-heal-lock-"))
     const commonDir = join(repo, ".git")
@@ -1183,7 +1373,9 @@ describe("createGitWorktreeStore", () => {
     }
   })
 
-  it("removes a lender worktree and re-homes borrower alternates cleanly (25908)", async () => {
+  // #27143: the ordinary rehome journey must preserve a borrower whose actual writer owns its store.
+  // The free-writer positive alone cannot detect repack or alternate replacement under another holder.
+  it.each([false, true])("removes a lender only with borrower writer custody; held=%s (25908, 27143)", async (held) => {
     const root = await mkdtemp(join(tmpdir(), "git-super-rehome-"))
     const subRemote = join(root, "sub-remote.git")
     const repo = join(root, "owner")
@@ -1226,12 +1418,83 @@ describe("createGitWorktreeStore", () => {
       const altFile = join(borrowerSubAdmin, "objects", "info", "alternates")
       await writeFile(altFile, `${lenderSubObjects}\n${durableSubObjects}\n`, "utf8")
 
-      await store.remove(lender, {
-        retention: {
-          root: retainedDir,
-          report: () => {},
-        },
+      if (held) {
+        const original = await readFile(altFile, "utf8")
+        const objects = objectStoreSnapshot(join(borrowerSubAdmin, "objects"))
+        const writer = await acquireExclusive(
+          join(borrowerSubAdmin, "yrd-worktree-mutations"),
+          { timeoutMs: 0 },
+          "native borrower writer",
+        )
+        try {
+          await expect(store.remove(lender, { retention: { root: retainedDir, report: () => {} } })).rejects.toThrow(
+            /writer (?:lease|lock)/u,
+          )
+          expect(existsSync(lender)).toBe(true)
+          expect(existsSync(lenderSubAdmin)).toBe(true)
+          expect(await readFile(altFile, "utf8")).toBe(original)
+          expect(objectStoreSnapshot(join(borrowerSubAdmin, "objects"))).toEqual(objects)
+        } finally {
+          writer.release()
+        }
+        return
+      }
+
+      const nativeRename = (await vi.importActual<typeof import("node:fs")>("node:fs")).renameSync
+      const writerPath = join(borrowerSubAdmin, "yrd-worktree-mutations", "writer.lock")
+      let observedCustody = false
+      const renaming = vi.mocked(renameSync).mockImplementation((from, to) => {
+        if (to === altFile) {
+          const contender = tryAcquireFlock(writerPath)
+          try {
+            expect(contender, "borrower custody released before alternate replacement").toBeNull()
+            observedCustody = true
+          } finally {
+            contender?.release()
+          }
+        }
+        return nativeRename(from, to)
       })
+      // #27143 requires one canonical order across enclosing lender and borrower custody.
+      // Delegate actual kernel acquisition and track only handles that remain held;
+      // removal's released preliminary probes are therefore not mistaken for nesting.
+      const nativeAcquire = (await vi.importActual<typeof import("@bearly/flock")>("@bearly/flock")).tryAcquireFlock
+      const heldOwners = new Set<string>()
+      const orderViolations: Array<{ held: string[]; next: string }> = []
+      const acquiring = vi.mocked(tryAcquireFlock).mockImplementation((path, options) => {
+        const handle = nativeAcquire(path, options)
+        if (handle === null) return null
+        const owner = dirname(dirname(path))
+        const enclosing = [...heldOwners]
+        if (enclosing.some((prior) => prior > owner)) orderViolations.push({ held: enclosing, next: owner })
+        heldOwners.add(owner)
+        const release = () => {
+          handle.release()
+          heldOwners.delete(owner)
+        }
+        return {
+          ...handle,
+          get held() {
+            return handle.held
+          },
+          release,
+          [Symbol.dispose]: release,
+        }
+      })
+      try {
+        await store.remove(lender, { retention: { root: retainedDir, report: () => {} } })
+      } finally {
+        acquiring.mockRestore()
+        renaming.mockRestore()
+      }
+      expect(heldOwners.size, "native owner custody leaked after removal").toBe(0)
+      expect(observedCustody).toBe(true)
+      const released = tryAcquireFlock(writerPath)
+      try {
+        expect(released, "borrower custody remained held after removal settled").not.toBeNull()
+      } finally {
+        released?.release()
+      }
       expect(existsSync(lender)).toBe(false)
 
       const altContent = await readFile(altFile, "utf8")
@@ -1241,6 +1504,7 @@ describe("createGitWorktreeStore", () => {
       const fsck = spawnSync("git", ["-C", borrowerSub, "fsck", "--full"], { encoding: "utf8" })
       expect(fsck.status).toBe(0)
       expect(fsck.stderr).toBe("")
+      expect(orderViolations, "borrower acquisition reverses canonical order beneath held lender custody").toEqual([])
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -1334,6 +1598,7 @@ describe("createGitWorktreeStore", () => {
       const lenderModules = join(root, "lender/modules")
       const borrowerModules = join(root, "worktrees/borrower/modules/sub/objects/info")
       const { mkdir } = await import("node:fs/promises")
+      git(root, ["init", "--bare", "-q", dirname(dirname(borrowerModules))])
       await mkdir(borrowerModules, { recursive: true })
       await mkdir(lenderModules, { recursive: true })
       await writeFile(join(borrowerModules, "alternates"), `${join(lenderModules, "sub/objects")}\n`, "utf8")
@@ -1348,7 +1613,7 @@ describe("createGitWorktreeStore", () => {
         stderr: "",
       })) as unknown as typeof spawnSync
 
-      expect(() => rehomeBorrowers(root, join(root, "lender"), lenderModules, { spawn: fakeSpawn })).toThrow(
+      await expect(rehomeBorrowers(root, join(root, "lender"), lenderModules, { spawn: fakeSpawn })).rejects.toThrow(
         /timed out after 120s bound/,
       )
     } finally {

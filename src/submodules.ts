@@ -3,7 +3,7 @@ import { alternateEntries, alternatesLineage } from "./alternates.ts"
 import { setTimeout as delay } from "node:timers/promises"
 import { existsSync, realpathSync } from "node:fs"
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises"
-import { dirname, join, relative, resolve } from "node:path"
+import { dirname, isAbsolute, join, relative, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { createLogger, type ConditionalLogger, type LogLevel } from "loggily"
 import { cleanGitRepositoryEnvironment, validateExcludedSubmodules } from "./git.ts"
@@ -14,6 +14,7 @@ import { shellQuote } from "./shell-command.ts"
 import { nestedStoreMissingDetail, preparedPinFetchArgs, preparedSubmoduleStore } from "./submodule-prepare.ts"
 import { resolveSubmoduleOrigin } from "./submodule-origin.ts"
 import { readCommitSubmodules, type CommitSubmodule, type SelectedCommitSubmodules } from "./commit-graph.ts"
+import { createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS, type WriterLock } from "./exclusive.ts"
 
 export const SUBMODULE_ALTERNATE_LOCATION = "superproject"
 export const SUBMODULE_ALTERNATE_ERROR_STRATEGY = "info"
@@ -61,6 +62,9 @@ export type SubmoduleMaterializationResult = SubmoduleGitResult &
 
 export type SubmoduleMaterializationOptions = Readonly<{
   worktree: string
+  /** Actual live root custody issued by the existing flock owner, when a parent operation already holds it. */
+  writerLock?: WriterLock
+  mutationLockTimeoutMs?: number
   referenceWorktree?: string
   force?: boolean
   /** Restrict only the top-level pass; nested submodules still recurse. */
@@ -604,14 +608,43 @@ export async function syncOriginTrackingRefs(
 export async function materializeSubmodules(
   git: SubmoduleGit,
   options: SubmoduleMaterializationOptions,
+  privateProjection?: Parameters<typeof materializeSubmodulesUnderLock>[2],
+): Promise<SubmoduleMaterializationResult> {
+  validateExcludedSubmodules(options.excludedSubmodules)
+  if (privateProjection?.prepareCommit !== undefined) {
+    return materializeSubmodulesUnderLock(git, options, privateProjection)
+  }
+  const discovered = await git.run(options.worktree, ["rev-parse", "--path-format=absolute", "--git-common-dir"], true)
+  if (discovered.code !== 0 || discovered.timedOut || discovered.failure !== undefined) {
+    throw new Error(`cannot establish materializer writer owner for ${options.worktree}: ${discovered.stderr}`)
+  }
+  const common = discovered.stdout.trim()
+  if (!isAbsolute(common)) throw new Error(`materializer returned no absolute common directory for ${options.worktree}`)
+  return createExclusive(join(common, "yrd-worktree-mutations"), {
+    timeoutMs: options.mutationLockTimeoutMs ?? DEFAULT_MUTATION_LOCK_WAIT_MS,
+  }).run(() => materializeSubmodulesUnderLock(git, options, privateProjection), {
+    holder: `materialize submodules ${options.worktree}`,
+    ...(options.writerLock === undefined ? {} : { held: options.writerLock }),
+  })
+}
+
+async function materializeSubmodulesUnderLock(
+  git: SubmoduleGit,
+  options: SubmoduleMaterializationOptions,
   privateProjection?: Readonly<{
+    /** Trusted read-only preparation uses the same selection walk before private construction. */
+    prepareCommit?: string
     validate(
       worktree: string,
       head: string,
       excluded: readonly string[],
       metadata: SelectedCommitSubmodules,
     ): Promise<void>
-    materialize(parent: string, entry: CommitSubmodule): Promise<void>
+    materialize(
+      parent: string,
+      entry: CommitSubmodule,
+      descend: () => Promise<SubmoduleGitResult>,
+    ): Promise<SubmoduleGitResult>
   }>,
 ): Promise<SubmoduleMaterializationResult> {
   validateExcludedSubmodules(options.excludedSubmodules)
@@ -721,12 +754,18 @@ export async function materializeSubmodules(
     preparedReference = false,
     parentIdentity?: Readonly<{ commit: string; remote: string }>,
     logicalPath = "",
+    frozenHead?: string,
   ): Promise<SubmoduleGitResult> => {
-    const policy = await configureSubmoduleAlternatePolicy(git, worktree)
-    if (policy.code !== 0) return policy
+    if (privateProjection?.prepareCommit === undefined) {
+      const policy = await configureSubmoduleAlternatePolicy(git, worktree)
+      if (policy.code !== 0) return policy
+    }
 
     const source = depth === 0 ? (options.source ?? "head") : "head"
-    const headResult = await git.run(worktree, ["rev-parse", "--verify", "HEAD"], true)
+    const headResult =
+      frozenHead === undefined
+        ? await git.run(worktree, ["rev-parse", "--verify", "HEAD"], true)
+        : { code: 0, stdout: frozenHead, stderr: "" }
     if (headResult.code !== 0 || headResult.timedOut || headResult.failure !== undefined) return headResult
     const head = headResult.stdout.trim()
     if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(head)) {
@@ -778,6 +817,25 @@ export async function materializeSubmodules(
       }
     }
     const selectedPins = new Map(entries.map(({ path, target }) => [path, target]))
+    if (privateProjection?.prepareCommit !== undefined) {
+      for (const entry of entries) {
+        const nested = await privateProjection.materialize(worktree, entry, () =>
+          walk(
+            join(worktree, entry.path),
+            undefined,
+            durableLevel,
+            undefined,
+            depth + 1,
+            false,
+            undefined,
+            "",
+            entry.target,
+          ),
+        )
+        if (nested.code !== 0) return nested
+      }
+      return success()
+    }
     for (const evidence of metadata.selectedPaths) {
       // A selector beneath an included gitlink belongs to that child's existing walk.
       if (entries.some((entry) => evidence.path.startsWith(`${entry.path}/`))) continue
@@ -841,10 +899,11 @@ export async function materializeSubmodules(
     if (entries.length === 0) return success()
     if (privateProjection !== undefined) {
       for (const entry of entries) {
-        await privateProjection.materialize(worktree, entry)
+        const nested = await privateProjection.materialize(worktree, entry, () =>
+          walk(join(worktree, entry.path), undefined, durableLevel, undefined, depth + 1),
+        )
         considered += 1
         borrowed += 1
-        const nested = await walk(join(worktree, entry.path), undefined, durableLevel, undefined, depth + 1)
         if (nested.code !== 0) return nested
       }
       return success()
@@ -1397,150 +1456,198 @@ export async function materializeSubmodules(
       const freshClone = !existsSync(join(submoduleDir, ".git"))
       const level = await durableLevel()
       if (typeof level !== "string") return level
-      // The span closes over the `git.run` ALONE. Letting it wrap the recursive
-      // walk below would bill every nested submodule to its parent, so the one
-      // submodule at the root of a deep tree would appear to be the slow one
-      // and the actually-slow leaf would never show up in the ranking.
-      const updated = await (async () => {
-        using updateSpan = log?.span?.("update", { path, source })
-        // Run the standard creator directly through this process owner. Native
-        // submodule--helper clears the object context on its clone child.
-        let result: SubmoduleGitResult = success()
-        if (freshClone) {
-          try {
-            validateExcludedSubmodules([name])
-          } catch {
-            return {
-              code: 1,
-              stdout: "",
-              stderr: `unsafe submodule name ${JSON.stringify(name)} in ${worktree}; use a normalized module store name before materialization`,
-            }
+      let moduleDir: string | undefined
+      let initialized = false
+      if (freshClone) {
+        try {
+          validateExcludedSubmodules([name])
+        } catch {
+          return {
+            code: 1,
+            stdout: "",
+            stderr: `unsafe submodule name ${JSON.stringify(name)} in ${worktree}; use a normalized module store name before materialization`,
           }
-          const parentDir = await git.run(worktree, ["rev-parse", "--absolute-git-dir"], true)
-          if (parentDir.code !== 0 || parentDir.stdout.trim() === "") {
-            return {
-              ...parentDir,
-              code: parentDir.code || 1,
-              stderr: `cannot resolve module metadata in ${worktree}; preserve its checkout before materialization\n${parentDir.stderr}`,
-            }
+        }
+        const parentDir = await git.run(worktree, ["rev-parse", "--absolute-git-dir"], true)
+        if (parentDir.code !== 0 || parentDir.stdout.trim() === "") {
+          return {
+            ...parentDir,
+            code: parentDir.code || 1,
+            stderr: `cannot resolve module metadata in ${worktree}; preserve its checkout before materialization\n${parentDir.stderr}`,
           }
-          const moduleDir = join(parentDir.stdout.trim(), "modules", name)
-          if (existsSync(moduleDir)) {
-            await mkdir(submoduleDir, { recursive: true })
-            await writeFile(
-              join(submoduleDir, ".git"),
-              `gitdir: ${relative(submoduleDir, moduleDir).split("\\").join("/")}\n`,
-            )
-            result = await git.run(
-              submoduleDir,
-              ["config", "--local", "core.worktree", relative(moduleDir, submoduleDir)],
-              true,
-            )
-          } else {
-            await mkdir(dirname(moduleDir), { recursive: true })
-            // Native clone's --reference writes into GIT_OBJECT_DIRECTORY.
-            // Initialize normal metadata and apply the existing physical
-            // borrowing policy to that metadata, never to the selected store.
-            result = await git.run(worktree, ["init", "--quiet", "--separate-git-dir", moduleDir, submoduleDir], true)
-            if (result.code !== 0) return result
-            for (const config of [
-              ["remote.origin.url", remote],
-              ["remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"],
-            ]) {
-              result = await git.run(submoduleDir, ["config", "--local", ...config], true)
-              if (result.code !== 0) return result
-            }
-            if (nestedReference === undefined) {
-              // Populate the configured origin head refspec just as clone does;
-              // a later SHA-only fetch fills FETCH_HEAD, not tracking refs.
-              result = await git.run(submoduleDir, ["fetch", "origin"], true)
-              if (result.code !== 0) return result
-            }
-            if (nestedReference !== undefined) {
-              const referenceDir = await git.run(
-                nestedReference,
-                ["rev-parse", "--path-format=absolute", "--git-common-dir"],
-                true,
-              )
-              if (referenceDir.code !== 0 || referenceDir.stdout.trim() === "") {
-                return {
-                  ...referenceDir,
-                  code: referenceDir.code || 1,
-                  stderr: `cannot resolve reference metadata in ${nestedReference}\n${referenceDir.stderr}`,
+        }
+        moduleDir = join(parentDir.stdout.trim(), "modules", name)
+        if (!existsSync(moduleDir)) {
+          // The parent lease owns creating its absent child. Do not create a
+          // lease directory that would make an uninitialized store look present.
+          await mkdir(dirname(moduleDir), { recursive: true })
+          const created = await git.run(
+            worktree,
+            ["init", "--quiet", "--separate-git-dir", moduleDir, submoduleDir],
+            true,
+          )
+          if (created.code !== 0) return created
+          initialized = true
+        }
+      }
+      const owner = await git.run(
+        moduleDir ?? submoduleDir,
+        ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        true,
+      )
+      const childCommon = owner.stdout.trim()
+      if (owner.code !== 0 || owner.timedOut || owner.failure !== undefined || !isAbsolute(childCommon)) {
+        return {
+          ...owner,
+          code: owner.code || 1,
+          stderr: `cannot establish child materializer writer owner for ${submoduleDir}\n${owner.stderr}`,
+        }
+      }
+      return createExclusive(join(childCommon, "yrd-worktree-mutations"), {
+        timeoutMs: options.mutationLockTimeoutMs ?? DEFAULT_MUTATION_LOCK_WAIT_MS,
+      }).run(
+        async () => {
+          // The span closes over the `git.run` ALONE. Letting it wrap the recursive
+          // walk below would bill every nested submodule to its parent, so the one
+          // submodule at the root of a deep tree would appear to be the slow one
+          // and the actually-slow leaf would never show up in the ranking.
+          const updated = await (async () => {
+            using updateSpan = log?.span?.("update", { path, source })
+            // Run the standard creator directly through this process owner. Native
+            // submodule--helper clears the object context on its clone child.
+            let result: SubmoduleGitResult = success()
+            if (freshClone) {
+              if (moduleDir === undefined) {
+                throw new Error(`fresh child ${submoduleDir} has no selected module directory`)
+              }
+              if (!initialized) {
+                await mkdir(submoduleDir, { recursive: true })
+                await writeFile(
+                  join(submoduleDir, ".git"),
+                  `gitdir: ${relative(submoduleDir, moduleDir).split("\\").join("/")}\n`,
+                )
+                result = await git.run(
+                  submoduleDir,
+                  ["config", "--local", "core.worktree", relative(moduleDir, submoduleDir)],
+                  true,
+                )
+              } else {
+                // Native clone's --reference writes into GIT_OBJECT_DIRECTORY.
+                // Initialize normal metadata and apply the existing physical
+                // borrowing policy to that metadata, never to the selected store.
+                for (const config of [
+                  ["remote.origin.url", remote],
+                  ["remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"],
+                ]) {
+                  result = await git.run(submoduleDir, ["config", "--local", ...config], true)
+                  if (result.code !== 0) return result
+                }
+                if (nestedReference === undefined) {
+                  // Populate the configured origin head refspec just as clone does;
+                  // a later SHA-only fetch fills FETCH_HEAD, not tracking refs.
+                  result = await git.run(submoduleDir, ["fetch", "origin"], true)
+                  if (result.code !== 0) return result
+                }
+                if (nestedReference !== undefined) {
+                  const referenceDir = await git.run(
+                    nestedReference,
+                    ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                    true,
+                  )
+                  if (referenceDir.code !== 0 || referenceDir.stdout.trim() === "") {
+                    return {
+                      ...referenceDir,
+                      code: referenceDir.code || 1,
+                      stderr: `cannot resolve reference metadata in ${nestedReference}\n${referenceDir.stderr}`,
+                    }
+                  }
+                  result = await anchorDurableAlternates(git, submoduleDir, referenceDir.stdout.trim(), log)
+                  if (result.code !== 0) return result
+                  const heads = await git.run(
+                    nestedReference,
+                    ["for-each-ref", "--format=%(objectname) %(refname)", "refs/heads"],
+                    true,
+                  )
+                  if (heads.code !== 0) return heads
+                  const updates = heads.stdout
+                    .trim()
+                    .split("\n")
+                    .filter(Boolean)
+                    .map((line) => {
+                      const [oid, ref] = line.split(" ")
+                      return `update refs/remotes/origin/${ref?.slice("refs/heads/".length)} ${oid}\n`
+                    })
+                    .join("")
+                  if (updates !== "") {
+                    result = await git.run(submoduleDir, ["update-ref", "--stdin"], true, { stdin: updates })
+                  }
                 }
               }
-              result = await anchorDurableAlternates(git, submoduleDir, referenceDir.stdout.trim(), log)
               if (result.code !== 0) return result
-              const heads = await git.run(
-                nestedReference,
-                ["for-each-ref", "--format=%(objectname) %(refname)", "refs/heads"],
-                true,
-              )
-              if (heads.code !== 0) return heads
-              const updates = heads.stdout
-                .trim()
-                .split("\n")
-                .filter(Boolean)
-                .map((line) => {
-                  const [oid, ref] = line.split(" ")
-                  return `update refs/remotes/origin/${ref?.slice("refs/heads/".length)} ${oid}\n`
-                })
-                .join("")
-              if (updates !== "") {
-                result = await git.run(submoduleDir, ["update-ref", "--stdin"], true, { stdin: updates })
+            }
+            if (!isLocal) {
+              const present = await git.run(submoduleDir, ["cat-file", "-e", `${required}^{commit}`], true)
+              if (present.code !== 0) {
+                result = await git.run(submoduleDir, ["fetch", "origin", required], true)
+                if (result.code !== 0) return result
               }
             }
+            const current = await git.run(submoduleDir, ["rev-parse", "--verify", "HEAD"], true)
+            if (freshClone || options.force || current.code !== 0 || current.stdout.trim() !== required) {
+              const args =
+                (freshClone && !policy.startsWith("!")) || policy === "checkout"
+                  ? ["checkout", "--quiet", "--detach", ...(options.force ? ["--force"] : []), required]
+                  : policy.startsWith("!")
+                    ? ["-c", `alias.git-super-submodule-update=${policy}`, "git-super-submodule-update", required]
+                    : [policy, required]
+              result = await git.run(submoduleDir, args, true)
+            }
+            if (updateSpan !== undefined) {
+              Object.assign(updateSpan.spanData, { outcome: result.code === 0 ? "ok" : "failed" })
+            }
+            return result
+          })()
+          if (updated.code !== 0) {
+            return {
+              ...updated,
+              stderr: `submodule '${logicalPath === "" ? path : `${logicalPath}/${path}`}' at ${required}: materialization failed\n${updated.stderr}`,
+            }
           }
-          if (result.code !== 0) return result
-        }
-        if (!isLocal) {
-          const present = await git.run(submoduleDir, ["cat-file", "-e", `${required}^{commit}`], true)
-          if (present.code !== 0) {
-            result = await git.run(submoduleDir, ["fetch", "origin", required], true)
-            if (result.code !== 0) return result
+          if (freshClone && nestedReference !== undefined) {
+            const synced = await syncOriginTrackingRefs(git, submoduleDir, nestedReference, log)
+            if (synced.code !== 0) return synced
           }
-        }
-        const current = await git.run(submoduleDir, ["rev-parse", "--verify", "HEAD"], true)
-        if (freshClone || options.force || current.code !== 0 || current.stdout.trim() !== required) {
-          const args =
-            (freshClone && !policy.startsWith("!")) || policy === "checkout"
-              ? ["checkout", "--quiet", "--detach", ...(options.force ? ["--force"] : []), required]
-              : policy.startsWith("!")
-                ? ["-c", `alias.git-super-submodule-update=${policy}`, "git-super-submodule-update", required]
-                : [policy, required]
-          result = await git.run(submoduleDir, args, true)
-        }
-        if (updateSpan !== undefined) {
-          Object.assign(updateSpan.spanData, { outcome: result.code === 0 ? "ok" : "failed" })
-        }
-        return result
-      })()
-      if (updated.code !== 0) {
-        return {
-          ...updated,
-          stderr: `submodule '${logicalPath === "" ? path : `${logicalPath}/${path}`}' at ${required}: materialization failed\n${updated.stderr}`,
-        }
-      }
-      if (freshClone && nestedReference !== undefined) {
-        const synced = await syncOriginTrackingRefs(git, submoduleDir, nestedReference, log)
-        if (synced.code !== 0) return synced
-      }
-      const durableGitDir = join(level, "modules", name)
-      const anchored = await anchorDurableAlternates(git, submoduleDir, durableGitDir, log)
-      if (anchored.code !== 0) return anchored
-      return walk(
-        submoduleDir,
-        nestedReference,
-        () => Promise.resolve(durableGitDir),
-        undefined,
-        depth + 1,
-        referenceIsPrepared,
-        { commit: required, remote },
-        logicalPath === "" ? path : `${logicalPath}/${path}`,
+          const durableGitDir = join(level, "modules", name)
+          const anchored = await anchorDurableAlternates(git, submoduleDir, durableGitDir, log)
+          if (anchored.code !== 0) return anchored
+          return walk(
+            submoduleDir,
+            nestedReference,
+            () => Promise.resolve(durableGitDir),
+            undefined,
+            depth + 1,
+            referenceIsPrepared,
+            { commit: required, remote },
+            logicalPath === "" ? path : `${logicalPath}/${path}`,
+          )
+        },
+        { holder: `materialize child ${submoduleDir}` },
       )
     }
     for (let start = 0; start < local.length; start += MAX_CONCURRENT_SUBMODULE_UPDATES) {
-      const results = await Promise.all(local.slice(start, start + MAX_CONCURRENT_SUBMODULE_UPDATES).map(update))
+      // A thrown custody refusal must not release the parent while a sibling
+      // writer or its Git child is still running under that parent.
+      const settled = await Promise.allSettled(local.slice(start, start + MAX_CONCURRENT_SUBMODULE_UPDATES).map(update))
+      const rejected = settled.filter((result) => result.status === "rejected")
+      const firstRejection = rejected[0]
+      if (rejected.length === 1 && firstRejection !== undefined) throw firstRejection.reason
+      if (rejected.length > 1) {
+        throw new AggregateError(
+          rejected.map((result) => result.reason as unknown),
+          `child materialization failed in ${worktree}`,
+        )
+      }
+      const results = settled.flatMap((result) => (result.status === "fulfilled" ? [result.value] : []))
       const failed = results.find((result) => result.code !== 0)
       if (failed !== undefined) return failed
     }
@@ -1555,7 +1662,17 @@ export async function materializeSubmodules(
 
   const selectedPaths = options.paths === undefined ? undefined : new Set(options.paths)
   using span = log?.span?.("materialize", { worktree: options.worktree, reference: referenceRoot })
-  const result = await walk(options.worktree, referenceRoot, resolveDurableRoot, selectedPaths)
+  const result = await walk(
+    options.worktree,
+    referenceRoot,
+    resolveDurableRoot,
+    selectedPaths,
+    0,
+    false,
+    undefined,
+    "",
+    privateProjection?.prepareCommit,
+  )
   // ONE record carrying the totals AND what they are totals of. The counters
   // existed before this and were printed into a log with no reader; a reader
   // that gets `remoteFallbacks: 16` still cannot tell a broken reference store
@@ -1806,6 +1923,8 @@ export async function materializeSubmodulesFromLocalWorktreeParallel(
   }
   const result = await materializeSubmodules(git, {
     worktree: options.worktree,
+    ...(options.writerLock === undefined ? {} : { writerLock: options.writerLock }),
+    ...(options.mutationLockTimeoutMs === undefined ? {} : { mutationLockTimeoutMs: options.mutationLockTimeoutMs }),
     ...(referenceWorktree === undefined ? {} : { referenceWorktree }),
     ...(options.paths === undefined ? {} : { paths: options.paths }),
     ...(options.excludedSubmodules === undefined ? {} : { excludedSubmodules: options.excludedSubmodules }),

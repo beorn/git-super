@@ -13,6 +13,7 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -20,8 +21,10 @@ import {
   writeFileSync,
 } from "node:fs"
 import { mkdtemp, rm } from "node:fs/promises"
-import { join } from "node:path"
+import * as filesystem from "node:fs/promises"
+import { dirname, join } from "node:path"
 import { afterEach, expect, it, vi } from "vitest"
+import { tryAcquireFlock } from "@bearly/flock"
 import * as GitSuper from "../src/index.ts"
 import { createExclusive } from "../src/exclusive.ts"
 import { cleanGitEnvironment, withGitEnvironment } from "../src/git.ts"
@@ -30,6 +33,16 @@ import { createGit, createGitWorktreeStore } from "../src/worktree.ts"
 import { acquireRemovalWriterLeases, retainWorktreeModules } from "../src/worktree-removal.ts"
 import { shellQuote } from "../src/shell-command.ts"
 import { addNestedAlphaSubmodule, advanceRepository, canonicalTmpdir, createProductFixture, git } from "./fixture.ts"
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const fs = await importOriginal<typeof import("node:fs/promises")>()
+  return { ...fs, open: vi.fn(fs.open), readFile: vi.fn(fs.readFile) }
+})
+
+vi.mock("@bearly/flock", async (importOriginal) => {
+  const flock = await importOriginal<typeof import("@bearly/flock")>()
+  return { ...flock, tryAcquireFlock: vi.fn(flock.tryAcquireFlock) }
+})
 
 const roots: string[] = []
 // Binding-only fixture: sandbox stop truth is proved separately by its native lifecycle tests.
@@ -46,6 +59,456 @@ function certificateFor(projection: GitSuper.PrivateGitProjection): GitSuper.Pri
 }
 afterEach(async () => {
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true })
+})
+
+// CTOa6e10f22: only lstat-proven absence permits standalone metadata.
+// Existing creator fixtures have no commondir fault, so ENOENT from a dangling link reached Git unnoticed.
+it.each([
+  "absent",
+  "regular pointer",
+  "dangling symlink",
+  "live symlink",
+  "directory",
+  "empty",
+  "multiline",
+  "missing target",
+  "unreadable",
+] as const)("checks commondir entry before projection Git: %s", async (entry) => {
+  const root = await mkdtemp(join(canonicalTmpdir(), "git-super-commondir-entry-"))
+  roots.push(root)
+  const fixture = createProductFixture(root)
+  const common = join(fixture.product, ".git", "commondir")
+  const head = readFileSync(join(fixture.product, ".git", "refs", "heads", "main"), "utf8")
+  if (entry === "dangling symlink") symlinkSync(join(root, "missing"), common)
+  if (entry === "live symlink") {
+    const target = join(root, "pointer")
+    writeFileSync(target, ".\n")
+    symlinkSync(target, common)
+  }
+  if (entry === "directory") mkdirSync(common)
+  if (entry === "regular pointer") writeFileSync(common, ".\n")
+  if (entry === "empty") writeFileSync(common, "\n")
+  if (entry === "multiline") writeFileSync(common, ".\nother\n")
+  if (entry === "missing target") writeFileSync(common, "../../missing\n")
+  if (entry === "unreadable") {
+    writeFileSync(common, ".\n")
+    chmodSync(common, 0)
+  }
+  const transport = createLocalGitProcess()
+  const run = vi.fn(transport.run.bind(transport))
+  const destination = join(root, "seat")
+  const result = await GitSuper.projectPrivateGitWorktree({
+    sourceCheckout: fixture.product,
+    commit: fixture.productBase,
+    branch: "task/seat",
+    destination,
+    excludedSubmodules: [],
+    git: { run },
+  })
+  if (entry === "absent" || entry === "regular pointer") {
+    expect(result.state, JSON.stringify(result.detail)).toBe("updated")
+    expect(run.mock.calls.length).toBeGreaterThan(0)
+  } else {
+    expect(result.state, JSON.stringify(result.detail)).toBe("failed")
+    expect(run).not.toHaveBeenCalled()
+    expect(result.detail?.message).toContain(common)
+    expect(existsSync(destination)).toBe(false)
+  }
+  expect(readFileSync(join(fixture.product, ".git", "refs", "heads", "main"), "utf8")).toBe(head)
+})
+
+// CTOa6e10f22: every included child must prove metadata before its first selection Git command.
+// Root-only preflight faults and valid recursive custody fixtures miss bad descendant metadata.
+it.each([
+  [false, "git pointer"],
+  [true, "git pointer"],
+  [false, "commondir"],
+  [true, "commondir"],
+  [false, "unknown lender"],
+  [true, "unknown lender"],
+] as const)("refuses child metadata before selection Git: nested=%s; fault=%s", async (nested, fault) => {
+  const root = await mkdtemp(join(canonicalTmpdir(), "git-super-child-preflight-"))
+  roots.push(root)
+  const fixture = addNestedAlphaSubmodule(createProductFixture(root))
+  const child = join(fixture.product, "packages/alpha", ...(nested ? ["apps/maddoc"] : []))
+  const childGit = git(child, "rev-parse", "--absolute-git-dir")
+  const rootRefs = git(fixture.product, "for-each-ref", "--format=%(refname) %(objectname)")
+  const childRefs = git(child, "for-each-ref", "--format=%(refname) %(objectname)")
+  let invalid: string
+  if (fault === "git pointer") {
+    invalid = join(child, ".git")
+    const pointer = readFileSync(invalid, "utf8")
+    const replacement = join(root, "redirected-child-pointer")
+    writeFileSync(replacement, pointer)
+    unlinkSync(invalid)
+    symlinkSync(replacement, invalid)
+  } else if (fault === "commondir") {
+    invalid = join(childGit, "commondir")
+    symlinkSync(join(root, "absent-common"), invalid)
+  } else {
+    invalid = join(fixture.alpha, ".git/objects")
+    writeFileSync(join(childGit, "objects/info/alternates"), `${invalid}\n`)
+  }
+  const transport = createLocalGitProcess()
+  const run = vi.fn(transport.run.bind(transport))
+  const destination = join(root, "seat")
+  const result = await GitSuper.projectPrivateGitWorktree({
+    sourceCheckout: fixture.product,
+    commit: fixture.productWithNestedBase,
+    branch: "task/seat",
+    destination,
+    excludedSubmodules: [],
+    git: { run },
+  })
+  expect(result.state, JSON.stringify(result.detail)).toBe("failed")
+  expect(
+    run.mock.calls.filter(([request]) => request.repo === child),
+    "invalid child reached selection Git",
+  ).toEqual([])
+  expect(result.detail?.message).toContain(invalid)
+  expect(run.mock.calls.filter(([request]) => request.repo.startsWith(destination))).toEqual([])
+  expect(existsSync(destination)).toBe(false)
+  expect(git(fixture.product, "for-each-ref", "--format=%(refname) %(objectname)")).toBe(rootRefs)
+  // Remove the fixture's invalid pointer so Git can inspect the unchanged native ref inventory.
+  if (fault === "commondir") unlinkSync(invalid)
+  expect(git(fixture.product, "--git-dir", childGit, "for-each-ref", "--format=%(refname) %(objectname)")).toBe(
+    childRefs,
+  )
+})
+
+// CTOa6e10f22: custody must bind inspected entries, even when replacement resolves to the same paths.
+// Read-boundary mutation cases miss replacement between trusted preparation and owner acquisition.
+it.each(["commondir", "alternates"] as const)(
+  "refuses same-byte metadata replacement during owner acquisition: %s",
+  async (kind) => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-prepared-identity-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const pointer = join(fixture.product, ".git", kind === "commondir" ? "commondir" : "objects/info/alternates")
+    writeFileSync(pointer, kind === "commondir" ? ".\n" : "")
+    const bytes = readFileSync(pointer)
+    const replacement = join(root, "replacement")
+    writeFileSync(replacement, bytes)
+    const inspected = statSync(pointer)
+    const refs = git(fixture.product, "for-each-ref", "--format=%(refname) %(objectname)")
+    const flock = await vi.importActual<typeof import("@bearly/flock")>("@bearly/flock")
+    let changed = false
+    const acquiring = vi.mocked(tryAcquireFlock).mockImplementation((path, options) => {
+      const lease = flock.tryAcquireFlock(path, options)
+      if (lease !== null && !changed) {
+        try {
+          renameSync(replacement, pointer)
+          changed = true
+        } catch (error) {
+          lease.release()
+          throw error
+        }
+      }
+      return lease
+    })
+    const transport = createLocalGitProcess()
+    const afterReplacement: string[][] = []
+    const destination = join(root, "seat")
+    try {
+      const result = await GitSuper.projectPrivateGitWorktree({
+        sourceCheckout: fixture.product,
+        commit: fixture.productBase,
+        branch: "task/seat",
+        destination,
+        excludedSubmodules: [],
+        git: {
+          run: (request) => {
+            if (changed) afterReplacement.push([...request.args])
+            return transport.run(request)
+          },
+        },
+      })
+      expect(changed, "replacement did not occur at native owner acquisition").toBe(true)
+      expect(readFileSync(pointer)).toEqual(bytes)
+      expect(statSync(pointer).ino).not.toBe(inspected.ino)
+      expect(result.state, JSON.stringify(result.detail)).toBe("failed")
+      expect(result.detail?.message).toContain(pointer)
+      expect(afterReplacement, "changed prepared identity reached request Git").toEqual([])
+      expect(git(fixture.product, "for-each-ref", "--format=%(refname) %(objectname)")).toBe(refs)
+      expect(existsSync(join(destination, ".git", "HEAD"))).toBe(false)
+    } finally {
+      acquiring.mockImplementation(flock.tryAcquireFlock)
+      acquiring.mockClear()
+    }
+  },
+)
+
+// Schedule real filesystem replacement at the existing open boundary, after the creator inspected the entry.
+// The syscall spy only changes fixture timing; all reads, inode comparisons and refusals remain production-owned.
+it.each(["removed", "regular replacement", "symlink replacement"] as const)(
+  "refuses commondir changed after inspection before any Git: %s",
+  async (change) => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-commondir-replacement-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const common = join(fixture.product, ".git", "commondir")
+    writeFileSync(common, ".\n")
+    const replacement = join(root, "replacement")
+    writeFileSync(replacement, ".\n")
+    const originalOpen = (await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises")).open
+    let changed = false
+    const opening = vi.mocked(filesystem.open).mockImplementation(async (...args) => {
+      if (args[0] === common && !changed) {
+        changed = true
+        if (change === "regular replacement") renameSync(replacement, common)
+        else {
+          unlinkSync(common)
+          if (change === "symlink replacement") symlinkSync(replacement, common)
+        }
+      }
+      return originalOpen(...args)
+    })
+    const transport = createLocalGitProcess()
+    const run = vi.fn(transport.run.bind(transport))
+    try {
+      const result = await GitSuper.projectPrivateGitWorktree({
+        sourceCheckout: fixture.product,
+        commit: fixture.productBase,
+        branch: "task/seat",
+        destination: join(root, "seat"),
+        excludedSubmodules: [],
+        git: { run },
+      })
+      expect(changed, "the native metadata replacement never reached the reader").toBe(true)
+      expect(result.state, JSON.stringify(result.detail)).toBe("failed")
+      expect(result.detail?.message).toContain(common)
+      expect(run).not.toHaveBeenCalled()
+      expect(existsSync(join(root, "seat"))).toBe(false)
+    } finally {
+      opening.mockImplementation(originalOpen)
+      opening.mockClear()
+    }
+  },
+)
+
+// CTOa6e10f22: strict closure must bind inspected alternates identity before the first Git call.
+// Static malformed-entry cases miss a replacement at the actual filesystem read boundary.
+it.each(["removed", "regular replacement", "symlink replacement", "regular replacement after reading"] as const)(
+  "refuses alternates changed after inspection before any Git: %s",
+  async (change) => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-alternates-replacement-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const alternates = join(fixture.product, ".git/objects/info/alternates")
+    writeFileSync(alternates, "")
+    const replacement = join(root, "replacement")
+    writeFileSync(replacement, "")
+    const original = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises")
+    let changed = false
+    const replace = (path: unknown): void => {
+      if (path !== alternates || changed) return
+      changed = true
+      if (change === "regular replacement" || change === "regular replacement after reading") {
+        renameSync(replacement, alternates)
+      } else {
+        unlinkSync(alternates)
+        if (change === "symlink replacement") symlinkSync(replacement, alternates)
+      }
+    }
+    const opening = vi.mocked(filesystem.open).mockImplementation(async (...args) => {
+      if (change !== "regular replacement after reading") replace(args[0])
+      const handle = await original.open(...args)
+      if (args[0] === alternates && change === "regular replacement after reading") {
+        const read = handle.readFile.bind(handle)
+        vi.spyOn(handle, "readFile").mockImplementation(async (...readArgs) => {
+          const content = await read(...readArgs)
+          replace(args[0])
+          return content
+        })
+      }
+      return handle
+    })
+    const reading = vi.mocked(filesystem.readFile).mockImplementation(async (...args) => {
+      if (change !== "regular replacement after reading") replace(args[0])
+      return original.readFile(...args)
+    })
+    const transport = createLocalGitProcess()
+    const run = vi.fn(transport.run.bind(transport))
+    const destination = join(root, "seat")
+    try {
+      const result = await GitSuper.projectPrivateGitWorktree({
+        sourceCheckout: fixture.product,
+        commit: fixture.productBase,
+        branch: "task/seat",
+        destination,
+        excludedSubmodules: [],
+        git: { run },
+      })
+      expect(changed, "the native alternates replacement never reached the reader").toBe(true)
+      expect(result.state, JSON.stringify(result.detail)).toBe("failed")
+      expect(result.detail?.message).toContain(alternates)
+      expect(run).not.toHaveBeenCalled()
+      expect(existsSync(destination)).toBe(false)
+    } finally {
+      opening.mockImplementation(original.open)
+      opening.mockClear()
+      reading.mockImplementation(original.readFile)
+      reading.mockClear()
+    }
+  },
+)
+
+// CTOa6e10f22: caller inputs are copied at entry before asynchronous trusted preparation.
+// Metadata replacement tests do not mutate the caller's branch, commit or exclusion array.
+it("keeps the entered projection selection when the caller changes its inputs during preparation", async () => {
+  const root = await mkdtemp(join(canonicalTmpdir(), "git-super-frozen-projection-inputs-"))
+  roots.push(root)
+  const fixture = addNestedAlphaSubmodule(createProductFixture(root))
+  const destination = join(root, "seat")
+  const changedDestination = join(root, "changed-seat")
+  const transport = createLocalGitProcess()
+  const options = {
+    sourceCheckout: fixture.product,
+    commit: fixture.productWithNestedBase,
+    branch: "task/seat",
+    destination,
+    excludedSubmodules: [] as string[],
+    git: transport,
+  }
+  let changed = false
+  options.git = {
+    run: (request) => {
+      if (!changed) {
+        options.sourceCheckout = fixture.beta
+        options.commit = fixture.betaBase
+        options.branch = "task/changed-seat"
+        options.destination = changedDestination
+        options.excludedSubmodules.push("vendor/beta")
+        changed = true
+      }
+      return transport.run(request)
+    },
+  }
+  const result = await GitSuper.projectPrivateGitWorktree(options)
+  expect(changed, "caller mutation never reached actual trusted preparation").toBe(true)
+  expect(result.state, JSON.stringify(result.detail)).toBe("updated")
+  expect(result.projection?.checkout).toBe(destination)
+  expect(result.projection?.base).toBe(fixture.productWithNestedBase)
+  expect(result.projection?.branch).toBe("task/seat")
+  expect(result.projection?.repositories.map((entry) => entry.path)).toEqual([
+    "",
+    "packages/alpha",
+    "packages/alpha/apps/maddoc",
+    "vendor/beta",
+  ])
+  expect(git(destination, "symbolic-ref", "HEAD")).toBe("refs/heads/task/seat")
+  expect(existsSync(changedDestination)).toBe(false)
+})
+
+// CTOa6e10f22: private root creation and descendants retain routing custody through recursive traversal.
+// Ordinary materializer contention does not execute the private creator callback or private nested policy writes.
+it("holds private root creation, child and ancestor custody through checkout and recursive routing", async () => {
+  const root = await mkdtemp(join(canonicalTmpdir(), "git-super-private-child-custody-"))
+  roots.push(root)
+  const fixture = addNestedAlphaSubmodule(createProductFixture(root))
+  const destination = join(root, "seat")
+  const alpha = join(destination, "packages/alpha")
+  const leaf = join(alpha, "apps/maddoc")
+  const rootGit = join(destination, ".git")
+  const alphaGit = join(rootGit, "modules/packages/alpha")
+  const leafGit = join(alphaGit, "modules/apps/maddoc")
+  const transport = createLocalGitProcess()
+  const observations: Array<{ checkout: string; phase: string; owners: readonly boolean[] }> = []
+  // CTOa6e10f22: acquiring a public lender below a held private owner must obey
+  // the same canonical ordering as every other writer, including nested paths.
+  const nativeAcquire = (await vi.importActual<typeof import("@bearly/flock")>("@bearly/flock")).tryAcquireFlock
+  const heldOwners = new Set<string>()
+  const orderViolations: Array<{ held: string[]; next: string }> = []
+  const acquiring = vi.mocked(tryAcquireFlock).mockImplementation((path, options) => {
+    const handle = nativeAcquire(path, options)
+    if (handle === null) return null
+    const owner = dirname(dirname(path))
+    const enclosing = [...heldOwners]
+    if (enclosing.some((prior) => prior > owner)) orderViolations.push({ held: enclosing, next: owner })
+    heldOwners.add(owner)
+    const release = () => {
+      handle.release()
+      heldOwners.delete(owner)
+    }
+    return {
+      ...handle,
+      get held() {
+        return handle.held
+      },
+      release,
+      [Symbol.dispose]: release,
+    }
+  })
+  let result: Awaited<ReturnType<typeof GitSuper.projectPrivateGitWorktree>>
+  try {
+    result = await GitSuper.projectPrivateGitWorktree({
+      sourceCheckout: fixture.product,
+      commit: git(fixture.product, "rev-parse", "HEAD"),
+      branch: "task/seat",
+      destination,
+      excludedSubmodules: [],
+      git: {
+        async run(request) {
+          const phase =
+            request.repo === destination && request.args.includes("check-ref-format")
+              ? "branch validation"
+              : request.repo === destination && request.args.includes("init")
+                ? "init"
+                : request.args.includes("checkout")
+                  ? "checkout"
+                  : request.args.includes("submodule.alternateLocation")
+                    ? "routing"
+                    : undefined
+          if (
+            (request.repo === destination || request.repo === alpha || request.repo === leaf) &&
+            phase !== undefined
+          ) {
+            const owners =
+              request.repo === destination
+                ? [rootGit]
+                : request.repo === alpha
+                  ? [rootGit, alphaGit]
+                  : [rootGit, alphaGit, leafGit]
+            observations.push({
+              checkout: request.repo,
+              phase,
+              owners: owners.map((owner) => {
+                const lock = join(owner, "yrd-worktree-mutations/writer.lock")
+                if (!existsSync(lock)) return false
+                const contender = tryAcquireFlock(lock)
+                contender?.release()
+                return contender === null
+              }),
+            })
+          }
+          return transport.run(request)
+        },
+      },
+    })
+  } finally {
+    acquiring.mockRestore()
+  }
+  expect(result.state, JSON.stringify(result.detail)).toBe("updated")
+  expect(observations).toEqual([
+    { checkout: destination, phase: "branch validation", owners: [true] },
+    { checkout: destination, phase: "init", owners: [true] },
+    { checkout: destination, phase: "checkout", owners: [true] },
+    { checkout: destination, phase: "routing", owners: [true] },
+    { checkout: alpha, phase: "checkout", owners: [true, true] },
+    { checkout: alpha, phase: "routing", owners: [true, true] },
+    { checkout: leaf, phase: "checkout", owners: [true, true, true] },
+    { checkout: leaf, phase: "routing", owners: [true, true, true] },
+  ])
+  for (const owner of [rootGit, alphaGit, leafGit]) {
+    const available = tryAcquireFlock(join(owner, "yrd-worktree-mutations/writer.lock"))
+    try {
+      expect(available).not.toBeNull()
+    } finally {
+      available?.release()
+    }
+  }
+  expect(heldOwners.size, "projection leaked native owner custody").toBe(0)
+  expect(orderViolations, "public lender acquisition reverses order beneath private custody").toEqual([])
 })
 
 // CTO63d0a344: retirement needs the sandbox lifetime proof; existing lifecycle tests lacked this gate.
@@ -277,13 +740,14 @@ it.each(["unknown-store", "unknown-hook"] as const)(
 // CTO343fc3e2/0a13f6da: host-selected linked environments borrow declared public stores transitively.
 // Existing primary-source fixtures have no public alternates and therefore miss real Yrd source closure.
 it.each([
-  [false, false, false],
-  [true, false, false],
-  [false, true, false],
-  [false, false, true],
+  [false, false, false, false],
+  [true, false, false, false],
+  [false, true, false, false],
+  [false, false, true, false],
+  [false, false, false, true],
 ])(
-  "projects a public linked source with its declared child object-store lenders; nested=%s; authored=%s; remove donor=%s",
-  async (nested, authored, removeDonor) => {
+  "projects a public linked source with its declared child object-store lenders; nested=%s; authored=%s; remove donor=%s; redirected owner=%s",
+  async (nested, authored, removeDonor, redirectedOwner) => {
     const root = await mkdtemp(join(canonicalTmpdir(), "git-super-linked-source-closure-"))
     roots.push(root)
     const fixture = nested ? addNestedAlphaSubmodule(createProductFixture(root)) : createProductFixture(root)
@@ -313,13 +777,30 @@ it.each([
       git(source, "commit", "-q", "-m", "select authored child")
       base = git(source, "rev-parse", "HEAD")
     }
+    const sourcePins = git(alpha, "for-each-ref", "--format=%(refname) %(objectname)", "refs/git-super/pins/")
+    // A declared store is not custody evidence when its metadata selects another GC owner.
+    // The positive lender rows never redirect that independent owner association.
+    if (redirectedOwner) {
+      writeFileSync(join(fixture.product, ".git/modules/packages/alpha/commondir"), `${sourceGit}\n`)
+    }
+    const run = vi.fn(transport.run.bind(transport))
     const projected = await GitSuper.projectPrivateGitWorktree({
       sourceCheckout: source,
       commit: base,
       branch: "task/seat",
       destination: join(root, "seat"),
       excludedSubmodules,
+      git: { run },
     })
+    if (redirectedOwner) {
+      expect(projected.state, JSON.stringify(projected.detail)).toBe("failed")
+      expect(projected.detail?.message).toContain("unproven object-store owner")
+      expect(projected.detail?.message).toContain(durableObjects)
+      expect(run.mock.calls.some(([request]) => request.repo === join(root, "seat/packages/alpha"))).toBe(false)
+      expect(existsSync(join(root, "seat/packages/alpha/.git"))).toBe(false)
+      expect(git(alpha, "for-each-ref", "--format=%(refname) %(objectname)", "refs/git-super/pins/")).toBe(sourcePins)
+      return
+    }
     expect(projected.state, JSON.stringify(projected.detail)).toBe("updated")
     expect(projected.projection?.mounts).toContainEqual({
       source: durableObjects,
@@ -348,8 +829,8 @@ it.each([
       expect(projected.projection?.mounts).toContainEqual({ source: leafObjects, target: leafObjects, mode: "ro" })
     }
     if (removeDonor) {
-      // A retained private root has a free writer lease, not an active Git lock.
-      // Existing retention journeys never remove its linked-source donor afterwards.
+      // Custody is the kernel lease, not the diagnostic bytes left by materialization.
+      // The retained inode must be available before removing its linked-source donor.
       if (projected.projection === undefined) throw new Error("projection omitted its custody record")
       const retained = await GitSuper.retainPrivateGitProjection(projected.projection, join(root, "retained-seat"))
       expect(retained.state, JSON.stringify(retained.detail)).toBe("updated")
@@ -362,7 +843,14 @@ it.each([
       for (const dependency of proof.externalObjectStores) {
         expect(dependency.target === donorGit || dependency.target.startsWith(`${donorGit}/`)).toBe(false)
       }
-      expect(statSync(join(proof.retained, "yrd-worktree-mutations/writer.lock")).size).toBe(0)
+      const retainedLock = join(proof.retained, "yrd-worktree-mutations/writer.lock")
+      expect(statSync(retainedLock).isFile()).toBe(true)
+      const retainedLease = tryAcquireFlock(retainedLock)
+      try {
+        expect(retainedLease, "retained private root still has an active writer lease").not.toBeNull()
+      } finally {
+        retainedLease?.release()
+      }
       const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true)
       try {
         await store.remove(source, {
@@ -387,22 +875,19 @@ it.each([
     const original = readFileSync(alternates, "utf8")
     for (const unapproved of [privateObjects, join(root, "missing-public-lender")]) {
       writeFileSync(alternates, `${original}${unapproved}\n`)
+      const destination = join(root, unapproved === privateObjects ? "rejected-private" : "rejected-missing")
       const rejected = await GitSuper.projectPrivateGitWorktree({
         sourceCheckout: source,
         commit: base,
         branch: "task/rejected-seat",
-        destination: join(root, unapproved === privateObjects ? "rejected-private" : "rejected-missing"),
+        destination,
         excludedSubmodules: ["vendor/beta"],
       })
       expect(rejected.state, JSON.stringify(rejected)).toBe("failed")
       expect(rejected.detail?.message).toContain(unapproved)
+      expect(rejected.retainedPaths).toEqual([])
+      expect(existsSync(destination)).toBe(false)
       writeFileSync(alternates, original)
-      // Each failed attempt preserves its partial tree at its own destination.
-      if (unapproved === privateObjects) {
-        const rootRecord = rejected.retainedPaths[0]
-        if (rootRecord === undefined) throw new Error("failed projection omitted partial root")
-        expect(existsSync(rootRecord)).toBe(true)
-      }
     }
   },
 )
