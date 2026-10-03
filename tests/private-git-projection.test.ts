@@ -274,6 +274,35 @@ it.each(["unknown-store", "unknown-hook"] as const)(
   },
 )
 
+// CTO343fc3e2/0a13f6da: host-selected linked environments borrow declared public stores transitively.
+// Existing primary-source fixtures have no public alternates and therefore miss real Yrd source closure.
+it("projects a public linked source with its declared child object-store lenders", async () => {
+  const root = await mkdtemp(join(canonicalTmpdir(), "git-super-linked-source-closure-"))
+  roots.push(root)
+  const fixture = createProductFixture(root)
+  const source = join(root, "source")
+  const transport = createLocalGitProcess()
+  const store = createGitWorktreeStore({ repo: fixture.product, gitProcess: transport })
+  await store.add({ kind: "detached", path: source, ref: fixture.productBase })
+  await store.materializeSubmodules(source)
+  const alpha = join(source, "packages/alpha")
+  const sourceGit = git(alpha, "rev-parse", "--path-format=absolute", "--git-common-dir")
+  const durableObjects = join(fixture.product, ".git/modules/packages/alpha/objects")
+  expect(readFileSync(join(sourceGit, "objects/info/alternates"), "utf8")).toContain(durableObjects)
+  expect(git(alpha, "rev-parse", "HEAD")).toBe(fixture.alphaBase)
+  const projected = await GitSuper.projectPrivateGitWorktree({
+    sourceCheckout: source,
+    commit: fixture.productBase,
+    branch: "task/seat",
+    destination: join(root, "seat"),
+    excludedSubmodules: [],
+  })
+  expect(projected.state, JSON.stringify(projected.detail)).toBe("updated")
+  expect(projected.projection?.mounts).toContainEqual({
+    source: durableObjects, target: durableObjects, mode: "ro",
+  })
+})
+
 // CTO63d0a344 step 5: publication must not separate the final equality check from removal.
 // The helper-config race mutates at lease acquisition, before snapshot; this writes after proof publication.
 it("keeps the original when another process writes after custody proof publication", async () => {
