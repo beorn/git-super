@@ -1,4 +1,4 @@
-import { existsSync, realpathSync, statSync } from "node:fs"
+import { existsSync, lstatSync, realpathSync, statSync } from "node:fs"
 import { readFile } from "node:fs/promises"
 import { isAbsolute, join, resolve } from "node:path"
 
@@ -48,12 +48,21 @@ export async function alternatesLineage(
     const file = join(store, "info", "alternates")
     let content: string
     try {
-      if (policy !== undefined && realpathSync(file) !== file) {
-        throw new Error(`redirected alternates file: ${file}`)
+      if (policy !== undefined) {
+        const info = lstatSync(join(store, "info"), { throwIfNoEntry: false })
+        // silent-fallback-allow: a genuinely absent info directory cannot contain an alternates file
+        if (info === undefined) return
+        if (!info.isDirectory()) throw new Error(`redirected or non-directory alternates parent: ${file}`)
+        const metadata = lstatSync(file, { throwIfNoEntry: false })
+        // silent-fallback-allow: absent file borrows nothing; lstat distinguishes a dangling symlink from absence
+        if (metadata === undefined) return
+        if (!metadata.isFile() || realpathSync(file) !== file) {
+          throw new Error(`redirected or non-file alternates file: ${file}`)
+        }
       }
       content = await readFile(file, "utf8")
     } catch (error) {
-      if (policy !== undefined && (error as NodeJS.ErrnoException).code !== "ENOENT") {
+      if (policy !== undefined) {
         throw new Error(`cannot inspect alternates file: ${file}`, { cause: error })
       }
       // silent-fallback-allow: a store with no alternates file borrows nothing; it ends its branch of the lineage
