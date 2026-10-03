@@ -227,9 +227,9 @@ it.each(["removed", "regular replacement", "symlink replacement", "regular repla
   },
 )
 
-// CTOa6e10f22: private descendants retain their own and ancestor routing custody through recursive traversal.
+// CTOa6e10f22: private root creation and descendants retain routing custody through recursive traversal.
 // Ordinary materializer contention does not execute the private creator callback or private nested policy writes.
-it("holds private child and ancestor custody through checkout and recursive routing", async () => {
+it("holds private root creation, child and ancestor custody through checkout and recursive routing", async () => {
   const root = await mkdtemp(join(canonicalTmpdir(), "git-super-private-child-custody-"))
   roots.push(root)
   const fixture = addNestedAlphaSubmodule(createProductFixture(root))
@@ -249,18 +249,30 @@ it("holds private child and ancestor custody through checkout and recursive rout
     excludedSubmodules: [],
     git: {
       async run(request) {
-        const phase = request.args.includes("checkout")
-          ? "checkout"
-          : request.args.includes("submodule.alternateLocation")
-            ? "routing"
-            : undefined
-        if ((request.repo === alpha || request.repo === leaf) && phase !== undefined) {
-          const owners = request.repo === alpha ? [rootGit, alphaGit] : [rootGit, alphaGit, leafGit]
+        const phase =
+          request.repo === destination && request.args.includes("check-ref-format")
+            ? "branch validation"
+            : request.repo === destination && request.args.includes("init")
+              ? "init"
+              : request.args.includes("checkout")
+                ? "checkout"
+                : request.args.includes("submodule.alternateLocation")
+                  ? "routing"
+                  : undefined
+        if ((request.repo === destination || request.repo === alpha || request.repo === leaf) && phase !== undefined) {
+          const owners =
+            request.repo === destination
+              ? [rootGit]
+              : request.repo === alpha
+                ? [rootGit, alphaGit]
+                : [rootGit, alphaGit, leafGit]
           observations.push({
             checkout: request.repo,
             phase,
             owners: owners.map((owner) => {
-              const contender = tryAcquireFlock(join(owner, "yrd-worktree-mutations/writer.lock"))
+              const lock = join(owner, "yrd-worktree-mutations/writer.lock")
+              if (!existsSync(lock)) return false
+              const contender = tryAcquireFlock(lock)
               contender?.release()
               return contender === null
             }),
@@ -272,6 +284,10 @@ it("holds private child and ancestor custody through checkout and recursive rout
   })
   expect(result.state, JSON.stringify(result.detail)).toBe("updated")
   expect(observations).toEqual([
+    { checkout: destination, phase: "branch validation", owners: [true] },
+    { checkout: destination, phase: "init", owners: [true] },
+    { checkout: destination, phase: "checkout", owners: [true] },
+    { checkout: destination, phase: "routing", owners: [true] },
     { checkout: alpha, phase: "checkout", owners: [true, true] },
     { checkout: alpha, phase: "routing", owners: [true, true] },
     { checkout: leaf, phase: "checkout", owners: [true, true, true] },
