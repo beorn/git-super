@@ -95,18 +95,13 @@ function treeGitlinks(root: string, ref: string): TreeGitlink[] {
  * The paths one commit's `.gitmodules` declares `private = true`, read from the commit alone through the single
  * reader, and only when a refusal must name a cure.
  *
- * A manifest that cannot be read leaves the set empty, so the cure list is INCOMPLETE rather than the refusal being
- * replaced by a manifest-read failure. The empty set never suppresses the refusal; it only narrows which cures the
- * message can name.
+ * A commit that carries no `.gitmodules` declares nothing, which the single reader already answers with `[]`. Every
+ * other outcome it produces — a git read that failed, or a declaration it refuses, such as a private section with no
+ * path — is a named cause and must reach the caller: swallowing it would drop the cause from the ancestry refusal and
+ * leave only a generic "initialize" cure, which is exactly the silent fallback a refusal must never be.
  */
 async function readDeclaredPrivatePaths(root: string, commit: string): Promise<ReadonlySet<string>> {
-  try {
-    return new Set(await readPrivateSubmodulePaths(createLocalGitProcess(), root, commit))
-  } catch {
-    // silent-fallback-allow: a `.gitmodules` that cannot be read narrows the cure list to "initialize"; the
-    // ancestry refusal still fires, and it never answers a different question or hides the child.
-    return new Set()
-  }
+  return new Set(await readPrivateSubmodulePaths(createLocalGitProcess(), root, commit))
 }
 
 export async function superIsAncestor(options: SuperIsAncestorOptions): Promise<SuperIsAncestorResult> {

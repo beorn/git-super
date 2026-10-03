@@ -170,6 +170,38 @@ describe("Phase 1 read commands", () => {
     expect(stderr.output).toContain("--exclude-submodule " + path)
   })
 
+  /**
+   * @failure A target manifest that declares a private submodule with no path makes the canonical reader throw a
+   *          named cause, but the empty-set catch in readDeclaredPrivatePaths swallows it, so the ancestry
+   *          refusal drops the cause instead of naming it (27272, @dev/11 falsifier manifest-repro1681).
+   * @level l1
+   * @consumer git super merge-base --is-ancestor when a target manifest cannot be fully read
+   * @testonly none
+   */
+  test("a private section without a path stays named in the ancestry refusal", async () => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-unpathed-private-ancestry-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    git(fixture.product, "config", "--file", ".gitmodules", "submodule.packages/alpha.private", "true")
+    git(fixture.product, "config", "--file", ".gitmodules", "submodule.broken-private.private", "true")
+    git(fixture.product, "add", ".gitmodules")
+    git(fixture.product, "commit", "-q", "-m", "declare alpha private, leave broken-private without a path")
+    git(fixture.product, "submodule", "deinit", "-f", "--all")
+    const stdout = outputSink()
+    const stderr = outputSink()
+    expect(
+      await runCli(
+        ["--repo", fixture.product, "--json", "merge-base", "--is-ancestor", fixture.productBase, "HEAD"],
+        stdout,
+        stderr,
+      ),
+    ).toBe(2)
+    expect(stdout.output).toBe("")
+    expect(stderr.output).toContain("ancestry unknown")
+    expect(stderr.output).toContain("broken-private")
+    expect(stderr.output).toContain("without a path")
+  })
+
   // Gate A: existing extension calls use --repo/--json and formatted results.
   // Native callers need unchanged syntax even for names already registered here.
   test("plain repository calls, including registered names, match native Git bytes", async () => {
