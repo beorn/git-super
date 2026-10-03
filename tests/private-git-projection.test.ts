@@ -516,13 +516,14 @@ it.each(["unknown-store", "unknown-hook"] as const)(
 // CTO343fc3e2/0a13f6da: host-selected linked environments borrow declared public stores transitively.
 // Existing primary-source fixtures have no public alternates and therefore miss real Yrd source closure.
 it.each([
-  [false, false, false],
-  [true, false, false],
-  [false, true, false],
-  [false, false, true],
+  [false, false, false, false],
+  [true, false, false, false],
+  [false, true, false, false],
+  [false, false, true, false],
+  [false, false, false, true],
 ])(
-  "projects a public linked source with its declared child object-store lenders; nested=%s; authored=%s; remove donor=%s",
-  async (nested, authored, removeDonor) => {
+  "projects a public linked source with its declared child object-store lenders; nested=%s; authored=%s; remove donor=%s; redirected owner=%s",
+  async (nested, authored, removeDonor, redirectedOwner) => {
     const root = await mkdtemp(join(canonicalTmpdir(), "git-super-linked-source-closure-"))
     roots.push(root)
     const fixture = nested ? addNestedAlphaSubmodule(createProductFixture(root)) : createProductFixture(root)
@@ -552,13 +553,30 @@ it.each([
       git(source, "commit", "-q", "-m", "select authored child")
       base = git(source, "rev-parse", "HEAD")
     }
+    const sourcePins = git(alpha, "for-each-ref", "--format=%(refname) %(objectname)", "refs/git-super/pins/")
+    // A declared store is not custody evidence when its metadata selects another GC owner.
+    // The positive lender rows never redirect that independent owner association.
+    if (redirectedOwner) {
+      writeFileSync(join(fixture.product, ".git/modules/packages/alpha/commondir"), `${sourceGit}\n`)
+    }
+    const run = vi.fn(transport.run.bind(transport))
     const projected = await GitSuper.projectPrivateGitWorktree({
       sourceCheckout: source,
       commit: base,
       branch: "task/seat",
       destination: join(root, "seat"),
       excludedSubmodules,
+      git: { run },
     })
+    if (redirectedOwner) {
+      expect(projected.state, JSON.stringify(projected.detail)).toBe("failed")
+      expect(projected.detail?.message).toContain("unproven object-store owner")
+      expect(projected.detail?.message).toContain(durableObjects)
+      expect(run.mock.calls.some(([request]) => request.repo === join(root, "seat/packages/alpha"))).toBe(false)
+      expect(existsSync(join(root, "seat/packages/alpha/.git"))).toBe(false)
+      expect(git(alpha, "for-each-ref", "--format=%(refname) %(objectname)", "refs/git-super/pins/")).toBe(sourcePins)
+      return
+    }
     expect(projected.state, JSON.stringify(projected.detail)).toBe("updated")
     expect(projected.projection?.mounts).toContainEqual({
       source: durableObjects,

@@ -276,6 +276,7 @@ export async function projectPrivateGitWorktree(
   const retainedPaths: string[] = []
   const repositories: Array<{ path: string; checkout: string; gitDirectory: string; head: string }> = []
   const stores = new Set<string>()
+  const objectOwners = new Map<string, string>()
   const publicDirectories = new Map<string, string>()
   const destination = resolve(options.destination)
   const environment = {
@@ -339,11 +340,23 @@ export async function projectPrivateGitWorktree(
       const common = await commonDirectory(sourceGit)
       const objects = join(common, "objects")
       const publicDirectory = publicGitDirectory ?? common
+      if (!(await lstat(publicDirectory)).isDirectory() || (await realpath(publicDirectory)) !== publicDirectory) {
+        throw new Error(`nonphysical declared public metadata: ${publicDirectory}`)
+      }
+      const publicCommon = await commonDirectory(publicDirectory)
+      objectOwners.set(objects, common)
+      objectOwners.set(join(publicCommon, "objects"), publicCommon)
       publicDirectories.set(checkout, publicDirectory)
       const publicObjects = join(publicDirectory, "objects")
       const lineage = await alternatesLineage([objects], join(checkout, ".git", "objects"), {
         allowedObjects: new Set([...stores, objects, publicObjects]),
       })
+      const owners = new Set<string>()
+      for (const store of [objects, ...lineage]) {
+        const owner = objectOwners.get(store)
+        if (owner === undefined) throw new Error(`unproven object-store owner: ${store}`)
+        owners.add(owner)
+      }
       if (root) await mkdir(checkout)
       else await mkdir(checkout, { recursive: true })
       retainedPaths.push(checkout)
@@ -364,7 +377,7 @@ export async function projectPrivateGitWorktree(
         await run(checkout, ["cat-file", "-e", `${head}^{commit}`])
         // A ref in the borrower cannot protect objects from a lender's own GC.
         // Every validated lender must hold the selected commit under the existing exact-object pin.
-        for (const directory of new Set([common, ...lineage.map((lender) => dirname(lender))])) {
+        for (const directory of owners) {
           await createExclusive(join(directory, "yrd-worktree-mutations")).run(
             async () => {
               // A linked source may own a newer commit than its public lenders.
