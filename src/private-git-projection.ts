@@ -6,7 +6,7 @@ import { readPrivateSubmodulePaths } from "./commit-graph.ts"
 import { cleanGitEnvironment, validateExcludedSubmodules, withGitEnvironment } from "./git.ts"
 import { createLocalGitProcess, type GitProcess } from "./process.ts"
 import { materializeSubmodules } from "./submodules.ts"
-import { pinRef } from "./objects.ts"
+import { ensureCommitObject, pinRef } from "./objects.ts"
 import { createExclusive } from "./exclusive.ts"
 import { safeStorePath } from "./submodule-prepare.ts"
 import { createGit, createGitWorktreeStore } from "./worktree.ts"
@@ -357,6 +357,25 @@ export async function projectPrivateGitWorktree(
       for (const directory of new Set([common, ...lineage.map((lender) => dirname(lender))])) {
         await createExclusive(join(directory, "yrd-worktree-mutations")).run(
           async () => {
+            // A linked source may own a newer commit than its public lenders.
+            // Reuse exact-object transfer before anchoring it in every GC owner.
+            await ensureCommitObject({
+              repository: checkout,
+              remote: common,
+              commit: head,
+              git: {
+                run: (request) =>
+                  git.run({
+                    ...request,
+                    args: [
+                      "--git-dir",
+                      directory,
+                      ...(request.args[0] === "fetch" ? ["-c", "protocol.file.allow=always"] : []),
+                      ...request.args,
+                    ],
+                  }),
+              },
+            })
             await run(checkout, ["--git-dir", directory, "update-ref", pinRef(head), head])
           },
           { holder: `private projection ${destination}` },

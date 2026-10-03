@@ -276,16 +276,20 @@ it.each(["unknown-store", "unknown-hook"] as const)(
 
 // CTO343fc3e2/0a13f6da: host-selected linked environments borrow declared public stores transitively.
 // Existing primary-source fixtures have no public alternates and therefore miss real Yrd source closure.
-it.each([false, true])(
-  "projects a public linked source with its declared child object-store lenders; nested=%s",
-  async (nested) => {
+it.each([
+  [false, false],
+  [true, false],
+  [false, true],
+])(
+  "projects a public linked source with its declared child object-store lenders; nested=%s; authored=%s",
+  async (nested, authored) => {
     const root = await mkdtemp(join(canonicalTmpdir(), "git-super-linked-source-closure-"))
     roots.push(root)
     const fixture = nested ? addNestedAlphaSubmodule(createProductFixture(root)) : createProductFixture(root)
     git(fixture.product, "config", "-f", ".gitmodules", "submodule.vendor/beta.private", "true")
     git(fixture.product, "add", ".gitmodules")
     git(fixture.product, "commit", "-q", "-m", "declare excluded source child")
-    const base = git(fixture.product, "rev-parse", "HEAD")
+    let base = git(fixture.product, "rev-parse", "HEAD")
     const source = join(root, "source")
     const transport = createLocalGitProcess()
     const store = createGitWorktreeStore({ repo: fixture.product, gitProcess: transport })
@@ -296,6 +300,15 @@ it.each([false, true])(
     const durableObjects = join(fixture.product, ".git/modules/packages/alpha/objects")
     expect(readFileSync(join(sourceGit, "objects/info/alternates"), "utf8")).toContain(durableObjects)
     expect(git(alpha, "rev-parse", "HEAD")).toBe(git(join(fixture.product, "packages/alpha"), "rev-parse", "HEAD"))
+    // Real Yrd sources can hold a new child commit absent from their public lender.
+    // The old table selected only lender-owned commits, so pinning HEAD everywhere looked valid.
+    const selected = authored ? advanceRepository(alpha, "authored.txt", "local public work\n") : fixture.alphaBase
+    if (authored) {
+      expect(() => git(join(fixture.product, "packages/alpha"), "cat-file", "-e", selected)).toThrow()
+      git(source, "add", "packages/alpha")
+      git(source, "commit", "-q", "-m", "select authored child")
+      base = git(source, "rev-parse", "HEAD")
+    }
     const projected = await GitSuper.projectPrivateGitWorktree({
       sourceCheckout: source,
       commit: base,
@@ -312,6 +325,20 @@ it.each([false, true])(
     const privateObjects = join(fixture.product, ".git/modules/vendor/beta/objects")
     expect(projected.projection?.mounts.some((mount) => mount.source === privateObjects)).toBe(false)
     expect(existsSync(join(source, "vendor/beta/.git"))).toBe(false)
+    if (authored) {
+      const lender = join(fixture.product, "packages/alpha")
+      const unrelated = git(lender, "commit-tree", "HEAD^{tree}", "-m", "unrelated lender tip")
+      git(lender, "update-ref", "--no-deref", "HEAD", unrelated)
+      for (const ref of git(lender, "for-each-ref", "--format=%(refname)").split("\n")) {
+        if (ref !== "" && !ref.startsWith("refs/git-super/pins/")) git(lender, "update-ref", "-d", ref)
+      }
+      git(lender, "reflog", "expire", "--expire=now", "--all")
+      git(lender, "gc", "--prune=now")
+      const child = join(root, "seat/packages/alpha")
+      expect(git(child, "rev-parse", "HEAD")).toBe(selected)
+      expect(readFileSync(join(child, "authored.txt"), "utf8")).toBe("local public work\n")
+      git(child, "fsck", "--full", "--no-reflogs")
+    }
     if (nested) {
       const leafObjects = join(fixture.product, ".git/modules/packages/alpha/modules/apps/maddoc/objects")
       expect(projected.projection?.mounts).toContainEqual({ source: leafObjects, target: leafObjects, mode: "ro" })
