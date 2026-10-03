@@ -841,6 +841,7 @@ async function applyRepositories(
     let applied = await runApply(git, repository.repository, args)
     let retryDelayMs = 100
     let retries = 0
+    let contentionExhausted = false
     while (
       applied.code !== 0 &&
       applied.failure === undefined &&
@@ -851,7 +852,10 @@ async function applyRepositories(
       /Unable to create '[^\n]*index\.lock': File exists/u.test(applied.stderr)
     ) {
       contentionRemainingMs -= performance.now() - attemptStarted
-      if (contentionRemainingMs <= 0) break
+      if (contentionRemainingMs <= 0) {
+        contentionExhausted = true
+        break
+      }
       retryDelayMs = decorrelatedJitter(100, 1_000, retryDelayMs)
       phase(`index-lock-wait ${repository.path} retry=${++retries} remaining=${Math.ceil(contentionRemainingMs)}ms`)
       const sleepStarted = performance.now()
@@ -859,18 +863,49 @@ async function applyRepositories(
         setTimeout(resolve, Math.min(retryDelayMs, contentionRemainingMs))
       })
       contentionRemainingMs -= performance.now() - sleepStarted
-      if (contentionRemainingMs <= 0) break
+      if (contentionRemainingMs <= 0) {
+        contentionExhausted = true
+        break
+      }
       // Keep the ordinary native command bound; a timeout/signal is an unknown outcome, never a lock retry.
       attemptStarted = performance.now()
       applied = await runApply(git, repository.repository, args)
     }
     if (applied.code !== 0) {
-      const failure = operationError(
+      let failure = operationError(
         repository.repository,
         index === 0 ? "apply-root" : "apply-submodule",
         args,
         applied,
       ).resultDetail
+      if (contentionExhausted) {
+        const lookupArgs = ["rev-parse", "--path-format=absolute", "--git-path", "index.lock"]
+        const lookup = await git.run({ repo: repository.repository, args: lookupArgs, timeoutMs: 1_000 })
+        const lock = lookup.stdout.trim()
+        const readable =
+          lookup.code === 0 &&
+          lookup.failure === undefined &&
+          lookup.timedOut !== true &&
+          lookup.stalled !== true &&
+          lookup.signal == null &&
+          lookup.backstop === undefined &&
+          isAbsolute(lock)
+        let observation: string
+        if (readable) {
+          try {
+            observation = `lock age=${Math.max(0, Math.round(Date.now() - statSync(lock).mtimeMs))}ms`
+          } catch (error) {
+            observation = `lock age could not be read at ${lock}: ${error instanceof Error ? error.message : String(error)}`
+          }
+        } else {
+          observation = `native index.lock path could not be read: ${operationError(repository.repository, "observe-index-lock", lookupArgs, lookup).message}; stdout=${JSON.stringify(lookup.stdout)}`
+        }
+        failure = {
+          ...failure,
+          ...(readable ? { subject: lock } : {}),
+          message: `${failure.message}\n8000ms contention allowance exhausted across the frozen pull; ${readable ? `path=${lock}; ` : ""}${observation}. No lock was removed.`,
+        }
+      }
       results.push(repositoryResult(repository, "failed", failure))
       for (const remaining of plan.repositories.slice(index + 1)) {
         results.push(repositoryResult(remaining, "not-run", failure))
