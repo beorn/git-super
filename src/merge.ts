@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, statSync } from "node:fs"
+import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs"
 import { rm } from "node:fs/promises"
 import { dirname, isAbsolute, join, resolve } from "node:path"
 import {
@@ -722,6 +722,11 @@ async function mergeObserved(
   let tree: string
   let composed: ReadonlyMap<string, ComposedGitlink> = new Map()
   let forkComposed: ReadonlyMap<string, ComposedGitlink> = new Map()
+  /**
+   * The wrong-store read abort is the only composition whose native apply cannot leave unmerged entries: the
+   * settle step below is enabled for it alone (27268 918).
+   */
+  let wrongStoreComposition = false
   if (options.continue) {
     if (continuationTree === undefined) {
       return failed(
@@ -813,6 +818,7 @@ async function mergeObserved(
     if ("failure" in composition) return failed(root, [], composition.failure)
     tree = composition.tree
     composed = composition.composed
+    wrongStoreComposition = prospective.conflict === undefined
   } else {
     tree = prospective.tree
   }
@@ -1027,7 +1033,16 @@ async function mergeObserved(
      * is, and only for paths this merge composed. Any other unmerged path is
      * the ordinary application failure.
      */
-    const applied = await applyComposedResolutions(git, root, composed, timeoutMs)
+    const applied = await applyComposedResolutions(
+      git,
+      root,
+      head,
+      target,
+      tree,
+      wrongStoreComposition,
+      composed,
+      timeoutMs,
+    )
     if (applied === "unsettled") {
       const unreadable = await applyPhaseUnreadable(git, root, tree, mergeArgs, merged, timeoutMs)
       return unreadable === undefined
@@ -2852,12 +2867,21 @@ type ComposedApplication = "settled" | "unsettled" | Readonly<{ detail: GitResul
 async function applyComposedResolutions(
   git: GitProcess,
   root: string,
+  head: string,
+  target: string,
+  tree: string,
+  wrongStoreComposition: boolean,
   composed: ReadonlyMap<string, ComposedGitlink>,
   timeoutMs: number,
 ): Promise<ComposedApplication> {
   if (composed.size === 0) return "unsettled"
   const unmerged = await unmergedPaths(git, root, timeoutMs)
-  if (unmerged === undefined || unmerged.length === 0) return "unsettled"
+  if (unmerged === undefined) return "unsettled"
+  if (unmerged.length === 0) {
+    return wrongStoreComposition
+      ? settleProvenCompositionWithoutUnmerged(git, root, head, target, tree, composed, timeoutMs)
+      : "unsettled"
+  }
   if (unmerged.some((path) => !composed.has(path))) return "unsettled"
   for (const path of unmerged) {
     const sha = composed.get(path)?.sha
@@ -2883,6 +2907,82 @@ async function applyComposedResolutions(
   }
   const remaining = await unmergedPaths(git, root, timeoutMs)
   return remaining === undefined || remaining.length > 0 ? "unsettled" : "settled"
+}
+
+/**
+ * THE NATIVE APPLY CAN ABORT WITH THE INDEX UNTOUCHED (27268 918), and only the wrong-store composition does.
+ *
+ * The wrong-store read failure is `fatal: failure to merge`, so HEAD, the index
+ * and the worktree are exactly the pre-merge state: there is no unmerged entry
+ * for the conflicted-settle path to fix, and the ordinary application failure
+ * is returned even though the preflight already proved the result. When every
+ * diverged gitlink has a composed resolution and the prospective tree states
+ * it, settle the merge the way a successful `merge --no-commit` would have:
+ * the proven tree into the index and worktree, MERGE_HEAD for the second
+ * parent, and the ordinary finish commits it. An index that already moved, a
+ * tree that disagrees with a composed pin, or a stage that cannot be written
+ * keeps the named refusal.
+ */
+async function settleProvenCompositionWithoutUnmerged(
+  git: GitProcess,
+  root: string,
+  head: string,
+  target: string,
+  tree: string,
+  composed: ReadonlyMap<string, ComposedGitlink>,
+  timeoutMs: number,
+): Promise<ComposedApplication> {
+  const paths = [...composed.keys()]
+  const observedHead = await run(git, root, ["rev-parse", "HEAD^{commit}"], timeoutMs)
+  if (observedHead.code !== 0 || observedHead.stdout.trim() !== head) return "unsettled"
+  const headTree = await run(git, root, ["rev-parse", "HEAD^{tree}"], timeoutMs)
+  const indexTree = await run(git, root, ["write-tree"], timeoutMs)
+  if (headTree.code !== 0 || indexTree.code !== 0 || indexTree.stdout.trim() !== headTree.stdout.trim()) {
+    return "unsettled"
+  }
+  const status = await run(git, root, ["status", "--porcelain", "-z"], timeoutMs)
+  if (status.code !== 0 || status.timedOut === true || status.stdout !== "") return "unsettled"
+  const mergeHead = await run(git, root, ["rev-parse", "--git-path", "MERGE_HEAD"], timeoutMs)
+  if (mergeHead.code !== 0) return "unsettled"
+  // The proven tree must state every composition; a disagreement is evidence, never a retry.
+  for (const [path, composition] of composed) {
+    const stated = await run(git, root, ["ls-tree", "-z", tree, "--", path], timeoutMs)
+    if (stated.code !== 0) return "unsettled"
+    const record = nulRecords(stated.stdout)[0]
+    const [meta, statedPath] = record === undefined ? [] : record.split("\t")
+    const [mode, , oid] = meta === undefined ? [] : meta.split(" ")
+    if (statedPath !== path || mode !== "160000" || oid !== composition.sha) {
+      return {
+        detail: obviousDetail(
+          "gitlink-compose-unsettled",
+          `The native apply of ${target} aborted with nothing staged, and the prospective tree ${tree} does not state the composed gitlink ${JSON.stringify(path)} as ${composition.sha}.`,
+          `git -C ${root} status --short`,
+          "Preserve this checkout and report the disagreement; the merge was proven against a tree that does not carry it.",
+          "the caller",
+          { objectIds: [head, target, tree, composition.sha], paths, phase: "apply-merge" },
+        ),
+      }
+    }
+  }
+  const staged = await run(git, root, ["read-tree", "--reset", "-u", tree], timeoutMs)
+  if (staged.code !== 0) {
+    return {
+      detail: resultDetailFromGit(
+        "gitlink-compose-unsettled",
+        "settle-proven-composition",
+        root,
+        ["read-tree", "--reset", "-u", tree],
+        staged,
+        `The merge of ${target} composed every diverged gitlink, but the proven result ${tree} could not be staged.`,
+        `git -C ${root} status --short`,
+        "Inspect and preserve the uncommitted state before deciding whether a retry is safe.",
+        "the caller",
+        { objectIds: [head, target, tree], paths, phase: "apply-merge" },
+      ),
+    }
+  }
+  writeFileSync(resolve(root, mergeHead.stdout.trim()), `${target}\n`)
+  return "settled"
 }
 
 /** Every path the index holds at a conflicted stage; `undefined` when the index could not be read. */

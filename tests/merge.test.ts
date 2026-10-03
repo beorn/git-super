@@ -3621,6 +3621,49 @@ describe("git super merge", () => {
   })
 
   /**
+   * @failure The wrong-store 128 aborts the preflight AND the native apply, so a composition that was fully proven still comes back as the ordinary application failure and the merge never lands (27268 918).
+   * @level l1
+   * @consumer Yrd settled candidate preparation and landing
+   * @testonly none; both wrong-store failures are simulated, every composition step is native
+   */
+  it("settles the proven composition when the native apply also aborts and leaves the index unchanged", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-wrong-store-apply-918-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const diverged = divergeBothProductComponentsWithRootEdits(fixture)
+    const heldByBeta = git(fixture.beta, "rev-parse", "HEAD")
+    const local = createLocalGitProcess()
+    const result = await superMerge({
+      commit: diverged.candidate,
+      git: corruptNativeApply(
+        wrongStoreFirstMerge(local, fixture.product, diverged.alphaOurs),
+        fixture.product,
+        heldByBeta,
+        "packages/alpha",
+      ),
+      repo: fixture.product,
+    })
+
+    expect(result.state, JSON.stringify(result)).toBe("updated")
+    // Final parents are the real HEAD and the merged target, never the carrier.
+    const parents = git(fixture.product, "rev-list", "--parents", "-n", "1", "HEAD").trim().split(/\s+/u).slice(1)
+    expect(parents).toEqual([diverged.head, diverged.candidate])
+    // Both diverged gitlinks landed as the component merge of BOTH sides.
+    const alphaPin = git(fixture.product, "ls-tree", "HEAD", "packages/alpha").trim().split(/\s+/u)[2] ?? ""
+    expect(git(fixture.alpha, "rev-list", "--parents", "-n", "1", alphaPin).trim().split(/\s+/u).slice(1)).toEqual([
+      diverged.alphaOurs,
+      diverged.alphaTheirs,
+    ])
+    expect(git(fixture.alpha, "rev-parse", "HEAD")).toBe(diverged.alphaOurs)
+    // Ordinary root edits from BOTH sides survive the settled merge.
+    expect(git(fixture.product, "show", `HEAD:${diverged.oursRoot}`).trim()).toBe("ours")
+    expect(git(fixture.product, "show", `HEAD:${diverged.theirsRoot}`).trim()).toBe("theirs")
+    // Nothing user-visible names a carrier commit, and the tree is left clean.
+    expect(git(fixture.product, "log", "-1", "--format=%B")).not.toContain("carrier")
+    expect(git(fixture.product, "status", "--porcelain").trim()).toBe("")
+  })
+
+  /**
    * @failure A wrong-store divergence with an ordinary root conflict leaks the scratch carrier into the refusal (27268).
    * @level l1
    * @consumer Yrd settled candidate preparation and landing
