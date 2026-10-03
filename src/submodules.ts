@@ -4,7 +4,7 @@ import { setTimeout as delay } from "node:timers/promises"
 import { existsSync, realpathSync } from "node:fs"
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises"
 import { dirname, join, relative, resolve } from "node:path"
-import { fileURLToPath, pathToFileURL } from "node:url"
+import { fileURLToPath } from "node:url"
 import { createLogger, type ConditionalLogger, type LogLevel } from "loggily"
 import { cleanGitRepositoryEnvironment, validateExcludedSubmodules } from "./git.ts"
 import type { NotCompared } from "./diff.ts"
@@ -1093,7 +1093,6 @@ export async function materializeSubmodules(
     }
     const prepared: Array<
       Readonly<{
-        args: readonly string[]
         isLocal: boolean
         name: string
         nestedReference: string | undefined
@@ -1148,30 +1147,6 @@ export async function materializeSubmodules(
         selectedRemote = resolveSubmoduleOrigin(worktree, base, declaredUrl)
       }
       const isLocal = canBorrow
-      const args = [
-        "-c",
-        "submodule.recurse=false",
-        "-c",
-        `submodule.alternateLocation=${SUBMODULE_ALTERNATE_LOCATION}`,
-        "-c",
-        `submodule.alternateErrorStrategy=${SUBMODULE_ALTERNATE_ERROR_STRATEGY}`,
-        ...(borrowFrom === undefined
-          ? []
-          : [
-              "-c",
-              "protocol.file.allow=always",
-              "-c",
-              `url.${pathToFileURL(borrowFrom).href}.insteadOf=${configuredUrl.stdout.trim()}`,
-            ]),
-        "submodule",
-        "update",
-        "--init",
-        ...(isLocal ? ["--no-fetch"] : []),
-        ...(options.force ? ["--force"] : []),
-        ...(borrowFrom === undefined ? [] : ["--reference", borrowFrom]),
-        "--",
-        path,
-      ]
       if (isLocal) {
         borrowed += 1
       } else if (referenceSubmodule !== undefined) {
@@ -1190,7 +1165,6 @@ export async function materializeSubmodules(
         unreferencedPaths.push(path)
       }
       prepared.push({
-        args,
         isLocal,
         name,
         referenceIsPrepared,
@@ -1393,7 +1367,6 @@ export async function materializeSubmodules(
       required,
       remote,
     }: Readonly<{
-      args: readonly string[]
       isLocal: boolean
       name: string
       nestedReference: string | undefined
@@ -1405,6 +1378,8 @@ export async function materializeSubmodules(
       const source = isLocal ? "local" : "remote"
       const submoduleDir = join(worktree, path)
       const freshClone = !existsSync(join(submoduleDir, ".git"))
+      const level = await durableLevel()
+      if (typeof level !== "string") return level
       // The span closes over the `git.run` ALONE. Letting it wrap the recursive
       // walk below would bill every nested submodule to its parent, so the one
       // submodule at the root of a deep tree would appear to be the slow one
@@ -1520,8 +1495,6 @@ export async function materializeSubmodules(
         const synced = await syncOriginTrackingRefs(git, submoduleDir, nestedReference, log)
         if (synced.code !== 0) return synced
       }
-      const level = await durableLevel()
-      if (typeof level !== "string") return level
       const durableGitDir = join(level, "modules", name)
       const anchored = await anchorDurableAlternates(git, submoduleDir, durableGitDir, log)
       if (anchored.code !== 0) return anchored

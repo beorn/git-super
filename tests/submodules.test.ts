@@ -5,7 +5,16 @@
  * @reach fs-walk <fixture-only: materializers use mkdtemp(canonicalTmpdir()) Git repos>
  * @testonly syncOriginTrackingRefs: unit test for tracking ref sync across borrowed submodules
  */
-import { existsSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs"
 import { mkdir, mkdtemp, rm } from "node:fs/promises"
 import { spawnSync } from "node:child_process"
 import {
@@ -93,14 +102,27 @@ function withReferenceStores(git: SubmoduleGit): SubmoduleGit {
 function withDurableStores(
   git: SubmoduleGit,
   worktree: string,
-  root: string,
+  _root: string,
   modules: Record<string, string>,
 ): SubmoduleGit {
+  // The process double now creates standard metadata through init/checkout;
+  // physical custody paths must be fixture-owned even when Git itself is fake.
+  const root = mkdtempSync(join(tmpdir(), "git-super-mocked-module-store-"))
+  roots.push(root)
+  for (const name of Object.values(modules)) mkdirSync(join(root, "modules", name, "objects"), { recursive: true })
   return {
     ...git,
     async run(repo, args, allowFailure) {
       if (args[0] === "rev-parse" && args.includes("--git-common-dir") && repo === worktree) {
         return { ...success(), stdout: `${root}\n` }
+      }
+      if (args[0] === "rev-parse" && args.includes("--absolute-git-dir") && repo === worktree) {
+        return { ...success(), stdout: `${root}\n` }
+      }
+      if (args[0] === "rev-parse" && args.includes("--git-common-dir") && repo !== worktree) {
+        const path = Object.keys(modules).find((candidate) => repo === join(worktree, candidate))
+        const name = path === undefined ? undefined : modules[path]
+        return { ...success(), stdout: `${name === undefined ? root : join(root, "modules", name)}\n` }
       }
       if (args[0] === "rev-parse" && args.includes("--git-path")) {
         const path = Object.keys(modules).find((candidate) => repo === join(worktree, candidate))
@@ -581,7 +603,7 @@ describe("materializeSubmodules", () => {
       expect(requests.some(({ args }) => args[0] === "fetch")).toBe(false)
       if (pinState === "nested") {
         expect(git(join(candidate, "gamma", "nested"), ["rev-parse", "HEAD"]).trim()).toBe(nestedPin)
-        expect(requests.filter(({ args }) => args.includes("submodule") && args.includes("update"))).toHaveLength(2)
+        expect(requests.some(({ args }) => args.includes("submodule") && args.includes("update"))).toBe(false)
       }
     } else if (pinState === "nested-missing") {
       // The existing nested capability arm supplies both stores explicitly;
@@ -1054,7 +1076,8 @@ describe("materializeSubmodules", () => {
   })
 
   it("SAYS SO when no reference store was supplied, instead of materializing silently", async () => {
-    const worktree = "/candidate"
+    const worktree = await mkdtemp(join(tmpdir(), "git-super-unreferenced-candidate-"))
+    roots.push(worktree)
     const messages: string[] = []
     const git: SubmoduleGit = {
       async run(repo, args) {
@@ -1437,7 +1460,8 @@ describe("materializeSubmodules", () => {
   })
 
   it("permits fallback only when the caller raises the limit deliberately", async () => {
-    const worktree = "/candidate"
+    const worktree = await mkdtemp(join(tmpdir(), "git-super-fallback-candidate-"))
+    roots.push(worktree)
     const referenceWorktree = await mkdtemp(join(tmpdir(), "git-super-fallback-reference-"))
     roots.push(referenceWorktree)
     // A COLD store: the budget is about pins a store cannot serve, and there is
@@ -1480,7 +1504,11 @@ describe("materializeSubmodules", () => {
         // The store is there and stays cold: the warm-up runs, fails, and the
         // raised budget is what lets the fallback happen instead of a refusal.
         if (args[0] === "cat-file" && args[1] === "-e") return { ...success(), code: 1 }
-        if (args[0] === "fetch") return { ...success(), code: 1, stderr: "could not read from remote\n" }
+        if (args[0] === "fetch") {
+          return repo.startsWith(worktree)
+            ? success()
+            : { ...success(), code: 1, stderr: "could not read from remote\n" }
+        }
         return success()
       },
     }
@@ -1512,7 +1540,8 @@ describe("materializeSubmodules", () => {
     const referenceWorktree = await mkdtemp(join(tmpdir(), "git-super-warm-"))
     roots.push(referenceWorktree)
     await mkdir(join(referenceWorktree, "apps/maddoc"), { recursive: true })
-    const worktree = "/candidate"
+    const worktree = await mkdtemp(join(tmpdir(), "git-super-warm-candidate-"))
+    roots.push(worktree)
     const required = "d".repeat(40)
     const messages: string[] = []
     const commands: Array<Readonly<{ repo: string; args: readonly string[] }>> = []
@@ -1595,7 +1624,8 @@ describe("materializeSubmodules", () => {
     const referenceWorktree = await mkdtemp(join(tmpdir(), "git-super-spans-"))
     roots.push(referenceWorktree)
     await mkdir(join(referenceWorktree, "apps/maddoc"), { recursive: true })
-    const worktree = "/candidate"
+    const worktree = await mkdtemp(join(tmpdir(), "git-super-spans-candidate-"))
+    roots.push(worktree)
     const required = "e".repeat(40)
 
     const git: SubmoduleGit = {
@@ -1781,12 +1811,13 @@ describe("materializeSubmodules", () => {
   })
 
   it("initializes sibling paths in one config mutation before parallel updates", async () => {
-    const worktree = "/worktree"
+    const worktree = await mkdtemp(join(tmpdir(), "git-super-siblings-candidate-"))
+    roots.push(worktree)
     const paths = ["vendor/one", "vendor/two", "vendor/three"]
-    const commands: Array<Readonly<{ args: readonly string[]; mutation: boolean }>> = []
+    const commands: Array<Readonly<{ repo?: string; args: readonly string[]; mutation: boolean }>> = []
     const git: SubmoduleGit = {
       async run(repo, args) {
-        commands.push({ args, mutation: false })
+        commands.push({ repo, args, mutation: false })
         if (args[0] === "rev-parse" && args.includes("--verify") && args.at(-1) === "HEAD") {
           return { ...success(), stdout: "7".repeat(40) }
         }
@@ -1845,8 +1876,8 @@ describe("materializeSubmodules", () => {
     ])
     expect(
       commands
-        .filter(({ args }) => args.includes("update"))
-        .map(({ args }) => args.at(-1))
+        .filter(({ args }) => args[0] === "checkout")
+        .map(({ repo }) => repo?.slice(worktree.length + 1))
         .toSorted(),
     ).toEqual(paths.toSorted())
   })
@@ -1858,7 +1889,8 @@ describe("materializeSubmodules", () => {
     // every fetch, push, submit and landing stopped for the whole fleet. A
     // borrow is a local clone and can fan out; a remote fallback is a network
     // connection and must not.
-    const worktree = "/candidate"
+    const worktree = await mkdtemp(join(tmpdir(), "git-super-parallel-candidate-"))
+    roots.push(worktree)
     // referenceContains checks existsSync(<reference>/<path>) before asking
     // git, so the borrowable reference stores must exist on disk.
     const referenceWorktree = await mkdtemp(join(tmpdir(), "git-super-reference-"))
@@ -1920,8 +1952,8 @@ describe("materializeSubmodules", () => {
         if (args[0] === "config" && args[1] === "--get") {
           return { ...success(), stdout: "https://example.invalid/module.git\n" }
         }
-        if (args.includes("update")) {
-          const isBorrow = args.includes("--reference")
+        if (args[0] === "checkout") {
+          const isBorrow = borrowable.some((path) => repo === join(worktree, path))
           if (isBorrow) {
             inFlightLocal += 1
             peakLocal = Math.max(peakLocal, inFlightLocal)
