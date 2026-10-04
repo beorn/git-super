@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process"
 import { alternateEntries, alternatesLineage } from "./alternates.ts"
 import { setTimeout as delay } from "node:timers/promises"
 import { existsSync, realpathSync } from "node:fs"
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises"
+import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises"
 import { dirname, join, relative, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { createLogger, type ConditionalLogger, type LogLevel } from "loggily"
@@ -13,6 +13,7 @@ import { createLocalGitProcess, type GitProcess, type GitProcessRequest, type Gi
 import { shellQuote } from "./shell-command.ts"
 import { nestedStoreMissingDetail, preparedPinFetchArgs, preparedSubmoduleStore } from "./submodule-prepare.ts"
 import { resolveSubmoduleOrigin } from "./submodule-origin.ts"
+import { ensureCommitObject } from "./objects.ts"
 import { readCommitSubmodules, type CommitSubmodule, type SelectedCommitSubmodules } from "./commit-graph.ts"
 
 export const SUBMODULE_ALTERNATE_LOCATION = "superproject"
@@ -138,6 +139,7 @@ type Probe = Readonly<{
   referenceHasIt: boolean
   referenceIsPrepared: boolean
   referenceSubmodule: string | undefined
+  selectedSourceSubmodule: string | undefined
   required: string
 }>
 
@@ -319,6 +321,99 @@ async function referenceStoreAt(git: SubmoduleGit, referenceSubmodule: string): 
   const toplevel = top.stdout.trim()
   if (top.code !== 0 || toplevel === "") return false
   return canonical(toplevel) === canonical(referenceSubmodule)
+}
+
+/** Verify new borrowing without changing a live primary's alternates. */
+async function primaryClosure(
+  git: SubmoduleGit,
+  primary: string,
+  source: string,
+  commit: string,
+  imported: boolean,
+): Promise<SubmoduleGitResult> {
+  const directory = await git.run(primary, ["rev-parse", "--absolute-git-dir"], true)
+  if (directory.code !== 0 || directory.stdout.trim() === "") {
+    return {
+      ...directory,
+      code: directory.code || 1,
+      stderr: `cannot resolve primary object custody for '${primary}' at ${commit}\n${directory.stderr}`,
+    }
+  }
+  const objects = join(directory.stdout.trim(), "objects")
+  let alternates = ""
+  try {
+    alternates = await readFile(join(objects, "info", "alternates"), "utf8")
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      return {
+        code: 1,
+        stdout: "",
+        stderr: `cannot inspect primary alternates in '${primary}' at ${commit}: ${String(error)}`,
+      }
+    }
+    // silent-fallback-allow: an absent optional alternates file borrows no objects
+  }
+  if (alternates.trim() === "" && !imported) return success()
+  const closure = await git.run(primary, ["rev-list", "--objects", "--missing=error", commit], true)
+  if (closure.code !== 0) {
+    return {
+      ...closure,
+      stderr: `primary '${primary}' lacks complete closure for ${commit} from selected source '${source}'\n${closure.stderr}`,
+    }
+  }
+  if (alternates.trim() === "") return success()
+  const missing = new Set(
+    closure.stdout
+      .split(/\r?\n/u)
+      .filter(Boolean)
+      .flatMap((line) => line.split(" ", 1)),
+  )
+  if (!missing.has(commit) || [...missing].some((oid) => !/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/u.test(oid))) {
+    return {
+      code: 1,
+      stdout: "",
+      stderr: `cannot prove primary closure in '${primary}' at ${commit}: rev-list returned empty or malformed object identities`,
+    }
+  }
+  for (const oid of missing) {
+    if (existsSync(join(objects, oid.slice(0, 2), oid.slice(2)))) missing.delete(oid)
+  }
+  if (missing.size > 0) {
+    let packs: string[]
+    try {
+      packs = await readdir(join(objects, "pack"))
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        return {
+          code: 1,
+          stdout: "",
+          stderr: `cannot inspect primary packs in '${primary}' at ${commit}: ${String(error)}`,
+        }
+      }
+      // silent-fallback-allow: an absent optional pack directory supplies no packed objects
+      packs = []
+    }
+    for (const pack of packs.filter((name) => name.endsWith(".idx"))) {
+      const verified = await git.run(primary, ["verify-pack", "-v", join(objects, "pack", pack)], true)
+      if (verified.code !== 0) {
+        return {
+          ...verified,
+          stderr: `cannot verify primary pack custody in '${primary}' at ${commit}\n${verified.stderr}`,
+        }
+      }
+      for (const line of verified.stdout.split(/\r?\n/u)) {
+        const oid = /^([0-9a-f]{40}(?:[0-9a-f]{24})?) /u.exec(line)?.[1]
+        if (oid !== undefined) missing.delete(oid)
+      }
+      if (missing.size === 0) break
+    }
+  }
+  if (missing.size === 0) return success()
+  return {
+    code: 1,
+    stdout: "",
+    stderr: `git-super: refusing new borrow of ${commit}: primary '${primary}' depends on alternate storage for ${missing.size} required object(s), including ${missing.values().next().value}; selected source '${source}'. Repair existing lenders under #26497/#25949 before retrying; live alternates were not changed.`,
+  }
 }
 
 /**
@@ -721,6 +816,7 @@ export async function materializeSubmodules(
     preparedReference = false,
     parentIdentity?: Readonly<{ commit: string; remote: string }>,
     logicalPath = "",
+    selectedSource = reference,
   ): Promise<SubmoduleGitResult> => {
     const policy = await configureSubmoduleAlternatePolicy(git, worktree)
     if (policy.code !== 0) return policy
@@ -889,7 +985,10 @@ export async function materializeSubmodules(
               let referenceSubmodule = reference === undefined ? undefined : join(reference, path)
               let referenceIsPrepared = false
               let referenceHasIt =
-                referenceSubmodule !== undefined && (await referenceContains(git, referenceSubmodule, required))
+                referenceSubmodule !== undefined &&
+                (await referenceStoreAt(git, referenceSubmodule)) &&
+                (await promisorRemote(git, referenceSubmodule)) === undefined &&
+                (await referenceContains(git, referenceSubmodule, required))
               let detached =
                 heldInWorktree || referenceHasIt || reference === undefined || preparedReference
                   ? undefined
@@ -944,6 +1043,7 @@ export async function materializeSubmodules(
                 referenceHasIt,
                 referenceIsPrepared,
                 referenceSubmodule,
+                selectedSourceSubmodule: selectedSource === undefined ? undefined : join(selectedSource, path),
                 required,
               }
             }),
@@ -965,10 +1065,12 @@ export async function materializeSubmodules(
       referenceHasIt: refHasIt,
       referenceIsPrepared,
       referenceSubmodule,
+      selectedSourceSubmodule,
       required,
     } of probes as Probe[]) {
       let canBorrow = borrowable
       let referenceHasIt = refHasIt
+      let imported = false
       if (!canBorrow && referenceSubmodule !== undefined) {
         // One connection into the reference repairs it for every later bay;
         // sixteen connections out of sixteen candidates repair nothing.
@@ -1020,39 +1122,94 @@ export async function materializeSubmodules(
             why: `reference is a partial clone (${promisor}); object presence there cannot prove the borrow is local`,
           })
         } else {
-          // The one network call on the healthy path. Its own span, because
-          // "materialization was slow" and "the reference store was cold" are
-          // different problems with different owners, and only the split tells
-          // you which one you have.
-          using warmSpan = log?.span?.("warm", { path, required, reference: referenceSubmodule })
-          log?.debug?.("warming the reference with one fetch", { path, required })
-          const warm = await warmReference(git, referenceSubmodule, required)
-          referenceHasIt = warm.code === 0 && (await referenceContains(git, referenceSubmodule, required))
-          canBorrow = referenceHasIt
-          if (warmSpan !== undefined) {
-            Object.assign(warmSpan.spanData, { outcome: canBorrow ? "warmed" : "failed" })
+          // The selected linked checkout may hold a pin that neither primary
+          // nor origin has. Import it into primary; only primary may lend.
+          if (
+            selectedSourceSubmodule !== undefined &&
+            canonical(selectedSourceSubmodule) !== canonical(referenceSubmodule) &&
+            (await referenceStoreAt(git, selectedSourceSubmodule))
+          ) {
+            const sourcePromisor = await promisorRemote(git, selectedSourceSubmodule)
+            if (sourcePromisor !== undefined) {
+              return {
+                code: 1,
+                stdout: "",
+                stderr: `git-super: selected source '${selectedSourceSubmodule}' is a partial clone (${sourcePromisor}); refusing local import of ${required} into primary '${referenceSubmodule}'.`,
+              }
+            }
+            if (await referenceContains(git, selectedSourceSubmodule, required)) {
+              try {
+                await ensureCommitObject({
+                  repository: referenceSubmodule,
+                  remote: selectedSourceSubmodule,
+                  commit: required,
+                  git: {
+                    run: (request) =>
+                      git.run(
+                        request.repo,
+                        request.args,
+                        true,
+                        request.stdin === undefined ? {} : { stdin: request.stdin },
+                      ),
+                  },
+                })
+                imported = true
+              } catch (error) {
+                return {
+                  code: 1,
+                  stdout: "",
+                  stderr: `git-super: cannot import ${required} from selected source '${selectedSourceSubmodule}' into primary '${referenceSubmodule}': ${error instanceof Error ? error.message : String(error)}`,
+                }
+              }
+              referenceHasIt = await referenceContains(git, referenceSubmodule, required)
+              canBorrow = referenceHasIt
+            }
           }
-          if (canBorrow) {
-            warmed += 1
-            // The object came over the wire even though the borrow succeeded, so
-            // the path belongs beside the fallbacks: both are network work.
-            remotePaths.push(path)
-          } else {
-            misses.push({
-              absentStore: false,
-              detached: undefined,
-              originRejected: warm.code !== 0 && REMOTE_PIN_REJECTION.test(warm.stderr),
-              path,
-              reference: referenceSubmodule,
-              required,
-              worktreeSubmodule: join(worktree, path),
-              why:
-                warm.code === 0
-                  ? "warm-up fetch succeeded but the reference still lacks the commit"
-                  : `warm-up fetch failed: ${warm.stderr.trim() || `exit ${warm.code}`}`,
-            })
+          if (!canBorrow) {
+            // The one network call on the healthy path. Its own span, because
+            // "materialization was slow" and "the reference store was cold" are
+            // different problems with different owners, and only the split tells
+            // you which one you have.
+            using warmSpan = log?.span?.("warm", { path, required, reference: referenceSubmodule })
+            log?.debug?.("warming the reference with one fetch", { path, required })
+            const warm = await warmReference(git, referenceSubmodule, required)
+            referenceHasIt = warm.code === 0 && (await referenceContains(git, referenceSubmodule, required))
+            canBorrow = referenceHasIt
+            if (warmSpan !== undefined) {
+              Object.assign(warmSpan.spanData, { outcome: canBorrow ? "warmed" : "failed" })
+            }
+            if (canBorrow) {
+              warmed += 1
+              // The object came over the wire even though the borrow succeeded, so
+              // the path belongs beside the fallbacks: both are network work.
+              remotePaths.push(path)
+            } else {
+              misses.push({
+                absentStore: false,
+                detached: undefined,
+                originRejected: warm.code !== 0 && REMOTE_PIN_REJECTION.test(warm.stderr),
+                path,
+                reference: referenceSubmodule,
+                required,
+                worktreeSubmodule: join(worktree, path),
+                why:
+                  warm.code === 0
+                    ? "warm-up fetch succeeded but the reference still lacks the commit"
+                    : `warm-up fetch failed: ${warm.stderr.trim() || `exit ${warm.code}`}`,
+              })
+            }
           }
         }
+      }
+      if (referenceHasIt && referenceSubmodule !== undefined) {
+        const custody = await primaryClosure(
+          git,
+          referenceSubmodule,
+          selectedSourceSubmodule ?? referenceSubmodule,
+          required,
+          imported,
+        )
+        if (custody.code !== 0) return custody
       }
       resolved.push({
         canBorrow,
@@ -1063,6 +1220,7 @@ export async function materializeSubmodules(
         referenceHasIt,
         referenceIsPrepared,
         referenceSubmodule,
+        selectedSourceSubmodule,
         required,
       })
       considered += 1
@@ -1537,6 +1695,7 @@ export async function materializeSubmodules(
         referenceIsPrepared,
         { commit: required, remote },
         logicalPath === "" ? path : `${logicalPath}/${path}`,
+        selectedSource === undefined ? undefined : join(selectedSource, path),
       )
     }
     for (let start = 0; start < local.length; start += MAX_CONCURRENT_SUBMODULE_UPDATES) {
@@ -1555,7 +1714,17 @@ export async function materializeSubmodules(
 
   const selectedPaths = options.paths === undefined ? undefined : new Set(options.paths)
   using span = log?.span?.("materialize", { worktree: options.worktree, reference: referenceRoot })
-  const result = await walk(options.worktree, referenceRoot, resolveDurableRoot, selectedPaths)
+  const result = await walk(
+    options.worktree,
+    referenceRoot,
+    resolveDurableRoot,
+    selectedPaths,
+    0,
+    false,
+    undefined,
+    "",
+    referenceRoot === undefined ? undefined : (options.referenceWorktree ?? referenceRoot),
+  )
   // ONE record carrying the totals AND what they are totals of. The counters
   // existed before this and were printed into a log with no reader; a reader
   // that gets `remoteFallbacks: 16` still cannot tell a broken reference store
@@ -1644,7 +1813,7 @@ export async function materializeSubmodulesWithProcess(
   const { referenceWorktree: _requestedReference, ...selected } = options
   return materializeSubmodules(git, {
     ...selected,
-    ...(referenceWorktree === undefined ? {} : { referenceWorktree }),
+    ...(referenceWorktree === undefined ? {} : { referenceWorktree: options.referenceWorktree ?? referenceWorktree }),
   })
 }
 
@@ -1704,6 +1873,17 @@ async function discoverReferenceWorktree(
   // A reference naming the worktree itself explicitly opts out of borrowing.
   const selfReference =
     options.referenceWorktree !== undefined && canonical(options.referenceWorktree) === canonical(options.worktree)
+  if (
+    options.referenceWorktree !== undefined &&
+    !selfReference &&
+    !(await referenceStoreAt(git, options.referenceWorktree))
+  ) {
+    return {
+      code: 1,
+      stdout: "",
+      stderr: `git-super: cannot prove selected source identity for '${options.referenceWorktree}' while materializing '${options.worktree}'; the requested checkout is absent or resolves to another repository.`,
+    }
+  }
   const discovered = selfReference
     ? undefined
     : await primaryWorktree(git, options.referenceWorktree ?? options.worktree)
@@ -1806,7 +1986,7 @@ export async function materializeSubmodulesFromLocalWorktreeParallel(
   }
   const result = await materializeSubmodules(git, {
     worktree: options.worktree,
-    ...(referenceWorktree === undefined ? {} : { referenceWorktree }),
+    ...(referenceWorktree === undefined ? {} : { referenceWorktree: options.referenceWorktree ?? referenceWorktree }),
     ...(options.paths === undefined ? {} : { paths: options.paths }),
     ...(options.excludedSubmodules === undefined ? {} : { excludedSubmodules: options.excludedSubmodules }),
     ...(options.log === undefined ? {} : { log: options.log }),

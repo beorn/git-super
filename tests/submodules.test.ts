@@ -2138,9 +2138,13 @@ describe("materializeSubmodules", () => {
   // Git registers that primary at its separate submodule Git directory (26996).
   // Request the unpublished linked pin: merely creating it while materializing
   // the old root pin missed hh 27426 and never exercised local object custody.
-  it.each([false, true])(
-    "loads a linked private pin and borrows only from primary; submodule parent=%s",
-    async (submoduleParent) => {
+  it.each([
+    [false, false],
+    [true, false],
+    [false, true],
+  ])(
+    "loads a linked private pin and borrows only from primary; submodule parent=%s dependent primary=%s",
+    async (submoduleParent, dependentPrimary) => {
       const root = await mkdtemp(join(tmpdir(), "git-super-primary-reference-"))
       roots.push(root)
       const dependency = join(root, "dependency")
@@ -2197,6 +2201,24 @@ describe("materializeSubmodules", () => {
       git(linked, ["add", "vendor/dependency"])
       git(linked, ["commit", "-qm", "pin unpublished linked dependency"])
       const linkedPin = git(linked, ["rev-parse", "HEAD"]).trim()
+      if (dependentPrimary) {
+        // A visible commit is not physical custody: primary can see this pin
+        // solely through the disposable selected source (hh 27426 CTO boundary).
+        const primaryObjects = git(join(owner, "vendor/dependency"), [
+          "rev-parse",
+          "--path-format=absolute",
+          "--git-path",
+          "objects",
+        ]).trim()
+        const sourceObjects = git(linkedDependency, [
+          "rev-parse",
+          "--path-format=absolute",
+          "--git-path",
+          "objects",
+        ]).trim()
+        mkdirSync(join(primaryObjects, "info"), { recursive: true })
+        writeFileSync(join(primaryObjects, "info", "alternates"), `${sourceObjects}\n`)
+      }
       git(owner, ["worktree", "add", "-q", "--detach", candidate, linkedPin])
 
       const previousGitAllowProtocol = process.env.GIT_ALLOW_PROTOCOL
@@ -2211,6 +2233,14 @@ describe("materializeSubmodules", () => {
       } finally {
         if (previousGitAllowProtocol === undefined) delete process.env.GIT_ALLOW_PROTOCOL
         else process.env.GIT_ALLOW_PROTOCOL = previousGitAllowProtocol
+      }
+      if (dependentPrimary) {
+        expect(materialized.code, "a dependent primary must refuse the new borrow").not.toBe(0)
+        expect(materialized.stderr).toContain(join(owner, "vendor/dependency"))
+        expect(materialized.stderr).toContain(linkedDependency)
+        expect(materialized.stderr).toContain(privatePin)
+        expect(materialized.stderr).toContain("26497")
+        return
       }
       expect(materialized, materialized.stderr).toMatchObject({ code: 0, borrowed: 1, remoteFallbacks: 0 })
 
