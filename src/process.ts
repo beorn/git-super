@@ -136,12 +136,13 @@ export async function delegateNativeGit(
   stderr: ProcessOutputSink,
   replaceProcess: boolean,
 ): Promise<number> {
-  if (typeof Bun === "undefined") {
+  const bunVersion = process.versions.bun
+  if (bunVersion === undefined) {
     throw new Error("git-super: native delegation is a Bun CLI operation; Bun CLI requires Bun >=1.3.14")
   }
   if (replaceProcess) {
     if (process.execve === undefined) {
-      throw new Error(`git-super: Bun ${Bun.version} lacks process.execve; use Bun >=1.3.14 for native Git delegation`)
+      throw new Error(`git-super: Bun ${bunVersion} lacks process.execve; use Bun >=1.3.14 for native Git delegation`)
     }
     const executable = nativeGitExecutable()
     process.execve(executable, [executable, ...args], process.env)
