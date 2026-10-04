@@ -2313,13 +2313,26 @@ async function admitOwningStoreInternalCommit(
  * output for a bare name (measured 2026-10-04: a temporary repository, an all-zero/absent SHA and a non-hex name).
  * Anything else — a timeout, a transport failure, or a repository git cannot even open — proved nothing about
  * ownership, so an absent answer is the ONLY non-zero result 27315 lets continue past.
+ *
+ * A PRESENT loose object truncated to empty is NOT absence (27315 review of candidate 8b5d142): git exits 128 and still
+ * ends with that same generic invalid-name fatal, but prefixes it with `error: object file ... is empty`. Matching the
+ * generic line anywhere read real corruption as absence and admitted composition on an unreadable ownership proof, so
+ * the fatal must be the ENTIRE output. Extra diagnostics keep the original refusal — never drop it for a near miss.
  */
+const ABSENCE_FATAL = /^fatal: Not a valid object name .+\^\{(?:commit|tree|object|tag)\}$/u
+
 function ownershipAbsenceProven(result: GitProcessResult): boolean {
   if (result.failure !== undefined) return false
   if (result.timedOut === true || result.stalled === true) return false
   if (result.backstop !== undefined || result.signal != null) return false
   if (result.code === 1) return result.stderr.trim() === ""
-  return result.code === 128 && /not a valid object name/iu.test(result.stderr)
+  if (result.code !== 128) return false
+  const lines = result.stderr
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line !== "")
+  const [only] = lines
+  return lines.length === 1 && only !== undefined && ABSENCE_FATAL.test(only)
 }
 
 async function composeWrongStoreGitlinks(

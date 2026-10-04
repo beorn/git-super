@@ -770,14 +770,17 @@ function wrongStoreFirstMerge(local: GitProcess, product: string, unreadable: st
  * The wrong-store 128 PLUS an UNAVAILABLE ownership probe in the OTHER component's store: its `cat-file -e` for the
  * internal commit times out, fails in transport, or cannot even open the repository. 27315 review d0d1d55f: an
  * unreadable ownership proof must keep the original refusal, because it proves nothing about whether that store also
- * holds the commit. Only a PROVEN absence (git's own "Not a valid object name") may continue. Every other call is
- * native.
+ * holds the commit. 27315 review of candidate 8b5d142 adds the native corrupt-object shape: a PRESENT loose object
+ * truncated to empty makes `cat-file -e` exit 128 with two `error: object file ... is empty` lines followed by the
+ * GENERIC `fatal: Not a valid object name` line, so a substring match on that final line alone would read real
+ * corruption as absence. Only a PROVEN absence (git's own single generic invalid-name fatal) may continue. Every
+ * other call is native.
  */
 function unavailableSecondStoreProbe(
   local: GitProcess,
   product: string,
   unreadable: string,
-  mode: "timeout" | "transport-failure" | "fatal-store",
+  mode: "timeout" | "transport-failure" | "fatal-store" | "corrupt-object",
 ): GitProcess {
   const base = wrongStoreFirstMerge(local, product, unreadable)
   return {
@@ -794,6 +797,17 @@ function unavailableSecondStoreProbe(
             stdout: "",
             stderr: "owning store unavailable",
             failure: "Error: spawn git EACCES",
+          })
+        }
+        if (mode === "corrupt-object") {
+          const loose = `.git/objects/${unreadable.slice(0, 2)}/${unreadable.slice(2)}`
+          return Promise.resolve({
+            code: 128,
+            stdout: "",
+            stderr:
+              `error: object file ${loose} is empty\n` +
+              `error: object file ${loose} is empty\n` +
+              `fatal: Not a valid object name ${unreadable}^{commit}\n`,
           })
         }
         return Promise.resolve({
@@ -3521,13 +3535,13 @@ describe("git super merge", () => {
   })
 
   /**
-   * @failure An ownership probe in the other component's store that is UNAVAILABLE (timeout, transport failure, or a repository git cannot open) is read as absence and admits composition on unproven unique ownership (27315 review d0d1d55f).
+   * @failure An ownership probe in the other component's store that is UNAVAILABLE (timeout, transport failure, a repository git cannot open, or a PRESENT loose object truncated to empty whose exit 128 carries the generic invalid-name fatal) is read as absence and admits composition on unproven unique ownership (27315 review d0d1d55f, candidate 8b5d142).
    * @level l1
    * @consumer Yrd settled candidate preparation and landing
-   * @testonly The unavailable second-store probe is simulated; the wrong-store 128 is simulated; every composition step is native.
+   * @testonly The unavailable/corrupt second-store probe is simulated; the wrong-store 128 is simulated; every composition step is native.
    */
   it("keeps the original refusal when another store's ownership probe is unavailable", async () => {
-    for (const mode of ["timeout", "transport-failure", "fatal-store"] as const) {
+    for (const mode of ["timeout", "transport-failure", "fatal-store", "corrupt-object"] as const) {
       const fixtureRoot = mkdtempSync(join(tmpdir(), `git-super-merge-unavailable-probe-${mode}-`))
       roots.push(fixtureRoot)
       const fixture = createProductFixture(fixtureRoot)
