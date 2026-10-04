@@ -2147,6 +2147,7 @@ describe("materializeSubmodules", () => {
     [false, "alternate-source", "process"],
     [false, "promisor-source", "process"],
     [false, "packed-independent", "process"],
+    [false, "broken-alternates", "process"],
   ])(
     "loads a linked private pin and borrows only from primary; submodule parent=%s custody=%s adapter=%s",
     async (submoduleParent, custody, adapter) => {
@@ -2242,7 +2243,7 @@ describe("materializeSubmodules", () => {
         writeFileSync(join(sourceObjects, "info", "alternates"), `${lenderObjects}\n`)
       }
       if (custody === "promisor-source") git(linkedDependency, ["config", "remote.origin.promisor", "true"])
-      if (custody === "packed-independent") {
+      if (custody === "packed-independent" || custody === "broken-alternates") {
         // Keep the imported private objects packed, so custody must inspect the
         // primary's own pack instead of accepting visibility through alternates.
         git(join(owner, "vendor/dependency"), [
@@ -2252,6 +2253,18 @@ describe("materializeSubmodules", () => {
           linkedDependency,
           `${privatePin}:refs/git-super/pins/${privatePin}`,
         ])
+      }
+      if (custody === "broken-alternates") {
+        // Required primary metadata must be readable before any new borrow.
+        // A directory at the alternates-file path is a real filesystem fault,
+        // even though the primary physically owns the requested objects.
+        const alternates = git(join(owner, "vendor/dependency"), [
+          "rev-parse",
+          "--path-format=absolute",
+          "--git-path",
+          "objects/info/alternates",
+        ]).trim()
+        mkdirSync(alternates, { recursive: true })
       }
       if (custody === "dependent" || custody === "packed-independent") {
         // A visible commit is not physical custody: primary can see this pin
@@ -2315,6 +2328,13 @@ describe("materializeSubmodules", () => {
         expect(materialized.stderr).toContain(linkedDependency)
         expect(materialized.stderr).toContain(privatePin)
         expect(materialized.stderr).toContain("26497")
+        return
+      }
+      if (custody === "broken-alternates") {
+        expect(materialized.code, "unreadable primary alternates must refuse the new borrow").not.toBe(0)
+        expect(materialized.stderr).toContain("cannot inspect primary alternates")
+        expect(materialized.stderr).toContain(join(owner, "vendor/dependency"))
+        expect(materialized.stderr).toContain(privatePin)
         return
       }
       expect(materialized, materialized.stderr).toMatchObject({
