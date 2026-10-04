@@ -2136,9 +2136,10 @@ describe("materializeSubmodules", () => {
 
   // A linked target must borrow from the physical primary checkout even when
   // Git registers that primary at its separate submodule Git directory (26996).
-  // Ordinary top-level primary fixtures cannot expose that path distinction.
+  // Request the unpublished linked pin: merely creating it while materializing
+  // the old root pin missed hh 27426 and never exercised local object custody.
   it.each([false, true])(
-    "borrows only from the primary submodule store; submodule parent=%s",
+    "loads a linked private pin and borrows only from primary; submodule parent=%s",
     async (submoduleParent) => {
       const root = await mkdtemp(join(tmpdir(), "git-super-primary-reference-"))
       roots.push(root)
@@ -2188,7 +2189,15 @@ describe("materializeSubmodules", () => {
           encoding: "utf8",
         }).status,
       ).not.toBe(0)
-      git(owner, ["worktree", "add", "-q", "--detach", candidate, "HEAD"])
+      expect(
+        spawnSync("git", ["-C", dependency, "cat-file", "-e", `${privatePin}^{commit}`], {
+          encoding: "utf8",
+        }).status,
+      ).not.toBe(0)
+      git(linked, ["add", "vendor/dependency"])
+      git(linked, ["commit", "-qm", "pin unpublished linked dependency"])
+      const linkedPin = git(linked, ["rev-parse", "HEAD"]).trim()
+      git(owner, ["worktree", "add", "-q", "--detach", candidate, linkedPin])
 
       const previousGitAllowProtocol = process.env.GIT_ALLOW_PROTOCOL
       process.env.GIT_ALLOW_PROTOCOL = "file"
@@ -2206,6 +2215,7 @@ describe("materializeSubmodules", () => {
       expect(materialized, materialized.stderr).toMatchObject({ code: 0, borrowed: 1, remoteFallbacks: 0 })
 
       const candidateDependency = join(candidate, "vendor/dependency")
+      expect(git(candidateDependency, ["rev-parse", "HEAD"]).trim()).toBe(privatePin)
       const alternatesFile = git(candidateDependency, [
         "rev-parse",
         "--path-format=absolute",
@@ -2236,6 +2246,8 @@ describe("materializeSubmodules", () => {
       git(owner, ["worktree", "remove", "--force", linked])
       expect(git(candidateDependency, ["fsck", "--connectivity-only"]).trim()).toBe("")
       expect(git(candidateDependency, ["cat-file", "-e", "HEAD^{commit}"])).toBe("")
+      expect(git(candidateDependency, ["rev-list", "--objects", "--missing=error", privatePin])).toContain(privatePin)
+      expect(git(candidateDependency, ["show", "HEAD:dependency.txt"])).toBe("private linked commit\n")
     },
   )
 
