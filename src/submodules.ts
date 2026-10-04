@@ -487,8 +487,9 @@ const REMOTE_PIN_REJECTION = /not our ref|couldn'?t find remote ref|could not fi
  * borrow survivable, and because this runs after EVERY update — warm no-ops
  * included — it also heals stores emitted before the anchor existed.
  *
- * Never drops an existing line and keeps their order; the borrow's own lineage
- * is written before them (see below). Skips only a store that already IS the durable one.
+ * Fresh local borrowers use only the durable store, whose custody was checked
+ * before cloning. Existing stores keep every line in order, preceded by their
+ * lineage (see below). Skips a store that already IS the durable one.
  * A durable store that does not exist yet is announced and still anchored —
  * a dangling alternates line is harmless to git, and it becomes load-bearing
  * the moment the primary checkout materializes that submodule.
@@ -498,6 +499,7 @@ async function anchorDurableAlternates(
   checkout: string,
   durableGitDir: string,
   log?: ConditionalLogger,
+  freshBorrow = false,
 ): Promise<SubmoduleGitResult> {
   // Custody belongs to the repository's physical store. --git-path objects
   // follows GIT_OBJECT_DIRECTORY and would anchor into a selected public store.
@@ -537,8 +539,12 @@ async function anchorDurableAlternates(
   // reached through a chain, and git prints no "nesting too deep" (review2 cf994b3d). The existing lines follow in
   // their own order, then the durable line; nothing is dropped, and a file already in this shape is not written.
   // The durable store borrows from nothing, so it stays last, where its line always was.
-  const lineage = (await alternatesLineage(listed, canonical(ownObjects))).filter((entry) => entry !== target)
-  const desired = [...lineage, ...listed, target].filter((entry, index, all) => all.indexOf(entry) === index)
+  const lineage = freshBorrow
+    ? []
+    : (await alternatesLineage(listed, canonical(ownObjects))).filter((entry) => entry !== target)
+  const desired = freshBorrow
+    ? [target]
+    : [...lineage, ...listed, target].filter((entry, index, all) => all.indexOf(entry) === index)
   if (desired.length === listed.length && desired.every((entry, index) => entry === listed[index])) return success()
   if (!existsSync(durableObjects)) {
     log?.warn?.("durable module store does not exist yet; anchoring its line for when it does", {
@@ -1627,7 +1633,13 @@ export async function materializeSubmodules(
                   stderr: `cannot resolve reference metadata in ${nestedReference}\n${referenceDir.stderr}`,
                 }
               }
-              result = await anchorDurableAlternates(git, submoduleDir, referenceDir.stdout.trim(), log)
+              result = await anchorDurableAlternates(
+                git,
+                submoduleDir,
+                referenceDir.stdout.trim(),
+                log,
+                freshClone && isLocal,
+              )
               if (result.code !== 0) return result
               const heads = await git.run(
                 nestedReference,
@@ -1684,8 +1696,13 @@ export async function materializeSubmodules(
         if (synced.code !== 0) return synced
       }
       const durableGitDir = join(level, "modules", name)
-      const anchored = await anchorDurableAlternates(git, submoduleDir, durableGitDir, log)
-      if (anchored.code !== 0) return anchored
+      // Fresh local borrowers were anchored to the verified reference above.
+      // An explicit reference may belong to a different superproject, whose
+      // canonical store must not be replaced by this target's empty store.
+      if (!freshClone || !isLocal) {
+        const anchored = await anchorDurableAlternates(git, submoduleDir, durableGitDir, log)
+        if (anchored.code !== 0) return anchored
+      }
       return walk(
         submoduleDir,
         nestedReference,
@@ -1873,22 +1890,26 @@ async function discoverReferenceWorktree(
   // A reference naming the worktree itself explicitly opts out of borrowing.
   const selfReference =
     options.referenceWorktree !== undefined && canonical(options.referenceWorktree) === canonical(options.worktree)
-  if (
-    options.referenceWorktree !== undefined &&
-    !selfReference &&
-    !(await referenceStoreAt(git, options.referenceWorktree))
-  ) {
-    return {
-      code: 1,
-      stdout: "",
-      stderr: `git-super: cannot prove selected source identity for '${options.referenceWorktree}' while materializing '${options.worktree}'; the requested checkout is absent or resolves to another repository.`,
-    }
-  }
   const discovered = selfReference
     ? undefined
     : await primaryWorktree(git, options.referenceWorktree ?? options.worktree)
   if (discovered !== undefined && typeof discovered !== "string") return discovered
   if (discovered === undefined || canonical(discovered) === canonical(options.worktree)) return undefined
+  if (options.referenceWorktree !== undefined) {
+    const source = await git.run(
+      options.referenceWorktree,
+      ["rev-parse", "--path-format=absolute", "--show-toplevel"],
+      true,
+    )
+    const selected = source.stdout.trim()
+    if (source.code !== 0 || selected === "" || canonical(selected) !== canonical(options.referenceWorktree)) {
+      return {
+        ...source,
+        code: source.code || 1,
+        stderr: `git-super: cannot prove reference identity for '${options.worktree}' against '${options.referenceWorktree}': the source probe selected '${selected}', not the requested checkout.\n${source.stderr}`,
+      }
+    }
+  }
 
   // A submodule's primary path can name its Git directory, while its actual
   // checkout is selected by core.worktree. Bind the target first: rev-parse

@@ -11,6 +11,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -2139,12 +2140,16 @@ describe("materializeSubmodules", () => {
   // Request the unpublished linked pin: merely creating it while materializing
   // the old root pin missed hh 27426 and never exercised local object custody.
   it.each([
-    [false, false],
-    [true, false],
-    [false, true],
+    [false, "independent", "process"],
+    [true, "independent", "sync-host"],
+    [false, "dependent", "process"],
+    [false, "nested", "parallel-host"],
+    [false, "alternate-source", "process"],
+    [false, "promisor-source", "process"],
+    [false, "packed-independent", "process"],
   ])(
-    "loads a linked private pin and borrows only from primary; submodule parent=%s dependent primary=%s",
-    async (submoduleParent, dependentPrimary) => {
+    "loads a linked private pin and borrows only from primary; submodule parent=%s custody=%s adapter=%s",
+    async (submoduleParent, custody, adapter) => {
       const root = await mkdtemp(join(tmpdir(), "git-super-primary-reference-"))
       roots.push(root)
       const dependency = join(root, "dependency")
@@ -2158,6 +2163,12 @@ describe("materializeSubmodules", () => {
       writeFileSync(join(dependency, "dependency.txt"), "dependency\n")
       git(dependency, ["add", "dependency.txt"])
       git(dependency, ["commit", "-qm", "dependency"])
+      const leafRemote = join(root, "leaf")
+      if (custody === "nested") {
+        createRepository(leafRemote, "leaf.txt", "leaf\n")
+        git(dependency, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", leafRemote, "nested/leaf"])
+        git(dependency, ["commit", "-qam", "add nested leaf"])
+      }
 
       git(root, ["init", "-q", "-b", "main", owner])
       git(owner, ["config", "user.name", "Git Super Test"])
@@ -2168,6 +2179,9 @@ describe("materializeSubmodules", () => {
       git(owner, ["commit", "-qm", "owner"])
       git(owner, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", dependency, "vendor/dependency"])
       git(owner, ["commit", "-qam", "add dependency"])
+      if (custody === "nested") {
+        git(owner, ["-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive"])
+      }
 
       if (submoduleParent) {
         const outer = join(root, "outer")
@@ -2184,6 +2198,18 @@ describe("materializeSubmodules", () => {
       git(owner, ["worktree", "add", "-q", "--detach", linked, "HEAD"])
       git(linked, ["-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive"])
       const linkedDependency = join(linked, "vendor/dependency")
+      let leafPin: string | undefined
+      if (custody === "nested") {
+        const linkedLeaf = join(linkedDependency, "nested/leaf")
+        writeFileSync(join(linkedLeaf, "leaf.txt"), "private linked leaf\n")
+        git(linkedLeaf, ["add", "leaf.txt"])
+        git(linkedLeaf, ["commit", "-qm", "private linked leaf"])
+        leafPin = git(linkedLeaf, ["rev-parse", "HEAD"]).trim()
+        for (const repo of [leafRemote, join(owner, "vendor/dependency/nested/leaf")]) {
+          expect(spawnSync("git", ["-C", repo, "cat-file", "-e", `${leafPin}^{commit}`]).status).not.toBe(0)
+        }
+        git(linkedDependency, ["add", "nested/leaf"])
+      }
       writeFileSync(join(linkedDependency, "dependency.txt"), "private linked commit\n")
       git(linkedDependency, ["add", "dependency.txt"])
       git(linkedDependency, ["commit", "-qm", "private linked commit"])
@@ -2201,7 +2227,33 @@ describe("materializeSubmodules", () => {
       git(linked, ["add", "vendor/dependency"])
       git(linked, ["commit", "-qm", "pin unpublished linked dependency"])
       const linkedPin = git(linked, ["rev-parse", "HEAD"]).trim()
-      if (dependentPrimary) {
+      const lender = join(root, "lender")
+      if (custody === "alternate-source") {
+        git(root, ["clone", "-q", "--no-hardlinks", linkedDependency, lender])
+        const sourceObjects = git(linkedDependency, [
+          "rev-parse",
+          "--path-format=absolute",
+          "--git-path",
+          "objects",
+        ]).trim()
+        const lenderObjects = git(lender, ["rev-parse", "--path-format=absolute", "--git-path", "objects"]).trim()
+        renameSync(sourceObjects, `${sourceObjects}.retained`)
+        mkdirSync(join(sourceObjects, "info"), { recursive: true })
+        writeFileSync(join(sourceObjects, "info", "alternates"), `${lenderObjects}\n`)
+      }
+      if (custody === "promisor-source") git(linkedDependency, ["config", "remote.origin.promisor", "true"])
+      if (custody === "packed-independent") {
+        // Keep the imported private objects packed, so custody must inspect the
+        // primary's own pack instead of accepting visibility through alternates.
+        git(join(owner, "vendor/dependency"), [
+          "-c",
+          "fetch.unpackLimit=1",
+          "fetch",
+          linkedDependency,
+          `${privatePin}:refs/git-super/pins/${privatePin}`,
+        ])
+      }
+      if (custody === "dependent" || custody === "packed-independent") {
         // A visible commit is not physical custody: primary can see this pin
         // solely through the disposable selected source (hh 27426 CTO boundary).
         const primaryObjects = git(join(owner, "vendor/dependency"), [
@@ -2224,17 +2276,40 @@ describe("materializeSubmodules", () => {
       const previousGitAllowProtocol = process.env.GIT_ALLOW_PROTOCOL
       process.env.GIT_ALLOW_PROTOCOL = "file"
       let materialized: Awaited<ReturnType<typeof materializeSubmodulesWithProcess>>
+      const requests: GitProcessRequest[] = []
+      const local = createLocalGitProcess()
       try {
-        materialized = await materializeSubmodulesWithProcess(
-          createLocalGitProcess(),
-          { worktree: candidate, referenceWorktree: linked },
-          { resolveReferenceWorktree: true },
-        )
+        const options = { worktree: candidate, referenceWorktree: linked }
+        if (adapter === "process") {
+          materialized = await materializeSubmodulesWithProcess(
+            {
+              run(request) {
+                requests.push(request)
+                return local.run(request)
+              },
+            },
+            options,
+            { resolveReferenceWorktree: true },
+          )
+        } else {
+          const result =
+            adapter === "sync-host"
+              ? materializeSubmodulesFromLocalWorktree(options)
+              : await materializeSubmodulesFromLocalWorktreeParallel(options)
+          materialized = { ...result, code: result.exitCode }
+        }
       } finally {
         if (previousGitAllowProtocol === undefined) delete process.env.GIT_ALLOW_PROTOCOL
         else process.env.GIT_ALLOW_PROTOCOL = previousGitAllowProtocol
       }
-      if (dependentPrimary) {
+      expect(requests.filter(({ args }) => args[0] === "fetch" && args.includes("origin"))).toEqual([])
+      if (custody === "promisor-source") {
+        expect(materialized.code).not.toBe(0)
+        expect(materialized.stderr).toContain("partial clone")
+        expect(materialized.stderr).toContain(linkedDependency)
+        return
+      }
+      if (custody === "dependent") {
         expect(materialized.code, "a dependent primary must refuse the new borrow").not.toBe(0)
         expect(materialized.stderr).toContain(join(owner, "vendor/dependency"))
         expect(materialized.stderr).toContain(linkedDependency)
@@ -2242,10 +2317,33 @@ describe("materializeSubmodules", () => {
         expect(materialized.stderr).toContain("26497")
         return
       }
-      expect(materialized, materialized.stderr).toMatchObject({ code: 0, borrowed: 1, remoteFallbacks: 0 })
+      expect(materialized, materialized.stderr).toMatchObject({
+        code: 0,
+        borrowed: leafPin === undefined ? 1 : 2,
+        remoteFallbacks: 0,
+        warmed: 0,
+        remotePaths: [],
+      })
 
       const candidateDependency = join(candidate, "vendor/dependency")
       expect(git(candidateDependency, ["rev-parse", "HEAD"]).trim()).toBe(privatePin)
+      if (leafPin !== undefined) {
+        const candidateLeaf = join(candidateDependency, "nested/leaf")
+        expect(git(candidateLeaf, ["rev-parse", "HEAD"]).trim()).toBe(leafPin)
+        const leafAlternates = git(candidateLeaf, [
+          "rev-parse",
+          "--path-format=absolute",
+          "--git-path",
+          "objects/info/alternates",
+        ]).trim()
+        const primaryLeafObjects = git(join(owner, "vendor/dependency/nested/leaf"), [
+          "rev-parse",
+          "--path-format=absolute",
+          "--git-path",
+          "objects",
+        ]).trim()
+        expect(readFileSync(leafAlternates, "utf8").trim()).toBe(primaryLeafObjects)
+      }
       const alternatesFile = git(candidateDependency, [
         "rev-parse",
         "--path-format=absolute",
@@ -2263,7 +2361,7 @@ describe("materializeSubmodules", () => {
       const defaultCandidate = join(root, "default-candidate")
       git(owner, ["worktree", "add", "-q", "--detach", defaultCandidate, "HEAD"])
       const ordinary = await materializeSubmodulesFromLocalWorktreeParallel({ worktree: defaultCandidate })
-      expect(ordinary, ordinary.stderr).toMatchObject({ exitCode: 0, borrowed: 1 })
+      expect(ordinary, ordinary.stderr).toMatchObject({ exitCode: 0, borrowed: leafPin === undefined ? 1 : 2 })
       const defaultAlternates = git(join(defaultCandidate, "vendor/dependency"), [
         "rev-parse",
         "--path-format=absolute",
@@ -2274,10 +2372,16 @@ describe("materializeSubmodules", () => {
 
       // Acceptance criterion 2: Removing any worktree leaves every other worktree's objects intact
       git(owner, ["worktree", "remove", "--force", linked])
+      if (custody === "alternate-source") renameSync(join(lender, ".git"), join(lender, ".git.retired"))
       expect(git(candidateDependency, ["fsck", "--connectivity-only"]).trim()).toBe("")
       expect(git(candidateDependency, ["cat-file", "-e", "HEAD^{commit}"])).toBe("")
       expect(git(candidateDependency, ["rev-list", "--objects", "--missing=error", privatePin])).toContain(privatePin)
       expect(git(candidateDependency, ["show", "HEAD:dependency.txt"])).toBe("private linked commit\n")
+      if (leafPin !== undefined) {
+        const candidateLeaf = join(candidateDependency, "nested/leaf")
+        expect(git(candidateLeaf, ["rev-list", "--objects", "--missing=error", leafPin])).toContain(leafPin)
+        expect(git(candidateLeaf, ["show", "HEAD:leaf.txt"])).toBe("private linked leaf\n")
+      }
     },
   )
 
