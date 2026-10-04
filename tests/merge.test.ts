@@ -767,6 +767,47 @@ function wrongStoreFirstMerge(local: GitProcess, product: string, unreadable: st
 }
 
 /**
+ * The wrong-store 128 PLUS an UNAVAILABLE ownership probe in the OTHER component's store: its `cat-file -e` for the
+ * internal commit times out, fails in transport, or cannot even open the repository. 27315 review d0d1d55f: an
+ * unreadable ownership proof must keep the original refusal, because it proves nothing about whether that store also
+ * holds the commit. Only a PROVEN absence (git's own "Not a valid object name") may continue. Every other call is
+ * native.
+ */
+function unavailableSecondStoreProbe(
+  local: GitProcess,
+  product: string,
+  unreadable: string,
+  mode: "timeout" | "transport-failure" | "fatal-store",
+): GitProcess {
+  const base = wrongStoreFirstMerge(local, product, unreadable)
+  return {
+    run: (request) => {
+      if (
+        request.args[0] === "cat-file" &&
+        request.args[2] === `${unreadable}^{commit}` &&
+        request.repo.endsWith("beta")
+      ) {
+        if (mode === "timeout") return Promise.resolve({ code: 1, stdout: "", stderr: "", timedOut: true })
+        if (mode === "transport-failure") {
+          return Promise.resolve({
+            code: 1,
+            stdout: "",
+            stderr: "owning store unavailable",
+            failure: "Error: spawn git EACCES",
+          })
+        }
+        return Promise.resolve({
+          code: 128,
+          stdout: "",
+          stderr: "fatal: not a git repository (or any parent up to mount point /)\n",
+        })
+      }
+      return base.run(request)
+    },
+  }
+}
+
+/**
  * A git process whose root native APPLY reproduces the wrong-store corruption
  * (27268): the preflight `merge-tree` succeeds — merge-tree never reads
  * submodule interiors — but `git merge --no-ff --no-commit` cannot read an
@@ -3477,6 +3518,34 @@ describe("git super merge", () => {
     expect(git(fixture.product, "show", `HEAD:${diverged.theirsRoot}`).trim()).toBe("theirs")
     // Nothing user-visible names a carrier commit.
     expect(git(fixture.product, "log", "-1", "--format=%B")).not.toContain("carrier")
+  })
+
+  /**
+   * @failure An ownership probe in the other component's store that is UNAVAILABLE (timeout, transport failure, or a repository git cannot open) is read as absence and admits composition on unproven unique ownership (27315 review d0d1d55f).
+   * @level l1
+   * @consumer Yrd settled candidate preparation and landing
+   * @testonly The unavailable second-store probe is simulated; the wrong-store 128 is simulated; every composition step is native.
+   */
+  it("keeps the original refusal when another store's ownership probe is unavailable", async () => {
+    for (const mode of ["timeout", "transport-failure", "fatal-store"] as const) {
+      const fixtureRoot = mkdtempSync(join(tmpdir(), `git-super-merge-unavailable-probe-${mode}-`))
+      roots.push(fixtureRoot)
+      const fixture = createProductFixture(fixtureRoot)
+      const diverged = divergeBothProductComponentsWithRootEdits(fixture)
+      const local = createLocalGitProcess()
+      const result = await superMerge({
+        commit: diverged.candidate,
+        git: unavailableSecondStoreProbe(local, fixture.product, fixture.alphaBase, mode),
+        repo: fixture.product,
+      })
+
+      expect(result.state, `${mode}: ${JSON.stringify(result)}`).toBe("failed")
+      expect(result.detail?.code, mode).toBe("submodule-history-unreadable")
+      // The refusal mutated nothing: HEAD is still ours and the ordinary root edit is untouched.
+      expect(git(fixture.product, "rev-parse", "HEAD"), mode).toBe(diverged.head)
+      expect(git(fixture.product, "show", `HEAD:${diverged.oursRoot}`).trim(), mode).toBe("ours")
+      expect(git(fixture.product, "status", "--porcelain").trim(), mode).toBe("")
+    }
   })
 
   /**

@@ -2284,7 +2284,13 @@ async function admitOwningStoreInternalCommit(
       if (present.code !== 0 || present.failure !== undefined) return false
     }
     const held = await run(git, store, ["cat-file", "-e", `${unreadable}^{commit}`], timeoutMs)
-    if (held.code !== 0 || held.failure !== undefined) continue
+    if (held.code !== 0 || held.failure !== undefined) {
+      // 27315 (review d0d1d55f): an UNAVAILABLE ownership probe proves nothing, and the rule is that a missing or
+      // unreadable ownership proof keeps the original refusal. Only a PROVEN absence may continue to the next store;
+      // reading "could not tell" as "not here" would admit composition on unproven unique ownership.
+      if (!ownershipAbsenceProven(held)) return false
+      continue
+    }
     if (holder !== undefined) return false
     holder = path
     let reachable = false
@@ -2298,6 +2304,22 @@ async function admitOwningStoreInternalCommit(
     if (!reachable) return false
   }
   return holder !== undefined
+}
+
+/**
+ * Whether a `cat-file -e` answer PROVES the object absent from this store, rather than the store being unreadable.
+ *
+ * Git answers a name it cannot resolve with `fatal: Not a valid object name <spec>` (exit 128), or with exit 1 and no
+ * output for a bare name (measured 2026-10-04: a temporary repository, an all-zero/absent SHA and a non-hex name).
+ * Anything else — a timeout, a transport failure, or a repository git cannot even open — proved nothing about
+ * ownership, so an absent answer is the ONLY non-zero result 27315 lets continue past.
+ */
+function ownershipAbsenceProven(result: GitProcessResult): boolean {
+  if (result.failure !== undefined) return false
+  if (result.timedOut === true || result.stalled === true) return false
+  if (result.backstop !== undefined || result.signal != null) return false
+  if (result.code === 1) return result.stderr.trim() === ""
+  return result.code === 128 && /not a valid object name/iu.test(result.stderr)
 }
 
 async function composeWrongStoreGitlinks(
