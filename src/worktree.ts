@@ -1,8 +1,8 @@
 import { existsSync, realpathSync } from "node:fs"
 import { spawnSync } from "node:child_process"
 import { setTimeout as delay } from "node:timers/promises"
-import { appendFile } from "node:fs/promises"
-import { isAbsolute, join, relative, resolve, sep } from "node:path"
+import { appendFile, lstat, readFile } from "node:fs/promises"
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { fileURLToPath } from "node:url"
 import { createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS } from "./exclusive.ts"
 import {
@@ -10,6 +10,7 @@ import {
   assertExcludedRemovalCustody,
   inspectRemovalStatus,
   prepareRemovalBorrowers,
+  rehomeBorrowers,
   retainWorktreeModules,
   type WorktreeRetention,
 } from "./worktree-removal.ts"
@@ -18,6 +19,7 @@ import { createLocalGitProcess, type GitProcess, type GitProcessResult } from ".
 import { createProgressReporter } from "./progress.ts"
 import { materializeSubmodulesWithProcess } from "./submodules.ts"
 import type { SuperStatusResult } from "./status.ts"
+import { removalBorrowers } from "./worktree-administration.ts"
 
 export type GitResult = Readonly<{ code: number; stdout: string; stderr: string }>
 export type Git = ReturnType<typeof createGit>
@@ -539,13 +541,36 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
     },
     async recoverDestroyed(path: string, operation = `recover destroyed worktree ${path}`): Promise<void> {
       await mutate(operation, async () => {
-        if (existsSync(join(path, ".git"))) {
+        try {
+          await lstat(join(path, ".git"))
           throw new Error(`yrd: refusing destroyed-worktree recovery while '${path}/.git' still exists`)
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
         }
         if (!(await inspectWorktree(git, repo, path)).registered) return
-        await git.run(repo, ["worktree", "prune", "--expire=now"])
-        if ((await inspectWorktree(git, repo, path)).registered) {
-          throw new Error(`yrd: destroyed worktree '${path}' survived explicit recovery`)
+        const common = realpathSync(await git.text(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"]))
+        let directory: string | undefined
+        for (const candidate of removalBorrowers(common, common)) {
+          const pointer = (await readFile(join(candidate.adminDir, "gitdir"), "utf8")).trim()
+          if (resolve(dirname(pointer)) === resolve(path)) {
+            directory = candidate.adminDir
+            break
+          }
+        }
+        if (directory === undefined) {
+          throw new Error(`registered destroyed worktree '${path}' has no administration identity`)
+        }
+        const writerLeases = acquireRemovalWriterLeases(directory)
+        try {
+          rehomeBorrowers(common, directory, join(directory, "modules"))
+          await git.run(repo, ["worktree", "prune", "--expire=now"])
+          if ((await inspectWorktree(git, repo, path)).registered) {
+            throw new Error(`yrd: destroyed worktree '${path}' survived explicit recovery`)
+          }
+        } catch (error) {
+          throw writerLeases.refusal(error)
+        } finally {
+          writerLeases.release()
         }
       })
     },
