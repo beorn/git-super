@@ -120,7 +120,8 @@ describe("createGitWorktreeStore", () => {
               },
             },
           })
-          const action = operation === "inspect" ? store.inspectRemoval(remnant) : store.remove(remnant)
+          const action: Promise<unknown> =
+            operation === "inspect" ? store.inspectRemoval(remnant) : store.remove(remnant)
           refusal = await action.then(
             () => {
               throw new Error("removal accepted a directory without its own Git identity")
