@@ -14,6 +14,79 @@ const roots: string[] = []
 const gitSuperBin = fileURLToPath(new URL("../bin/git-super", import.meta.url))
 const gitWorktreeModule = new URL("../src/worktree.ts", import.meta.url).href
 
+/**
+ * @failure Check blocks root-only preservation on an unchanged absent child, or publishes an unavailable historical pin.
+ * @level l3
+ * @consumer Ordinary recursive check push (AC1–AC3); existing tip-only cases cannot see removed intermediate pins.
+ * @testonly none
+ */
+describe("ordinary check publication history", () => {
+  test("preserves a root-only candidate with an unchanged absent child", async () => {
+    const fixture = recursivePushFixture("publication-unchanged-absent")
+    git(fixture.root, "update-index", "--cacheinfo", `160000,${fixture.childBefore},child`)
+    git(fixture.root, "commit", "-q", "-m", "root-only candidate")
+    const candidate = git(fixture.root, "rev-parse", "HEAD")
+    // The unpublished intermediate revision must not itself move the child.
+    const tree = git(fixture.root, "rev-parse", `${candidate}^{tree}`)
+    const source = git(fixture.root, "commit-tree", tree, "-p", fixture.rootBefore, "-m", "root-only publication")
+    renameSync(fixture.child, join(fixture.fixture, "child-retained"))
+
+    const result = await superPush({
+      repo: fixture.root,
+      remote: "origin",
+      refspecs: [`${source}:refs/heads/preservation`],
+      recurseSubmodules: "check",
+    })
+
+    expect(result).toMatchObject({ state: "updated", partial: false })
+    expect(git(fixture.rootRemote, "rev-parse", "refs/heads/preservation")).toBe(source)
+    expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(fixture.childBefore)
+  })
+
+  test.each(["linear removal", "second-parent removal"] as const)(
+    "refuses an unpublished child introduced before %s",
+    async (history) => {
+      const fixture = recursivePushFixture(`publication-${history.replaceAll(" ", "-")}`)
+      let source: string
+      if (history === "linear removal") {
+        git(fixture.root, "update-index", "--force-remove", "child", ".gitmodules")
+        git(fixture.root, "commit", "-q", "-m", "remove child from candidate tip")
+        source = git(fixture.root, "rev-parse", "HEAD")
+      } else {
+        const baselineTree = git(fixture.root, "rev-parse", `${fixture.rootBefore}^{tree}`)
+        const left = git(fixture.root, "commit-tree", baselineTree, "-p", fixture.rootBefore, "-m", "left")
+        source = git(
+          fixture.root,
+          "commit-tree",
+          baselineTree,
+          "-p",
+          left,
+          "-p",
+          fixture.rootSource,
+          "-m",
+          "merge removes second-parent introduced pin",
+        )
+      }
+
+      const result = await superPush({
+        repo: fixture.root,
+        remote: "origin",
+        refspecs: [`${source}:refs/heads/preservation`],
+        recurseSubmodules: "check",
+      })
+
+      expect(result).toMatchObject({
+        state: "failed",
+        partial: false,
+        detail: { code: "submodule-commit-unavailable", paths: ["child"], objectIds: [fixture.childSource] },
+      })
+      expect(result.repositories.find((row) => row.repository === fixture.root)?.state).toBe("not-run")
+      expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(fixture.rootBefore)
+      expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(fixture.childBefore)
+    },
+  )
+})
+
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
 })
