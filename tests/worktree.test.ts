@@ -10,6 +10,7 @@ import { spawnSync } from "node:child_process"
 import { tmpdir } from "node:os"
 import { dirname, join, relative } from "node:path"
 import { describe, expect, it, vi } from "vitest"
+import { tryAcquireFlock } from "@bearly/flock"
 import { acquireExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS } from "../src/exclusive.ts"
 import {
   createGitWorktreeStore,
@@ -1582,6 +1583,142 @@ describe("createGitWorktreeStore", () => {
       expect(() => rehomeBorrowers(root, join(root, "lender"), lenderModules, { spawn: fakeSpawn })).toThrow(
         /timed out after 120s bound/,
       )
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  /**
+   * @failure Worktree removal holds the mutation lock through bulk filesystem deletion (#27551).
+   * @level l1
+   * @consumer Worktree removal callers
+   * @testonly none
+   */
+  it("releases the mutation lock during phase 2 bulk deletion allowing concurrent mutation (#27551)", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-two-phase-removal-"))
+    try {
+      const repo = join(root, "repo")
+      createRepository(repo, "root.txt", "root\n")
+      const store = createLocalGitWorktreeStore({ repo })
+      const target = join(root, "target")
+      await store.add({ kind: "detached", path: target, ref: "HEAD" })
+
+      for (let i = 0; i < 20; i++) {
+        await writeFile(join(target, `file-${i}.txt`), "content\n")
+      }
+
+      let concurrentAcquiredDuringPhase2 = false
+      const fs = await import("node:fs")
+      const origRmSync = fs.rmSync
+      const mutationLockFile = join(repo, ".git", "yrd-worktree-mutations", "writer.lock")
+      const rmSpy = vi.spyOn(fs, "rmSync").mockImplementation((targetPath, opts) => {
+        if (String(targetPath).includes(".trash")) {
+          const lock = tryAcquireFlock(mutationLockFile, {
+            body: JSON.stringify({ pid: process.pid, holder: "concurrent test" }),
+          })
+          if (lock !== null) {
+            concurrentAcquiredDuringPhase2 = true
+            lock.release()
+          }
+        }
+        return origRmSync(targetPath, opts as any)
+      })
+
+      try {
+        await store.remove(target)
+      } finally {
+        rmSpy.mockRestore()
+      }
+
+      expect(concurrentAcquiredDuringPhase2).toBe(true)
+      expect(existsSync(target)).toBe(false)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  /**
+   * @failure Worktree removal performs repo-wide pruning that destroys missing-dir lender admin entries (#27551).
+   * @level l1
+   * @consumer Worktree removal callers
+   * @testonly none
+   */
+  it("leaves a missing-dir lender's admin entry and borrower intact when removing another worktree (#27551)", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-lender-intact-"))
+    try {
+      const fixtureRoot = join(root, "fixture")
+      const fixture = createProductFixture(fixtureRoot)
+      const store = createLocalGitWorktreeStore({ repo: fixture.product })
+
+      // Create lender B with submodule packages/alpha
+      const lender = join(root, "lender")
+      await store.add({ kind: "detached", path: lender, ref: "HEAD" })
+      git(lender, ["-c", "protocol.file.allow=always", "submodule", "update", "--init", "packages/alpha"])
+      const lenderAdmin = git(lender, ["rev-parse", "--absolute-git-dir"]).trim()
+      const lenderSubAdmin = git(join(lender, "packages/alpha"), ["rev-parse", "--absolute-git-dir"]).trim()
+
+      // Create borrower C borrowing from lender B
+      const borrower = join(root, "borrower")
+      await store.add({ kind: "detached", path: borrower, ref: "HEAD" })
+      git(borrower, ["-c", "protocol.file.allow=always", "submodule", "update", "--init", "packages/alpha"])
+      const borrowerSub = join(borrower, "packages/alpha")
+      const borrowerSubAdmin = git(borrowerSub, ["rev-parse", "--absolute-git-dir"]).trim()
+      const altFile = join(borrowerSubAdmin, "objects", "info", "alternates")
+      await writeFile(altFile, `${join(lenderSubAdmin, "objects")}\n`, "utf8")
+
+      // Now lender B's working directory is deleted OUT OF BAND
+      await rm(lender, { recursive: true, force: true })
+      expect(existsSync(lender)).toBe(false)
+      expect(existsSync(lenderAdmin)).toBe(true)
+
+      // Create worktree A (target)
+      const target = join(root, "target")
+      await store.add({ kind: "detached", path: target, ref: "HEAD" })
+      expect(existsSync(target)).toBe(true)
+
+      // Remove worktree A
+      await store.remove(target)
+      expect(existsSync(target)).toBe(false)
+
+      // Lender B's admin directory and sub-admin directory must STILL exist
+      expect(existsSync(lenderAdmin)).toBe(true)
+      expect(existsSync(lenderSubAdmin)).toBe(true)
+
+      // Borrower C's git operations still succeed
+      const fsck = spawnSync("git", ["-C", borrowerSub, "fsck", "--full"], { encoding: "utf8" })
+      expect(fsck.status).toBe(0)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  /**
+   * @failure Worktree removal suppresses git verification error when removal is incomplete (#27551).
+   * @level l1
+   * @consumer Worktree removal callers
+   * @testonly none
+   */
+  it("throws when git reports success but path or registration remains (#27551)", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-not-fully-removed-"))
+    try {
+      const repo = join(root, "repo")
+      createRepository(repo, "root.txt", "root\n")
+      const baseProcess = createLocalGitProcess()
+      const store = createGitWorktreeStore({
+        repo,
+        gitProcess: {
+          run: async (request) => {
+            if (request.args.includes("remove") && request.args.includes("worktree")) {
+              return { code: 0, stdout: "", stderr: "" }
+            }
+            return baseProcess.run(request)
+          },
+        },
+      })
+      const target = join(root, "target")
+      await store.add({ kind: "detached", path: target, ref: "HEAD" })
+
+      await expect(store.remove(target)).rejects.toThrow(/git reported success but did not fully remove worktree/)
     } finally {
       await rm(root, { recursive: true, force: true })
     }

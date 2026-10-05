@@ -1,4 +1,5 @@
-import { existsSync, realpathSync } from "node:fs"
+import { copyFileSync, existsSync, mkdirSync, realpathSync, renameSync, rmdirSync, rmSync } from "node:fs"
+import { randomUUID } from "node:crypto"
 import { spawnSync } from "node:child_process"
 import { setTimeout as delay } from "node:timers/promises"
 import { appendFile, lstat, readFile } from "node:fs/promises"
@@ -471,6 +472,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       }> = {},
     ): Promise<void> {
       await assertRemovalRoot(path)
+      let stagingPath: string | undefined
       await mutate(removeOptions.operation ?? `worktree remove ${path}`, async () => {
         if (removeOptions.retention !== undefined && removeOptions.unlock === true) {
           throw new Error(`retained worktree removal cannot unlock ${path}; resolve its holder first`)
@@ -489,6 +491,8 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         }
         if (rehome === undefined) throw new Error(`worktree ${path} has no prepared borrower custody`)
         const writerLeases = acquireRemovalWriterLeases(gitDir)
+        let staged = false
+        const resolvedPath = resolve(path)
         try {
           if (removeOptions.retention !== undefined) {
             await retainWorktreeModules(
@@ -507,16 +511,87 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
             if (removeOptions.unlock === true) await unlockWorktree(git, repo, path)
             rehome.run()
           }
+
+          // Target-only two-phase removal (#27551, CTO ruling beadc3d2):
+          // Phase 1 (under mutation lock):
+          // Rename the worktree directory to <parent>/.trash/<uuid> on the same filesystem.
+          // Leave a stub at the original path holding only its .git gitlink file.
+          // Run existing `git worktree remove --force <path>` + verification.
+          // On EXDEV, fall back to today's in-lock removal with a warning.
+          const parentDir = dirname(resolvedPath)
+          const trashDir = join(parentDir, ".trash")
+          const targetStaging = join(trashDir, randomUUID())
+          const gitlinkPath = join(resolvedPath, ".git")
+
+          if (existsSync(gitlinkPath)) {
+            try {
+              mkdirSync(trashDir, { recursive: true })
+              renameSync(resolvedPath, targetStaging)
+              mkdirSync(resolvedPath, { recursive: true })
+              copyFileSync(join(targetStaging, ".git"), gitlinkPath)
+              staged = true
+              stagingPath = targetStaging
+            } catch (stageError) {
+              if (
+                stageError !== null &&
+                typeof stageError === "object" &&
+                "code" in stageError &&
+                stageError.code === "EXDEV"
+              ) {
+                console.warn(
+                  `git-super: worktree removal staging rename across devices failed (EXDEV); falling back to in-lock removal for '${path}'`,
+                )
+              } else {
+                if (staged) {
+                  try {
+                    rmSync(resolvedPath, { recursive: true, force: true })
+                    renameSync(targetStaging, resolvedPath)
+                  } catch {
+                    // restore failed, leave targetStaging
+                  }
+                  staged = false
+                  stagingPath = undefined
+                }
+                throw stageError
+              }
+            }
+          }
+
           await git.run(repo, ["worktree", "remove", "--force", path], false, timeouts.cleanup)
           if (existsSync(path) || (await inspectWorktree(git, repo, path)).registered) {
             throw new Error(`git reported success but did not fully remove worktree '${path}'`)
           }
         } catch (error) {
+          if (staged && stagingPath !== undefined && existsSync(stagingPath) && !existsSync(resolvedPath)) {
+            try {
+              renameSync(stagingPath, resolvedPath)
+              stagingPath = undefined
+            } catch {
+              // restore failed
+            }
+          }
           throw writerLeases.refusal(error)
         } finally {
           writerLeases.release()
         }
       })
+
+      // Phase 2 (outside mutation lock):
+      // Delete the staging directory synchronously in the caller. Never fire-and-forget.
+      if (stagingPath !== undefined) {
+        try {
+          rmSync(stagingPath, { recursive: true, force: true })
+          try {
+            rmdirSync(dirname(stagingPath))
+          } catch {
+            // .trash directory is not empty or cannot be removed; leftover sweep will handle it.
+          }
+        } catch (error) {
+          console.warn(
+            `git-super: failed to delete staged worktree directory '${stagingPath}': ${error instanceof Error ? error.message : String(error)}`,
+          )
+        }
+      }
     },
     async prune(
       pruneOptions: Readonly<{ expire?: string; verbose?: boolean; operation?: string }> = {},
