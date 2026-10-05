@@ -29,6 +29,11 @@ vi.mock("node:fs", async (importOriginal) => {
   return { ...fs, readdirSync: vi.fn(fs.readdirSync), readFileSync: vi.fn(fs.readFileSync) }
 })
 
+vi.mock("node:child_process", async (importOriginal) => {
+  const process = await importOriginal<typeof import("node:child_process")>()
+  return { ...process, spawnSync: vi.fn(process.spawnSync) }
+})
+
 function git(repo: string, args: readonly string[]): string {
   const result = spawnSync("git", ["-C", repo, ...args], { encoding: "utf8" })
   if (result.status !== 0) throw new Error(result.stderr || `git ${args.join(" ")} failed`)
@@ -80,6 +85,8 @@ describe("createGitWorktreeStore", () => {
       const parentGit = join(parent, ".git")
       await writeFile(join(parentGit, "tent-state-write.lock"), "")
       vi.mocked(readdirSync).mockClear()
+      vi.mocked(spawnSync).mockClear()
+      const requests: GitProcessRequest[] = []
       let refusal: string
       if (operation === "status") {
         const out = {
@@ -100,7 +107,16 @@ describe("createGitWorktreeStore", () => {
         expect(code, out.output).not.toBe(0)
         refusal = err.output
       } else {
-        const store = createLocalGitWorktreeStore({ repo: parent })
+        const local = createLocalGitProcess()
+        const store = createGitWorktreeStore({
+          repo: parent,
+          gitProcess: {
+            run: async (request) => {
+              requests.push(request)
+              return local.run(request)
+            },
+          },
+        })
         refusal = await store.remove(remnant).then(
           () => {
             throw new Error("removal accepted a directory without its own Git identity")
@@ -111,9 +127,54 @@ describe("createGitWorktreeStore", () => {
       expect(refusal).toContain(remnant)
       expect(refusal).toContain("not a worktree root")
       expect(refusal).toContain(parent)
+      const commands =
+        operation === "status"
+          ? vi.mocked(spawnSync).mock.calls.map(([, argv]) => (argv as string[]).slice(2))
+          : requests.map((request) => request.args)
+      expect(commands).toEqual([
+        ["rev-parse", "--show-toplevel"],
+        ["rev-parse", "--show-prefix"],
+      ])
       expect(vi.mocked(readdirSync).mock.calls.some(([path]) => String(path) === parentGit)).toBe(false)
       expect(await readFile(join(remnant, "remaining.txt"), "utf8")).toBe("interrupted removal\n")
     } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  /**
+   * @failure Root admission for an explicit --repo also refuses ordinary status from a subdirectory (#27477).
+   * @level l1
+   * @consumer Git-super CLI users standing inside their repository
+   * @testonly none
+   */
+  it("keeps default status discovery from a subdirectory", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-default-status-"))
+    const previous = process.cwd()
+    try {
+      const parent = join(root, "parent")
+      createRepository(parent, "tracked.txt", "parent data\n")
+      const child = join(parent, "child")
+      await mkdir(child)
+      process.chdir(child)
+      const out = {
+        output: "",
+        write(value: string) {
+          this.output += value
+          return true
+        },
+      }
+      const err = {
+        output: "",
+        write(value: string) {
+          this.output += value
+          return true
+        },
+      }
+      expect(await runCli(["--json", "status"], out, err), err.output).toBe(0)
+      expect(JSON.parse(out.output).consultedRepositories[0].root).toBe(parent)
+    } finally {
+      process.chdir(previous)
       await rm(root, { recursive: true, force: true })
     }
   })
