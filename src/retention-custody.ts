@@ -17,6 +17,7 @@ import { existsSync, readFileSync, realpathSync, statSync } from "node:fs"
 import { dirname, isAbsolute, join, relative, sep } from "node:path"
 import { alternateEntries } from "./alternates.ts"
 import {
+  assertStreamComplete,
   DEFAULT_SORT_RUN_LINES,
   externalSortToSidecar,
   mergeLabeledFiles,
@@ -239,15 +240,11 @@ async function indexWitnessStores(
         runLines: DEFAULT_SORT_RUN_LINES,
       })
       const outcome = await lineStream.outcome
-      if (outcome.timedOut) {
-        throw new UnknownError(`rev-list ${entry.tip} in ${gitDir} exceeded the ${bounds.reachableMs} ms bound`)
-      }
-      if (outcome.capped) {
-        throw new UnknownError(`reachable OIDs exceeded the ${bounds.maxReachableOids} cap in ${gitDir}`)
-      }
-      if (outcome.code !== 0) {
-        throw new UnknownError(`rev-list ${entry.tip} failed in witness store ${gitDir}: ${outcome.stderr.trim()}`)
-      }
+      assertStreamComplete(outcome, {
+        timedOut: `rev-list ${entry.tip} in ${gitDir} exceeded the ${bounds.reachableMs} ms bound`,
+        capped: `reachable OIDs exceeded the ${bounds.maxReachableOids} cap in ${gitDir}`,
+        failed: `rev-list ${entry.tip} failed in witness store ${gitDir}: ${outcome.stderr.trim()}`,
+      })
       if (clock() - started > bounds.reachableMs) {
         throw new UnknownError(`rev-list ${entry.tip} in ${gitDir} exceeded the ${bounds.reachableMs} ms bound`)
       }

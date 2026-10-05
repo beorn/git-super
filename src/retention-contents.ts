@@ -22,6 +22,7 @@ import { isAbsolute, join, relative, sep } from "node:path"
 import { alternateEntries } from "./alternates.ts"
 import type { ManifestEntry } from "./worktree-removal.ts"
 import {
+  assertStreamComplete,
   DEFAULT_SORT_RUN_LINES,
   externalSortToSidecar,
   gitLineStream,
@@ -408,15 +409,11 @@ async function scanComponent(
     )
     for (const source of [effectiveStream, ...independentStreams]) {
       const outcome = await source.outcome
-      if (outcome.timedOut) {
-        throw new UnknownError(`${component}: a git child exceeded the ${bounds.componentMs} ms component bound`)
-      }
-      if (outcome.capped) {
-        throw new UnknownError(`${component}: object list exceeded the ${bounds.maxEffectiveOids} cap`)
-      }
-      if (outcome.code !== 0) {
-        throw new UnknownError(`${component}: cat-file failed: ${outcome.stderr.trim()}`)
-      }
+      assertStreamComplete(outcome, {
+        timedOut: `${component}: a git child exceeded the ${bounds.componentMs} ms component bound`,
+        capped: `${component}: object list exceeded the ${bounds.maxEffectiveOids} cap`,
+        failed: `${component}: cat-file failed: ${outcome.stderr.trim()}`,
+      })
     }
   } catch (error) {
     atRiskWriter.abort()

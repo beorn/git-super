@@ -175,6 +175,16 @@ export interface GitStreamOptions {
   readonly maxBytes?: number
   /** Hard line cap; the child is killed when stdout exceeds it and reported `capped`. */
   readonly maxLines?: number
+  /**
+   * Observability hook: called with the running maximum of queued stdout lines as the child's
+   * output is read. The bounded-memory row uses it to prove the queue never exceeds the pause mark.
+   */
+  readonly onQueueHighWater?: (depth: number) => void
+  /**
+   * Test seam: read from this iterable instead of the child's stdout, so a stdout read failure can
+   * be injected deterministically. Production always reads the real pipe.
+   */
+  readonly stdout?: AsyncIterable<Buffer>
 }
 
 export interface GitStreamOutcome {
@@ -189,6 +199,35 @@ export interface GitStreamOutcome {
 export interface GitLineStream {
   readonly lines: AsyncIterable<string>
   readonly outcome: Promise<GitStreamOutcome>
+}
+
+/** The queued-line mark past which the reader stops pulling stdout until the consumer drains. */
+export const RETENTION_STREAM_QUEUE_LINES = 2048
+
+export interface StreamFaultMessages {
+  /** Message when the child was killed at its deadline. */
+  readonly timedOut: string
+  /** Message when the child was killed at its byte or line cap. */
+  readonly capped: string
+  /** Message when the child exited non-zero or its stdout read failed. */
+  readonly failed: string
+}
+
+class IncompleteStreamError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = "IncompleteStreamError"
+  }
+}
+
+/**
+ * The ONE rule every `gitLineStream` consumer applies: a stream that hit its deadline or cap, or
+ * exited non-zero, is an incomplete read and must be reported `unknown` — never a partial list.
+ * Callers supply one message per cause; this throws the error the retention scans map to `unknown`.
+ */
+export function assertStreamComplete(outcome: GitStreamOutcome, messages: StreamFaultMessages): void {
+  const fault = outcome.timedOut ? "timedOut" : outcome.capped ? "capped" : outcome.code !== 0 ? "failed" : undefined
+  if (fault !== undefined) throw new IncompleteStreamError(messages[fault])
 }
 
 const MAX_LINE_LENGTH = 1 << 20
@@ -258,29 +297,53 @@ export function gitLineStream(args: readonly string[], options: GitStreamOptions
   // stdout iteration only when the caller first pulls reads an already ended pipe and silently
   // yields nothing (measured: a lazy read lost the whole output in 30/30 trials, which dropped a
   // whole store's OIDs from the proof). Decoded lines land in a bounded queue the caller drains;
-  // the pipe is paused past the bound and resumed as it is consumed, so a slow consumer cannot
-  // grow the queue without limit.
-  const PAUSE_AT = 2048
+  // the reader stops pulling past the bound and resumes as the queue drains, so a slow consumer
+  // cannot grow the queue without limit.
+  const QUEUE_LINES = RETENTION_STREAM_QUEUE_LINES
   const pending: string[] = []
   let ended = false
-  let awake: (() => void) | undefined
-  const wake = (): void => {
-    if (awake !== undefined) {
-      const resolve = awake
-      awake = undefined
+  let readFailed = false
+  let queueHighWater = 0
+  let waiting: (() => void) | undefined
+  let draining: (() => void) | undefined
+  const wakeConsumer = (): void => {
+    if (waiting !== undefined) {
+      const resolve = waiting
+      waiting = undefined
+      resolve()
+    }
+  }
+  const wakeProducer = (): void => {
+    if (draining !== undefined) {
+      const resolve = draining
+      draining = undefined
       resolve()
     }
   }
   const push = (line: string): void => {
     pending.push(line)
-    wake()
-    if (pending.length >= PAUSE_AT) child.stdout?.pause()
+    if (options.onQueueHighWater !== undefined && pending.length > queueHighWater) {
+      queueHighWater = pending.length
+      options.onQueueHighWater(queueHighWater)
+    }
+    wakeConsumer()
+  }
+  // Real backpressure: the producer awaits here while the queue is full, so the async iterator
+  // stops pulling, the pipe fills, and git blocks on write. `pause()`/`resume()` are no-ops under
+  // an async iterator and would let the queue grow without bound.
+  const waitForCapacity = async (): Promise<void> => {
+    while (pending.length >= QUEUE_LINES) {
+      await new Promise<void>((resolve) => {
+        draining = resolve
+      })
+    }
   }
   void (async (): Promise<void> => {
     const decoder = new StringDecoder("utf8")
     let remainder = ""
     try {
-      for await (const chunk of child.stdout as AsyncIterable<Buffer>) {
+      const source = options.stdout ?? (child.stdout as AsyncIterable<Buffer>)
+      for await (const chunk of source) {
         bytes += chunk.length
         if (options.maxBytes !== undefined && bytes > options.maxBytes) {
           capped = true
@@ -300,6 +363,8 @@ export function gitLineStream(args: readonly string[], options: GitStreamOptions
             }
             lines += 1
             push(line)
+            if (capped) break
+            if (pending.length >= QUEUE_LINES) await waitForCapacity()
           }
           index = remainder.indexOf("\n")
         }
@@ -309,25 +374,29 @@ export function gitLineStream(args: readonly string[], options: GitStreamOptions
           kill()
           break
         }
+        if (pending.length >= QUEUE_LINES) await waitForCapacity()
       }
       if (!capped) {
         const tail = remainder + decoder.end()
         if (tail !== "") {
+          if (pending.length >= QUEUE_LINES) await waitForCapacity()
           lines += 1
           push(tail)
         }
       }
     } finally {
       ended = true
-      wake()
+      wakeConsumer()
       resolveDone()
     }
   })().catch((error: unknown) => {
     // A stdout read failure is never a silent short read: it lands in `stderr` and forces a
-    // non-zero code so the caller maps the source to `unknown` instead of trusting a partial list.
+    // non-zero code whatever the close/catch order, so the caller maps the source to `unknown`
+    // instead of trusting a partial list.
+    readFailed = true
     stderr = `${stderr}\nstdout read failed: ${error instanceof Error ? error.message : String(error)}`.trim()
     ended = true
-    wake()
+    wakeConsumer()
     resolveDone()
     settle(1)
   })
@@ -337,12 +406,12 @@ export function gitLineStream(args: readonly string[], options: GitStreamOptions
       while (pending.length > 0) {
         const line = pending.shift()
         if (line === undefined) break
-        if (pending.length < PAUSE_AT && !ended) child.stdout?.resume()
+        if (pending.length < QUEUE_LINES) wakeProducer()
         yield line
       }
       if (ended) return
       await new Promise<void>((resolve) => {
-        awake = resolve
+        waiting = resolve
       })
     }
   })()
@@ -352,7 +421,8 @@ export function gitLineStream(args: readonly string[], options: GitStreamOptions
     outcome: (async () => {
       const settled = await closePromise
       await donePromise
-      return { ...settled, bytes, lines, capped, timedOut }
+      const code = settled.code !== 0 ? settled.code : readFailed || capped || timedOut ? 1 : 0
+      return { code, bytes, lines, stderr, timedOut, capped }
     })(),
   }
 }

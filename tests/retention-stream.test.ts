@@ -19,6 +19,7 @@ import {
   mergeSortedFilesToSidecar,
   oidKey,
   readLines,
+  RETENTION_STREAM_QUEUE_LINES,
   RETENTION_STREAM_RSS_BOUND_BYTES,
   SidecarWriter,
 } from "../src/retention-stream.ts"
@@ -226,6 +227,60 @@ describe("retention stream primitives (#27443(b))", () => {
     } finally {
       void environment
     }
+  })
+
+  test("gitLineStream applies real backpressure: the queue never exceeds the pause mark", async () => {
+    // With pause()/resume() as the only throttle (a no-op under an async iterator) the queue grows
+    // to the whole output; the producer must instead stop pulling at the mark.
+    const bin = tmp("git-super-stream-slow-bin-")
+    const total = 5_000
+    writeFileSync(join(bin, "git"), `#!/bin/sh\ni=0\nwhile [ $i -lt ${total} ]; do echo line-$i; i=$((i+1)); done\n`, {
+      mode: 0o755,
+    })
+    const saved = process.env.PATH
+    process.env.PATH = `${bin}:${saved ?? ""}`
+    let highWater = 0
+    try {
+      const stream = gitLineStream(["--version"], {
+        onQueueHighWater: (depth) => {
+          highWater = Math.max(highWater, depth)
+        },
+      })
+      const iterator = stream.lines[Symbol.asyncIterator]()
+      const first = await iterator.next()
+      expect(first.done).toBe(false)
+      expect(String(first.value).startsWith("line-")).toBe(true)
+      // Stall the consumer: the producer must fill the queue to the mark and then stop pulling, so
+      // the pipe fills and git blocks. An unbounded queue would keep growing past the mark.
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      expect(highWater).toBe(RETENTION_STREAM_QUEUE_LINES)
+      let seen = 1
+      for (;;) {
+        const next = await iterator.next()
+        if (next.done === true) break
+        seen += 1
+      }
+      const outcome = await stream.outcome
+      expect(seen).toBe(total)
+      expect(outcome.code).toBe(0)
+    } finally {
+      process.env.PATH = saved
+    }
+  })
+
+  test("gitLineStream reports a non-zero outcome when stdout fails while the child exits 0", async () => {
+    // If 'close' settles with code 0 before the reader's catch runs, a partial read must still be
+    // non-zero — never a clean outcome with the failure only in stderr.
+    const failing: AsyncIterable<Buffer> = (async function* () {
+      yield Buffer.from("one\n")
+      throw new Error("injected stdout read failure")
+    })()
+    const stream = gitLineStream(["--version"], { stdout: failing })
+    const lines = await collect(stream.lines)
+    const outcome = await stream.outcome
+    expect(lines).toEqual(["one"])
+    expect(outcome.code).not.toBe(0)
+    expect(outcome.stderr).toContain("stdout read failed")
   })
 })
 

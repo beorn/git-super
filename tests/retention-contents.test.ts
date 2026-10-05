@@ -232,6 +232,15 @@ describe("retention contents scan — gate 4 (#27443(b))", () => {
     expect(seen.every((value) => value !== undefined && value > 0 && value <= 5_000)).toBe(true)
   })
 
+  test("a capped object list is unknown through the one stream rule, never a partial certificate", async () => {
+    const { root } = repoWithCommit("git-super-contents-")
+    const stream: GitStreamFactory = (args, options) =>
+      args.includes("cat-file") ? lineStreamFrom([], { capped: true }) : gitLineStream(args, options)
+    const result = await scan(root, componentEntries(".git"), { stream })
+    expect(result.status).toBe("unknown")
+    expect(result.detail).toContain("cap")
+  })
+
   test("a TERM-refusing git child is still killed at the deadline with a nonzero status", async () => {
     const bin = tmp("git-super-contents-bin-")
     writeFileSync(join(bin, "git"), "#!/bin/sh\ntrap '' TERM\nexec sleep 3\n", { mode: 0o755 })
