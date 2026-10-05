@@ -178,7 +178,8 @@ function closure(
   const stores: string[] = []
   const stack = [objects]
   while (stack.length > 0) {
-    const store = stack.pop()!
+    const store = stack.pop()
+    if (store === undefined) break
     if (seen.has(store)) continue
     seen.add(store)
     stores.push(store)
@@ -318,7 +319,11 @@ async function scanComponent(
     }
     return left
   }
-  const rootsRef = await externalSortToSidecar(rootOidLines(gitDir, run), {
+  // Every synchronous root query carries the component's REMAINING budget, so a stalled
+  // for-each-ref/rev-parse/ls-files yields `unknown` at the bound instead of blocking the scan
+  // (the streamed object lists are bounded the same way, below).
+  const componentRun: GitRun = (args) => run(args, { timeoutMs: remaining() })
+  const rootsRef = await externalSortToSidecar(rootOidLines(gitDir, componentRun), {
     dir: sidecarDir,
     runLines: DEFAULT_SORT_RUN_LINES,
   })
@@ -351,7 +356,7 @@ async function scanComponent(
   }
   const effectiveStream = stream(
     [`--git-dir=${gitDir}`, `--work-tree=${copyRoot}`, "cat-file", "--batch-all-objects", "--batch-check"],
-    { timeoutMs: remaining(), maxLines: bounds.maxEffectiveOids + 1 },
+    { timeoutMs: remaining(), maxLines: bounds.maxEffectiveOids },
   )
   const independentStreams = [...independentStores]
     .sort()
@@ -364,7 +369,7 @@ async function scanComponent(
           "--batch-all-objects",
           "--batch-check",
         ],
-        { timeoutMs: remaining(), maxLines: bounds.maxEffectiveOids + 1 },
+        { timeoutMs: remaining(), maxLines: bounds.maxEffectiveOids },
       ),
     )
   const atRiskWriter = new SidecarWriter(sidecarDir, "txt")
@@ -394,8 +399,8 @@ async function scanComponent(
         if (effectiveLines.length > 0) effective += 1
         if (independentLines.length > 0) independent += 1
         const rootSources = [...new Set(rootLines.map((line) => line.slice(line.indexOf("\t") + 1)))].join(", ")
-        if (effectiveLines.length > 0 && independentLines.length === 0) {
-          const first = effectiveLines[0]!
+        const first = effectiveLines[0]
+        if (first !== undefined && independentLines.length === 0) {
           const type = first.slice(first.indexOf("\t") + 1)
           atRisk += 1
           atRiskWriter.add(`${key}\t${type}\t${rootSources === "" ? "owned" : rootSources}`)
@@ -469,8 +474,8 @@ export async function scanContents(
     }
   }
   const blocked = components.filter((entry) => entry.missingRoots > 0)
-  if (blocked.length > 0) {
-    const first = blocked[0]!
+  const first = blocked[0]
+  if (first !== undefined) {
     return {
       status: "blocked",
       detail: `${blocked.length} component(s) name root OIDs their own store no longer carries, e.g. ${first.component}: ${first.missingRootsSample.join(", ")}`,

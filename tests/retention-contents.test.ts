@@ -3,6 +3,7 @@
  * OID set in memory, or misses a root OID the entry's own store no longer carries.
  * @level l1
  * @consumer the read-only retention verifier, gate 4; #27443(b)
+ * @reach fs-walk <fixture-only: every case builds an mkdtempSync(tmpdir()) Git repo; no repository source tree is walked>
  * @testonly none
  */
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
@@ -239,6 +240,44 @@ describe("retention contents scan — gate 4 (#27443(b))", () => {
     const result = await scan(root, componentEntries(".git"), { stream })
     expect(result.status).toBe("unknown")
     expect(result.detail).toContain("cap")
+  })
+
+  test("an effective set one over the declared cap is unknown, not a pass (the real stream boundary)", async () => {
+    const { root } = repoWithCommit("git-super-contents-")
+    hashObject(root, "over-cap\n")
+    const total = git(root, ["cat-file", "--batch-all-objects", "--batch-check"])
+      .split("\n")
+      .filter((line) => line !== "").length
+    expect(total).toBeGreaterThan(1)
+    const over = await scan(root, componentEntries(".git"), {
+      bounds: { maxEffectiveOids: total - 1, componentMs: 120_000 },
+    })
+    expect(over.status).toBe("unknown")
+    expect(over.detail).toContain("cap")
+    const at = await scan(root, componentEntries(".git"), {
+      bounds: { maxEffectiveOids: total, componentMs: 120_000 },
+    })
+    expect(at.status).toBe("pass")
+    expect(at.components[0]!.effective).toBe(total)
+  })
+
+  test("every synchronous component root query carries the remaining component budget", async () => {
+    const { root } = repoWithCommit("git-super-contents-")
+    const seen: Array<{ args: string; timeoutMs: number | undefined }> = []
+    const run: GitRun = (args, options) => {
+      seen.push({ args: args.join(" "), timeoutMs: options?.timeoutMs })
+      return defaultGitRun(args, options)
+    }
+    const result = await scan(root, componentEntries(".git"), {
+      run,
+      stream: gitLineStream,
+      bounds: { maxEffectiveOids: 4_000_000, componentMs: 120_000 },
+    })
+    expect(result.status).toBe("pass")
+    for (const query of ["for-each-ref", "rev-parse", "ls-files"]) {
+      expect(seen.some((entry) => entry.args.includes(query))).toBe(true)
+    }
+    expect(seen.every((entry) => typeof entry.timeoutMs === "number" && entry.timeoutMs > 0)).toBe(true)
   })
 
   test("a TERM-refusing git child is still killed at the deadline with a nonzero status", async () => {

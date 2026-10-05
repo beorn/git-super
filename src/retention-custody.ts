@@ -127,7 +127,8 @@ function alternateClosure(
   const seen = new Set<string>()
   const stack = [objects]
   while (stack.length > 0) {
-    const store = stack.pop()!
+    const store = stack.pop()
+    if (store === undefined) break
     if (seen.has(store)) continue
     seen.add(store)
     stores.push(store)
@@ -303,7 +304,7 @@ async function runCustody(
         (key, groups) => {
           const atRiskLines = groups.find((group) => group.label === "at-risk")?.lines
           if (atRiskLines === undefined || atRiskLines.length === 0) return
-          const source = atRiskLines[0]!.split("\t")[2] ?? "owned"
+          const source = atRiskLines[0]?.split("\t")[2] ?? "owned"
           const indexLines = groups.find((group) => group.label === "witness-index")?.lines
           if (indexLines === undefined || indexLines.length === 0) {
             missingCount += 1
@@ -311,7 +312,7 @@ async function runCustody(
             missingWriter.add(`${key}\t${component.component}\t${source}`)
             return
           }
-          const rank = indexLines[0]!.split("\t")[1]
+          const rank = indexLines[0]?.split("\t")[1]
           const record = rank === undefined ? undefined : records[Number(rank)]
           if (record === undefined) throw new UnknownError(`witness index names an unknown rank '${rank ?? ""}'`)
           if (formats.get(record.store) !== format.format) {
@@ -345,8 +346,8 @@ async function runCustody(
   if (missingCount > 0) missingSidecar = await missingWriter.finish()
   else missingWriter.abort()
   const witnesses = [...identities.values()]
-  if (missingCount > 0) {
-    const first = missing[0]!
+  const first = missing[0]
+  if (missingCount > 0 && first !== undefined) {
     return {
       status: "blocked",
       detail: `${missingCount} at-risk OID(s) have no durable witness, e.g. ${first.component} ${first.oid} (${first.source}); first ${missing.length} inline, full list in ${missingSidecar?.path ?? "a sidecar"}`,
