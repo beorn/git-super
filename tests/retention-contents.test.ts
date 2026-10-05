@@ -188,4 +188,27 @@ describe("retention contents scan — gate 4 (#27443(b))", () => {
     expect(seen.length).toBeGreaterThan(0)
     expect(seen.every((value) => value !== undefined && value > 0 && value <= 5_000)).toBe(true)
   })
+
+  test("a TERM-refusing git child is still killed at the deadline with a nonzero status", () => {
+    const bin = tmp("git-super-contents-bin-")
+    writeFileSync(join(bin, "git"), "#!/bin/sh\ntrap '' TERM\nexec sleep 3\n", { mode: 0o755 })
+    const savedPath = process.env.PATH
+    process.env.PATH = `${bin}:${savedPath ?? ""}`
+    const startedAt = Date.now()
+    try {
+      const result = defaultGitRun(["--version"], { timeoutMs: 100 })
+      expect(result.timedOut).toBe(true)
+      expect(result.code).not.toBe(0)
+      expect(Date.now() - startedAt).toBeLessThan(1_500)
+    } finally {
+      process.env.PATH = savedPath
+    }
+  })
+
+  test("a healthy git child keeps its own zero status and is not marked timedOut", () => {
+    const result = defaultGitRun(["--version"])
+    expect(result.code).toBe(0)
+    expect(result.timedOut).toBeFalsy()
+    expect(result.stdout).toMatch(/^git version/u)
+  })
 })

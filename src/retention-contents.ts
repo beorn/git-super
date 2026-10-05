@@ -86,6 +86,9 @@ export function defaultGitRun(args: readonly string[], options: GitRunOptions = 
     encoding: "utf8",
     maxBuffer: 1 << 30,
     ...(timeoutMs === undefined ? {} : { timeout: timeoutMs }),
+    // SIGKILL, not the default SIGTERM: a child that traps or ignores SIGTERM would otherwise run
+    // to natural completion and the "hard" deadline would not be hard.
+    killSignal: "SIGKILL",
     env: {
       PATH: process.env.PATH ?? "",
       HOME: process.env.HOME ?? "",
@@ -95,10 +98,11 @@ export function defaultGitRun(args: readonly string[], options: GitRunOptions = 
     },
   })
   // spawnSync reports a timeout kill as ETIMEDOUT on `error`, with `status` null. Reporting it as a
-  // named signal keeps a hung child from being confused with a genuine non-zero exit.
+  // named signal keeps a hung child from being confused with a genuine non-zero exit; a timeout is
+  // never a success, so `code` is forced nonzero even if the killed child happened to exit 0.
   const timedOut = (result.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT"
   return {
-    code: result.status ?? 1,
+    code: timedOut ? 1 : (result.status ?? 1),
     stdout: result.stdout ?? "",
     stderr: timedOut ? `git ${args[0] ?? ""} timed out after ${timeoutMs} ms` : (result.stderr ?? ""),
     ...(timedOut ? { timedOut: true } : {}),
