@@ -3,11 +3,12 @@
  * buffers an unbounded child's output instead of killing it at the cap.
  * @level l1
  * @consumer the read-only retention verifier, gates 4-6; #27443(b)
+ * @reach fs-walk <fixture-only: every case builds or reads mkdtempSync(tmpdir()) fixtures; no repository source tree is walked>
  * @testonly none
  */
 import { spawnSync } from "node:child_process"
 import { createHash } from "node:crypto"
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, test } from "vitest"
@@ -118,6 +119,28 @@ describe("retention stream primitives (#27443(b))", () => {
       deleteInputs: true,
     })
     expect(await collect(readLines(ref.path))).toEqual(["a", "b", "c", "d", "e", "f", "g", "h", "i"])
+    for (const path of inputs) expect(existsSync(path)).toBe(false)
+  })
+
+  test("mergeSortedFilesToSidecar with deleteInputs:false preserves every input across a multi-level merge", async () => {
+    const dir = tmp("git-super-stream-")
+    const chunks: string[][] = [["a", "e"], ["b", "f"], ["c", "g"], ["d", "h"], ["i"]]
+    const inputs = chunks.map((chunk, index) => {
+      const path = join(dir, `input-${index}`)
+      writeFileSync(path, chunk.map((line) => `${line}\n`).join(""))
+      return path
+    })
+    const ref = await mergeSortedFilesToSidecar(inputs, {
+      dir,
+      keyOf: oidKey,
+      pick: (group) => group[0],
+      maxFanIn: 2,
+      deleteInputs: false,
+    })
+    expect(await collect(readLines(ref.path))).toEqual(["a", "b", "c", "d", "e", "f", "g", "h", "i"])
+    for (const path of inputs) expect(existsSync(path)).toBe(true)
+    // The multi-level merge generated intermediate runs; those it owns are still cleaned.
+    expect(readdirSync(dir).filter((name) => name.startsWith(".merge-"))).toEqual([])
   })
 
   test("SidecarWriter hashes bytes it writes and reads them back before renaming", async () => {

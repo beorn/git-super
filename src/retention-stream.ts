@@ -640,7 +640,9 @@ async function reduceMergeGroup(group: readonly string[], options: MergeFilesOpt
 }
 
 function removeTemp(path: string, temporary: Set<string>): void {
-  temporary.delete(path)
+  // Only a path this merge actually owns (a caller input marked disposable, or an intermediate
+  // run it generated) may be removed; a preserved caller input is never in the set.
+  if (!temporary.delete(path)) return
   rmSync(path, { force: true })
 }
 
