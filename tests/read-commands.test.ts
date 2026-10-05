@@ -413,6 +413,7 @@ describe("Phase 1 read commands", () => {
     expect(selected).toMatchObject({
       submoduleProblems: [
         {
+          kind: "repository-not-consulted",
           path: "packages/alpha",
           reason: expect.any(String),
           ...(shape === "missing-gitdir" ? { gitDir: missingGitDir } : {}),
@@ -455,6 +456,7 @@ describe("Phase 1 read commands", () => {
     const additions = superStatus(statusOptions)
     expect(additions.records).toContain("A  new-child")
     expect(additions.submoduleProblems).toContainEqual({
+      kind: "repository-not-consulted",
       path: "new-child",
       reason: expect.stringContaining("symbolic link"),
     })
@@ -468,9 +470,33 @@ describe("Phase 1 read commands", () => {
 
     const result = superStatus({ repo: fixture.product })
     expect(result.submoduleProblems).toEqual([
-      { path: "packages/alpha/apps/maddoc", reason: expect.stringContaining("packages/alpha/apps/maddoc") },
+      {
+        kind: "repository-not-consulted",
+        path: "packages/alpha/apps/maddoc",
+        reason: expect.stringContaining("packages/alpha/apps/maddoc"),
+      },
     ])
     expect(result.consultedRepositories.map(({ path }) => path)).not.toContain("packages/alpha/apps/maddoc")
+  })
+
+  /**
+   * @failure Hab refuses an initialized checkout because a lazy pin is unreadable.
+   * @level l1
+   * @consumer Hab owned-checkout sandbox census
+   * Missing-checkout tests cannot distinguish comparison failure from census failure.
+   */
+  test("status distinguishes an unreadable pin from a repository that was not consulted", () => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-pin-census-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    git(fixture.product, "update-index", "--cacheinfo", `160000,${"c".repeat(40)},packages/alpha`)
+    const status = superStatus({ repo: fixture.product })
+    expect(status.notCompared).toContainEqual(expect.objectContaining({ path: "packages/alpha", reason: "unreadable" }))
+    expect(status.consultedRepositories.map(({ path }) => path)).toContain("packages/alpha")
+    expect(status.submoduleProblems).toContainEqual(
+      expect.objectContaining({ path: "packages/alpha", kind: "diff-unreadable" }),
+    )
+    expect(status.submoduleProblems.filter(({ kind }) => kind === "repository-not-consulted")).toEqual([])
   })
 
   /**
@@ -494,7 +520,18 @@ describe("Phase 1 read commands", () => {
     expect(result.exitCode, result.stderr.toString()).toBe(0)
     const status = superStatus({ repo: fixture.product, ...(indexFile === undefined ? {} : { indexFile }) })
     expect(status.records.some((record) => record.slice(3) === "conflicted")).toBe(true)
-    expect(status.submoduleProblems).toContainEqual({ path: "conflicted", reason: expect.stringContaining("unmerged") })
+    expect(status.submoduleProblems).toContainEqual({
+      kind: "diff-unreadable",
+      path: "conflicted",
+      reason: expect.stringContaining("unmerged"),
+    })
+    // A conflict is a comparison problem, not permission to omit an initialized
+    // checkout from the sandbox census (CTO f2c99fe4,27518). Earlier assertions
+    // covered only the porcelain record, not the initialized checkout walk.
+    git(fixture.alpha, "worktree", "add", "-q", "--detach", join(fixture.product, "conflicted"), fixture.alphaBase)
+    const initialized = superStatus({ repo: fixture.product, ...(indexFile === undefined ? {} : { indexFile }) })
+    expect(initialized.consultedRepositories.map(({ path }) => path)).toContain("conflicted")
+    expect(initialized.submoduleProblems.filter(({ kind }) => kind === "repository-not-consulted")).toEqual([])
   })
 
   test("merge-base finds the repository that owns a sha and compares against the ref's pin", async () => {

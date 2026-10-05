@@ -48,6 +48,35 @@ afterEach(async () => {
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true })
 })
 
+/**
+ * @failure Hab owned-checkout mode derives another .git parser or cannot resolve
+ * linked root and initialized child metadata through the public shared owner.
+ * @level l1
+ * @consumer Hab sandbox projection preparation
+ * Existing private projection tests never expose metadata for an owned checkout.
+ */
+it("inspects owned checkout Git metadata through the shared root export", async () => {
+  const root = await mkdtemp(join(canonicalTmpdir(), "git-super-owned-metadata-"))
+  roots.push(root)
+  const fixture = createProductFixture(root)
+  const linked = join(root, "linked")
+  git(fixture.product, "worktree", "add", "-q", "--detach", linked, fixture.productBase)
+  git(linked, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
+  for (const checkout of [fixture.product, linked, join(linked, "packages/alpha")]) {
+    expect(await GitSuper.inspectCheckoutGitMetadata(checkout)).toEqual({
+      gitDirectory: git(checkout, "rev-parse", "--absolute-git-dir"),
+      commonDirectory: git(checkout, "rev-parse", "--path-format=absolute", "--git-common-dir"),
+    })
+  }
+  const invalid = join(root, "invalid")
+  mkdirSync(invalid)
+  await expect(GitSuper.inspectCheckoutGitMetadata(invalid)).rejects.toThrow(/\.git/u)
+  writeFileSync(join(invalid, ".git"), "not a gitdir pointer\n")
+  await expect(GitSuper.inspectCheckoutGitMetadata(invalid)).rejects.toThrow("invalid Git metadata pointer")
+  writeFileSync(join(invalid, ".git"), `gitdir: ${join(root, "missing")}\n`)
+  await expect(GitSuper.inspectCheckoutGitMetadata(invalid)).rejects.toThrow(/missing/u)
+})
+
 // CTO63d0a344: retirement needs the sandbox lifetime proof; existing lifecycle tests lacked this gate.
 it("refuses retirement without a unit stop certificate", async () => {
   const root = await mkdtemp(join(canonicalTmpdir(), "git-super-stop-certificate-"))
