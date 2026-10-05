@@ -5,6 +5,16 @@ export * from "./pull.ts"
 export * from "./push.ts"
 export * from "./result.ts"
 export {
+  verifyRetainedEntry,
+  retentionRemovalBoundary,
+  type RetentionGateId,
+  type RetentionGateResult,
+  type RetentionGateStatus,
+  type RetentionVerifyOptions,
+  type RetentionVerifyResult,
+  type RetentionVerifyVerdict,
+} from "./retention-verify.ts"
+export {
   projectPrivateGitWorktree,
   retainPrivateGitProjection,
   retirePrivateGitProjection,

@@ -9,6 +9,7 @@ import {
   type MergeParams,
   type PullParams,
   type PushParams,
+  type RetentionVerifyParams,
   type StatusParams,
   type SubmodulePrepareParams,
   type WorktreeAddParams,
@@ -18,6 +19,7 @@ import type { ConsultedRepository, SuperDiffResult } from "./diff.ts"
 import type { SuperIsAncestorResult } from "./merge-base.ts"
 import type { SuperMergeResult } from "./merge.ts"
 import type { GitSuperResult } from "./result.ts"
+import type { RetentionVerifyResult } from "./retention-verify.ts"
 import type { SuperStatusResult } from "./status.ts"
 import type { SuperSubmodulePrepareResult } from "./submodule-prepare.ts"
 import { delegateNativeGit, readNativeGit, type ProcessOutputSink } from "./process.ts"
@@ -42,6 +44,12 @@ type CapturedInvocation =
   | Readonly<{ node: typeof commands.submodule.prepare; params: SubmodulePrepareParams; json: boolean; nul: boolean }>
   | Readonly<{ node: typeof commands.worktree.add; params: WorktreeAddParams; json: boolean; nul: boolean }>
   | Readonly<{ node: typeof commands.worktree.remove; params: WorktreeRemoveParams; json: boolean; nul: boolean }>
+  | Readonly<{
+      node: typeof commands.worktree.retention.verify
+      params: RetentionVerifyParams
+      json: boolean
+      nul: boolean
+    }>
 
 function stableValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(stableValue)
@@ -78,6 +86,7 @@ async function commandResult(
   | SuperIsAncestorResult
   | SuperMergeResult
   | SuperSubmodulePrepareResult
+  | RetentionVerifyResult
   | GitSuperResult
 > {
   const { resolveInvocation } = await import("@silvery/command")
@@ -90,6 +99,7 @@ async function commandResult(
       | SuperIsAncestorResult
       | SuperMergeResult
       | SuperSubmodulePrepareResult
+      | RetentionVerifyResult
       | GitSuperResult
     >,
     context,
@@ -102,7 +112,7 @@ async function commandResult(
 // Only these existing operations interpret superproject topology. Ordinary Git
 // commands are delegated by default; there is no registry of native commands.
 const ENRICHED_COMMANDS = new Set(["diff", "status", "merge-base", "merge", "pull", "push", "worktree"])
-const OWNED_WORKTREE_SUBCOMMANDS = new Set(["add", "remove"])
+const OWNED_WORKTREE_SUBCOMMANDS = new Set(["add", "remove", "retention"])
 
 function inputObjects(command: string, args: readonly string[]): readonly { argument: string; object: string }[] {
   if (command === "status") return []
@@ -605,6 +615,44 @@ async function runInvocation(
       }
     })
 
+  const retention = worktree
+    .command("retention")
+    .description("Read-only verification of retained GitSuper entries; its result is never removal authority")
+    .allowExcessArguments()
+    .action((_options, command) => {
+      const subcommand = command.args[0]
+      usage =
+        (subcommand === undefined
+          ? "git-super: worktree retention needs a subcommand\n"
+          : `git-super: unknown worktree retention subcommand '${subcommand}'\n`) + command.helpInformation()
+    })
+  retention
+    .command("verify")
+    .description("Read one retained entry and refuse or report incomplete unless every gate passes")
+    .requiredOption("--root <directory>", "the declared retained-modules root this entry is a direct child of")
+    .option(
+      "--namespace <path>",
+      "a managed root whose object stores and borrower registries belong to the estate",
+      (value: string, previous: string[]) => [...previous, value],
+      [],
+    )
+    .argument("<entry>", "retained entry directory to verify")
+    .action((entry, _options, command) => {
+      const globals = command.optsWithGlobals() as { repo: string; json?: boolean }
+      const options = command.opts() as { root: string; namespace?: string[] }
+      const namespaces = options.namespace
+      captured = {
+        node: commands.worktree.retention.verify,
+        params: {
+          entry,
+          root: options.root,
+          ...(namespaces === undefined || namespaces.length === 0 ? {} : { namespaceRoots: namespaces }),
+        },
+        json: globals.json === true,
+        nul: false,
+      }
+    })
+
   program
     .command("diff")
     .description(commands.diff.description ?? commands.diff.title)
@@ -709,6 +757,7 @@ async function runInvocation(
     | SuperIsAncestorResult
     | SuperMergeResult
     | SuperSubmodulePrepareResult
+    | RetentionVerifyResult
     | GitSuperResult
   try {
     let objects: GitObjectContext | undefined
@@ -782,6 +831,10 @@ async function runInvocation(
       )
     }
     return operation.state === "updated" || operation.state === "unchanged" ? 0 : 2
+  }
+  if (captured.node === commands.worktree.retention.verify) {
+    const verify = result as RetentionVerifyResult
+    return verify.verdict === "candidate" ? 0 : verify.verdict === "blocked" ? 1 : 2
   }
   return 0
 }
@@ -890,6 +943,12 @@ async function writeResult(
       }
     }
     if (push.detail !== undefined) stderr.write(`${push.detail.message}\n`)
+  } else if (captured.node === nodes.worktree.retention.verify) {
+    const verify = result as RetentionVerifyResult
+    stdout.write(`${verify.verdict}\n`)
+    for (const gate of verify.gates) {
+      stdout.write(`${gate.status} ${gate.gate}: ${gate.message}\n`)
+    }
   } else {
     const pull = result as GitSuperResult
     stdout.write(`${pull.state}\n`)

@@ -523,18 +523,18 @@ async function cleanSnapshot(
   return snapshot
 }
 
-type ExternalObjectStore = Readonly<{ path: string; declaration: string; target: string }>
-type ManifestEntry = Readonly<
+export type ExternalObjectStore = Readonly<{ path: string; declaration: string; target: string }>
+export type ManifestEntry = Readonly<
   | { kind: "file"; sha256: string }
   | { kind: "objects-link"; declaration: string; target: string }
   | { kind: "symlink"; declaration: string }
 >
-type StoreManifest = Readonly<{
+export type StoreManifest = Readonly<{
   entries: Readonly<Record<string, ManifestEntry>>
   files: Readonly<Record<string, string>>
   externalObjectStores: readonly ExternalObjectStore[]
 }>
-type StoreCustody = Readonly<{ common: string; checkout: string; gitDir: string; modules: string }>
+export type StoreCustody = Readonly<{ common: string; checkout: string; gitDir: string; modules: string }>
 
 function isGitDirectory(owner: string, root: string, rootIsGitDir: boolean): boolean {
   if (!within(root, owner)) return false
@@ -650,7 +650,7 @@ export function metadataFileDigest(path: string): string {
   return createHash("sha256").update(readFileSync(path)).digest("hex")
 }
 
-function manifest(root: string, custody: StoreCustody, hashFiles = true, workingTree = false): StoreManifest {
+export function manifest(root: string, custody: StoreCustody, hashFiles = true, workingTree = false): StoreManifest {
   const entries: Record<string, ManifestEntry> = {}
   const files: Record<string, string> = {}
   const externalObjectStores: ExternalObjectStore[] = []

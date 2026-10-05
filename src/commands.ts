@@ -20,6 +20,7 @@ import {
   type SuperSubmodulePrepareResult,
 } from "./submodule-prepare.ts"
 import { superWorktreeAdd, type SuperWorktreeAddOptions } from "./worktree-add.ts"
+import { verifyRetainedEntry, type RetentionVerifyOptions, type RetentionVerifyResult } from "./retention-verify.ts"
 import { superWorktreeRemove, type SuperWorktreeRemoveOptions } from "./worktree-remove.ts"
 
 export type CommandContext = Readonly<{ repo: string; report?: (message: string) => void }>
@@ -33,6 +34,7 @@ export type GitlinkWriteParams = Omit<WriteGitlinkOptions, "repo" | "git">
 export type SubmodulePrepareParams = Omit<SuperSubmodulePrepareOptions, "repo" | "git" | "exclusive">
 export type WorktreeRemoveParams = Omit<SuperWorktreeRemoveOptions, "repo" | "report">
 export type WorktreeAddParams = Omit<SuperWorktreeAddOptions, "repo" | "env" | "log" | "report">
+export type RetentionVerifyParams = Omit<RetentionVerifyOptions, "clock">
 
 function params<T>(parse: (value: unknown) => T, missing?: (value: unknown) => string[]): ParseParamSchema<T> {
   return { parse, ...(missing === undefined ? {} : { missing }) }
@@ -329,6 +331,33 @@ const worktreeAdd = commandNode<CommandContext, WorktreeAddParams, GitSuperResul
     }),
 })
 
+const retentionVerify = commandNode<CommandContext, RetentionVerifyParams, RetentionVerifyResult>({
+  title: "Verify one retained GitSuper entry read-only",
+  description:
+    "Read a retained entry and its manifest, prove identity, eligibility and the full copy-to-manifest comparison, and refuse or report incomplete rather than authorizing removal.",
+  params: params((value) => {
+    const input = record(value)
+    if (typeof input.entry !== "string" || input.entry.trim() === "") {
+      throw new Error("worktree retention verify requires an entry path")
+    }
+    if (typeof input.root !== "string" || input.root.trim() === "") {
+      throw new Error("worktree retention verify requires --root <declared retained-modules root>")
+    }
+    if (
+      input.namespaceRoots !== undefined &&
+      (!Array.isArray(input.namespaceRoots) || input.namespaceRoots.some((entry) => typeof entry !== "string"))
+    ) {
+      throw new Error("namespaceRoots must be strings")
+    }
+    return {
+      entry: input.entry,
+      root: input.root,
+      ...(input.namespaceRoots === undefined ? {} : { namespaceRoots: input.namespaceRoots as string[] }),
+    }
+  }),
+  run: (_context, input) => Promise.resolve(verifyRetainedEntry(input)),
+})
+
 const worktreeRemove = commandNode<CommandContext, WorktreeRemoveParams, GitSuperResult>({
   title: "Remove a clean worktree with retained submodule stores",
   description: "Prove all repositories clean and unlocked, retain and verify Git stores, then remove once.",
@@ -371,6 +400,9 @@ export type GitSuperCommands = Readonly<{
   worktree: Readonly<{
     add: CommandNode<CommandContext, WorktreeAddParams, GitSuperResult>
     remove: CommandNode<CommandContext, WorktreeRemoveParams, GitSuperResult>
+    retention: Readonly<{
+      verify: CommandNode<CommandContext, RetentionVerifyParams, RetentionVerifyResult>
+    }>
   }>
 }>
 
@@ -383,5 +415,5 @@ export const commands = defineCommandNodes({
   push,
   gitlink: { write: gitlinkWrite },
   submodule: { prepare: submodulePrepare },
-  worktree: { add: worktreeAdd, remove: worktreeRemove },
+  worktree: { add: worktreeAdd, remove: worktreeRemove, retention: { verify: retentionVerify } },
 }) satisfies CommandNodeTree<CommandContext> as GitSuperCommands
