@@ -1,7 +1,9 @@
 /**
- * @failure A retained entry is verified from a partial walk, or a preliminary result is read as removal authority.
+ * @failure A retained entry is verified from a partial walk, or a preliminary `candidate` is read as removal authority.
  * @level l1
  * @consumer Yrd environment close through git-super worktree remove --retain; #27443(b)
+ * @reach fs-walk <fixture-only: the real retention writer, worktree add/remove and the estate scan use mkdtempSync(tmpdir()) Git repos>
+ * @testonly none
  */
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { spawnSync } from "node:child_process"
@@ -48,7 +50,7 @@ function outputSink(): { output: string; write(value: string): void } {
  * fixture per case starves neighbouring files (measured 2026-10-05: ten builds tipped
  * tests/diff.test.ts past its timeout in the full run).
  */
-let base: Readonly<{ root: string; entry: string; retainUntil: string }>
+let base: Readonly<{ root: string; entry: string; retainUntil: string; artifactDir: string }>
 let pristine: string | undefined
 
 beforeAll(async () => {
@@ -82,7 +84,7 @@ beforeAll(async () => {
   // cases therefore restore the entry in place from this snapshot rather than verifying a copy.
   pristine = join(fixtureRoot, "pristine")
   cpSync(entry, pristine, { recursive: true })
-  base = { root, entry, retainUntil: manifest.retainUntil }
+  base = { root, entry, retainUntil: manifest.retainUntil, artifactDir: join(fixtureRoot, "pass") }
 }, 120_000)
 
 /**
@@ -92,6 +94,7 @@ beforeAll(async () => {
 beforeEach(() => {
   rmSync(base.entry, { recursive: true, force: true })
   cpSync(pristine as string, base.entry, { recursive: true })
+  rmSync(base.artifactDir, { recursive: true, force: true })
 })
 
 function eligible(): Date {
@@ -106,90 +109,165 @@ function firstFile(root: string): string {
   throw new Error(`no file under ${root}`)
 }
 
-describe("retention verify gates 1-2", () => {
-  it("passes identity and the copy-to-manifest comparison, and never claims removal authority", () => {
-    const result = verifyRetainedEntry({ entry: base.entry, root: base.root, clock: eligible() })
-    expect(result.gates[0]).toMatchObject({ gate: "identity-eligibility", status: "pass" })
-    expect(result.gates[1]).toMatchObject({ gate: "copy-manifest", status: "pass" })
-    // Gates 3-6 are not implemented, so the pass can never read as a candidate.
-    expect(result.verdict).toBe("unknown")
-    expect(result.head).toMatch(/^[0-9a-f]{40}$/u)
-    expect(result.manifestSha256).toMatch(/^[0-9a-f]{64}$/u)
-    expect(retentionRemovalBoundary(result).authorized).toBe(false)
-  })
-
-  it("refuses eligibility before the retention floor", () => {
+describe("retention verify gates 1-6", () => {
+  it("reaches candidate only through gate 6 and never claims removal authority", () => {
     const result = verifyRetainedEntry({
       entry: base.entry,
       root: base.root,
-      clock: new Date(Date.parse(base.retainUntil) - 1000),
+      namespaceRoots: [fixtureRoot as string],
+      artifactDir: base.artifactDir,
+      clock: eligible(),
+    })
+    expect(result.verdict).toBe("candidate")
+    expect(result.gates.map((gate) => gate.status)).toEqual(["pass", "pass", "pass", "pass", "pass", "pass"])
+    expect(result.head).toMatch(/^[0-9a-f]{40}$/u)
+    expect(result.manifestSha256).toMatch(/^[0-9a-f]{64}$/u)
+    // The rendered, content-addressed certificate exists outside E.
+    expect(result.certificate?.digest).toMatch(/^[0-9a-f]{64}$/u)
+    expect(JSON.parse(readFileSync(result.certificate?.path as string, "utf8"))).toMatchObject({ verdict: "candidate" })
+    expect(retentionRemovalBoundary(result).authorized).toBe(false)
+    expect(retentionRemovalBoundary(result).reason).toContain("preliminary")
+  })
+
+  it("reports gate 2 unknown when no external pass directory was supplied", () => {
+    const result = verifyRetainedEntry({ entry: base.entry, root: base.root, clock: eligible() })
+    expect(result.verdict).toBe("unknown")
+    expect(result.gates[1]).toMatchObject({ gate: "copy-manifest", status: "unknown" })
+    expect(retentionRemovalBoundary(result).authorized).toBe(false)
+  })
+
+  it("refuses a pass directory inside the retention custody", () => {
+    const result = verifyRetainedEntry({
+      entry: base.entry,
+      root: base.root,
+      artifactDir: join(base.root, "inside"),
+      clock: eligible(),
+    })
+    expect(result.verdict).toBe("blocked")
+    expect(result.gates[1]).toMatchObject({ gate: "copy-manifest", status: "blocked" })
+    expect(result.gates[1]?.message).toContain("inside the retention custody")
+  })
+
+  it("refuses eligibility at the retention floor (now == retainUntil)", () => {
+    const result = verifyRetainedEntry({
+      entry: base.entry,
+      root: base.root,
+      artifactDir: base.artifactDir,
+      clock: new Date(Date.parse(base.retainUntil)),
     })
     expect(result.verdict).toBe("blocked")
     expect(result.gates[0]).toMatchObject({ gate: "identity-eligibility", status: "blocked" })
   })
 
   it("refuses a changed byte inside the copied store", () => {
-    const entry = base.entry
-    const target = firstFile(join(entry, "modules"))
+    const target = firstFile(join(base.entry, "modules"))
     writeFileSync(target, `${readFileSync(target, "utf8")}changed`)
-    const result = verifyRetainedEntry({ entry, root: base.root, clock: eligible() })
+    const result = verifyRetainedEntry({
+      entry: base.entry,
+      root: base.root,
+      artifactDir: base.artifactDir,
+      clock: eligible(),
+    })
     expect(result.verdict).toBe("blocked")
-    expect(result.gates[0]).toMatchObject({ status: "pass" })
     expect(result.gates[1]).toMatchObject({ gate: "copy-manifest", status: "blocked" })
   })
 
   it("refuses an extra wrapper file beside the manifest", () => {
-    const entry = base.entry
-    writeFileSync(join(entry, "notes.txt"), "unrecorded\n")
-    const result = verifyRetainedEntry({ entry, root: base.root, clock: eligible() })
+    writeFileSync(join(base.entry, "notes.txt"), "unrecorded\n")
+    const result = verifyRetainedEntry({
+      entry: base.entry,
+      root: base.root,
+      artifactDir: base.artifactDir,
+      clock: eligible(),
+    })
     expect(result.verdict).toBe("blocked")
     expect(result.gates[1]).toMatchObject({ gate: "copy-manifest", status: "blocked" })
   })
 
   it("refuses an entry that is not a direct child of the declared root", () => {
-    const entry = base.entry
-    const nested = join(entry, "nested")
+    const nested = join(base.entry, "nested")
     mkdirSync(nested, { recursive: true })
-    const result = verifyRetainedEntry({ entry: nested, root: base.root, clock: eligible() })
+    const result = verifyRetainedEntry({
+      entry: nested,
+      root: base.root,
+      artifactDir: base.artifactDir,
+      clock: eligible(),
+    })
     expect(result.verdict).toBe("blocked")
     expect(result.gates[0]).toMatchObject({ gate: "identity-eligibility", status: "blocked" })
     expect(JSON.stringify(result.gates[0])).toContain("direct child")
   })
 
   it("refuses an entry with no manifest", () => {
-    const entry = base.entry
-    rmSync(join(entry, "manifest.json"))
-    const result = verifyRetainedEntry({ entry, root: base.root, clock: eligible() })
+    rmSync(join(base.entry, "manifest.json"))
+    const result = verifyRetainedEntry({
+      entry: base.entry,
+      root: base.root,
+      artifactDir: base.artifactDir,
+      clock: eligible(),
+    })
     expect(result.verdict).toBe("blocked")
     expect(result.gates[0]).toMatchObject({ gate: "identity-eligibility", status: "blocked" })
   })
 
   it("reports a legacy manifest as unknown rather than a violated condition", () => {
-    const entry = base.entry
-    const manifestPath = join(entry, "manifest.json")
+    const manifestPath = join(base.entry, "manifest.json")
     const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, unknown>
     delete manifest["writerLocks"]
     writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)
-    const result = verifyRetainedEntry({ entry, root: base.root, clock: eligible() })
+    const result = verifyRetainedEntry({
+      entry: base.entry,
+      root: base.root,
+      artifactDir: base.artifactDir,
+      clock: eligible(),
+    })
     expect(result.verdict).toBe("unknown")
     expect(result.gates[0]).toMatchObject({ gate: "identity-eligibility", status: "unknown" })
   })
 
   it("refuses a present but malformed proof field", () => {
-    const entry = base.entry
-    const manifestPath = join(entry, "manifest.json")
+    const manifestPath = join(base.entry, "manifest.json")
     const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, unknown>
     manifest["writerLocks"] = "not-an-array"
     writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)
-    const result = verifyRetainedEntry({ entry, root: base.root, clock: eligible() })
+    const result = verifyRetainedEntry({
+      entry: base.entry,
+      root: base.root,
+      artifactDir: base.artifactDir,
+      clock: eligible(),
+    })
     expect(result.verdict).toBe("blocked")
     expect(result.gates[0]).toMatchObject({ gate: "identity-eligibility", status: "blocked" })
+  })
+
+  it("reports the estate and custody gates unknown without a declared namespace", () => {
+    const result = verifyRetainedEntry({
+      entry: base.entry,
+      root: base.root,
+      artifactDir: base.artifactDir,
+      clock: eligible(),
+    })
+    expect(result.verdict).toBe("unknown")
+    expect(result.gates[2]).toMatchObject({ gate: "estate-inventory", status: "unknown" })
+    expect(result.gates[3]).toMatchObject({ gate: "candidate-contents", status: "unknown" })
   })
 
   it("exposes the verdict through the CLI, refusing before the retention floor", async () => {
     const stdout = outputSink()
     const code = await runCli(
-      ["--repo", base.root, "--json", "worktree", "retention", "verify", base.entry, "--root", base.root],
+      [
+        "--repo",
+        base.root,
+        "--json",
+        "worktree",
+        "retention",
+        "verify",
+        base.entry,
+        "--root",
+        base.root,
+        "--artifact-dir",
+        base.artifactDir,
+      ],
       stdout,
       outputSink(),
     )
@@ -197,6 +275,37 @@ describe("retention verify gates 1-2", () => {
     const result = JSON.parse(stdout.output) as { verdict: string; gates: Array<{ gate: string; status: string }> }
     expect(result.verdict).toBe("blocked")
     expect(result.gates[0]).toMatchObject({ gate: "identity-eligibility", status: "blocked" })
+  })
+
+  it("exits 0 through the CLI only on a full candidate pass", async () => {
+    // The CLI reads the real clock, so bring the recorded retention floor into the past first;
+    // only `retainUntil` changes, and gate 2 compares the copied subtree, not these bytes.
+    const manifestPath = join(base.entry, "manifest.json")
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, unknown>
+    manifest["retainUntil"] = new Date(Date.now() - 1000).toISOString()
+    writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)
+    const stdout = outputSink()
+    const code = await runCli(
+      [
+        "--repo",
+        base.root,
+        "--json",
+        "worktree",
+        "retention",
+        "verify",
+        base.entry,
+        "--root",
+        base.root,
+        "--namespace",
+        fixtureRoot as string,
+        "--artifact-dir",
+        base.artifactDir,
+      ],
+      stdout,
+      outputSink(),
+    )
+    expect(code).toBe(0)
+    expect((JSON.parse(stdout.output) as { verdict: string }).verdict).toBe("candidate")
   })
 
   it("requires the declared root instead of inferring it", async () => {

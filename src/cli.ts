@@ -636,10 +636,14 @@ async function runInvocation(
       (value: string, previous: string[]) => [...previous, value],
       [],
     )
+    .option(
+      "--artifact-dir <directory>",
+      "external, caller-owned pass directory for the non-object metadata sidecar and the certificate",
+    )
     .argument("<entry>", "retained entry directory to verify")
     .action((entry, _options, command) => {
       const globals = command.optsWithGlobals() as { repo: string; json?: boolean }
-      const options = command.opts() as { root: string; namespace?: string[] }
+      const options = command.opts() as { root: string; namespace?: string[]; artifactDir?: string }
       const namespaces = options.namespace
       captured = {
         node: commands.worktree.retention.verify,
@@ -647,6 +651,7 @@ async function runInvocation(
           entry,
           root: options.root,
           ...(namespaces === undefined || namespaces.length === 0 ? {} : { namespaceRoots: namespaces }),
+          ...(options.artifactDir === undefined ? {} : { artifactDir: options.artifactDir }),
         },
         json: globals.json === true,
         nul: false,

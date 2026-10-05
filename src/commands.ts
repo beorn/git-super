@@ -349,10 +349,14 @@ const retentionVerify = commandNode<CommandContext, RetentionVerifyParams, Reten
     ) {
       throw new Error("namespaceRoots must be strings")
     }
+    if (input.artifactDir !== undefined && typeof input.artifactDir !== "string") {
+      throw new Error("artifactDir must be a string")
+    }
     return {
       entry: input.entry,
       root: input.root,
       ...(input.namespaceRoots === undefined ? {} : { namespaceRoots: input.namespaceRoots as string[] }),
+      ...(input.artifactDir === undefined ? {} : { artifactDir: input.artifactDir as string }),
     }
   }),
   run: (_context, input) => Promise.resolve(verifyRetainedEntry(input)),
