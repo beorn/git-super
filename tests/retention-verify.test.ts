@@ -19,7 +19,7 @@ import {
 } from "node:fs"
 import { spawnSync } from "node:child_process"
 import { tmpdir } from "node:os"
-import { dirname, join } from "node:path"
+import { join } from "node:path"
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest"
 import { runCli } from "../src/cli.ts"
 import { scanContents } from "../src/retention-contents.ts"
@@ -523,7 +523,10 @@ describe("retention verify fix-forward #27443(b) gaps", () => {
   it("still certifies durable evidence with no test seam", () => {
     // Durable means outside the OS temporary directory. The refusal above and this candidate must
     // stay a pair: the correction for #27443(b) tightened the temporary path, never the durable one.
-    const durableRoot = mkdtempSync(join(dirname(tmpdir()), "git-super-retention-durable-"))
+    // /var/tmp is the OS's persistent scratch, outside tmpdir() and writable on Linux and macOS
+    // runners alike. The earlier dirname(tmpdir()) was `/` on Linux CI, where mkdtemp failed EACCES,
+    // so the durable case was never exercised there.
+    const durableRoot = mkdtempSync(join("/var/tmp", "git-super-retention-durable-"))
     try {
       const result = verifyRetainedEntry({
         entry: base.entry,
