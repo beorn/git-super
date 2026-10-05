@@ -19,7 +19,7 @@ import {
 } from "node:fs"
 import { spawnSync } from "node:child_process"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest"
 import { runCli } from "../src/cli.ts"
 import { scanContents } from "../src/retention-contents.ts"
@@ -294,7 +294,7 @@ describe("retention verify gates 1-6", () => {
     expect(result.gates[0]).toMatchObject({ gate: "identity-eligibility", status: "blocked" })
   })
 
-  it("exits 0 through the CLI only on a full candidate pass", async () => {
+  it("keeps the public CLI from certifying a temporary artifact directory", async () => {
     // The CLI reads the real clock, so bring the recorded retention floor into the past first;
     // only `retainUntil` changes, and gate 2 compares the copied subtree, not these bytes.
     const manifestPath = join(base.entry, "manifest.json")
@@ -317,13 +317,44 @@ describe("retention verify gates 1-6", () => {
         fixtureRoot as string,
         "--artifact-dir",
         base.artifactDir,
+      ],
+      stdout,
+      outputSink(),
+    )
+    // The fixture's pass directory is under the OS temporary directory, so gate 6 can never see
+    // durable evidence: the public CLI reports unknown and never a candidate (exit 2).
+    expect(code).toBe(2)
+    const result = JSON.parse(stdout.output) as {
+      verdict: string
+      gates: Array<{ gate: string; status: string; message?: string }>
+    }
+    expect(result.verdict).toBe("unknown")
+    expect(result.gates[1]).toMatchObject({ gate: "copy-manifest", status: "unknown" })
+    expect(result.gates[1]?.message).toContain("temporary")
+  })
+
+  it("does not expose a public temporary-artifact bypass flag", async () => {
+    const stdout = outputSink()
+    const code = await runCli(
+      [
+        "--repo",
+        base.root,
+        "--json",
+        "worktree",
+        "retention",
+        "verify",
+        base.entry,
+        "--root",
+        base.root,
+        "--artifact-dir",
+        base.artifactDir,
         "--allow-temporary-artifact",
       ],
       stdout,
       outputSink(),
     )
-    expect(code).toBe(0)
-    expect((JSON.parse(stdout.output) as { verdict: string }).verdict).toBe("candidate")
+    expect(code).not.toBe(0)
+    expect(stdout.output).toBe("")
   })
 
   it("requires the declared root instead of inferring it", async () => {
@@ -487,5 +518,24 @@ describe("retention verify fix-forward #27443(b) gaps", () => {
     expect(result.verdict).toBe("unknown")
     expect(result.gates[1]).toMatchObject({ gate: "copy-manifest", status: "unknown" })
     expect(result.gates[1]?.message).toContain("temporary")
+  })
+
+  it("still certifies durable evidence with no test seam", () => {
+    // Durable means outside the OS temporary directory. The refusal above and this candidate must
+    // stay a pair: the correction for #27443(b) tightened the temporary path, never the durable one.
+    const durableRoot = mkdtempSync(join(dirname(tmpdir()), "git-super-retention-durable-"))
+    try {
+      const result = verifyRetainedEntry({
+        entry: base.entry,
+        root: base.root,
+        namespaceRoots: [fixtureRoot as string],
+        artifactDir: join(durableRoot, "pass"),
+        clock: eligible(),
+      })
+      expect(result.verdict).toBe("candidate")
+      expect(result.gates[5]).toMatchObject({ gate: "certificate", status: "pass" })
+    } finally {
+      rmSync(durableRoot, { recursive: true, force: true })
+    }
   })
 })

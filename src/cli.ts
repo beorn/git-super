@@ -640,10 +640,6 @@ async function runInvocation(
       "--artifact-dir <directory>",
       "external, caller-owned pass directory for the non-object metadata sidecar and the certificate",
     )
-    .option(
-      "--allow-temporary-artifact",
-      "TEST SEAM: admit an --artifact-dir under the OS temporary directory; /tmp is never durable evidence",
-    )
     .argument("<entry>", "retained entry directory to verify")
     .action((entry, _options, command) => {
       const globals = command.optsWithGlobals() as { repo: string; json?: boolean }
@@ -651,7 +647,6 @@ async function runInvocation(
         root: string
         namespace?: string[]
         artifactDir?: string
-        allowTemporaryArtifact?: boolean
       }
       const namespaces = options.namespace
       captured = {
@@ -661,7 +656,6 @@ async function runInvocation(
           root: options.root,
           ...(namespaces === undefined || namespaces.length === 0 ? {} : { namespaceRoots: namespaces }),
           ...(options.artifactDir === undefined ? {} : { artifactDir: options.artifactDir }),
-          ...(options.allowTemporaryArtifact === true ? { allowTemporaryArtifactDir: true } : {}),
         },
         json: globals.json === true,
         nul: false,
