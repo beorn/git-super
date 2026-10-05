@@ -152,4 +152,40 @@ describe("retention contents scan — gate 4 (#27443(b))", () => {
     expect(scan.status).toBe("unknown")
     expect(scan.detail).toContain("component bound")
   })
+
+  test("a hung git child is killed at the requested timeout, never blocking the scan", () => {
+    const bin = tmp("git-super-contents-bin-")
+    writeFileSync(join(bin, "git"), "#!/bin/sh\nexec sleep 5\n", { mode: 0o755 })
+    const savedPath = process.env.PATH
+    process.env.PATH = `${bin}:${savedPath ?? ""}`
+    const startedAt = Date.now()
+    try {
+      const result = defaultGitRun(["--version"], { timeoutMs: 300 })
+      expect(result.timedOut).toBe(true)
+      expect(result.code).not.toBe(0)
+      expect(Date.now() - startedAt).toBeLessThan(3_000)
+    } finally {
+      process.env.PATH = savedPath
+    }
+  })
+
+  test("scanContents hands every child the remaining component budget and maps a timeout to unknown", () => {
+    const { root } = repoWithCommit("git-super-contents-")
+    const seen: Array<number | undefined> = []
+    const hanging: GitRun = (args, options) => {
+      seen.push(options?.timeoutMs)
+      if (args.includes("cat-file")) {
+        return { code: 1, stdout: "", stderr: "git cat-file timed out after 5000 ms", timedOut: true }
+      }
+      return { code: 1, stdout: "", stderr: `git ${args[0] ?? ""} timed out`, timedOut: true }
+    }
+    const scan = scanContents(root, componentEntries(".git"), [], hanging, {
+      maxEffectiveOids: 4_000_000,
+      componentMs: 5_000,
+    })
+    expect(scan.status).toBe("unknown")
+    expect(scan.detail).toContain("timed out")
+    expect(seen.length).toBeGreaterThan(0)
+    expect(seen.every((value) => value !== undefined && value > 0 && value <= 5_000)).toBe(true)
+  })
 })

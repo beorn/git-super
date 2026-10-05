@@ -20,8 +20,16 @@ export interface GitRunResult {
   readonly code: number
   readonly stdout: string
   readonly stderr: string
+  /** True when the runner killed the child at `GitRunOptions.timeoutMs`, not on the child's own exit. */
+  readonly timedOut?: boolean
 }
-export type GitRun = (args: readonly string[]) => GitRunResult
+
+export interface GitRunOptions {
+  /** Hard per-child deadline. A child that outlives it is killed and reported `timedOut`. */
+  readonly timeoutMs?: number
+}
+
+export type GitRun = (args: readonly string[], options?: GitRunOptions) => GitRunResult
 
 export interface ContentsBounds {
   /** 4,000,000 effective OIDs per candidate component in the contract's initial pass. */
@@ -70,10 +78,14 @@ function within(parent: string, path: string): boolean {
   return part === "" || (part !== ".." && !part.startsWith(`..${sep}`) && !isAbsolute(part))
 }
 
-export function defaultGitRun(args: readonly string[]): GitRunResult {
+export function defaultGitRun(args: readonly string[], options: GitRunOptions = {}): GitRunResult {
+  // spawnSync requires a non-negative integer and treats 0 as "no timeout"; clamp to >=1 ms so a
+  // zero or fractional bound still kills a hung child instead of throwing or disarming the guard.
+  const timeoutMs = options.timeoutMs === undefined ? undefined : Math.max(1, Math.ceil(options.timeoutMs))
   const result = spawnSync("git", [...args], {
     encoding: "utf8",
     maxBuffer: 1 << 30,
+    ...(timeoutMs === undefined ? {} : { timeout: timeoutMs }),
     env: {
       PATH: process.env.PATH ?? "",
       HOME: process.env.HOME ?? "",
@@ -82,7 +94,15 @@ export function defaultGitRun(args: readonly string[]): GitRunResult {
       GIT_OPTIONAL_LOCKS: "0",
     },
   })
-  return { code: result.status ?? 1, stdout: result.stdout ?? "", stderr: result.stderr ?? "" }
+  // spawnSync reports a timeout kill as ETIMEDOUT on `error`, with `status` null. Reporting it as a
+  // named signal keeps a hung child from being confused with a genuine non-zero exit.
+  const timedOut = (result.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT"
+  return {
+    code: result.status ?? 1,
+    stdout: result.stdout ?? "",
+    stderr: timedOut ? `git ${args[0] ?? ""} timed out after ${timeoutMs} ms` : (result.stderr ?? ""),
+    ...(timedOut ? { timedOut: true } : {}),
+  }
 }
 
 /** Every nested component git directory the full manifest records, not a fixed list of names. */
@@ -257,7 +277,22 @@ export function scanContents(
   for (const component of componentsFromManifest(entries)) {
     const started = clock()
     const gitDir = join(copyRoot, component)
-    const effectiveRun = run([
+    // Every child is bounded by the component's REMAINING budget, so a hung git child yields
+    // `unknown` at the bound instead of blocking the scan forever (the post-component check below
+    // could never fire while a single `spawnSync` still had the process).
+    const componentRun: GitRun = (args) => {
+      const remaining = started + bounds.componentMs - clock()
+      if (remaining <= 0) {
+        return {
+          code: 1,
+          stdout: "",
+          stderr: `git ${args[0] ?? ""} not run: the ${bounds.componentMs} ms component bound is already exhausted`,
+          timedOut: true,
+        }
+      }
+      return run(args, { timeoutMs: remaining })
+    }
+    const effectiveRun = componentRun([
       `--git-dir=${gitDir}`,
       `--work-tree=${copyRoot}`,
       "cat-file",
@@ -311,7 +346,7 @@ export function scanContents(
     }
     const independent = new Set<string>()
     for (const store of [...independentStores].sort()) {
-      const storeRun = run([
+      const storeRun = componentRun([
         `--git-dir=${join(store, "..")}`,
         `--work-tree=${copyRoot}`,
         "cat-file",
@@ -332,7 +367,7 @@ export function scanContents(
       for (const oid of parsed.oids) independent.add(oid)
     }
     const atRiskOids = [...effective.oids].filter((oid) => !independent.has(oid)).sort()
-    const roots = readRootOids(gitDir, run)
+    const roots = readRootOids(gitDir, componentRun)
     if ("unreadable" in roots) return { status: "unknown", detail: `${component}: ${roots.unreadable}`, components }
     const rootOids = roots.oids
     const missingRoots = [...rootOids.keys()].filter((oid) => !effective.oids.has(oid)).sort()

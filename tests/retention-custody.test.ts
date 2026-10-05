@@ -10,7 +10,7 @@ import { spawnSync } from "node:child_process"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, test } from "vitest"
-import { defaultGitRun, type ComponentContents } from "../src/retention-contents.ts"
+import { defaultGitRun, type ComponentContents, type GitRun } from "../src/retention-contents.ts"
 import { scanCustody } from "../src/retention-custody.ts"
 
 const cleanup: string[] = []
@@ -125,5 +125,28 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     const scan = scanCustody(store.root, [componentOf(store.head, [store.head])], [notAStore], [])
     expect(scan.status).toBe("unknown")
     expect(scan.detail).toContain("not a Git object directory")
+  })
+
+  test("fsck gets the custody bound as a hard child deadline, so a hung git is unknown, not a block", () => {
+    const store = repoWithCommit("git-super-custody-")
+    const seen: Array<{ args: readonly string[]; timeoutMs: number | undefined }> = []
+    const running: GitRun = (args, options) => {
+      seen.push({ args, timeoutMs: options?.timeoutMs })
+      if (args.includes("fsck")) {
+        return { code: 1, stdout: "", stderr: "git fsck timed out after 300000 ms", timedOut: true }
+      }
+      return defaultGitRun(args, options)
+    }
+    const scan = scanCustody(
+      store.root,
+      [componentOf(store.head, [store.head])],
+      [join(store.root, ".git", "objects")],
+      [],
+      running,
+    )
+    expect(scan.status).toBe("unknown")
+    expect(scan.detail).toContain("fsck")
+    const fsck = seen.find((entry) => entry.args.includes("fsck"))
+    expect(fsck?.timeoutMs).toBe(300_000)
   })
 })

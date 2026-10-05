@@ -145,7 +145,11 @@ function indexStore(
   const closure = alternateClosure(store, removal)
   if (closure.status !== "ok") return closure
   const started = clock()
-  const fsck: GitRunResult = run([`--git-dir=${gitDir}`, "fsck", "--full", "--no-progress"])
+  // The bound is also the child's hard deadline: a hung `fsck` is killed and reported unknown,
+  // rather than blocking the scan at the post-hoc elapsed check below.
+  const fsck: GitRunResult = run([`--git-dir=${gitDir}`, "fsck", "--full", "--no-progress"], {
+    timeoutMs: bounds.fsckMs,
+  })
   if (fsck.code !== 0) {
     return { status: "unknown", detail: `fsck --full failed in witness store ${gitDir}: ${fsck.stderr.trim()}` }
   }
@@ -171,7 +175,7 @@ function indexStore(
     // only a named branch, tag or GitSuper pin qualifies (contract gate 5).
     if (!isDurableRef(ref)) continue
     const refStart = clock()
-    const graph = run([`--git-dir=${gitDir}`, "rev-list", "--objects", tip])
+    const graph = run([`--git-dir=${gitDir}`, "rev-list", "--objects", tip], { timeoutMs: bounds.reachableMs })
     if (graph.code !== 0) {
       return { status: "unknown", detail: `rev-list ${tip} failed in witness store ${gitDir}: ${graph.stderr.trim()}` }
     }
