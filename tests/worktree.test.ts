@@ -85,6 +85,9 @@ describe("createGitWorktreeStore", () => {
       await store.add({ kind: "detached", path: target, ref: "HEAD" })
       await store.add({ kind: "detached", path: other, ref: "HEAD" })
       const otherAdmin = git(other, ["rev-parse", "--absolute-git-dir"]).trim()
+      // An unrelated interrupted registration must not prevent target recovery (#27477 CTO review).
+      const unreadableAdmin = join(repo, ".git", "worktrees", "000-unreadable")
+      await mkdir(unreadableAdmin)
       await rename(target, `${target}-moved`)
       await rename(other, `${other}-moved`)
       const before = objectStoreSnapshot(otherAdmin)
@@ -92,6 +95,48 @@ describe("createGitWorktreeStore", () => {
       expect(await store.inspect(target)).toEqual({ registered: false })
       expect(await store.inspect(other)).toMatchObject({ registered: true, detached: true })
       expect(objectStoreSnapshot(otherAdmin)).toEqual(before)
+      expect(existsSync(unreadableAdmin)).toBe(true)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  /**
+   * @failure Recovery hides unreadable administration pointers when no registered target matches (#27477).
+   * @level l1
+   * @consumer Worktree recovery callers
+   * @testonly none
+   */
+  it("names unreadable administration pointers when no registered target matches", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-unreadable-recovery-"))
+    try {
+      const repo = join(root, "repo")
+      createRepository(repo, "root.txt", "root\n")
+      const target = join(root, "target")
+      await createLocalGitWorktreeStore({ repo }).add({ kind: "detached", path: target, ref: "HEAD" })
+      const admin = git(target, ["rev-parse", "--absolute-git-dir"]).trim()
+      const inventory = git(repo, ["worktree", "list", "--porcelain", "-z"])
+      await rename(target, `${target}-moved`)
+      await rm(join(admin, "gitdir"))
+      const local = createLocalGitProcess()
+      const store = createGitWorktreeStore({
+        repo,
+        gitProcess: {
+          run: (request) =>
+            request.args.join(" ") === "worktree list --porcelain -z"
+              ? Promise.resolve({ code: 0, stdout: inventory, stderr: "" })
+              : local.run(request),
+        },
+      })
+      const refusal = await store.recoverDestroyed(target).then(
+        () => {
+          throw new Error("recovery accepted a registration without administration identity")
+        },
+        (error: unknown) => String(error),
+      )
+      expect(refusal).toContain("has no administration identity")
+      expect(refusal).toContain(join(admin, "gitdir"))
+      expect(existsSync(admin)).toBe(true)
     } finally {
       await rm(root, { recursive: true, force: true })
     }

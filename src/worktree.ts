@@ -561,15 +561,25 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         if (!(await inspectWorktree(git, repo, path)).registered) return
         const common = realpathSync(await git.text(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"]))
         let directory: string | undefined
+        const unreadable: string[] = []
         for (const candidate of removalBorrowers(common, common)) {
-          const pointer = (await readFile(join(candidate.adminDir, "gitdir"), "utf8")).trim()
+          const pointerPath = join(candidate.adminDir, "gitdir")
+          let pointer: string
+          try {
+            pointer = (await readFile(pointerPath, "utf8")).trim()
+          } catch (error) {
+            unreadable.push(`${pointerPath}: ${String(error)}`)
+            continue
+          }
           if (resolve(dirname(pointer)) === resolve(path)) {
             directory = candidate.adminDir
             break
           }
         }
         if (directory === undefined) {
-          throw new Error(`registered destroyed worktree '${path}' has no administration identity`)
+          throw new Error(
+            `registered destroyed worktree '${path}' has no administration identity${unreadable.length === 0 ? "" : `; unreadable administration pointers: ${unreadable.join("; ")}`}`,
+          )
         }
         const writerLeases = acquireRemovalWriterLeases(directory)
         try {
