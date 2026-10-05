@@ -111,7 +111,9 @@ async function preserveProjection(
       throw new Error("invalid private projection checkout or repository record")
     }
     const rootGit = join(checkout, ".git")
-    if ((await metadata(checkout)) !== rootGit) throw new Error(`private root metadata changed at ${checkout}`)
+    if ((await inspectCheckoutGitMetadata(checkout)).gitDirectory !== rootGit) {
+      throw new Error(`private root metadata changed at ${checkout}`)
+    }
     const allowedObjects = new Set(
       projection.mounts
         .filter((mount) => mount.mode === "ro" && mount.source === mount.target)
@@ -125,7 +127,7 @@ async function preserveProjection(
       ) {
         throw new Error(`private repository escapes its recorded checkout: ${repository.checkout}`)
       }
-      if ((await metadata(repository.checkout)) !== repository.gitDirectory) {
+      if ((await inspectCheckoutGitMetadata(repository.checkout)).gitDirectory !== repository.gitDirectory) {
         throw new Error(`private metadata pointer changed at ${repository.checkout}`)
       }
       const configuration = join(repository.gitDirectory, "config")
@@ -261,6 +263,14 @@ async function commonDirectory(gitDirectory: string): Promise<string> {
   return realpath(resolve(gitDirectory, selected))
 }
 
+/** Resolve the selected checkout's canonical metadata; missing or malformed pointers refuse. */
+export async function inspectCheckoutGitMetadata(
+  checkout: string,
+): Promise<Readonly<{ gitDirectory: string; commonDirectory: string }>> {
+  const gitDirectory = await metadata(checkout)
+  return { gitDirectory, commonDirectory: await commonDirectory(gitDirectory) }
+}
+
 /** Make private metadata while the existing materializer owns recursive frozen declaration selection. */
 export async function projectPrivateGitWorktree(
   options: PrivateGitProjectionOptions,
@@ -326,8 +336,7 @@ export async function projectPrivateGitWorktree(
       privateGitDirectory?: string,
       publicGitDirectory?: string,
     ): Promise<void> => {
-      const sourceGit = await metadata(sourceCheckout)
-      const common = await commonDirectory(sourceGit)
+      const { commonDirectory: common } = await inspectCheckoutGitMetadata(sourceCheckout)
       const objects = join(common, "objects")
       const publicDirectory = publicGitDirectory ?? common
       publicDirectories.set(checkout, publicDirectory)
@@ -414,7 +423,7 @@ export async function projectPrivateGitWorktree(
         },
         materialize: async (parent, entry) => {
           const checkout = join(parent, entry.path)
-          const directory = safeStorePath(await metadata(parent), entry.name)
+          const directory = safeStorePath((await inspectCheckoutGitMetadata(parent)).gitDirectory, entry.name)
           const publicParent = publicDirectories.get(parent)
           if (publicParent === undefined) throw new Error(`missing declared public metadata for ${parent}`)
           const publicDirectory = safeStorePath(publicParent, entry.name)

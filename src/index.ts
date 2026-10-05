@@ -15,6 +15,7 @@ export {
   type RetentionVerifyVerdict,
 } from "./retention-verify.ts"
 export {
+  inspectCheckoutGitMetadata,
   projectPrivateGitWorktree,
   retainPrivateGitProjection,
   retirePrivateGitProjection,

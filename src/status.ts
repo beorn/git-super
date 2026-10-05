@@ -86,7 +86,12 @@ export type SuperStatusResult = Readonly<{
   /** Existing empty gitlink directories with no repository of their own; these are not dirty records. */
   uninitializedSubmodules: readonly string[]
   /** Named uncertainty is observable, but never sufficient evidence for worktree removal. */
-  submoduleProblems: readonly Readonly<{ path: string; reason: string; gitDir?: string }>[]
+  submoduleProblems: readonly Readonly<{
+    kind: "repository-not-consulted" | "diff-unreadable"
+    path: string
+    reason: string
+    gitDir?: string
+  }>[]
 }>
 
 function nulFields(value: string): string[] {
@@ -133,13 +138,30 @@ function diffRecords(
   excludedSubmodules: readonly string[],
 ): Readonly<{ records: string[]; notCompared: readonly NotCompared[] }> {
   if (from === to) return { records: [], notCompared: [] }
-  const result = recursiveNameStatusDiff({
-    repo: root,
-    prefix,
-    refs: [`${from}..${to}`],
-    consulted: { path: prefix, root, from, to },
-    excludedSubmodules,
-  })
+  let result: ReturnType<typeof recursiveNameStatusDiff>
+  try {
+    result = recursiveNameStatusDiff({
+      repo: root,
+      prefix,
+      refs: [`${from}..${to}`],
+      consulted: { path: prefix, root, from, to },
+      excludedSubmodules,
+    })
+  } catch (error) {
+    // Comparison failed, but the selected checkout can still be consulted.
+    // Preserve the exact query and failure as uncertainty, never clean status.
+    return {
+      records: [],
+      notCompared: [
+        {
+          path: prefix,
+          reason: "unreadable",
+          message: `cannot compare ${from}..${to} in ${root}: ${error instanceof Error ? error.message : String(error)}`,
+          remedy: "hydrate the selected pins and repeat the comparison",
+        },
+      ],
+    }
+  }
   return {
     notCompared: result.notCompared,
     records: result.entries.map(({ status, path }) => {
@@ -222,10 +244,10 @@ function statusRepository(
     let symbolicCheckout = false
     if (indexed.has(path) && indexed.get(path) === undefined) {
       submoduleProblems.push({
+        kind: "diff-unreadable",
         path: nestedPrefix,
         reason: `unmerged gitlink ${child} has no resolved index pin; resolve its conflict before removal`,
       })
-      continue
     }
     try {
       const childState = lstatSync(child)
@@ -240,6 +262,7 @@ function statusRepository(
       const probe = probeRepository(nestedRoot, runGit(child, ["rev-parse", "--show-prefix"]))
       if (childState.isSymbolicLink()) {
         submoduleProblems.push({
+          kind: "repository-not-consulted",
           path: nestedPrefix,
           reason: `checkout ${child} is a symbolic link; preserve its target before removal`,
         })
@@ -264,6 +287,7 @@ function statusRepository(
           notCompared.push(observation)
           if (observation.reason === "unreadable") {
             submoduleProblems.push({
+              kind: "diff-unreadable",
               path: observation.path,
               reason: `${observation.message}${observation.remedy ? `; ${observation.remedy}` : ""}`,
             })
@@ -296,6 +320,7 @@ function statusRepository(
       if (headPin !== undefined && indexPin !== undefined) checkedOutGitlinks.add(nestedPrefix)
     } catch (error) {
       submoduleProblems.push({
+        kind: "repository-not-consulted",
         path: nestedPrefix,
         reason: `${child}: ${symbolicCheckout ? "symbolic link checkout; " : ""}${error instanceof Error ? error.message : String(error)}`,
         ...(gitDir === undefined ? {} : { gitDir }),
