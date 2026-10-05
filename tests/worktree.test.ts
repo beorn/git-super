@@ -63,6 +63,62 @@ function objectStoreSnapshot(objects: string) {
 
 describe("createGitWorktreeStore", () => {
   /**
+   * @failure A .git-less removal remnant resolves to its ancestor repository and inspects unrelated custody (27477).
+   * @level l1
+   * @consumer Git-super status and landing worktree removal
+   * @testonly none
+   */
+  // Empty-submodule coverage does not protect the requested root itself losing its Git identity.
+  it.each(["status", "remove"] as const)("refuses ancestor custody for a .git-less %s root", async (operation) => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-ancestor-custody-"))
+    try {
+      const parent = join(root, "parent")
+      createRepository(parent, "tracked.txt", "parent data\n")
+      const remnant = join(parent, "remnant")
+      await mkdir(remnant)
+      await writeFile(join(remnant, "remaining.txt"), "interrupted removal\n")
+      const parentGit = join(parent, ".git")
+      await writeFile(join(parentGit, "tent-state-write.lock"), "")
+      vi.mocked(readdirSync).mockClear()
+      let refusal: string
+      if (operation === "status") {
+        const out = {
+          output: "",
+          write(value: string) {
+            this.output += value
+            return true
+          },
+        }
+        const err = {
+          output: "",
+          write(value: string) {
+            this.output += value
+            return true
+          },
+        }
+        const code = await runCli(["--repo", remnant, "--json", "status"], out, err)
+        expect(code, out.output).not.toBe(0)
+        refusal = err.output
+      } else {
+        const store = createLocalGitWorktreeStore({ repo: parent })
+        refusal = await store.remove(remnant).then(
+          () => {
+            throw new Error("removal accepted a directory without its own Git identity")
+          },
+          (error: unknown) => (error instanceof Error ? error.message : String(error)),
+        )
+      }
+      expect(refusal).toContain(remnant)
+      expect(refusal).toContain("not a worktree root")
+      expect(refusal).toContain(parent)
+      expect(vi.mocked(readdirSync).mock.calls.some(([path]) => String(path) === parentGit)).toBe(false)
+      expect(await readFile(join(remnant, "remaining.txt"), "utf8")).toBe("interrupted removal\n")
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  /**
    * @failure Caller inspection admits a private checkout that removal refuses, loses file-content evidence, or changes Git state before admission (27058).
    * @level l1
    * @consumer Bearly worktree admission and Git-super removal
