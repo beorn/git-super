@@ -22,9 +22,10 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest"
 import { runCli } from "../src/cli.ts"
-import { scanContents } from "../src/retention-contents.ts"
+import { scanContents, type ComponentContents } from "../src/retention-contents.ts"
 import { scanCustody } from "../src/retention-custody.ts"
 import { scanEstate } from "../src/retention-estate.ts"
+import { readLines, SidecarWriter } from "../src/retention-stream.ts"
 import {
   DEFAULT_NON_OBJECT_METADATA_BOUNDS,
   retentionRemovalBoundary,
@@ -128,9 +129,35 @@ function firstFile(root: string): string {
   throw new Error(`no file under ${root}`)
 }
 
+async function atRiskComponent(
+  sidecarDir: string,
+  rows: ReadonlyArray<{ oid: string; type: string; source: string }>,
+): Promise<ComponentContents> {
+  const writer = new SidecarWriter(sidecarDir, "txt")
+  for (const row of [...rows].sort((left, right) => (left.oid < right.oid ? -1 : 1))) {
+    writer.add(`${row.oid}\t${row.type}\t${row.source}`)
+  }
+  return {
+    component: ".git",
+    effective: rows.length,
+    independent: 0,
+    atRisk: rows.length,
+    atRiskSidecar: await writer.finish(),
+    missingRoots: 0,
+    missingRootsSample: [],
+    elapsedMs: 0,
+  }
+}
+
+async function sidecarRows(path: string): Promise<string[]> {
+  const rows: string[] = []
+  for await (const line of readLines(path)) rows.push(line)
+  return rows
+}
+
 describe("retention verify gates 1-6", () => {
-  it("reaches candidate only through gate 6 and never claims removal authority", () => {
-    const result = verifyRetainedEntry({
+  it("reaches candidate only through gate 6 and never claims removal authority", async () => {
+    const result = await verifyRetainedEntry({
       entry: base.entry,
       root: base.root,
       namespaceRoots: [fixtureRoot as string],
@@ -149,15 +176,15 @@ describe("retention verify gates 1-6", () => {
     expect(retentionRemovalBoundary(result).reason).toContain("preliminary")
   })
 
-  it("reports gate 2 unknown when no external pass directory was supplied", () => {
-    const result = verifyRetainedEntry({ entry: base.entry, root: base.root, clock: eligible() })
+  it("reports gate 2 unknown when no external pass directory was supplied", async () => {
+    const result = await verifyRetainedEntry({ entry: base.entry, root: base.root, clock: eligible() })
     expect(result.verdict).toBe("unknown")
     expect(result.gates[1]).toMatchObject({ gate: "copy-manifest", status: "unknown" })
     expect(retentionRemovalBoundary(result).authorized).toBe(false)
   })
 
-  it("refuses a pass directory inside the retention custody", () => {
-    const result = verifyRetainedEntry({
+  it("refuses a pass directory inside the retention custody", async () => {
+    const result = await verifyRetainedEntry({
       entry: base.entry,
       root: base.root,
       artifactDir: join(base.root, "inside"),
@@ -168,8 +195,8 @@ describe("retention verify gates 1-6", () => {
     expect(result.gates[1]?.message).toContain("inside the retention custody")
   })
 
-  it("refuses eligibility at the retention floor (now == retainUntil)", () => {
-    const result = verifyRetainedEntry({
+  it("refuses eligibility at the retention floor (now == retainUntil)", async () => {
+    const result = await verifyRetainedEntry({
       entry: base.entry,
       root: base.root,
       artifactDir: base.artifactDir,
@@ -179,10 +206,10 @@ describe("retention verify gates 1-6", () => {
     expect(result.gates[0]).toMatchObject({ gate: "identity-eligibility", status: "blocked" })
   })
 
-  it("refuses a changed byte inside the copied store", () => {
+  it("refuses a changed byte inside the copied store", async () => {
     const target = firstFile(join(base.entry, "modules"))
     writeFileSync(target, `${readFileSync(target, "utf8")}changed`)
-    const result = verifyRetainedEntry({
+    const result = await verifyRetainedEntry({
       entry: base.entry,
       root: base.root,
       artifactDir: base.artifactDir,
@@ -192,9 +219,9 @@ describe("retention verify gates 1-6", () => {
     expect(result.gates[1]).toMatchObject({ gate: "copy-manifest", status: "blocked" })
   })
 
-  it("refuses an extra wrapper file beside the manifest", () => {
+  it("refuses an extra wrapper file beside the manifest", async () => {
     writeFileSync(join(base.entry, "notes.txt"), "unrecorded\n")
-    const result = verifyRetainedEntry({
+    const result = await verifyRetainedEntry({
       entry: base.entry,
       root: base.root,
       artifactDir: base.artifactDir,
@@ -204,10 +231,10 @@ describe("retention verify gates 1-6", () => {
     expect(result.gates[1]).toMatchObject({ gate: "copy-manifest", status: "blocked" })
   })
 
-  it("refuses an entry that is not a direct child of the declared root", () => {
+  it("refuses an entry that is not a direct child of the declared root", async () => {
     const nested = join(base.entry, "nested")
     mkdirSync(nested, { recursive: true })
-    const result = verifyRetainedEntry({
+    const result = await verifyRetainedEntry({
       entry: nested,
       root: base.root,
       artifactDir: base.artifactDir,
@@ -218,9 +245,9 @@ describe("retention verify gates 1-6", () => {
     expect(JSON.stringify(result.gates[0])).toContain("direct child")
   })
 
-  it("refuses an entry with no manifest", () => {
+  it("refuses an entry with no manifest", async () => {
     rmSync(join(base.entry, "manifest.json"))
-    const result = verifyRetainedEntry({
+    const result = await verifyRetainedEntry({
       entry: base.entry,
       root: base.root,
       artifactDir: base.artifactDir,
@@ -230,12 +257,12 @@ describe("retention verify gates 1-6", () => {
     expect(result.gates[0]).toMatchObject({ gate: "identity-eligibility", status: "blocked" })
   })
 
-  it("reports a legacy manifest as unknown rather than a violated condition", () => {
+  it("reports a legacy manifest as unknown rather than a violated condition", async () => {
     const manifestPath = join(base.entry, "manifest.json")
     const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, unknown>
     delete manifest["writerLocks"]
     writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)
-    const result = verifyRetainedEntry({
+    const result = await verifyRetainedEntry({
       entry: base.entry,
       root: base.root,
       artifactDir: base.artifactDir,
@@ -245,12 +272,12 @@ describe("retention verify gates 1-6", () => {
     expect(result.gates[0]).toMatchObject({ gate: "identity-eligibility", status: "unknown" })
   })
 
-  it("refuses a present but malformed proof field", () => {
+  it("refuses a present but malformed proof field", async () => {
     const manifestPath = join(base.entry, "manifest.json")
     const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, unknown>
     manifest["writerLocks"] = "not-an-array"
     writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)
-    const result = verifyRetainedEntry({
+    const result = await verifyRetainedEntry({
       entry: base.entry,
       root: base.root,
       artifactDir: base.artifactDir,
@@ -260,8 +287,8 @@ describe("retention verify gates 1-6", () => {
     expect(result.gates[0]).toMatchObject({ gate: "identity-eligibility", status: "blocked" })
   })
 
-  it("reports the estate and custody gates unknown without a declared namespace", () => {
-    const result = verifyRetainedEntry({
+  it("reports the estate and custody gates unknown without a declared namespace", async () => {
+    const result = await verifyRetainedEntry({
       entry: base.entry,
       root: base.root,
       artifactDir: base.artifactDir,
@@ -390,7 +417,7 @@ describe("retention verify gates 1-6", () => {
 })
 
 describe("retention verify fix-forward #27443(b) gaps", () => {
-  it("follows alternate targets transitively and blocks a survivor that borrows into the removal set", () => {
+  it("follows alternate targets transitively and blocks a survivor that borrows into the removal set", async () => {
     const scene = mkdtempSync(join(tmpdir(), "estate-transitive-"))
     const roots = join(scene, "S")
     const target = join(scene, "T")
@@ -408,7 +435,7 @@ describe("retention verify fix-forward #27443(b) gaps", () => {
     )
   })
 
-  it("keeps a transitive alternate chain that never enters the removal set at pass", () => {
+  it("keeps a transitive alternate chain that never enters the removal set at pass", async () => {
     const scene = mkdtempSync(join(tmpdir(), "estate-transitive-pass-"))
     const roots = join(scene, "S")
     const target = join(scene, "T")
@@ -419,7 +446,7 @@ describe("retention verify fix-forward #27443(b) gaps", () => {
     expect(result.status).toBe("pass")
   })
 
-  it("reports a malformed borrower registry record unknown", () => {
+  it("reports a malformed borrower registry record unknown", async () => {
     const scene = mkdtempSync(join(tmpdir(), "estate-registry-"))
     const roots = join(scene, "R")
     mkdirSync(join(roots, "git-super-retained-borrowers"), { recursive: true })
@@ -429,7 +456,7 @@ describe("retention verify fix-forward #27443(b) gaps", () => {
     expect(result.detail).toContain("not valid JSON")
   })
 
-  it("reads a valid borrower registry record and reconciles it with the manifest it names", () => {
+  it("reads a valid borrower registry record and reconciles it with the manifest it names", async () => {
     const scene = mkdtempSync(join(tmpdir(), "estate-registry-good-"))
     const roots = join(scene, "R")
     const entry = join(scene, "entry")
@@ -446,39 +473,28 @@ describe("retention verify fix-forward #27443(b) gaps", () => {
     expect(result.registries).toHaveLength(1)
   })
 
-  it("records the witnessed OID's own type rather than the ref tip's type", () => {
+  it("records the at-risk OID's own type in the sidecar and names the ref whose closure carries it", async () => {
     const scene = mkdtempSync(join(tmpdir(), "custody-type-"))
     const repo = join(scene, "witness")
+    const sidecarDir = join(scene, "sidecars")
     mkdirSync(repo, { recursive: true })
     git(repo, ["init", "-q", "-b", "main"])
     writeFileSync(join(repo, "f.txt"), "hello\n")
     git(repo, ["add", "f.txt"])
     git(repo, ["commit", "-q", "-m", "c"])
     const blob = git(repo, ["rev-parse", "HEAD:f.txt"])
-    const result = scanCustody(
-      repo,
-      [
-        {
-          component: ".git",
-          effective: 0,
-          independent: 0,
-          atRisk: 1,
-          missingRoots: [],
-          atRiskOids: [blob],
-          atRiskSources: { [blob]: "owned" },
-          elapsedMs: 0,
-        },
-      ],
-      [join(repo, ".git", "objects")],
-      [],
-    )
+    const commit = git(repo, ["rev-parse", "HEAD"])
+    const component = await atRiskComponent(sidecarDir, [{ oid: blob, type: "blob", source: "owned" }])
+    const result = await scanCustody(repo, [component], [join(repo, ".git", "objects")], [], { sidecarDir })
     expect(result.status).toBe("pass")
-    expect(result.witnesses[0]).toMatchObject({ oid: blob, objectType: "blob", ref: "refs/heads/main" })
+    expect(result.witnesses[0]).toMatchObject({ ref: "refs/heads/main", tip: commit })
+    expect(await sidecarRows(component.atRiskSidecar.path)).toEqual([`${blob}\tblob\towned`])
   })
 
-  it("refuses a transient operation ref as a durable witness", () => {
+  it("refuses a transient operation ref as a durable witness", async () => {
     const scene = mkdtempSync(join(tmpdir(), "custody-transient-"))
     const repo = join(scene, "witness")
+    const sidecarDir = join(scene, "sidecars")
     mkdirSync(repo, { recursive: true })
     git(repo, ["init", "-q", "-b", "main"])
     writeFileSync(join(repo, "f.txt"), "hello\n")
@@ -487,27 +503,12 @@ describe("retention verify fix-forward #27443(b) gaps", () => {
     const blob = git(repo, ["rev-parse", "HEAD:f.txt"])
     git(repo, ["update-ref", "refs/rewritten/temporary-review", blob])
     git(repo, ["update-ref", "-d", "refs/heads/main"])
-    const result = scanCustody(
-      repo,
-      [
-        {
-          component: ".git",
-          effective: 0,
-          independent: 0,
-          atRisk: 1,
-          missingRoots: [],
-          atRiskOids: [blob],
-          atRiskSources: { [blob]: "owned" },
-          elapsedMs: 0,
-        },
-      ],
-      [join(repo, ".git", "objects")],
-      [],
-    )
+    const component = await atRiskComponent(sidecarDir, [{ oid: blob, type: "blob", source: "owned" }])
+    const result = await scanCustody(repo, [component], [join(repo, ".git", "objects")], [], { sidecarDir })
     expect(result.status).toBe("blocked")
   })
 
-  it("subtracts an external objects-symlink target from the at-risk set", () => {
+  it("subtracts an external objects-symlink target from the at-risk set", async () => {
     const scene = mkdtempSync(join(tmpdir(), "contents-link-"))
     const source = join(scene, "source")
     const component = join(scene, "comp")
@@ -525,14 +526,16 @@ describe("retention verify fix-forward #27443(b) gaps", () => {
     const entries = {
       ".git/objects/info/alternates": { kind: "file", sha256: "0".repeat(64) },
     } as Record<string, ManifestEntry>
-    const result = scanContents(component, entries, [])
+    const result = await scanContents(component, entries, [], {
+      sidecarDir: mkdtempSync(join(tmpdir(), "contents-link-sidecars-")),
+    })
     expect(result.status).toBe("pass")
     expect(result.components[0]).toMatchObject({ component: ".git", atRisk: 0 })
     expect(result.components[0]!.independent).toBeGreaterThan(0)
   })
 
-  it("refuses a temporary artifact directory as durable evidence", () => {
-    const result = verifyRetainedEntry({
+  it("refuses a temporary artifact directory as durable evidence", async () => {
+    const result = await verifyRetainedEntry({
       entry: base.entry,
       root: base.root,
       namespaceRoots: [fixtureRoot as string],
@@ -544,7 +547,7 @@ describe("retention verify fix-forward #27443(b) gaps", () => {
     expect(result.gates[1]?.message).toContain("temporary")
   })
 
-  it("still certifies durable evidence with no test seam", () => {
+  it("still certifies durable evidence with no test seam", async () => {
     // Durable means outside the OS temporary directory. The refusal above and this candidate must
     // stay a pair: the correction for #27443(b) tightened the temporary path, never the durable one.
     // /var/tmp is the OS's persistent scratch, outside tmpdir() and writable on Linux and macOS
@@ -552,7 +555,7 @@ describe("retention verify fix-forward #27443(b) gaps", () => {
     // so the durable case was never exercised there.
     const durableRoot = mkdtempSync(join("/var/tmp", "git-super-retention-durable-"))
     try {
-      const result = verifyRetainedEntry({
+      const result = await verifyRetainedEntry({
         entry: base.entry,
         root: base.root,
         namespaceRoots: [fixtureRoot as string],
@@ -564,5 +567,66 @@ describe("retention verify fix-forward #27443(b) gaps", () => {
     } finally {
       rmSync(durableRoot, { recursive: true, force: true })
     }
+  })
+
+  it("emits a byte-identical certificate and sidecars on a rerun of the same estate", async () => {
+    const artifactDir = mkdtempSync(join(tmpdir(), "verify-rerun-"))
+    const options = {
+      entry: base.entry,
+      root: base.root,
+      namespaceRoots: [fixtureRoot as string],
+      artifactDir,
+      allowTemporaryArtifactDir: true,
+      clock: eligible(),
+      monotonic: () => 0,
+    }
+    const first = await verifyRetainedEntry(options)
+    expect(first.verdict).toBe("candidate")
+    const firstBytes = readFileSync(first.certificate?.path as string, "utf8")
+    const sidecarsAfterFirst = readdirSync(join(artifactDir, "sidecars")).sort()
+    expect(sidecarsAfterFirst.length).toBeGreaterThan(0)
+    const second = await verifyRetainedEntry(options)
+    expect(second.certificate?.digest).toBe(first.certificate?.digest)
+    expect(readFileSync(second.certificate?.path as string, "utf8")).toBe(firstBytes)
+    expect(readdirSync(join(artifactDir, "sidecars")).sort()).toEqual(sidecarsAfterFirst)
+    // Content-addressed only: no temporary name (`.<prefix>-<pid>-<n>`) survives a pass.
+    expect(sidecarsAfterFirst.every((name) => /^[0-9a-f]{64}\.txt$/u.test(name))).toBe(true)
+  })
+
+  it("reports unknown when a previously written sidecar was tampered with", async () => {
+    const artifactDir = mkdtempSync(join(tmpdir(), "verify-tamper-"))
+    const options = {
+      entry: base.entry,
+      root: base.root,
+      namespaceRoots: [fixtureRoot as string],
+      artifactDir,
+      allowTemporaryArtifactDir: true,
+      clock: eligible(),
+      monotonic: () => 0,
+    }
+    const first = await verifyRetainedEntry(options)
+    expect(first.verdict).toBe("candidate")
+    // Corrupt every sidecar: whichever ones a rerun re-derives, it must refuse to trust a name.
+    for (const name of readdirSync(join(artifactDir, "sidecars"))) {
+      writeFileSync(join(artifactDir, "sidecars", name), "tampered\n")
+    }
+    const second = await verifyRetainedEntry(options)
+    expect(second.verdict).toBe("unknown")
+    expect(second.reasons.join(" ")).toContain("read-back mismatch")
+  })
+
+  it("reports an uncreatable pass directory unknown, never a crash", async () => {
+    const scene = mkdtempSync(join(tmpdir(), "verify-unwritable-"))
+    writeFileSync(join(scene, "blocker"), "x")
+    const result = await verifyRetainedEntry({
+      entry: base.entry,
+      root: base.root,
+      namespaceRoots: [fixtureRoot as string],
+      artifactDir: join(scene, "blocker", "pass"),
+      allowTemporaryArtifactDir: true,
+      clock: eligible(),
+    })
+    expect(result.verdict).toBe("unknown")
+    expect(result.gates[1]).toMatchObject({ gate: "copy-manifest", status: "unknown" })
   })
 })

@@ -6,15 +6,33 @@
  * set). `IndependentStores(g,R)` is the union of the effective sets of external alternate and
  * objects-link targets that are present, independently owned and disjoint from `R`.
  * `AtRisk(g) = Effective(g) \ IndependentStores(g,R)`. `Roots(g)` is every ref, reflog old/new,
- * pseudo-ref and index OID. Read-only: it runs git queries and reads files; it never writes,
- * prunes or gc's. A malformed row, an unreadable index, a failed git command or a cap hit is
- * `unknown`; a root OID the component's own store no longer carries is a violated condition.
+ * pseudo-ref and index OID.
+ *
+ * Every large set is streamed: the two object sets are compared by a k-way merge over the sorted
+ * `cat-file` streams (already OID-sorted) and the roots, and the result lands in content-addressed
+ * sidecars rather than in a Set/Map/array. Peak memory is the sort run buffer plus one line per
+ * source, so a 4,000,000-OID component no longer costs hundreds of MB of heap. Read-only: it runs
+ * git queries and reads files; it never writes, prunes or gc's. A malformed row, an unreadable
+ * index, a failed git command, an unwritable sidecar or a cap hit is `unknown`; a root OID the
+ * component's own store no longer carries is a violated condition.
  */
 import { spawnSync } from "node:child_process"
 import { existsSync, lstatSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs"
 import { isAbsolute, join, relative, sep } from "node:path"
 import { alternateEntries } from "./alternates.ts"
 import type { ManifestEntry } from "./worktree-removal.ts"
+import {
+  DEFAULT_SORT_RUN_LINES,
+  externalSortToSidecar,
+  gitLineStream,
+  mergeSorted,
+  oidKey,
+  readLines,
+  SidecarWriter,
+  type GitLineStream,
+  type GitStreamOptions,
+  type SidecarRef,
+} from "./retention-stream.ts"
 
 export interface GitRunResult {
   readonly code: number
@@ -30,6 +48,12 @@ export interface GitRunOptions {
 }
 
 export type GitRun = (args: readonly string[], options?: GitRunOptions) => GitRunResult
+
+/** Streams a git child's stdout as bounded lines; the seam tests use to fake a large or broken output. */
+export type GitStreamFactory = (args: readonly string[], options?: GitStreamOptions) => GitLineStream
+
+/** The production line stream: a real child, killed at its byte/line cap or deadline. */
+export const defaultGitStream: GitStreamFactory = gitLineStream
 
 export interface ContentsBounds {
   /** 4,000,000 effective OIDs per candidate component in the contract's initial pass. */
@@ -47,12 +71,16 @@ export interface ComponentContents {
   readonly independent: number
   /** OIDs reachable in this component but not in any independent store; the gate 5 input. */
   readonly atRisk: number
+  /**
+   * The sorted at-risk sidecar: one `<oid>\t<objectType>\t<source>` line per at-risk OID. Its
+   * own sha256 is the certificate's `atRiskDigest`.
+   */
+  readonly atRiskSidecar: SidecarRef
   /** Root OIDs (refs, reflogs, pseudo-refs, index) that are NOT in the store's effective set. */
-  readonly missingRoots: readonly string[]
-  /** The full at-risk OID list, sorted (streamed in real runs; a list here for the certificate). */
-  readonly atRiskOids: readonly string[]
-  /** at-risk OID -> the named source that records it (ref/reflog/pseudo-ref/index), else "owned". */
-  readonly atRiskSources: Readonly<Record<string, string>>
+  readonly missingRoots: number
+  /** The first 100 missing root OIDs, for the inline refusal; the full list is the sidecar. */
+  readonly missingRootsSample: readonly string[]
+  readonly missingRootsSidecar?: SidecarRef | undefined
   readonly elapsedMs: number
 }
 
@@ -60,6 +88,15 @@ export interface ContentsScan {
   readonly status: "pass" | "blocked" | "unknown"
   readonly detail: string
   readonly components: readonly ComponentContents[]
+}
+
+export interface ContentsScanOptions {
+  /** Directory for the content-addressed sidecars; must be outside `E` and `R`. */
+  readonly sidecarDir: string
+  readonly run?: GitRun
+  readonly stream?: GitStreamFactory
+  readonly bounds?: ContentsBounds
+  readonly clock?: () => number
 }
 
 const PSEUDO_REFS = [
@@ -72,6 +109,16 @@ const PSEUDO_REFS = [
   "BISECT_LOG",
 ]
 const HEX40 = /^[0-9a-f]{40}$/u
+const ZERO_OID = /^0+$/u
+const MISSING_INLINE = 100
+
+/** A proof step that could not complete; `scanContents` reports it as `unknown`, never a crash. */
+class UnknownError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = "UnknownError"
+  }
+}
 
 function within(parent: string, path: string): boolean {
   const part = relative(parent, path)
@@ -121,33 +168,6 @@ export function componentsFromManifest(entries: Readonly<Record<string, Manifest
   return [...names].sort()
 }
 
-function parseEffective(
-  stdout: string,
-  cap: number,
-): { status: "ok"; oids: Set<string> } | { status: "unknown"; detail: string } {
-  const oids = new Map<string, string>()
-  for (const line of stdout.split("\n")) {
-    if (line === "") continue
-    const [oid, type, size] = line.split(" ")
-    if (oid === undefined || type === undefined || size === undefined || !HEX40.test(oid)) {
-      return { status: "unknown", detail: `malformed cat-file row: ${line.slice(0, 120)}` }
-    }
-    if (type !== "commit" && type !== "tree" && type !== "blob" && type !== "tag") {
-      return { status: "unknown", detail: `cat-file reported unsupported object type '${type}' for ${oid}` }
-    }
-    if (!/^\d+$/u.test(size)) {
-      return { status: "unknown", detail: `cat-file reported malformed object size '${size}' for ${oid}` }
-    }
-    const previous = oids.get(oid)
-    if (previous !== undefined && previous !== type) {
-      return { status: "unknown", detail: `cat-file reported conflicting types for ${oid}: ${previous} and ${type}` }
-    }
-    oids.set(oid, type)
-    if (oids.size > cap) return { status: "unknown", detail: `effective OID count exceeded the ${cap} cap` }
-  }
-  return { status: "ok", oids: new Set(oids.keys()) }
-}
-
 /** Strict transitive alternates closure of one object dir: every link present, no cycle back into R. */
 function closure(
   objects: string,
@@ -185,221 +205,278 @@ function closure(
   return { status: "ok", stores }
 }
 
-type RootSet = Readonly<{ oids: Map<string, string[]>; unreadable?: string }>
-
-const ZERO_OID = /^0+$/u
-
-function addSource(oids: Map<string, string[]>, oid: string, source: string): void {
-  // The contract excludes zero OIDs: the creation record of a reflog and a symbolic HEAD both
-  // name them, and neither is an object the store must carry.
-  if (ZERO_OID.test(oid)) return
-  const existing = oids.get(oid)
-  if (existing === undefined) oids.set(oid, [source])
-  else existing.push(source)
-}
-
-function readRootOids(gitDir: string, run: GitRun): RootSet | { unreadable: string } {
-  const oids = new Map<string, string[]>()
+/**
+ * Yields one `<oid>\t<source>` line per root OID the component records: refs, HEAD, reflog
+ * old/new, pseudo-refs and the index. Zero OIDs are excluded (the creation record of a reflog and
+ * a symbolic HEAD both name them, and neither is an object the store must carry). Unreadable or
+ * malformed root state throws; `scanContents` reports that as `unknown`.
+ */
+function* rootOidLines(gitDir: string, run: GitRun): Generator<string> {
   const refs = run([`--git-dir=${gitDir}`, "for-each-ref", "--format=%(objectname) %(refname)"])
-  if (refs.code !== 0) return { unreadable: `for-each-ref failed in ${gitDir}: ${refs.stderr.trim()}` }
+  if (refs.code !== 0) throw new UnknownError(`for-each-ref failed in ${gitDir}: ${refs.stderr.trim()}`)
   for (const line of refs.stdout.split("\n")) {
     if (line === "") continue
     const [oid, name] = line.split(" ")
     if (oid === undefined || !HEX40.test(oid)) {
-      return { unreadable: `malformed for-each-ref row in ${gitDir}: ${line.slice(0, 120)}` }
+      throw new UnknownError(`malformed for-each-ref row in ${gitDir}: ${line.slice(0, 120)}`)
     }
-    addSource(oids, oid, `ref ${name ?? ""}`.trim())
+    if (!ZERO_OID.test(oid)) yield `${oid}\tref ${name ?? ""}`.trimEnd()
   }
   const head = run([`--git-dir=${gitDir}`, "rev-parse", "HEAD"])
   if (head.code === 0) {
     const oid = head.stdout.trim()
-    if (HEX40.test(oid)) addSource(oids, oid, "HEAD")
+    if (HEX40.test(oid) && !ZERO_OID.test(oid)) yield `${oid}\tHEAD`
   } else if (!/unknown revision|Needed a single revision|ambiguous argument/u.test(head.stderr)) {
-    return { unreadable: `rev-parse HEAD failed in ${gitDir}: ${head.stderr.trim()}` }
+    throw new UnknownError(`rev-parse HEAD failed in ${gitDir}: ${head.stderr.trim()}`)
   }
   const logs = join(gitDir, "logs")
   if (existsSync(logs)) {
-    const walk = (dir: string): string | undefined => {
-      for (const entry of readdirSync(dir, { withFileTypes: true })) {
-        const path = join(dir, entry.name)
-        if (entry.isDirectory()) {
-          const problem = walk(path)
-          if (problem !== undefined) return problem
-        } else if (entry.isFile()) {
-          let content: string
-          try {
-            content = readFileSync(path, "utf8")
-          } catch (error) {
-            return `cannot read reflog ${path}: ${error instanceof Error ? error.message : String(error)}`
-          }
-          for (const line of content.split("\n")) {
-            if (line === "") continue
-            const [old, next] = line.split(" ")
-            if (old === undefined || next === undefined || !HEX40.test(old) || !HEX40.test(next)) {
-              return `malformed reflog record in ${path}: ${line.slice(0, 120)}`
-            }
-            addSource(oids, old, `reflog ${relative(gitDir, path)}`)
-            addSource(oids, next, `reflog ${relative(gitDir, path)}`)
-          }
-        }
+    for (const path of reflogFiles(logs)) {
+      let content: string
+      try {
+        content = readFileSync(path, "utf8")
+      } catch (error) {
+        throw new UnknownError(`cannot read reflog ${path}: ${error instanceof Error ? error.message : String(error)}`)
       }
-      return undefined
+      for (const line of content.split("\n")) {
+        if (line === "") continue
+        const [old, next] = line.split(" ")
+        if (old === undefined || next === undefined || !HEX40.test(old) || !HEX40.test(next)) {
+          throw new UnknownError(`malformed reflog record in ${path}: ${line.slice(0, 120)}`)
+        }
+        const source = `reflog ${relative(gitDir, path)}`
+        if (!ZERO_OID.test(old)) yield `${old}\t${source}`
+        if (!ZERO_OID.test(next)) yield `${next}\t${source}`
+      }
     }
-    const problem = walk(logs)
-    if (problem !== undefined) return { unreadable: problem }
   }
   for (const name of PSEUDO_REFS) {
     const path = join(gitDir, name)
     if (!existsSync(path) || !statSync(path).isFile()) continue
     const content = readFileSync(path, "utf8")
     const found = (content.match(/[0-9a-f]{40}/gu) ?? []).filter((oid) => HEX40.test(oid))
-    if (found.length === 0 && content.trim() !== "") return { unreadable: `pseudo-ref ${path} holds no object id` }
-    for (const oid of found) addSource(oids, oid, `pseudo-ref ${name}`)
+    if (found.length === 0 && content.trim() !== "") {
+      throw new UnknownError(`pseudo-ref ${path} holds no object id`)
+    }
+    for (const oid of found) yield `${oid}\tpseudo-ref ${name}`
   }
   const index = run([`--git-dir=${gitDir}`, "ls-files", "--stage"])
   if (index.code === 0) {
     for (const line of index.stdout.split("\n")) {
       if (line === "") continue
       const oid = line.split(/\s+/u)[1]
-      if (oid !== undefined && HEX40.test(oid)) addSource(oids, oid, "index")
+      if (oid !== undefined && HEX40.test(oid)) yield `${oid}\tindex`
     }
   } else if (/index file smaller|bad index|unknown index|fatal: index/u.test(index.stderr)) {
-    return { unreadable: `unreadable index in ${gitDir}: ${index.stderr.trim()}` }
+    throw new UnknownError(`unreadable index in ${gitDir}: ${index.stderr.trim()}`)
   }
-  return { oids }
 }
 
-export function scanContents(
+function reflogFiles(dir: string, found: string[] = []): string[] {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = join(dir, entry.name)
+    if (entry.isDirectory()) reflogFiles(path, found)
+    else if (entry.isFile()) found.push(path)
+  }
+  return found
+}
+
+/** Validates a `cat-file --batch-all-objects --batch-check` stream, yielding `<oid>\t<type>` lines. */
+async function* validatedOidLines(stream: GitLineStream, label: string): AsyncGenerator<string> {
+  for await (const line of stream.lines) {
+    const [oid, type, size] = line.split(" ")
+    if (oid === undefined || type === undefined || size === undefined || !HEX40.test(oid)) {
+      throw new UnknownError(`${label}: malformed cat-file row: ${line.slice(0, 120)}`)
+    }
+    if (type !== "commit" && type !== "tree" && type !== "blob" && type !== "tag") {
+      throw new UnknownError(`${label}: cat-file reported unsupported object type '${type}' for ${oid}`)
+    }
+    if (!/^\d+$/u.test(size)) {
+      throw new UnknownError(`${label}: cat-file reported malformed object size '${size}' for ${oid}`)
+    }
+    yield `${oid}\t${type}`
+  }
+}
+
+async function scanComponent(
+  component: string,
+  copyRoot: string,
+  removal: readonly string[],
+  run: GitRun,
+  stream: GitStreamFactory,
+  bounds: ContentsBounds,
+  clock: () => number,
+  sidecarDir: string,
+): Promise<ComponentContents> {
+  const started = clock()
+  const gitDir = join(copyRoot, component)
+  const remaining = (): number => {
+    const left = started + bounds.componentMs - clock()
+    if (left <= 0) {
+      throw new UnknownError(`${component}: the ${bounds.componentMs} ms component bound is already exhausted`)
+    }
+    return left
+  }
+  const rootsRef = await externalSortToSidecar(rootOidLines(gitDir, run), {
+    dir: sidecarDir,
+    runLines: DEFAULT_SORT_RUN_LINES,
+  })
+  const objects = join(gitDir, "objects")
+  const closureResult = closure(objects, removal, new Set())
+  if (closureResult.status !== "ok") throw new UnknownError(`${component}: ${closureResult.detail}`)
+  // IndependentStores(g,R) also includes an actual external `objects`-symlink target: its store
+  // survives E and those objects are borrowed, never owned (contract gate 4). Dropping the
+  // component's own initial store while keeping the link target is the whole correction.
+  const independentStores = new Set<string>()
+  for (const store of closureResult.stores) {
+    if (store === objects) continue
+    independentStores.add(store)
+  }
+  const linkMetadata = lstatSync(objects, { throwIfNoEntry: false })
+  if (linkMetadata?.isSymbolicLink() === true) {
+    let linkTarget: string
+    try {
+      linkTarget = realpathSync(objects)
+      if (!statSync(linkTarget).isDirectory()) throw new Error("target is not a directory")
+    } catch (error) {
+      throw new UnknownError(
+        `${component}: objects link ${objects} is dangling or not a directory: ${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
+    if (removal.some((root) => within(root, linkTarget))) {
+      throw new UnknownError(`${component}: objects link target ${linkTarget} resolves inside the removal set`)
+    }
+    independentStores.add(linkTarget)
+  }
+  const effectiveStream = stream(
+    [`--git-dir=${gitDir}`, `--work-tree=${copyRoot}`, "cat-file", "--batch-all-objects", "--batch-check"],
+    { timeoutMs: remaining(), maxLines: bounds.maxEffectiveOids + 1 },
+  )
+  const independentStreams = [...independentStores]
+    .sort()
+    .map((store) =>
+      stream(
+        [
+          `--git-dir=${join(store, "..")}`,
+          `--work-tree=${copyRoot}`,
+          "cat-file",
+          "--batch-all-objects",
+          "--batch-check",
+        ],
+        { timeoutMs: remaining(), maxLines: bounds.maxEffectiveOids + 1 },
+      ),
+    )
+  const atRiskWriter = new SidecarWriter(sidecarDir, "txt")
+  const missingWriter = new SidecarWriter(sidecarDir, "txt")
+  let effective = 0
+  let independent = 0
+  let atRisk = 0
+  let missing = 0
+  const missingRootsSample: string[] = []
+  try {
+    await mergeSorted(
+      [
+        { label: "effective", lines: validatedOidLines(effectiveStream, component), keyOf: oidKey },
+        ...independentStreams.map((source, index) => ({
+          label: `independent:${index}`,
+          lines: validatedOidLines(source, `independent store ${index} of ${component}`),
+          keyOf: oidKey,
+        })),
+        { label: "roots", lines: readLines(rootsRef.path), keyOf: oidKey },
+      ],
+      (key, groups) => {
+        const effectiveLines = groups.filter((group) => group.label === "effective").flatMap((group) => group.lines)
+        const independentLines = groups
+          .filter((group) => group.label.startsWith("independent:"))
+          .flatMap((group) => group.lines)
+        const rootLines = groups.filter((group) => group.label === "roots").flatMap((group) => group.lines)
+        if (effectiveLines.length > 0) effective += 1
+        if (independentLines.length > 0) independent += 1
+        const rootSources = [...new Set(rootLines.map((line) => line.slice(line.indexOf("\t") + 1)))].join(", ")
+        if (effectiveLines.length > 0 && independentLines.length === 0) {
+          const first = effectiveLines[0]!
+          const type = first.slice(first.indexOf("\t") + 1)
+          atRisk += 1
+          atRiskWriter.add(`${key}\t${type}\t${rootSources === "" ? "owned" : rootSources}`)
+        }
+        if (rootLines.length > 0 && effectiveLines.length === 0) {
+          missing += 1
+          if (missingRootsSample.length < MISSING_INLINE) missingRootsSample.push(key)
+          missingWriter.add(`${key}\t${rootSources}`)
+        }
+      },
+    )
+    for (const source of [effectiveStream, ...independentStreams]) {
+      const outcome = await source.outcome
+      if (outcome.timedOut) {
+        throw new UnknownError(`${component}: a git child exceeded the ${bounds.componentMs} ms component bound`)
+      }
+      if (outcome.capped) {
+        throw new UnknownError(`${component}: object list exceeded the ${bounds.maxEffectiveOids} cap`)
+      }
+      if (outcome.code !== 0) {
+        throw new UnknownError(`${component}: cat-file failed: ${outcome.stderr.trim()}`)
+      }
+    }
+  } catch (error) {
+    atRiskWriter.abort()
+    missingWriter.abort()
+    throw error
+  }
+  const atRiskSidecar = await atRiskWriter.finish()
+  let missingRootsSidecar: SidecarRef | undefined
+  if (missing > 0) missingRootsSidecar = await missingWriter.finish()
+  else missingWriter.abort()
+  const elapsedMs = clock() - started
+  if (elapsedMs > bounds.componentMs) {
+    throw new UnknownError(`${component} exceeded the ${bounds.componentMs} ms component bound after ${effective} OIDs`)
+  }
+  return {
+    component,
+    effective,
+    independent,
+    atRisk,
+    atRiskSidecar,
+    missingRoots: missing,
+    missingRootsSample,
+    ...(missingRootsSidecar === undefined ? {} : { missingRootsSidecar }),
+    elapsedMs,
+  }
+}
+
+/**
+ * Scan every component's candidate contents. A `blocked` result names the first 100 missing root
+ * OIDs inline and records the full list in a sidecar; any unreadable, malformed, capped or
+ * unwritable step is `unknown` with the observed cause, never a silent pass.
+ */
+export async function scanContents(
   copyRoot: string,
   entries: Readonly<Record<string, ManifestEntry>>,
   removal: readonly string[],
-  run: GitRun = defaultGitRun,
-  bounds: ContentsBounds = DEFAULT_CONTENTS_BOUNDS,
-  clock: () => number = Date.now,
-): ContentsScan {
+  options: ContentsScanOptions,
+): Promise<ContentsScan> {
+  const run = options.run ?? defaultGitRun
+  const stream = options.stream ?? defaultGitStream
+  const bounds = options.bounds ?? DEFAULT_CONTENTS_BOUNDS
+  const clock = options.clock ?? Date.now
   const components: ComponentContents[] = []
-  for (const component of componentsFromManifest(entries)) {
-    const started = clock()
-    const gitDir = join(copyRoot, component)
-    // Every child is bounded by the component's REMAINING budget, so a hung git child yields
-    // `unknown` at the bound instead of blocking the scan forever (the post-component check below
-    // could never fire while a single `spawnSync` still had the process).
-    const componentRun: GitRun = (args) => {
-      const remaining = started + bounds.componentMs - clock()
-      if (remaining <= 0) {
-        return {
-          code: 1,
-          stdout: "",
-          stderr: `git ${args[0] ?? ""} not run: the ${bounds.componentMs} ms component bound is already exhausted`,
-          timedOut: true,
-        }
-      }
-      return run(args, { timeoutMs: remaining })
+  try {
+    for (const component of componentsFromManifest(entries)) {
+      components.push(await scanComponent(component, copyRoot, removal, run, stream, bounds, clock, options.sidecarDir))
     }
-    const effectiveRun = componentRun([
-      `--git-dir=${gitDir}`,
-      `--work-tree=${copyRoot}`,
-      "cat-file",
-      "--batch-all-objects",
-      "--batch-check",
-    ])
-    if (effectiveRun.code !== 0) {
-      return {
-        status: "unknown",
-        detail: `cat-file failed for ${component}: ${effectiveRun.stderr.trim()}`,
-        components,
-      }
-    }
-    const effective = parseEffective(effectiveRun.stdout, bounds.maxEffectiveOids)
-    if (effective.status !== "ok") return { status: "unknown", detail: `${component}: ${effective.detail}`, components }
-    const objects = join(gitDir, "objects")
-    const seen = new Set<string>()
-    const closureResult = closure(objects, removal, seen)
-    if (closureResult.status !== "ok") {
-      return { status: "unknown", detail: `${component}: ${closureResult.detail}`, components }
-    }
-    // IndependentStores(g,R) also includes an actual external `objects`-symlink target: its store
-    // survives E and those objects are borrowed, never owned (contract gate 4). Dropping the
-    // component's own initial store while keeping the link target is the whole correction.
-    const independentStores = new Set<string>()
-    for (const store of closureResult.stores) {
-      if (store === objects) continue
-      independentStores.add(store)
-    }
-    const linkMetadata = lstatSync(objects, { throwIfNoEntry: false })
-    if (linkMetadata?.isSymbolicLink() === true) {
-      let linkTarget: string
-      try {
-        linkTarget = realpathSync(objects)
-        if (!statSync(linkTarget).isDirectory()) throw new Error("target is not a directory")
-      } catch (error) {
-        return {
-          status: "unknown",
-          detail: `${component}: objects link ${objects} is dangling or not a directory: ${error instanceof Error ? error.message : String(error)}`,
-          components,
-        }
-      }
-      if (removal.some((root) => within(root, linkTarget))) {
-        return {
-          status: "unknown",
-          detail: `${component}: objects link target ${linkTarget} resolves inside the removal set`,
-          components,
-        }
-      }
-      independentStores.add(linkTarget)
-    }
-    const independent = new Set<string>()
-    for (const store of [...independentStores].sort()) {
-      const storeRun = componentRun([
-        `--git-dir=${join(store, "..")}`,
-        `--work-tree=${copyRoot}`,
-        "cat-file",
-        "--batch-all-objects",
-        "--batch-check",
-      ])
-      if (storeRun.code !== 0) {
-        return {
-          status: "unknown",
-          detail: `cat-file failed for independent store ${store}: ${storeRun.stderr.trim()}`,
-          components,
-        }
-      }
-      const parsed = parseEffective(storeRun.stdout, bounds.maxEffectiveOids)
-      if (parsed.status !== "ok") {
-        return { status: "unknown", detail: `independent store ${store}: ${parsed.detail}`, components }
-      }
-      for (const oid of parsed.oids) independent.add(oid)
-    }
-    const atRiskOids = [...effective.oids].filter((oid) => !independent.has(oid)).sort()
-    const roots = readRootOids(gitDir, componentRun)
-    if ("unreadable" in roots) return { status: "unknown", detail: `${component}: ${roots.unreadable}`, components }
-    const rootOids = roots.oids
-    const missingRoots = [...rootOids.keys()].filter((oid) => !effective.oids.has(oid)).sort()
-    const atRiskSources: Record<string, string> = {}
-    for (const oid of atRiskOids) atRiskSources[oid] = rootOids.get(oid)?.join(", ") ?? "owned"
-    components.push({
-      component,
-      effective: effective.oids.size,
-      independent: independent.size,
-      atRisk: atRiskOids.length,
-      missingRoots,
-      atRiskOids,
-      atRiskSources,
-      elapsedMs: clock() - started,
-    })
-    if (clock() - started > bounds.componentMs) {
-      return {
-        status: "unknown",
-        detail: `${component} exceeded the ${bounds.componentMs} ms component bound after ${effective.oids.size} OIDs`,
-        components,
-      }
+  } catch (error) {
+    return {
+      status: "unknown",
+      detail: error instanceof Error ? error.message : String(error),
+      components,
     }
   }
-  const missing = components.filter((entry) => entry.missingRoots.length > 0)
-  if (missing.length > 0) {
+  const blocked = components.filter((entry) => entry.missingRoots > 0)
+  if (blocked.length > 0) {
+    const first = blocked[0]!
     return {
       status: "blocked",
-      detail: `${missing.length} component(s) name root OIDs their own store no longer carries, e.g. ${missing[0]!.component} ${missing[0]!.missingRoots[0]}`,
+      detail: `${blocked.length} component(s) name root OIDs their own store no longer carries, e.g. ${first.component}: ${first.missingRootsSample.join(", ")}`,
       components,
     }
   }

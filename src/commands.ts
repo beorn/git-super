@@ -365,7 +365,7 @@ const retentionVerify = commandNode<CommandContext, RetentionVerifyParams, Reten
         : { allowTemporaryArtifactDir: input.allowTemporaryArtifactDir as boolean }),
     }
   }),
-  run: (_context, input) => Promise.resolve(verifyRetainedEntry(input)),
+  run: (_context, input) => verifyRetainedEntry(input),
 })
 
 const worktreeRemove = commandNode<CommandContext, WorktreeRemoveParams, GitSuperResult>({

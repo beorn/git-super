@@ -12,10 +12,30 @@ import { tmpdir } from "node:os"
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { createHash } from "node:crypto"
 import { digestDirectory, emitCertificate, RETENTION_CERTIFICATE_SCHEMA } from "./retention-certificate.ts"
-import { scanContents, type ComponentContents, type ContentsBounds, type GitRun } from "./retention-contents.ts"
-import { scanCustody, type CustodyBounds, type Witness } from "./retention-custody.ts"
+import {
+  scanContents,
+  type ComponentContents,
+  type ContentsBounds,
+  type ContentsScan,
+  type GitRun,
+  type GitStreamFactory,
+} from "./retention-contents.ts"
+import { scanCustody, type CustodyBounds, type WitnessIdentity } from "./retention-custody.ts"
 import { scanEstate, type EstateScan, type EstateScanBounds } from "./retention-estate.ts"
+import { RETENTION_STREAM_RSS_BOUND_BYTES } from "./retention-stream.ts"
 import { manifest, metadataFileDigest, type ManifestEntry, type StoreCustody } from "./worktree-removal.ts"
+
+/** The emitting tool's own name and version, read loudly (an unreadable package.json is fatal). */
+const RETENTION_TOOL = (() => {
+  const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
+    name?: unknown
+    version?: unknown
+  }
+  return {
+    name: typeof pkg.name === "string" ? pkg.name : "git-super",
+    version: typeof pkg.version === "string" ? pkg.version : "unknown",
+  }
+})()
 
 /**
  * Read-only verification of one retained GitSuper entry (a direct child of a declared
@@ -65,7 +85,7 @@ export type RetentionVerifyResult = Readonly<{
   reasons: readonly string[]
   estate?: EstateScan | undefined
   contents?: readonly ComponentContents[] | undefined
-  witnesses?: readonly Witness[] | undefined
+  witnesses?: readonly WitnessIdentity[] | undefined
   certificate?: Readonly<{ path: string; digest: string }> | undefined
   coverage: Readonly<{
     declaredNamespaceRoots: readonly string[]
@@ -115,6 +135,8 @@ export type RetentionVerifyOptions = Readonly<{
   bounds?: RetentionVerifyBounds
   /** Injected git runner and monotonic clock for tests; real runs use the clean-child defaults. */
   gitRun?: GitRun
+  /** Injected line stream for the large object ledgers; tests use it to fake a capped or large run. */
+  gitStream?: GitStreamFactory
   monotonic?: () => number
 }>
 
@@ -238,7 +260,7 @@ function inside(parent: string, path: string): boolean {
   return part === "" || (part !== ".." && !part.startsWith(`..${sep}`) && !isAbsolute(part))
 }
 
-export function verifyRetainedEntry(options: RetentionVerifyOptions): RetentionVerifyResult {
+export async function verifyRetainedEntry(options: RetentionVerifyOptions): Promise<RetentionVerifyResult> {
   const clock = options.clock ?? new Date()
   const monotonic = options.monotonic ?? Date.now
   const startedAt = monotonic()
@@ -257,7 +279,7 @@ export function verifyRetainedEntry(options: RetentionVerifyOptions): RetentionV
     artifactDir?: string | undefined
     estate?: EstateScan | undefined
     contents?: readonly ComponentContents[] | undefined
-    witnesses?: readonly Witness[] | undefined
+    witnesses?: readonly WitnessIdentity[] | undefined
     certificate?: Readonly<{ path: string; digest: string }> | undefined
   } = { entry: resolve(options.entry), root: resolve(options.root) }
   let witnessStores: readonly string[] = []
@@ -525,9 +547,23 @@ export function verifyRetainedEntry(options: RetentionVerifyOptions): RetentionV
         return finish()
       }
       result.artifactDir = artifactDir
-      mkdirSync(artifactDir, { recursive: true })
       const bundle = join(artifactDir, "metadata")
-      mkdirSync(bundle, { recursive: true })
+      try {
+        mkdirSync(artifactDir, { recursive: true })
+        mkdirSync(bundle, { recursive: true })
+      } catch (error) {
+        push(
+          incomplete(
+            "copy-manifest",
+            `pass artifact ${artifactDir} cannot be created: ${error instanceof Error ? error.message : String(error)}`,
+            {
+              path: artifactDir,
+              remedy: "Choose a writable, external pass directory outside the retention custody.",
+            },
+          ),
+        )
+        return finish()
+      }
       const nonObject = Object.keys(expectedEntries)
         .filter((key) => !key.split("/").includes("objects"))
         .sort()
@@ -655,15 +691,24 @@ export function verifyRetainedEntry(options: RetentionVerifyOptions): RetentionV
   })
 
   // ---- Gate 4: candidate Git contents ---------------------------------------------------
-  let contents: ReturnType<typeof scanContents> | undefined
-  contents = scanContents(
-    expectedCopyRoot,
-    proof.entries,
-    [entryReal],
-    options.gitRun,
-    options.bounds?.contents,
-    monotonic,
-  )
+  // Gate 2 has already proved the artifact directory writable, external and non-temporary; the
+  // content-addressed sidecars live beside its metadata bundle, never under E or R.
+  if (result.artifactDir === undefined) {
+    push(
+      incomplete("candidate-contents", "no artifact directory is available for the content-addressed sidecars", {
+        remedy: "Supply an external, caller-owned --artifact-dir outside the retention custody.",
+      }),
+    )
+    return finish()
+  }
+  const sidecarDir = join(result.artifactDir, "sidecars")
+  const contents: ContentsScan = await scanContents(expectedCopyRoot, proof.entries, [entryReal], {
+    sidecarDir,
+    ...(options.gitRun === undefined ? {} : { run: options.gitRun }),
+    ...(options.gitStream === undefined ? {} : { stream: options.gitStream }),
+    ...(options.bounds?.contents === undefined ? {} : { bounds: options.bounds.contents }),
+    clock: monotonic,
+  })
   result.contents = contents.components
   if (contents.status !== "pass") {
     push(
@@ -687,15 +732,13 @@ export function verifyRetainedEntry(options: RetentionVerifyOptions): RetentionV
   })
 
   // ---- Gate 5: positive surviving custody ----------------------------------------------
-  const custody = scanCustody(
-    expectedCopyRoot,
-    contents.components,
-    witnessStores,
-    [entryReal],
-    options.gitRun,
-    options.bounds?.custody,
-    monotonic,
-  )
+  const custody = await scanCustody(expectedCopyRoot, contents.components, witnessStores, [entryReal], {
+    sidecarDir,
+    ...(options.gitRun === undefined ? {} : { run: options.gitRun }),
+    ...(options.gitStream === undefined ? {} : { stream: options.gitStream }),
+    ...(options.bounds?.custody === undefined ? {} : { bounds: options.bounds.custody }),
+    clock: monotonic,
+  })
   result.witnesses = custody.witnesses
   if (custody.status !== "pass") {
     push(
@@ -746,8 +789,12 @@ export function verifyRetainedEntry(options: RetentionVerifyOptions): RetentionV
       effective: component.effective,
       independent: component.independent,
       atRisk: component.atRisk,
-      atRiskDigest: createHash("sha256").update(component.atRiskOids.join("\n")).digest("hex"),
-      missingRoots: component.missingRoots.length,
+      atRiskDigest: component.atRiskSidecar.sha256,
+      atRiskSidecar: component.atRiskSidecar.path,
+      missingRoots: component.missingRoots,
+      ...(component.missingRootsSidecar === undefined
+        ? {}
+        : { missingRootsSidecar: component.missingRootsSidecar.path }),
     })),
     estate: {
       roots: estate.roots,
@@ -758,11 +805,18 @@ export function verifyRetainedEntry(options: RetentionVerifyOptions): RetentionV
       survivorIntoRemoval: estate.survivorIntoRemoval,
     },
     witnesses: custody.witnesses,
+    witnessCount: custody.witnessCount,
+    ...(custody.witnessSidecar === undefined ? {} : { witnessSidecar: custody.witnessSidecar.path }),
+    ...(custody.missingSidecar === undefined ? {} : { missingSidecar: custody.missingSidecar.path }),
+    tool: RETENTION_TOOL,
     bounds: {
       estate: options.bounds?.estate ?? null,
       contents: options.bounds?.contents ?? null,
       custody: options.bounds?.custody ?? null,
       metadata: options.bounds?.metadata ?? null,
+      // The named memory budget the streamed object-set passes were built against; recorded so the
+      // certificate names the bound a later reader can re-check, not just the OID caps.
+      stream: { rssBoundBytes: RETENTION_STREAM_RSS_BOUND_BYTES },
     },
     elapsedMs: monotonic() - startedAt,
     coverage: {

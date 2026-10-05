@@ -6,12 +6,34 @@
  * whose alternate path closure is disjoint from the removal set `R`, and whose `fsck --full`
  * succeeds (cached once per pass). An existing alternate target, `cat-file -e`, a transient
  * reflog, or a bead is never a witness. Read-only: git queries and file reads only.
+ *
+ * The witness search is a MERGE, never a set: each durable ref's `rev-list --objects` output is
+ * traversal-ordered, so it is externally sorted into a content-addressed sidecar, and the refs are
+ * merged under a bounded fan-in into one OID -> ref-rank index. The at-risk stream is then
+ * merge-joined against that index, so peak memory is the sort run buffer plus a line per stream,
+ * not a 20,000,000-entry Map.
  */
-import { createHash } from "node:crypto"
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs"
 import { dirname, isAbsolute, join, relative, sep } from "node:path"
 import { alternateEntries } from "./alternates.ts"
-import { defaultGitRun, type ComponentContents, type GitRun, type GitRunResult } from "./retention-contents.ts"
+import {
+  DEFAULT_SORT_RUN_LINES,
+  externalSortToSidecar,
+  mergeLabeledFiles,
+  mergeSorted,
+  oidKey,
+  readLines,
+  SidecarWriter,
+  type GitLineStream,
+  type SidecarRef,
+} from "./retention-stream.ts"
+import {
+  defaultGitRun,
+  defaultGitStream,
+  type ComponentContents,
+  type GitRun,
+  type GitStreamFactory,
+} from "./retention-contents.ts"
 
 export interface CustodyBounds {
   /** 20,000,000 reachable OIDs per survivor graph in the contract's initial pass. */
@@ -33,27 +55,50 @@ export interface CustodyTarget {
   readonly source: string
 }
 
-export interface Witness {
-  readonly component: string
-  readonly oid: string
+/** A durable survivor ref that witnessed at least one at-risk OID; the inline distinct identity. */
+export interface WitnessIdentity {
   readonly store: string
   readonly ref: string
   readonly tip: string
-  readonly objectType: string
+  /** sha256 of this ref's sorted reachable-OID sidecar. */
   readonly graphDigest: string
 }
 
 export interface CustodyScan {
   readonly status: "pass" | "blocked" | "unknown"
   readonly detail: string
-  readonly witnesses: readonly Witness[]
+  /** The distinct (store, ref, tip) identities; bounded by the number of durable refs. */
+  readonly witnesses: readonly WitnessIdentity[]
+  /** The number of at-risk OIDs that found a durable witness. */
+  readonly witnessCount: number
+  readonly witnessSidecar?: SidecarRef | undefined
+  /** The first 100 un-witnessed OIDs; the full list is `missingSidecar`. */
   readonly missing: readonly CustodyTarget[]
+  readonly missingCount: number
+  readonly missingSidecar?: SidecarRef | undefined
+}
+
+export interface CustodyScanOptions {
+  /** Directory for the content-addressed sidecars; must be outside `E` and `R`. */
+  readonly sidecarDir: string
+  readonly run?: GitRun
+  readonly stream?: GitStreamFactory
+  readonly bounds?: CustodyBounds
+  readonly clock?: () => number
 }
 
 const HEX40 = /^[0-9a-f]{40}$/u
 /** The only durable witness namespaces the contract admits: branches, tags and GitSuper pins. */
 const DURABLE_REF = /^refs\/(?:heads|tags)\//u
 const PIN_REF = /^refs\/git-super\/pins\//u
+const MISSING_INLINE = 100
+
+class UnknownError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = "UnknownError"
+  }
+}
 
 function isDurableRef(ref: string): boolean {
   return DURABLE_REF.test(ref) || PIN_REF.test(ref)
@@ -124,101 +169,105 @@ function objectFormat(
   return { status: "ok", format }
 }
 
-type StoreIndex =
-  | {
-      status: "ok"
-      format: string
-      byOid: Map<string, Readonly<{ ref: string; tip: string; digest: string }>>
+/** Validates a `rev-list --objects` stream, yielding the bare OID of every reachable object. */
+async function* reachableOidLines(stream: GitLineStream, gitDir: string, tip: string): AsyncGenerator<string> {
+  for await (const line of stream.lines) {
+    const oid = line.split(" ")[0]
+    if (oid === undefined || !HEX40.test(oid)) {
+      throw new UnknownError(`malformed rev-list row for ${tip} in ${gitDir}: ${line.slice(0, 120)}`)
     }
-  | { status: "unknown"; detail: string }
+    yield oid
+  }
+}
 
-function indexStore(
-  store: string,
+interface DurableRefRecord {
+  readonly store: string
+  readonly ref: string
+  readonly tip: string
+  readonly format: string
+  readonly sidecar: SidecarRef
+}
+
+async function indexWitnessStores(
+  stores: readonly string[],
   removal: readonly string[],
+  stream: GitStreamFactory,
   run: GitRun,
   bounds: CustodyBounds,
   clock: () => number,
-): StoreIndex {
-  const gitDir = dirname(store)
-  const format = objectFormat(gitDir, run)
-  if (format.status !== "ok") return format
-  const closure = alternateClosure(store, removal)
-  if (closure.status !== "ok") return closure
-  const started = clock()
-  // The bound is also the child's hard deadline: a hung `fsck` is killed and reported unknown,
-  // rather than blocking the scan at the post-hoc elapsed check below.
-  const fsck: GitRunResult = run([`--git-dir=${gitDir}`, "fsck", "--full", "--no-progress"], {
-    timeoutMs: bounds.fsckMs,
-  })
-  if (fsck.code !== 0) {
-    return { status: "unknown", detail: `fsck --full failed in witness store ${gitDir}: ${fsck.stderr.trim()}` }
-  }
-  if (clock() - started > bounds.fsckMs) {
-    return { status: "unknown", detail: `fsck in ${gitDir} exceeded the ${bounds.fsckMs} ms bound` }
-  }
-  const refs = run([`--git-dir=${gitDir}`, "for-each-ref", "--format=%(refname)%09%(objectname)"])
-  if (refs.code !== 0) {
-    return { status: "unknown", detail: `for-each-ref failed in witness store ${gitDir}: ${refs.stderr.trim()}` }
-  }
-  const byOid = new Map<string, Readonly<{ ref: string; tip: string; digest: string }>>()
-  let reachable = 0
-  for (const line of refs.stdout.split("\n")) {
-    if (line === "") continue
-    const [ref, tip] = line.split("\t")
-    if (ref === undefined || tip === undefined || !HEX40.test(tip)) {
-      return {
-        status: "unknown",
-        detail: `malformed for-each-ref row in witness store ${gitDir}: ${line.slice(0, 120)}`,
-      }
+  sidecarDir: string,
+): Promise<{ records: DurableRefRecord[]; formats: Map<string, string> }> {
+  const records: DurableRefRecord[] = []
+  const formats = new Map<string, string>()
+  for (const store of stores) {
+    const gitDir = dirname(store)
+    const format = objectFormat(gitDir, run)
+    if (format.status !== "ok") throw new UnknownError(format.detail)
+    formats.set(store, format.format)
+    const closureResult = alternateClosure(store, removal)
+    if (closureResult.status !== "ok") throw new UnknownError(closureResult.detail)
+    // A hung `fsck` is killed at the declared deadline and reported unknown, never blocking.
+    const fsck = run([`--git-dir=${gitDir}`, "fsck", "--full", "--no-progress"], { timeoutMs: bounds.fsckMs })
+    if (fsck.code !== 0) {
+      throw new UnknownError(`fsck --full failed in witness store ${gitDir}: ${fsck.stderr.trim()}`)
     }
-    // A transient operation ref, remote-tracking ref or detached HEAD is never a durable witness:
-    // only a named branch, tag or GitSuper pin qualifies (contract gate 5).
-    if (!isDurableRef(ref)) continue
-    const refStart = clock()
-    const graph = run([`--git-dir=${gitDir}`, "rev-list", "--objects", tip], { timeoutMs: bounds.reachableMs })
-    if (graph.code !== 0) {
-      return { status: "unknown", detail: `rev-list ${tip} failed in witness store ${gitDir}: ${graph.stderr.trim()}` }
+    const refs = run([`--git-dir=${gitDir}`, "for-each-ref", "--format=%(refname)%09%(objectname)"])
+    if (refs.code !== 0) {
+      throw new UnknownError(`for-each-ref failed in witness store ${gitDir}: ${refs.stderr.trim()}`)
     }
-    if (clock() - refStart > bounds.reachableMs) {
-      return { status: "unknown", detail: `rev-list ${tip} in ${gitDir} exceeded the ${bounds.reachableMs} ms bound` }
-    }
-    const oids: string[] = []
-    for (const row of graph.stdout.split("\n")) {
+    const durable: Array<{ ref: string; tip: string }> = []
+    for (const row of refs.stdout.split("\n")) {
       if (row === "") continue
-      const oid = row.split(" ")[0]!
-      if (!HEX40.test(oid)) {
-        return { status: "unknown", detail: `malformed rev-list row in ${gitDir}: ${row.slice(0, 120)}` }
+      const [ref, tip] = row.split("\t")
+      if (ref === undefined || tip === undefined || !HEX40.test(tip)) {
+        throw new UnknownError(`malformed for-each-ref row in witness store ${gitDir}: ${row.slice(0, 120)}`)
       }
-      oids.push(oid)
-      reachable += 1
-      if (reachable > bounds.maxReachableOids) {
-        return { status: "unknown", detail: `reachable OIDs exceeded the ${bounds.maxReachableOids} cap in ${gitDir}` }
-      }
+      // A transient operation ref, remote-tracking ref or detached HEAD is never a durable
+      // witness: only a named branch, tag or GitSuper pin qualifies (contract gate 5).
+      if (!isDurableRef(ref)) continue
+      durable.push({ ref, tip })
     }
-    const digest = createHash("sha256")
-      .update([...oids].sort().join("\n"))
-      .digest("hex")
-    for (const oid of oids) {
-      if (!byOid.has(oid)) byOid.set(oid, { ref, tip, digest })
+    durable.sort((left, right) => (left.ref < right.ref ? -1 : left.ref > right.ref ? 1 : 0))
+    for (const entry of durable) {
+      const started = clock()
+      const lineStream = stream([`--git-dir=${gitDir}`, "rev-list", "--objects", entry.tip], {
+        timeoutMs: bounds.reachableMs,
+        maxLines: bounds.maxReachableOids,
+      })
+      const sidecar = await externalSortToSidecar(reachableOidLines(lineStream, gitDir, entry.tip), {
+        dir: sidecarDir,
+        runLines: DEFAULT_SORT_RUN_LINES,
+      })
+      const outcome = await lineStream.outcome
+      if (outcome.timedOut) {
+        throw new UnknownError(`rev-list ${entry.tip} in ${gitDir} exceeded the ${bounds.reachableMs} ms bound`)
+      }
+      if (outcome.capped) {
+        throw new UnknownError(`reachable OIDs exceeded the ${bounds.maxReachableOids} cap in ${gitDir}`)
+      }
+      if (outcome.code !== 0) {
+        throw new UnknownError(`rev-list ${entry.tip} failed in witness store ${gitDir}: ${outcome.stderr.trim()}`)
+      }
+      if (clock() - started > bounds.reachableMs) {
+        throw new UnknownError(`rev-list ${entry.tip} in ${gitDir} exceeded the ${bounds.reachableMs} ms bound`)
+      }
+      records.push({ store, ref: entry.ref, tip: entry.tip, format: format.format, sidecar })
     }
   }
-  return { status: "ok", format: format.format, byOid }
+  return { records, formats }
 }
 
-/**
- * Prove surviving custody for every at-risk OID. `witnessStores` are the managed object
- * directories that survive this pass (the caller owns the complete `N` inventory); a store
- * inside `R`, borrowing into `R`, of a different object format, or failing `fsck` never witnesses.
- */
-export function scanCustody(
+async function runCustody(
   copyRoot: string,
   components: readonly ComponentContents[],
   witnessStores: readonly string[],
   removal: readonly string[],
-  run: GitRun = defaultGitRun,
-  bounds: CustodyBounds = DEFAULT_CUSTODY_BOUNDS,
-  clock: () => number = Date.now,
-): CustodyScan {
+  run: GitRun,
+  stream: GitStreamFactory,
+  bounds: CustodyBounds,
+  clock: () => number,
+  sidecarDir: string,
+): Promise<CustodyScan> {
   const stores = [...new Set(witnessStores.map((store) => realpathSync(store)))]
     .filter((store) => !removal.some((root) => within(root, store)))
     .sort()
@@ -228,94 +277,138 @@ export function scanCustody(
       status: "unknown",
       detail: `witness store ${badStore} is not a Git object directory`,
       witnesses: [],
+      witnessCount: 0,
       missing: [],
+      missingCount: 0,
     }
   }
-  const index = new Map<string, StoreIndex>()
-  for (const store of stores) {
-    const entry = indexStore(store, removal, run, bounds, clock)
-    index.set(store, entry)
-    if (entry.status !== "ok") return { status: "unknown", detail: entry.detail, witnesses: [], missing: [] }
-  }
-  // The contract records the witnessed OID's OWN type, not the ref tip's type: a blob reached from
-  // a commit ref is a blob witness. Resolve lazily, once per (store, oid), through Git itself.
-  const typeCache = new Map<string, Map<string, string>>()
-  const resolveObjectType = (
-    store: string,
-    oid: string,
-  ): { status: "ok"; type: string } | { status: "unknown"; detail: string } => {
-    const gitDir = dirname(store)
-    let cache = typeCache.get(store)
-    if (cache === undefined) {
-      cache = new Map()
-      typeCache.set(store, cache)
-    }
-    const cached = cache.get(oid)
-    if (cached !== undefined) return { status: "ok", type: cached }
-    const result = run([`--git-dir=${gitDir}`, "cat-file", "-t", oid])
-    if (result.code !== 0) {
-      return {
-        status: "unknown",
-        detail: `cat-file -t ${oid} failed in witness store ${gitDir}: ${result.stderr.trim()}`,
-      }
-    }
-    const type = result.stdout.trim()
-    if (type !== "commit" && type !== "tree" && type !== "blob" && type !== "tag") {
-      return {
-        status: "unknown",
-        detail: `witness store ${gitDir} reports unsupported object type '${type}' for ${oid}`,
-      }
-    }
-    cache.set(oid, type)
-    return { status: "ok", type }
-  }
-  const witnesses: Witness[] = []
+  const { records, formats } = await indexWitnessStores(stores, removal, stream, run, bounds, clock, sidecarDir)
+  const width = String(Math.max(1, records.length)).length
+  const index = await mergeLabeledFiles(
+    records.map((record, rank) => ({ path: record.sidecar.path, label: String(rank).padStart(width, "0") })),
+    { dir: sidecarDir },
+  )
+  const witnessWriter = new SidecarWriter(sidecarDir, "txt")
+  const missingWriter = new SidecarWriter(sidecarDir, "txt")
+  const identities = new Map<string, WitnessIdentity>()
   const missing: CustodyTarget[] = []
-  for (const component of components) {
-    const format = objectFormat(join(copyRoot, component.component), run)
-    if (format.status !== "ok") return { status: "unknown", detail: format.detail, witnesses: [], missing: [] }
-    for (const oid of component.atRiskOids) {
-      let found: Witness | undefined
-      for (const store of stores) {
-        const entry = index.get(store)!
-        if (entry.status !== "ok" || entry.format !== format.format) continue
-        const hit = entry.byOid.get(oid)
-        if (hit === undefined) continue
-        const objectType = resolveObjectType(store, oid)
-        if (objectType.status !== "ok") {
-          return { status: "unknown", detail: objectType.detail, witnesses: [], missing: [] }
-        }
-        found = {
-          component: component.component,
-          oid,
-          store,
-          ref: hit.ref,
-          tip: hit.tip,
-          objectType: objectType.type,
-          graphDigest: hit.digest,
-        }
-        break
-      }
-      if (found === undefined) {
-        missing.push({ component: component.component, oid, source: component.atRiskSources[oid] ?? "owned" })
-      } else {
-        witnesses.push(found)
-      }
+  let witnessCount = 0
+  let missingCount = 0
+  try {
+    for (const component of components) {
+      const format = objectFormat(join(copyRoot, component.component), run)
+      if (format.status !== "ok") throw new UnknownError(format.detail)
+      await mergeSorted(
+        [
+          { label: "at-risk", lines: readLines(component.atRiskSidecar.path), keyOf: oidKey },
+          { label: "witness-index", lines: readLines(index.path), keyOf: oidKey },
+        ],
+        (key, groups) => {
+          const atRiskLines = groups.find((group) => group.label === "at-risk")?.lines
+          if (atRiskLines === undefined || atRiskLines.length === 0) return
+          const source = atRiskLines[0]!.split("\t")[2] ?? "owned"
+          const indexLines = groups.find((group) => group.label === "witness-index")?.lines
+          if (indexLines === undefined || indexLines.length === 0) {
+            missingCount += 1
+            if (missing.length < MISSING_INLINE) missing.push({ component: component.component, oid: key, source })
+            missingWriter.add(`${key}\t${component.component}\t${source}`)
+            return
+          }
+          const rank = indexLines[0]!.split("\t")[1]
+          const record = rank === undefined ? undefined : records[Number(rank)]
+          if (record === undefined) throw new UnknownError(`witness index names an unknown rank '${rank ?? ""}'`)
+          if (formats.get(record.store) !== format.format) {
+            throw new UnknownError(
+              `witness store ${record.store} object format does not match component ${component.component}`,
+            )
+          }
+          witnessCount += 1
+          witnessWriter.add(`${key}\t${component.component}\t${record.store}\t${record.ref}\t${record.tip}`)
+          const identityKey = `${record.store}\t${record.ref}\t${record.tip}`
+          if (!identities.has(identityKey)) {
+            identities.set(identityKey, {
+              store: record.store,
+              ref: record.ref,
+              tip: record.tip,
+              graphDigest: record.sidecar.sha256,
+            })
+          }
+        },
+      )
     }
+  } catch (error) {
+    witnessWriter.abort()
+    missingWriter.abort()
+    throw error
   }
-  if (missing.length > 0) {
+  let witnessSidecar: SidecarRef | undefined
+  if (witnessCount > 0) witnessSidecar = await witnessWriter.finish()
+  else witnessWriter.abort()
+  let missingSidecar: SidecarRef | undefined
+  if (missingCount > 0) missingSidecar = await missingWriter.finish()
+  else missingWriter.abort()
+  const witnesses = [...identities.values()]
+  if (missingCount > 0) {
     const first = missing[0]!
     return {
       status: "blocked",
-      detail: `${missing.length} at-risk OID(s) have no durable witness, e.g. ${first.component} ${first.oid} (${first.source})`,
+      detail: `${missingCount} at-risk OID(s) have no durable witness, e.g. ${first.component} ${first.oid} (${first.source}); first ${missing.length} inline, full list in ${missingSidecar?.path ?? "a sidecar"}`,
       witnesses,
+      witnessCount,
+      ...(witnessSidecar === undefined ? {} : { witnessSidecar }),
       missing,
+      missingCount,
+      ...(missingSidecar === undefined ? {} : { missingSidecar }),
     }
   }
   return {
     status: "pass",
-    detail: `${witnesses.length} at-risk OID(s) each have a named surviving witness across ${stores.length} store(s)`,
+    detail: `${witnessCount} at-risk OID(s) each have a named surviving witness across ${stores.length} store(s), ${witnesses.length} distinct identities`,
     witnesses,
-    missing,
+    witnessCount,
+    ...(witnessSidecar === undefined ? {} : { witnessSidecar }),
+    missing: [],
+    missingCount: 0,
+  }
+}
+
+/**
+ * Prove surviving custody for every at-risk OID. `witnessStores` are the managed object
+ * directories that survive this pass (the caller owns the complete `N` inventory); a store inside
+ * `R`, borrowing into `R`, of a different object format, or failing `fsck` never witnesses. Any
+ * unreadable, malformed, capped or unwritable step is `unknown` with the observed cause.
+ */
+export async function scanCustody(
+  copyRoot: string,
+  components: readonly ComponentContents[],
+  witnessStores: readonly string[],
+  removal: readonly string[],
+  options: CustodyScanOptions,
+): Promise<CustodyScan> {
+  const run = options.run ?? defaultGitRun
+  const stream = options.stream ?? defaultGitStream
+  const bounds = options.bounds ?? DEFAULT_CUSTODY_BOUNDS
+  const clock = options.clock ?? Date.now
+  try {
+    return await runCustody(
+      copyRoot,
+      components,
+      witnessStores,
+      removal,
+      run,
+      stream,
+      bounds,
+      clock,
+      options.sidecarDir,
+    )
+  } catch (error) {
+    return {
+      status: "unknown",
+      detail: error instanceof Error ? error.message : String(error),
+      witnesses: [],
+      witnessCount: 0,
+      missing: [],
+      missingCount: 0,
+    }
   }
 }
