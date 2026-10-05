@@ -532,6 +532,7 @@ export async function verifyRetainedEntry(options: RetentionVerifyOptions): Prom
         temporaryRoots.add(realpathSync(tmpdir()))
       } catch {
         // silent-fallback-allow: the raw tmpdir() is already in the set, so an unresolvable symlink target only means the real path adds no second root
+        // delete-fallback-allow: temporaryRoots — a failed realpath only omits the resolved temp root; this set decides the temporary-path refusal, never a delete.
       }
       if (options.allowTemporaryArtifactDir !== true && [...temporaryRoots].some((root) => inside(root, artifactDir))) {
         push(
@@ -599,8 +600,8 @@ export async function verifyRetainedEntry(options: RetentionVerifyOptions): Prom
         return finish()
       }
       for (const key of nonObject) {
-        const want = actual.entries[key]!
-        if (want.kind !== "file") continue
+        const want = actual.entries[key]
+        if (want?.kind !== "file") continue
         const source = join(expectedCopyRoot, key)
         const target = join(bundle, key)
         mkdirSync(dirname(target), { recursive: true })
@@ -634,7 +635,6 @@ export async function verifyRetainedEntry(options: RetentionVerifyOptions): Prom
   }
 
   // ---- Gate 3: complete estate and reverse dependency snapshot --------------------------
-  let estate: EstateScan | undefined
   if (declaredNamespaceRoots.length === 0) {
     push(
       incomplete(
@@ -648,7 +648,7 @@ export async function verifyRetainedEntry(options: RetentionVerifyOptions): Prom
     )
     return finish()
   }
-  estate = scanEstate(declaredNamespaceRoots, [entryReal], options.bounds?.estate, monotonic)
+  const estate = scanEstate(declaredNamespaceRoots, [entryReal], options.bounds?.estate, monotonic)
   result.estate = estate
   witnessStores = estate.objectDirs.filter((path) => !inside(entryReal, path))
   if (estate.status !== "pass") {
