@@ -25,7 +25,14 @@ import type { SuperSubmodulePrepareResult } from "./submodule-prepare.ts"
 import { delegateNativeGit, readNativeGit, type ProcessOutputSink } from "./process.ts"
 import { openInvocationProtocol, type InvocationProtocol } from "./protocol.ts"
 import { isAbsolute } from "node:path"
-import { validateGitObjectContext, withGitEnvironment, type GitObjectContext } from "./git.ts"
+import {
+  probeRepository,
+  repositoryRoot,
+  runGit,
+  validateGitObjectContext,
+  withGitEnvironment,
+  type GitObjectContext,
+} from "./git.ts"
 
 export type OutputSink = ProcessOutputSink &
   Readonly<{
@@ -790,12 +797,22 @@ async function runInvocation(
     }
     result = await withGitEnvironment(
       process.env,
-      () =>
-        commandResult(
+      () => {
+        if (invocation.node === commands.status && program.getOptionValueSource("repo") === "cli") {
+          const discovered = repositoryRoot(globals.repo)
+          const identity = probeRepository(discovered, runGit(globals.repo, ["rev-parse", "--show-prefix"]))
+          if (identity.kind === "absent") {
+            throw new Error(
+              `${globals.repo} is not a worktree root; its git dir resolves to the parent repository ${identity.discovered}`,
+            )
+          }
+        }
+        return commandResult(
           invocation.node,
           { repo: globals.repo, report: (message) => stderr.write(message) },
           invocation.params,
-        ),
+        )
+      },
       objects,
     )
   } catch (error) {

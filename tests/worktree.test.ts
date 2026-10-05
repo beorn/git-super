@@ -23,6 +23,7 @@ import { canonicalTmpdir, createProductFixture, createRepository } from "./fixtu
 import { runCli } from "../src/cli.ts"
 import { discoverRepository } from "../src/push.ts"
 import { createLocalGitProcess } from "../src/process.ts"
+import type { SuperStatusResult } from "../src/status.ts"
 
 vi.mock("node:fs", async (importOriginal) => {
   const fs = await importOriginal<typeof import("node:fs")>()
@@ -74,73 +75,77 @@ describe("createGitWorktreeStore", () => {
    * @testonly none
    */
   // Empty-submodule coverage does not protect the requested root itself losing its Git identity.
-  it.each(["status", "remove"] as const)("refuses ancestor custody for a .git-less %s root", async (operation) => {
-    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-ancestor-custody-"))
-    try {
-      const parent = join(root, "parent")
-      createRepository(parent, "tracked.txt", "parent data\n")
-      const remnant = join(parent, "remnant")
-      await mkdir(remnant)
-      await writeFile(join(remnant, "remaining.txt"), "interrupted removal\n")
-      const parentGit = join(parent, ".git")
-      await writeFile(join(parentGit, "tent-state-write.lock"), "")
-      vi.mocked(readdirSync).mockClear()
-      vi.mocked(spawnSync).mockClear()
-      const requests: GitProcessRequest[] = []
-      let refusal: string
-      if (operation === "status") {
-        const out = {
-          output: "",
-          write(value: string) {
-            this.output += value
-            return true
-          },
-        }
-        const err = {
-          output: "",
-          write(value: string) {
-            this.output += value
-            return true
-          },
-        }
-        const code = await runCli(["--repo", remnant, "--json", "status"], out, err)
-        expect(code, out.output).not.toBe(0)
-        refusal = err.output
-      } else {
-        const local = createLocalGitProcess()
-        const store = createGitWorktreeStore({
-          repo: parent,
-          gitProcess: {
-            run: async (request) => {
-              requests.push(request)
-              return local.run(request)
+  it.each(["status", "remove", "inspect"] as const)(
+    "refuses ancestor custody for a .git-less %s root",
+    async (operation) => {
+      const root = await mkdtemp(join(canonicalTmpdir(), "git-super-ancestor-custody-"))
+      try {
+        const parent = join(root, "parent")
+        createRepository(parent, "tracked.txt", "parent data\n")
+        const remnant = join(parent, "remnant")
+        await mkdir(remnant)
+        await writeFile(join(remnant, "remaining.txt"), "interrupted removal\n")
+        const parentGit = join(parent, ".git")
+        await writeFile(join(parentGit, "tent-state-write.lock"), "")
+        vi.mocked(readdirSync).mockClear()
+        vi.mocked(spawnSync).mockClear()
+        const requests: GitProcessRequest[] = []
+        let refusal: string
+        if (operation === "status") {
+          const out = {
+            output: "",
+            write(value: string) {
+              this.output += value
+              return true
             },
-          },
-        })
-        refusal = await store.remove(remnant).then(
-          () => {
-            throw new Error("removal accepted a directory without its own Git identity")
-          },
-          (error: unknown) => (error instanceof Error ? error.message : String(error)),
-        )
+          }
+          const err = {
+            output: "",
+            write(value: string) {
+              this.output += value
+              return true
+            },
+          }
+          const code = await runCli(["--repo", remnant, "--json", "status"], out, err)
+          expect(code, out.output).not.toBe(0)
+          refusal = err.output
+        } else {
+          const local = createLocalGitProcess()
+          const store = createGitWorktreeStore({
+            repo: parent,
+            gitProcess: {
+              run: async (request) => {
+                requests.push(request)
+                return local.run(request)
+              },
+            },
+          })
+          const action = operation === "inspect" ? store.inspectRemoval(remnant) : store.remove(remnant)
+          refusal = await action.then(
+            () => {
+              throw new Error("removal accepted a directory without its own Git identity")
+            },
+            (error: unknown) => (error instanceof Error ? error.message : String(error)),
+          )
+        }
+        expect(refusal).toContain(remnant)
+        expect(refusal).toContain("not a worktree root")
+        expect(refusal).toContain(parent)
+        const commands =
+          operation === "status"
+            ? vi.mocked(spawnSync).mock.calls.map(([, argv]) => (argv as string[]).slice(2))
+            : requests.map((request) => request.args)
+        expect(commands).toEqual([
+          ["rev-parse", "--show-toplevel"],
+          ["rev-parse", "--show-prefix"],
+        ])
+        expect(vi.mocked(readdirSync).mock.calls.some(([path]) => String(path) === parentGit)).toBe(false)
+        expect(await readFile(join(remnant, "remaining.txt"), "utf8")).toBe("interrupted removal\n")
+      } finally {
+        await rm(root, { recursive: true, force: true })
       }
-      expect(refusal).toContain(remnant)
-      expect(refusal).toContain("not a worktree root")
-      expect(refusal).toContain(parent)
-      const commands =
-        operation === "status"
-          ? vi.mocked(spawnSync).mock.calls.map(([, argv]) => (argv as string[]).slice(2))
-          : requests.map((request) => request.args)
-      expect(commands).toEqual([
-        ["rev-parse", "--show-toplevel"],
-        ["rev-parse", "--show-prefix"],
-      ])
-      expect(vi.mocked(readdirSync).mock.calls.some(([path]) => String(path) === parentGit)).toBe(false)
-      expect(await readFile(join(remnant, "remaining.txt"), "utf8")).toBe("interrupted removal\n")
-    } finally {
-      await rm(root, { recursive: true, force: true })
-    }
-  })
+    },
+  )
 
   /**
    * @failure Root admission for an explicit --repo also refuses ordinary status from a subdirectory (#27477).
@@ -172,7 +177,7 @@ describe("createGitWorktreeStore", () => {
         },
       }
       expect(await runCli(["--json", "status"], out, err), err.output).toBe(0)
-      expect(JSON.parse(out.output).consultedRepositories[0].root).toBe(parent)
+      expect((JSON.parse(out.output) as SuperStatusResult).consultedRepositories[0]?.root).toBe(parent)
     } finally {
       process.chdir(previous)
       await rm(root, { recursive: true, force: true })

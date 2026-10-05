@@ -13,7 +13,7 @@ import {
   retainWorktreeModules,
   type WorktreeRetention,
 } from "./worktree-removal.ts"
-import { cleanGitEnvironment } from "./git.ts"
+import { cleanGitEnvironment, probeRepository } from "./git.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
 import { createProgressReporter } from "./progress.ts"
 import { materializeSubmodulesWithProcess } from "./submodules.ts"
@@ -310,7 +310,18 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       return { code: result.code, stdout: result.stdout, stderr: result.stderr }
     },
   })
+  const assertRemovalRoot = async (path: string) => {
+    const discovered = await git.text(path, ["rev-parse", "--show-toplevel"])
+    const prefix = await git.text(path, ["rev-parse", "--show-prefix"])
+    const identity = probeRepository(discovered, prefix)
+    if (identity.kind === "absent") {
+      throw new Error(
+        `${path} is not a worktree root; its git dir resolves to the parent repository ${identity.discovered}`,
+      )
+    }
+  }
   const prepareRemoval = async (path: string, excludedSubmodules?: readonly string[]) => {
+    await assertRemovalRoot(path)
     const gitDir = realpathSync(await git.text(path, ["rev-parse", "--absolute-git-dir"]))
     const common = realpathSync(await git.text(path, ["rev-parse", "--path-format=absolute", "--git-common-dir"]))
     const custody = await assertExcludedRemovalCustody(
@@ -450,6 +461,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         excludedSubmodules?: readonly string[]
       }> = {},
     ): Promise<void> {
+      await assertRemovalRoot(path)
       await mutate(removeOptions.operation ?? `worktree remove ${path}`, async () => {
         if (removeOptions.retention !== undefined && removeOptions.unlock === true) {
           throw new Error(`retained worktree removal cannot unlock ${path}; resolve its holder first`)
