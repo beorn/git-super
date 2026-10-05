@@ -1,7 +1,7 @@
 /**
- * @failure Gate 5 accepts an alternate target, `cat-file -e`, a transient reflog, or a witness
- * store that borrows from the removal set as durable custody for an at-risk object; or it holds a
- * whole reachable set in memory instead of merging.
+ * @failure Gate 5 accepts an alternate target, `cat-file -e`, a transient reflog, a witness store
+ * that borrows from the removal set, or a successful git query that wrote to stderr as durable
+ * custody for an at-risk object; or it holds a whole reachable set in memory instead of merging.
  * @level l1
  * @consumer the read-only retention verifier, gate 5; #27443(b)
  * @testonly none
@@ -197,5 +197,25 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     expect(scan.detail).toContain("fsck")
     const fsck = seen.find((entry) => entry.args.includes("fsck"))
     expect(fsck?.timeoutMs).toBe(300_000)
+  })
+
+  test("a witness for-each-ref that exits 0 with stderr is unknown, never custody", async () => {
+    const store = repoWithCommit("git-super-custody-")
+    const sidecarDir = tmp("git-super-custody-sidecars-")
+    const component = await componentOf([store.head], sidecarDir, "owned")
+    const warned: GitRun = (args, options) =>
+      args.includes("for-each-ref")
+        ? {
+            code: 0,
+            stdout: `refs/heads/main\t${store.head}\n`,
+            stderr: "error: unable to normalize alternate object path: /gone",
+          }
+        : defaultGitRun(args, options)
+    const scan = await scanCustody(store.root, [component], [join(store.root, ".git", "objects")], [], {
+      sidecarDir,
+      run: warned,
+    })
+    expect(scan.status).toBe("unknown")
+    expect(scan.detail).toContain("stderr")
   })
 })
