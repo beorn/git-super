@@ -1723,4 +1723,78 @@ describe("createGitWorktreeStore", () => {
       await rm(root, { recursive: true, force: true })
     }
   })
+
+  /**
+   * @failure Staging restore failure is swallowed silently leaving worktree contents unannounced (#27551).
+   * @level l1
+   * @consumer Worktree removal callers
+   * @testonly none
+   */
+  it("makes staging restore failure loud, names operator remedy, and marks directory as not deletable (#27551)", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-restore-fail-"))
+    try {
+      const repo = join(root, "repo")
+      createRepository(repo, "root.txt", "root\n")
+      const baseProcess = createLocalGitProcess()
+      const store = createGitWorktreeStore({
+        repo,
+        gitProcess: {
+          run: async (request) => {
+            if (request.args.includes("remove") && request.args.includes("worktree")) {
+              throw new Error("simulated git worktree remove failure")
+            }
+            return baseProcess.run(request)
+          },
+        },
+      })
+      const target = join(root, "target")
+      await store.add({ kind: "detached", path: target, ref: "HEAD" })
+      await writeFile(join(target, "precious.txt"), "precious payload\n")
+
+      // Mock renameSync so that restoring from .trash to target throws
+      const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
+      const fs = await import("node:fs")
+      const origRenameSync = fs.renameSync
+      let renameCallCount = 0
+      const renameSpy = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+        // First rename is target -> staging (allow it)
+        // Second rename is staging -> target during restore (fail it!)
+        renameCallCount++
+        if (renameCallCount === 2) {
+          throw new Error("simulated disk error on restore rename")
+        }
+        return origRenameSync(from, to)
+      })
+
+      let thrownError: Error | undefined
+      try {
+        await store.remove(target)
+      } catch (err) {
+        thrownError = err as Error
+      } finally {
+        renameSpy.mockRestore()
+      }
+
+      expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringMatching(/failed to restore worktree from staging/))
+      consoleErrorSpy.mockRestore()
+
+      expect(thrownError).toBeDefined()
+      expect(thrownError?.message).toMatch(/failed to restore worktree from staging/)
+      expect(thrownError?.message).toMatch(/Operator remedy: mv/)
+      expect(thrownError?.message).toContain(target)
+      expect(thrownError?.message).toContain(".restore-failed")
+
+      // The staging directory should now be renamed with .restore-failed and carry .restore-failed marker
+      const trashDir = join(root, ".trash")
+      expect(existsSync(trashDir)).toBe(true)
+      const trashEntries = fs.readdirSync(trashDir)
+      const failedEntry = trashEntries.find((name) => name.endsWith(".restore-failed"))
+      expect(failedEntry).toBeDefined()
+      const preservedPath = join(trashDir, failedEntry!)
+      expect(existsSync(join(preservedPath, ".restore-failed"))).toBe(true)
+      expect(fs.readFileSync(join(preservedPath, "precious.txt"), "utf8")).toBe("precious payload\n")
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
 })

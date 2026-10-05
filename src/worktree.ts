@@ -1,4 +1,13 @@
-import { copyFileSync, existsSync, mkdirSync, realpathSync, renameSync, rmdirSync, rmSync } from "node:fs"
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  realpathSync,
+  renameSync,
+  rmdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs"
 import { randomUUID } from "node:crypto"
 import { spawnSync } from "node:child_process"
 import { setTimeout as delay } from "node:timers/promises"
@@ -296,6 +305,51 @@ async function ignoreInRepositoryRoot(git: Git, repo: string, root: string): Pro
   const escaped = normalized.replace(/([\\[\]*?!#])/gu, "\\$1")
   await appendFile(exclude, `\n/${escaped}/\n`, { encoding: "utf8", mode: 0o600 })
 }
+function restoreStagedWorktree(stagingPath: string, resolvedPath: string, triggerError: unknown): void {
+  if (existsSync(resolvedPath)) {
+    try {
+      rmSync(resolvedPath, { recursive: true, force: true })
+    } catch (rmError) {
+      console.warn(
+        `git-super: failed to remove worktree stub at '${resolvedPath}' before restore: ${rmError instanceof Error ? rmError.message : String(rmError)}`,
+      )
+    }
+  }
+
+  try {
+    renameSync(stagingPath, resolvedPath)
+  } catch (restoreError) {
+    let preservedPath = stagingPath
+    const failedPath = `${stagingPath}.restore-failed`
+    try {
+      renameSync(stagingPath, failedPath)
+      preservedPath = failedPath
+    } catch (renameFailedError) {
+      console.warn(
+        `git-super: failed to rename staging directory '${stagingPath}' to '${failedPath}': ${renameFailedError instanceof Error ? renameFailedError.message : String(renameFailedError)}`,
+      )
+    }
+    try {
+      writeFileSync(join(preservedPath, ".restore-failed"), "restore-failed\n")
+    } catch (markerError) {
+      console.warn(
+        `git-super: failed to write restore-failed marker in '${preservedPath}': ${markerError instanceof Error ? markerError.message : String(markerError)}`,
+      )
+    }
+
+    const restoreMsg = restoreError instanceof Error ? restoreError.message : String(restoreError)
+    const triggerMsg = triggerError instanceof Error ? triggerError.message : String(triggerError)
+    const message =
+      `git-super: failed to restore worktree from staging '${preservedPath}' to '${resolvedPath}': ${restoreMsg}. ` +
+      `Trigger error: ${triggerMsg}. ` +
+      `Operator remedy: mv '${preservedPath}' '${resolvedPath}'`
+
+    console.error(message)
+    const err = new Error(message)
+    err.cause = triggerError
+    throw err
+  }
+}
 
 export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
   const repo = resolve(options.repo)
@@ -543,14 +597,10 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
                 )
               } else {
                 if (staged) {
-                  try {
-                    rmSync(resolvedPath, { recursive: true, force: true })
-                    renameSync(targetStaging, resolvedPath)
-                  } catch {
-                    // restore failed, leave targetStaging
-                  }
+                  const currentStaging = targetStaging
                   staged = false
                   stagingPath = undefined
+                  restoreStagedWorktree(currentStaging, resolvedPath, stageError)
                 }
                 throw stageError
               }
@@ -562,13 +612,11 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
             throw new Error(`git reported success but did not fully remove worktree '${path}'`)
           }
         } catch (error) {
-          if (staged && stagingPath !== undefined && existsSync(stagingPath) && !existsSync(resolvedPath)) {
-            try {
-              renameSync(stagingPath, resolvedPath)
-              stagingPath = undefined
-            } catch {
-              // restore failed
-            }
+          if (staged && stagingPath !== undefined && existsSync(stagingPath)) {
+            const currentStaging = stagingPath
+            staged = false
+            stagingPath = undefined
+            restoreStagedWorktree(currentStaging, resolvedPath, error)
           }
           throw writerLeases.refusal(error)
         } finally {
@@ -583,8 +631,19 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
           rmSync(stagingPath, { recursive: true, force: true })
           try {
             rmdirSync(dirname(stagingPath))
-          } catch {
-            // .trash directory is not empty or cannot be removed; leftover sweep will handle it.
+          } catch (rmdirError) {
+            if (
+              rmdirError !== null &&
+              typeof rmdirError === "object" &&
+              "code" in rmdirError &&
+              rmdirError.code === "ENOTEMPTY"
+            ) {
+              // silent-fallback-allow: .trash directory still contains other staged worktree entries; leftover sweep will remove it when empty
+            } else {
+              console.warn(
+                `git-super: failed to remove trash directory '${dirname(stagingPath)}': ${rmdirError instanceof Error ? rmdirError.message : String(rmdirError)}`,
+              )
+            }
           }
         } catch (error) {
           console.warn(
