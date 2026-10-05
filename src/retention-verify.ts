@@ -74,10 +74,20 @@ export type RetentionVerifyResult = Readonly<{
   }>
 }>
 
+/**
+ * The contract's finite bound on the NON-OBJECT metadata one entry may carry (refs/reflogs/
+ * pseudo-refs/index/config and other manifest files outside `objects/**`): 256 MiB per entry in the
+ * initial pass. A bound is not permission to truncate — exceeding it is `unknown`, never a partial
+ * bundle.
+ */
+export type NonObjectMetadataBounds = Readonly<{ maxBytes: number }>
+export const DEFAULT_NON_OBJECT_METADATA_BOUNDS: NonObjectMetadataBounds = { maxBytes: 256 * 1024 * 1024 }
+
 export type RetentionVerifyBounds = Readonly<{
   estate?: EstateScanBounds
   contents?: ContentsBounds
   custody?: CustodyBounds
+  metadata?: NonObjectMetadataBounds
 }>
 
 export type RetentionVerifyOptions = Readonly<{
@@ -525,6 +535,22 @@ export function verifyRetainedEntry(options: RetentionVerifyOptions): RetentionV
         (total, key) => total + (actual.entries[key]?.kind === "file" ? statSync(join(expectedCopyRoot, key)).size : 0),
         0,
       )
+      // Contract: at most 256 MiB of non-object metadata per entry in the initial pass. Over the
+      // bound is `unknown` naming the observed bytes and the cap, never a truncated bundle.
+      const metadataBounds = options.bounds?.metadata ?? DEFAULT_NON_OBJECT_METADATA_BOUNDS
+      if (bytes > metadataBounds.maxBytes) {
+        push(
+          incomplete(
+            "copy-manifest",
+            `non-object metadata is ${bytes} byte(s), over the ${metadataBounds.maxBytes} byte bound for one entry`,
+            {
+              path: entryReal,
+              remedy: "Preserve the entry and investigate; the per-entry metadata bound is not permission to truncate.",
+            },
+          ),
+        )
+        return finish()
+      }
       const free = statfsSync(artifactDir)
       const available = Number(free.bavail) * Number(free.bsize)
       if (available < bytes) {
@@ -736,6 +762,7 @@ export function verifyRetainedEntry(options: RetentionVerifyOptions): RetentionV
       estate: options.bounds?.estate ?? null,
       contents: options.bounds?.contents ?? null,
       custody: options.bounds?.custody ?? null,
+      metadata: options.bounds?.metadata ?? null,
     },
     elapsedMs: monotonic() - startedAt,
     coverage: {

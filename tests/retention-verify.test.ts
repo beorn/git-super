@@ -25,7 +25,11 @@ import { runCli } from "../src/cli.ts"
 import { scanContents } from "../src/retention-contents.ts"
 import { scanCustody } from "../src/retention-custody.ts"
 import { scanEstate } from "../src/retention-estate.ts"
-import { retentionRemovalBoundary, verifyRetainedEntry } from "../src/retention-verify.ts"
+import {
+  DEFAULT_NON_OBJECT_METADATA_BOUNDS,
+  retentionRemovalBoundary,
+  verifyRetainedEntry,
+} from "../src/retention-verify.ts"
 import type { ManifestEntry } from "../src/worktree-removal.ts"
 
 /** The shared, real-writer fixture and the pristine snapshot used to restore it in place. */
@@ -331,6 +335,26 @@ describe("retention verify gates 1-6", () => {
     expect(result.verdict).toBe("unknown")
     expect(result.gates[1]).toMatchObject({ gate: "copy-manifest", status: "unknown" })
     expect(result.gates[1]?.message).toContain("temporary")
+  })
+
+  it("non-object metadata over the per-entry bound is unknown with the observed bytes and the cap", () => {
+    const result = verifyRetainedEntry({
+      entry: base.entry,
+      root: base.root,
+      namespaceRoots: [fixtureRoot as string],
+      artifactDir: base.artifactDir,
+      allowTemporaryArtifactDir: true,
+      clock: eligible(),
+      bounds: { metadata: { maxBytes: 1 } },
+    })
+    expect(result.verdict).toBe("unknown")
+    expect(result.gates[1]).toMatchObject({ gate: "copy-manifest", status: "unknown" })
+    expect(result.gates[1]?.message).toMatch(/non-object metadata/)
+    expect(result.gates[1]?.message).toContain("bound")
+  })
+
+  it("defaults the per-entry non-object metadata bound to the contract's 256 MiB", () => {
+    expect(DEFAULT_NON_OBJECT_METADATA_BOUNDS.maxBytes).toBe(256 * 1024 * 1024)
   })
 
   it("does not expose a public temporary-artifact bypass flag", async () => {
