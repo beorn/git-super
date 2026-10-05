@@ -352,11 +352,17 @@ const retentionVerify = commandNode<CommandContext, RetentionVerifyParams, Reten
     if (input.artifactDir !== undefined && typeof input.artifactDir !== "string") {
       throw new Error("artifactDir must be a string")
     }
+    if (input.allowTemporaryArtifactDir !== undefined && typeof input.allowTemporaryArtifactDir !== "boolean") {
+      throw new Error("allowTemporaryArtifactDir must be a boolean")
+    }
     return {
       entry: input.entry,
       root: input.root,
       ...(input.namespaceRoots === undefined ? {} : { namespaceRoots: input.namespaceRoots as string[] }),
       ...(input.artifactDir === undefined ? {} : { artifactDir: input.artifactDir as string }),
+      ...(input.allowTemporaryArtifactDir === undefined
+        ? {}
+        : { allowTemporaryArtifactDir: input.allowTemporaryArtifactDir as boolean }),
     }
   }),
   run: (_context, input) => Promise.resolve(verifyRetainedEntry(input)),

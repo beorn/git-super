@@ -5,13 +5,28 @@
  * @reach fs-walk <fixture-only: the real retention writer, worktree add/remove and the estate scan use mkdtempSync(tmpdir()) Git repos>
  * @testonly none
  */
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs"
+import {
+  cpSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs"
 import { spawnSync } from "node:child_process"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest"
 import { runCli } from "../src/cli.ts"
+import { scanContents } from "../src/retention-contents.ts"
+import { scanCustody } from "../src/retention-custody.ts"
+import { scanEstate } from "../src/retention-estate.ts"
 import { retentionRemovalBoundary, verifyRetainedEntry } from "../src/retention-verify.ts"
+import type { ManifestEntry } from "../src/worktree-removal.ts"
 
 /** The shared, real-writer fixture and the pristine snapshot used to restore it in place. */
 let fixtureRoot: string | undefined
@@ -116,6 +131,7 @@ describe("retention verify gates 1-6", () => {
       root: base.root,
       namespaceRoots: [fixtureRoot as string],
       artifactDir: base.artifactDir,
+      allowTemporaryArtifactDir: true,
       clock: eligible(),
     })
     expect(result.verdict).toBe("candidate")
@@ -245,6 +261,7 @@ describe("retention verify gates 1-6", () => {
       entry: base.entry,
       root: base.root,
       artifactDir: base.artifactDir,
+      allowTemporaryArtifactDir: true,
       clock: eligible(),
     })
     expect(result.verdict).toBe("unknown")
@@ -300,6 +317,7 @@ describe("retention verify gates 1-6", () => {
         fixtureRoot as string,
         "--artifact-dir",
         base.artifactDir,
+        "--allow-temporary-artifact",
       ],
       stdout,
       outputSink(),
@@ -313,5 +331,161 @@ describe("retention verify gates 1-6", () => {
     const code = await runCli(["worktree", "retention", "verify", base.entry], stdout, outputSink())
     expect(code).not.toBe(0)
     expect(stdout.output).toBe("")
+  })
+})
+
+describe("retention verify fix-forward #27443(b) gaps", () => {
+  it("follows alternate targets transitively and blocks a survivor that borrows into the removal set", () => {
+    const scene = mkdtempSync(join(tmpdir(), "estate-transitive-"))
+    const roots = join(scene, "S")
+    const target = join(scene, "T")
+    const removal = join(scene, "E")
+    mkdirSync(join(roots, "objects", "info"), { recursive: true })
+    mkdirSync(join(target, "objects", "info"), { recursive: true })
+    mkdirSync(join(removal, "kept", "objects", "info"), { recursive: true })
+    writeFileSync(join(roots, "objects", "info", "alternates"), `${join(target, "objects")}\n`)
+    writeFileSync(join(target, "objects", "info", "alternates"), `${join(removal, "kept", "objects")}\n`)
+    const result = scanEstate([roots], [removal])
+    expect(result.status).toBe("blocked")
+    expect(result.objectDirs).toContain(realpathSync(join(target, "objects")))
+    expect(result.survivorIntoRemoval.some((edge) => edge.borrower === realpathSync(join(target, "objects")))).toBe(
+      true,
+    )
+  })
+
+  it("keeps a transitive alternate chain that never enters the removal set at pass", () => {
+    const scene = mkdtempSync(join(tmpdir(), "estate-transitive-pass-"))
+    const roots = join(scene, "S")
+    const target = join(scene, "T")
+    mkdirSync(join(roots, "objects", "info"), { recursive: true })
+    mkdirSync(join(target, "objects", "info"), { recursive: true })
+    writeFileSync(join(roots, "objects", "info", "alternates"), `${join(target, "objects")}\n`)
+    const result = scanEstate([roots], [join(scene, "E")])
+    expect(result.status).toBe("pass")
+  })
+
+  it("reports a malformed borrower registry record unknown", () => {
+    const scene = mkdtempSync(join(tmpdir(), "estate-registry-"))
+    const roots = join(scene, "R")
+    mkdirSync(join(roots, "git-super-retained-borrowers"), { recursive: true })
+    writeFileSync(join(roots, "git-super-retained-borrowers", "broken.json"), "{ not json")
+    const result = scanEstate([roots], [join(scene, "E")])
+    expect(result.status).toBe("unknown")
+    expect(result.detail).toContain("not valid JSON")
+  })
+
+  it("reads a valid borrower registry record and reconciles it with the manifest it names", () => {
+    const scene = mkdtempSync(join(tmpdir(), "estate-registry-good-"))
+    const roots = join(scene, "R")
+    const entry = join(scene, "entry")
+    mkdirSync(join(roots, "git-super-retained-borrowers"), { recursive: true })
+    mkdirSync(entry, { recursive: true })
+    const manifestPath = join(entry, "manifest.json")
+    writeFileSync(manifestPath, `${JSON.stringify({ retainUntil: "2020-01-01T00:00:00Z" })}\n`)
+    writeFileSync(
+      join(roots, "git-super-retained-borrowers", "good.json"),
+      `${JSON.stringify({ retained: entry, manifest: manifestPath })}\n`,
+    )
+    const result = scanEstate([roots], [join(scene, "E")])
+    expect(result.status).toBe("pass")
+    expect(result.registries).toHaveLength(1)
+  })
+
+  it("records the witnessed OID's own type rather than the ref tip's type", () => {
+    const scene = mkdtempSync(join(tmpdir(), "custody-type-"))
+    const repo = join(scene, "witness")
+    mkdirSync(repo, { recursive: true })
+    git(repo, ["init", "-q", "-b", "main"])
+    writeFileSync(join(repo, "f.txt"), "hello\n")
+    git(repo, ["add", "f.txt"])
+    git(repo, ["commit", "-q", "-m", "c"])
+    const blob = git(repo, ["rev-parse", "HEAD:f.txt"])
+    const result = scanCustody(
+      repo,
+      [
+        {
+          component: ".git",
+          effective: 0,
+          independent: 0,
+          atRisk: 1,
+          missingRoots: [],
+          atRiskOids: [blob],
+          atRiskSources: { [blob]: "owned" },
+          elapsedMs: 0,
+        },
+      ],
+      [join(repo, ".git", "objects")],
+      [],
+    )
+    expect(result.status).toBe("pass")
+    expect(result.witnesses[0]).toMatchObject({ oid: blob, objectType: "blob", ref: "refs/heads/main" })
+  })
+
+  it("refuses a transient operation ref as a durable witness", () => {
+    const scene = mkdtempSync(join(tmpdir(), "custody-transient-"))
+    const repo = join(scene, "witness")
+    mkdirSync(repo, { recursive: true })
+    git(repo, ["init", "-q", "-b", "main"])
+    writeFileSync(join(repo, "f.txt"), "hello\n")
+    git(repo, ["add", "f.txt"])
+    git(repo, ["commit", "-q", "-m", "c"])
+    const blob = git(repo, ["rev-parse", "HEAD:f.txt"])
+    git(repo, ["update-ref", "refs/rewritten/temporary-review", blob])
+    git(repo, ["update-ref", "-d", "refs/heads/main"])
+    const result = scanCustody(
+      repo,
+      [
+        {
+          component: ".git",
+          effective: 0,
+          independent: 0,
+          atRisk: 1,
+          missingRoots: [],
+          atRiskOids: [blob],
+          atRiskSources: { [blob]: "owned" },
+          elapsedMs: 0,
+        },
+      ],
+      [join(repo, ".git", "objects")],
+      [],
+    )
+    expect(result.status).toBe("blocked")
+  })
+
+  it("subtracts an external objects-symlink target from the at-risk set", () => {
+    const scene = mkdtempSync(join(tmpdir(), "contents-link-"))
+    const source = join(scene, "source")
+    const component = join(scene, "comp")
+    mkdirSync(source, { recursive: true })
+    mkdirSync(component, { recursive: true })
+    git(source, ["init", "-q", "-b", "main"])
+    writeFileSync(join(source, "f.txt"), "hello\n")
+    git(source, ["add", "f.txt"])
+    git(source, ["commit", "-q", "-m", "c"])
+    const commit = git(source, ["rev-parse", "HEAD"])
+    git(component, ["init", "-q", "-b", "main"])
+    rmSync(join(component, ".git", "objects"), { recursive: true, force: true })
+    symlinkSync(join(source, ".git", "objects"), join(component, ".git", "objects"))
+    git(component, ["update-ref", "refs/heads/main", commit])
+    const entries = {
+      ".git/objects/info/alternates": { kind: "file", sha256: "0".repeat(64) },
+    } as Record<string, ManifestEntry>
+    const result = scanContents(component, entries, [])
+    expect(result.status).toBe("pass")
+    expect(result.components[0]).toMatchObject({ component: ".git", atRisk: 0 })
+    expect(result.components[0]!.independent).toBeGreaterThan(0)
+  })
+
+  it("refuses a temporary artifact directory as durable evidence", () => {
+    const result = verifyRetainedEntry({
+      entry: base.entry,
+      root: base.root,
+      namespaceRoots: [fixtureRoot as string],
+      artifactDir: base.artifactDir,
+      clock: eligible(),
+    })
+    expect(result.verdict).toBe("unknown")
+    expect(result.gates[1]).toMatchObject({ gate: "copy-manifest", status: "unknown" })
+    expect(result.gates[1]?.message).toContain("temporary")
   })
 })

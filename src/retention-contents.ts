@@ -11,7 +11,7 @@
  * `unknown`; a root OID the component's own store no longer carries is a violated condition.
  */
 import { spawnSync } from "node:child_process"
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs"
+import { existsSync, lstatSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs"
 import { isAbsolute, join, relative, sep } from "node:path"
 import { alternateEntries } from "./alternates.ts"
 import type { ManifestEntry } from "./worktree-removal.ts"
@@ -101,17 +101,27 @@ function parseEffective(
   stdout: string,
   cap: number,
 ): { status: "ok"; oids: Set<string> } | { status: "unknown"; detail: string } {
-  const oids = new Set<string>()
+  const oids = new Map<string, string>()
   for (const line of stdout.split("\n")) {
     if (line === "") continue
     const [oid, type, size] = line.split(" ")
     if (oid === undefined || type === undefined || size === undefined || !HEX40.test(oid)) {
       return { status: "unknown", detail: `malformed cat-file row: ${line.slice(0, 120)}` }
     }
-    oids.add(oid)
+    if (type !== "commit" && type !== "tree" && type !== "blob" && type !== "tag") {
+      return { status: "unknown", detail: `cat-file reported unsupported object type '${type}' for ${oid}` }
+    }
+    if (!/^\d+$/u.test(size)) {
+      return { status: "unknown", detail: `cat-file reported malformed object size '${size}' for ${oid}` }
+    }
+    const previous = oids.get(oid)
+    if (previous !== undefined && previous !== type) {
+      return { status: "unknown", detail: `cat-file reported conflicting types for ${oid}: ${previous} and ${type}` }
+    }
+    oids.set(oid, type)
     if (oids.size > cap) return { status: "unknown", detail: `effective OID count exceeded the ${cap} cap` }
   }
-  return { status: "ok", oids }
+  return { status: "ok", oids: new Set(oids.keys()) }
 }
 
 /** Strict transitive alternates closure of one object dir: every link present, no cycle back into R. */
@@ -171,8 +181,9 @@ function readRootOids(gitDir: string, run: GitRun): RootSet | { unreadable: stri
   for (const line of refs.stdout.split("\n")) {
     if (line === "") continue
     const [oid, name] = line.split(" ")
-    if (oid === undefined || !HEX40.test(oid))
+    if (oid === undefined || !HEX40.test(oid)) {
       return { unreadable: `malformed for-each-ref row in ${gitDir}: ${line.slice(0, 120)}` }
+    }
     addSource(oids, oid, `ref ${name ?? ""}`.trim())
   }
   const head = run([`--git-dir=${gitDir}`, "rev-parse", "HEAD"])
@@ -265,11 +276,41 @@ export function scanContents(
     const objects = join(gitDir, "objects")
     const seen = new Set<string>()
     const closureResult = closure(objects, removal, seen)
-    if (closureResult.status !== "ok")
+    if (closureResult.status !== "ok") {
       return { status: "unknown", detail: `${component}: ${closureResult.detail}`, components }
-    const independent = new Set<string>()
+    }
+    // IndependentStores(g,R) also includes an actual external `objects`-symlink target: its store
+    // survives E and those objects are borrowed, never owned (contract gate 4). Dropping the
+    // component's own initial store while keeping the link target is the whole correction.
+    const independentStores = new Set<string>()
     for (const store of closureResult.stores) {
       if (store === objects) continue
+      independentStores.add(store)
+    }
+    const linkMetadata = lstatSync(objects, { throwIfNoEntry: false })
+    if (linkMetadata?.isSymbolicLink() === true) {
+      let linkTarget: string
+      try {
+        linkTarget = realpathSync(objects)
+        if (!statSync(linkTarget).isDirectory()) throw new Error("target is not a directory")
+      } catch (error) {
+        return {
+          status: "unknown",
+          detail: `${component}: objects link ${objects} is dangling or not a directory: ${error instanceof Error ? error.message : String(error)}`,
+          components,
+        }
+      }
+      if (removal.some((root) => within(root, linkTarget))) {
+        return {
+          status: "unknown",
+          detail: `${component}: objects link target ${linkTarget} resolves inside the removal set`,
+          components,
+        }
+      }
+      independentStores.add(linkTarget)
+    }
+    const independent = new Set<string>()
+    for (const store of [...independentStores].sort()) {
       const storeRun = run([
         `--git-dir=${join(store, "..")}`,
         `--work-tree=${copyRoot}`,
@@ -285,8 +326,9 @@ export function scanContents(
         }
       }
       const parsed = parseEffective(storeRun.stdout, bounds.maxEffectiveOids)
-      if (parsed.status !== "ok")
+      if (parsed.status !== "ok") {
         return { status: "unknown", detail: `independent store ${store}: ${parsed.detail}`, components }
+      }
       for (const oid of parsed.oids) independent.add(oid)
     }
     const atRiskOids = [...effective.oids].filter((oid) => !independent.has(oid)).sort()

@@ -8,6 +8,7 @@ import {
   mkdirSync,
   copyFileSync,
 } from "node:fs"
+import { tmpdir } from "node:os"
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { createHash } from "node:crypto"
 import { digestDirectory, emitCertificate, RETENTION_CERTIFICATE_SCHEMA } from "./retention-certificate.ts"
@@ -94,6 +95,12 @@ export type RetentionVerifyOptions = Readonly<{
    * produced, so gates 2 and 6 report `unknown`.
    */
   artifactDir?: string
+  /**
+   * TEST SEAM ONLY. The production CLI never sets this; a unit test that must build its fixture under
+   * the OS temporary directory sets it so gates 1-6 stay reachable. Without it, an `artifactDir`
+   * under `tmpdir()` is `unknown`: no path in /tmp is durable evidence (#27443(b) gate 6).
+   */
+  allowTemporaryArtifactDir?: boolean
   clock?: Date
   bounds?: RetentionVerifyBounds
   /** Injected git runner and monotonic clock for tests; real runs use the clean-child defaults. */
@@ -484,6 +491,26 @@ export function verifyRetainedEntry(options: RetentionVerifyOptions): RetentionV
             path: artifactDir,
             remedy: "Choose a pass directory outside the declared retention root and the entry.",
           }),
+        )
+        return finish()
+      }
+      // Contract gate 6: no path in /tmp (the OS temporary directory) is durable evidence.
+      const temporaryRoots = new Set<string>([resolve(tmpdir())])
+      try {
+        temporaryRoots.add(realpathSync(tmpdir()))
+      } catch {
+        // silent-fallback-allow: the raw tmpdir() is already in the set, so an unresolvable symlink target only means the real path adds no second root
+      }
+      if (options.allowTemporaryArtifactDir !== true && [...temporaryRoots].some((root) => inside(root, artifactDir))) {
+        push(
+          incomplete(
+            "copy-manifest",
+            `pass artifact ${artifactDir} is inside the OS temporary directory; a temporary path is not durable evidence`,
+            {
+              path: artifactDir,
+              remedy: "Choose an external, non-temporary --artifact-dir; /tmp never serves as durable evidence.",
+            },
+          ),
         )
         return finish()
       }

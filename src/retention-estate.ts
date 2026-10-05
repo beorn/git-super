@@ -8,7 +8,7 @@
  * directory under `R` is `blocked`.
  */
 import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs"
-import { isAbsolute, join, relative, resolve, sep } from "node:path"
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { alternateEntries } from "./alternates.ts"
 
 export interface EstateScanBounds {
@@ -88,35 +88,129 @@ export function scanEstate(
   const registryDirs = new Set<string>()
   const borrowers: EstateBorrower[] = []
   let alternatesFiles = 0
+
+  const unknown = (detail: string): EstateScan => ({
+    status: "unknown",
+    detail,
+    roots,
+    objectDirs: [...objectDirs].sort(),
+    alternatesFiles,
+    borrowers,
+    registries: [...registryDirs].sort(),
+    survivorIntoRemoval: [],
+  })
+
+  // One worklist of object directories, seeded from the filesystem walk AND from every alternate /
+  // objects-link target reached. Scanning a reached target is what makes the inventory the closed
+  // transitive set the contract requires; it reads only `info/alternates`, never a pack store walk.
+  const processedStores = new Set<string>()
+  const processStore = (store: string): EstateScan | undefined => {
+    if (processedStores.has(store)) return undefined
+    processedStores.add(store)
+    objectDirs.add(store)
+    const alternatesFile = join(store, "info", "alternates")
+    if (!existsSync(alternatesFile)) return undefined
+    alternatesFiles += 1
+    if (alternatesFiles > bounds.maxAlternatesFiles) {
+      return unknown(
+        `estate declaration scan hit the alternates-file bound (${alternatesFiles} recorded, cap ${bounds.maxAlternatesFiles})`,
+      )
+    }
+    let content: string
+    try {
+      content = readFileSync(alternatesFile, "utf8")
+    } catch (error) {
+      return unknown(`cannot read ${alternatesFile}: ${error instanceof Error ? error.message : String(error)}`)
+    }
+    for (const target of alternateEntries(content, store)) {
+      const actual = canonical(target)
+      if (!existsSync(actual) || !statSync(actual).isDirectory()) {
+        return unknown(`${alternatesFile} names a missing or non-directory alternate ${target}`)
+      }
+      borrowers.push({ borrower: canonical(store), target: actual })
+      const nested = processStore(actual)
+      if (nested !== undefined) return nested
+    }
+    return undefined
+  }
+
+  // Read every borrower-registry record; an unreadable, malformed or stale proof is `unknown`. The
+  // record names a survivor retained borrower of the holder's stores, so it is recorded as a reverse
+  // link and a survivor-into-R is blocked without invoking the mutating lender guard.
+  const readRegistry = (dir: string): EstateScan | undefined => {
+    registryDirs.add(dir)
+    let names: string[]
+    try {
+      names = readdirSync(dir)
+        .filter((name) => name.endsWith(".json"))
+        .sort()
+    } catch (error) {
+      return unknown(`cannot read borrower registry ${dir}: ${error instanceof Error ? error.message : String(error)}`)
+    }
+    const holder = canonical(dirname(dir))
+    for (const name of names) {
+      const file = join(dir, name)
+      let bytes: string
+      try {
+        bytes = readFileSync(file, "utf8")
+      } catch (error) {
+        return unknown(
+          `cannot read borrower registry record ${file}: ${error instanceof Error ? error.message : String(error)}`,
+        )
+      }
+      let record: unknown
+      try {
+        record = JSON.parse(bytes)
+      } catch (error) {
+        return unknown(
+          `borrower registry record ${file} is not valid JSON: ${error instanceof Error ? error.message : String(error)}`,
+        )
+      }
+      if (record === null || typeof record !== "object" || Array.isArray(record)) {
+        return unknown(`borrower registry record ${file} is not a JSON object`)
+      }
+      const row = record as Record<string, unknown>
+      if (
+        typeof row.retained !== "string" ||
+        row.retained.trim() === "" ||
+        typeof row.manifest !== "string" ||
+        row.manifest.trim() === ""
+      ) {
+        return unknown(`borrower registry record ${file} lacks a retained path and a manifest path`)
+      }
+      // Reconcile the record with the manifest it names: a stale or unreadable proof is unknown.
+      let manifestBytes: string
+      try {
+        manifestBytes = readFileSync(row.manifest as string, "utf8")
+      } catch (error) {
+        return unknown(
+          `borrower registry record ${file} names an unreadable manifest ${row.manifest}: ${error instanceof Error ? error.message : String(error)}`,
+        )
+      }
+      try {
+        JSON.parse(manifestBytes)
+      } catch {
+        return unknown(`borrower registry record ${file} names a manifest that is not valid JSON: ${row.manifest}`)
+      }
+      borrowers.push({ borrower: canonical(row.retained as string), target: holder })
+    }
+    return undefined
+  }
+
+  const visited = new Set<string>()
   const stack = [...roots]
   while (stack.length > 0) {
     if (clock() - started > bounds.scanMs) {
-      return {
-        status: "unknown",
-        detail: `estate declaration scan exceeded ${bounds.scanMs} ms after ${alternatesFiles} alternates file(s)`,
-        roots,
-        objectDirs: [...objectDirs].sort(),
-        alternatesFiles,
-        borrowers,
-        registries: [...registryDirs].sort(),
-        survivorIntoRemoval: [],
-      }
+      return unknown(`estate declaration scan exceeded ${bounds.scanMs} ms after ${alternatesFiles} alternates file(s)`)
     }
     const current = stack.pop()!
+    if (visited.has(current)) continue
+    visited.add(current)
     let entries
     try {
       entries = readdirSync(current, { withFileTypes: true })
     } catch (error) {
-      return {
-        status: "unknown",
-        detail: `cannot read ${current}: ${error instanceof Error ? error.message : String(error)}`,
-        roots,
-        objectDirs: [...objectDirs].sort(),
-        alternatesFiles,
-        borrowers,
-        registries: [...registryDirs].sort(),
-        survivorIntoRemoval: [],
-      }
+      return unknown(`cannot read ${current}: ${error instanceof Error ? error.message : String(error)}`)
     }
     for (const entry of entries) {
       const path = join(current, entry.name)
@@ -130,75 +224,24 @@ export function scanEstate(
           target = realpathSync(path)
           if (!statSync(target).isDirectory()) throw new Error("target is not a directory")
         } catch (error) {
-          return {
-            status: "unknown",
-            detail: `objects link ${path} has an unavailable or redirected target: ${error instanceof Error ? error.message : String(error)}`,
-            roots,
-            objectDirs: [...objectDirs].sort(),
-            alternatesFiles,
-            borrowers,
-            registries: [...registryDirs].sort(),
-            survivorIntoRemoval: [],
-          }
+          return unknown(
+            `objects link ${path} has an unavailable or redirected target: ${error instanceof Error ? error.message : String(error)}`,
+          )
         }
-        objectDirs.add(path)
-        borrowers.push({ borrower: canonical(join(current, "..")), target })
+        borrowers.push({ borrower: path, target })
+        const nested = processStore(target)
+        if (nested !== undefined) return nested
         continue
       }
       if (!entry.isDirectory()) continue
       if (entry.name === "objects" && isObjectDir(path)) {
-        objectDirs.add(path)
-        const alternatesFile = join(path, "info", "alternates")
-        if (existsSync(alternatesFile)) {
-          alternatesFiles += 1
-          if (alternatesFiles > bounds.maxAlternatesFiles) {
-            return {
-              status: "unknown",
-              detail: `estate declaration scan hit the alternates-file bound (${alternatesFiles} recorded, cap ${bounds.maxAlternatesFiles})`,
-              roots,
-              objectDirs: [...objectDirs].sort(),
-              alternatesFiles,
-              borrowers,
-              registries: [...registryDirs].sort(),
-              survivorIntoRemoval: [],
-            }
-          }
-          let content: string
-          try {
-            content = readFileSync(alternatesFile, "utf8")
-          } catch (error) {
-            return {
-              status: "unknown",
-              detail: `cannot read ${alternatesFile}: ${error instanceof Error ? error.message : String(error)}`,
-              roots,
-              objectDirs: [...objectDirs].sort(),
-              alternatesFiles,
-              borrowers,
-              registries: [...registryDirs].sort(),
-              survivorIntoRemoval: [],
-            }
-          }
-          for (const target of alternateEntries(content, path)) {
-            const actual = canonical(target)
-            if (!existsSync(actual) || !statSync(actual).isDirectory()) {
-              return {
-                status: "unknown",
-                detail: `${alternatesFile} names a missing or non-directory alternate ${target}`,
-                roots,
-                objectDirs: [...objectDirs].sort(),
-                alternatesFiles,
-                borrowers,
-                registries: [...registryDirs].sort(),
-                survivorIntoRemoval: [],
-              }
-            }
-            borrowers.push({ borrower: canonical(path), target: actual })
-          }
-        }
+        const nested = processStore(path)
+        if (nested !== undefined) return nested
         continue
       }
       if (entry.name === "git-super-retained-borrowers") {
-        registryDirs.add(path)
+        const registry = readRegistry(path)
+        if (registry !== undefined) return registry
         continue
       }
       stack.push(path)

@@ -51,6 +51,13 @@ export interface CustodyScan {
 }
 
 const HEX40 = /^[0-9a-f]{40}$/u
+/** The only durable witness namespaces the contract admits: branches, tags and GitSuper pins. */
+const DURABLE_REF = /^refs\/(?:heads|tags)\//u
+const PIN_REF = /^refs\/git-super\/pins\//u
+
+function isDurableRef(ref: string): boolean {
+  return DURABLE_REF.test(ref) || PIN_REF.test(ref)
+}
 
 function within(parent: string, path: string): boolean {
   const part = relative(parent, path)
@@ -107,11 +114,13 @@ function objectFormat(
   run: GitRun,
 ): { status: "ok"; format: string } | { status: "unknown"; detail: string } {
   const result = run([`--git-dir=${gitDir}`, "rev-parse", "--show-object-format"])
-  if (result.code !== 0)
+  if (result.code !== 0) {
     return { status: "unknown", detail: `rev-parse --show-object-format failed in ${gitDir}: ${result.stderr.trim()}` }
+  }
   const format = result.stdout.trim()
-  if (format !== "sha1" && format !== "sha256")
+  if (format !== "sha1" && format !== "sha256") {
     return { status: "unknown", detail: `${gitDir} reports unsupported object format '${format}'` }
+  }
   return { status: "ok", format }
 }
 
@@ -119,7 +128,7 @@ type StoreIndex =
   | {
       status: "ok"
       format: string
-      byOid: Map<string, Readonly<{ ref: string; tip: string; objectType: string; digest: string }>>
+      byOid: Map<string, Readonly<{ ref: string; tip: string; digest: string }>>
     }
   | { status: "unknown"; detail: string }
 
@@ -137,36 +146,45 @@ function indexStore(
   if (closure.status !== "ok") return closure
   const started = clock()
   const fsck: GitRunResult = run([`--git-dir=${gitDir}`, "fsck", "--full", "--no-progress"])
-  if (fsck.code !== 0)
+  if (fsck.code !== 0) {
     return { status: "unknown", detail: `fsck --full failed in witness store ${gitDir}: ${fsck.stderr.trim()}` }
-  if (clock() - started > bounds.fsckMs)
+  }
+  if (clock() - started > bounds.fsckMs) {
     return { status: "unknown", detail: `fsck in ${gitDir} exceeded the ${bounds.fsckMs} ms bound` }
-  const refs = run([`--git-dir=${gitDir}`, "for-each-ref", "--format=%(refname)%09%(objectname)%09%(objecttype)"])
-  if (refs.code !== 0)
+  }
+  const refs = run([`--git-dir=${gitDir}`, "for-each-ref", "--format=%(refname)%09%(objectname)"])
+  if (refs.code !== 0) {
     return { status: "unknown", detail: `for-each-ref failed in witness store ${gitDir}: ${refs.stderr.trim()}` }
-  const byOid = new Map<string, Readonly<{ ref: string; tip: string; objectType: string; digest: string }>>()
+  }
+  const byOid = new Map<string, Readonly<{ ref: string; tip: string; digest: string }>>()
   let reachable = 0
   for (const line of refs.stdout.split("\n")) {
     if (line === "") continue
-    const [ref, tip, objectType] = line.split("\t")
+    const [ref, tip] = line.split("\t")
     if (ref === undefined || tip === undefined || !HEX40.test(tip)) {
       return {
         status: "unknown",
         detail: `malformed for-each-ref row in witness store ${gitDir}: ${line.slice(0, 120)}`,
       }
     }
+    // A transient operation ref, remote-tracking ref or detached HEAD is never a durable witness:
+    // only a named branch, tag or GitSuper pin qualifies (contract gate 5).
+    if (!isDurableRef(ref)) continue
     const refStart = clock()
     const graph = run([`--git-dir=${gitDir}`, "rev-list", "--objects", tip])
-    if (graph.code !== 0)
+    if (graph.code !== 0) {
       return { status: "unknown", detail: `rev-list ${tip} failed in witness store ${gitDir}: ${graph.stderr.trim()}` }
-    if (clock() - refStart > bounds.reachableMs)
+    }
+    if (clock() - refStart > bounds.reachableMs) {
       return { status: "unknown", detail: `rev-list ${tip} in ${gitDir} exceeded the ${bounds.reachableMs} ms bound` }
+    }
     const oids: string[] = []
     for (const row of graph.stdout.split("\n")) {
       if (row === "") continue
       const oid = row.split(" ")[0]!
-      if (!HEX40.test(oid))
+      if (!HEX40.test(oid)) {
         return { status: "unknown", detail: `malformed rev-list row in ${gitDir}: ${row.slice(0, 120)}` }
+      }
       oids.push(oid)
       reachable += 1
       if (reachable > bounds.maxReachableOids) {
@@ -177,7 +195,7 @@ function indexStore(
       .update([...oids].sort().join("\n"))
       .digest("hex")
     for (const oid of oids) {
-      if (!byOid.has(oid)) byOid.set(oid, { ref, tip, objectType: objectType ?? "unknown", digest })
+      if (!byOid.has(oid)) byOid.set(oid, { ref, tip, digest })
     }
   }
   return { status: "ok", format: format.format, byOid }
@@ -215,6 +233,38 @@ export function scanCustody(
     index.set(store, entry)
     if (entry.status !== "ok") return { status: "unknown", detail: entry.detail, witnesses: [], missing: [] }
   }
+  // The contract records the witnessed OID's OWN type, not the ref tip's type: a blob reached from
+  // a commit ref is a blob witness. Resolve lazily, once per (store, oid), through Git itself.
+  const typeCache = new Map<string, Map<string, string>>()
+  const resolveObjectType = (
+    store: string,
+    oid: string,
+  ): { status: "ok"; type: string } | { status: "unknown"; detail: string } => {
+    const gitDir = dirname(store)
+    let cache = typeCache.get(store)
+    if (cache === undefined) {
+      cache = new Map()
+      typeCache.set(store, cache)
+    }
+    const cached = cache.get(oid)
+    if (cached !== undefined) return { status: "ok", type: cached }
+    const result = run([`--git-dir=${gitDir}`, "cat-file", "-t", oid])
+    if (result.code !== 0) {
+      return {
+        status: "unknown",
+        detail: `cat-file -t ${oid} failed in witness store ${gitDir}: ${result.stderr.trim()}`,
+      }
+    }
+    const type = result.stdout.trim()
+    if (type !== "commit" && type !== "tree" && type !== "blob" && type !== "tag") {
+      return {
+        status: "unknown",
+        detail: `witness store ${gitDir} reports unsupported object type '${type}' for ${oid}`,
+      }
+    }
+    cache.set(oid, type)
+    return { status: "ok", type }
+  }
   const witnesses: Witness[] = []
   const missing: CustodyTarget[] = []
   for (const component of components) {
@@ -227,13 +277,17 @@ export function scanCustody(
         if (entry.status !== "ok" || entry.format !== format.format) continue
         const hit = entry.byOid.get(oid)
         if (hit === undefined) continue
+        const objectType = resolveObjectType(store, oid)
+        if (objectType.status !== "ok") {
+          return { status: "unknown", detail: objectType.detail, witnesses: [], missing: [] }
+        }
         found = {
           component: component.component,
           oid,
           store,
           ref: hit.ref,
           tip: hit.tip,
-          objectType: hit.objectType,
+          objectType: objectType.type,
           graphDigest: hit.digest,
         }
         break
