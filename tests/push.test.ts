@@ -21,6 +21,90 @@ const gitWorktreeModule = new URL("../src/worktree.ts", import.meta.url).href
  * @testonly none
  */
 describe("ordinary check publication history", () => {
+  test("inherits a published parent pin without discovering its absent child", async () => {
+    const fixture = recursivePushFixture("publication-published-parent")
+    git(fixture.child, "push", "-q", "origin", `${fixture.childSource}:refs/heads/main`)
+    git(fixture.root, "push", "-q", "origin", `${fixture.rootSource}:refs/heads/main`)
+    const baselineTree = git(fixture.root, "rev-parse", `${fixture.rootBefore}^{tree}`)
+    const left = git(fixture.root, "commit-tree", baselineTree, "-p", fixture.rootBefore, "-m", "left")
+    const source = git(
+      fixture.root,
+      "commit-tree",
+      git(fixture.root, "rev-parse", `${fixture.rootSource}^{tree}`),
+      "-p",
+      left,
+      "-p",
+      fixture.rootSource,
+      "-m",
+      "inherit published parent pin",
+    )
+    renameSync(fixture.child, join(fixture.fixture, "child-retained"))
+
+    const result = await superPush({
+      repo: fixture.root,
+      remote: "origin",
+      refspecs: [`${source}:refs/heads/preservation`],
+      recurseSubmodules: "check",
+    })
+
+    expect(result, JSON.stringify(result)).toMatchObject({ state: "updated", partial: false })
+    expect(git(fixture.rootRemote, "rev-parse", "refs/heads/preservation")).toBe(source)
+  })
+
+  // AC2/AC3 share a parent-publication boundary: parent reachability never substitutes for a changed nested pin.
+  test.each([false, true])("a published moved parent with nested changed=%s", async (changed) => {
+    const fixture = nestedRecursivePushFixture(`publication-nested-${changed}`)
+    const baselineParent = git(fixture.child, "rev-parse", `${fixture.childSource}^`)
+    const baselineRoot = git(fixture.root, "rev-parse", `${fixture.rootSource}^`)
+    git(fixture.child, "push", "-q", "origin", `${baselineParent}:refs/heads/main`)
+    git(fixture.root, "push", "-q", "origin", `${baselineRoot}:refs/heads/main`)
+    const movedParent = changed
+      ? fixture.childSource
+      : git(
+          fixture.child,
+          "commit-tree",
+          git(fixture.child, "rev-parse", `${baselineParent}^{tree}`),
+          "-p",
+          baselineParent,
+          "-m",
+          "move parent with same nested pin",
+        )
+    git(fixture.child, "push", "-q", "origin", `${movedParent}:refs/heads/main`)
+    git(fixture.root, "read-tree", baselineRoot)
+    git(fixture.root, "update-index", "--cacheinfo", `160000,${movedParent},child`)
+    const source = git(
+      fixture.root,
+      "commit-tree",
+      git(fixture.root, "write-tree"),
+      "-p",
+      baselineRoot,
+      "-m",
+      "move parent",
+    )
+    if (!changed) renameSync(fixture.leaf, join(fixture.fixture, "leaf-retained"))
+
+    const result = await superPush({
+      repo: fixture.root,
+      remote: "origin",
+      refspecs: [`${source}:refs/heads/preservation`],
+      recurseSubmodules: "check",
+    })
+
+    if (changed) {
+      expect(result, JSON.stringify(result)).toMatchObject({
+        state: "failed",
+        partial: false,
+        detail: { code: "submodule-commit-unavailable", paths: ["child/leaf"], objectIds: [fixture.leafSource] },
+      })
+      expect(result.repositories.find((row) => row.repository === fixture.root)?.state).toBe("not-run")
+      expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(baselineRoot)
+    } else {
+      expect(result, JSON.stringify(result)).toMatchObject({ state: "updated", partial: false })
+      expect(git(fixture.rootRemote, "rev-parse", "refs/heads/preservation")).toBe(source)
+    }
+    expect(git(fixture.leafRemote, "rev-parse", "refs/heads/main")).toBe(fixture.leafBefore)
+  })
+
   test("preserves a root-only candidate with an unchanged absent child", async () => {
     const fixture = recursivePushFixture("publication-unchanged-absent")
     git(fixture.root, "update-index", "--cacheinfo", `160000,${fixture.childBefore},child`)
@@ -2501,13 +2585,26 @@ describe("a frozen push works only on the children its merge moved (25303, obser
     const local = createLocalGitProcess()
     const withoutFetch: GitProcess = {
       run(request) {
-        if (request.args[0] === "fetch") return Promise.resolve({ code: 0, stdout: "", stderr: "" })
+        if (request.args[0] === "fetch" && !request.args.includes("--dry-run")) {
+          return Promise.resolve({ code: 0, stdout: "", stderr: "" })
+        }
         return local.run(request)
       },
     }
     await expect(
       remoteContainsCommit({ repository, remote: "origin", commit: source, git: withoutFetch }),
     ).rejects.toThrow(new RegExp(`${missing}.*refs/heads/foreign.*origin.*remains missing`, "u"))
+    // Ordinary check must use this same strict advertised-object boundary before selecting history.
+    const checked = await superPush({
+      repo: repository,
+      remote: "origin",
+      refspecs: [`${source}:refs/heads/preservation`],
+      recurseSubmodules: "check",
+      git: withoutFetch,
+    })
+    expect(checked).toMatchObject({ state: "failed", partial: false })
+    expect(checked.detail?.message).toMatch(new RegExp(`${missing}.*refs/heads/foreign.*origin.*remains missing`, "u"))
+    expect(checked.repositories.find((row) => row.repository === repository)?.state).toBe("not-run")
   })
 
   /**

@@ -203,7 +203,7 @@ Unrelated staged, tracked, untracked, and ignored files survive. A path the inco
 
 `push` resolves every nonempty selected source to an exact object ID, freezes each destination's advertised old value, and rechecks it under the shared lock. With no refspecs it asks Git for the configured default push selection using a non-writing dry run, then applies exactly those rows. General force refspecs and implicit fetch-racy leases are refused; `--force-with-lease=<full-ref>:<expected>` is explicit, and an empty expected value means create-only.
 
-- `check` requires every recorded child commit to be reachable from at least one configured remote, then pushes root refs.
+- `check` checks child pins introduced in revisions newly published to the root remote, then pushes root refs. It walks all parents, including intermediate pins later removed, and requires each selected child commit to be reachable from a configured child remote. Nested obligations use the previous parent pins as their history cut. An unchanged child is not discovered; a selected missing store or unreadable advertised root object refuses. A merge result pin inherited from any parent is not a new obligation, while newly published histories of all parents remain checked.
 - `on-demand` pushes missing nested commits leaf-first and root-last.
 - `only` publishes the nested commits and leaves root refs untouched.
 - `no` pushes only the selected root refs.

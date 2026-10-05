@@ -107,6 +107,7 @@ type CommitRequirement = Readonly<{
   repository: string
   path: string
   target: string
+  introducedBy?: string
   retention?: readonly RefUpdate[]
 }>
 
@@ -1341,6 +1342,7 @@ async function collectCommitRequirements(
   frozen?: FrozenPushIntent,
   rootStores?: ReadonlyMap<string, string>,
   excludedSubmodules: readonly string[] = [],
+  publicationBaselines?: readonly string[],
 ): Promise<CommitRequirement[]> {
   // A frozen merge carries its own exclusions (27147); the capture passes them directly. Never both, so a push can
   // neither widen nor narrow the list its merge froze.
@@ -1360,10 +1362,12 @@ async function collectCommitRequirements(
     preparedParent = false,
     depth = 0,
     declaredRemote?: string,
+    baselines?: readonly string[],
   ): Promise<void> => {
     if (depth > missingDepth) return
     const key = `${repository}\0${commit}`
-    if (completed.has(key)) return
+    const scopeKey = `${key}\0${baselines === undefined ? "full" : [...new Set(baselines)].sort().join(",")}`
+    if (completed.has(scopeKey)) return
     if (visiting.has(key)) {
       throw Object.assign(new Error(`recursive gitlink cycle at ${path} ${commit}`), {
         resultDetail: detail("gitlink-cycle", "read-push-graph", `Recursive gitlink cycle at ${path}.`, {
@@ -1391,107 +1395,162 @@ async function collectCommitRequirements(
     if (parentStore !== undefined && !isAbsolute(parentStore)) {
       throw new Error(`Git returned an invalid common directory for prepared parent ${repository}: ${parentStore}`)
     }
-    for (const recorded of await readCommitSubmodules(git, repository, commit)) {
-      if (path === "." && isSubmoduleExcluded(recorded.path, excluded)) continue
-      const target = path === "." ? rootPins?.get(recorded.path) : undefined
-      const entry = target === undefined ? recorded : { ...recorded, target }
-      const childPath = path === "." ? entry.path : `${path}/${entry.path}`
-      const store = stores?.get(entry.path)
-      // A PREPARED store is deliberately somewhere else, so its toplevel is not
-      // expected to be the gitlink's path and the guard below does not apply to
-      // it. The guard is for the fallback, where the path IS the claim.
-      const nestedStore =
-        parentStore === undefined ? undefined : await preparedSubmoduleStore(git, parentStore, entry.name)
-      if ((parentStore !== undefined && nestedStore === undefined) || (stores !== undefined && store === undefined)) {
-        if (depth < missingDepth) {
-          missing.length = 0
-          missingDepth = depth
-        }
-        missing.push({
-          path: childPath,
-          name: entry.name,
-          parentStore: parentStore ?? repository,
-          parentCommit: commit,
-          ...(declaredRemote === undefined ? {} : { parentRemote: declaredRemote }),
-          commit: entry.target,
-        })
-        continue
-      }
-      const prepared = store?.gitdir ?? nestedStore ?? (path === "." ? rootStores?.get(entry.path) : undefined)
-      const child = prepared ?? join(repository, entry.path)
-      const discovered = await discoverRepository(git, child, "discover-submodule", prepared === undefined)
-      const retention: RefUpdate[] = []
-      if (frozen !== undefined) {
-        const row = frozen.children.find((candidate) => candidate.path === childPath && candidate.pin === entry.target)
-        if (row === undefined) throw new Error(`Frozen merge has no child disposition for ${childPath}@${entry.target}`)
-        for (const source of new Set([row.pin, ...(row.publication === undefined ? [] : [row.publication.source])])) {
-          const args = ["cat-file", "-e", `${source}^{commit}`]
-          const present = await git.run({ repo: discovered, args })
-          if (!ancestrySettled(present)) {
-            throw operationError(discovered, args, "recover-frozen-source", present)
-          }
-          if (present.code === 0) continue
-          if (!sameHostedOwner(frozen.rootRemote, row.remote)) {
-            throw new Error(
-              `External child ${childPath}@${source} is unavailable locally and has no authorized cold recovery prerequisite`,
+    // The same collector walks ordinary check publication history or the existing full-tree modes.
+    // Every newly reachable revision is visited, including histories introduced through a merge's other parents.
+    const revisions =
+      baselines === undefined
+        ? [[commit]]
+        : (
+            await required(
+              git,
+              repository,
+              ["rev-list", "--parents", "--topo-order", commit, "--not", ...new Set(baselines)],
+              "read-push-publication-history",
             )
+          )
+            .split(/\r?\n/u)
+            .filter(Boolean)
+            .map((line) => line.split(/\s+/u))
+    for (const revision of revisions) {
+      const current = revision[0]
+      if (current === undefined || revision.some((oid) => !OBJECT_ID.test(oid))) {
+        throw new Error(`Invalid publication revision row in ${repository}: ${revision.join(" ")}`)
+      }
+      const parents =
+        baselines === undefined
+          ? []
+          : await Promise.all(revision.slice(1).map((parent) => readCommitGitlinks(git, repository, parent)))
+      const entries = await readCommitSubmodules(git, repository, current)
+      const changed = parents.map((rows) => new Set(changedGitlinks(rows, entries).map((row) => row.path)))
+      for (const recorded of entries) {
+        // A result pin inherited from ANY immediate parent is not introduced by this revision.
+        // That parent's own newly published history is still visited independently above.
+        if (baselines !== undefined && changed.some((paths) => !paths.has(recorded.path))) {
+          continue
+        }
+        if (path === "." && isSubmoduleExcluded(recorded.path, excluded)) continue
+        const target = path === "." ? rootPins?.get(recorded.path) : undefined
+        const entry = target === undefined ? recorded : { ...recorded, target }
+        const childPath = path === "." ? entry.path : `${path}/${entry.path}`
+        const store = stores?.get(entry.path)
+        // A PREPARED store is deliberately somewhere else, so its toplevel is not
+        // expected to be the gitlink's path and the guard below does not apply to
+        // it. The guard is for the fallback, where the path IS the claim.
+        const nestedStore =
+          parentStore === undefined ? undefined : await preparedSubmoduleStore(git, parentStore, entry.name)
+        if ((parentStore !== undefined && nestedStore === undefined) || (stores !== undefined && store === undefined)) {
+          if (depth < missingDepth) {
+            missing.length = 0
+            missingDepth = depth
           }
-          const retainedSource: RefUpdate = {
-            repository: discovered,
-            remote: row.remote,
-            source,
-            destination: `refs/git-super/pins/${source}`,
-            expectedDestination: { state: "missing" },
+          missing.push({
+            path: childPath,
+            name: entry.name,
+            parentStore: parentStore ?? repository,
+            parentCommit: current,
+            ...(declaredRemote === undefined ? {} : { parentRemote: declaredRemote }),
+            commit: entry.target,
+          })
+          continue
+        }
+        const prepared = store?.gitdir ?? nestedStore ?? (path === "." ? rootStores?.get(entry.path) : undefined)
+        const child = prepared ?? join(repository, entry.path)
+        let discovered: string
+        try {
+          discovered = await discoverRepository(git, child, "discover-submodule", prepared === undefined)
+        } catch (error) {
+          if (baselines === undefined) throw error
+          const failure = resultError(error, "discover-submodule")
+          const message = `${childPath}@${entry.target} is required by newly published revision ${current}: ${failure.message}`
+          throw Object.assign(new Error(message, { cause: error }), {
+            resultDetail: { ...failure, message, paths: [childPath], objectIds: [entry.target, current] },
+          })
+        }
+        const retention: RefUpdate[] = []
+        if (frozen !== undefined) {
+          const row = frozen.children.find(
+            (candidate) => candidate.path === childPath && candidate.pin === entry.target,
+          )
+          if (row === undefined) {
+            throw new Error(`Frozen merge has no child disposition for ${childPath}@${entry.target}`)
           }
-          // Cold adoption is a prerequisite, including for unchanged rows. A
-          // failed read is never absence; an existing immutable ref must agree.
-          const observed = await observeDestination(git, retainedSource, "recover-frozen-source")
-          if (observed.state === "oid") {
-            if (observed.oid !== source) {
+          for (const source of new Set([row.pin, ...(row.publication === undefined ? [] : [row.publication.source])])) {
+            const args = ["cat-file", "-e", `${source}^{commit}`]
+            const present = await git.run({ repo: discovered, args })
+            if (!ancestrySettled(present)) {
+              throw operationError(discovered, args, "recover-frozen-source", present)
+            }
+            if (present.code === 0) continue
+            if (!sameHostedOwner(frozen.rootRemote, row.remote)) {
               throw new Error(
-                `Cold child ${childPath}@${source}: ${row.remote} ${retainedSource.destination} names ${observed.oid}`,
+                `External child ${childPath}@${source} is unavailable locally and has no authorized cold recovery prerequisite`,
               )
             }
-            await verifyRetainedSource(git, retainedSource)
-          } else {
-            if (!(await commitAvailableOnRemote(git, discovered, row.remote, source, undefined, true))) {
-              const message = `Cold child ${childPath}@${source} is not reachable from advertised refs on frozen remote ${row.remote}; nothing was published.`
-              throw Object.assign(new Error(message), {
-                resultDetail: detail("submodule-commit-unavailable", "recover-frozen-source", message, {
-                  paths: [childPath],
-                  objectIds: [source],
-                  remedy:
-                    "Publish a branch or tag reaching the exact child commit on its declared remote, then retry the same push.",
-                }),
-              })
+            const retainedSource: RefUpdate = {
+              repository: discovered,
+              remote: row.remote,
+              source,
+              destination: `refs/git-super/pins/${source}`,
+              expectedDestination: { state: "missing" },
             }
-            retention.push(retainedSource)
+            // Cold adoption is a prerequisite, including for unchanged rows. A
+            // failed read is never absence; an existing immutable ref must agree.
+            const observed = await observeDestination(git, retainedSource, "recover-frozen-source")
+            if (observed.state === "oid") {
+              if (observed.oid !== source) {
+                throw new Error(
+                  `Cold child ${childPath}@${source}: ${row.remote} ${retainedSource.destination} names ${observed.oid}`,
+                )
+              }
+              await verifyRetainedSource(git, retainedSource)
+            } else {
+              if (!(await commitAvailableOnRemote(git, discovered, row.remote, source, undefined, true))) {
+                const message = `Cold child ${childPath}@${source} is not reachable from advertised refs on frozen remote ${row.remote}; nothing was published.`
+                throw Object.assign(new Error(message), {
+                  resultDetail: detail("submodule-commit-unavailable", "recover-frozen-source", message, {
+                    paths: [childPath],
+                    objectIds: [source],
+                    remedy:
+                      "Publish a branch or tag reaching the exact child commit on its declared remote, then retry the same push.",
+                  }),
+                })
+              }
+              retention.push(retainedSource)
+            }
+            await required(git, discovered, args, "verify-recovered-source")
           }
-          await required(git, discovered, args, "verify-recovered-source")
         }
+        await verifyOrRecoverSubmoduleCommit(git, discovered, childPath, entry.target)
+        await walk(
+          discovered,
+          childPath,
+          entry.target,
+          prepared !== undefined,
+          depth + 1,
+          entry.url === undefined ? undefined : resolveSubmoduleOrigin(repository, declaredRemote, entry.url),
+          baselines === undefined
+            ? undefined
+            : [
+                ...new Set(
+                  parents.flatMap((rows) => rows.filter((row) => row.path === entry.path).map((row) => row.target)),
+                ),
+              ],
+        )
+        requirements.push({
+          superproject: repository,
+          entry,
+          repository: discovered,
+          path: childPath,
+          target: entry.target,
+          ...(baselines === undefined ? {} : { introducedBy: current }),
+          ...(retention.length === 0 ? {} : { retention }),
+        })
       }
-      await verifyOrRecoverSubmoduleCommit(git, discovered, childPath, entry.target)
-      await walk(
-        discovered,
-        childPath,
-        entry.target,
-        prepared !== undefined,
-        depth + 1,
-        entry.url === undefined ? undefined : resolveSubmoduleOrigin(repository, declaredRemote, entry.url),
-      )
-      requirements.push({
-        superproject: repository,
-        entry,
-        repository: discovered,
-        path: childPath,
-        target: entry.target,
-        ...(retention.length === 0 ? {} : { retention }),
-      })
     }
     visiting.delete(key)
-    completed.add(key)
+    completed.add(scopeKey)
   }
-  for (const commit of new Set(commits)) await walk(root, ".", commit)
+  for (const commit of new Set(commits)) await walk(root, ".", commit, false, 0, undefined, publicationBaselines)
   if (missing.length > 0) {
     const resultDetail = nestedStoreMissingDetail(missing)
     throw Object.assign(new Error(resultDetail.message), { resultDetail })
@@ -2371,7 +2430,33 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
       )
     }
     if (options.recurseSubmodules === "check") {
-      const requirements = await collectCommitRequirements(git, root, rootSources)
+      let requirements: CommitRequirement[]
+      try {
+        const baselines = await advertisedTips(git, root, remote, await readAdvertisement(git, root, remote))
+        requirements = await collectCommitRequirements(
+          git,
+          root,
+          rootSources,
+          undefined,
+          undefined,
+          undefined,
+          [],
+          baselines,
+        )
+      } catch (error) {
+        const failure = resultError(error, "plan-push")
+        return {
+          ...failedResult(root, failure),
+          repositories: [
+            {
+              repository: root,
+              state: "not-run",
+              detail: failure,
+              refs: rootUpdates.map((row) => refResult(row, "not-run")),
+            },
+          ],
+        }
+      }
       const available: GitSuperRepositoryResult[] = []
       for (const requirement of requirements) {
         const reach = await commitAvailableOnAnyRemote(git, requirement)
@@ -2382,7 +2467,7 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
         const failure = detail(
           "submodule-commit-unavailable",
           "check-submodule-availability",
-          `Commit ${requirement.target} from ${requirement.path} is not reachable from any configured submodule remote; read by name: ${reach.read.join(", ")}.`,
+          `Commit ${requirement.target} from ${requirement.path}, introduced by newly published revision ${requirement.introducedBy}, is not reachable from any configured submodule remote; read by name: ${reach.read.join(", ")}.`,
           {
             paths: [requirement.path],
             objectIds: [requirement.target],
