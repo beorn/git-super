@@ -827,31 +827,40 @@ describe("explicit recursive push mechanics", () => {
     expect(() => git(fixture.leaf, "cat-file", "-e", `${fixture.leafSource}^{commit}`)).not.toThrow()
   })
 
-  test("refuses a nested gitlink commit missing from both the nested clone and its origin", async () => {
-    const fixture = unfetchedLeafFixture("nested-fetch-on-miss-absent", false)
-    expect(() => git(fixture.leaf, "cat-file", "-e", `${fixture.leafSource}^{commit}`)).toThrow()
+  // AC4: check must identify the revision introducing a cold pin, while on-demand keeps its recovery contract.
+  test.each(["on-demand", "check"] as const)(
+    "refuses a nested gitlink commit missing from both the nested clone and its origin (%s)",
+    async (recurseSubmodules) => {
+      const fixture = unfetchedLeafFixture("nested-fetch-on-miss-absent", false)
+      expect(() => git(fixture.leaf, "cat-file", "-e", `${fixture.leafSource}^{commit}`)).toThrow()
 
-    const result = await superPush({
-      repo: fixture.root,
-      remote: "origin",
-      refspecs: [`${fixture.rootSource}:refs/heads/main`],
-      recurseSubmodules: "on-demand",
-    })
+      const result = await superPush({
+        repo: fixture.root,
+        remote: "origin",
+        refspecs: [`${fixture.rootSource}:refs/heads/main`],
+        recurseSubmodules,
+      })
 
-    expect(result).toMatchObject({
-      state: "failed",
-      partial: false,
-      detail: {
-        phase: "verify-submodule-commit",
-        message: expect.stringContaining(fixture.leafSource),
-      },
-    })
-    expect(result.detail?.paths).toContain("child/leaf")
-    expect(result.detail?.objectIds).toContain(fixture.leafSource)
-    expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(fixture.rootBefore)
-    expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(fixture.childBefore)
-    expect(git(fixture.leafRemote, "rev-parse", "refs/heads/main")).toBe(fixture.leafBefore)
-  })
+      expect(result).toMatchObject({
+        state: "failed",
+        partial: false,
+        detail: {
+          phase: "verify-submodule-commit",
+          message: expect.stringContaining(fixture.leafSource),
+        },
+      })
+      expect(result.detail?.paths).toContain("child/leaf")
+      expect(result.detail?.objectIds).toContain(fixture.leafSource)
+      if (recurseSubmodules === "check") {
+        expect(result.detail?.message).toContain(`newly published revision ${fixture.childSource}`)
+        expect(result.detail?.objectIds).toContain(fixture.childSource)
+        expect(result.repositories.find((row) => row.repository === fixture.root)?.state).toBe("not-run")
+      }
+      expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(fixture.rootBefore)
+      expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(fixture.childBefore)
+      expect(git(fixture.leafRemote, "rev-parse", "refs/heads/main")).toBe(fixture.leafBefore)
+    },
+  )
 
   test("creates a missing destination through an explicit create-only lease", async () => {
     const { repository, remote, source } = pushFixture("create-only")

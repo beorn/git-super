@@ -1456,8 +1456,66 @@ async function collectCommitRequirements(
         const prepared = store?.gitdir ?? nestedStore ?? (path === "." ? rootStores?.get(entry.path) : undefined)
         const child = prepared ?? join(repository, entry.path)
         let discovered: string
+        const retention: RefUpdate[] = []
         try {
           discovered = await discoverRepository(git, child, "discover-submodule", prepared === undefined)
+          if (frozen !== undefined) {
+            const row = frozen.children.find(
+              (candidate) => candidate.path === childPath && candidate.pin === entry.target,
+            )
+            if (row === undefined) {
+              throw new Error(`Frozen merge has no child disposition for ${childPath}@${entry.target}`)
+            }
+            for (const source of new Set([
+              row.pin,
+              ...(row.publication === undefined ? [] : [row.publication.source]),
+            ])) {
+              const args = ["cat-file", "-e", `${source}^{commit}`]
+              const present = await git.run({ repo: discovered, args })
+              if (!ancestrySettled(present)) {
+                throw operationError(discovered, args, "recover-frozen-source", present)
+              }
+              if (present.code === 0) continue
+              if (!sameHostedOwner(frozen.rootRemote, row.remote)) {
+                throw new Error(
+                  `External child ${childPath}@${source} is unavailable locally and has no authorized cold recovery prerequisite`,
+                )
+              }
+              const retainedSource: RefUpdate = {
+                repository: discovered,
+                remote: row.remote,
+                source,
+                destination: `refs/git-super/pins/${source}`,
+                expectedDestination: { state: "missing" },
+              }
+              // Cold adoption is a prerequisite, including for unchanged rows. A
+              // failed read is never absence; an existing immutable ref must agree.
+              const observed = await observeDestination(git, retainedSource, "recover-frozen-source")
+              if (observed.state === "oid") {
+                if (observed.oid !== source) {
+                  throw new Error(
+                    `Cold child ${childPath}@${source}: ${row.remote} ${retainedSource.destination} names ${observed.oid}`,
+                  )
+                }
+                await verifyRetainedSource(git, retainedSource)
+              } else {
+                if (!(await commitAvailableOnRemote(git, discovered, row.remote, source, undefined, true))) {
+                  const message = `Cold child ${childPath}@${source} is not reachable from advertised refs on frozen remote ${row.remote}; nothing was published.`
+                  throw Object.assign(new Error(message), {
+                    resultDetail: detail("submodule-commit-unavailable", "recover-frozen-source", message, {
+                      paths: [childPath],
+                      objectIds: [source],
+                      remedy:
+                        "Publish a branch or tag reaching the exact child commit on its declared remote, then retry the same push.",
+                    }),
+                  })
+                }
+                retention.push(retainedSource)
+              }
+              await required(git, discovered, args, "verify-recovered-source")
+            }
+          }
+          await verifyOrRecoverSubmoduleCommit(git, discovered, childPath, entry.target)
         } catch (error) {
           if (baselines === undefined) throw error
           const failure = resultError(error, "discover-submodule")
@@ -1466,61 +1524,6 @@ async function collectCommitRequirements(
             resultDetail: { ...failure, message, paths: [childPath], objectIds: [entry.target, current] },
           })
         }
-        const retention: RefUpdate[] = []
-        if (frozen !== undefined) {
-          const row = frozen.children.find(
-            (candidate) => candidate.path === childPath && candidate.pin === entry.target,
-          )
-          if (row === undefined) {
-            throw new Error(`Frozen merge has no child disposition for ${childPath}@${entry.target}`)
-          }
-          for (const source of new Set([row.pin, ...(row.publication === undefined ? [] : [row.publication.source])])) {
-            const args = ["cat-file", "-e", `${source}^{commit}`]
-            const present = await git.run({ repo: discovered, args })
-            if (!ancestrySettled(present)) {
-              throw operationError(discovered, args, "recover-frozen-source", present)
-            }
-            if (present.code === 0) continue
-            if (!sameHostedOwner(frozen.rootRemote, row.remote)) {
-              throw new Error(
-                `External child ${childPath}@${source} is unavailable locally and has no authorized cold recovery prerequisite`,
-              )
-            }
-            const retainedSource: RefUpdate = {
-              repository: discovered,
-              remote: row.remote,
-              source,
-              destination: `refs/git-super/pins/${source}`,
-              expectedDestination: { state: "missing" },
-            }
-            // Cold adoption is a prerequisite, including for unchanged rows. A
-            // failed read is never absence; an existing immutable ref must agree.
-            const observed = await observeDestination(git, retainedSource, "recover-frozen-source")
-            if (observed.state === "oid") {
-              if (observed.oid !== source) {
-                throw new Error(
-                  `Cold child ${childPath}@${source}: ${row.remote} ${retainedSource.destination} names ${observed.oid}`,
-                )
-              }
-              await verifyRetainedSource(git, retainedSource)
-            } else {
-              if (!(await commitAvailableOnRemote(git, discovered, row.remote, source, undefined, true))) {
-                const message = `Cold child ${childPath}@${source} is not reachable from advertised refs on frozen remote ${row.remote}; nothing was published.`
-                throw Object.assign(new Error(message), {
-                  resultDetail: detail("submodule-commit-unavailable", "recover-frozen-source", message, {
-                    paths: [childPath],
-                    objectIds: [source],
-                    remedy:
-                      "Publish a branch or tag reaching the exact child commit on its declared remote, then retry the same push.",
-                  }),
-                })
-              }
-              retention.push(retainedSource)
-            }
-            await required(git, discovered, args, "verify-recovered-source")
-          }
-        }
-        await verifyOrRecoverSubmoduleCommit(git, discovered, childPath, entry.target)
         await walk(
           discovered,
           childPath,
