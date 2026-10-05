@@ -55,6 +55,13 @@ export type WorktreeInspection = Readonly<{
   locked?: string
 }>
 
+export type RegisteredWorktree = Readonly<{
+  path: string
+  head?: string
+  detached: boolean
+  locked?: string
+}>
+
 export type WorktreeAdd = Readonly<{ hooks?: WorktreeHookPolicy; lockReason?: string; operation?: string }> &
   (
     | Readonly<{ kind: "branch"; path: string; branch: string }>
@@ -526,6 +533,10 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
     async inspect(path: string): Promise<WorktreeInspection> {
       return inspectWorktree(git, repo, path)
     },
+    /** This read-only inventory is a snapshot, not permission: removal rechecks under its mutation lock. */
+    async list(): Promise<readonly RegisteredWorktree[]> {
+      return listWorktrees(git, repo)
+    },
     /** This read-only inspection is a snapshot, not permission: remove rechecks admission under its mutation lock. */
     async inspectRemoval(
       path: string,
@@ -563,7 +574,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         const writerLeases = acquireRemovalWriterLeases(directory)
         try {
           rehomeBorrowers(common, directory, join(directory, "modules"))
-          await git.run(repo, ["worktree", "prune", "--expire=now"])
+          await git.run(repo, ["worktree", "remove", "--force", path], false, timeouts.cleanup)
           if ((await inspectWorktree(git, repo, path)).registered) {
             throw new Error(`yrd: destroyed worktree '${path}' survived explicit recovery`)
           }
@@ -578,22 +589,32 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
 }
 
 async function inspectWorktree(git: Git, repo: string, path: string): Promise<WorktreeInspection> {
+  const row = (await listWorktrees(git, repo)).find((entry) => entry.path === resolve(path))
+  if (row === undefined) return { registered: false }
+  const { path: _path, ...fields } = row
+  return { registered: true, ...fields }
+}
+
+async function listWorktrees(git: Git, repo: string): Promise<RegisteredWorktree[]> {
   const listed = await git.run(repo, ["worktree", "list", "--porcelain", "-z"])
-  const target = resolve(path)
+  const rows: RegisteredWorktree[] = []
   for (const record of listed.stdout.split("\0\0")) {
+    if (record === "") continue
     const fields = record.split("\0").filter((field) => field !== "")
     const worktree = fields.find((field) => field.startsWith("worktree "))
-    if (worktree === undefined || resolve(worktree.slice("worktree ".length)) !== target) continue
+    if (worktree === undefined || worktree === "worktree ") {
+      throw new Error("git worktree list --porcelain -z returned a non-empty record without a worktree path")
+    }
     const head = fields.find((field) => field.startsWith("HEAD "))?.slice("HEAD ".length)
     const locked = fields.find((field) => field === "locked" || field.startsWith("locked "))
-    return {
-      registered: true,
+    rows.push({
+      path: resolve(worktree.slice("worktree ".length)),
       ...(head === undefined ? {} : { head }),
       detached: fields.includes("detached"),
       ...(locked === undefined ? {} : { locked: locked === "locked" ? "" : locked.slice("locked ".length) }),
-    }
+    })
   }
-  return { registered: false }
+  return rows
 }
 
 export type GitWorktreeStore = Awaited<ReturnType<typeof createGitWorktreeStore>>

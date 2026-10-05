@@ -69,6 +69,69 @@ function objectStoreSnapshot(objects: string) {
 
 describe("createGitWorktreeStore", () => {
   /**
+   * @failure Recovery globally prunes another destroyed registration and its object custody (#27477).
+   * @level l1
+   * @consumer Worktree recovery callers
+   * @testonly none
+   */
+  it("recovers only the requested destroyed registration", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-targeted-recovery-"))
+    try {
+      const repo = join(root, "repo")
+      createRepository(repo, "root.txt", "root\n")
+      const store = createLocalGitWorktreeStore({ repo })
+      const target = join(root, "target")
+      const other = join(root, "other")
+      await store.add({ kind: "detached", path: target, ref: "HEAD" })
+      await store.add({ kind: "detached", path: other, ref: "HEAD" })
+      const otherAdmin = git(other, ["rev-parse", "--absolute-git-dir"]).trim()
+      await rename(target, `${target}-moved`)
+      await rename(other, `${other}-moved`)
+      const before = objectStoreSnapshot(otherAdmin)
+      await store.recoverDestroyed(target)
+      expect(await store.inspect(target)).toEqual({ registered: false })
+      expect(await store.inspect(other)).toMatchObject({ registered: true, detached: true })
+      expect(objectStoreSnapshot(otherAdmin)).toEqual(before)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  /**
+   * @failure Registration inventory and inspection disagree or omit a malformed row (#27477).
+   * @level l1
+   * @consumer Landing recovery and worktree inspection
+   * @testonly none
+   */
+  it("lists registered primary and locked linked worktrees using inspection fields", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-registration-list-"))
+    try {
+      const repo = join(root, "repo")
+      createRepository(repo, "root.txt", "root\n")
+      const linked = join(root, "linked")
+      const store = createLocalGitWorktreeStore({ repo })
+      await store.add({ kind: "detached", path: linked, ref: "HEAD", lockReason: "fixture holder" })
+      const rows = await store.list()
+      expect(rows).toEqual([
+        { path: repo, head: git(repo, ["rev-parse", "HEAD"]).trim(), detached: false },
+        { path: linked, head: git(repo, ["rev-parse", "HEAD"]).trim(), detached: true, locked: "fixture holder" },
+      ])
+      for (const { path, ...fields } of rows) expect(await store.inspect(path)).toEqual({ registered: true, ...fields })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it("refuses malformed worktree list records for listing and inspection", async () => {
+    const store = createGitWorktreeStore({
+      repo: "/not-opened-by-fixture",
+      gitProcess: { run: async () => ({ code: 0, stdout: "HEAD abc\0detached\0\0", stderr: "" }) },
+    })
+    await expect(store.list()).rejects.toThrow("git worktree list")
+    await expect(store.inspect("/missing")).rejects.toThrow("git worktree list")
+  })
+
+  /**
    * @failure A .git-less removal remnant resolves to its ancestor repository and inspects unrelated custody (27477).
    * @level l1
    * @consumer Git-super status and landing worktree removal
