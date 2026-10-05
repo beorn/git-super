@@ -364,8 +364,8 @@ describe("retention verify gates 1-6", () => {
     expect(result.gates[1]?.message).toContain("temporary")
   })
 
-  it("non-object metadata over the per-entry bound is unknown with the observed bytes and the cap", () => {
-    const result = verifyRetainedEntry({
+  it("non-object metadata over the per-entry bound is unknown with the observed bytes and the cap", async () => {
+    const result = await verifyRetainedEntry({
       entry: base.entry,
       root: base.root,
       namespaceRoots: [fixtureRoot as string],
