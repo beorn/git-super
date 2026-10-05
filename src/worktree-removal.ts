@@ -29,6 +29,7 @@ import type { NotCompared } from "./diff.ts"
 import type { Git, WorktreeInspection } from "./worktree.ts"
 import type { PrivateGitProjection } from "./private-git-projection.ts"
 import { alternatesLineage } from "./alternates.ts"
+import { removalBorrowers, type RemovalBorrower } from "./worktree-administration.ts"
 
 export type WorktreeRemovalProof = Readonly<{
   path: string
@@ -211,33 +212,6 @@ export async function assertExcludedRemovalCustody(
 export interface RehomeBorrowersOptions {
   readonly repackTimeoutMs?: number
   readonly spawn?: typeof spawnSync
-}
-
-type RemovalBorrower = Readonly<{
-  adminDir: string
-  name: string
-  excludedStores?: readonly Readonly<{ path: string; store: string }>[]
-  includedStores?: readonly string[]
-}>
-
-/** One candidate inventory for metadata admission and the actual borrower walk. */
-function removalBorrowers(commonDir: string, lenderGitDir: string): RemovalBorrower[] {
-  const worktreesDir = join(commonDir, "worktrees")
-  const candidates: RemovalBorrower[] = []
-  if (existsSync(worktreesDir)) {
-    for (const entry of readdirSync(worktreesDir, { withFileTypes: true })) {
-      if (entry.isDirectory()) {
-        const adminDir = join(worktreesDir, entry.name)
-        if (toCanonical(adminDir) !== toCanonical(lenderGitDir)) {
-          candidates.push({ adminDir, name: entry.name })
-        }
-      }
-    }
-  }
-  if (toCanonical(commonDir) !== toCanonical(lenderGitDir)) {
-    candidates.push({ adminDir: commonDir, name: "primary" })
-  }
-  return candidates
 }
 
 /** Protected roots are pruned before entry, including symlinks. */

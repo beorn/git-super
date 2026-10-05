@@ -1,8 +1,8 @@
 import { existsSync, realpathSync } from "node:fs"
 import { spawnSync } from "node:child_process"
 import { setTimeout as delay } from "node:timers/promises"
-import { appendFile } from "node:fs/promises"
-import { isAbsolute, join, relative, resolve, sep } from "node:path"
+import { appendFile, lstat, readFile } from "node:fs/promises"
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { fileURLToPath } from "node:url"
 import { createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS } from "./exclusive.ts"
 import {
@@ -10,14 +10,16 @@ import {
   assertExcludedRemovalCustody,
   inspectRemovalStatus,
   prepareRemovalBorrowers,
+  rehomeBorrowers,
   retainWorktreeModules,
   type WorktreeRetention,
 } from "./worktree-removal.ts"
-import { cleanGitEnvironment } from "./git.ts"
+import { cleanGitEnvironment, probeRepository } from "./git.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
 import { createProgressReporter } from "./progress.ts"
 import { materializeSubmodulesWithProcess } from "./submodules.ts"
 import type { SuperStatusResult } from "./status.ts"
+import { removalBorrowers } from "./worktree-administration.ts"
 
 export type GitResult = Readonly<{ code: number; stdout: string; stderr: string }>
 export type Git = ReturnType<typeof createGit>
@@ -50,6 +52,13 @@ export type WorktreeInspection = Readonly<{
   registered: boolean
   head?: string
   detached?: boolean
+  locked?: string
+}>
+
+export type RegisteredWorktree = Readonly<{
+  path: string
+  head?: string
+  detached: boolean
   locked?: string
 }>
 
@@ -310,7 +319,18 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       return { code: result.code, stdout: result.stdout, stderr: result.stderr }
     },
   })
+  const assertRemovalRoot = async (path: string) => {
+    const discovered = await git.text(path, ["rev-parse", "--show-toplevel"])
+    const prefix = await git.text(path, ["rev-parse", "--show-prefix"])
+    const identity = probeRepository(discovered, prefix)
+    if (identity.kind === "absent") {
+      throw new Error(
+        `${path} is not a worktree root; its git dir resolves to the parent repository ${identity.discovered}`,
+      )
+    }
+  }
   const prepareRemoval = async (path: string, excludedSubmodules?: readonly string[]) => {
+    await assertRemovalRoot(path)
     const gitDir = realpathSync(await git.text(path, ["rev-parse", "--absolute-git-dir"]))
     const common = realpathSync(await git.text(path, ["rev-parse", "--path-format=absolute", "--git-common-dir"]))
     const custody = await assertExcludedRemovalCustody(
@@ -450,6 +470,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         excludedSubmodules?: readonly string[]
       }> = {},
     ): Promise<void> {
+      await assertRemovalRoot(path)
       await mutate(removeOptions.operation ?? `worktree remove ${path}`, async () => {
         if (removeOptions.retention !== undefined && removeOptions.unlock === true) {
           throw new Error(`retained worktree removal cannot unlock ${path}; resolve its holder first`)
@@ -512,6 +533,10 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
     async inspect(path: string): Promise<WorktreeInspection> {
       return inspectWorktree(git, repo, path)
     },
+    /** This read-only inventory is a snapshot, not permission: removal rechecks under its mutation lock. */
+    async list(): Promise<readonly RegisteredWorktree[]> {
+      return listWorktrees(git, repo)
+    },
     /** This read-only inspection is a snapshot, not permission: remove rechecks admission under its mutation lock. */
     async inspectRemoval(
       path: string,
@@ -527,13 +552,46 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
     },
     async recoverDestroyed(path: string, operation = `recover destroyed worktree ${path}`): Promise<void> {
       await mutate(operation, async () => {
-        if (existsSync(join(path, ".git"))) {
+        try {
+          await lstat(join(path, ".git"))
           throw new Error(`yrd: refusing destroyed-worktree recovery while '${path}/.git' still exists`)
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
         }
         if (!(await inspectWorktree(git, repo, path)).registered) return
-        await git.run(repo, ["worktree", "prune", "--expire=now"])
-        if ((await inspectWorktree(git, repo, path)).registered) {
-          throw new Error(`yrd: destroyed worktree '${path}' survived explicit recovery`)
+        const common = realpathSync(await git.text(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"]))
+        let directory: string | undefined
+        const unreadable: string[] = []
+        for (const candidate of removalBorrowers(common, common)) {
+          const pointerPath = join(candidate.adminDir, "gitdir")
+          let pointer: string
+          try {
+            pointer = (await readFile(pointerPath, "utf8")).trim()
+          } catch (error) {
+            unreadable.push(`${pointerPath}: ${String(error)}`)
+            continue
+          }
+          if (resolve(dirname(pointer)) === resolve(path)) {
+            directory = candidate.adminDir
+            break
+          }
+        }
+        if (directory === undefined) {
+          throw new Error(
+            `registered destroyed worktree '${path}' has no administration identity${unreadable.length === 0 ? "" : `; unreadable administration pointers: ${unreadable.join("; ")}`}`,
+          )
+        }
+        const writerLeases = acquireRemovalWriterLeases(directory)
+        try {
+          rehomeBorrowers(common, directory, join(directory, "modules"))
+          await git.run(repo, ["worktree", "remove", "--force", path], false, timeouts.cleanup)
+          if ((await inspectWorktree(git, repo, path)).registered) {
+            throw new Error(`yrd: destroyed worktree '${path}' survived explicit recovery`)
+          }
+        } catch (error) {
+          throw writerLeases.refusal(error)
+        } finally {
+          writerLeases.release()
         }
       })
     },
@@ -541,22 +599,32 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
 }
 
 async function inspectWorktree(git: Git, repo: string, path: string): Promise<WorktreeInspection> {
+  const row = (await listWorktrees(git, repo)).find((entry) => entry.path === resolve(path))
+  if (row === undefined) return { registered: false }
+  const { path: _path, ...fields } = row
+  return { registered: true, ...fields }
+}
+
+async function listWorktrees(git: Git, repo: string): Promise<RegisteredWorktree[]> {
   const listed = await git.run(repo, ["worktree", "list", "--porcelain", "-z"])
-  const target = resolve(path)
+  const rows: RegisteredWorktree[] = []
   for (const record of listed.stdout.split("\0\0")) {
+    if (record === "") continue
     const fields = record.split("\0").filter((field) => field !== "")
     const worktree = fields.find((field) => field.startsWith("worktree "))
-    if (worktree === undefined || resolve(worktree.slice("worktree ".length)) !== target) continue
+    if (worktree === undefined || worktree === "worktree ") {
+      throw new Error("git worktree list --porcelain -z returned a non-empty record without a worktree path")
+    }
     const head = fields.find((field) => field.startsWith("HEAD "))?.slice("HEAD ".length)
     const locked = fields.find((field) => field === "locked" || field.startsWith("locked "))
-    return {
-      registered: true,
+    rows.push({
+      path: resolve(worktree.slice("worktree ".length)),
       ...(head === undefined ? {} : { head }),
       detached: fields.includes("detached"),
       ...(locked === undefined ? {} : { locked: locked === "locked" ? "" : locked.slice("locked ".length) }),
-    }
+    })
   }
-  return { registered: false }
+  return rows
 }
 
 export type GitWorktreeStore = Awaited<ReturnType<typeof createGitWorktreeStore>>
