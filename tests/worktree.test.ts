@@ -23,10 +23,16 @@ import { canonicalTmpdir, createProductFixture, createRepository } from "./fixtu
 import { runCli } from "../src/cli.ts"
 import { discoverRepository } from "../src/push.ts"
 import { createLocalGitProcess } from "../src/process.ts"
+import type { SuperStatusResult } from "../src/status.ts"
 
 vi.mock("node:fs", async (importOriginal) => {
   const fs = await importOriginal<typeof import("node:fs")>()
   return { ...fs, readdirSync: vi.fn(fs.readdirSync), readFileSync: vi.fn(fs.readFileSync) }
+})
+
+vi.mock("node:child_process", async (importOriginal) => {
+  const process = await importOriginal<typeof import("node:child_process")>()
+  return { ...process, spawnSync: vi.fn(process.spawnSync) }
 })
 
 function git(repo: string, args: readonly string[]): string {
@@ -62,6 +68,231 @@ function objectStoreSnapshot(objects: string) {
 }
 
 describe("createGitWorktreeStore", () => {
+  /**
+   * @failure Recovery globally prunes another destroyed registration and its object custody (#27477).
+   * @level l1
+   * @consumer Worktree recovery callers
+   * @testonly none
+   */
+  it("recovers only the requested destroyed registration", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-targeted-recovery-"))
+    try {
+      const repo = join(root, "repo")
+      createRepository(repo, "root.txt", "root\n")
+      const store = createLocalGitWorktreeStore({ repo })
+      const target = join(root, "target")
+      const other = join(root, "other")
+      await store.add({ kind: "detached", path: target, ref: "HEAD" })
+      await store.add({ kind: "detached", path: other, ref: "HEAD" })
+      const otherAdmin = git(other, ["rev-parse", "--absolute-git-dir"]).trim()
+      // An unrelated interrupted registration must not prevent target recovery (#27477 CTO review).
+      const unreadableAdmin = join(repo, ".git", "worktrees", "000-unreadable")
+      await mkdir(unreadableAdmin)
+      await rename(target, `${target}-moved`)
+      await rename(other, `${other}-moved`)
+      const before = objectStoreSnapshot(otherAdmin)
+      await store.recoverDestroyed(target)
+      expect(await store.inspect(target)).toEqual({ registered: false })
+      expect(await store.inspect(other)).toMatchObject({ registered: true, detached: true })
+      expect(objectStoreSnapshot(otherAdmin)).toEqual(before)
+      expect(existsSync(unreadableAdmin)).toBe(true)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  /**
+   * @failure Recovery hides unreadable administration pointers when no registered target matches (#27477).
+   * @level l1
+   * @consumer Worktree recovery callers
+   * @testonly none
+   */
+  it("names unreadable administration pointers when no registered target matches", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-unreadable-recovery-"))
+    try {
+      const repo = join(root, "repo")
+      createRepository(repo, "root.txt", "root\n")
+      const target = join(root, "target")
+      await createLocalGitWorktreeStore({ repo }).add({ kind: "detached", path: target, ref: "HEAD" })
+      const admin = git(target, ["rev-parse", "--absolute-git-dir"]).trim()
+      const inventory = git(repo, ["worktree", "list", "--porcelain", "-z"])
+      await rename(target, `${target}-moved`)
+      await rm(join(admin, "gitdir"))
+      const local = createLocalGitProcess()
+      const store = createGitWorktreeStore({
+        repo,
+        gitProcess: {
+          run: (request) =>
+            request.args.join(" ") === "worktree list --porcelain -z"
+              ? Promise.resolve({ code: 0, stdout: inventory, stderr: "" })
+              : local.run(request),
+        },
+      })
+      const refusal = await store.recoverDestroyed(target).then(
+        () => {
+          throw new Error("recovery accepted a registration without administration identity")
+        },
+        (error: unknown) => String(error),
+      )
+      expect(refusal).toContain("has no administration identity")
+      expect(refusal).toContain(join(admin, "gitdir"))
+      expect(existsSync(admin)).toBe(true)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  /**
+   * @failure Registration inventory and inspection disagree or omit a malformed row (#27477).
+   * @level l1
+   * @consumer Landing recovery and worktree inspection
+   * @testonly none
+   */
+  it("lists registered primary and locked linked worktrees using inspection fields", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-registration-list-"))
+    try {
+      const repo = join(root, "repo")
+      createRepository(repo, "root.txt", "root\n")
+      const linked = join(root, "linked")
+      const store = createLocalGitWorktreeStore({ repo })
+      await store.add({ kind: "detached", path: linked, ref: "HEAD", lockReason: "fixture holder" })
+      const rows = await store.list()
+      expect(rows).toEqual([
+        { path: repo, head: git(repo, ["rev-parse", "HEAD"]).trim(), detached: false },
+        { path: linked, head: git(repo, ["rev-parse", "HEAD"]).trim(), detached: true, locked: "fixture holder" },
+      ])
+      for (const { path, ...fields } of rows) expect(await store.inspect(path)).toEqual({ registered: true, ...fields })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it("refuses malformed worktree list records for listing and inspection", async () => {
+    const store = createGitWorktreeStore({
+      repo: "/not-opened-by-fixture",
+      gitProcess: { run: async () => ({ code: 0, stdout: "HEAD abc\0detached\0\0", stderr: "" }) },
+    })
+    await expect(store.list()).rejects.toThrow("git worktree list")
+    await expect(store.inspect("/missing")).rejects.toThrow("git worktree list")
+  })
+
+  /**
+   * @failure A .git-less removal remnant resolves to its ancestor repository and inspects unrelated custody (27477).
+   * @level l1
+   * @consumer Git-super status and landing worktree removal
+   * @testonly none
+   */
+  // Empty-submodule coverage does not protect the requested root itself losing its Git identity.
+  it.each(["status", "remove", "inspect"] as const)(
+    "refuses ancestor custody for a .git-less %s root",
+    async (operation) => {
+      const root = await mkdtemp(join(canonicalTmpdir(), "git-super-ancestor-custody-"))
+      try {
+        const parent = join(root, "parent")
+        createRepository(parent, "tracked.txt", "parent data\n")
+        const remnant = join(parent, "remnant")
+        await mkdir(remnant)
+        await writeFile(join(remnant, "remaining.txt"), "interrupted removal\n")
+        const parentGit = join(parent, ".git")
+        await writeFile(join(parentGit, "tent-state-write.lock"), "")
+        vi.mocked(readdirSync).mockClear()
+        vi.mocked(spawnSync).mockClear()
+        const requests: GitProcessRequest[] = []
+        let refusal: string
+        if (operation === "status") {
+          const out = {
+            output: "",
+            write(value: string) {
+              this.output += value
+              return true
+            },
+          }
+          const err = {
+            output: "",
+            write(value: string) {
+              this.output += value
+              return true
+            },
+          }
+          const code = await runCli(["--repo", remnant, "--json", "status"], out, err)
+          expect(code, out.output).not.toBe(0)
+          refusal = err.output
+        } else {
+          const local = createLocalGitProcess()
+          const store = createGitWorktreeStore({
+            repo: parent,
+            gitProcess: {
+              run: async (request) => {
+                requests.push(request)
+                return local.run(request)
+              },
+            },
+          })
+          const action: Promise<unknown> =
+            operation === "inspect" ? store.inspectRemoval(remnant) : store.remove(remnant)
+          refusal = await action.then(
+            () => {
+              throw new Error("removal accepted a directory without its own Git identity")
+            },
+            (error: unknown) => (error instanceof Error ? error.message : String(error)),
+          )
+        }
+        expect(refusal).toContain(remnant)
+        expect(refusal).toContain("not a worktree root")
+        expect(refusal).toContain(parent)
+        const commands =
+          operation === "status"
+            ? vi.mocked(spawnSync).mock.calls.map(([, argv]) => (argv as string[]).slice(2))
+            : requests.map((request) => request.args)
+        expect(commands).toEqual([
+          ["rev-parse", "--show-toplevel"],
+          ["rev-parse", "--show-prefix"],
+        ])
+        expect(vi.mocked(readdirSync).mock.calls.some(([path]) => String(path) === parentGit)).toBe(false)
+        expect(await readFile(join(remnant, "remaining.txt"), "utf8")).toBe("interrupted removal\n")
+      } finally {
+        await rm(root, { recursive: true, force: true })
+      }
+    },
+  )
+
+  /**
+   * @failure Root admission for an explicit --repo also refuses ordinary status from a subdirectory (#27477).
+   * @level l1
+   * @consumer Git-super CLI users standing inside their repository
+   * @testonly none
+   */
+  it("keeps default status discovery from a subdirectory", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-default-status-"))
+    const previous = process.cwd()
+    try {
+      const parent = join(root, "parent")
+      createRepository(parent, "tracked.txt", "parent data\n")
+      const child = join(parent, "child")
+      await mkdir(child)
+      process.chdir(child)
+      const out = {
+        output: "",
+        write(value: string) {
+          this.output += value
+          return true
+        },
+      }
+      const err = {
+        output: "",
+        write(value: string) {
+          this.output += value
+          return true
+        },
+      }
+      expect(await runCli(["--json", "status"], out, err), err.output).toBe(0)
+      expect((JSON.parse(out.output) as SuperStatusResult).consultedRepositories[0]?.root).toBe(parent)
+    } finally {
+      process.chdir(previous)
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   /**
    * @failure Caller inspection admits a private checkout that removal refuses, loses file-content evidence, or changes Git state before admission (27058).
    * @level l1
