@@ -137,13 +137,16 @@ describe("GitProcess", () => {
     const fixture = join(root, "pause.ts")
     writeFileSync(
       fixture,
-      `import { existsSync, writeFileSync } from "node:fs"
+      `import { existsSync, renameSync, writeFileSync } from "node:fs"
 const read = Bun.spawnSync(["git", "cat-file", "-t", ${JSON.stringify(head)}], { stdout: "pipe", stderr: "pipe" })
-writeFileSync(${JSON.stringify(entered)}, JSON.stringify({
+// Publish only the completed witness: file creation precedes a direct write's contents.
+const witness = ${JSON.stringify(entered + ".tmp")}
+writeFileSync(witness, JSON.stringify({
   directory: process.env.GIT_OBJECT_DIRECTORY,
   alternates: process.env.GIT_ALTERNATE_OBJECT_DIRECTORIES,
   code: read.exitCode, type: read.stdout.toString().trim(), stderr: read.stderr.toString()
 }))
+renameSync(witness, ${JSON.stringify(entered)})
 const deadline = Date.now() + 2000
 while (!existsSync(${JSON.stringify(release)})) {
   if (Date.now() >= deadline) throw new Error("Cancellation fixture was not released")
