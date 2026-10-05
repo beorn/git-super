@@ -849,6 +849,33 @@ function corruptNativeApply(local: GitProcess, product: string, unreadable: stri
 }
 
 /**
+ * The wrong-store apply failure PLUS an unanswerable census probe (27268 review F1): `cat-file -e` for the
+ * unreadable commit cannot answer in the targeted store (a timeout, standing in for transport failure or a
+ * store Git cannot open). `one-store` makes only the absorbed `modules/vendor/beta` probe unanswerable while
+ * the checkout candidate still proves the holder, mixing a real holder with an incomplete census; `no-store`
+ * makes every `packages/alpha` and `vendor/beta` candidate unanswerable, leaving no holder at all. Every other
+ * call is native.
+ */
+function unanswerableModulesProbe(local: GitProcess, unreadable: string, component: string): GitProcess {
+  // The preflight probes only the checkout layout; the apply-phase census also probes the absorbed
+  // modules layout. Making ONLY that candidate unanswerable keeps the preflight intact and leaves
+  // the apply-phase census with an unproven store (27268 review F1).
+  const modules = "/modules/" + component
+  return {
+    run: (request) => {
+      if (
+        request.args[0] === "cat-file" &&
+        request.args[2] === unreadable + "^{commit}" &&
+        request.repo.endsWith(modules)
+      ) {
+        return Promise.resolve({ code: 1, stdout: "", stderr: "", timedOut: true })
+      }
+      return local.run(request)
+    },
+  }
+}
+
+/**
  * A git process whose root native APPLY times out: the preflight composed the
  * gitlinks, and the apply returns a supervisory timeout rather than the
  * wrong-store read abort. A timeout is not an admission to settle anything
@@ -3719,6 +3746,62 @@ describe("git super merge", () => {
     expect(git(fixture.product, "rev-parse", "HEAD")).toBe(diverged.head)
     expect(git(fixture.product, "status", "--porcelain").trim()).toBe("")
   })
+
+  /**
+   * @failure An unavailable store probe is dropped from the apply-phase census, so the caller is told the object is
+   * readable in no planned store, or in exactly one, when a queried store never answered (27268 review F1).
+   * @level l1
+   * @consumer Yrd settled candidate preparation and landing
+   * @testonly none; only the apply-phase git failure and the inaccessible store probe are simulated
+   */
+  it.each([
+    { component: "vendor/beta", mode: "one holder + one unanswerable store" },
+    { component: "packages/alpha", mode: "no holder + one unanswerable store" },
+  ])(
+    "does not report proved absence or sole ownership when a store probe could not answer ($mode)",
+    async ({ component }) => {
+      const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-apply-unproven-store-"))
+      roots.push(fixtureRoot)
+      const fixture = createProductFixture(fixtureRoot)
+      const diverged = divergeBothProductComponents(
+        fixture,
+        { content: "export const alpha = 'ours'\n", file: "alpha-ours.ts" },
+        { content: "export const alpha = 'theirs'\n", file: "alpha-theirs.ts" },
+      )
+      const betaHead = git(fixture.beta, "rev-parse", "HEAD")
+      // A store that holds the object (beta) mixed with the unanswerable one, then a store that holds
+      // nothing: the census must qualify both, and never call either proved absence or sole ownership.
+      const unreadable = component === "vendor/beta" ? betaHead : "a".repeat(40)
+      const local = createLocalGitProcess()
+      const result = await superMerge({
+        commit: diverged.candidate,
+        git: unanswerableModulesProbe(
+          corruptNativeApply(local, fixture.product, unreadable, "packages/alpha"),
+          unreadable,
+          component,
+        ),
+        repo: fixture.product,
+      })
+
+      expect(result.state, JSON.stringify(result)).toBe("failed")
+      expect(result.partial).toBe(false)
+      expect(result.detail?.code).toBe("submodule-object-unreadable-in-store")
+      // The whole point: an unanswerable probe must never be reported as absence or as sole ownership.
+      expect(result.detail?.subject).toContain("could not be probed")
+      expect(result.detail?.subject).not.toContain("no planned component store holds it")
+      expect(result.detail?.remedy).toContain("did not answer")
+      expect(result.detail?.remedy).toContain("ownership is NOT proven")
+      expect(result.detail?.paths?.some((path) => path.includes("/modules/"))).toBe(true)
+      if (component === "vendor/beta") {
+        expect(result.detail?.subject).toContain("vendor/beta holds it")
+        expect(result.detail?.subject).toContain("ownership is not proven")
+      } else {
+        expect(result.detail?.subject).toContain("no store that answered holds it")
+      }
+      expect(git(fixture.product, "rev-parse", "HEAD")).toBe(diverged.head)
+      expect(git(fixture.product, "status", "--porcelain").trim()).toBe("")
+    },
+  )
 
   /**
    * @failure The wrong-store 128 aborts the preflight AND the native apply; settling it from the proven tree needs a whole-tree root writer that the carrier-only rulings do not authorize, so the application failure must stay loud and named (27268 918, CTO 1a8894cb).

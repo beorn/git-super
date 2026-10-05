@@ -3487,19 +3487,40 @@ async function applyPhaseUnreadable(
   ).trim()
   const commonDir = resolve(root, common)
   const holders: string[] = []
+  const unproven: string[] = []
   for (const path of paths) {
+    let held = false
+    let unanswered: string | undefined
     for (const candidate of [join(commonDir, "modules", path), join(root, path)]) {
-      const held = await run(git, candidate, ["cat-file", "-e", `${unreadable}^{commit}`], timeoutMs)
-      if (held.code === 0 && held.failure === undefined) {
-        holders.push(path)
+      // A candidate that is not on disk is no store and cannot hold the object: that is a
+      // filesystem fact, not a Git answer we failed to get. Only an EXISTING store that
+      // will not answer counts as unproven evidence below.
+      if (!existsSync(candidate)) continue
+      const probe = await run(git, candidate, ["cat-file", "-e", `${unreadable}^{commit}`], timeoutMs)
+      if (probe.code === 0 && probe.failure === undefined) {
+        held = true
         break
       }
+      // 27315's rule, applied to this census: only Git's own proven-absent answer may be read
+      // as "not this store". A timeout, transport failure, or a store Git cannot open (a corrupt
+      // object included) proves NOTHING, and dropping it is what let an unavailable query be
+      // reported as proved absence or as sole ownership (27268 review F1).
+      if (!ownershipAbsenceProven(probe)) unanswered = candidate
     }
+    if (held) holders.push(path)
+    // An unanswerable candidate stays evidence EVEN WHEN another candidate for the same path
+    // holds the object: the census is still incomplete, and the singular result below must say so.
+    if (unanswered !== undefined) unproven.push(unanswered)
   }
   const owning = holders.filter((path) => path !== submodule)
   const store = join(commonDir, "modules", submodule)
-  const remedy =
-    owning.length === 1
+  const censusComplete = unproven.length === 0
+  const remedy = !censusComplete
+    ? `${unreadable} ${
+        owning.length === 0 ? "was not found in any store that answered" : `is readable in ${owning.join(", ")}`
+      }, but ${unproven.join(", ")} did not answer a cat-file probe (a timeout, transport failure, or a store Git cannot read), so ownership is NOT proven. ` +
+      `Repair or re-probe ${unproven.join(", ")}, then rerun the same git super merge command.`
+    : owning.length === 1
       ? `${unreadable} is readable in the ${owning[0]} store but not in the ${submodule} store; repair the ${submodule} store or re-cut that gitlink, then rerun the same git super merge command.`
       : owning.length === 0
         ? `${unreadable} is readable in no component store this merge planned over; restore the object, then rerun the same git super merge command.`
@@ -3511,16 +3532,20 @@ async function applyPhaseUnreadable(
     args,
     result,
     `Merge cannot read ${unreadable} in the ${submodule} store${
-      owning.length === 1
-        ? `; ${owning[0]} holds it`
-        : owning.length === 0
-          ? "; no planned component store holds it"
-          : `; ${owning.join(", ")} hold it`
+      !censusComplete
+        ? owning.length === 0
+          ? `; no store that answered holds it, but ${unproven.join(", ")} could not be probed`
+          : `; ${owning.join(", ")} holds it, but ${unproven.join(", ")} could not be probed, so ownership is not proven`
+        : owning.length === 1
+          ? `; ${owning[0]} holds it`
+          : owning.length === 0
+            ? "; no planned component store holds it"
+            : `; ${owning.join(", ")} hold it`
     }.`,
     `git -C ${shellQuote(store)} cat-file -t ${unreadable}`,
     remedy,
     "the submodule writer",
-    { paths: [submodule], objectIds: [unreadable] },
+    { paths: [submodule, ...unproven], objectIds: [unreadable] },
   )
 }
 
