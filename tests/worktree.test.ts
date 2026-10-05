@@ -1589,6 +1589,82 @@ describe("createGitWorktreeStore", () => {
   })
 
   /**
+   * @failure Failed removal strands contents without reporting the recovery path and both causes (#27707).
+   * @level l1
+   * @consumer Worktree removal callers
+   * @testonly none
+   */
+  it.each([
+    { failure: "preparation", restoreFails: false },
+    { failure: "preparation", restoreFails: true },
+    { failure: "removal", restoreFails: false },
+    { failure: "removal", restoreFails: true },
+  ])("preserves contents after $failure failure (restoreFails=$restoreFails)", async ({ failure, restoreFails }) => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-removal-recovery-"))
+    const fs = await import("node:fs")
+    const originalCopy = fs.copyFileSync
+    const originalRename = fs.renameSync
+    let stagingPath: string | undefined
+    try {
+      const repo = join(root, "repo")
+      createRepository(repo, "root.txt", "root\n")
+      const target = join(root, "target")
+      const baseProcess = createLocalGitProcess()
+      const store = createGitWorktreeStore({
+        repo,
+        gitProcess: {
+          run: async (request) => {
+            if (failure === "removal" && request.args.includes("worktree") && request.args.includes("remove")) {
+              return { code: 1, stdout: "", stderr: "injected removal failure" }
+            }
+            return baseProcess.run(request)
+          },
+        },
+      })
+      await store.add({ kind: "detached", path: target, ref: "HEAD" })
+      // Untracked contents must survive too, not only the committed fixture.
+      await writeFile(join(target, "uncommitted.txt"), "unique work\n")
+      const renameSpy = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+        if (String(from) === target) stagingPath = String(to)
+        if (restoreFails && String(from) === stagingPath && String(to) === target) {
+          throw new Error("injected restoration failure")
+        }
+        return originalRename(from, to)
+      })
+      const copySpy = vi.spyOn(fs, "copyFileSync").mockImplementation((from, to, mode) => {
+        if (failure === "preparation" && String(to) === join(target, ".git")) {
+          throw new Error("injected preparation failure")
+        }
+        return originalCopy(from, to, mode)
+      })
+      let error: unknown
+      try {
+        await store.remove(target)
+      } catch (caught) {
+        error = caught
+      } finally {
+        copySpy.mockRestore()
+        renameSpy.mockRestore()
+      }
+      expect(error).toBeInstanceOf(Error)
+      expect((error as Error).message).toContain(`injected ${failure} failure`)
+      const retained = restoreFails ? stagingPath : target
+      expect(retained).toBeDefined()
+      expect(await readFile(join(retained!, "root.txt"), "utf8")).toBe("root\n")
+      expect(await readFile(join(retained!, "uncommitted.txt"), "utf8")).toBe("unique work\n")
+      if (restoreFails) {
+        expect((error as Error).message).toContain(stagingPath!)
+        expect((error as Error).message).toContain("injected restoration failure")
+      } else {
+        expect(existsSync(stagingPath!)).toBe(false)
+        expect(git(target, ["rev-parse", "--is-inside-work-tree"]).trim()).toBe("true")
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  /**
    * @failure Worktree removal holds the mutation lock through bulk filesystem deletion (#27551).
    * @level l1
    * @consumer Worktree removal callers

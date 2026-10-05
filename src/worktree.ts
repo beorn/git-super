@@ -491,7 +491,6 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         }
         if (rehome === undefined) throw new Error(`worktree ${path} has no prepared borrower custody`)
         const writerLeases = acquireRemovalWriterLeases(gitDir)
-        let staged = false
         const resolvedPath = resolve(path)
         try {
           if (removeOptions.retention !== undefined) {
@@ -527,12 +526,13 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
             try {
               mkdirSync(trashDir, { recursive: true })
               renameSync(resolvedPath, targetStaging)
+              // Ownership changes at rename, even if creating the Git stub fails.
+              stagingPath = targetStaging
               mkdirSync(resolvedPath, { recursive: true })
               copyFileSync(join(targetStaging, ".git"), gitlinkPath)
-              staged = true
-              stagingPath = targetStaging
             } catch (stageError) {
               if (
+                stagingPath === undefined &&
                 stageError !== null &&
                 typeof stageError === "object" &&
                 "code" in stageError &&
@@ -542,16 +542,6 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
                   `git-super: worktree removal staging rename across devices failed (EXDEV); falling back to in-lock removal for '${path}'`,
                 )
               } else {
-                if (staged) {
-                  try {
-                    rmSync(resolvedPath, { recursive: true, force: true })
-                    renameSync(targetStaging, resolvedPath)
-                  } catch {
-                    // restore failed, leave targetStaging
-                  }
-                  staged = false
-                  stagingPath = undefined
-                }
                 throw stageError
               }
             }
@@ -562,12 +552,23 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
             throw new Error(`git reported success but did not fully remove worktree '${path}'`)
           }
         } catch (error) {
-          if (staged && stagingPath !== undefined && existsSync(stagingPath) && !existsSync(resolvedPath)) {
+          if (stagingPath !== undefined && existsSync(stagingPath)) {
             try {
+              if (existsSync(resolvedPath)) {
+                // Only remove our Git stub. Unexpected contents block restoration
+                // rather than being recursively deleted with the original error.
+                rmSync(join(resolvedPath, ".git"), { force: true })
+                rmdirSync(resolvedPath)
+              }
               renameSync(stagingPath, resolvedPath)
               stagingPath = undefined
-            } catch {
-              // restore failed
+            } catch (restoreError) {
+              throw writerLeases.refusal(
+                new Error(
+                  `worktree removal failed: ${error instanceof Error ? error.message : String(error)}; restoration to '${resolvedPath}' failed: ${restoreError instanceof Error ? restoreError.message : String(restoreError)}; contents retained at '${stagingPath}'`,
+                  { cause: new AggregateError([error, restoreError], "worktree removal and restoration failed") },
+                ),
+              )
             }
           }
           throw writerLeases.refusal(error)
@@ -583,8 +584,18 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
           rmSync(stagingPath, { recursive: true, force: true })
           try {
             rmdirSync(dirname(stagingPath))
-          } catch {
-            // .trash directory is not empty or cannot be removed; leftover sweep will handle it.
+          } catch (error) {
+            // Other removals may still own entries in the shared staging directory.
+            if (
+              error === null ||
+              typeof error !== "object" ||
+              !("code" in error) ||
+              (error.code !== "ENOTEMPTY" && error.code !== "EEXIST")
+            ) {
+              console.warn(
+                `git-super: failed to remove staging parent '${dirname(stagingPath)}': ${error instanceof Error ? error.message : String(error)}`,
+              )
+            }
           }
         } catch (error) {
           console.warn(
