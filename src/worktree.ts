@@ -633,7 +633,10 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
     async list(): Promise<readonly RegisteredWorktree[]> {
       return listWorktrees(git, repo)
     },
-    /** This read-only inspection is a snapshot, not permission: remove rechecks admission under its mutation lock. */
+    /**
+     * This read-only inspection is a snapshot, not permission: remove rechecks admission under its mutation lock.
+     * A removal refused by a non-excluded `notCompared` entry carries that refusal and inspects no `borrowers`.
+     */
     async inspectRemoval(
       path: string,
       inspectOptions: Readonly<{ excludedSubmodules?: readonly string[] }> = {},
@@ -643,9 +646,16 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
     > {
       const prepared = await prepareRemoval(path, inspectOptions.excludedSubmodules)
       const status = inspectRemovalStatus(path, inspectOptions.excludedSubmodules)
-      if (prepared.rehome === undefined) throw new Error(`worktree ${path} has no prepared borrower custody`)
+      // 27811: prepareRemoval prepares no borrower custody exactly when a non-excluded entry already refuses removal,
+      // and remove() reports that refusal before it needs custody. Inspection returns the same refusal, so its caller
+      // sees what removal would say; a refused removal inspects no borrowers, so the list is empty beside that refusal.
+      // Missing custody without such a refusal is an impossible state and stays loud.
+      const refused = prepared.notCompared.some((entry) => entry.reason !== "excluded")
+      if (prepared.rehome === undefined && !refused) {
+        throw new Error(`worktree ${path} has no prepared borrower custody`)
+      }
       return {
-        borrowers: prepared.rehome.inspect(),
+        borrowers: prepared.rehome === undefined ? [] : prepared.rehome.inspect(),
         records: status.records,
         notCompared: [...prepared.notCompared, ...status.notCompared],
         consultedRepositories: status.consultedRepositories,
