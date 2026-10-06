@@ -14,6 +14,7 @@ import { Readable } from "node:stream"
 import { afterEach, describe, expect, test } from "vitest"
 import {
   defaultGitRun,
+  readReflogEntries,
   scanContents,
   type ContentsScan,
   type GitRun,
@@ -114,6 +115,28 @@ function scan(
 const ZERO = "0".repeat(40)
 
 describe("retention contents scan — gate 4 (#27443(b))", () => {
+  /**
+   * @failure The shared reader loses no-message creation records, splits inside an ident, or silently skips malformed OIDs.
+   * @level l1
+   * @consumer Retention roots and Yrd environment provenance
+   */
+  test.each([
+    { name: "creation without a TAB", row: `${ZERO} ${"a".repeat(40)} Test <test@example.test> 1 +0000`, message: "" },
+    {
+      name: "TAB in ident and colon in message",
+      row: `${"a".repeat(40)} ${"b".repeat(40)} Test\tName <test@example.test> 2 -0700\tcommit: two words: detail`,
+      message: "commit: two words: detail",
+    },
+    { name: "malformed next OID", row: `${ZERO} invalid Test <test@example.test> 1 +0000`, message: undefined },
+  ])("reads shared reflog entries: $name", ({ row, message }) => {
+    const path = join(tmp("git-super-reflog-"), "HEAD")
+    writeFileSync(path, `${row}\n`)
+    if (message === undefined) {
+      expect(() => [...readReflogEntries(path)]).toThrow(`malformed reflog record in ${path}`)
+    } else {
+      expect([...readReflogEntries(path)]).toEqual([{ oldOid: row.slice(0, 40), newOid: row.slice(41, 81), message }])
+    }
+  })
   test("a loose unreferenced OID is at-risk and sourced as owned", async () => {
     const { root } = repoWithCommit("git-super-contents-")
     const blob = hashObject(root, "unique-bytes\n")

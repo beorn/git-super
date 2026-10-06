@@ -4,6 +4,7 @@ export * from "./gitlink-carrier.ts"
 export * from "./pull.ts"
 export * from "./push.ts"
 export * from "./result.ts"
+export { readReflogEntries, type ReflogEntry } from "./retention-contents.ts"
 export {
   verifyRetainedEntry,
   retentionRemovalBoundary,

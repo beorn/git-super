@@ -207,6 +207,35 @@ function closure(
   return { status: "ok", stores }
 }
 
+export type ReflogEntry = Readonly<{ oldOid: string; newOid: string; message: string }>
+
+/** Read Git's raw reflog records once; retention and author provenance share this decoder. */
+export function* readReflogEntries(path: string): Generator<ReflogEntry> {
+  let content: string
+  try {
+    content = readFileSync(path, "utf8")
+  } catch (error) {
+    throw new UnknownError(`cannot read reflog ${path}: ${error instanceof Error ? error.message : String(error)}`)
+  }
+  for (const line of content.split("\n")) {
+    if (line === "") continue
+    const [oldOid, newOid] = line.split(" ")
+    // The ident may contain a TAB. Only the committer timezone delimits the message.
+    const metadata = line.match(/^[^ ]+ [^ ]+ .*?> -?\d+ [+-]\d{4}(?:\t(.*))?$/u)
+    if (
+      oldOid === undefined ||
+      newOid === undefined ||
+      !HEX40.test(oldOid) ||
+      !HEX40.test(newOid) ||
+      metadata === null
+    ) {
+      throw new UnknownError(`malformed reflog record in ${path}: ${line.slice(0, 120)}`)
+    }
+    // Git omits the TAB when the creation record has no message.
+    yield { oldOid, newOid, message: metadata[1] ?? "" }
+  }
+}
+
 /**
  * Yields one `<oid>\t<source>` line per root OID the component records: refs, HEAD, reflog
  * old/new, pseudo-refs and the index. Zero OIDs are excluded (the creation record of a reflog and
@@ -234,18 +263,7 @@ function* rootOidLines(gitDir: string, run: GitRun): Generator<string> {
   const logs = join(gitDir, "logs")
   if (existsSync(logs)) {
     for (const path of reflogFiles(logs)) {
-      let content: string
-      try {
-        content = readFileSync(path, "utf8")
-      } catch (error) {
-        throw new UnknownError(`cannot read reflog ${path}: ${error instanceof Error ? error.message : String(error)}`)
-      }
-      for (const line of content.split("\n")) {
-        if (line === "") continue
-        const [old, next] = line.split(" ")
-        if (old === undefined || next === undefined || !HEX40.test(old) || !HEX40.test(next)) {
-          throw new UnknownError(`malformed reflog record in ${path}: ${line.slice(0, 120)}`)
-        }
+      for (const { oldOid: old, newOid: next } of readReflogEntries(path)) {
         const source = `reflog ${relative(gitDir, path)}`
         if (!ZERO_OID.test(old)) yield `${old}\t${source}`
         if (!ZERO_OID.test(next)) yield `${next}\t${source}`
