@@ -637,10 +637,16 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
     async inspectRemoval(
       path: string,
       inspectOptions: Readonly<{ excludedSubmodules?: readonly string[] }> = {},
-    ): Promise<Pick<SuperStatusResult, "notCompared" | "consultedRepositories" | "uninitializedSubmodules">> {
+    ): Promise<
+      Pick<SuperStatusResult, "records" | "notCompared" | "consultedRepositories" | "uninitializedSubmodules"> &
+        Readonly<{ borrowers: readonly string[] }>
+    > {
       const prepared = await prepareRemoval(path, inspectOptions.excludedSubmodules)
       const status = inspectRemovalStatus(path, inspectOptions.excludedSubmodules)
+      if (prepared.rehome === undefined) throw new Error(`worktree ${path} has no prepared borrower custody`)
       return {
+        borrowers: prepared.rehome.inspect(),
+        records: status.records,
         notCompared: [...prepared.notCompared, ...status.notCompared],
         consultedRepositories: status.consultedRepositories,
         uninitializedSubmodules: status.uninitializedSubmodules,
