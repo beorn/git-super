@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, test, vi } from "vitest"
+import { afterEach, describe, expect, onTestFailed, test, vi } from "vitest"
+import { createLogger } from "loggily"
 import {
   existsSync,
   mkdirSync,
@@ -197,6 +198,24 @@ while (!existsSync(${JSON.stringify(release)})) {
   test.each([false, true])(
     "delegated CLI preserves native bytes and closes its control endpoint (protocol=%s)",
     async (protocol) => {
+      const attempts: Array<{
+        pid: number
+        inputBytes: number
+        exitSettled: boolean
+        stdoutSettled: boolean
+        stderrSettled: boolean
+        controlSettled: boolean
+      }> = []
+      // Failure hooks run after fixture cleanup; settlement does not imply success.
+      onTestFailed(() => {
+        createLogger("git-super:test:delegate").error?.(
+          "Delegated CLI promise state after failure and fixture cleanup",
+          {
+            protocol,
+            attempts,
+          },
+        )
+      })
       const root = mkdtempSync(join(canonicalTmpdir(), "git-super-native-bytes-"))
       roots.push(root)
       writeFileSync(
@@ -231,6 +250,15 @@ process.exitCode = 19
             stdio: protocol ? [new Blob([input]), "pipe", "pipe", "pipe"] : [new Blob([input]), "pipe", "pipe"],
           },
         )
+        const attempt = {
+          pid: child.pid,
+          inputBytes: input.length,
+          exitSettled: false,
+          stdoutSettled: false,
+          stderrSettled: false,
+          controlSettled: !protocol,
+        }
+        attempts.push(attempt)
         const fd = child.stdio[3]
         const control =
           protocol && typeof fd === "number"
@@ -244,10 +272,18 @@ process.exitCode = 19
           writeSync(fd, JSON.stringify({ version: 1, token: "native-fd-token" }) + "\n")
         }
         const [code, stdout, stderr, controlBytes] = await Promise.all([
-          child.exited,
-          new Response(child.stdout).bytes(),
-          new Response(child.stderr).bytes(),
-          control,
+          child.exited.finally(() => {
+            attempt.exitSettled = true
+          }),
+          new Response(child.stdout).bytes().finally(() => {
+            attempt.stdoutSettled = true
+          }),
+          new Response(child.stderr).bytes().finally(() => {
+            attempt.stderrSettled = true
+          }),
+          control?.finally(() => {
+            attempt.controlSettled = true
+          }),
         ])
         expect(code, Buffer.from(stderr).toString()).toBe(19)
         expect(Buffer.from(stdout)).toEqual(
