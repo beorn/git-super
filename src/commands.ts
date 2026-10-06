@@ -376,9 +376,13 @@ const worktreeRemove = commandNode<CommandContext, WorktreeRemoveParams, GitSupe
     if (typeof input.path !== "string" || typeof input.retain !== "string" || input.retain.trim() === "") {
       throw new Error("worktree remove requires a path and --retain <external directory>")
     }
+    if (input.noRehome !== undefined && typeof input.noRehome !== "boolean") {
+      throw new Error("worktree remove noRehome must be a boolean")
+    }
     return {
       path: input.path,
       retain: input.retain,
+      ...(input.noRehome === true ? { noRehome: true } : {}),
       ...(input.excludedSubmodules === undefined
         ? {}
         : {

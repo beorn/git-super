@@ -10,6 +10,7 @@ export type SuperWorktreeRemoveOptions = Readonly<{
   retain: string
   report?: (message: string) => void
   excludedSubmodules?: readonly string[]
+  noRehome?: boolean
 }>
 
 export type SuperWorktreeRemoveResult = GitSuperResult &
@@ -17,6 +18,8 @@ export type SuperWorktreeRemoveResult = GitSuperResult &
     path: string
     proof?: WorktreeRemovalProof
     notCompared: readonly NotCompared[]
+    reason?: "borrowed"
+    borrowers?: readonly string[]
   }>
 
 /** Retention and cleanliness are owned by the same store that performs native removal. */
@@ -27,8 +30,9 @@ export async function superWorktreeRemove(options: SuperWorktreeRemoveOptions): 
   let removalReturned = false
   try {
     const store = createLocalGitWorktreeStore({ repo })
-    await store.remove(path, {
+    const outcome = await store.remove(path, {
       ...(options.excludedSubmodules === undefined ? {} : { excludedSubmodules: options.excludedSubmodules }),
+      ...(options.noRehome === undefined ? {} : { noRehome: options.noRehome }),
       retention: {
         root: options.retain,
         report: (retained) => {
@@ -37,6 +41,15 @@ export async function superWorktreeRemove(options: SuperWorktreeRemoveOptions): 
         },
       },
     })
+    if (outcome !== undefined) {
+      return {
+        ...gitSuperResult([{ repository: repo, state: "unchanged", refs: [] }]),
+        path,
+        notCompared: [],
+        reason: "borrowed",
+        borrowers: outcome.borrowers,
+      }
+    }
     removalReturned = true
     if (proof === undefined) throw new Error(`worktree ${path} removal returned without its required retention proof`)
     return {

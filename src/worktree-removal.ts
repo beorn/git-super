@@ -232,10 +232,24 @@ export async function prepareRemovalBorrowers(
   lenderGitDir: string,
   custody: ExcludedRemovalCustody,
   excludedSubmodules: readonly string[] = [],
-): Promise<Readonly<{ run: () => readonly string[]; notCompared: readonly NotCompared[] }>> {
+): Promise<
+  Readonly<{ run: () => readonly string[]; inspect: () => readonly string[]; notCompared: readonly NotCompared[] }>
+> {
   const lenderModules = join(lenderGitDir, "modules")
   if (excludedSubmodules.length === 0) {
-    return { run: () => rehomeBorrowers(commonDir, lenderGitDir, lenderModules), notCompared: [] }
+    return {
+      run: () => rehomeBorrowers(commonDir, lenderGitDir, lenderModules),
+      inspect: () =>
+        rehomeBorrowerCandidates(
+          commonDir,
+          lenderGitDir,
+          lenderModules,
+          removalBorrowers(commonDir, lenderGitDir),
+          undefined,
+          "inspect",
+        ),
+      notCompared: [],
+    }
   }
   if (custody.declaredPaths.length > 0 && present(join(commonDir, "git-super-retained-borrowers"))) {
     throw new Error(
@@ -299,7 +313,11 @@ export async function prepareRemovalBorrowers(
     }
     candidates.push({ ...candidate, excludedStores, includedStores })
   }
-  return { run: () => rehomeBorrowerCandidates(commonDir, lenderGitDir, lenderModules, candidates), notCompared }
+  return {
+    run: () => rehomeBorrowerCandidates(commonDir, lenderGitDir, lenderModules, candidates),
+    inspect: () => rehomeBorrowerCandidates(commonDir, lenderGitDir, lenderModules, candidates, undefined, "inspect"),
+    notCompared,
+  }
 }
 
 export function rehomeBorrowers(
@@ -323,6 +341,7 @@ function rehomeBorrowerCandidates(
   lenderModules: string,
   candidates: readonly RemovalBorrower[],
   options?: RehomeBorrowersOptions,
+  policy: "inspect" | "rehome" = "rehome",
 ): readonly string[] {
   guardRetainedBorrowers(commonDir, lenderGitDir)
   const hasLenderModules = present(lenderModules)
@@ -368,6 +387,10 @@ function rehomeBorrowerCandidates(
               )
             }
             if (within(realpathSync(lenderGitDir), target)) {
+              if (policy === "inspect") {
+                rehomedBorrowers.add(borrowerIdentity)
+                continue
+              }
               throw new Error(
                 `borrower ${borrowerIdentity} submodule ${relative(candidateModules, entry.parentPath)} still links objects ${objects} to ${target}; preserve its objects before removing ${lenderGitDir}`,
               )
@@ -390,6 +413,7 @@ function rehomeBorrowerCandidates(
           if (!hasLender) continue
 
           rehomedBorrowers.add(borrowerIdentity)
+          if (policy === "inspect") continue
 
           const subGitDir = dirname(objectsDir)
           const subRel = relative(candidateModules, subGitDir)

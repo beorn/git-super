@@ -469,10 +469,12 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         unlock?: boolean
         retention?: WorktreeRetention
         excludedSubmodules?: readonly string[]
+        noRehome?: boolean
       }> = {},
-    ): Promise<void> {
+    ): Promise<void | Readonly<{ borrowers: readonly string[] }>> {
       await assertRemovalRoot(path)
       let stagingPath: string | undefined
+      let borrowed: Readonly<{ borrowers: readonly string[] }> | undefined
       await mutate(removeOptions.operation ?? `worktree remove ${path}`, async () => {
         if (removeOptions.retention !== undefined && removeOptions.unlock === true) {
           throw new Error(`retained worktree removal cannot unlock ${path}; resolve its holder first`)
@@ -493,6 +495,13 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         const writerLeases = acquireRemovalWriterLeases(gitDir)
         const resolvedPath = resolve(path)
         try {
+          if (removeOptions.noRehome === true) {
+            const borrowers = rehome.inspect()
+            if (borrowers.length > 0) {
+              borrowed = { borrowers }
+              return
+            }
+          }
           if (removeOptions.retention !== undefined) {
             await retainWorktreeModules(
               git,
@@ -502,13 +511,13 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
               (repository, target) => inspectWorktree(git, repository, target),
               writerLeases.proof,
               writerLeases.created,
-              rehome.run,
+              removeOptions.noRehome === true ? () => [] : rehome.run,
               removeOptions.excludedSubmodules,
               notCompared,
             )
           } else {
             if (removeOptions.unlock === true) await unlockWorktree(git, repo, path)
-            rehome.run()
+            if (removeOptions.noRehome !== true) rehome.run()
           }
 
           // Target-only two-phase removal (#27551, CTO ruling beadc3d2):
@@ -603,6 +612,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
           )
         }
       }
+      return borrowed
     },
     async prune(
       pruneOptions: Readonly<{ expire?: string; verbose?: boolean; operation?: string }> = {},

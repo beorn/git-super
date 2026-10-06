@@ -600,6 +600,7 @@ async function runInvocation(
     .command("remove")
     .description(commands.worktree.remove.description ?? commands.worktree.remove.title)
     .requiredOption("--retain <directory>", "durable directory outside the worktree and its Git directory")
+    .option("--no-rehome", "keep a lender with borrowers instead of changing their object stores")
     .option(
       "--exclude-submodule <path>",
       "exclude a literal root-relative submodule and descendants before content access",
@@ -609,12 +610,13 @@ async function runInvocation(
     .argument("<path>", "registered clean worktree to remove")
     .action((path, _options, command) => {
       const globals = command.optsWithGlobals() as { repo: string; json?: boolean }
-      const options = command.opts() as { retain: string; excludeSubmodule?: string[] }
+      const options = command.opts() as { retain: string; excludeSubmodule?: string[]; rehome: boolean }
       captured = {
         node: commands.worktree.remove,
         params: {
           path,
           retain: options.retain,
+          ...(options.rehome === false ? { noRehome: true } : {}),
           ...(options.excludeSubmodule?.length ? { excludedSubmodules: options.excludeSubmodule } : {}),
         },
         json: globals.json === true,
