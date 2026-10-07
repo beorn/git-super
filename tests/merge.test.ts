@@ -4718,6 +4718,31 @@ describe("git super merge — a diverged gitlink the merge composes", () => {
     })
   })
 
+  /** @failure A preview's merge publishes the composed child as a permanent pin at the component origin and in its
+   *          store, though its caller keeps custody of the result itself (27510). */
+  it("composes the same child with no pin anywhere when the caller keeps custody (retainPins false, 27510)", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-compose-no-retain-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const pins = divergedAlphaPins(
+      fixture,
+      [["main-side.ts", "export const main = 1\n"]],
+      [["change-side.ts", "export const change = 1\n"]],
+    )
+    const submodule = join(fixture.product, "packages/alpha")
+    const before = { remote: retainedPins(fixture.alpha), store: retainedPins(submodule) }
+
+    const result = await superMerge({ repo: fixture.product, commit: pins.candidate, retainPins: false })
+
+    expect(result).toMatchObject({ state: "updated", partial: false })
+    const settled = result.gitlinks.find((row) => row.path === "packages/alpha")
+    expect(settled).toMatchObject({ path: "packages/alpha", state: "merged", to: pins.ours })
+    const composed = settled?.from ?? ""
+    expect(git(submodule, "cat-file", "-t", composed)).toBe("commit")
+    expect(git(fixture.product, "ls-tree", "HEAD", "--", "packages/alpha")).toBe(`160000 commit ${composed}\tpackages/alpha`)
+    expect({ remote: retainedPins(fixture.alpha), store: retainedPins(submodule) }).toEqual(before)
+  })
+
   /**
    * THE CASE A REBUILT THREE-WAY WOULD HAVE LOST. Both sides edit one root file
    * in different hunks, which Git merges cleanly, beside a diverged gitlink
