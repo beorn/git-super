@@ -223,6 +223,13 @@ export type SuperMergeOptions = Readonly<{
   continue?: boolean
   expectedHead?: string
   expectedBranch?: string
+  /**
+   * Whether this merge keeps what it fetches and composes under permanent `refs/git-super/pins/<sha>`, here and at a
+   * composed child's origin. Defaults to TRUE: a merge whose result lands must never name an object no store retains.
+   * `false` is a PREVIEW's policy (27510): the caller owns custody of the composed closure (yrd's preview anchors),
+   * so this merge writes no pin ref anywhere and pushes nothing.
+   */
+  retainPins?: boolean
 }>
 
 type GitlinkPlan = Readonly<{
@@ -795,8 +802,26 @@ async function mergeObserved(
     }
     const composition =
       prospective.conflict === undefined
-        ? await composeWrongStoreGitlinks(git, root, head, target, prospective.failure, options.message, timeoutMs)
-        : await composeDivergedGitlinks(git, root, head, target, prospective.conflict, options.message, timeoutMs)
+        ? await composeWrongStoreGitlinks(
+            git,
+            root,
+            head,
+            target,
+            prospective.failure,
+            options.message,
+            timeoutMs,
+            options.retainPins ?? true,
+          )
+        : await composeDivergedGitlinks(
+            git,
+            root,
+            head,
+            target,
+            prospective.conflict,
+            options.message,
+            timeoutMs,
+            options.retainPins ?? true,
+          )
     if (composition === undefined) {
       const gitlinkPaths = [
         ...new Set(prospective.conflict?.entries.filter((entry) => entry.mode === "160000").map((entry) => entry.path)),
@@ -830,6 +855,7 @@ async function mergeObserved(
       options.unboundedLocalMain,
       options.report,
       excludedSubmodules,
+      options.retainPins ?? true,
     )
   } catch (error) {
     return failed(root, [], resultError(error, "inspect-gitlinks"))
@@ -840,7 +866,17 @@ async function mergeObserved(
    * the plan ran on, and the plan is read once more so the composed pin renames below. The `composed` map is
    * the union of both steps.
    */
-  const forked = await composeForkedGitlinks(git, root, head, target, tree, planned, options.message, timeoutMs)
+  const forked = await composeForkedGitlinks(
+    git,
+    root,
+    head,
+    target,
+    tree,
+    planned,
+    options.message,
+    timeoutMs,
+    options.retainPins ?? true,
+  )
   if (forked !== undefined) {
     if ("failure" in forked) return failed(root, [], forked.failure)
     tree = forked.tree
@@ -857,6 +893,7 @@ async function mergeObserved(
         options.unboundedLocalMain,
         options.report,
         excludedSubmodules,
+        options.retainPins ?? true,
       )
     } catch (error) {
       return failed(root, [], resultError(error, "inspect-gitlinks"))
@@ -2135,6 +2172,7 @@ async function ensureCompositionCommit(
   sha: string,
   taskBranch: string | undefined,
   timeoutMs: number,
+  retainPins = true,
 ): Promise<boolean> {
   const verified = await run(git, store, ["cat-file", "-e", `${sha}^{commit}`], timeoutMs)
   if (verified.code === 0) return true
@@ -2148,7 +2186,10 @@ async function ensureCompositionCommit(
       : taskBranch.startsWith("refs/heads/")
         ? taskBranch
         : `refs/heads/${taskBranch}`
-  const refspecs = [`+${pin}:${pin}`, `+${sha}:${pin}`, ...(branchRef === undefined ? [] : [`+${branchRef}:${pin}`])]
+  // A preview (retainPins false) fetches the objects and writes no ref: its caller anchors what it keeps (27510).
+  const refspecs = retainPins
+    ? [`+${pin}:${pin}`, `+${sha}:${pin}`, ...(branchRef === undefined ? [] : [`+${branchRef}:${pin}`])]
+    : [pin, sha, ...(branchRef === undefined ? [] : [branchRef])]
   const remotes = remote === "origin" ? ["origin"] : ["origin", remote]
   for (const targetRemote of remotes) {
     for (const refspec of refspecs) {
@@ -2189,6 +2230,7 @@ async function composeDivergedGitlinks(
   conflict: NonNullable<ProspectiveFailure["conflict"]>,
   message: string | undefined,
   timeoutMs: number,
+  retainPins = true,
 ): Promise<ComposedGitlinks | Readonly<{ failure: GitResultDetail }> | undefined> {
   const { entries, paths, stageEvidence } = conflict
   if (paths.length === 0 || entries.some((entry) => entry.mode !== "160000")) return undefined
@@ -2230,6 +2272,7 @@ async function composeDivergedGitlinks(
     },
     message,
     timeoutMs,
+    retainPins,
   )
 }
 
@@ -2343,6 +2386,7 @@ async function composeWrongStoreGitlinks(
   failure: GitResultDetail,
   message: string | undefined,
   timeoutMs: number,
+  retainPins = true,
 ): Promise<ComposedGitlinks | Readonly<{ failure: GitResultDetail }> | undefined> {
   if (failure.code !== "submodule-history-unreadable") return undefined
   const unreadable = failure.objectIds?.filter((oid) => oid !== head && oid !== target).at(-1)
@@ -2425,6 +2469,7 @@ async function composeWrongStoreGitlinks(
     },
     message,
     timeoutMs,
+    retainPins,
   )
   if (composed === undefined) return undefined
   if ("failure" in composed) return composed
@@ -2511,6 +2556,7 @@ async function composeForkedGitlinks(
   planned: GitlinkPlans,
   message: string | undefined,
   timeoutMs: number,
+  retainPins = true,
 ): Promise<ComposedGitlinks | Readonly<{ failure: GitResultDetail }> | undefined> {
   const reader = { run: (request: GitProcessRequest) => git.run({ timeoutMs, ...request }) }
   const candidates = planned.settlements.filter((plan) => plan.state === "left-off-main" && plan.changedByMerge)
@@ -2583,6 +2629,7 @@ async function composeForkedGitlinks(
     },
     message,
     timeoutMs,
+    retainPins,
   )
 }
 
@@ -2614,6 +2661,7 @@ async function composeGitlinks(
   evidence: CompositionEvidence,
   message: string | undefined,
   timeoutMs: number,
+  retainPins = true,
 ): Promise<ComposedGitlinks | Readonly<{ failure: GitResultDetail }> | undefined> {
   const { entries, head, rootConflict, stageEvidence, target } = evidence
   const paths = conflicts.map((conflict) => conflict.path)
@@ -2651,6 +2699,7 @@ async function composeGitlinks(
       resolution.incomingSha,
       taskBranch,
       timeoutMs,
+      retainPins,
     )
     if (!hasCommit) {
       return {
@@ -2791,6 +2840,8 @@ async function composeGitlinks(
 
   for (const [path, sha] of substituted) {
     if (!composed.has(path)) continue
+    // A preview keeps the composed child in its own custody and publishes nothing (27510).
+    if (!retainPins) continue
     /**
      * RETAINED ONLY ONCE THE TREE IS CLEAN, AND BEFORE THE ROOT MERGE RECORDS
      * IT (D1 b). The root commit must never name an object the component remote
@@ -3067,6 +3118,7 @@ async function planGitlinks(
   unboundedLocalMain?: boolean,
   report?: (line: string) => void,
   excludedSubmodules: readonly string[] = [],
+  retainPins = true,
 ): Promise<GitlinkPlans> {
   const plans: GitlinkPlan[] = []
   const descents: SuperMergeDescentResult[] = []
@@ -3101,6 +3153,7 @@ async function planGitlinks(
         commit: submodule.gitlink,
         timeoutMs,
         git,
+        anchor: retainPins,
       })
       stores.set(submodule.path, submodule.gitdir)
     }
@@ -3138,7 +3191,14 @@ async function planGitlinks(
       // a pin this repository cannot read is the SUBMITTER's problem, reported
       // by the command below, never an exception that stops the queue.
       try {
-        await ensureCommitObject({ repository: submodule, remote: entry.url, commit: onParentMain, timeoutMs, git })
+        await ensureCommitObject({
+          repository: submodule,
+          remote: entry.url,
+          commit: onParentMain,
+          timeoutMs,
+          git,
+          anchor: retainPins,
+        })
       } catch {
         // silent-fallback-allow: the next three lines re-ask the same question
         // against the same store and answer it LOUDLY either way — an
@@ -3357,7 +3417,14 @@ async function planGitlinks(
       // what caught this — git-super's own suite cannot see the ownership question
       // because ownership is decided one layer up.
       try {
-        await ensureCommitObject({ repository: submodule, remote: entry.url, commit: entry.target, timeoutMs, git })
+        await ensureCommitObject({
+          repository: submodule,
+          remote: entry.url,
+          commit: entry.target,
+          timeoutMs,
+          git,
+          anchor: retainPins,
+        })
       } catch {
         // silent-fallback-allow: and ONLY here. The next line re-asks the same
         // question against the same store and answers it loudly either way, so

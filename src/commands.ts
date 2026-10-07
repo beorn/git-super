@@ -143,6 +143,7 @@ const merge = commandNode<CommandContext, MergeParams, SuperMergeResult>({
           : { excludedSubmodules: stringArray(input.excludedSubmodules, "excludedSubmodules") }),
         ...(input.noFetch === true ? { noFetch: true } : {}),
         ...(input.unboundedLocalMain === true ? { unboundedLocalMain: true } : {}),
+        ...(input.retainPins === false ? { retainPins: false } : {}),
       }
     },
     (value) => {
@@ -173,6 +174,7 @@ const merge = commandNode<CommandContext, MergeParams, SuperMergeResult>({
       ...(input.excludedSubmodules ?? []).flatMap((path) => ["--exclude-submodule", path]),
       ...(input.noFetch === true ? ["--no-fetch"] : []),
       ...(input.unboundedLocalMain === true ? ["--unbounded-local-main"] : []),
+      ...(input.retainPins === false ? ["--no-retain-pins"] : []),
     ]
     const next = `Wait for the named holder to finish, then run ${argv.map(shellQuote).join(" ")}.`
     const detail = result.detail

@@ -410,6 +410,10 @@ async function runInvocation(
       "--unbounded-local-main",
       "with --no-fetch, read unchanged Equal child mains locally without a refresh age bound",
     )
+    .option(
+      "--no-retain-pins",
+      "preview only: write no refs/git-super/pins and push no composed child; the caller keeps custody of the result",
+    )
     .argument("<commit>", "commit to merge into the current branch")
     .action((commit, options, command) => {
       const globals = command.optsWithGlobals() as { repo: string; json?: boolean }
@@ -428,6 +432,7 @@ async function runInvocation(
             : { excludedSubmodules: options.excludeSubmodule }),
           ...(options.fetch === false ? { noFetch: true } : {}),
           ...(options.unboundedLocalMain === true ? { unboundedLocalMain: true } : {}),
+          ...(options.retainPins === false ? { retainPins: false } : {}),
         },
         json: globals.json === true,
         nul: false,
