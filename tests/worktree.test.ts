@@ -20,7 +20,7 @@ import {
 } from "../src/worktree.ts"
 import { rehomeBorrowers, type WorktreeRemovalProof } from "../src/worktree-removal.ts"
 import type { GitProcessRequest } from "../src/process.ts"
-import { canonicalTmpdir, createProductFixture, createRepository } from "./fixture.ts"
+import { canonicalTmpdir, createProductFixture, createRepository, NO_BACKGROUND_MAINTENANCE } from "./fixture.ts"
 import { runCli } from "../src/cli.ts"
 import { discoverRepository } from "../src/push.ts"
 import { createLocalGitProcess } from "../src/process.ts"
@@ -37,7 +37,7 @@ vi.mock("node:child_process", async (importOriginal) => {
 })
 
 function git(repo: string, args: readonly string[]): string {
-  const result = spawnSync("git", ["-C", repo, ...args], { encoding: "utf8" })
+  const result = spawnSync("git", [...NO_BACKGROUND_MAINTENANCE, "-C", repo, ...args], { encoding: "utf8" })
   if (result.status !== 0) throw new Error(result.stderr || `git ${args.join(" ")} failed`)
   return result.stdout
 }

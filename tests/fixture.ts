@@ -10,8 +10,16 @@ export function canonicalTmpdir(): string {
   return realpathSync(tmpdir())
 }
 
+/**
+ * Git's own background work, off for every fixture command (#27900). A fixture `git commit` otherwise starts a
+ * detached `git maintenance run --auto` whose repack writes objects/pack/tmp_* while a test snapshots that store, so a
+ * before-and-after comparison can read a file Git removes mid-read, or see Git's repack instead of git-super's work.
+ * Passed as `-c`, it reaches every child the command starts, so a clone or fetch inside a submodule update is covered.
+ */
+export const NO_BACKGROUND_MAINTENANCE = ["-c", "maintenance.auto=false", "-c", "gc.auto=0"] as const
+
 export function git(cwd: string, ...args: string[]): string {
-  const result = spawnSync("git", ["-C", cwd, ...args], {
+  const result = spawnSync("git", [...NO_BACKGROUND_MAINTENANCE, "-C", cwd, ...args], {
     env: {
       ...process.env,
       GIT_AUTHOR_NAME: "Git Super Test",
