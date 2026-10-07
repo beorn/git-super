@@ -1,3 +1,6 @@
+/**
+ * @reach fs-walk <fixture-only: the trace2 directory a fixture commit writes under mkdtempSync(canonicalTmpdir())>
+ */
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs"
 import { join } from "node:path"
 import { describe, expect, it } from "vitest"
