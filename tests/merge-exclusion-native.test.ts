@@ -17,8 +17,8 @@ const cli = fileURLToPath(new URL("../bin/git-super", import.meta.url))
 
 function completeSyscalls(lines: readonly string[]): string[] {
   const complete: string[] = []
-  const pending = new Map<string, { syscall: string; prefix: string; index: number }>()
-  for (const line of lines) {
+  const pending = new Map<string, { syscall: string; prefix: string; index: number; line: number }>()
+  for (const [at, line] of lines.entries()) {
     const unfinished = /^(\d+)\s+(\w+)\(.*<unfinished \.\.\.>$/u.exec(line)
     if (unfinished) {
       const [, pid, syscall] = unfinished
@@ -27,6 +27,7 @@ function completeSyscalls(lines: readonly string[]): string[] {
         syscall: syscall!,
         prefix: line.slice(0, line.lastIndexOf("<unfinished")).trimEnd(),
         index: complete.length,
+        line: at,
       })
       complete.push(line)
       continue
@@ -44,7 +45,25 @@ function completeSyscalls(lines: readonly string[]): string[] {
     }
     complete.push(line)
   }
-  if (pending.size > 0) throw new Error(`Unpaired unfinished strace syscall for PID ${[...pending.keys()].join(", ")}`)
+  if (pending.size > 0) {
+    // 27968: hosted CI leaves an unfinished row unpaired about once in twenty runs and no host reproduces it, so the
+    // error carries each unpaired row and its PID's later rows: the failing trace's shape reaches the CI log.
+    const row = (text: string) => (text.length > 400 ? `${text.slice(0, 400)}…` : text)
+    const context = [...pending].map(([pid, start]) => {
+      const later = lines
+        .slice(start.line + 1)
+        .filter((text) => text.startsWith(`${pid} `))
+        .slice(0, 5)
+      return [
+        row(lines[start.line]!),
+        ...later.map((text) => `  then ${row(text)}`),
+        ...(later.length === 0 ? ["  then (no later row for this PID)"] : []),
+      ].join("\n")
+    })
+    throw new Error(
+      `Unpaired unfinished strace syscall for PID ${[...pending.keys()].join(", ")}\n${context.join("\n")}`,
+    )
+  }
   return complete
 }
 
@@ -72,6 +91,14 @@ it.each(["local", "hosted"] as const)(
     ]) {
       expect(() => completeSyscalls(malformed)).toThrow(/strace syscall/u)
     }
+    // 27968: an unpaired row's error names what its PID did next.
+    expect(() =>
+      completeSyscalls([
+        '1 newfstatat(AT_FDCWD, "child/.git" <unfinished ...>',
+        "2 close(3) = 0",
+        "1 +++ exited with 0 +++",
+      ]),
+    ).toThrow(/Unpaired unfinished strace syscall for PID 1\n1 newfstatat.*\n {2}then 1 \+\+\+ exited with 0 \+\+\+/u)
     const available = spawnSync("strace", ["--version"], { encoding: "utf8" })
     if (available.error || available.status !== 0) {
       throw new Error(
