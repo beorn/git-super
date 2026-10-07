@@ -290,6 +290,8 @@ async function mergeWithSteps(
 ): Promise<SuperMergeResult> {
   const git = options.git ?? createLocalGitProcess()
   const timeoutMs = options.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS
+  // The one default (27510): every inner step takes the policy as a required argument, so a forward cannot be dropped.
+  const retainPins = options.retainPins ?? true
   const fallbackRoot = resolve(options.repo)
   let root: string
   try {
@@ -312,7 +314,7 @@ async function mergeWithSteps(
     return await exclusive.run(
       () => {
         progress.cancel()
-        return mergeUnderLock(git, root, options, timeoutMs, steps, initializations)
+        return mergeUnderLock(git, root, options, timeoutMs, retainPins, steps, initializations)
       },
       { holder: "git super merge" },
     )
@@ -356,6 +358,7 @@ async function mergeUnderLock(
   root: string,
   options: SuperMergeOptions,
   timeoutMs: number,
+  retainPins: boolean,
   steps: StepClock,
   initializations: SuperMergeInitializationResult[],
 ): Promise<SuperMergeResult> {
@@ -449,7 +452,7 @@ async function mergeUnderLock(
     }
     let result: SuperMergeResult
     try {
-      result = await mergeObserved(git, root, options, timeoutMs, steps, initializations)
+      result = await mergeObserved(git, root, options, timeoutMs, retainPins, steps, initializations)
     } catch (error) {
       result = failed(root, [], resultError(error, "merge"))
     }
@@ -505,6 +508,7 @@ async function mergeObserved(
   root: string,
   options: SuperMergeOptions,
   timeoutMs: number,
+  retainPins: boolean,
   steps: StepClock,
   initializations: SuperMergeInitializationResult[],
 ): Promise<SuperMergeResult> {
@@ -810,7 +814,7 @@ async function mergeObserved(
             prospective.failure,
             options.message,
             timeoutMs,
-            options.retainPins ?? true,
+            retainPins,
           )
         : await composeDivergedGitlinks(
             git,
@@ -820,7 +824,7 @@ async function mergeObserved(
             prospective.conflict,
             options.message,
             timeoutMs,
-            options.retainPins ?? true,
+            retainPins,
           )
     if (composition === undefined) {
       const gitlinkPaths = [
@@ -855,7 +859,7 @@ async function mergeObserved(
       options.unboundedLocalMain,
       options.report,
       excludedSubmodules,
-      options.retainPins ?? true,
+      retainPins,
     )
   } catch (error) {
     return failed(root, [], resultError(error, "inspect-gitlinks"))
@@ -875,7 +879,7 @@ async function mergeObserved(
     planned,
     options.message,
     timeoutMs,
-    options.retainPins ?? true,
+    retainPins,
   )
   if (forked !== undefined) {
     if ("failure" in forked) return failed(root, [], forked.failure)
@@ -893,7 +897,7 @@ async function mergeObserved(
         options.unboundedLocalMain,
         options.report,
         excludedSubmodules,
-        options.retainPins ?? true,
+        retainPins,
       )
     } catch (error) {
       return failed(root, [], resultError(error, "inspect-gitlinks"))
@@ -2172,7 +2176,7 @@ async function ensureCompositionCommit(
   sha: string,
   taskBranch: string | undefined,
   timeoutMs: number,
-  retainPins = true,
+  retainPins: boolean,
 ): Promise<boolean> {
   const verified = await run(git, store, ["cat-file", "-e", `${sha}^{commit}`], timeoutMs)
   if (verified.code === 0) return true
@@ -2230,7 +2234,7 @@ async function composeDivergedGitlinks(
   conflict: NonNullable<ProspectiveFailure["conflict"]>,
   message: string | undefined,
   timeoutMs: number,
-  retainPins = true,
+  retainPins: boolean,
 ): Promise<ComposedGitlinks | Readonly<{ failure: GitResultDetail }> | undefined> {
   const { entries, paths, stageEvidence } = conflict
   if (paths.length === 0 || entries.some((entry) => entry.mode !== "160000")) return undefined
@@ -2386,7 +2390,7 @@ async function composeWrongStoreGitlinks(
   failure: GitResultDetail,
   message: string | undefined,
   timeoutMs: number,
-  retainPins = true,
+  retainPins: boolean,
 ): Promise<ComposedGitlinks | Readonly<{ failure: GitResultDetail }> | undefined> {
   if (failure.code !== "submodule-history-unreadable") return undefined
   const unreadable = failure.objectIds?.filter((oid) => oid !== head && oid !== target).at(-1)
@@ -2556,7 +2560,7 @@ async function composeForkedGitlinks(
   planned: GitlinkPlans,
   message: string | undefined,
   timeoutMs: number,
-  retainPins = true,
+  retainPins: boolean,
 ): Promise<ComposedGitlinks | Readonly<{ failure: GitResultDetail }> | undefined> {
   const reader = { run: (request: GitProcessRequest) => git.run({ timeoutMs, ...request }) }
   const candidates = planned.settlements.filter((plan) => plan.state === "left-off-main" && plan.changedByMerge)
@@ -2661,7 +2665,7 @@ async function composeGitlinks(
   evidence: CompositionEvidence,
   message: string | undefined,
   timeoutMs: number,
-  retainPins = true,
+  retainPins: boolean,
 ): Promise<ComposedGitlinks | Readonly<{ failure: GitResultDetail }> | undefined> {
   const { entries, head, rootConflict, stageEvidence, target } = evidence
   const paths = conflicts.map((conflict) => conflict.path)
@@ -3114,11 +3118,11 @@ async function planGitlinks(
   head: string,
   tree: string,
   timeoutMs: number,
-  noFetch?: boolean,
-  unboundedLocalMain?: boolean,
-  report?: (line: string) => void,
-  excludedSubmodules: readonly string[] = [],
-  retainPins = true,
+  noFetch: boolean | undefined,
+  unboundedLocalMain: boolean | undefined,
+  report: ((line: string) => void) | undefined,
+  excludedSubmodules: readonly string[],
+  retainPins: boolean,
 ): Promise<GitlinkPlans> {
   const plans: GitlinkPlan[] = []
   const descents: SuperMergeDescentResult[] = []
