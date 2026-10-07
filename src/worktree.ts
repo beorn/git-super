@@ -473,6 +473,8 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       }> = {},
     ): Promise<void | Readonly<{ borrowers: readonly string[] }>> {
       await assertRemovalRoot(path)
+      // The selected checkout can be the removal target. Its registry outlives it.
+      const removalRepo = await git.text(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"])
       let stagingPath: string | undefined
       let borrowed: Readonly<{ borrowers: readonly string[] }> | undefined
       await mutate(removeOptions.operation ?? `worktree remove ${path}`, async () => {
@@ -556,8 +558,8 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
             }
           }
 
-          await git.run(repo, ["worktree", "remove", "--force", path], false, timeouts.cleanup)
-          if (existsSync(path) || (await inspectWorktree(git, repo, path)).registered) {
+          await git.run(removalRepo, ["worktree", "remove", "--force", path], false, timeouts.cleanup)
+          if (existsSync(path) || (await inspectWorktree(git, removalRepo, path)).registered) {
             throw new Error(`git reported success but did not fully remove worktree '${path}'`)
           }
         } catch (error) {
