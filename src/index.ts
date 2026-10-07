@@ -37,4 +37,6 @@ export {
   worktreeHomeRoot,
   DEFAULT_WORKTREE_HOME,
   WORKTREE_HOME_ENV,
+  POOL_ROOT_CONFIG_KEY,
+  type WorktreeHomeOptions,
 } from "./worktree-add.ts"
