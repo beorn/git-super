@@ -4739,7 +4739,9 @@ describe("git super merge — a diverged gitlink the merge composes", () => {
     expect(settled).toMatchObject({ path: "packages/alpha", state: "merged", to: pins.ours })
     const composed = settled?.from ?? ""
     expect(git(submodule, "cat-file", "-t", composed)).toBe("commit")
-    expect(git(fixture.product, "ls-tree", "HEAD", "--", "packages/alpha")).toBe(`160000 commit ${composed}\tpackages/alpha`)
+    expect(git(fixture.product, "ls-tree", "HEAD", "--", "packages/alpha")).toBe(
+      `160000 commit ${composed}\tpackages/alpha`,
+    )
     expect({ remote: retainedPins(fixture.alpha), store: retainedPins(submodule) }).toEqual(before)
   })
 
