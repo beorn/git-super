@@ -343,7 +343,7 @@ function rehomeBorrowerCandidates(
   options?: RehomeBorrowersOptions,
   policy: "inspect" | "rehome" = "rehome",
 ): readonly string[] {
-  guardRetainedBorrowers(commonDir, lenderGitDir)
+  guardRetainedBorrowers(commonDir, lenderGitDir, policy)
   const hasLenderModules = present(lenderModules)
   const canonicalCommon = realpathSync(commonDir)
 
@@ -740,7 +740,7 @@ function registerRetainedBorrower(common: string, retained: string, manifestPath
 }
 
 /** Retained copies are borrowers too: verify their actual links before allowing an owner store to disappear. */
-function guardRetainedBorrowers(common: string, lenderGitDir: string): void {
+function guardRetainedBorrowers(common: string, lenderGitDir: string, policy: "inspect" | "rehome" = "rehome"): void {
   const registry = join(common, "git-super-retained-borrowers")
   if (!present(registry)) return
   if (!lstatSync(registry).isDirectory()) {
@@ -779,6 +779,7 @@ function guardRetainedBorrowers(common: string, lenderGitDir: string): void {
       }
       retained = record.retained
       if (!present(retained)) {
+        if (policy === "inspect") continue
         unlinkSync(registration)
         process.stderr.write(`retained borrower ${retained} is gone; dropped registry entry ${registration}\n`)
         continue
@@ -819,6 +820,7 @@ function guardRetainedBorrowers(common: string, lenderGitDir: string): void {
         }
       }
       if (!linkedDependency) {
+        if (policy === "inspect") continue
         unlinkSync(registration)
         process.stderr.write(
           `retained borrower ${retained} has no objects links into removable linked stores; dropped registry entry ${registration}\n`,
