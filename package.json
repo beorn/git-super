@@ -128,7 +128,7 @@
     "oxlint": "1.85.0",
     "tsdown": "^0.15.7",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.10"
+    "vitest": "4.1.11"
   },
   "tsdown": {
     "clean": true,
