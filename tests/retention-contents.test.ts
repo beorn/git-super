@@ -1,12 +1,13 @@
 /**
  * @failure Gate 4 subtracts borrowed objects as owned, samples the effective set, holds a whole
- * OID set in memory, or misses a root OID the entry's own store no longer carries.
+ * OID set in memory, misses a root OID the entry's own store no longer carries, or accepts a
+ * successful git query whose stderr shows an ignored/unusable alternate as a complete read.
  * @level l1
  * @consumer the read-only retention verifier, gate 4; #27443(b)
  * @reach fs-walk <fixture-only: every case builds an mkdtempSync(tmpdir()) Git repo; no repository source tree is walked>
  * @testonly none
  */
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { spawnSync } from "node:child_process"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -20,7 +21,13 @@ import {
   type GitRun,
   type GitStreamFactory,
 } from "../src/retention-contents.ts"
-import { gitLineStream, readLines, type GitLineStream, type GitStreamOutcome } from "../src/retention-stream.ts"
+import {
+  assertStreamComplete,
+  gitLineStream,
+  readLines,
+  type GitLineStream,
+  type GitStreamOutcome,
+} from "../src/retention-stream.ts"
 import type { ManifestEntry } from "../src/worktree-removal.ts"
 
 const cleanup: string[] = []
@@ -179,7 +186,7 @@ describe("retention contents scan — gate 4 (#27443(b))", () => {
     writeFileSync(join(borrower, ".git", "objects", "info", "alternates"), `${join(borrower, "gone", "objects")}\n`)
     const result = await scan(borrower, componentEntries(".git"))
     expect(result.status).toBe("unknown")
-    expect(result.detail).toContain("missing alternate")
+    expect(result.detail).toContain(join(borrower, "gone", "objects"))
   })
 
   test("a malformed cat-file row is unknown, never a silent skip", async () => {
@@ -283,6 +290,71 @@ describe("retention contents scan — gate 4 (#27443(b))", () => {
     expect(at.status).toBe("pass")
     expect(at.components[0]!.effective).toBe(total)
   })
+
+  test("a successful cat-file stream that wrote to stderr is unknown through the one stream rule", async () => {
+    const { root } = repoWithCommit("git-super-contents-")
+    const stream: GitStreamFactory = (args, options) =>
+      args.includes("cat-file")
+        ? lineStreamFrom([`${ZERO} blob 3`], {
+            stderr: "error: unable to normalize alternate object path: /gone",
+          })
+        : gitLineStream(args, options)
+    const result = await scan(root, componentEntries(".git"), { stream })
+    expect(result.status).toBe("unknown")
+    expect(result.detail).toContain("stderr")
+  })
+
+  test.skipIf(process.getuid?.() === 0)(
+    "a real git cat-file stream that warns on stderr is refused at the stream boundary",
+    async () => {
+      // Git warns and still exits 0 when an alternate directory cannot be read, and the stdout that
+      // follows is shorter than the store. The claim here is deliberately the STREAM boundary: a
+      // scan-level fixture cannot isolate it, because the independent-store stream runs
+      // `--git-dir=<alternate>/..`, which turns the same unusable target into a non-zero fatal and
+      // makes the pre-fix scan unknown for an unrelated cause (measured: a plain unreadable target
+      // yields `fatal: not a git repository` before the fix). The healthy control proves the
+      // discriminator is the stderr, not the fixture layout.
+      const messages = { timedOut: "deadline", capped: "cap", failed: "failed", warned: "warned" }
+      const drain = async (iterable: AsyncIterable<string>): Promise<void> => {
+        for await (const _line of iterable) void _line
+      }
+      const { root, gitDir } = repoWithCommit("git-super-contents-")
+      const target = join(root, "locked-store")
+      mkdirSync(target)
+      chmodSync(target, 0o000)
+      try {
+        mkdirSync(join(gitDir, "objects", "info"), { recursive: true })
+        writeFileSync(join(gitDir, "objects", "info", "alternates"), `${target}\n`)
+        const broken = gitLineStream([
+          `--git-dir=${gitDir}`,
+          `--work-tree=${root}`,
+          "cat-file",
+          "--batch-all-objects",
+          "--batch-check",
+        ])
+        await drain(broken.lines)
+        const brokenOutcome = await broken.outcome
+        expect(brokenOutcome.code).toBe(0)
+        expect(brokenOutcome.stderr).toContain("Permission denied")
+        expect(() => assertStreamComplete(brokenOutcome, messages)).toThrow(/warned/u)
+      } finally {
+        chmodSync(target, 0o755)
+      }
+      const { root: healthy } = repoWithCommit("git-super-contents-")
+      const ok = gitLineStream([
+        `--git-dir=${join(healthy, ".git")}`,
+        `--work-tree=${healthy}`,
+        "cat-file",
+        "--batch-all-objects",
+        "--batch-check",
+      ])
+      await drain(ok.lines)
+      const okOutcome = await ok.outcome
+      expect(okOutcome.code).toBe(0)
+      expect(okOutcome.stderr).toBe("")
+      expect(() => assertStreamComplete(okOutcome, messages)).not.toThrow()
+    },
+  )
 
   test("every synchronous component root query carries the remaining component budget", async () => {
     const { root } = repoWithCommit("git-super-contents-")

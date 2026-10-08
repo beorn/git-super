@@ -211,6 +211,12 @@ export interface StreamFaultMessages {
   readonly capped: string
   /** Message when the child exited non-zero or its stdout read failed. */
   readonly failed: string
+  /**
+   * Message when the child exited 0 but wrote to stderr. Git reports an unusable alternate, an
+   * ignored object store or a broken ref there WITHOUT a non-zero exit, and the stdout that
+   * follows is shorter than the store — a partial object set that must never pass a gate.
+   */
+  readonly warned: string
 }
 
 class IncompleteStreamError extends Error {
@@ -222,11 +228,20 @@ class IncompleteStreamError extends Error {
 
 /**
  * The ONE rule every `gitLineStream` consumer applies: a stream that hit its deadline or cap, or
- * exited non-zero, is an incomplete read and must be reported `unknown` — never a partial list.
- * Callers supply one message per cause; this throws the error the retention scans map to `unknown`.
+ * exited non-zero, or exited 0 with stderr output, is an incomplete read and must be reported
+ * `unknown` — never a partial list. Callers supply one message per cause; this throws the error
+ * the retention scans map to `unknown`.
  */
 export function assertStreamComplete(outcome: GitStreamOutcome, messages: StreamFaultMessages): void {
-  const fault = outcome.timedOut ? "timedOut" : outcome.capped ? "capped" : outcome.code !== 0 ? "failed" : undefined
+  const fault = outcome.timedOut
+    ? "timedOut"
+    : outcome.capped
+      ? "capped"
+      : outcome.code !== 0
+        ? "failed"
+        : outcome.stderr.trim() === ""
+          ? undefined
+          : "warned"
   if (fault !== undefined) throw new IncompleteStreamError(messages[fault])
 }
 

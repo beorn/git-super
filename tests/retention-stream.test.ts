@@ -1,6 +1,7 @@
 /**
- * @failure The retirement proof holds whole OID sets in memory, trusts a sidecar by its name, or
- * buffers an unbounded child's output instead of killing it at the cap.
+ * @failure The retirement proof holds whole OID sets in memory, trusts a sidecar by its name,
+ * buffers an unbounded child's output instead of killing it at the cap, or accepts a git child
+ * that exited 0 while writing to stderr as a clean, complete read.
  * @level l1
  * @consumer the read-only retention verifier, gates 4-6; #27443(b)
  * @reach fs-walk <fixture-only: every case builds or reads mkdtempSync(tmpdir()) fixtures; no repository source tree is walked>
@@ -13,6 +14,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, test } from "vitest"
 import {
+  assertStreamComplete,
   externalSortToSidecar,
   gitLineStream,
   mergeLabeledFiles,
@@ -304,6 +306,29 @@ describe("retention stream primitives (#27443(b))", () => {
     expect(lines).toEqual(["one"])
     expect(outcome.code).not.toBe(0)
     expect(outcome.stderr).toContain("stdout read failed")
+  })
+
+  test("a successful outcome that wrote to stderr is refused, never treated as a clean read", () => {
+    // Git reports a missing alternate, an ignored store or a broken ref on stderr while still
+    // exiting 0: the stdout that follows is shorter than the store. The one stream rule must call
+    // that incomplete, never let a truncated OID set pass a gate.
+    const messages = { timedOut: "deadline", capped: "cap", failed: "failed", warned: "warned" }
+    expect(() =>
+      assertStreamComplete(
+        {
+          code: 0,
+          bytes: 12,
+          lines: 1,
+          stderr: "error: unable to normalize alternate object path: /gone",
+          timedOut: false,
+          capped: false,
+        },
+        messages,
+      ),
+    ).toThrow(/warned/u)
+    expect(() =>
+      assertStreamComplete({ code: 0, bytes: 12, lines: 1, stderr: "", timedOut: false, capped: false }, messages),
+    ).not.toThrow()
   })
 })
 

@@ -31,6 +31,7 @@ import {
 import {
   defaultGitRun,
   defaultGitStream,
+  refuseSuccessfulStderr,
   type ComponentContents,
   type GitRun,
   type GitStreamFactory,
@@ -161,6 +162,7 @@ function objectFormat(
   run: GitRun,
 ): { status: "ok"; format: string } | { status: "unknown"; detail: string } {
   const result = run([`--git-dir=${gitDir}`, "rev-parse", "--show-object-format"])
+  refuseSuccessfulStderr(result, `rev-parse --show-object-format in ${gitDir}`)
   if (result.code !== 0) {
     return { status: "unknown", detail: `rev-parse --show-object-format failed in ${gitDir}: ${result.stderr.trim()}` }
   }
@@ -210,10 +212,12 @@ async function indexWitnessStores(
     if (closureResult.status !== "ok") throw new UnknownError(closureResult.detail)
     // A hung `fsck` is killed at the declared deadline and reported unknown, never blocking.
     const fsck = run([`--git-dir=${gitDir}`, "fsck", "--full", "--no-progress"], { timeoutMs: bounds.fsckMs })
+    refuseSuccessfulStderr(fsck, `fsck --full in witness store ${gitDir}`)
     if (fsck.code !== 0) {
       throw new UnknownError(`fsck --full failed in witness store ${gitDir}: ${fsck.stderr.trim()}`)
     }
     const refs = run([`--git-dir=${gitDir}`, "for-each-ref", "--format=%(refname)%09%(objectname)"])
+    refuseSuccessfulStderr(refs, `for-each-ref in witness store ${gitDir}`)
     if (refs.code !== 0) {
       throw new UnknownError(`for-each-ref failed in witness store ${gitDir}: ${refs.stderr.trim()}`)
     }
@@ -245,6 +249,7 @@ async function indexWitnessStores(
         timedOut: `rev-list ${entry.tip} in ${gitDir} exceeded the ${bounds.reachableMs} ms bound`,
         capped: `reachable OIDs exceeded the ${bounds.maxReachableOids} cap in ${gitDir}`,
         failed: `rev-list ${entry.tip} failed in witness store ${gitDir}: ${outcome.stderr.trim()}`,
+        warned: `rev-list ${entry.tip} in ${gitDir} exited 0 with stderr: ${outcome.stderr.trim()}`,
       })
       if (clock() - started > bounds.reachableMs) {
         throw new UnknownError(`rev-list ${entry.tip} in ${gitDir} exceeded the ${bounds.reachableMs} ms bound`)

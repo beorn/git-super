@@ -157,6 +157,18 @@ export function defaultGitRun(args: readonly string[], options: GitRunOptions = 
   }
 }
 
+/**
+ * A read-only proof query that exits 0 while writing to stderr has NOT read cleanly: Git reports an
+ * unusable alternate, an ignored object store or a broken ref on stderr without a non-zero exit, and
+ * the stdout that follows is shorter than the store. Any successful `run` carrying stderr output is
+ * `unknown`, never a clean source. Non-zero results keep their own named error at the call site.
+ */
+export function refuseSuccessfulStderr(result: GitRunResult, label: string): void {
+  if (result.code === 0 && result.stderr.trim() !== "") {
+    throw new UnknownError(`${label} exited 0 with unexpected stderr: ${result.stderr.trim()}`)
+  }
+}
+
 /** Every nested component git directory the full manifest records, not a fixed list of names. */
 export function componentsFromManifest(entries: Readonly<Record<string, ManifestEntry>>): string[] {
   const names = new Set<string>()
@@ -244,6 +256,7 @@ export function* readReflogEntries(path: string): Generator<ReflogEntry> {
  */
 function* rootOidLines(gitDir: string, run: GitRun): Generator<string> {
   const refs = run([`--git-dir=${gitDir}`, "for-each-ref", "--format=%(objectname) %(refname)"])
+  refuseSuccessfulStderr(refs, `for-each-ref in ${gitDir}`)
   if (refs.code !== 0) throw new UnknownError(`for-each-ref failed in ${gitDir}: ${refs.stderr.trim()}`)
   for (const line of refs.stdout.split("\n")) {
     if (line === "") continue
@@ -254,6 +267,7 @@ function* rootOidLines(gitDir: string, run: GitRun): Generator<string> {
     if (!ZERO_OID.test(oid)) yield `${oid}\tref ${name ?? ""}`.trimEnd()
   }
   const head = run([`--git-dir=${gitDir}`, "rev-parse", "HEAD"])
+  refuseSuccessfulStderr(head, `rev-parse HEAD in ${gitDir}`)
   if (head.code === 0) {
     const oid = head.stdout.trim()
     if (HEX40.test(oid) && !ZERO_OID.test(oid)) yield `${oid}\tHEAD`
@@ -281,6 +295,7 @@ function* rootOidLines(gitDir: string, run: GitRun): Generator<string> {
     for (const oid of found) yield `${oid}\tpseudo-ref ${name}`
   }
   const index = run([`--git-dir=${gitDir}`, "ls-files", "--stage"])
+  refuseSuccessfulStderr(index, `ls-files --stage in ${gitDir}`)
   if (index.code === 0) {
     for (const line of index.stdout.split("\n")) {
       if (line === "") continue
@@ -436,6 +451,7 @@ async function scanComponent(
         timedOut: `${component}: a git child exceeded the ${bounds.componentMs} ms component bound`,
         capped: `${component}: object list exceeded the ${bounds.maxEffectiveOids} cap`,
         failed: `${component}: cat-file failed: ${outcome.stderr.trim()}`,
+        warned: `${component}: cat-file exited 0 with stderr: ${outcome.stderr.trim()}`,
       })
     }
   } catch (error) {
