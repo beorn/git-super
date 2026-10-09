@@ -223,25 +223,17 @@ export async function readCommitSubmodules(
       ),
     })
   }
-  const configuredArgs = [
-    "config",
-    "--null",
-    "--blob",
-    `${commit}:.gitmodules`,
-    ...(selection === undefined ? ["--get-regexp", "^submodule\\..*\\.(path|url|branch|private)$"] : ["--list"]),
-  ]
+  // --list exits 0 and prints nothing for a valid empty manifest, where --get-regexp's
+  // "no match" exit 1 read as a failed read. A real read failure still refuses, silent exit included.
+  const configuredArgs = ["config", "--null", "--blob", `${commit}:.gitmodules`, "--list"]
   const configured = await git.run({ repo: repository, args: configuredArgs })
   if (gitProcessFailed(configured)) {
     throw operationError(repository, "read-target-submodules", configuredArgs, configured)
   }
-  // --list succeeds on a valid empty manifest; failures still refuse, including a silent exit 1.
-  const configuration =
-    selection === undefined
-      ? configured.stdout
-      : configured.stdout
-          .split("\0")
-          .filter((entry) => /^submodule\..*\.(path|url|branch|private)\n/u.test(entry))
-          .join("\0")
+  const configuration = configured.stdout
+    .split("\0")
+    .filter((entry) => /^submodule\..*\.(path|url|branch|private)\n/u.test(entry))
+    .join("\0")
   return finish(parseCommitSubmoduleConfig(configuration, commit))
 }
 

@@ -368,6 +368,19 @@ describe("commit submodule graph", () => {
     })
   })
 
+  test("reads a valid empty manifest with no gitlinks as an empty submodule graph", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-commit-graph-empty-manifest-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    git(fixture.product, "update-index", "--force-remove", "packages/alpha", "vendor/beta")
+    writeFileSync(join(fixture.product, ".gitmodules"), "")
+    git(fixture.product, "add", ".gitmodules")
+    git(fixture.product, "commit", "--allow-empty", "-q", "-m", "empty manifest and no gitlinks")
+    const empty = git(fixture.product, "rev-parse", "HEAD")
+
+    await expect(readCommitSubmodules(createLocalGitProcess(), fixture.product, empty)).resolves.toEqual([])
+  })
+
   test("does not interpret a silent config command failure as an empty submodule graph", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-commit-graph-config-failure-"))
     roots.push(fixtureRoot)
