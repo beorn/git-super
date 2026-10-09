@@ -32,6 +32,7 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
       expect(existsSync(componentWt)).toBe(false)
       expect(git(alpha, "worktree", "list", "--porcelain")).not.toContain(componentWt)
     } finally {
+      // raw-delete-allow: the fixture tree this test made under its own mkdtemp root
       await rm(root, { recursive: true, force: true })
     }
   })
@@ -56,6 +57,7 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
       expect(existsSync(componentWt)).toBe(true)
       expect(git(alpha, "worktree", "list", "--porcelain")).toContain(componentWt)
     } finally {
+      // raw-delete-allow: the fixture tree this test made under its own mkdtemp root
       await rm(root, { recursive: true, force: true })
     }
   })
@@ -79,6 +81,7 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
       expect(result.detail?.message ?? "").toMatch(/gitdir .* outside /iu)
       expect(existsSync(outsider)).toBe(true)
     } finally {
+      // raw-delete-allow: the fixture tree this test made under its own mkdtemp root
       await rm(root, { recursive: true, force: true })
     }
   })
@@ -97,6 +100,7 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
       const lenderObjects = join(git(join(lender, "apps/maddoc"), "rev-parse", "--absolute-git-dir").trim(), "objects")
       const borrowerGitDir = git(join(borrower, "apps/maddoc"), "rev-parse", "--absolute-git-dir").trim()
       const borrowerObjects = join(borrowerGitDir, "objects")
+      // raw-delete-allow: the fixture tree this test made under its own mkdtemp root
       await rm(borrowerObjects, { recursive: true, force: true })
       await symlink(lenderObjects, borrowerObjects, "dir")
 
@@ -112,6 +116,7 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
       expect(result.borrowers).toEqual([borrower])
       expect(existsSync(lender)).toBe(true)
     } finally {
+      // raw-delete-allow: the fixture tree this test made under its own mkdtemp root
       await rm(root, { recursive: true, force: true })
     }
   })
