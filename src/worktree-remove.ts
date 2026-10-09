@@ -1,4 +1,4 @@
-import { lstatSync, readFileSync, realpathSync } from "node:fs"
+import { realpathSync } from "node:fs"
 import { isAbsolute, join, relative, resolve, sep } from "node:path"
 import { runGit } from "./git.ts"
 import { gitSuperResult, type GitSuperResult } from "./result.ts"
@@ -11,43 +11,17 @@ function within(parent: string, path: string): boolean {
   return part === "" || (part !== ".." && !part.startsWith(`..${sep}`) && !isAbsolute(part))
 }
 
-function gitdirPointer(worktree: string): string | undefined {
-  const pointer = join(worktree, ".git")
-  let st
-  try {
-    st = lstatSync(pointer)
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code
-    if (code === "ENOENT" || code === "ENOTDIR") return undefined
-    throw error
-  }
-  if (!st.isFile()) return undefined
-  const match = /^gitdir:\s*(.+)$/u.exec(readFileSync(pointer, "utf8").trim())
-  const gitdir = match?.[1]
-  if (gitdir === undefined || gitdir === "") {
-    throw new Error(`worktree ${worktree} has a gitfile without a gitdir pointer`)
-  }
-  return resolve(worktree, gitdir)
-}
-
 /** A linked worktree of a submodule is registered under the super's modules store, not the super worktree list (28393). */
 function owningComponentRepository(superRepo: string, path: string): string | undefined {
-  const gitdir = gitdirPointer(path)
-  if (gitdir === undefined) return undefined
+  const gitdir = realpathSync(runGit(path, ["rev-parse", "--absolute-git-dir"]).trim())
   const common = realpathSync(runGit(superRepo, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim())
   const modules = join(common, "modules")
-  let resolvedGitdir: string
-  try {
-    resolvedGitdir = realpathSync(gitdir)
-  } catch (error) {
-    throw new Error(`worktree ${path} gitdir ${gitdir} is missing or unreadable`, { cause: error })
+  if (!within(modules, gitdir)) {
+    throw new Error(`worktree ${path} gitdir ${gitdir} is outside ${modules}`)
   }
-  if (!within(modules, resolvedGitdir)) {
-    throw new Error(`worktree ${path} gitdir ${resolvedGitdir} is outside ${modules}`)
-  }
-  const owner = realpathSync(runGit(resolvedGitdir, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim())
+  const owner = realpathSync(runGit(gitdir, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim())
   if (!within(modules, owner)) {
-    throw new Error(`worktree ${path} gitdir ${resolvedGitdir} is outside ${modules}`)
+    throw new Error(`worktree ${path} gitdir ${gitdir} is outside ${modules}`)
   }
   return owner
 }
