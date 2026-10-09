@@ -1,8 +1,56 @@
-import { resolve } from "node:path"
+import { lstatSync, readFileSync, realpathSync } from "node:fs"
+import { isAbsolute, join, relative, resolve, sep } from "node:path"
+import { runGit } from "./git.ts"
 import { gitSuperResult, type GitSuperResult } from "./result.ts"
 import { createLocalGitWorktreeStore } from "./worktree.ts"
 import type { WorktreeRemovalProof } from "./worktree-removal.ts"
 import type { NotCompared } from "./diff.ts"
+
+function within(parent: string, path: string): boolean {
+  const part = relative(parent, path)
+  return part === "" || (part !== ".." && !part.startsWith(`..${sep}`) && !isAbsolute(part))
+}
+
+function gitdirPointer(worktree: string): string | undefined {
+  const pointer = join(worktree, ".git")
+  let st
+  try {
+    st = lstatSync(pointer)
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === "ENOENT" || code === "ENOTDIR") return undefined
+    throw error
+  }
+  if (!st.isFile()) return undefined
+  const match = /^gitdir:\s*(.+)$/u.exec(readFileSync(pointer, "utf8").trim())
+  const gitdir = match?.[1]
+  if (gitdir === undefined || gitdir === "") {
+    throw new Error(`worktree ${worktree} has a gitfile without a gitdir pointer`)
+  }
+  return resolve(worktree, gitdir)
+}
+
+/** A linked worktree of a submodule is registered under the super's modules store, not the super worktree list (28393). */
+function owningComponentRepository(superRepo: string, path: string): string | undefined {
+  const gitdir = gitdirPointer(path)
+  if (gitdir === undefined) return undefined
+  const common = realpathSync(runGit(superRepo, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim())
+  const modules = join(common, "modules")
+  let resolvedGitdir: string
+  try {
+    resolvedGitdir = realpathSync(gitdir)
+  } catch (error) {
+    throw new Error(`worktree ${path} gitdir ${gitdir} is missing or unreadable`, { cause: error })
+  }
+  if (!within(modules, resolvedGitdir)) {
+    throw new Error(`worktree ${path} gitdir ${resolvedGitdir} is outside ${modules}`)
+  }
+  const owner = realpathSync(runGit(resolvedGitdir, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim())
+  if (!within(modules, owner)) {
+    throw new Error(`worktree ${path} gitdir ${resolvedGitdir} is outside ${modules}`)
+  }
+  return owner
+}
 
 export type SuperWorktreeRemoveOptions = Readonly<{
   repo: string
@@ -30,6 +78,12 @@ export async function superWorktreeRemove(options: SuperWorktreeRemoveOptions): 
   let removalReturned = false
   try {
     const store = createLocalGitWorktreeStore({ repo })
+    if (!(await store.inspect(path)).registered) {
+      const owner = owningComponentRepository(repo, path)
+      if (owner !== undefined && owner !== repo) {
+        return await superWorktreeRemove({ ...options, repo: owner })
+      }
+    }
     const outcome = await store.remove(path, {
       ...(options.excludedSubmodules === undefined ? {} : { excludedSubmodules: options.excludedSubmodules }),
       ...(options.noRehome === undefined ? {} : { noRehome: options.noRehome }),
