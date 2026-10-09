@@ -43,6 +43,15 @@ function completeSyscalls(lines: readonly string[]): string[] {
       pending.delete(pid!)
       continue
     }
+    // 27968: a thread blocked in a syscall when it exits, is killed, or is superseded by an execve may never resume.
+    // Older strace (Ubuntu 24.04's hosted runner) prints its unfinished row, then this end row, and no resumed row.
+    // The call is complete with no result; its arguments still count as an access.
+    const ended = /^(\d+)\s+\+\+\+ (?:exited with|killed by|superseded by) .* \+\+\+$/u.exec(line)
+    const start = ended ? pending.get(ended[1]!) : undefined
+    if (ended && start) {
+      complete[start.index] = `${start.prefix}) = ?`
+      pending.delete(ended[1]!)
+    }
     complete.push(line)
   }
   if (pending.size > 0) {
@@ -96,9 +105,35 @@ it.each(["local", "hosted"] as const)(
       completeSyscalls([
         '1 newfstatat(AT_FDCWD, "child/.git" <unfinished ...>',
         "2 close(3) = 0",
-        "1 +++ exited with 0 +++",
+        "1 --- SIGTERM {si_signo=SIGTERM, si_code=SI_USER} ---",
       ]),
-    ).toThrow(/Unpaired unfinished strace syscall for PID 1\n1 newfstatat.*\n {2}then 1 \+\+\+ exited with 0 \+\+\+/u)
+    ).toThrow(/Unpaired unfinished strace syscall for PID 1\n1 newfstatat.*\n {2}then 1 --- SIGTERM/u)
+    // 27968: CI run 37983345758's shape. A syscall cut off by its own thread's exit, kill or execve completes with no
+    // result, and its path still reaches the access filter; a resume after that end is still refused.
+    expect(
+      completeSyscalls([
+        "1 futex(0x45a5a6b00d8, FUTEX_WAIT_BITSET_PRIVATE|FUTEX_CLOCK_REALTIME, 0, {tv_sec=1, tv_nsec=2}, FUTEX_BITSET_MATCH_ANY <unfinished ...>",
+        '2 newfstatat(AT_FDCWD, "store/HEAD" <unfinished ...>',
+        '3 openat(AT_FDCWD, "child/.git", O_RDONLY <unfinished ...>',
+        "1 +++ exited with 0 +++",
+        "2 +++ killed by SIGKILL +++",
+        "3 +++ superseded by execve in pid 4 +++",
+      ]),
+    ).toEqual([
+      "1 futex(0x45a5a6b00d8, FUTEX_WAIT_BITSET_PRIVATE|FUTEX_CLOCK_REALTIME, 0, {tv_sec=1, tv_nsec=2}, FUTEX_BITSET_MATCH_ANY) = ?",
+      '2 newfstatat(AT_FDCWD, "store/HEAD") = ?',
+      '3 openat(AT_FDCWD, "child/.git", O_RDONLY) = ?',
+      "1 +++ exited with 0 +++",
+      "2 +++ killed by SIGKILL +++",
+      "3 +++ superseded by execve in pid 4 +++",
+    ])
+    expect(() =>
+      completeSyscalls([
+        '1 newfstatat(AT_FDCWD, "child/.git" <unfinished ...>',
+        "1 +++ exited with 0 +++",
+        "1 <... newfstatat resumed>, 0x1, 0) = -1 ENOENT",
+      ]),
+    ).toThrow(/Unmatched resumed strace syscall newfstatat for PID 1/u)
     const available = spawnSync("strace", ["--version"], { encoding: "utf8" })
     if (available.error || available.status !== 0) {
       throw new Error(
