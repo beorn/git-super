@@ -3871,6 +3871,7 @@ describe("git super merge", () => {
       roots.push(fixtureRoot)
       const fixture = createProductFixture(fixtureRoot)
       const diverged = divergeBothProductComponentsWithRootClash(fixture)
+      git(fixture.product, "switch", "-q", "-c", "task/conflict-remedy")
       const local = createLocalGitProcess()
       const carriers: string[] = []
       let mergeCalls = 0
@@ -3903,6 +3904,8 @@ describe("git super merge", () => {
       for (const carrier of carriers) expect(serialized, `carrier ${carrier} leaked`).not.toContain(carrier)
       expect(result.detail?.message).not.toContain("carrier")
       expect(result.detail?.code).toBe("gitlink-compose-conflict")
+      expect(result.detail?.remedy).toContain("your current branch")
+      expect(result.detail?.remedy).not.toContain("on the branch you are merging")
       // The refusal names the real HEAD and target and the observed ordinary conflict.
       expect(result.detail?.message).toContain(diverged.head)
       expect(result.detail?.message).toContain(diverged.candidate)
@@ -3912,6 +3915,21 @@ describe("git super merge", () => {
       // The refusal is before mutation: HEAD and the worktree are untouched.
       expect(git(fixture.product, "rev-parse", "HEAD")).toBe(diverged.head)
       expect(git(fixture.product, "status", "--porcelain").trim()).toBe("")
+
+      // Follow the remedy on the caller's task branch; the incoming ref never moves.
+      writeFileSync(join(fixture.product, "clash.txt"), "theirs\n")
+      git(fixture.product, "add", "clash.txt")
+      git(fixture.product, "commit", "-q", "-m", "make the caller branch compatible with the incoming change")
+      const retried = await superMerge({
+        commit: diverged.candidate,
+        git: wrongStoreFirstMerge(local, fixture.product, diverged.alphaOurs),
+        preserveConflicts,
+        repo: fixture.product,
+      })
+      expect(retried.state, JSON.stringify(retried)).toBe("updated")
+      expect(git(fixture.product, "branch", "--show-current")).toBe("task/conflict-remedy")
+      expect(git(fixture.product, "rev-parse", "diverge-both")).toBe(diverged.candidate)
+      expect(readFileSync(join(fixture.product, "clash.txt"), "utf8")).toBe("theirs\n")
     },
   )
 

@@ -68,6 +68,14 @@ function objectStoreSnapshot(objects: string) {
     .sort((a, b) => a.path.localeCompare(b.path))
 }
 
+function registrySnapshot(registry: string) {
+  if (!existsSync(registry)) return []
+  return readdirSync(registry)
+    .filter((name) => name.endsWith(".json"))
+    .sort()
+    .map((name) => ({ name, bytes: readFileSync(join(registry, name)) }))
+}
+
 describe("createGitWorktreeStore", () => {
   /**
    * @failure Recovery globally prunes another destroyed registration and its object custody (#27477).
@@ -986,6 +994,45 @@ describe("createGitWorktreeStore", () => {
       }
     },
   )
+
+  /**
+   * @failure inspectRemoval unlinks retained-borrower registry entries that a later remove still needs (28218).
+   * @level l1
+   * @consumer git-super inspectRemoval callers (tent/yrd census)
+   * @testonly none
+   */
+  // AC: inspect is a snapshot; a gone retained copy still leaves the registry bytes unchanged.
+  // remove() is the only writer that may drop stale registry rows.
+  it("leaves the retained-borrower registry unchanged when inspecting a gone retained copy", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-inspect-retained-registry-"))
+    try {
+      const fixture = createProductFixture(root)
+      const store = createLocalGitWorktreeStore({ repo: fixture.product })
+      const owner = await addAlphaWorktree(store, root, "owner")
+      const borrower = await addAlphaWorktree(store, root, "borrower")
+      await linkObjects(borrower.moduleDir, owner.objects)
+      const proofs: WorktreeRemovalProof[] = []
+      const retention = { root: join(root, "retained"), report: (proof: WorktreeRemovalProof) => proofs.push(proof) }
+      await store.remove(borrower.linked, { retention })
+      const retained = proofs[0]?.retained
+      if (typeof retained !== "string") throw new Error("retention omitted the retained copy")
+      await rm(retained, { recursive: true, force: true })
+      const common = git(fixture.product, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim()
+      const registry = join(common, "git-super-retained-borrowers")
+      const before = registrySnapshot(registry)
+      expect(before.length).toBeGreaterThan(0)
+      const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true)
+      try {
+        await store.inspectRemoval(owner.linked)
+      } finally {
+        stderr.mockRestore()
+      }
+      expect(registrySnapshot(registry)).toEqual(before)
+      expect(existsSync(owner.linked)).toBe(true)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
 
   /**
    * @failure Repointing a retained objects link to another linked owner drops its custody record and permits that owner's deletion (26270).

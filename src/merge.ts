@@ -2523,7 +2523,7 @@ async function composeWrongStoreGitlinks(
         "gitlink-compose-conflict",
         `Merge ${target} conflicts with current HEAD ${head}${located}; composing the diverged gitlinks does not settle the conflict, and the non-mutating preflight left HEAD, index, and worktree unchanged. ${conflict.stageEvidence}`,
         `git -C ${root} status --short`,
-        `Resolve the conflict${located} on the branch you are merging, then rerun the same git super merge command.`,
+        `Adjust the conflicting changes${located} on your current branch to be compatible with the incoming changes, commit the result, then rerun the same git super merge command.`,
         "the caller",
         {
           objectIds: [...new Set([head, target, ...conflict.entries.map((entry) => entry.oid)])],

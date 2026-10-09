@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `inspectRemoval` no longer unlinks retained-borrower registry entries. Inspection remains a snapshot; `remove` still drops gone or independent registrations under its mutation lock (#28218).
+
 ## 0.5.0 — 2026-10-02
 
 - Export `readPrivateSubmodulePaths` from `git-super/commit-graph` to read sorted private-submodule declarations from a frozen commit without joining gitlinks. A private declaration without a path and invalid private values refuse explicitly.
