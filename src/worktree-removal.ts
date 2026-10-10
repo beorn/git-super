@@ -220,8 +220,53 @@ function* borrowerEntries(root: string, excludedStores: RemovalBorrower["exclude
     const path = join(root, entry.name)
     if (excludedStores?.some((excluded) => within(excluded.store, path))) continue
     yield entry
-    if (entry.isDirectory()) yield* borrowerEntries(path, excludedStores)
+    if (!entry.isDirectory()) continue
+    // A directory directly inside a Git objects directory is `info` (the only one that can hold an
+    // `alternates` line), a pack directory, or a loose-object fan-out directory. This walk's own
+    // `git repack -a -d` runs prune-packed over the same store and removes a loose object's emptied
+    // fan-out directory while the generator is still enumerating the parent listing, so descending
+    // into one scandirs a directory that has just vanished and aborts a removal the borrower can
+    // already read through (hh 28572). Only `info` can carry a borrower marker, so the walk never
+    // enters the others.
+    if (basename(root) === "objects" && entry.name !== "info") continue
+    yield* borrowerEntries(path, excludedStores)
   }
+}
+
+/** A compact age for a lock barrier: "12s", "5m08s", "3h04m", "2d11h". */
+function formatLockAge(ms: number): string {
+  const seconds = Math.max(0, Math.floor(ms / 1000))
+  if (seconds < 60) return `${seconds}s`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes}m${String(seconds % 60).padStart(2, "0")}s`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours}h${String(minutes % 60).padStart(2, "0")}m`
+  return `${Math.floor(hours / 24)}d${String(hours % 24).padStart(2, "0")}h`
+}
+
+/**
+ * How old a `.lock` barrier is and whether the kernel reports any process still holding it. A lock
+ * file left behind by a finished or killed writer has no holder at all, and a refusal that only says
+ * "resolve its holder" sends its reader looking for one that does not exist (hh 28572).
+ */
+function describeLockBarrier(path: string, now = Date.now()): string {
+  let age = "age unknown"
+  try {
+    const { mtimeMs } = statSync(path)
+    age = `age ${formatLockAge(now - mtimeMs)} (mtime ${new Date(mtimeMs).toISOString()})`
+  } catch {
+    // silent-fallback-allow: this only enriches a refusal the caller is already raising for a `.lock`
+    // entry it just listed. A file that vanished between that listing and this read has no age to
+    // report, and the refusal still names its path; rethrowing would replace the real barrier report
+    // with a worse stat error, and this text decides no removal.
+  }
+  const holders = fileLockHolders([path], { self: process.pid })
+  if (holders.kind === "unknown") return `${age}; lock holders unreadable (${holders.reason})`
+  const file = holders.files[0]
+  if (file === undefined) return `${age}; lock holder unknown`
+  if ("absent" in file) return `${age}; no lock holder (file absent)`
+  if ("unreadable" in file) return `${age}; lock holders unreadable (${file.unreadable})`
+  return file.locks.length === 0 ? `${age}; no lock holder (${file.id})` : `${age}; ${formatLockHolders(holders)}`
 }
 
 /** Resolve each public parent independently; current-worktree names cannot stand for another HEAD. */
@@ -587,7 +632,7 @@ export function acquireRemovalWriterLeases(gitDir: string, onAcquired?: (path: s
       if (!entry.name.endsWith(".lock")) continue
       const path = join(entry.parentPath, entry.name)
       if (!entry.isFile() || !isWriterLeasePath(path, gitDir, true)) {
-        throw new Error(`Git lock ${path} prevents worktree removal; resolve its holder`)
+        throw new Error(`Git lock ${path} prevents worktree removal; resolve its holder (${describeLockBarrier(path)})`)
       }
     }
     const directories = [
@@ -661,7 +706,7 @@ export function manifest(root: string, custody: StoreCustody, hashFiles = true, 
       entry.name.endsWith(".lock") &&
       !isWriterLeasePath(path, workingTree ? custody.gitDir : root, workingTree || root === custody.gitDir)
     ) {
-      throw new Error(`Git lock ${path} prevents worktree removal; resolve its holder`)
+      throw new Error(`Git lock ${path} prevents worktree removal; resolve its holder (${describeLockBarrier(path)})`)
     }
     if (entry.isDirectory()) continue
     if (entry.isSymbolicLink()) {

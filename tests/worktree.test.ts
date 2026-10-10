@@ -5,7 +5,7 @@
  * @reach fs-walk <fixture-only: worktree stores and retention checks read isolated mkdtemp Git repositories>
  */
 import { existsSync, readdirSync, readFileSync } from "node:fs"
-import { mkdir, mkdtemp, readFile, readlink, rename, rm, symlink, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, readlink, rename, rm, symlink, utimes, writeFile } from "node:fs/promises"
 import { spawnSync } from "node:child_process"
 import { tmpdir } from "node:os"
 import { dirname, join, relative } from "node:path"
@@ -1667,6 +1667,96 @@ describe("createGitWorktreeStore", () => {
       expect(() => rehomeBorrowers(root, join(root, "lender"), lenderModules, { spawn: fakeSpawn })).toThrow(
         /timed out after 120s bound/,
       )
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  /**
+   * @failure Re-homing descends into a loose-object fan-out directory that its own `git repack -a -d`
+   *          has just emptied and removed, so the removal aborts ENOENT although the borrower still
+   *          reads (28572).
+   * @level l1
+   * @consumer Yrd automatic environment cleanup
+   * @testonly none
+   */
+  it("re-homes a borrower whose loose-object fan-out directory vanished mid-walk (28572)", async () => {
+    const root = await mkdtemp(join(tmpdir(), "git-super-rehome-vanished-fanout-"))
+    try {
+      const lenderModules = join(root, "lender/modules")
+      const borrowerObjects = join(root, "worktrees/borrower/modules/sub/objects")
+      const fanout = join(borrowerObjects, "7e")
+      await mkdir(join(borrowerObjects, "info"), { recursive: true })
+      await mkdir(fanout, { recursive: true })
+      await mkdir(lenderModules, { recursive: true })
+      const alternates = join(borrowerObjects, "info", "alternates")
+      await writeFile(alternates, `${join(lenderModules, "sub/objects")}\n`, "utf8")
+
+      // The re-home's own repack prunes emptied fan-out directories inside the store the walk is
+      // still enumerating, so one is listed and then gone before the walk enters it.
+      const readdir = vi.mocked(readdirSync)
+      const original = readdir.getMockImplementation()
+      readdir.mockImplementation(((path: unknown, options: unknown) => {
+        if (String(path) === fanout) {
+          throw Object.assign(new Error(`ENOENT: no such file or directory, scandir '${fanout}'`), { code: "ENOENT" })
+        }
+        return (original as (input: unknown, opts: unknown) => unknown)(path, options)
+      }) as typeof readdirSync)
+
+      const fakeSpawn = (() => ({
+        status: 0,
+        error: undefined,
+        stdout: "",
+        stderr: "",
+        signal: null,
+        output: [],
+        pid: 1,
+      })) as unknown as typeof spawnSync
+      try {
+        expect(() => rehomeBorrowers(root, join(root, "lender"), lenderModules, { spawn: fakeSpawn })).not.toThrow()
+        expect(await readFile(alternates, "utf8")).toBe("")
+        expect(readdir.mock.calls.some(([path]) => String(path) === fanout)).toBe(false)
+      } finally {
+        readdir.mockImplementation(original as never)
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  /**
+   * @failure A `.lock` barrier refusal says "resolve its holder" without naming the file's age or
+   *          whether any holder exists, sending a reader after a dead owner (28572).
+   * @level l1
+   * @consumer Yrd automatic environment cleanup
+   * @testonly none
+   */
+  it("names a lock barrier's age and absent holder in the removal refusal (28572)", async () => {
+    const root = await mkdtemp(join(tmpdir(), "git-super-lock-barrier-"))
+    const repo = join(root, "owner")
+    const linked = join(root, "linked")
+    createRepository(repo, "seed.txt", "seed\n")
+    try {
+      const store = createLocalGitWorktreeStore({ repo })
+      await store.add({ kind: "detached", path: linked, ref: "HEAD" })
+      const barrier = join(repo, ".git", "worktrees", "linked", "objects", "maintenance.lock")
+      await mkdir(dirname(barrier), { recursive: true })
+      await writeFile(barrier, "")
+      const stale = new Date(Date.now() - 90 * 60_000)
+      await utimes(barrier, stale, stale)
+
+      const refusal = await store
+        .remove(linked, { retention: { root: join(root, "retained"), report: () => {} } })
+        .then(
+          () => {
+            throw new Error("removal accepted a stale lock barrier")
+          },
+          (error: unknown) => (error instanceof Error ? error.message : String(error)),
+        )
+      expect(refusal).toContain(barrier)
+      expect(refusal).toContain("resolve its holder")
+      expect(refusal).toMatch(/age 1h3\dm \(mtime /)
+      expect(refusal).toMatch(/no lock holder|lock holders unreadable/)
     } finally {
       await rm(root, { recursive: true, force: true })
     }
