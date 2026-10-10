@@ -24,19 +24,26 @@ type SubmoduleRepository = Readonly<{ repo: string; env?: NodeJS.ProcessEnv }>
 const DEFAULT_GIT_TIMEOUT_MS = 30_000
 const GITLINK_MODE = "160000"
 const OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu
+/**
+ * An abbreviated object name Git itself would consider (its minimum abbreviation is four
+ * characters). Admitted here and resolved to one exact object IN the submodule repository
+ * before anything is written (#28554): a prefix that names no commit, or more than one,
+ * is refused loudly rather than silently leaving the index untouched.
+ */
+const ABBREVIATED_OBJECT_ID = /^[0-9a-f]{4,64}$/iu
 
 /** Set one existing gitlink's exact index commit without moving the submodule checkout. */
 export async function writeGitlink(options: WriteGitlinkOptions): Promise<GitSuperResult> {
   const fallbackRepository = resolve(options.repo)
-  if (!OBJECT_ID.test(options.commit)) {
+  if (!ABBREVIATED_OBJECT_ID.test(options.commit)) {
     const failure = detail(
       "invalid-commit",
       "validate-commit",
-      `Gitlink commit ${options.commit} is not an exact 40- or 64-hex object ID.`,
+      `Gitlink commit ${options.commit} is not a hex object ID; pass a full 40- or 64-hex object ID, or an abbreviation of at least 4 hex characters.`,
       {
         paths: [options.path],
         objectIds: [options.commit],
-        remedy: "Resolve the desired commit to one exact object ID before retrying.",
+        remedy: `Get the full ID with \`git -C <submodule> rev-parse ${options.commit}\`, then rerun \`bun git-super --repo <dir> gitlink write ${options.path} <full-oid>\`.`,
       },
     )
     return operationResult(fallbackRepository, "failed", failure)
@@ -73,6 +80,7 @@ export async function writeGitlink(options: WriteGitlinkOptions): Promise<GitSup
   }
 
   let wrote = false
+  let target = options.commit.toLowerCase()
   let postWriteResult: GitSuperResult | undefined
   try {
     const exclusive: Exclusive =
@@ -87,22 +95,21 @@ export async function writeGitlink(options: WriteGitlinkOptions): Promise<GitSup
         }
         const submodule = await submoduleRepository(git, repository, options.path, options.commit)
         if ("state" in submodule) return submodule
-        const unavailable = await commitExists(git, repository, submodule, options.path, options.commit)
+        const resolved = await resolveCommitId(git, repository, submodule, options.path, options.commit)
+        if (typeof resolved !== "string") return resolved
+        target = resolved
+        const unavailable = await commitExists(git, repository, submodule, options.path, target)
         if (unavailable !== undefined) return unavailable
-        if (
-          before.length === 1 &&
-          before[0]?.stage === 0 &&
-          before[0]?.oid.toLowerCase() === options.commit.toLowerCase()
-        ) {
+        if (before.length === 1 && before[0]?.stage === 0 && before[0]?.oid.toLowerCase() === target) {
           return operationResult(repository, "unchanged")
         }
 
-        const args = ["update-index", "--cacheinfo", `${GITLINK_MODE},${options.commit},${options.path}`]
+        const args = ["update-index", "--cacheinfo", `${GITLINK_MODE},${target},${options.path}`]
         const written = await git.run({ repo: repository, args })
         if (written.code !== 0) {
           throw operationError(repository, args, "write-gitlink", written, {
             paths: [options.path],
-            objectIds: [options.commit],
+            objectIds: [target],
           })
         }
         wrote = true
@@ -115,10 +122,10 @@ export async function writeGitlink(options: WriteGitlinkOptions): Promise<GitSup
           const failure = detail(
             "post-write-observation-failed",
             "observe-index",
-            `Gitlink ${options.path} may have been written to ${options.commit}, but the resulting index entry could not be read: ${observation.message}`,
+            `Gitlink ${options.path} may have been written to ${target}, but the resulting index entry could not be read: ${observation.message}`,
             {
               paths: [options.path],
-              objectIds: [options.commit],
+              objectIds: [target],
               remedy: "Inspect `git ls-files --stage` before deciding whether a retry is safe.",
             },
           )
@@ -129,15 +136,15 @@ export async function writeGitlink(options: WriteGitlinkOptions): Promise<GitSup
           after.length !== 1 ||
           after[0]?.mode !== GITLINK_MODE ||
           after[0]?.stage !== 0 ||
-          after[0]?.oid.toLowerCase() !== options.commit.toLowerCase()
+          after[0]?.oid.toLowerCase() !== target
         ) {
           const failure = detail(
             "gitlink-observation-mismatch",
             "observe-index",
-            `Git reported success, but ${options.path} does not resolve to stage-zero gitlink ${options.commit}.`,
+            `Git reported success, but ${options.path} does not resolve to stage-zero gitlink ${target}.`,
             {
               paths: [options.path],
-              objectIds: [options.commit, ...after.map(({ oid }) => oid)],
+              objectIds: [target, ...after.map(({ oid }) => oid)],
               remedy: "Inspect `git ls-files --stage` before deciding whether a retry is safe.",
             },
           )
@@ -150,9 +157,47 @@ export async function writeGitlink(options: WriteGitlinkOptions): Promise<GitSup
       { holder: "git super gitlink write" },
     )
   } catch (error) {
-    if (wrote) return postWriteCleanupFailure(repository, options.path, options.commit, error, postWriteResult)
+    if (wrote) return postWriteCleanupFailure(repository, options.path, target, error, postWriteResult)
     return operationResult(repository, "failed", errorDetail(error, "write-gitlink"))
   }
+}
+
+/**
+ * Resolve the caller's commit to ONE exact object ID inside the submodule repository
+ * (#28554). A full ID passes through unchanged; an abbreviation is expanded by Git in the
+ * repository that must contain it, and a prefix that names no commit — or more than one —
+ * returns a loud refusal naming the full-sha requirement and the command form that works,
+ * never a silent no-op.
+ */
+async function resolveCommitId(
+  git: GitProcess,
+  repository: string,
+  submodule: SubmoduleRepository,
+  path: string,
+  commit: string,
+): Promise<string | GitSuperResult> {
+  if (OBJECT_ID.test(commit)) return commit.toLowerCase()
+  const args = ["rev-parse", "--verify", "--quiet", `${commit}^{commit}`]
+  const observed = await git.run({
+    repo: submodule.repo,
+    args,
+    ...(submodule.env === undefined ? {} : { env: submodule.env }),
+  })
+  const resolved = observed.stdout.trim()
+  if (observed.code === 0 && OBJECT_ID.test(resolved)) return resolved.toLowerCase()
+  const ambiguity = observed.stderr.trim()
+  const failure = detail(
+    "invalid-commit",
+    "resolve-commit",
+    `Gitlink commit ${commit} does not resolve to exactly one commit in submodule ${path}; pass the full 40-hex object ID instead — \`git -C <submodule> rev-parse ${commit}\` prints it, then rerun \`bun git-super --repo <dir> gitlink write ${path} <full-oid>\`.`,
+    {
+      paths: [path],
+      objectIds: [commit],
+      ...(ambiguity === "" ? {} : { evidence: ambiguity }),
+      remedy: `Get the full ID with \`git -C <submodule> rev-parse ${commit}\`, then rerun \`bun git-super --repo <dir> gitlink write ${path} <full-oid>\`.`,
+    },
+  )
+  return operationResult(repository, "failed", failure)
 }
 
 function detail(code: string, phase: string, message: string, extra: Partial<GitResultDetail> = {}): GitResultDetail {

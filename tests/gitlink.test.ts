@@ -341,4 +341,46 @@ describe("policy-free gitlink writes", () => {
 
     await expect(pending).resolves.toMatchObject({ state: "updated", partial: false })
   })
+
+  // @failure A gitlink write given an abbreviated commit silently leaves the index at the old
+  //          pin while answering "updated" — the no-op @dev/3 reported for a short sha (#28554).
+  // @level l1
+  // @consumer @hh/tooling/28554: callers that advance a submodule pin by an abbreviated object ID
+  test("resolves an abbreviated commit to the full object id, and the printed result matches the index", async () => {
+    const product = fixture("abbreviated-commit")
+    const next = advanceRepository(product.alpha, "alpha.ts", "export const alpha = 9\n")
+    fetchWithoutCheckout(product.product, "packages/alpha", next)
+    const abbreviated = next.slice(0, 10)
+    expect(abbreviated).not.toBe(next)
+    const stdout = outputSink()
+    const stderr = outputSink()
+
+    expect(
+      await runCli(["--repo", product.product, "gitlink", "write", "packages/alpha", abbreviated], stdout, stderr),
+    ).toBe(0)
+    expect(stderr.output).toBe("")
+    expect(stdout.output).toBe("updated\n")
+    // The abbreviation is resolved IN the submodule repository, so the index carries the FULL id.
+    expect(stage(product.product, "packages/alpha")).toBe(`160000 ${next} 0\tpackages/alpha`)
+  })
+
+  // @failure An abbreviation that names no commit refuses without naming the command form that
+  //          produces the accepted input, so the caller cannot act on the refusal (#28554).
+  // @level l1
+  // @consumer @hh/tooling/28554 refusal breadcrumb (NO SILENT ERRORS, docs/principles.md)
+  test("refuses an abbreviated commit that resolves to no commit, naming the full-sha command form", async () => {
+    const product = fixture("abbreviated-missing")
+    const before = stage(product.product, "packages/alpha")
+    const stdout = outputSink()
+    const stderr = outputSink()
+
+    expect(
+      await runCli(["--repo", product.product, "gitlink", "write", "packages/alpha", "0000000"], stdout, stderr),
+    ).toBe(2)
+    expect(stdout.output).toBe("failed\n")
+    // Breadcrumb: the refusal names the full-sha requirement AND the command that prints it.
+    expect(stderr.output).toContain("rev-parse")
+    expect(stderr.output).toContain("bun git-super --repo <dir> gitlink write packages/alpha <full-oid>")
+    expect(stage(product.product, "packages/alpha")).toBe(before)
+  })
 })
