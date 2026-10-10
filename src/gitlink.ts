@@ -177,7 +177,10 @@ async function resolveCommitId(
   commit: string,
 ): Promise<string | GitSuperResult> {
   if (OBJECT_ID.test(commit)) return commit.toLowerCase()
-  const args = ["rev-parse", "--verify", "--quiet", `${commit}^{commit}`]
+  // Not --quiet: Git's own words ("short object ID <x> is ambiguous", with its candidate list)
+  // are the evidence a reader needs to tell "names several objects" from "names none", and the
+  // refusal must not be the only place that fact ever appears (#28554).
+  const args = ["rev-parse", "--verify", `${commit}^{commit}`]
   const observed = await git.run({
     repo: submodule.repo,
     args,
