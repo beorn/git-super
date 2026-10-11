@@ -17,8 +17,10 @@ import {
   rehomeBorrowers,
   retainWorktreeModules,
   type PrivateStoreDiscard,
+  type WorktreeRemovalProof,
   type WorktreeRetention,
 } from "./worktree-removal.ts"
+import { compactRetainedModules } from "./retention-compact.ts"
 import { cleanGitEnvironment, probeRepository } from "./git.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
 import { createProgressReporter } from "./progress.ts"
@@ -518,6 +520,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       const removalRepo = await git.text(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"])
       let stagingPath: string | undefined
       let borrowed: Readonly<{ borrowers: readonly string[] }> | undefined
+      let removalProof: WorktreeRemovalProof | undefined
       await mutate(removeOptions.operation ?? `worktree remove ${path}`, async () => {
         if (removeOptions.retention !== undefined && removeOptions.unlock === true) {
           throw new Error(`retained worktree removal cannot unlock ${path}; resolve its holder first`)
@@ -551,7 +554,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
             }
           }
           if (removeOptions.retention !== undefined) {
-            await retainWorktreeModules(
+            removalProof = await retainWorktreeModules(
               git,
               repo,
               path,
@@ -638,30 +641,37 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         }
       })
 
-      // Phase 2 (outside mutation lock):
-      // Delete the staging directory synchronously in the caller. Never fire-and-forget.
-      if (stagingPath !== undefined) {
-        try {
-          rmSync(stagingPath, { recursive: true, force: true })
+      try {
+        // After native --force: pack-refs + drop remote reflogs on the retained copy, then rewrite
+        // the proof so gate 2 still matches. A compact failure must not restore the live worktree
+        // (already gone) and must not delete the copy; close fails loud with the verified original.
+        if (removalProof?.retained != null) compactRetainedModules(removalProof)
+      } finally {
+        // Phase 2 (outside mutation lock):
+        // Delete the staging directory synchronously in the caller. Never fire-and-forget.
+        if (stagingPath !== undefined) {
           try {
-            rmdirSync(dirname(stagingPath))
-          } catch (error) {
-            // Other removals may still own entries in the shared staging directory.
-            if (
-              error === null ||
-              typeof error !== "object" ||
-              !("code" in error) ||
-              (error.code !== "ENOTEMPTY" && error.code !== "EEXIST")
-            ) {
-              console.warn(
-                `git-super: failed to remove staging parent '${dirname(stagingPath)}': ${error instanceof Error ? error.message : String(error)}`,
-              )
+            rmSync(stagingPath, { recursive: true, force: true })
+            try {
+              rmdirSync(dirname(stagingPath))
+            } catch (error) {
+              // Other removals may still own entries in the shared staging directory.
+              if (
+                error === null ||
+                typeof error !== "object" ||
+                !("code" in error) ||
+                (error.code !== "ENOTEMPTY" && error.code !== "EEXIST")
+              ) {
+                console.warn(
+                  `git-super: failed to remove staging parent '${dirname(stagingPath)}': ${error instanceof Error ? error.message : String(error)}`,
+                )
+              }
             }
+          } catch (error) {
+            console.warn(
+              `git-super: failed to delete staged worktree directory '${stagingPath}': ${error instanceof Error ? error.message : String(error)}`,
+            )
           }
-        } catch (error) {
-          console.warn(
-            `git-super: failed to delete staged worktree directory '${stagingPath}': ${error instanceof Error ? error.message : String(error)}`,
-          )
         }
       }
       return borrowed
