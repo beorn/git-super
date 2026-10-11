@@ -286,6 +286,24 @@ test("the empty-first precondition cannot be stated without a declared checkout"
   expect(stderr.output).toContain("--checkout")
 })
 
+test("a source-only refspec maps nothing, so a fabricated tracker cannot read as equal", async () => {
+  const fixture = storeFixture()
+  // Real Git writes FETCH_HEAD for a source-only refspec and creates no ref at all. A verifier that
+  // synthesized refs/remotes/<remote>/<branch> would invent a mapping for a ref Git never wrote.
+  git(fixture.store, "config", "remote.origin.fetch", "+refs/heads/main")
+  git(fixture.store, "update-ref", "-d", "refs/remotes/origin/main")
+  git(fixture.store, "update-ref", "-d", "refs/remotes/origin/HEAD")
+  git(fixture.store, "update-ref", "refs/heads/main", fixture.second)
+  git(fixture.store, "update-ref", "refs/remotes/origin/main", fixture.second)
+  const result = await verifyPrivateStoreCandidate({ store: fixture.store, checkout: join(fixture.root, "env") })
+  expect(result.verdict).toBe("not-a-candidate")
+  expect(result.refs.find((row) => row.ref === "refs/remotes/origin/main")).toMatchObject({
+    mappedFrom: null,
+    state: "unadvertised",
+  })
+  expect(result.reasons.map((reason) => reason.code)).toEqual(["local-only"])
+})
+
 test("a malformed advertisement is a named unproven reason and never relays the raw line", async () => {
   const fixture = storeFixture()
   conventionalClone(fixture)

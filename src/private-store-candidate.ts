@@ -149,16 +149,16 @@ async function read(git: GitProcess, repo: string, args: readonly string[]): Pro
 type RefSpec = Readonly<{ source: string; destination: string }>
 
 /** The store's OWN fetch refspecs. A convention is never assumed: a narrow or mirror refspec maps correctly. */
-function parseFetchRefspecs(remote: string, lines: readonly string[]): readonly RefSpec[] {
+function parseFetchRefspecs(lines: readonly string[]): readonly RefSpec[] {
   const specs: RefSpec[] = []
   for (const raw of lines) {
     const spec = raw.startsWith("+") ? raw.slice(1) : raw
     if (spec === "") continue
     const colon = spec.indexOf(":")
     if (colon === -1) {
-      // A fetch refspec with no destination implies refs/remotes/<remote>/<branch>.
-      if (!spec.startsWith("refs/heads/")) continue
-      specs.push({ source: spec, destination: `refs/remotes/${remote}/${spec.slice("refs/heads/".length)}` })
+      // A source-only refspec declares NO destination: real Git writes FETCH_HEAD and creates no ref at
+      // all. Synthesizing refs/remotes/<remote>/<branch> here would fabricate a mapping for a local ref
+      // Git never wrote, and a fabricated tracker would then read as `equal`.
       continue
     }
     const source = spec.slice(0, colon)
@@ -192,8 +192,8 @@ type MappedSource = Readonly<{ remote: string; source: string }>
  */
 function mappingForRef(remotes: ReadonlyMap<string, readonly string[]>, ref: string): readonly MappedSource[] {
   const matches: MappedSource[] = []
-  for (const [remote, specs] of remotes) {
-    for (const spec of parseFetchRefspecs(remote, specs)) {
+  for (const [remote, lines] of remotes) {
+    for (const spec of parseFetchRefspecs(lines)) {
       const source = mapThrough(spec, ref)
       if (source !== null) matches.push({ remote, source })
     }
