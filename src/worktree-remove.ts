@@ -66,9 +66,13 @@ export async function superWorktreeRemove(options: SuperWorktreeRemoveOptions): 
       // discard nobody can read the cause of later is a mistake with extra steps (@cto 2026-10-11).
       journal: (record) => {
         discarded.push(record)
+        // F1 (@cto 0d4c5e3a): this line is written BEFORE the deletion, so it says "discarding", not "discarded" —
+        // a removal that then fails must not read as a completed deletion. The stores that actually went are named
+        // in the result's own discardedStores, which exists only after the removal returned.
         options.report?.(
-          `git-super: @gate/git-worktree-private-store: discarded store ${record.store} (${record.path}) ` +
-            `actor=${record.actor ?? "(no actor token)"} reason=${JSON.stringify(record.reason)}\n`,
+          `git-super: @gate/git-worktree-private-store: discarding store ${record.store} (${record.path}) ` +
+            `actor=${record.actor ?? "(no actor token)"} reason=${JSON.stringify(record.reason)} ` +
+            `(journaled before deletion)\n`,
         )
       },
     })

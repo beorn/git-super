@@ -720,6 +720,16 @@ async function runInvocation(
         reason?: string
         actor?: string
       }
+      // F3 (@cto 0d4c5e3a): --reason and --actor describe a DELIBERATE discard. Without the flag they changed
+      // nothing and said nothing — the silent-ignore NO SILENT ERRORS refuses — so a caller who typed them beside
+      // a plain removal learns here, before anything runs, that nothing would have read them.
+      if (options.discardPrivateStore !== true && (options.reason !== undefined || options.actor !== undefined)) {
+        usage =
+          "git-super: --reason and --actor have no meaning without --discard-private-store\n" +
+          "  a plain worktree removal destroys no declared-private store, so nothing reads either flag; " +
+          'pass --discard-private-store with --reason "<text>" to delete one on purpose\n'
+        return
+      }
       captured = {
         node: commands.worktree.remove,
         params: {

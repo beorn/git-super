@@ -9,6 +9,7 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs"
 import { join } from "node:path"
 import { afterEach, expect, it } from "vitest"
 import { createLocalGitWorktreeStore } from "../src/worktree.ts"
+import { runCli } from "../src/cli.ts"
 import {
   assertNoPrivateStore,
   assertNoPrivateStoreAcrossPrune,
@@ -21,6 +22,16 @@ const roots: string[] = []
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
 })
+
+function outputSink(): Readonly<{ output(): string; write(value: string): void }> {
+  let written = ""
+  return {
+    output: () => written,
+    write(value) {
+      written += value
+    },
+  }
+}
 
 /**
  * A checkout that carries a submodule its own `.gitmodules` declares `private = true`, plus the
@@ -349,4 +360,24 @@ it("deletes the store on purpose with a reason, and journals the actor and the r
   expect(journal[0]?.reason).toBe("abandoned unpushed draft")
   expect(journal[0]?.actor).toBe("seat-under-test")
   expect(existsSync(store)).toBe(false)
+})
+
+// F3 (@cto 0d4c5e3a): --reason and --actor describe a DELIBERATE discard. Beside a plain removal commander took
+// them and the removal read neither — a silently ignored flag, which NO SILENT ERRORS refuses. The refusal comes
+// before anything runs, so the worktree and the store are untouched.
+it.each(["--reason", "--actor"])("refuses %s beside a plain removal instead of ignoring it", async (flag) => {
+  const root = mkdtempSync(join(canonicalTmpdir(), "git-super-private-ignored-flag-"))
+  roots.push(root)
+  const { repo, linked, store } = privateFixture(root)
+  const stderr = outputSink()
+  const code = await runCli(
+    ["--repo", repo, "worktree", "remove", linked, "--retain", join(root, "retained"), flag, "seat-under-test"],
+    outputSink(),
+    stderr,
+  )
+  expect(code).toBe(2)
+  expect(stderr.output()).toContain("--discard-private-store")
+  expect(stderr.output()).toContain(flag)
+  expect(existsSync(store)).toBe(true)
+  expect(existsSync(linked)).toBe(true)
 })

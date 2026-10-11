@@ -967,6 +967,11 @@ describe("git super worktree add", () => {
     expect(code).toBe(2)
     expect(stderr.output).toContain("Could not read from remote repository")
     expect(stderr.output).toContain("the worktree was removed")
+    // F2 (@cto 0d4c5e3a): the rollback deleted a declared-private store, and it says so by name. Naming it is
+    // also this arm's non-vacuity proof: the store is gone by the time we can look, so the failure detail is the
+    // only artefact that can show the store EXISTED when rollback ran.
+    expect(stderr.output).toMatch(/Discarded 1 declared-private store the add had just laid down:/u)
+    expect(stderr.output).toContain("aaa-secret")
     expect(existsSync(worktree)).toBe(false)
     expect(git(fixture.product, ["worktree", "list", "--porcelain"])).not.toContain(worktree)
   })

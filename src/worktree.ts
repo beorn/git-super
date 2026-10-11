@@ -344,6 +344,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
     path: string,
     excludedSubmodules?: readonly string[],
     discardPrivateStore?: Readonly<{ reason: string; actor?: string | null }>,
+    journal?: (record: PrivateStoreDiscard) => void,
   ) => {
     await assertRemovalRoot(path)
     const gitDir = realpathSync(await git.text(path, ["rev-parse", "--absolute-git-dir"]))
@@ -352,13 +353,14 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
     // 28661: the DECLARATION decides whether the store inside this admin dir is private, not the caller's
     // exclusion list. Runs BEFORE the custody walk, so an empty list can no longer mean "no question asked";
     // a caller proves custody by ADDING an exclusion, never by naming nothing.
+    const sink = journal ?? options.journal
     await assertNoPrivateStore(configuredProcess(), {
       adminDir: gitDir,
       repository: repo,
       head,
       ...(excludedSubmodules === undefined ? {} : { excludedSubmodules }),
       ...(discardPrivateStore === undefined ? {} : { discardPrivateStore }),
-      ...(options.journal === undefined ? {} : { journal: options.journal }),
+      ...(sink === undefined ? {} : { journal: sink }),
     })
     // 28661: the same declared-private stores the guard just judged, named for retention to LEAVE BEHIND. A
     // private store is never copied into retained-modules, however its custody was proved (chief c8a3b06d).
@@ -502,6 +504,13 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         noRehome?: boolean
         /** The operator's override for a declared-private store inside this admin dir; the reason is REQUIRED. */
         discardPrivateStore?: Readonly<{ reason: string; actor?: string | null }>
+        /**
+         * The caller's sink for THIS removal's discard records (F2, @cto 0d4c5e3a). It travels with
+         * `discardPrivateStore` because the guard that decides a discard is the one that journals it: a per-call
+         * sink is what lets a caller READ what its own removal just deleted, where the store's own journal only
+         * lets the store WRITE. Absent means this call falls back to the store's journal, never to silence.
+         */
+        journal?: (record: PrivateStoreDiscard) => void
       }> = {},
     ): Promise<void | Readonly<{ borrowers: readonly string[] }>> {
       await assertRemovalRoot(path)
@@ -517,6 +526,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
           path,
           removeOptions.excludedSubmodules,
           removeOptions.discardPrivateStore,
+          removeOptions.journal,
         )
         if (notCompared.some((entry) => entry.reason !== "excluded")) {
           throw Object.assign(

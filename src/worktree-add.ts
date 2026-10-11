@@ -9,6 +9,7 @@ import { validateExcludedSubmodules } from "./git.ts"
 import { gitSuperResult, type GitResultDetail, type GitSuperResult } from "./result.ts"
 import { materializeSubmodulesFromLocalWorktreeParallel } from "./submodules.ts"
 import { createLocalGitWorktreeStore, type GitWorktreeStore } from "./worktree.ts"
+import type { PrivateStoreDiscard } from "./worktree-removal.ts"
 
 /**
  * Owner attribution for a worktree registration (@i/4-supervision/24306).
@@ -346,7 +347,11 @@ function counts(gitlinks: WorktreeGitlinkCounts): string {
  * standing. Collapsing them into one "failed" is how a caller retries into an
  * existing path and gets a second, unrelated error.
  */
-async function rollback(store: GitWorktreeStore, path: string): Promise<string | undefined> {
+async function rollback(
+  store: GitWorktreeStore,
+  path: string,
+): Promise<Readonly<{ failure?: string; discarded: readonly PrivateStoreDiscard[] }>> {
+  const discarded: PrivateStoreDiscard[] = []
   try {
     await store.remove(path, {
       operation: `git super worktree add rollback ${path}`,
@@ -359,10 +364,14 @@ async function rollback(store: GitWorktreeStore, path: string): Promise<string |
       // store standing and force the operator to reach for the data-loss override to undo a command that
       // promised to undo itself.
       discardPrivateStore: { reason: "git super worktree add rollback" },
+      // F2 (@cto 0d4c5e3a): this discard was SILENT — the removal gate journaled to nobody, so a failure detail
+      // said only "the worktree was removed" while a private store had just been deleted. The sink belongs to the
+      // caller, and the caller names every store in the failure it returns.
+      journal: (record) => discarded.push(record),
     })
-    return undefined
+    return { discarded }
   } catch (error) {
-    return message(error)
+    return { failure: message(error), discarded }
   }
 }
 
@@ -527,14 +536,21 @@ export async function superWorktreeAdd(options: SuperWorktreeAddOptions): Promis
     }
   } catch (error) {
     const reason = message(error)
-    const undone = await rollback(store, path)
+    const { failure: undone, discarded } = await rollback(store, path)
+    // F2 (@cto 0d4c5e3a): a rollback that deleted declared-private bytes says so, by name, in the failure the
+    // operator reads. A deletion nobody can find later is a mistake with extra steps.
+    const deleted =
+      discarded.length === 0
+        ? ""
+        : `\nDiscarded ${String(discarded.length)} declared-private store${discarded.length === 1 ? "" : "s"} the add had just laid down: ` +
+          discarded.map((entry) => `${entry.path} (store ${entry.store})`).join(", ")
     if (undone === undefined) {
       return failed(
         "failed",
         detail(
           "worktree-materialize-failed",
           "materialize",
-          `${at(path, options.commit, commit)} failed; the worktree was removed.\n${reason}`,
+          `${at(path, options.commit, commit)} failed; the worktree was removed.${deleted}\n${reason}`,
           "Repair the reported submodule condition, then rerun the same git super worktree add command.",
         ),
         commit,
@@ -547,7 +563,7 @@ export async function superWorktreeAdd(options: SuperWorktreeAddOptions): Promis
         "worktree-rollback-failed",
         "rollback",
         `${at(path, options.commit, commit)} failed AND the worktree could not be removed; ` +
-          `'${path}' is left half-materialized.\n${reason}\nrollback: ${undone}`,
+          `'${path}' is left half-materialized.${deleted}\n${reason}\nrollback: ${undone}`,
         `Inspect '${path}', remove it with 'git -C ${repo} worktree remove --force ${path}', then rerun.`,
       ),
       commit,
