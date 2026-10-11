@@ -348,7 +348,18 @@ function counts(gitlinks: WorktreeGitlinkCounts): string {
  */
 async function rollback(store: GitWorktreeStore, path: string): Promise<string | undefined> {
   try {
-    await store.remove(path, { operation: `git super worktree add rollback ${path}` })
+    await store.remove(path, {
+      operation: `git super worktree add rollback ${path}`,
+      // 28661 (@dev/13): an add that materialized a declared-private child (`--include-private`) OWNS the store
+      // it just laid down, and its atomicity contract — "either the worktree stands with all of its submodules
+      // materialized, or it does not stand at all" — must survive the removal gate. The worktree and its admin
+      // dir are this process's own, so any declared-private store inside was created here moments ago; the
+      // reasoned discard is exactly that undo. The reason is REQUIRED by the guard and is journaled, with the
+      // resolved actor, before any byte goes; without it a later materialize failure would leave a private
+      // store standing and force the operator to reach for the data-loss override to undo a command that
+      // promised to undo itself.
+      discardPrivateStore: { reason: "git super worktree add rollback" },
+    })
     return undefined
   } catch (error) {
     return message(error)

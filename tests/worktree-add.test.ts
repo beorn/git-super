@@ -936,6 +936,41 @@ describe("git super worktree add", () => {
     expect(git(fixture.product, ["worktree", "list", "--porcelain"])).not.toContain(worktree)
   })
 
+  it("removes the private store an --include-private add just laid down when a later pin is unreachable", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-worktree-private-rollback-"))
+    roots.push(fixtureRoot)
+    const fixture = createSuperproject(fixtureRoot)
+    // A declared-private child that --include-private materializes, laying down the store...
+    const secret = join(fixtureRoot, "secret")
+    initRepository(secret, "secret.ts", "export const secret = 1\n")
+    git(fixture.product, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", secret, "vendor/aaa-secret"])
+    git(fixture.product, ["config", "-f", ".gitmodules", "submodule.vendor/aaa-secret.private", "true"])
+    git(fixture.product, ["add", ".gitmodules", "vendor/aaa-secret"])
+    git(fixture.product, ["commit", "-q", "-m", "declare vendor/aaa-secret private"])
+    // ...and a second child whose pin cannot be fetched, so the add fails AFTER the store exists.
+    const { pin, commit } = publishUnfetchedPin(fixture, fixtureRoot)
+    git(fixture.product, ["config", "--local", "protocol.file.allow", "always"])
+    rmSync(fixture.dependency, { recursive: true, force: true })
+    expect(referenceStoreHas(fixture, pin)).toBe(false)
+    const worktree = join(fixtureRoot, "candidate")
+    const stdout = outputSink()
+    const stderr = outputSink()
+
+    const code = await runCli(
+      ["--repo", fixture.product, "worktree", "add", worktree, commit, "--include-private", "vendor/aaa-secret"],
+      stdout,
+      stderr,
+    )
+
+    // The add promised atomicity. Its OWN rollback must not be turned into a refusal by the removal gate: the
+    // worktree and the private store it laid down both go, and the named failure stays the unreachable pin.
+    expect(code).toBe(2)
+    expect(stderr.output).toContain("Could not read from remote repository")
+    expect(stderr.output).toContain("the worktree was removed")
+    expect(existsSync(worktree)).toBe(false)
+    expect(git(fixture.product, ["worktree", "list", "--porcelain"])).not.toContain(worktree)
+  })
+
   it("borrows from the repository --reference names rather than the one it stands in", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-worktree-reference-"))
     roots.push(fixtureRoot)
