@@ -22,7 +22,7 @@ import { fileLockHolders, formatLockHolders } from "@bearly/flock/holders"
 import { spawnSync } from "node:child_process"
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { classifyExcludedPath, inspectExcludedCheckout, superStatus, type SuperStatusResult } from "./status.ts"
-import { readCommitSubmodules, type SelectedCommitSubmodules } from "./commit-graph.ts"
+import { readCommitSubmodules, readPrivateSubmodules, type SelectedCommitSubmodules } from "./commit-graph.ts"
 import type { PrivateGitProjection } from "./private-git-projection.ts"
 import { alternatesLineage } from "./alternates.ts"
 import { validateExcludedSubmodules } from "./git.ts"
@@ -30,6 +30,261 @@ import type { GitProcess } from "./process.ts"
 import type { NotCompared } from "./diff.ts"
 import type { Git, WorktreeInspection } from "./worktree.ts"
 import { removalBorrowers, type RemovalBorrower } from "./worktree-administration.ts"
+
+/** What a removal guard needs to know about the store it is about to destroy (28661). */
+export type PrivateStoreCustody = Readonly<{
+  /** Absolute Git dir of the worktree being removed; the store it may destroy lives at `<adminDir>/modules/<name>`. */
+  adminDir: string
+  /** The superproject whose commits carry the `.gitmodules` declarations. */
+  repository: string
+  /** The target worktree's own HEAD commit. */
+  head: string
+  /** Paths the caller has ALREADY taken custody of. A declared-private path here is the caller's proof, not an exemption. */
+  excludedSubmodules?: readonly string[]
+  /**
+   * The operator's explicit decision to delete a declared-private store on purpose (28661 gate
+   * `git-worktree-private-store`). The reason is REQUIRED: an override with an empty one is refused by name,
+   * never read as consent. One journal record per covered store is written BEFORE the deletion, so the actor
+   * and the reason outlive the bytes they describe.
+   */
+  discardPrivateStore?: Readonly<{ reason: string; actor?: string | null }>
+  /** The caller's sink for a discard record. Absent means the caller keeps no journal, not that none happened. */
+  journal?: (record: PrivateStoreDiscard) => void
+}>
+
+/** One refused store, named so a caller can be told exactly which bytes were about to go. */
+export type PrivateStoreRefusal = Readonly<{ name: string; path: string; head: string; store: string }>
+
+/**
+ * One store an override deleted on purpose, with the reason it was deleted and the actor who decided, when the
+ * caller could resolve one — `null` says plainly that it could not, so a journal never reads as "no actor
+ * needed". A deletion nobody can read the cause of later is a mistake with extra steps (@cto 2026-10-11).
+ */
+export type PrivateStoreDiscard = Readonly<{
+  name: string
+  path: string
+  store: string
+  reason: string
+  actor: string | null
+}>
+
+/**
+ * What a removal's journal records actually MEAN, measured rather than assumed (F2; @dev/4 7d4a2522, revised by
+ * @dev/4 e73f8644).
+ *
+ * The guard journals the DECISION — it runs before the bytes go (`assertNoPrivateStore`, at `:246`) — so on a
+ * failed removal a record is evidence of intent, never of a completed delete. A caller that reports the outcome
+ * must therefore measure it, and the measurement has THREE outcomes that must stay apart (@dev/4 e73f8644):
+ * a store PROVEN absent (ENOENT) is discarded; a store observed present is standing; and a lookup that could not
+ * answer (EACCES/EPERM/ELOOP/ENOTDIR — a chmod000 parent is not a deleted store) is UNKNOWN, carrying the path
+ * and the cause, never folded into either pile. `existsSync` alone conflated the last with the first, and read
+ * every path twice: the asymmetry that produced (true,false omits a path, false,true lists it twice) is exactly
+ * what ONE observation per record removes.
+ *
+ * `lookup` is injectable so the split is testable without racing a real removal or depending on which uid runs.
+ */
+export type StorePresence =
+  | Readonly<{ kind: "present" }>
+  | Readonly<{ kind: "absent" }>
+  | Readonly<{ kind: "unknown"; cause: string }>
+
+export type StoreLookup = (store: string) => StorePresence
+
+/**
+ * ONE metadata observation of a store's path. `lstatSync` (not `statSync`/`existsSync`): a store is a directory
+ * in place, and following a symlink would answer about a different path than the one being removed. Only ENOENT
+ * proves absence; every other failure is `unknown` with its errno text — the difference between "I deleted your
+ * private bytes" and "I could not tell whether they are there".
+ */
+export function observeStorePresence(store: string): StorePresence {
+  try {
+    lstatSync(store)
+    return { kind: "present" }
+  } catch (error) {
+    const code = errnoCode(error)
+    if (code === "ENOENT") return { kind: "absent" }
+    // Bun/node already prefix the message with the errno code ("EACCES: permission denied, …"), so prefix only a
+    // throw that does not carry it: the reason must read once, not as "EACCES: EACCES: …".
+    const described = error instanceof Error ? error.message : String(error)
+    return {
+      kind: "unknown",
+      cause: code === undefined || described.startsWith(code) ? described : `${code}: ${described}`,
+    }
+  }
+}
+
+/** The errno code of a thrown fs error, or undefined when the throw is not an errno-shaped one. */
+function errnoCode(error: unknown): string | undefined {
+  return typeof error === "object" && error !== null && "code" in error && typeof error.code === "string"
+    ? error.code
+    : undefined
+}
+
+export function classifyDiscardedStores(
+  records: readonly PrivateStoreDiscard[],
+  lookup: StoreLookup = observeStorePresence,
+): Readonly<{
+  discarded: readonly PrivateStoreDiscard[]
+  standing: readonly PrivateStoreDiscard[]
+  unknown: readonly Readonly<{ record: PrivateStoreDiscard; cause: string }>[]
+}> {
+  const discarded: PrivateStoreDiscard[] = []
+  const standing: PrivateStoreDiscard[] = []
+  const unknown: { record: PrivateStoreDiscard; cause: string }[] = []
+  for (const record of records) {
+    // ONE observation per record, taken once and reused — never a second lookup whose answer could disagree.
+    const presence = lookup(record.store)
+    if (presence.kind === "absent") discarded.push(record)
+    else if (presence.kind === "present") standing.push(record)
+    else unknown.push({ record, cause: presence.cause })
+  }
+  return { discarded, standing, unknown }
+}
+
+/** One discard record rendered for operator-facing text: the store, its section and the checkout it came from. */
+export function nameDiscardedStore(record: PrivateStoreDiscard): string {
+  return `${record.store} (section ${record.name}, from ${record.path})`
+}
+
+/**
+ * The refusal as a CLASS, so a caller can tell "these bytes must not be deleted" from "git failed" without
+ * matching message text. A queue that has to discard a tree skips it, names it once and continues on a refusal;
+ * anything else still stops the round. Same message, same named stores — only the type is new (@cto C4).
+ */
+export class PrivateStoreRefusalError extends Error {
+  constructor(
+    message: string,
+    /**
+     * The refused stores, structured. A caller that must NAME the route (yrd's env close, 27120) reads the
+     * guard's own answer from here rather than re-deriving `modules/<name>` or parsing this message.
+     */
+    readonly refusals: readonly PrivateStoreRefusal[] = [],
+  ) {
+    super(message)
+    this.name = "PrivateStoreRefusalError"
+  }
+}
+
+/**
+ * The commits whose declaration decides whether a store inside `adminDir` is private: the target's own HEAD,
+ * plus the repository's current `main` when it differs (chief custody ruling (b), 2026-10-11 — a store is
+ * private for what it holds, not for how old the target's HEAD is). ONE function owns this key, so the ruling
+ * can change without a second copy of it appearing beside the guard.
+ */
+async function privateDeclarationHeads(process: GitProcess, repository: string, head: string): Promise<string[]> {
+  // `for-each-ref` exits 0 with EMPTY output when the ref is absent, so "no main here" is an answer this guard
+  // can read without ever collapsing a broken transport into it. (`rev-parse --verify --quiet` exits 1, which a
+  // seam may surface as either a code or a throw, and one of those two would have had to be guessed at.)
+  const result = await process.run({
+    repo: repository,
+    args: ["for-each-ref", "--format=%(objectname)", "refs/heads/main"],
+  })
+  if (result.code !== 0) {
+    throw new Error(
+      `cannot read refs/heads/main in ${repository} before judging a private store: ${result.stderr.trim() || `exit ${result.code}`}`,
+    )
+  }
+  const main = result.stdout.trim()
+  const heads = [head]
+  if (main !== "" && main !== head) heads.push(main)
+  return heads
+}
+
+/**
+ * Every declared-private store that EXISTS under one admin dir's `modules` tree, each with the section name
+ * whose directory holds it. ONE reader (`readPrivateSubmodules`) keyed by the ONE declaration-head function, so
+ * the refusal guard and the retention copy can never disagree about which directories are private.
+ *
+ * `excluded` is the CALLER's custody proof and is honoured only where the caller asked for it (the guard).
+ * Retention passes none: a private store is NEVER copied into retained-modules, however its custody was proved
+ * (@cto 2026-10-11; chief ruling c8a3b06d).
+ */
+async function privateStoresIn(
+  process: GitProcess,
+  repository: string,
+  head: string,
+  adminDir: string,
+  excluded: ReadonlySet<string>,
+): Promise<PrivateStoreRefusal[]> {
+  const modules = join(adminDir, "modules")
+  if (!present(modules)) return []
+  const refusals: PrivateStoreRefusal[] = []
+  for (const at of await privateDeclarationHeads(process, repository, head)) {
+    for (const declared of await readPrivateSubmodules(process, repository, at)) {
+      if (excluded.has(declared.path)) continue
+      const store = join(modules, declared.name)
+      if (!present(store)) continue
+      if (refusals.some((entry) => entry.store === store)) continue
+      refusals.push({ name: declared.name, path: declared.path, head: at, store })
+    }
+  }
+  return refusals
+}
+
+/**
+ * The section names of the declared-private stores that exist under `adminDir`, for retention to LEAVE BEHIND.
+ * No exclusion set is applied: a store the declaration calls private is never copied into retained-modules, and a
+ * caller that proved custody of one has proved what it may DELETE, not what it may copy (28661; chief c8a3b06d).
+ */
+export async function declaredPrivateStoreNames(
+  process: GitProcess,
+  repository: string,
+  head: string,
+  adminDir: string,
+): Promise<readonly string[]> {
+  const stores = await privateStoresIn(process, repository, head, adminDir, new Set())
+  return [...new Set(stores.map((entry) => entry.name))].sort()
+}
+
+/**
+ * Refuse a removal whose target admin dir holds the Git store of a submodule a removal-visible declaration
+ * calls private — unless the caller declared that path excluded.
+ *
+ * 28661. `assertExcludedRemovalCustody` returned early on an EMPTY exclusion list, so every caller naming no
+ * exclusion took Git's plain removal and destroyed `<admin dir>/modules/<name>` without ever proving the
+ * bytes inside it: bay cleanup, a reaper, a cleanup sweep, a hand run. The DECLARATION decides, never the
+ * caller's list. A caller may ADD an exclusion — that is how custody is proved, and R2 then judges the store —
+ * but it can never turn this refusal off by naming nothing.
+ *
+ * The guard reads declarations and EXISTENCE only: it never reads, copies, hashes or renames a byte inside the
+ * store (27058; chief ruling c8a3b06d).
+ */
+export async function assertNoPrivateStore(process: GitProcess, custody: PrivateStoreCustody): Promise<void> {
+  const refusals = await privateStoresIn(
+    process,
+    custody.repository,
+    custody.head,
+    custody.adminDir,
+    new Set(custody.excludedSubmodules ?? []),
+  )
+  if (refusals.length === 0) return
+  const discard = custody.discardPrivateStore
+  if (discard !== undefined) {
+    // The reason is REQUIRED, and an empty one is refused by name rather than read as consent. A silent pass
+    // here would turn "delete on purpose" into "delete with nobody able to say why" (NO SILENT ERRORS).
+    if (discard.reason.trim() === "") {
+      throw new PrivateStoreRefusalError(
+        `@gate/git-worktree-private-store: --discard-private-store requires --reason "<text>": the guard refuses ` +
+          `to delete ${refusals.map((entry) => entry.store).join(", ")} on purpose with no reason anyone can read later`,
+        refusals,
+      )
+    }
+    const actor = discard.actor ?? null
+    for (const entry of refusals) {
+      custody.journal?.({ name: entry.name, path: entry.path, store: entry.store, reason: discard.reason, actor })
+    }
+    return
+  }
+  throw new PrivateStoreRefusalError(
+    `@gate/git-worktree-private-store: worktree removal would destroy a private submodule store: ${refusals
+      .map((entry) => `${entry.path} (section ${entry.name}) store ${entry.store}, declared private at ${entry.head}`)
+      .join("; ")}; worktree preserved; take custody of each store first (the operator empties the checkout, runs ` +
+      `'git super worktree private-store verify <store> --checkout <checkout>', then removes the store), then ` +
+      `retry — or pass --exclude-submodule for a path whose custody you have already proved, or ` +
+      `--discard-private-store --reason "<text>" to delete the store on purpose`,
+    refusals,
+  )
+}
 
 export type WorktreeRemovalProof = Readonly<{
   path: string

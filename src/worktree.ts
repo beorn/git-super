@@ -780,3 +780,16 @@ async function unlockWorktree(git: Git, repo: string, path: string): Promise<voi
 function withHookPolicy(args: readonly string[], policy: WorktreeHookPolicy | undefined): string[] {
   return policy === "quarantine" ? ["-c", "core.hooksPath=/dev/null", ...args] : [...args]
 }
+
+/**
+ * The private-store custody reader belongs to the same public surface as the removal it guards, so a caller
+ * that removes a worktree WITHOUT the git-super primitive (a plain `rmSync`, a bare `git worktree prune`, the
+ * `yrd env close` refusal, 27058) reaches the ONE implementation rather than writing a second one beside it.
+ */
+export {
+  assertNoPrivateStore,
+  PrivateStoreRefusalError,
+  type PrivateStoreCustody,
+  type PrivateStoreRefusal,
+  type PrivateStoreDiscard,
+} from "./worktree-removal.ts"
