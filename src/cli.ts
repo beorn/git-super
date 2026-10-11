@@ -702,18 +702,26 @@ async function runInvocation(
     })
   privateStore
     .command("verify")
-    .description(commands.worktree["private-store"].verify.description ?? commands.worktree["private-store"].verify.title)
-    .option("--checkout <path>", "the excluded checkout this store belongs to, named in the operator's path block")
+    .description(
+      commands.worktree["private-store"].verify.description ?? commands.worktree["private-store"].verify.title,
+    )
+    .option(
+      "--checkout <path>",
+      "the excluded checkout this store belongs to (required); its absent-or-empty state is the empty-first precondition",
+    )
     .argument("<store>", "the private store directory, a worktree admin dir's modules/<name>")
     .action((store, _options, command) => {
       const globals = command.optsWithGlobals() as { repo: string; json?: boolean }
       const options = command.opts() as { checkout?: string }
+      if (options.checkout === undefined || options.checkout === "") {
+        usage =
+          "git-super: worktree private-store verify requires --checkout <path>: the empty-first precondition is stated against it\n" +
+          command.helpInformation()
+        return
+      }
       captured = {
         node: commands.worktree["private-store"].verify,
-        params: {
-          store,
-          ...(options.checkout === undefined ? {} : { checkout: options.checkout }),
-        },
+        params: { store, checkout: options.checkout },
         json: globals.json === true,
         nul: false,
       }

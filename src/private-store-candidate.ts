@@ -1,3 +1,4 @@
+import { readdirSync } from "node:fs"
 import { advertisements } from "./observe.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
 import { shellQuote } from "./shell-command.ts"
@@ -16,6 +17,10 @@ import { shellQuote } from "./shell-command.ts"
  * What it reads: ref names and values, HEAD, and the store's own configured fetch refspecs.
  * What it never reads: the working tree, the index, the reflog, or any object content. That is the
  * point — a route that needs the private bytes to be *looked at* is the operator's, by design.
+ *
+ * The ruled ORDER is enforced, not trusted: the operator looks at the checkout, EMPTIES it, and only
+ * then does this run. A populated checkout is a named refusal, because a `candidate` from an env whose
+ * private checkout still holds bytes would be evidence for the state the operator is trying to leave.
  */
 
 /** Printed with every verdict, verbatim. The scope of the proof, stated where a reader will see it. */
@@ -62,8 +67,11 @@ export type PrivateStoreHeadRow = Readonly<{
 export type PrivateStoreCandidateOptions = Readonly<{
   /** The store path (the `modules/<name>` directory inside a worktree's admin dir). */
   store: string
-  /** The excluded checkout the store belongs to, for the operator's path-only block. Never read. */
-  checkout?: string
+  /**
+   * The excluded checkout this store belongs to. Required: its absent-or-empty state IS the ruled
+   * empty-first precondition, and the operator's path-only block names it. Only ever listed, never read.
+   */
+  checkout: string
   git?: GitProcess
 }>
 
@@ -71,7 +79,7 @@ export type PrivateStoreCandidateResult = Readonly<{
   version: 1
   verdict: PrivateStoreVerdict
   store: string
-  checkout: string | null
+  checkout: string
   refs: readonly PrivateStoreRefRow[]
   head: PrivateStoreHeadRow | null
   reasons: readonly PrivateStoreReason[]
@@ -173,6 +181,44 @@ function mapThrough(spec: RefSpec, ref: string): string | null {
   return spec.source.replace("*", ref.slice(prefix.length, ref.length - suffix.length))
 }
 
+/** One configured remote whose fetch refspec destination matches a local ref, with the mapped source. */
+type MappedSource = Readonly<{ remote: string; source: string }>
+
+/**
+ * V1's mapping is derived from the store's OWN configured fetch refspecs, never from the
+ * `refs/remotes/<remote>/<name>` convention, so a narrow or mirror destination maps correctly. Every
+ * match is returned: if two configured remotes map this ref to sources they advertise with different
+ * values, that disagreement is named rather than resolved silently.
+ */
+function mappingForRef(remotes: ReadonlyMap<string, readonly string[]>, ref: string): readonly MappedSource[] {
+  const matches: MappedSource[] = []
+  for (const [remote, specs] of remotes) {
+    for (const spec of parseFetchRefspecs(remote, specs)) {
+      const source = mapThrough(spec, ref)
+      if (source !== null) matches.push({ remote, source })
+    }
+  }
+  return matches
+}
+
+/** Sentinel for "the mapped source is not advertised by its own remote" inside a Set of advertised values. */
+const UNADVERTISED = "\u0000unadvertised"
+
+/**
+ * The checkout's occupancy from a directory listing only — no entry name and no content ever leaves
+ * here. `absent` is acceptable: an absent checkout has nothing to empty. R2(a) uses the same
+ * absent/empty/populated vocabulary for the removal refusal.
+ */
+function checkoutOccupancy(checkout: string): "absent" | "empty" | "populated" | "unreadable" {
+  let entries: readonly string[]
+  try {
+    entries = readdirSync(checkout)
+  } catch (cause) {
+    return (cause as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : "unreadable"
+  }
+  return entries.length === 0 ? "empty" : "populated"
+}
+
 /** The advertised `HEAD` of one remote. `--refs` excludes HEAD, so this is its own request. */
 async function advertisedHead(git: GitProcess, repo: string, remote: string): Promise<string | null> {
   const output = await read(git, repo, ["ls-remote", remote, "HEAD"])
@@ -191,18 +237,41 @@ export async function verifyPrivateStoreCandidate(
   options: PrivateStoreCandidateOptions,
 ): Promise<PrivateStoreCandidateResult> {
   const store = options.store
-  const checkout = options.checkout ?? null
+  const checkout = options.checkout
   const base: Pick<PrivateStoreCandidateResult, "version" | "store" | "checkout" | "notCovered"> = {
     version: 1,
     store,
     checkout,
     notCovered: PRIVATE_STORE_NOT_COVERED,
   }
-  const paths = [...(checkout === null ? [] : [shellQuote(checkout)]), shellQuote(store)]
+  const paths = [shellQuote(checkout), shellQuote(store)]
 
   const git = readonlyGit(options.git ?? createLocalGitProcess(globalThis.process.env, { attempts: 1 }))
   try {
     await read(git, store, ["rev-parse", "--git-dir"])
+
+    const reasons: PrivateStoreReason[] = []
+    const refRows: PrivateStoreRefRow[] = []
+
+    // The empty-first precondition, ENFORCED here rather than trusted (the ruled order is: the
+    // operator looks, empties the checkout, THEN the verifier runs). A `candidate` emitted while the
+    // checkout still holds bytes would be evidence for the wrong state, so a populated checkout is a
+    // named refusal. This is a directory listing only; no entry name reaches the result.
+    const occupancy = checkoutOccupancy(checkout)
+    if (occupancy === "unreadable") {
+      throw new PrivateStoreFailure(
+        "invalid",
+        "checkout-unreadable",
+        `${checkout}: the excluded checkout could not be listed; nothing is proven`,
+      )
+    }
+    if (occupancy === "populated") {
+      reasons.push({
+        code: "checkout-not-empty",
+        ref: null,
+        message: `${checkout}: the excluded checkout is not empty; empty it first — the working tree, the index and reflog-only commits are the operator's own look`,
+      })
+    }
 
     const remoteListing = await read(git, store, ["config", "--get-regexp", "^remote\\..*\\.fetch$"])
     const remotes = new Map<string, readonly string[]>()
@@ -212,12 +281,27 @@ export async function verifyPrivateStoreCandidate(
       remotes.set(match[1], [...(remotes.get(match[1]) ?? []), match[2]])
     }
 
-    // Query every configured remote once. A remote that cannot be reached makes the WHOLE verdict
-    // `unproven`: an unqueried remote must never be read as "this ref is not advertised".
+    // Query every configured remote once and keep each remote's OWN advertisement. A remote that
+    // cannot be reached makes the WHOLE verdict `unproven`, and a flattened map would let one
+    // remote's value stand in for another's — the identity defect a peer read named.
+    const advertisedByRemote = new Map<string, ReadonlyMap<string, string>>()
     const advertised = new Map<string, string>()
     const ambiguous = new Set<string>()
     for (const remote of remotes.keys()) {
-      const rows = await advertisements(git, store, remote)
+      let rows: Map<string, string>
+      try {
+        rows = await advertisements(git, store, remote)
+      } catch (cause) {
+        // `advertisements` carries the raw advertised line into its own error, so it is converted
+        // here into a named reason that names the remote and nothing else. No private ref escapes.
+        if (cause instanceof PrivateStoreFailure) throw cause
+        throw new PrivateStoreFailure(
+          "unproven",
+          "malformed-advert",
+          `${remote}: the remote's advertisement could not be read as refs; nothing is proven`,
+        )
+      }
+      advertisedByRemote.set(remote, rows)
       for (const [ref, value] of rows) {
         const seen = advertised.get(ref)
         if (seen !== undefined && seen !== value) ambiguous.add(ref)
@@ -226,8 +310,6 @@ export async function verifyPrivateStoreCandidate(
     }
 
     const refLines = await read(git, store, ["for-each-ref", "--format=%(refname)%00%(objectname)%00%(symref)"])
-    const reasons: PrivateStoreReason[] = []
-    const refRows: PrivateStoreRefRow[] = []
 
     for (const line of refLines.split("\n").filter(Boolean)) {
       const [ref, value, symref] = line.split("\0")
@@ -260,56 +342,56 @@ export async function verifyPrivateStoreCandidate(
         continue
       }
 
-      const tracking = TRACKING.exec(ref)
-      if (tracking !== null && tracking[1] !== undefined && tracking[2] !== undefined) {
-        const remote = tracking[1]
-        const specs = remotes.get(remote)
-        if (specs === undefined) {
-          refRows.push({ ref, mappedFrom: null, value, advertised: null, state: "unqueried-remote" })
+      // V1's mapping: every configured fetch refspec destination, from every configured remote, is a
+      // candidate mapping for this ref — never the refs/remotes pattern. The comparison is against the
+      // value THAT ref's own remote advertises for the mapped source, never another remote's.
+      const mapping = mappingForRef(remotes, ref)
+      if (mapping.length > 0) {
+        const sources = new Set(
+          mapping.map((entry) => advertisedByRemote.get(entry.remote)?.get(entry.source) ?? UNADVERTISED),
+        )
+        if (sources.size > 1) {
+          refRows.push({ ref, mappedFrom: null, value, advertised: null, state: "differs" })
           reasons.push({
-            code: "tracking-unqueried-remote",
+            code: "ambiguous-advertisement",
             ref,
-            message: `${ref}: names remote ${remote}, which this store does not configure; that remote was not queried`,
+            message: `${ref}: the configured fetch refspecs map this ref to sources the remotes advertise with different values`,
           })
           continue
         }
-        let mapped: string | null = null
-        for (const spec of parseFetchRefspecs(remote, specs)) {
-          const candidate = mapThrough(spec, ref)
-          if (candidate !== null) {
-            mapped = candidate
-            break
-          }
-        }
-        if (mapped === null) {
-          refRows.push({ ref, mappedFrom: null, value, advertised: null, state: "unmapped" })
-          reasons.push({
-            code: "unmapped",
-            ref,
-            message: `${ref}: no configured fetch refspec of remote ${remote} maps this ref`,
-          })
-          continue
-        }
-        const advertisedValue = advertised.get(mapped)
+        const mapped = mapping[0] as MappedSource
+        const advertisedValue = advertisedByRemote.get(mapped.remote)?.get(mapped.source)
         if (advertisedValue === undefined) {
-          refRows.push({ ref, mappedFrom: mapped, value, advertised: null, state: "unadvertised" })
+          refRows.push({ ref, mappedFrom: mapped.source, value, advertised: null, state: "unadvertised" })
           reasons.push({
             code: "mapped-source-unadvertised",
             ref,
-            message: `${ref}: maps to ${mapped}, which the remote does not advertise (the branch may be deleted; this commit may exist only here)`,
+            message: `${ref}: maps to ${mapped.source}, which the remote does not advertise (the branch may be deleted; this commit may exist only here)`,
           })
           continue
         }
         if (advertisedValue === value) {
-          refRows.push({ ref, mappedFrom: mapped, value, advertised: advertisedValue, state: "equal" })
+          refRows.push({ ref, mappedFrom: mapped.source, value, advertised: advertisedValue, state: "equal" })
         } else {
-          refRows.push({ ref, mappedFrom: mapped, value, advertised: advertisedValue, state: "differs" })
+          refRows.push({ ref, mappedFrom: mapped.source, value, advertised: advertisedValue, state: "differs" })
           reasons.push({
             code: "value-differs",
             ref,
-            message: `${ref}: value differs from the advertised ${mapped} (behind or diverged)`,
+            message: `${ref}: value differs from the advertised ${mapped.source} (behind or diverged)`,
           })
         }
+        continue
+      }
+
+      // A tracking ref for a remote this store does not configure: that remote was never queried.
+      const tracking = TRACKING.exec(ref)
+      if (tracking?.[1] !== undefined && !remotes.has(tracking[1])) {
+        refRows.push({ ref, mappedFrom: null, value, advertised: null, state: "unqueried-remote" })
+        reasons.push({
+          code: "tracking-unqueried-remote",
+          ref,
+          message: `${ref}: names remote ${tracking[1]}, which this store does not configure; that remote was not queried`,
+        })
         continue
       }
 

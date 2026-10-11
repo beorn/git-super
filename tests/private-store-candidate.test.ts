@@ -9,7 +9,7 @@
  * namespaces, a detached HEAD no advertised value carries, and the two ways this must never lie —
  * an unreachable remote is `unproven`, and no failure path may relay raw stderr or a private path.
  */
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { afterEach, expect, test } from "vitest"
 import {
@@ -92,7 +92,7 @@ test("a lagging tracking ref fails by name, so a fetch-and-recheck can clear it"
   const fixture = storeFixture()
   conventionalClone(fixture)
   git(fixture.store, "update-ref", "refs/remotes/origin/main", fixture.first)
-  const result = await verifyPrivateStoreCandidate({ store: fixture.store })
+  const result = await verifyPrivateStoreCandidate({ store: fixture.store, checkout: join(fixture.root, "env") })
   expect(result.verdict).toBe("not-a-candidate")
   expect(result.reasons.map((reason) => reason.code)).toEqual(["value-differs"])
   expect(result.reasons[0]?.message).toBe(
@@ -104,7 +104,7 @@ test("a tracking ref whose mapped source the remote no longer advertises is name
   const fixture = storeFixture()
   conventionalClone(fixture)
   git(fixture.store, "update-ref", "refs/remotes/origin/gone", fixture.second)
-  const result = await verifyPrivateStoreCandidate({ store: fixture.store })
+  const result = await verifyPrivateStoreCandidate({ store: fixture.store, checkout: join(fixture.root, "env") })
   expect(result.verdict).toBe("not-a-candidate")
   expect(result.reasons.map((reason) => reason.code)).toEqual(["mapped-source-unadvertised"])
   expect(result.reasons[0]?.message).toContain("maps to refs/heads/gone")
@@ -114,7 +114,7 @@ test("a tracking ref for a remote the store does not configure is never mapped s
   const fixture = storeFixture()
   conventionalClone(fixture)
   git(fixture.store, "update-ref", "refs/remotes/elsewhere/main", fixture.second)
-  const result = await verifyPrivateStoreCandidate({ store: fixture.store })
+  const result = await verifyPrivateStoreCandidate({ store: fixture.store, checkout: join(fixture.root, "env") })
   expect(result.verdict).toBe("not-a-candidate")
   expect(result.reasons.map((reason) => reason.code)).toEqual(["tracking-unqueried-remote"])
 })
@@ -124,7 +124,7 @@ test("local-only namespaces and a stash are not candidates", async () => {
   conventionalClone(fixture)
   git(fixture.store, "update-ref", "refs/notes/local", fixture.second)
   git(fixture.store, "update-ref", "refs/stash", fixture.second)
-  const result = await verifyPrivateStoreCandidate({ store: fixture.store })
+  const result = await verifyPrivateStoreCandidate({ store: fixture.store, checkout: join(fixture.root, "env") })
   expect(result.verdict).toBe("not-a-candidate")
   expect(result.reasons.map((reason) => reason.code).sort()).toEqual(["local-only", "local-stash"])
 })
@@ -132,7 +132,7 @@ test("local-only namespaces and a stash are not candidates", async () => {
 test("a detached HEAD that no advertised value carries is named", async () => {
   const fixture = storeFixture()
   git(fixture.store, "update-ref", "--no-deref", "HEAD", fixture.first)
-  const result = await verifyPrivateStoreCandidate({ store: fixture.store })
+  const result = await verifyPrivateStoreCandidate({ store: fixture.store, checkout: join(fixture.root, "env") })
   expect(result.verdict).toBe("not-a-candidate")
   expect(result.head).toMatchObject({ state: "detached", advertised: false })
   expect(result.reasons.map((reason) => reason.code)).toEqual(["detached-head-unadvertised"])
@@ -143,27 +143,42 @@ test("an unreachable remote is unproven, never a candidate and never a leaked pa
   conventionalClone(fixture)
   const privatePath = join(fixture.root, "private-remote-does-not-exist.git")
   git(fixture.store, "remote", "set-url", "origin", privatePath)
-  const result = await verifyPrivateStoreCandidate({ store: fixture.store })
+  const result = await verifyPrivateStoreCandidate({ store: fixture.store, checkout: join(fixture.root, "env") })
   expect(result.verdict).toBe("unproven")
   expect(result.reasons.map((reason) => reason.code)).toEqual(["unavailable-transport"])
   expect(JSON.stringify(result)).not.toContain(privatePath)
 })
 
-test("the verifier issues only allowlisted, read-only Git requests", async () => {
+test("the verifier issues exactly the allowlisted, read-only Git requests", async () => {
   const fixture = storeFixture()
   conventionalClone(fixture)
   const inner = createLocalGitProcess(globalThis.process.env, { attempts: 1 })
-  const seen: string[] = []
+  const seen: string[][] = []
   const git: GitProcess = {
     async run(request) {
-      seen.push(request.args[0] ?? "")
+      seen.push([...request.args])
       return inner.run(request)
     },
   }
-  const result = await verifyPrivateStoreCandidate({ store: fixture.store, git })
+  const result = await verifyPrivateStoreCandidate({
+    store: fixture.store,
+    checkout: join(fixture.root, "env"),
+    git,
+  })
   expect(result.verdict).toBe("candidate")
-  expect(seen.length).toBeGreaterThan(0)
-  for (const verb of seen) expect(PRIVATE_STORE_GIT_REQUESTS).toContain(verb)
+  // The exact argv, not membership in a verb list: nothing may read the index, the reflog, an object,
+  // or any content, and nothing may fetch, push or mutate a ref or the store.
+  expect(new Set(seen.map((args) => args.join(" ")))).toEqual(
+    new Set([
+      "rev-parse --git-dir",
+      "config --get-regexp ^remote\\..*\\.fetch$",
+      "ls-remote --refs origin",
+      "for-each-ref --format=%(refname)%00%(objectname)%00%(symref)",
+      "symbolic-ref --quiet HEAD",
+      "rev-parse HEAD",
+    ]),
+  )
+  for (const args of seen) expect(PRIVATE_STORE_GIT_REQUESTS).toContain(args[0] ?? "")
 })
 
 test("the operator card carries the verdict, named reasons, the not-covered line and the paths", async () => {
@@ -187,4 +202,125 @@ test("the operator card carries the verdict, named reasons, the not-covered line
   )
   expect(stdout.output).toContain(PRIVATE_STORE_NOT_COVERED)
   expect(lines.slice(-2)).toEqual([`'${checkout}'`, `'${fixture.store}'`])
+})
+
+test("a tracking ref is compared with its OWN remote's advertisement, never another remote's", async () => {
+  const root = mkdtempSync(join(canonicalTmpdir(), "git-super-private-store-two-"))
+  roots.push(root)
+  const work = join(root, "work")
+  const originRemote = join(root, "origin.git")
+  const upstreamRemote = join(root, "upstream.git")
+  git(root, "init", "-q", "-b", "main", work)
+  writeFileSync(join(work, "vendor.txt"), "one\n")
+  git(work, "add", "vendor.txt")
+  git(work, "commit", "-qm", "one")
+  const older = git(work, "rev-parse", "HEAD")
+  writeFileSync(join(work, "vendor.txt"), "two\n")
+  git(work, "commit", "-qam", "two")
+  const newer = git(work, "rev-parse", "HEAD")
+  git(root, "init", "-q", "--bare", "-b", "main", originRemote)
+  git(work, "remote", "add", "origin", originRemote)
+  git(work, "push", "-q", "origin", "main")
+  git(originRemote, "update-ref", "refs/heads/main", older)
+  git(root, "init", "-q", "--bare", "-b", "main", upstreamRemote)
+  git(work, "push", "-q", upstreamRemote, "main")
+  const store = join(root, "modules", "vendor", "brain8")
+  git(root, "init", "-q", "--bare", store)
+  git(store, "remote", "add", "origin", originRemote)
+  git(store, "remote", "add", "upstream", upstreamRemote)
+  git(store, "fetch", "-q", "origin")
+  git(store, "fetch", "-q", "upstream")
+  git(store, "update-ref", "refs/heads/main", newer)
+  git(store, "update-ref", "refs/remotes/origin/main", newer)
+  git(store, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+  const result = await verifyPrivateStoreCandidate({ store, checkout: join(root, "env") })
+  expect(result.verdict).toBe("not-a-candidate")
+  // origin advertises `older` under refs/heads/main while upstream advertises `newer`. A flattened
+  // cross-remote map would let upstream's value stand in for origin's and read this row as `equal`.
+  expect(result.refs.find((row) => row.ref === "refs/remotes/origin/main")).toMatchObject({
+    mappedFrom: "refs/heads/main",
+    value: newer,
+    advertised: older,
+    state: "differs",
+  })
+  expect(result.reasons.map((reason) => reason.code)).toContain("value-differs")
+})
+
+test("a configured destination outside refs/remotes is mapped, never read as local-only", async () => {
+  const fixture = storeFixture()
+  git(fixture.store, "config", "remote.origin.fetch", "+refs/heads/*:refs/cache/*")
+  git(fixture.store, "update-ref", "-d", "refs/remotes/origin/main")
+  git(fixture.store, "update-ref", "-d", "refs/remotes/origin/HEAD")
+  git(fixture.store, "fetch", "-q", "origin")
+  git(fixture.store, "update-ref", "refs/heads/main", fixture.second)
+  git(fixture.store, "update-ref", "refs/cache/main", fixture.second)
+  const result = await verifyPrivateStoreCandidate({ store: fixture.store, checkout: join(fixture.root, "env") })
+  expect(result.verdict).toBe("candidate")
+  expect(result.refs.find((row) => row.ref === "refs/cache/main")).toMatchObject({
+    mappedFrom: "refs/heads/main",
+    state: "equal",
+  })
+})
+
+test("a checkout that still holds bytes is a named refusal, never a candidate", async () => {
+  const fixture = storeFixture()
+  conventionalClone(fixture)
+  const checkout = join(fixture.root, "env")
+  mkdirSync(join(checkout, "vendor", "brain8"), { recursive: true })
+  writeFileSync(join(checkout, "vendor", "brain8", "PRIVATE-SENTINEL.txt"), "secret\n")
+  const result = await verifyPrivateStoreCandidate({ store: fixture.store, checkout })
+  expect(result.verdict).toBe("not-a-candidate")
+  expect(result.reasons.map((reason) => reason.code)).toEqual(["checkout-not-empty"])
+  // A directory listing is all the check may use: no entry name ever reaches the result.
+  expect(JSON.stringify(result)).not.toContain("PRIVATE-SENTINEL")
+})
+
+test("the empty-first precondition cannot be stated without a declared checkout", async () => {
+  const fixture = storeFixture()
+  conventionalClone(fixture)
+  const stdout = sink()
+  const stderr = sink()
+  const code = await runCli(["worktree", "private-store", "verify", fixture.store], stdout, stderr)
+  expect(code).toBe(2)
+  expect(stdout.output).toBe("")
+  expect(stderr.output).toContain("--checkout")
+})
+
+test("a malformed advertisement is a named unproven reason and never relays the raw line", async () => {
+  const fixture = storeFixture()
+  conventionalClone(fixture)
+  const inner = createLocalGitProcess(globalThis.process.env, { attempts: 1 })
+  const sentinel = "PRIVATE-SENTINEL-SUBJECT"
+  const git: GitProcess = {
+    async run(request) {
+      if (request.args[0] === "ls-remote" && request.args[1] === "--refs") {
+        return { code: 0, stdout: `refs/heads/${sentinel}\n`, stderr: "" }
+      }
+      return inner.run(request)
+    },
+  }
+  const result = await verifyPrivateStoreCandidate({ store: fixture.store, checkout: join(fixture.root, "env"), git })
+  expect(result.verdict).toBe("unproven")
+  expect(result.reasons.map((reason) => reason.code)).toEqual(["malformed-advert"])
+  expect(result.reasons[0]?.message).not.toContain(sentinel)
+  expect(JSON.stringify(result)).not.toContain(sentinel)
+})
+
+test("no failure path relays a private name into stdout or stderr", async () => {
+  const fixture = storeFixture()
+  conventionalClone(fixture)
+  const privatePath = join(fixture.root, "PRIVATE-SENTINEL-REMOTE.git")
+  git(fixture.store, "remote", "set-url", "origin", privatePath)
+  const checkout = join(fixture.root, "env")
+  mkdirSync(checkout, { recursive: true })
+  writeFileSync(join(checkout, "PRIVATE-SENTINEL-FILE.txt"), "secret\n")
+  const stdout = sink()
+  const stderr = sink()
+  const code = await runCli(
+    ["worktree", "private-store", "verify", fixture.store, "--checkout", checkout],
+    stdout,
+    stderr,
+  )
+  expect(code).toBe(4)
+  expect(stdout.output + stderr.output).not.toContain("PRIVATE-SENTINEL")
 })

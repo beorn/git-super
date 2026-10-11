@@ -416,13 +416,12 @@ const privateStoreVerify = commandNode<CommandContext, PrivateStoreVerifyParams,
     if (typeof input.store !== "string" || input.store.trim() === "") {
       throw new Error("worktree private-store verify requires a store path")
     }
-    if (input.checkout !== undefined && typeof input.checkout !== "string") {
-      throw new Error("checkout must be a string")
+    if (typeof input.checkout !== "string" || input.checkout.trim() === "") {
+      throw new Error(
+        "worktree private-store verify requires --checkout <path>: the empty-first precondition is stated against it",
+      )
     }
-    return {
-      store: input.store,
-      ...(input.checkout === undefined ? {} : { checkout: input.checkout as string }),
-    }
+    return { store: input.store, checkout: input.checkout }
   }),
   run: (_context, input) => verifyPrivateStoreCandidate(input),
 })
