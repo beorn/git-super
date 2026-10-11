@@ -9,14 +9,10 @@ import { createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS } from "./exclusive.ts"
 import {
   acquireRemovalWriterLeases,
   assertExcludedRemovalCustody,
-  assertNoPrivateStore,
-  assertNoPrivateStoreAcrossPrune,
-  declaredPrivateStoreNames,
   inspectRemovalStatus,
   prepareRemovalBorrowers,
   rehomeBorrowers,
   retainWorktreeModules,
-  type PrivateStoreDiscard,
   type WorktreeRemovalProof,
   type WorktreeRetention,
 } from "./worktree-removal.ts"
@@ -45,12 +41,6 @@ export type GitWorktreeStoreOptions = Readonly<{
   timeouts?: Partial<GitWorktreeTimeouts>
   /** Reports writer-lock contention without writing to stderr from the library. */
   report?: (line: string) => void
-  /**
-   * The caller's journal for a deliberate discard of a declared-private submodule store (28661 gate
-   * `git-worktree-private-store`). The library writes nothing itself: a caller that keeps no journal receives
-   * nothing, which is why each record carries its own actor and reason.
-   */
-  journal?: (record: PrivateStoreDiscard) => void
 }>
 
 export type GitWorktreeTimeouts = Readonly<{
@@ -342,31 +332,10 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       )
     }
   }
-  const prepareRemoval = async (
-    path: string,
-    excludedSubmodules?: readonly string[],
-    discardPrivateStore?: Readonly<{ reason: string; actor?: string | null }>,
-    journal?: (record: PrivateStoreDiscard) => void,
-  ) => {
+  const prepareRemoval = async (path: string, excludedSubmodules?: readonly string[]) => {
     await assertRemovalRoot(path)
     const gitDir = realpathSync(await git.text(path, ["rev-parse", "--absolute-git-dir"]))
     const common = realpathSync(await git.text(path, ["rev-parse", "--path-format=absolute", "--git-common-dir"]))
-    const head = await git.text(path, ["rev-parse", "--verify", "HEAD"])
-    // 28661: the DECLARATION decides whether the store inside this admin dir is private, not the caller's
-    // exclusion list. Runs BEFORE the custody walk, so an empty list can no longer mean "no question asked";
-    // a caller proves custody by ADDING an exclusion, never by naming nothing.
-    const sink = journal ?? options.journal
-    await assertNoPrivateStore(configuredProcess(), {
-      adminDir: gitDir,
-      repository: repo,
-      head,
-      ...(excludedSubmodules === undefined ? {} : { excludedSubmodules }),
-      ...(discardPrivateStore === undefined ? {} : { discardPrivateStore }),
-      ...(sink === undefined ? {} : { journal: sink }),
-    })
-    // 28661: the same declared-private stores the guard just judged, named for retention to LEAVE BEHIND. A
-    // private store is never copied into retained-modules, however its custody was proved (chief c8a3b06d).
-    const privateStoreNames = await declaredPrivateStoreNames(configuredProcess(), repo, head, gitDir)
     const custody = await assertExcludedRemovalCustody(
       git,
       configuredProcess(),
@@ -376,12 +345,11 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       excludedSubmodules,
     )
     if (custody.notCompared.some((entry) => entry.reason !== "excluded")) {
-      return { gitDir, privateStoreNames, rehome: undefined, notCompared: custody.notCompared }
+      return { gitDir, rehome: undefined, notCompared: custody.notCompared }
     }
     const rehome = await prepareRemovalBorrowers(git, path, common, gitDir, custody, excludedSubmodules)
     return {
       gitDir,
-      privateStoreNames,
       rehome,
       notCompared: [...custody.notCompared, ...rehome.notCompared],
     }
@@ -504,15 +472,6 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         retention?: WorktreeRetention
         excludedSubmodules?: readonly string[]
         noRehome?: boolean
-        /** The operator's override for a declared-private store inside this admin dir; the reason is REQUIRED. */
-        discardPrivateStore?: Readonly<{ reason: string; actor?: string | null }>
-        /**
-         * The caller's sink for THIS removal's discard records (F2, @cto 0d4c5e3a). It travels with
-         * `discardPrivateStore` because the guard that decides a discard is the one that journals it: a per-call
-         * sink is what lets a caller READ what its own removal just deleted, where the store's own journal only
-         * lets the store WRITE. Absent means this call falls back to the store's journal, never to silence.
-         */
-        journal?: (record: PrivateStoreDiscard) => void
       }> = {},
     ): Promise<void | Readonly<{ borrowers: readonly string[] }> | Readonly<{ compaction: CompactionResult }>> {
       await assertRemovalRoot(path)
@@ -526,12 +485,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         if (removeOptions.retention !== undefined && removeOptions.unlock === true) {
           throw new Error(`retained worktree removal cannot unlock ${path}; resolve its holder first`)
         }
-        const { gitDir, privateStoreNames, rehome, notCompared } = await prepareRemoval(
-          path,
-          removeOptions.excludedSubmodules,
-          removeOptions.discardPrivateStore,
-          removeOptions.journal,
-        )
+        const { gitDir, rehome, notCompared } = await prepareRemoval(path, removeOptions.excludedSubmodules)
         if (notCompared.some((entry) => entry.reason !== "excluded")) {
           throw Object.assign(
             new Error(
@@ -566,10 +520,6 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
               removeOptions.noRehome === true ? () => [] : rehome.run,
               removeOptions.excludedSubmodules,
               notCompared,
-              undefined,
-              undefined,
-              undefined,
-              privateStoreNames,
             )
           } else {
             if (removeOptions.unlock === true) await unlockWorktree(git, repo, path)
@@ -691,21 +641,9 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         expire?: string
         verbose?: boolean
         operation?: string
-        /** The operator's override for a store inside an admin dir Git is about to forget; reason REQUIRED. */
-        discardPrivateStore?: Readonly<{ reason: string; actor?: string | null }>
       }> = {},
     ): Promise<void> {
       await mutate(pruneOptions.operation ?? "worktree prune", async () => {
-        // 28661: prune deletes the admin dir of every registration whose checkout is gone, and with it the
-        // private store inside it. Ask Git what it WOULD remove and judge each candidate first; never prune blind.
-        await assertNoPrivateStoreAcrossPrune(configuredProcess(), {
-          repository: repo,
-          ...(pruneOptions.expire === undefined ? {} : { expire: pruneOptions.expire }),
-          ...(pruneOptions.discardPrivateStore === undefined
-            ? {}
-            : { discardPrivateStore: pruneOptions.discardPrivateStore }),
-          ...(options.journal === undefined ? {} : { journal: options.journal }),
-        })
         return git.run(repo, [
           "worktree",
           "prune",
@@ -839,17 +777,3 @@ async function unlockWorktree(git: Git, repo: string, path: string): Promise<voi
 function withHookPolicy(args: readonly string[], policy: WorktreeHookPolicy | undefined): string[] {
   return policy === "quarantine" ? ["-c", "core.hooksPath=/dev/null", ...args] : [...args]
 }
-
-/**
- * 28661 re-export: the private-store refusal belongs to the same public surface as the removal it guards, so a
- * caller that removes a worktree WITHOUT the git-super primitive (a plain `rmSync`, a bare `git worktree prune`)
- * reaches the ONE implementation rather than writing a second one beside it.
- */
-export {
-  assertNoPrivateStore,
-  assertNoPrivateStoreAcrossPrune,
-  PrivateStoreRefusalError,
-  type PrivateStoreCustody,
-  type PrivateStoreRefusal,
-  type PrivateStoreDiscard,
-} from "./worktree-removal.ts"

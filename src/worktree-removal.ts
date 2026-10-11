@@ -22,13 +22,11 @@ import { fileLockHolders, formatLockHolders } from "@bearly/flock/holders"
 import { spawnSync } from "node:child_process"
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { classifyExcludedPath, inspectExcludedCheckout, superStatus, type SuperStatusResult } from "./status.ts"
-import { readCommitSubmodules, readPrivateSubmodules, type SelectedCommitSubmodules } from "./commit-graph.ts"
+import { readCommitSubmodules, type SelectedCommitSubmodules } from "./commit-graph.ts"
 import { validateExcludedSubmodules } from "./git.ts"
 import type { GitProcess } from "./process.ts"
 import type { NotCompared } from "./diff.ts"
 import type { Git, WorktreeInspection } from "./worktree.ts"
-import type { PrivateGitProjection } from "./private-git-projection.ts"
-import { alternatesLineage } from "./alternates.ts"
 import { removalBorrowers, type RemovalBorrower } from "./worktree-administration.ts"
 
 export type WorktreeRemovalProof = Readonly<{
@@ -80,387 +78,6 @@ type ExcludedRemovalCustody = Readonly<{
   declaredPaths: readonly string[]
   borrowers: readonly RemovalParent[]
 }>
-
-/** What a removal guard needs to know about the store it is about to destroy (28661). */
-export type PrivateStoreCustody = Readonly<{
-  /** Absolute Git dir of the worktree being removed; the store it may destroy lives at `<adminDir>/modules/<name>`. */
-  adminDir: string
-  /** The superproject whose commits carry the `.gitmodules` declarations. */
-  repository: string
-  /** The target worktree's own HEAD commit. */
-  head: string
-  /** Paths the caller has ALREADY taken custody of. A declared-private path here is the caller's proof, not an exemption. */
-  excludedSubmodules?: readonly string[]
-  /**
-   * The operator's explicit decision to delete a declared-private store on purpose (28661 gate
-   * `git-worktree-private-store`). The reason is REQUIRED: an override with an empty one is refused by name,
-   * never read as consent. One journal record per covered store is written BEFORE the deletion, so the actor
-   * and the reason outlive the bytes they describe.
-   */
-  discardPrivateStore?: Readonly<{ reason: string; actor?: string | null }>
-  /** The caller's sink for a discard record. Absent means the caller keeps no journal, not that none happened. */
-  journal?: (record: PrivateStoreDiscard) => void
-}>
-
-/** One refused store, named so a caller can be told exactly which bytes were about to go. */
-export type PrivateStoreRefusal = Readonly<{ name: string; path: string; head: string; store: string }>
-
-/**
- * One store an override deleted on purpose, with the reason it was deleted and the actor who decided, when the
- * caller could resolve one — `null` says plainly that it could not, so a journal never reads as "no actor
- * needed". A deletion nobody can read the cause of later is a mistake with extra steps (@cto 2026-10-11).
- */
-export type PrivateStoreDiscard = Readonly<{
-  name: string
-  path: string
-  store: string
-  reason: string
-  actor: string | null
-}>
-
-/**
- * What a removal's journal records actually MEAN, measured rather than assumed (F2; @dev/4 7d4a2522, revised by
- * @dev/4 e73f8644).
- *
- * The guard journals the DECISION — it runs before the bytes go (`assertNoPrivateStore`, at `:246`) — so on a
- * failed removal a record is evidence of intent, never of a completed delete. A caller that reports the outcome
- * must therefore measure it, and the measurement has THREE outcomes that must stay apart (@dev/4 e73f8644):
- * a store PROVEN absent (ENOENT) is discarded; a store observed present is standing; and a lookup that could not
- * answer (EACCES/EPERM/ELOOP/ENOTDIR — a chmod000 parent is not a deleted store) is UNKNOWN, carrying the path
- * and the cause, never folded into either pile. `existsSync` alone conflated the last with the first, and read
- * every path twice: the asymmetry that produced (true,false omits a path, false,true lists it twice) is exactly
- * what ONE observation per record removes.
- *
- * `lookup` is injectable so the split is testable without racing a real removal or depending on which uid runs.
- */
-export type StorePresence =
-  | Readonly<{ kind: "present" }>
-  | Readonly<{ kind: "absent" }>
-  | Readonly<{ kind: "unknown"; cause: string }>
-
-export type StoreLookup = (store: string) => StorePresence
-
-/**
- * ONE metadata observation of a store's path. `lstatSync` (not `statSync`/`existsSync`): a store is a directory
- * in place, and following a symlink would answer about a different path than the one being removed. Only ENOENT
- * proves absence; every other failure is `unknown` with its errno text — the difference between "I deleted your
- * private bytes" and "I could not tell whether they are there".
- */
-export function observeStorePresence(store: string): StorePresence {
-  try {
-    lstatSync(store)
-    return { kind: "present" }
-  } catch (error) {
-    const code = errnoCode(error)
-    if (code === "ENOENT") return { kind: "absent" }
-    // Bun/node already prefix the message with the errno code ("EACCES: permission denied, …"), so prefix only a
-    // throw that does not carry it: the reason must read once, not as "EACCES: EACCES: …".
-    const described = error instanceof Error ? error.message : String(error)
-    return {
-      kind: "unknown",
-      cause: code === undefined || described.startsWith(code) ? described : `${code}: ${described}`,
-    }
-  }
-}
-
-/** The errno code of a thrown fs error, or undefined when the throw is not an errno-shaped one. */
-function errnoCode(error: unknown): string | undefined {
-  return typeof error === "object" && error !== null && "code" in error && typeof error.code === "string"
-    ? error.code
-    : undefined
-}
-
-export function classifyDiscardedStores(
-  records: readonly PrivateStoreDiscard[],
-  lookup: StoreLookup = observeStorePresence,
-): Readonly<{
-  discarded: readonly PrivateStoreDiscard[]
-  standing: readonly PrivateStoreDiscard[]
-  unknown: readonly Readonly<{ record: PrivateStoreDiscard; cause: string }>[]
-}> {
-  const discarded: PrivateStoreDiscard[] = []
-  const standing: PrivateStoreDiscard[] = []
-  const unknown: { record: PrivateStoreDiscard; cause: string }[] = []
-  for (const record of records) {
-    // ONE observation per record, taken once and reused — never a second lookup whose answer could disagree.
-    const presence = lookup(record.store)
-    if (presence.kind === "absent") discarded.push(record)
-    else if (presence.kind === "present") standing.push(record)
-    else unknown.push({ record, cause: presence.cause })
-  }
-  return { discarded, standing, unknown }
-}
-
-/** One discard record rendered for operator-facing text: the store, its section and the checkout it came from. */
-export function nameDiscardedStore(record: PrivateStoreDiscard): string {
-  return `${record.store} (section ${record.name}, from ${record.path})`
-}
-
-/**
- * The refusal as a CLASS, so a caller can tell "these bytes must not be deleted" from "git failed" without
- * matching message text. A queue that has to discard a tree skips it, names it once and continues on a refusal;
- * anything else still stops the round. Same message, same named stores — only the type is new (@cto C4).
- */
-export class PrivateStoreRefusalError extends Error {
-  constructor(
-    message: string,
-    /**
-     * The refused stores, structured. A caller that must NAME the route (yrd's env close, 27120) reads the
-     * guard's own answer from here rather than re-deriving `modules/<name>` or parsing this message.
-     */
-    readonly refusals: readonly PrivateStoreRefusal[] = [],
-  ) {
-    super(message)
-    this.name = "PrivateStoreRefusalError"
-  }
-}
-
-/**
- * The commits whose declaration decides whether a store inside `adminDir` is private: the target's own HEAD,
- * plus the repository's current `main` when it differs (chief custody ruling (b), 2026-10-11 — a store is
- * private for what it holds, not for how old the target's HEAD is). ONE function owns this key, so the ruling
- * can change without a second copy of it appearing beside the guard.
- */
-async function privateDeclarationHeads(process: GitProcess, repository: string, head: string): Promise<string[]> {
-  // `for-each-ref` exits 0 with EMPTY output when the ref is absent, so "no main here" is an answer this guard
-  // can read without ever collapsing a broken transport into it. (`rev-parse --verify --quiet` exits 1, which a
-  // seam may surface as either a code or a throw, and one of those two would have had to be guessed at.)
-  const result = await process.run({
-    repo: repository,
-    args: ["for-each-ref", "--format=%(objectname)", "refs/heads/main"],
-  })
-  if (result.code !== 0) {
-    throw new Error(
-      `cannot read refs/heads/main in ${repository} before judging a private store: ${result.stderr.trim() || `exit ${result.code}`}`,
-    )
-  }
-  const main = result.stdout.trim()
-  const heads = [head]
-  if (main !== "" && main !== head) heads.push(main)
-  return heads
-}
-
-/**
- * Every declared-private store that EXISTS under one admin dir's `modules` tree, each with the section name
- * whose directory holds it. ONE reader (`readPrivateSubmodules`) keyed by the ONE declaration-head function, so
- * the refusal guard and the retention copy can never disagree about which directories are private.
- *
- * `excluded` is the CALLER's custody proof and is honoured only where the caller asked for it (the guard).
- * Retention passes none: a private store is NEVER copied into retained-modules, however its custody was proved
- * (@cto 2026-10-11; chief ruling c8a3b06d).
- */
-async function privateStoresIn(
-  process: GitProcess,
-  repository: string,
-  head: string,
-  adminDir: string,
-  excluded: ReadonlySet<string>,
-): Promise<PrivateStoreRefusal[]> {
-  const modules = join(adminDir, "modules")
-  if (!present(modules)) return []
-  const refusals: PrivateStoreRefusal[] = []
-  for (const at of await privateDeclarationHeads(process, repository, head)) {
-    for (const declared of await readPrivateSubmodules(process, repository, at)) {
-      if (excluded.has(declared.path)) continue
-      const store = join(modules, declared.name)
-      if (!present(store)) continue
-      if (refusals.some((entry) => entry.store === store)) continue
-      refusals.push({ name: declared.name, path: declared.path, head: at, store })
-    }
-  }
-  return refusals
-}
-
-/**
- * The section names of the declared-private stores that exist under `adminDir`, for retention to LEAVE BEHIND.
- * No exclusion set is applied: a store the declaration calls private is never copied into retained-modules, and a
- * caller that proved custody of one has proved what it may DELETE, not what it may copy (28661; chief c8a3b06d).
- */
-export async function declaredPrivateStoreNames(
-  process: GitProcess,
-  repository: string,
-  head: string,
-  adminDir: string,
-): Promise<readonly string[]> {
-  const stores = await privateStoresIn(process, repository, head, adminDir, new Set())
-  return [...new Set(stores.map((entry) => entry.name))].sort()
-}
-
-/**
- * Refuse a removal whose target admin dir holds the Git store of a submodule a removal-visible declaration
- * calls private — unless the caller declared that path excluded.
- *
- * 28661. `assertExcludedRemovalCustody` returned early on an EMPTY exclusion list, so every caller naming no
- * exclusion took Git's plain removal and destroyed `<admin dir>/modules/<name>` without ever proving the
- * bytes inside it: bay cleanup, a reaper, a cleanup sweep, a hand run. The DECLARATION decides, never the
- * caller's list. A caller may ADD an exclusion — that is how custody is proved, and R2 then judges the store —
- * but it can never turn this refusal off by naming nothing.
- *
- * The guard reads declarations and EXISTENCE only: it never reads, copies, hashes or renames a byte inside the
- * store (27058; chief ruling c8a3b06d).
- */
-export async function assertNoPrivateStore(process: GitProcess, custody: PrivateStoreCustody): Promise<void> {
-  const refusals = await privateStoresIn(
-    process,
-    custody.repository,
-    custody.head,
-    custody.adminDir,
-    new Set(custody.excludedSubmodules ?? []),
-  )
-  if (refusals.length === 0) return
-  const discard = custody.discardPrivateStore
-  if (discard !== undefined) {
-    // The reason is REQUIRED, and an empty one is refused by name rather than read as consent. A silent pass
-    // here would turn "delete on purpose" into "delete with nobody able to say why" (NO SILENT ERRORS).
-    if (discard.reason.trim() === "") {
-      throw new PrivateStoreRefusalError(
-        `@gate/git-worktree-private-store: --discard-private-store requires --reason "<text>": the guard refuses ` +
-          `to delete ${refusals.map((entry) => entry.store).join(", ")} on purpose with no reason anyone can read later`,
-        refusals,
-      )
-    }
-    const actor = discard.actor ?? null
-    for (const entry of refusals) {
-      custody.journal?.({ name: entry.name, path: entry.path, store: entry.store, reason: discard.reason, actor })
-    }
-    return
-  }
-  throw new PrivateStoreRefusalError(
-    `@gate/git-worktree-private-store: worktree removal would destroy a private submodule store: ${refusals
-      .map((entry) => `${entry.path} (section ${entry.name}) store ${entry.store}, declared private at ${entry.head}`)
-      .join("; ")}; worktree preserved; take custody of each store first (the operator empties the checkout, runs ` +
-      `'git super worktree private-store verify <store> --checkout <checkout>', then removes the store), then ` +
-      `retry — or pass --exclude-submodule for a path whose custody you have already proved, or ` +
-      `--discard-private-store --reason "<text>" to delete the store on purpose`,
-    refusals,
-  )
-}
-
-/**
- * The admin dirs `git worktree prune` WOULD delete, from its own preview. Git reports them on stderr, one
- * `Removing <path>: <reason>` line each, relative to the common dir. Parsing Git's own plan is the point: the
- * set is whatever the installed Git would act on, not a reimplementation of its expiry rules.
- *
- * FAIL CLOSED (C1). The preview is the ONLY source of that set, so a line this guard cannot parse means it
- * cannot prove it has seen every admin dir Git would delete, and the prune is refused rather than trusted. The
- * refusal names the line's KIND and never its text, because a preview line can carry a path and a path can be
- * private; a shape this guard does not recognize is skipped by nothing and reported by kind alone.
- */
-function prunableAdminDirs(common: string, preview: Readonly<{ stdout: string; stderr: string }>): string[] {
-  const dirs: string[] = []
-  for (const [stream, report] of [
-    ["stderr", preview.stderr],
-    ["stdout", preview.stdout],
-  ] as const) {
-    for (const line of report.split("\n")) {
-      const trimmed = line.trim()
-      if (trimmed === "") continue
-      const match = /^Removing (.+?): /u.exec(trimmed)
-      if (match?.[1] === undefined) {
-        throw new PrivateStoreRefusalError(
-          `git worktree prune --dry-run --verbose printed a ${previewLineKind(trimmed)} on ${stream} that this ` +
-            `guard cannot parse (its text is withheld: a preview line can name a private path); nothing was ` +
-            `pruned — an unparsed preview cannot be proven to name every admin dir Git would delete`,
-          // A refusal that names no store still carries the typed EMPTY list, never the constructor's implicit
-          // default: a consumer reads this field, and an absent one would read as "nothing private" (27120, @cto).
-          [],
-        )
-      }
-      const dir = resolve(common, match[1])
-      if (!dirs.includes(dir)) dirs.push(dir)
-    }
-  }
-  return dirs
-}
-
-/** The KIND of an unparsed preview line: enough to route it, never its text or any character of it. */
-function previewLineKind(line: string): string {
-  if (/^warning:/iu.test(line)) return "warning line"
-  if (/^(fatal|error):/iu.test(line)) return "error line"
-  if (/^Removing\b/u.test(line)) return "malformed `Removing` line"
-  return "line in no recognized shape"
-}
-
-/**
- * Refuse a `git worktree prune` that would delete the admin dir of a registration whose CHECKOUT is gone and
- * whose admin dir holds a private submodule store.
- *
- * 28661. Prune removes every prunable registration's admin dir, and with it `<admin dir>/modules/<name>`. Every
- * other guard in this file reads the checkout, so a gone checkout is exactly what makes them blind — the one
- * shape prune exists to act on is the one they cannot see. The guard therefore asks Git what it WOULD remove
- * (`--dry-run --verbose`) and judges each candidate BEFORE the real prune, reading the admin dir's own HEAD,
- * which Git leaves in place for precisely these registrations.
- *
- * RESIDUAL (C1), stated rather than implied: the guard judges a PREVIEW and the caller then prunes for real. An
- * admin dir that becomes prunable between the two runs — one whose checkout is deleted inside that window — is
- * pruned by the real command without ever being judged. The window is inherent to asking Git what it would do;
- * it is `--dry-run` that makes the set Git's own rather than a reimplementation of its expiry rules.
- */
-export async function assertNoPrivateStoreAcrossPrune(
-  process: GitProcess,
-  request: Readonly<{
-    repository: string
-    expire?: string
-    /** The operator's override, threaded to the same guard every other removal asks. Absent means refuse. */
-    discardPrivateStore?: Readonly<{ reason: string; actor?: string | null }>
-    journal?: (record: PrivateStoreDiscard) => void
-  }>,
-): Promise<void> {
-  const previewArgs = [
-    "worktree",
-    "prune",
-    "--dry-run",
-    "--verbose",
-    ...(request.expire === undefined ? [] : ["--expire", request.expire]),
-  ]
-  const preview = await process.run({
-    repo: request.repository,
-    args: previewArgs,
-    // C1: read the preview in a FIXED locale. The guard parses the word `Removing`, and a localized Git
-    // prints a translated word instead — which, under the fail-closed rule below, would refuse every prune.
-    env: { LC_ALL: "C" },
-  })
-  if (preview.code !== 0) {
-    throw new Error(
-      `git worktree prune --dry-run failed in ${request.repository}: ${preview.stderr.trim() || preview.stdout.trim()}`,
-    )
-  }
-  const commonRun = await process.run({
-    repo: request.repository,
-    args: ["rev-parse", "--path-format=absolute", "--git-common-dir"],
-  })
-  if (commonRun.code !== 0 || commonRun.stdout.trim() === "") {
-    throw new Error(
-      `cannot resolve the common dir of ${request.repository} before pruning it: ${commonRun.stderr.trim()}`,
-    )
-  }
-  const common = realpathSync(commonRun.stdout.trim())
-  for (const adminDir of prunableAdminDirs(common, preview)) {
-    // An admin dir with no store cannot destroy one; the question only arises where modules/ exists.
-    if (!present(join(adminDir, "modules"))) continue
-    const headRun = await process.run({
-      repo: request.repository,
-      args: ["--git-dir", adminDir, "rev-parse", "--verify", "HEAD"],
-    })
-    if (headRun.code !== 0 || headRun.stdout.trim() === "") {
-      throw new PrivateStoreRefusalError(
-        `@gate/git-worktree-private-store: git worktree prune would delete ${adminDir}, which holds a submodule store, ` +
-          `and its recorded HEAD cannot be read ` +
-          `(${headRun.stderr.trim() || "no HEAD"}); nothing was pruned; inspect that admin dir and its store before pruning`,
-        // Explicit [], never the implicit default: this refusal names no store, and a consumer reads the field
-        // itself rather than a message (27120, @cto).
-        [],
-      )
-    }
-    await assertNoPrivateStore(process, {
-      adminDir,
-      repository: request.repository,
-      head: headRun.stdout.trim(),
-      ...(request.discardPrivateStore === undefined ? {} : { discardPrivateStore: request.discardPrivateStore }),
-      ...(request.journal === undefined ? {} : { journal: request.journal }),
-    })
-  }
-}
 
 export async function assertExcludedRemovalCustody(
   git: Git,
@@ -1074,32 +691,13 @@ export function metadataFileDigest(path: string): string {
   return createHash("sha256").update(readFileSync(path)).digest("hex")
 }
 
-export function manifest(
-  root: string,
-  custody: StoreCustody,
-  hashFiles = true,
-  workingTree = false,
-  /**
-   * Paths retention must LEAVE BEHIND. A declared-private store is never copied into a durable directory, so the
-   * retained manifest neither lists nor hashes the bytes inside it (28661; chief ruling c8a3b06d).
-   */
-  exclude: (path: string) => boolean = () => false,
-  /**
-   * The directory reader. Injected ONLY so a test can prove the walk never ENTERS an excluded store instead of
-   * trusting the filtered output; production always uses the real `readdirSync` (@cto 2026-10-11).
-   */
-  readdir: (directory: string) => readonly Dirent[] = (directory) => readdirSync(directory, { withFileTypes: true }),
-): StoreManifest {
+export function manifest(root: string, custody: StoreCustody, hashFiles = true, workingTree = false): StoreManifest {
   const entries: Record<string, ManifestEntry> = {}
   const files: Record<string, string> = {}
   const externalObjectStores: ExternalObjectStore[] = []
-  // A WALK, not `readdirSync(root, { recursive: true })`: an excluded directory is never ENTERED, so not even the
-  // names of the entries inside a declared-private store are read (c8a3b06d; @cto 2026-10-11). The recursive
-  // reader lists a directory's children regardless of an exclusion, which is itself a read of the store's names.
   const visit = (directory: string): void => {
-    for (const entry of readdir(directory)) {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
       const path = join(directory, entry.name)
-      if (exclude(path)) continue
       const key = relative(root, path)
       const metadata = within(custody.gitDir, path)
       if (
@@ -1298,67 +896,29 @@ export async function retainWorktreeModules(
   rehome?: () => readonly string[],
   excludedSubmodules: readonly string[] = [],
   notCompared: readonly NotCompared[] = [],
-  privateProjection?: PrivateGitProjection,
   onRetainedPath?: (path: string) => void,
-  retirePrivate?: () => void,
-  /**
-   * Section names of declared-private stores to LEAVE OUT of the retained copy, read through the ONE reader by
-   * `declaredPrivateStoreNames`. A private store is never copied into retained-modules (28661; chief c8a3b06d).
-   */
-  privateStoreNames: readonly string[] = [],
 ): Promise<WorktreeRemovalProof> {
   const path = realpathSync(requested)
-  if (privateProjection === undefined) {
-    const registered = await inspect(repo, path)
-    if (!registered.registered) {
-      throw new Error(`worktree ${path} is not registered in ${repo}; inspect git worktree list`)
-    }
-    if (registered.locked !== undefined) {
-      throw new Error(`worktree ${path} is locked: ${registered.locked}; resolve its holder before removal`)
-    }
+  const registered = await inspect(repo, path)
+  if (!registered.registered) {
+    throw new Error(`worktree ${path} is not registered in ${repo}; inspect git worktree list`)
   }
-  const gitDir =
-    privateProjection === undefined
-      ? realpathSync(await git.text(path, ["rev-parse", "--absolute-git-dir"]))
-      : join(path, ".git")
-  const common =
-    privateProjection === undefined
-      ? realpathSync(await git.text(path, ["rev-parse", "--path-format=absolute", "--git-common-dir"]))
-      : gitDir
-  if (gitDir === common && privateProjection === undefined) {
+  if (registered.locked !== undefined) {
+    throw new Error(`worktree ${path} is locked: ${registered.locked}; resolve its holder before removal`)
+  }
+  const gitDir = realpathSync(await git.text(path, ["rev-parse", "--absolute-git-dir"]))
+  const common = realpathSync(await git.text(path, ["rev-parse", "--path-format=absolute", "--git-common-dir"]))
+  if (gitDir === common) {
     throw new Error(`worktree ${path} is the primary worktree; only a linked worktree can be removed`)
   }
   const modules = join(gitDir, "modules")
-  // 28661: the declared-private stores this copy must leave behind. Retention answers the SAME question the guard
-  // asks, through the same reader, so the copy can never retain what the refusal would have protected.
-  const privateStoreRoots = privateStoreNames.map((name) => join(modules, name))
-  const inPrivateStore = (candidate: string): boolean =>
-    privateStoreRoots.some((root) => candidate === root || within(root, candidate))
   const custody = { common, checkout: path, gitDir, modules }
   // Diagnose metadata links before Git discovery can hide their source and target in an object lookup failure.
-  manifest(gitDir, custody, false, false, inPrivateStore)
-  if (privateProjection !== undefined) {
-    if (privateProjection.checkout !== path || gitDir !== join(path, ".git")) {
-      throw new Error(`private projection metadata does not match ${path}`)
-    }
-    const allowedObjects = new Set(
-      privateProjection.mounts.filter((mount) => mount.mode === "ro").map((mount) => mount.source),
-    )
-    for (const repository of privateProjection.repositories) {
-      if (
-        !within(gitDir, repository.gitDirectory) ||
-        realpathSync(repository.gitDirectory) !== repository.gitDirectory
-      ) {
-        throw new Error(`private repository metadata escapes custody: ${repository.gitDirectory}`)
-      }
-      const objects = join(repository.gitDirectory, "objects")
-      await alternatesLineage([objects], "", { allowedObjects: new Set([...allowedObjects, objects]) })
-    }
-  }
-  let before = privateProjection === undefined ? await cleanSnapshot(git, path, inspect, excludedSubmodules) : undefined
+  manifest(gitDir, custody, false, false)
+  const before = await cleanSnapshot(git, path, inspect, excludedSubmodules)
   // Check metadata locks before copying. The modules subtree includes every store,
   // even one left by an earlier gitlink that the current tree no longer records.
-  const metadata = manifest(gitDir, custody, true, false, inPrivateStore)
+  const metadata = manifest(gitDir, custody, true, false)
   const requestedRoot = resolve(retention.root)
   // Resolve existing ancestors before creating anything, so a symlink cannot put
   // the only retained copy back inside either native deletion path.
@@ -1385,34 +945,21 @@ export async function retainWorktreeModules(
   onRetainedPath?.(canonical)
   const retainedRoot = mkdtempSync(join(canonical, `${basename(gitDir)}-`))
   onRetainedPath?.(retainedRoot)
-  const copiedSource = privateProjection === undefined ? modules : path
-  const copiedCheckout = privateProjection === undefined ? path : join(retainedRoot, "checkout")
-  const copiedTree = privateProjection === undefined ? join(retainedRoot, "modules") : copiedCheckout
-  const retained = existsSync(copiedSource)
-    ? privateProjection === undefined
-      ? copiedTree
-      : join(copiedTree, ".git")
-    : null
-  const copiedCustody =
-    privateProjection === undefined
-      ? { ...custody, modules: retained ?? modules }
-      : {
-          common: join(copiedTree, ".git"),
-          checkout: copiedCheckout,
-          gitDir: join(copiedTree, ".git"),
-          modules: join(copiedTree, ".git/modules"),
-        }
+  const copiedSource = modules
+  const copiedCheckout = path
+  const copiedTree = join(retainedRoot, "modules")
+  const retained = existsSync(copiedSource) ? copiedTree : null
+  const copiedCustody = { ...custody, modules: retained ?? modules }
   let expectedCopy: Readonly<Record<string, ManifestEntry>> = {}
   let retainedManifest: StoreManifest = { entries: {}, files: {}, externalObjectStores: [] }
   if (retained !== null) {
-    retainedManifest = manifest(copiedSource, custody, true, privateProjection !== undefined, inPrivateStore)
+    retainedManifest = manifest(copiedSource, custody, true)
     cpSync(copiedSource, copiedTree, {
       recursive: true,
       errorOnExist: true,
       force: false,
       dereference: false,
       verbatimSymlinks: true,
-      ...(privateStoreRoots.length === 0 ? {} : { filter: (source: string) => !inPrivateStore(resolve(source)) }),
     })
     onRetainedPath?.(copiedTree)
     onRetainedPath?.(retained)
@@ -1428,89 +975,20 @@ export async function retainWorktreeModules(
       ]),
     )
     if (
-      JSON.stringify(manifest(copiedTree, copiedCustody, true, privateProjection !== undefined).entries) !==
-        JSON.stringify(expectedCopy) ||
-      JSON.stringify(manifest(copiedSource, custody, true, privateProjection !== undefined, inPrivateStore).entries) !==
-        JSON.stringify(retainedManifest.entries)
+      JSON.stringify(manifest(copiedTree, copiedCustody, true).entries) !== JSON.stringify(expectedCopy) ||
+      JSON.stringify(manifest(copiedSource, custody, true).entries) !== JSON.stringify(retainedManifest.entries)
     ) {
       throw new Error(
         `Git store ${modules} changed during retention at ${retained}; worktree preserved, retry after its writer stops`,
       )
     }
   }
-  if (privateProjection !== undefined && retained !== null) {
-    const allowedObjects = new Set(
-      privateProjection.mounts.filter((mount) => mount.mode === "ro").map((mount) => mount.source),
-    )
-    const knownMetadata = new Set(privateProjection.repositories.map((repository) => repository.gitDirectory))
-    for (const key of Object.keys(retainedManifest.entries)) {
-      const original = join(path, key)
-      if (within(gitDir, original)) {
-        if (
-          (basename(original) === "config" && !knownMetadata.has(dirname(original))) ||
-          ["config.worktree", "commondir", "gitdir"].includes(basename(original)) ||
-          key.split(sep).includes("hooks")
-        ) {
-          throw new Error(`unknown private Git metadata ${original}; preserve before custody`)
-        }
-      } else if (
-        basename(original) === ".git" &&
-        !privateProjection.repositories.some((repository) => original === join(repository.checkout, ".git"))
-      ) {
-        throw new Error(`unknown child metadata ${original}; preserve before custody`)
-      }
-    }
-    for (const repository of privateProjection.repositories) {
-      const copied = join(retained, relative(gitDir, repository.gitDirectory))
-      const configuration = join(copied, "config")
-      if (!lstatSync(configuration).isFile() || metadataFileDigest(configuration) !== repository.configurationSha256) {
-        throw new Error(`private Git configuration changed or is unknown: ${configuration}; preserve before custody`)
-      }
-      const objects = join(copied, "objects")
-      await alternatesLineage([objects], "", { allowedObjects: new Set([...allowedObjects, objects]) })
-      if (repository.path !== "") {
-        const pointer = join(copiedCheckout, repository.path, ".git")
-        if (!lstatSync(pointer).isFile() || readFileSync(pointer, "utf8") !== `gitdir: ${repository.gitDirectory}\n`) {
-          throw new Error(`copied child pointer changed or is unknown: ${pointer}; preserve before custody`)
-        }
-      }
-    }
-    for (const repository of privateProjection.repositories) {
-      if (repository.path === "") continue
-      const copied = join(retained, relative(gitDir, repository.gitDirectory))
-      const pointer = join(copiedCheckout, repository.path, ".git")
-      writeFileSync(pointer, `gitdir: ${copied}\n`)
-      expectedCopy = {
-        ...expectedCopy,
-        [relative(copiedCheckout, pointer)]: { kind: "file", sha256: metadataFileDigest(pointer) },
-      }
-    }
-    before = await cleanSnapshot(git, copiedCheckout, inspect, excludedSubmodules)
-    for (const repository of privateProjection.repositories) {
-      const copied = join(retained, relative(gitDir, repository.gitDirectory))
-      // Full integrity includes borrowed stores: the public root takes 62s and a large child 207–239s.
-      // Keep a finite five-minute bound for this full scan rather than the interactive deadline.
-      await git.run(copiedCheckout, ["--git-dir", copied, "fsck", "--full", "--no-reflogs"], false, 300_000)
-    }
-  }
-  const rehomedBorrowers =
-    privateProjection === undefined ? (rehome === undefined ? rehomeBorrowers(common, gitDir, modules) : rehome()) : []
+  const rehomedBorrowers = rehome === undefined ? rehomeBorrowers(common, gitDir, modules) : rehome()
   const inspectedPath = copiedCheckout
   const after = await cleanSnapshot(git, inspectedPath, inspect, excludedSubmodules)
-  const verifyPrivateManifest = (): void => {
-    if (
-      privateProjection !== undefined &&
-      (JSON.stringify(manifest(path, custody, true, true).entries) !== JSON.stringify(retainedManifest.entries) ||
-        JSON.stringify(manifest(copiedCheckout, copiedCustody, true, true).entries) !== JSON.stringify(expectedCopy))
-    ) {
-      throw new Error(`worktree ${path} changed during retention; preserved, retry after its writer stops`)
-    }
-  }
-  verifyPrivateManifest()
   if (JSON.stringify(after) !== JSON.stringify(before)) {
     throw new Error(`worktree ${path} changed during retention; preserved, retry after its writer stops`)
   }
-  if (before === undefined) throw new Error(`private snapshot missing for ${path}; worktree preserved`)
   const proof: WorktreeRemovalProof = {
     path,
     head: await git.commit(inspectedPath, "HEAD"),
@@ -1533,16 +1011,6 @@ export async function retainWorktreeModules(
   if (retained !== null && retainedManifest.externalObjectStores.length > 0) {
     registerRetainedBorrower(common, retained, proof.manifest)
   }
-  if (retained !== null && privateProjection !== undefined) {
-    for (const mount of privateProjection.mounts.filter((mount) => mount.mode === "ro")) {
-      registerRetainedBorrower(dirname(mount.source), retained, proof.manifest)
-    }
-  }
   retention.report(proof)
-  if (retirePrivate !== undefined) {
-    if (privateProjection === undefined) throw new Error("private retirement requires its projection record")
-    verifyPrivateManifest()
-    retirePrivate()
-  }
   return proof
 }

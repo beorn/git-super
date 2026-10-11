@@ -4,7 +4,7 @@ import { runGit } from "./git.ts"
 import { gitSuperResult, type GitSuperResult } from "./result.ts"
 import { createLocalGitWorktreeStore } from "./worktree.ts"
 import type { CompactionResult } from "./retention-compact.ts"
-import type { PrivateStoreDiscard, WorktreeRemovalProof } from "./worktree-removal.ts"
+import type { WorktreeRemovalProof } from "./worktree-removal.ts"
 import type { NotCompared } from "./diff.ts"
 
 function within(parent: string, path: string): boolean {
@@ -34,12 +34,6 @@ export type SuperWorktreeRemoveOptions = Readonly<{
   report?: (message: string) => void
   excludedSubmodules?: readonly string[]
   noRehome?: boolean
-  /**
-   * The operator's explicit decision to delete a declared-private submodule store on purpose (28661 gate
-   * `git-worktree-private-store`). The reason is REQUIRED by the guard; the actor is resolved by the caller and
-   * `null` records plainly that none could be named.
-   */
-  discardPrivateStore?: Readonly<{ reason: string; actor?: string | null }>
 }>
 
 export type SuperWorktreeRemoveResult = GitSuperResult &
@@ -49,8 +43,6 @@ export type SuperWorktreeRemoveResult = GitSuperResult &
     notCompared: readonly NotCompared[]
     reason?: "borrowed"
     borrowers?: readonly string[]
-    /** Stores this removal deleted on purpose, present only when the override ran. */
-    discardedStores?: readonly PrivateStoreDiscard[]
     /** Present when a retained copy was compacted after native --force; failure does not fail the removal. */
     compaction?: CompactionResult
   }>
@@ -61,24 +53,8 @@ export async function superWorktreeRemove(options: SuperWorktreeRemoveOptions): 
   const path = resolve(options.path)
   let proof: WorktreeRemovalProof | undefined
   let removalReturned = false
-  const discarded: PrivateStoreDiscard[] = []
   try {
-    const store = createLocalGitWorktreeStore({
-      repo,
-      // The override journals BEFORE the store goes, and the line names the actor or says there is none: a
-      // discard nobody can read the cause of later is a mistake with extra steps (@cto 2026-10-11).
-      journal: (record) => {
-        discarded.push(record)
-        // F1 (@cto 0d4c5e3a): this line is written BEFORE the deletion, so it says "discarding", not "discarded" —
-        // a removal that then fails must not read as a completed deletion. The stores that actually went are named
-        // in the result's own discardedStores, which exists only after the removal returned.
-        options.report?.(
-          `git-super: @gate/git-worktree-private-store: discarding store ${record.store} (${record.path}) ` +
-            `actor=${record.actor ?? "(no actor token)"} reason=${JSON.stringify(record.reason)} ` +
-            `(journaled before deletion)\n`,
-        )
-      },
-    })
+    const store = createLocalGitWorktreeStore({ repo })
     if (!(await store.inspect(path)).registered) {
       const owner = owningComponentRepository(repo, path)
       if (owner !== undefined && owner !== repo) {
@@ -88,7 +64,6 @@ export async function superWorktreeRemove(options: SuperWorktreeRemoveOptions): 
     const outcome = await store.remove(path, {
       ...(options.excludedSubmodules === undefined ? {} : { excludedSubmodules: options.excludedSubmodules }),
       ...(options.noRehome === undefined ? {} : { noRehome: options.noRehome }),
-      ...(options.discardPrivateStore === undefined ? {} : { discardPrivateStore: options.discardPrivateStore }),
       retention: {
         root: options.retain,
         report: (retained) => {
@@ -114,7 +89,6 @@ export async function superWorktreeRemove(options: SuperWorktreeRemoveOptions): 
       notCompared: proof.notCompared,
       proof,
       ...(outcome !== undefined && "compaction" in outcome ? { compaction: outcome.compaction } : {}),
-      ...(discarded.length === 0 ? {} : { discardedStores: discarded }),
     }
   } catch (error) {
     const detail = {
