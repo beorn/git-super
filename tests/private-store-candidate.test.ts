@@ -342,3 +342,47 @@ test("no failure path relays a private name into stdout or stderr", async () => 
   expect(code).toBe(4)
   expect(stdout.output + stderr.output).not.toContain("PRIVATE-SENTINEL")
 })
+
+// @cto's THREE NO-RE-READ items on the reviewed component (round-3 GO, 2026-10-11): each of these
+// pins a field that used to say more than it could prove.
+
+test("a FAILING LOCAL READ is the store's own fault, named by verb, never a network code", async () => {
+  const fixture = storeFixture()
+  conventionalClone(fixture)
+  const inner = createLocalGitProcess(globalThis.process.env, { attempts: 1 })
+  const git: GitProcess = {
+    async run(request) {
+      if (request.args[0] === "for-each-ref") return { code: 124, stdout: "", stderr: "", timedOut: true }
+      return inner.run(request)
+    },
+  }
+  const result = await verifyPrivateStoreCandidate({ store: fixture.store, checkout: join(fixture.root, "env"), git })
+  expect(result.verdict).toBe("unproven")
+  // Not `unavailable-transport`: nothing here left the machine, so no remote may be blamed.
+  expect(result.reasons.map((reason) => reason.code)).toEqual(["local-read-failed"])
+  expect(result.reasons[0]?.message).toContain("git for-each-ref did not complete")
+  expect(result.reasons[0]?.message).not.toContain("ls-remote")
+})
+
+test("a store with NO configured remote is named `no-configured-remote`, not an unreadable store", async () => {
+  const fixture = storeFixture()
+  const bare = join(fixture.root, "no-remote.git")
+  git(fixture.root, "init", "-q", "--bare", "-b", "main", bare)
+  const result = await verifyPrivateStoreCandidate({ store: bare, checkout: join(fixture.root, "env") })
+  // `git config --get-regexp` exits 1 when nothing matches. The store read fine; it just has no remote.
+  expect(result.verdict).toBe("unproven")
+  expect(result.reasons.map((reason) => reason.code)).toEqual(["no-configured-remote"])
+  expect(result.reasons[0]?.message).toContain("no fetch refspec")
+})
+
+test("a symbolic HEAD claims advertisement only where the ref it rides on does", async () => {
+  const fixture = storeFixture()
+  conventionalClone(fixture)
+  // HEAD rides refs/heads/main; move that branch off the advertised value.
+  git(fixture.store, "symbolic-ref", "HEAD", "refs/heads/main")
+  git(fixture.store, "update-ref", "refs/heads/main", fixture.first)
+  const result = await verifyPrivateStoreCandidate({ store: fixture.store, checkout: join(fixture.root, "env") })
+  expect(result.verdict).toBe("not-a-candidate")
+  expect(result.head).toMatchObject({ state: "symbolic", attachedTo: "refs/heads/main", advertised: false })
+  expect(result.refs.find((row) => row.ref === "refs/heads/main")).toMatchObject({ state: "differs" })
+})

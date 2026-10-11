@@ -121,12 +121,18 @@ function readonlyGit(inner: GitProcess): GitProcess {
       })
       const network = verb === "ls-remote"
       if (result.timedOut === true || result.failure !== undefined || result.signal || (network && result.code !== 0)) {
-        // The raw stderr is deliberately NOT carried: it can name a private remote path. Say what
-        // happened, name the remote and the exit, and let the verdict be `unproven`.
+        // The raw stderr is deliberately NOT carried: it can name a private remote path. Name the
+        // VERB that failed and the exit, and let the verdict be `unproven`.
+        const exit = `exit ${result.code}${result.timedOut ? ", timed out" : ""}`
         throw new PrivateStoreFailure(
           "unproven",
-          "unavailable-transport",
-          `${request.repo}: git ls-remote did not complete (exit ${result.code}${result.timedOut ? ", timed out" : ""}); the remote could not be reached, so nothing is proven`,
+          // A local read failing is the STORE's own fault, never the network's: calling it
+          // `unavailable-transport` would blame a remote for a config, for-each-ref, rev-parse or
+          // symbolic-ref that never left this machine.
+          network ? "unavailable-transport" : "local-read-failed",
+          network
+            ? `${request.repo}: git ls-remote did not complete (${exit}); the remote could not be reached, so nothing is proven`
+            : `${request.repo}: git ${verb} did not complete (${exit}); the store's own metadata could not be read, so nothing is proven`,
         )
       }
       return result
@@ -141,6 +147,32 @@ async function read(git: GitProcess, repo: string, args: readonly string[]): Pro
       "invalid",
       "request-refused",
       `${repo}: git ${args[0] ?? "?"} did not succeed (exit ${result.code}); the store could not be read`,
+    )
+  }
+  return result.stdout.trimEnd()
+}
+
+/**
+ * The store's own configured fetch refspecs. `git config --get-regexp` exits 1 when nothing matches,
+ * and that is NOT a broken store: it is a store with no remote to compare its refs against. It gets
+ * its own named reason (`no-configured-remote`, verdict `unproven`) instead of being folded into
+ * "the store could not be read", which would tell a reader the bytes were unreadable when they were
+ * read fine. An exit 1 that also says something on stderr IS a broken store, and stays `invalid`.
+ */
+async function readConfiguredFetchRefspecs(git: GitProcess, store: string): Promise<string> {
+  const result = await git.run({ repo: store, args: ["config", "--get-regexp", "^remote\\..*\\.fetch$"] })
+  if (result.code === 1 && result.stdout.trim() === "" && result.stderr.trim() === "") {
+    throw new PrivateStoreFailure(
+      "unproven",
+      "no-configured-remote",
+      `${store}: the store configures no fetch refspec, so there is no remote to compare its refs against; nothing is proven`,
+    )
+  }
+  if (result.code !== 0) {
+    throw new PrivateStoreFailure(
+      "invalid",
+      "request-refused",
+      `${store}: git config did not succeed (exit ${result.code}); the store could not be read`,
     )
   }
   return result.stdout.trimEnd()
@@ -273,7 +305,7 @@ export async function verifyPrivateStoreCandidate(
       })
     }
 
-    const remoteListing = await read(git, store, ["config", "--get-regexp", "^remote\\..*\\.fetch$"])
+    const remoteListing = await readConfiguredFetchRefspecs(git, store)
     const remotes = new Map<string, readonly string[]>()
     for (const line of remoteListing.split("\n").filter(Boolean)) {
       const match = /^remote\.(.+?)\.fetch\s+(.*)$/u.exec(line)
@@ -431,7 +463,12 @@ export async function verifyPrivateStoreCandidate(
     const headValue = await read(git, store, ["rev-parse", "HEAD"])
     let head: PrivateStoreHeadRow
     if (symbolic.code === 0) {
-      head = { state: "symbolic", attachedTo: symbolic.stdout.trim(), value: headValue, advertised: true }
+      const attachedTo = symbolic.stdout.trim()
+      // The symbolic HEAD rides on the ref it is attached to, so it claims advertisement only where
+      // that ref's own row claims it. Hard-coding `true` would let a JSON reader trust a field the
+      // row beneath it contradicts.
+      const attachedRow = refRows.find((row) => row.ref === attachedTo)
+      head = { state: "symbolic", attachedTo, value: headValue, advertised: attachedRow?.state === "equal" }
     } else {
       const advertisedValue = [...advertised.values()].includes(headValue)
       head = { state: "detached", attachedTo: null, value: headValue, advertised: advertisedValue }
