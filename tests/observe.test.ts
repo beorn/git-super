@@ -115,15 +115,21 @@ test("the selected executable observes idle tips, excludes external children and
   ).toEqual(beforeStores)
 })
 
-test.each(["new", "removed", "changed", "root"] as const)(
-  "discards buffered findings when a %s ref changes during child reads",
+// @failure A full-ref fence treats a similarly named ref as selected (28615); namespace fences must still see additions.
+// @level l2 — real observer over hosted fixture refs, with a move interleaved at the existing process seam.
+// @consumer Scoped Yrd history reads and the queue runner's namespace fence.
+test.each(["new", "removed", "changed", "root", "neighbor"] as const)(
+  "judges a %s ref move during child reads according to the selected fence",
   async (change) => {
     const f = fixture()
     const recordRef = "refs/changes/main/live"
     git(f.product, "update-ref", recordRef, f.input.root.targetOid)
     const input: ObservationInput = {
       ...f.input,
-      fence: { ...f.input.fence, refs: [{ ref: recordRef, oid: f.input.root.targetOid }] },
+      fence: {
+        prefixes: change === "neighbor" ? [recordRef] : f.input.fence.prefixes,
+        refs: [{ ref: recordRef, oid: f.input.root.targetOid }],
+      },
     }
     advanceRepository(f.alpha, "alpha.ts", "export const alpha = 3\n")
     const other = git(
@@ -144,15 +150,26 @@ test.each(["new", "removed", "changed", "root"] as const)(
           injected = true
           if (change === "new") git(f.product, "update-ref", "refs/changes/main/not-a-recognized-row", other)
           else if (change === "removed") git(f.product, "update-ref", "-d", recordRef)
-          else git(f.product, "update-ref", change === "root" ? "refs/heads/main" : recordRef, other)
+          else {
+            git(
+              f.product,
+              "update-ref",
+              change === "root" ? "refs/heads/main" : change === "neighbor" ? `${recordRef}-2` : recordRef,
+              other,
+            )
+          }
         }
         return result
       },
     }
     const result = await observe(f.product, input, process)
     expect(injected, "child-read interleaving must actually run").toBe(true)
-    expect(result).toMatchObject({ outcome: "changed-during-read", notices: [] })
-    expect(result.message).toContain("All buffered findings were discarded")
+    if (change === "neighbor") {
+      expect(result.outcome).toBe("observed")
+    } else {
+      expect(result).toMatchObject({ outcome: "changed-during-read", notices: [] })
+      expect(result.message).toContain("All buffered findings were discarded")
+    }
   },
 )
 

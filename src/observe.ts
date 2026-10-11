@@ -128,6 +128,10 @@ async function required(git: GitProcess, repo: string, args: readonly string[]):
   return result.stdout.trimEnd()
 }
 
+function selectsRef(prefix: string, ref: string): boolean {
+  return prefix.endsWith("/") ? ref.startsWith(prefix) : ref === prefix
+}
+
 async function validateFence(git: GitProcess, repo: string, input: ObservationInput): Promise<void> {
   hostedRemoteIdentity(input.root.remote)
   const fullRef = async (ref: string) => {
@@ -142,7 +146,7 @@ async function validateFence(git: GitProcess, repo: string, input: ObservationIn
   const refs = new Map<string, string>()
   for (const row of input.fence.refs) {
     await fullRef(row.ref)
-    if (!input.fence.prefixes.some((prefix) => row.ref.startsWith(prefix))) {
+    if (!input.fence.prefixes.some((prefix) => selectsRef(prefix, row.ref))) {
       throw new Error(`Fence ref ${row.ref}: outside the selected prefixes`)
     }
     if (refs.has(row.ref)) throw new Error(`Fence ref ${row.ref}: duplicate or contradictory row`)
@@ -293,7 +297,7 @@ export async function observe(repo: string, value: unknown, process?: GitProcess
     const current = await advertisements(git, repo, input.root.remote)
     const captured = new Map(input.fence.refs.map((row) => [row.ref, row.oid]))
     const selected = new Map(
-      [...current].filter(([ref]) => input.fence.prefixes.some((prefix) => ref.startsWith(prefix))),
+      [...current].filter(([ref]) => input.fence.prefixes.some((prefix) => selectsRef(prefix, ref))),
     )
     const moved = [...new Set([...captured.keys(), ...selected.keys()])].filter(
       (ref) => captured.get(ref) !== selected.get(ref),
