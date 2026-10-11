@@ -649,7 +649,7 @@ describe("git super worktree add", () => {
     expect(git(fixture.product, ["worktree", "list", "--porcelain"])).not.toContain(worktree)
     const store = join(result.proof.retained, "vendor/dep")
     expect(readFileSync(join(store, "logs/HEAD"), "utf8")).toBe(beforeLog)
-    expect(readFileSync(result.proof.manifest, "utf8")).toContain("vendor/dep/refs/heads/spare")
+    expect(readFileSync(result.proof.manifest, "utf8")).toContain("vendor/dep/packed-refs")
     const rescued = join(fixtureRoot, "rescued.git")
     git(fixtureRoot, ["clone", "--quiet", "--bare", "--no-hardlinks", store, rescued])
     expect(git(rescued, ["rev-parse", "refs/heads/spare"])).toBe(spare)
