@@ -119,23 +119,76 @@ export type PrivateStoreDiscard = Readonly<{
 }>
 
 /**
- * What a removal's journal records actually MEAN, measured rather than assumed (F2; @dev/4 7d4a2522).
+ * What a removal's journal records actually MEAN, measured rather than assumed (F2; @dev/4 7d4a2522, revised by
+ * @dev/4 e73f8644).
  *
  * The guard journals the DECISION — it runs before the bytes go (`assertNoPrivateStore`, at `:246`) — so on a
  * failed removal a record is evidence of intent, never of a completed delete. A caller that reports the outcome
- * must therefore measure it: a store still present is STANDING, and only a store that is gone is discarded. The
- * distinction is the difference between "I deleted your private bytes" and "I was about to and did not".
+ * must therefore measure it, and the measurement has THREE outcomes that must stay apart (@dev/4 e73f8644):
+ * a store PROVEN absent (ENOENT) is discarded; a store observed present is standing; and a lookup that could not
+ * answer (EACCES/EPERM/ELOOP/ENOTDIR — a chmod000 parent is not a deleted store) is UNKNOWN, carrying the path
+ * and the cause, never folded into either pile. `existsSync` alone conflated the last with the first, and read
+ * every path twice: the asymmetry that produced (true,false omits a path, false,true lists it twice) is exactly
+ * what ONE observation per record removes.
  *
- * `exists` is injectable so the split is testable without racing a real removal.
+ * `lookup` is injectable so the split is testable without racing a real removal or depending on which uid runs.
  */
+export type StorePresence =
+  | Readonly<{ kind: "present" }>
+  | Readonly<{ kind: "absent" }>
+  | Readonly<{ kind: "unknown"; cause: string }>
+
+export type StoreLookup = (store: string) => StorePresence
+
+/**
+ * ONE metadata observation of a store's path. `lstatSync` (not `statSync`/`existsSync`): a store is a directory
+ * in place, and following a symlink would answer about a different path than the one being removed. Only ENOENT
+ * proves absence; every other failure is `unknown` with its errno text — the difference between "I deleted your
+ * private bytes" and "I could not tell whether they are there".
+ */
+export function observeStorePresence(store: string): StorePresence {
+  try {
+    lstatSync(store)
+    return { kind: "present" }
+  } catch (error) {
+    const code = errnoCode(error)
+    if (code === "ENOENT") return { kind: "absent" }
+    // Bun/node already prefix the message with the errno code ("EACCES: permission denied, …"), so prefix only a
+    // throw that does not carry it: the reason must read once, not as "EACCES: EACCES: …".
+    const described = error instanceof Error ? error.message : String(error)
+    return {
+      kind: "unknown",
+      cause: code === undefined || described.startsWith(code) ? described : `${code}: ${described}`,
+    }
+  }
+}
+
+/** The errno code of a thrown fs error, or undefined when the throw is not an errno-shaped one. */
+function errnoCode(error: unknown): string | undefined {
+  return typeof error === "object" && error !== null && "code" in error && typeof error.code === "string"
+    ? error.code
+    : undefined
+}
+
 export function classifyDiscardedStores(
   records: readonly PrivateStoreDiscard[],
-  exists: (store: string) => boolean = existsSync,
-): Readonly<{ discarded: readonly PrivateStoreDiscard[]; standing: readonly PrivateStoreDiscard[] }> {
-  return {
-    discarded: records.filter((record) => !exists(record.store)),
-    standing: records.filter((record) => exists(record.store)),
+  lookup: StoreLookup = observeStorePresence,
+): Readonly<{
+  discarded: readonly PrivateStoreDiscard[]
+  standing: readonly PrivateStoreDiscard[]
+  unknown: readonly Readonly<{ record: PrivateStoreDiscard; cause: string }>[]
+}> {
+  const discarded: PrivateStoreDiscard[] = []
+  const standing: PrivateStoreDiscard[] = []
+  const unknown: { record: PrivateStoreDiscard; cause: string }[] = []
+  for (const record of records) {
+    // ONE observation per record, taken once and reused — never a second lookup whose answer could disagree.
+    const presence = lookup(record.store)
+    if (presence.kind === "absent") discarded.push(record)
+    else if (presence.kind === "present") standing.push(record)
+    else unknown.push({ record, cause: presence.cause })
   }
+  return { discarded, standing, unknown }
 }
 
 /** One discard record rendered for operator-facing text: the store, its section and the checkout it came from. */

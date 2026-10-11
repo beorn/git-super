@@ -542,7 +542,7 @@ export async function superWorktreeAdd(options: SuperWorktreeAddOptions): Promis
     // CLAIM of deletion. The journal records the guard's DECISION, which happens before the bytes go, and this
     // failure is exactly the case where they did not: so the outcome is MEASURED, a store still present is named
     // as standing, and only a store that is gone is called discarded.
-    const { discarded: gone, standing } = classifyDiscardedStores(discarded)
+    const { discarded: gone, standing, unknown } = classifyDiscardedStores(discarded)
     const deleted =
       (gone.length === 0
         ? ""
@@ -550,7 +550,11 @@ export async function superWorktreeAdd(options: SuperWorktreeAddOptions): Promis
           gone.map(nameDiscardedStore).join(", ")) +
       (standing.length === 0
         ? ""
-        : `\nStill standing (journaled for discard, but NOT deleted): ${standing.map(nameDiscardedStore).join(", ")}`)
+        : `\nStill standing (journaled for discard, but NOT deleted): ${standing.map(nameDiscardedStore).join(", ")}`) +
+      (unknown.length === 0
+        ? ""
+        : `\nDiscard outcome UNKNOWN (journaled for discard; the store could not be observed, so it is neither proven deleted nor proven standing): ` +
+          unknown.map((entry) => `${nameDiscardedStore(entry.record)} — ${entry.cause}`).join(", "))
     if (undone === undefined) {
       return failed(
         "failed",

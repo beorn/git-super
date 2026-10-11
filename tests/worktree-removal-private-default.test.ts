@@ -5,7 +5,7 @@
  * @reach fs-walk <fixture-only: synthetic repositories under the temp root>
  * @testonly none
  */
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { afterEach, expect, it } from "vitest"
 import { createLocalGitWorktreeStore } from "../src/worktree.ts"
@@ -15,7 +15,10 @@ import {
   assertNoPrivateStoreAcrossPrune,
   classifyDiscardedStores,
   nameDiscardedStore,
+  observeStorePresence,
   PrivateStoreRefusalError,
+  type StoreLookup,
+  type StorePresence,
   type PrivateStoreDiscard,
 } from "../src/worktree-removal.ts"
 import { createLocalGitProcess, type GitProcess } from "../src/process.ts"
@@ -423,4 +426,57 @@ it("a removal that fails after the guard leaves the store standing, and the spli
   // The negative control: once the store IS gone, the same split calls it discarded.
   rmSync(store, { recursive: true, force: true })
   expect(classifyDiscardedStores(journal)).toMatchObject({ discarded: [{ store }], standing: [] })
+})
+
+/**
+ * F2 correction (@dev/4 e73f8644): the outcome measurement must take ONE observation per record, and it must keep
+ * three outcomes apart. These exercise the seam for what a single removal cannot stage on demand.
+ */
+it("observes each discarded record ONCE, so a store can never land in two lists", () => {
+  const records: readonly PrivateStoreDiscard[] = [
+    { name: "s", path: "vendor/private", store: "/tmp/one-shot", reason: "r", actor: null },
+  ]
+  // The answers a second read would have contradicted: present, then absent. The old `existsSync` PAIR read the
+  // path twice, so (present, absent) listed it as BOTH standing and discarded. One observation cannot.
+  const answers: StorePresence[] = [{ kind: "present" }, { kind: "absent" }]
+  let calls = 0
+  const lookup: StoreLookup = () => answers[calls++] ?? { kind: "unknown", cause: "over-read" }
+  const split = classifyDiscardedStores(records, lookup)
+  expect(calls).toBe(1)
+  expect(split.standing.map((entry) => entry.store)).toEqual(["/tmp/one-shot"])
+  expect(split.discarded).toEqual([])
+  expect(split.unknown).toEqual([])
+})
+
+it("classifies an unanswerable lookup as unknown with its cause, never as discarded", () => {
+  const records: readonly PrivateStoreDiscard[] = [
+    { name: "s", path: "vendor/private", store: "/tmp/unreadable", reason: "r", actor: null },
+  ]
+  const lookup: StoreLookup = () => ({ kind: "unknown", cause: "EACCES: permission denied, lstat '/tmp/unreadable'" })
+  const split = classifyDiscardedStores(records, lookup)
+  // A store the lookup could not observe is NOT a deleted store: it must never be reported as a deletion.
+  expect(split.discarded).toEqual([])
+  expect(split.standing).toEqual([])
+  expect(split.unknown.map((entry) => entry.cause)).toEqual(["EACCES: permission denied, lstat '/tmp/unreadable'"])
+  expect(split.unknown.map((entry) => nameDiscardedStore(entry.record))).toEqual([
+    "/tmp/unreadable (section s, from vendor/private)",
+  ])
+})
+
+it("observeStorePresence: a real chmod000 parent is unknown, a genuinely absent path is absent", () => {
+  // Native, not injected — this is the defect @dev/4 measured at uid 3001: existsSync folded EACCES into absence.
+  const root = mkdtempSync(join(canonicalTmpdir(), "git-super-store-presence-"))
+  roots.push(root)
+  const parent = join(root, "sealed")
+  const store = join(parent, "store")
+  mkdirSync(store, { recursive: true })
+  chmodSync(parent, 0o000)
+  try {
+    // The store still EXISTS; the parent's mode is what denies the lookup. Only ENOENT may mean discarded.
+    expect(observeStorePresence(store)).toMatchObject({ kind: "unknown" })
+  } finally {
+    chmodSync(parent, 0o700)
+  }
+  // And the proof it did not become a blanket "unknown": a path that is truly gone is still proven absent.
+  expect(observeStorePresence(join(root, "gone"))).toEqual({ kind: "absent" })
 })
