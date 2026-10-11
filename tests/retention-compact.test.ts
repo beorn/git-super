@@ -6,11 +6,22 @@
  * @testonly none
  */
 import { createHash } from "node:crypto"
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs"
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs"
 import { spawnSync } from "node:child_process"
 import { join, sep } from "node:path"
 import { afterEach, describe, expect, it, vi } from "vitest"
-import { compactRetainedModules } from "../src/retention-compact.ts"
+import { compactRetainedModules, findRetainedGitDirs, type CompactionOptions } from "../src/retention-compact.ts"
+import { createLocalGitWorktreeStore } from "../src/worktree.ts"
 import { verifyRetainedEntry } from "../src/retention-verify.ts"
 import { manifest, type WorktreeRemovalProof } from "../src/worktree-removal.ts"
 import { canonicalTmpdir, createRepository, git as gitCwd } from "./fixture.ts"
@@ -49,6 +60,10 @@ function addLooseRemotes(gitDir: string, count: number): void {
 
 function digest(bytes: string): string {
   return createHash("sha256").update(bytes).digest("hex")
+}
+
+function inRun(common: string = sep): CompactionOptions {
+  return { common, preState: { kind: "in-run" } }
 }
 
 function outputSink(): { output: string; write(value: string): void } {
@@ -135,7 +150,7 @@ describe("compactRetainedModules", () => {
     expect(existsSync(join(gitDir, "logs/refs/remotes/origin/topic-1"))).toBe(true)
     expect(existsSync(join(nested, "refs/remotes/origin/topic-1"))).toBe(true)
 
-    compactRetainedModules(proof)
+    expect(compactRetainedModules(proof, inRun())).toEqual({ status: "ok" })
 
     expect(gitAt(gitDir, ["for-each-ref", "--format=%(refname) %(objectname)"])).toBe(before.refs)
     expect(gitAt(nested, ["for-each-ref", "--format=%(refname) %(objectname)"])).toBe(before.nestedRefs)
@@ -159,7 +174,7 @@ describe("compactRetainedModules", () => {
       retainUntil: string
       files: Record<string, string>
     }
-    compactRetainedModules(proof)
+    expect(compactRetainedModules(proof, inRun())).toEqual({ status: "ok" })
     const afterBytes = readFileSync(proof.manifest, "utf8")
     const after = JSON.parse(afterBytes) as {
       createdAt: string
@@ -201,7 +216,11 @@ describe("compactRetainedModules", () => {
     const before = readFileSync(proof.manifest)
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
     try {
-      expect(() => compactRetainedModules(proof)).toThrow(/pack-refs/u)
+      expect(compactRetainedModules(proof, inRun())).toEqual({
+        status: "failed",
+        child: gitDir,
+        step: "pack-refs",
+      })
       expect(readFileSync(proof.manifest)).toEqual(before)
       expect(existsSync(proof.retained as string)).toBe(true)
       expect(existsSync(join(gitDir, "HEAD"))).toBe(true)
@@ -212,6 +231,104 @@ describe("compactRetainedModules", () => {
       warn.mockRestore()
     }
   })
+
+  it("refuses rewrite when an objects-link sits outside the real common dir", () => {
+    const { proof, gitDir, entry, root } = buildSyntheticEntry()
+    const objects = join(gitDir, "objects")
+    const outside = join(root, "outside-objects")
+    rmSync(objects, { recursive: true, force: true })
+    mkdirSync(outside, { recursive: true })
+    symlinkSync(outside, objects)
+    const recorded = manifest(proof.retained as string, {
+      common: sep,
+      checkout: proof.path,
+      gitDir: join(entry, "original-modules", ".."),
+      modules: proof.retained as string,
+    })
+    const stored = JSON.parse(readFileSync(proof.manifest, "utf8")) as Record<string, unknown>
+    writeFileSync(
+      proof.manifest,
+      `${JSON.stringify({ ...stored, files: recorded.files, entries: recorded.entries }, null, 2)}\n`,
+    )
+    const before = readFileSync(proof.manifest)
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    try {
+      const result = compactRetainedModules(proof, inRun(join(entry, "not-the-common")))
+      expect(result.status).toBe("failed")
+      if (result.status !== "failed") throw new Error("expected failed compaction")
+      expect(result.step).toBe("rewrite-proof")
+      expect(readFileSync(proof.manifest)).toEqual(before)
+      expect(existsSync(proof.retained as string)).toBe(true)
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  it("gate-2 refuses a damaged child before packing and does not rewrite the proof", () => {
+    const { gitDir, proof } = buildSyntheticEntry()
+    writeFileSync(join(gitDir, "config"), `${readFileSync(join(gitDir, "config"), "utf8")}\n# damaged\n`)
+    const before = readFileSync(proof.manifest)
+    const packedBefore = existsSync(join(gitDir, "packed-refs"))
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    try {
+      expect(compactRetainedModules(proof, { common: sep, preState: { kind: "gate-2" } })).toEqual({
+        status: "failed",
+        child: proof.retained,
+        step: "gate-2",
+      })
+      expect(readFileSync(proof.manifest)).toEqual(before)
+      expect(existsSync(join(gitDir, "refs/remotes/origin/topic-1"))).toBe(true)
+      expect(existsSync(join(gitDir, "packed-refs"))).toBe(packedBefore)
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  it("keeps remove() resolved when pack-refs fails after native --force", async () => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-retention-compact-remove-fail-"))
+    roots.push(root)
+    const dependency = join(root, "dependency")
+    const product = join(root, "product")
+    mkdirSync(dependency, { recursive: true })
+    gitCwd(dependency, "init", "-q", "-b", "main")
+    writeFileSync(join(dependency, "dep.ts"), "export const dep = 1\n")
+    gitCwd(dependency, "add", "dep.ts")
+    gitCwd(dependency, "commit", "-q", "-m", "dep")
+    mkdirSync(product, { recursive: true })
+    gitCwd(product, "init", "-q", "-b", "main")
+    gitCwd(product, "-c", "protocol.file.allow=always", "submodule", "add", "-q", dependency, "vendor/dep")
+    gitCwd(product, "commit", "-q", "-m", "add vendor/dep")
+    const worktree = join(root, "candidate")
+    const retainedRoot = join(root, "retained")
+    expect(await runCli(["--repo", product, "worktree", "add", worktree, "HEAD"], outputSink(), outputSink())).toBe(0)
+    const moduleGitDir = gitCwd(join(worktree, "vendor/dep"), "rev-parse", "--absolute-git-dir")
+    addLooseRemotes(moduleGitDir, 8)
+    let captured: WorktreeRemovalProof | undefined
+    const store = createLocalGitWorktreeStore({ repo: product })
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    try {
+      const outcome = await store.remove(worktree, {
+        retention: {
+          root: retainedRoot,
+          report: (proof) => {
+            captured = proof
+            if (proof.retained === null) return
+            for (const gitDir of findRetainedGitDirs(proof.retained)) {
+              mkdirSync(join(gitDir, "packed-refs.lock"))
+            }
+          },
+        },
+      })
+      expect(existsSync(worktree)).toBe(false)
+      expect(outcome).toMatchObject({ compaction: { status: "failed", step: "pack-refs" } })
+      expect(captured?.retained).toEqual(expect.any(String))
+      const recordedManifest = JSON.parse(readFileSync(captured!.manifest, "utf8")) as { compaction?: unknown }
+      expect(recordedManifest.compaction).toBeUndefined()
+      expect(existsSync(captured!.retained as string)).toBe(true)
+    } finally {
+      warn.mockRestore()
+    }
+  }, 120_000)
 
   it("passes every retention-verify gate on a compacted real-writer child", async () => {
     const root = mkdtempSync(join(canonicalTmpdir(), "git-super-retention-compact-live-"))

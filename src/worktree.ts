@@ -20,7 +20,7 @@ import {
   type WorktreeRemovalProof,
   type WorktreeRetention,
 } from "./worktree-removal.ts"
-import { compactRetainedModules } from "./retention-compact.ts"
+import { compactRetainedModules, type CompactionResult } from "./retention-compact.ts"
 import { cleanGitEnvironment, probeRepository } from "./git.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
 import { createProgressReporter } from "./progress.ts"
@@ -514,13 +514,14 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
          */
         journal?: (record: PrivateStoreDiscard) => void
       }> = {},
-    ): Promise<void | Readonly<{ borrowers: readonly string[] }>> {
+    ): Promise<void | Readonly<{ borrowers: readonly string[] }> | Readonly<{ compaction: CompactionResult }>> {
       await assertRemovalRoot(path)
       // The selected checkout can be the removal target. Its registry outlives it.
       const removalRepo = await git.text(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"])
       let stagingPath: string | undefined
       let borrowed: Readonly<{ borrowers: readonly string[] }> | undefined
       let removalProof: WorktreeRemovalProof | undefined
+      let compaction: CompactionResult | undefined
       await mutate(removeOptions.operation ?? `worktree remove ${path}`, async () => {
         if (removeOptions.retention !== undefined && removeOptions.unlock === true) {
           throw new Error(`retained worktree removal cannot unlock ${path}; resolve its holder first`)
@@ -643,9 +644,16 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
 
       try {
         // After native --force: pack-refs + drop remote reflogs on the retained copy, then rewrite
-        // the proof so gate 2 still matches. A compact failure must not restore the live worktree
-        // (already gone) and must not delete the copy; close fails loud with the verified original.
-        if (removalProof?.retained != null) compactRetainedModules(removalProof)
+        // the proof so gate 2 still matches. Compaction must not throw: --force already succeeded,
+        // so a throw would record a failed close for a worktree that is gone (R2). On failure every
+        // ref value stays intact, the proof is not rewritten (later retention verify refuses), and
+        // the copy is never deleted.
+        if (removalProof?.retained != null) {
+          compaction = compactRetainedModules(removalProof, {
+            common: removalRepo,
+            preState: { kind: "in-run" },
+          })
+        }
       } finally {
         // Phase 2 (outside mutation lock):
         // Delete the staging directory synchronously in the caller. Never fire-and-forget.
@@ -674,7 +682,9 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
           }
         }
       }
-      return borrowed
+      if (borrowed !== undefined) return borrowed
+      if (compaction !== undefined) return { compaction }
+      return undefined
     },
     async prune(
       pruneOptions: Readonly<{

@@ -3,6 +3,7 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path"
 import { runGit } from "./git.ts"
 import { gitSuperResult, type GitSuperResult } from "./result.ts"
 import { createLocalGitWorktreeStore } from "./worktree.ts"
+import type { CompactionResult } from "./retention-compact.ts"
 import type { PrivateStoreDiscard, WorktreeRemovalProof } from "./worktree-removal.ts"
 import type { NotCompared } from "./diff.ts"
 
@@ -50,6 +51,8 @@ export type SuperWorktreeRemoveResult = GitSuperResult &
     borrowers?: readonly string[]
     /** Stores this removal deleted on purpose, present only when the override ran. */
     discardedStores?: readonly PrivateStoreDiscard[]
+    /** Present when a retained copy was compacted after native --force; failure does not fail the removal. */
+    compaction?: CompactionResult
   }>
 
 /** Retention and cleanliness are owned by the same store that performs native removal. */
@@ -94,7 +97,7 @@ export async function superWorktreeRemove(options: SuperWorktreeRemoveOptions): 
         },
       },
     })
-    if (outcome !== undefined) {
+    if (outcome !== undefined && "borrowers" in outcome) {
       return {
         ...gitSuperResult([{ repository: repo, state: "unchanged", refs: [] }]),
         path,
@@ -110,6 +113,7 @@ export async function superWorktreeRemove(options: SuperWorktreeRemoveOptions): 
       path,
       notCompared: proof.notCompared,
       proof,
+      ...(outcome !== undefined && "compaction" in outcome ? { compaction: outcome.compaction } : {}),
       ...(discarded.length === 0 ? {} : { discardedStores: discarded }),
     }
   } catch (error) {
