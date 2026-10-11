@@ -203,6 +203,9 @@ function prunableAdminDirs(common: string, preview: Readonly<{ stdout: string; s
           `git worktree prune --dry-run --verbose printed a ${previewLineKind(trimmed)} on ${stream} that this ` +
             `guard cannot parse (its text is withheld: a preview line can name a private path); nothing was ` +
             `pruned — an unparsed preview cannot be proven to name every admin dir Git would delete`,
+          // A refusal that names no store still carries the typed EMPTY list, never the constructor's implicit
+          // default: a consumer reads this field, and an absent one would read as "nothing private" (27120, @cto).
+          [],
         )
       }
       const dir = resolve(common, match[1])
@@ -279,6 +282,9 @@ export async function assertNoPrivateStoreAcrossPrune(
       throw new PrivateStoreRefusalError(
         `git worktree prune would delete ${adminDir}, which holds a submodule store, and its recorded HEAD cannot be read ` +
           `(${headRun.stderr.trim() || "no HEAD"}); nothing was pruned; inspect that admin dir and its store before pruning`,
+        // Explicit [], never the implicit default: this refusal names no store, and a consumer reads the field
+        // itself rather than a message (27120, @cto).
+        [],
       )
     }
     await assertNoPrivateStore(process, { adminDir, repository: request.repository, head: headRun.stdout.trim() })
