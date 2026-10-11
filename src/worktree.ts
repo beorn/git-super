@@ -779,6 +779,7 @@ function withHookPolicy(args: readonly string[], policy: WorktreeHookPolicy | un
 export {
   assertNoPrivateStore,
   assertNoPrivateStoreAcrossPrune,
+  PrivateStoreRefusalError,
   type PrivateStoreCustody,
   type PrivateStoreRefusal,
 } from "./worktree-removal.ts"

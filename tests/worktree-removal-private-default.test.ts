@@ -9,6 +9,8 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs"
 import { join } from "node:path"
 import { afterEach, expect, it } from "vitest"
 import { createLocalGitWorktreeStore } from "../src/worktree.ts"
+import { assertNoPrivateStoreAcrossPrune, PrivateStoreRefusalError } from "../src/worktree-removal.ts"
+import type { GitProcess } from "../src/process.ts"
 import { canonicalTmpdir, createRepository, git } from "./fixture.ts"
 
 const roots: string[] = []
@@ -172,5 +174,80 @@ it("refuses when only current main declares the store private (custody ruling (b
 
   expect(error, "main's declaration decides even where the target HEAD predates it").toBeInstanceOf(Error)
   expect(String(error)).toContain(store)
+  expect(existsSync(store)).toBe(true)
+})
+
+// C1: the preview is this guard's ONLY source for what prune would delete, so a line it cannot parse refuses
+// the prune instead of being skipped — and the refusal names the line's KIND, never any of its text.
+it("refuses a prune preview it cannot fully parse, and repeats none of the line", async () => {
+  const root = mkdtempSync(join(canonicalTmpdir(), "git-super-prune-unparsed-"))
+  roots.push(root)
+  const repo = join(root, "product")
+  createRepository(repo, "root.txt", "root\n")
+  const sentinel = "PRIVATE-SENTINEL-PATH"
+  let previewEnv: NodeJS.ProcessEnv | undefined
+  const process: GitProcess = {
+    async run(request) {
+      if (request.args[0] === "worktree") {
+        previewEnv = request.env
+        return { code: 0, stdout: "", stderr: `warning: something odd about ${sentinel}\n` }
+      }
+      return { code: 0, stdout: `${join(repo, ".git")}\n`, stderr: "" }
+    },
+  }
+  const error = await assertNoPrivateStoreAcrossPrune(process, { repository: repo }).then(
+    () => undefined,
+    (cause: unknown) => cause,
+  )
+  expect(error, "an unparsed preview cannot be proven to name every admin dir Git would delete").toBeInstanceOf(Error)
+  expect(String(error)).toContain("warning line")
+  expect(String(error)).not.toContain(sentinel)
+  // The other half of C1: the preview is read in a fixed locale, or a translated Git refuses every prune.
+  expect(previewEnv?.LC_ALL).toBe("C")
+})
+
+it("judges an unparsed preview line on stdout too, and names the stream", async () => {
+  const root = mkdtempSync(join(canonicalTmpdir(), "git-super-prune-unparsed-stdout-"))
+  roots.push(root)
+  const repo = join(root, "product")
+  createRepository(repo, "root.txt", "root\n")
+  const process: GitProcess = {
+    async run(request) {
+      if (request.args[0] === "worktree") return { code: 0, stdout: "Removing but no reason follows\n", stderr: "" }
+      return { code: 0, stdout: `${join(repo, ".git")}\n`, stderr: "" }
+    },
+  }
+  const error = await assertNoPrivateStoreAcrossPrune(process, { repository: repo }).then(
+    () => undefined,
+    (cause: unknown) => cause,
+  )
+  expect(error).toBeInstanceOf(Error)
+  expect(String(error)).toContain("stdout")
+  expect(String(error)).toContain("malformed")
+})
+
+// C4: the refusal is TYPED, so a caller that must discard a tree can tell "these bytes must not be deleted"
+// from "git failed" and skip the tree instead of wedging on message text. Both removal shapes carry it.
+it("refuses with a typed refusal on the plain removal and on the prune", async () => {
+  const root = mkdtempSync(join(canonicalTmpdir(), "git-super-typed-refusal-"))
+  roots.push(root)
+  const { repo, linked, store } = privateFixture(root)
+  const removal = await createLocalGitWorktreeStore({ repo })
+    .remove(linked)
+    .then(
+      () => undefined,
+      (cause: unknown) => cause,
+    )
+  expect(removal).toBeInstanceOf(PrivateStoreRefusalError)
+  expect(existsSync(store)).toBe(true)
+
+  rmSync(linked, { recursive: true, force: true })
+  const pruning = await createLocalGitWorktreeStore({ repo })
+    .prune()
+    .then(
+      () => undefined,
+      (cause: unknown) => cause,
+    )
+  expect(pruning).toBeInstanceOf(PrivateStoreRefusalError)
   expect(existsSync(store)).toBe(true)
 })

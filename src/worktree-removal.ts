@@ -97,6 +97,18 @@ export type PrivateStoreCustody = Readonly<{
 export type PrivateStoreRefusal = Readonly<{ name: string; path: string; head: string; store: string }>
 
 /**
+ * The refusal as a CLASS, so a caller can tell "these bytes must not be deleted" from "git failed" without
+ * matching message text. A queue that has to discard a tree skips it, names it once and continues on a refusal;
+ * anything else still stops the round. Same message, same named stores — only the type is new (@cto C4).
+ */
+export class PrivateStoreRefusalError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = "PrivateStoreRefusalError"
+  }
+}
+
+/**
  * The commits whose declaration decides whether a store inside `adminDir` is private: the target's own HEAD,
  * plus the repository's current `main` when it differs (chief custody ruling (b), 2026-10-11 — a store is
  * private for what it holds, not for how old the target's HEAD is). ONE function owns this key, so the ruling
@@ -149,7 +161,7 @@ export async function assertNoPrivateStore(process: GitProcess, custody: Private
     }
   }
   if (refusals.length === 0) return
-  throw new Error(
+  throw new PrivateStoreRefusalError(
     `worktree removal would destroy a private submodule store: ${refusals
       .map((entry) => `${entry.path} (section ${entry.name}) store ${entry.store}, declared private at ${entry.head}`)
       .join("; ")}; worktree preserved; take custody of each store first (the operator empties the checkout, runs ` +
@@ -162,16 +174,42 @@ export async function assertNoPrivateStore(process: GitProcess, custody: Private
  * The admin dirs `git worktree prune` WOULD delete, from its own preview. Git reports them on stderr, one
  * `Removing <path>: <reason>` line each, relative to the common dir. Parsing Git's own plan is the point: the
  * set is whatever the installed Git would act on, not a reimplementation of its expiry rules.
+ *
+ * FAIL CLOSED (C1). The preview is the ONLY source of that set, so a line this guard cannot parse means it
+ * cannot prove it has seen every admin dir Git would delete, and the prune is refused rather than trusted. The
+ * refusal names the line's KIND and never its text, because a preview line can carry a path and a path can be
+ * private; a shape this guard does not recognize is skipped by nothing and reported by kind alone.
  */
-function prunableAdminDirs(common: string, report: string): string[] {
+function prunableAdminDirs(common: string, preview: Readonly<{ stdout: string; stderr: string }>): string[] {
   const dirs: string[] = []
-  for (const line of report.split("\n")) {
-    const match = /^Removing (.+?): /u.exec(line.trim())
-    if (match?.[1] === undefined) continue
-    const dir = resolve(common, match[1])
-    if (!dirs.includes(dir)) dirs.push(dir)
+  for (const [stream, report] of [
+    ["stderr", preview.stderr],
+    ["stdout", preview.stdout],
+  ] as const) {
+    for (const line of report.split("\n")) {
+      const trimmed = line.trim()
+      if (trimmed === "") continue
+      const match = /^Removing (.+?): /u.exec(trimmed)
+      if (match?.[1] === undefined) {
+        throw new PrivateStoreRefusalError(
+          `git worktree prune --dry-run --verbose printed a ${previewLineKind(trimmed)} on ${stream} that this ` +
+            `guard cannot parse (its text is withheld: a preview line can name a private path); nothing was ` +
+            `pruned — an unparsed preview cannot be proven to name every admin dir Git would delete`,
+        )
+      }
+      const dir = resolve(common, match[1])
+      if (!dirs.includes(dir)) dirs.push(dir)
+    }
   }
   return dirs
+}
+
+/** The KIND of an unparsed preview line: enough to route it, never its text or any character of it. */
+function previewLineKind(line: string): string {
+  if (/^warning:/iu.test(line)) return "warning line"
+  if (/^(fatal|error):/iu.test(line)) return "error line"
+  if (/^Removing\b/u.test(line)) return "malformed `Removing` line"
+  return "line in no recognized shape"
 }
 
 /**
@@ -183,6 +221,11 @@ function prunableAdminDirs(common: string, report: string): string[] {
  * shape prune exists to act on is the one they cannot see. The guard therefore asks Git what it WOULD remove
  * (`--dry-run --verbose`) and judges each candidate BEFORE the real prune, reading the admin dir's own HEAD,
  * which Git leaves in place for precisely these registrations.
+ *
+ * RESIDUAL (C1), stated rather than implied: the guard judges a PREVIEW and the caller then prunes for real. An
+ * admin dir that becomes prunable between the two runs — one whose checkout is deleted inside that window — is
+ * pruned by the real command without ever being judged. The window is inherent to asking Git what it would do;
+ * it is `--dry-run` that makes the set Git's own rather than a reimplementation of its expiry rules.
  */
 export async function assertNoPrivateStoreAcrossPrune(
   process: GitProcess,
@@ -195,7 +238,13 @@ export async function assertNoPrivateStoreAcrossPrune(
     "--verbose",
     ...(request.expire === undefined ? [] : ["--expire", request.expire]),
   ]
-  const preview = await process.run({ repo: request.repository, args: previewArgs })
+  const preview = await process.run({
+    repo: request.repository,
+    args: previewArgs,
+    // C1: read the preview in a FIXED locale. The guard parses the word `Removing`, and a localized Git
+    // prints a translated word instead — which, under the fail-closed rule below, would refuse every prune.
+    env: { LC_ALL: "C" },
+  })
   if (preview.code !== 0) {
     throw new Error(
       `git worktree prune --dry-run failed in ${request.repository}: ${preview.stderr.trim() || preview.stdout.trim()}`,
@@ -211,7 +260,7 @@ export async function assertNoPrivateStoreAcrossPrune(
     )
   }
   const common = realpathSync(commonRun.stdout.trim())
-  for (const adminDir of prunableAdminDirs(common, `${preview.stdout}\n${preview.stderr}`)) {
+  for (const adminDir of prunableAdminDirs(common, preview)) {
     // An admin dir with no store cannot destroy one; the question only arises where modules/ exists.
     if (!present(join(adminDir, "modules"))) continue
     const headRun = await process.run({
@@ -219,7 +268,7 @@ export async function assertNoPrivateStoreAcrossPrune(
       args: ["--git-dir", adminDir, "rev-parse", "--verify", "HEAD"],
     })
     if (headRun.code !== 0 || headRun.stdout.trim() === "") {
-      throw new Error(
+      throw new PrivateStoreRefusalError(
         `git worktree prune would delete ${adminDir}, which holds a submodule store, and its recorded HEAD cannot be read ` +
           `(${headRun.stderr.trim() || "no HEAD"}); nothing was pruned; inspect that admin dir and its store before pruning`,
       )
