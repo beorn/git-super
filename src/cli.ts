@@ -620,11 +620,18 @@ async function runInvocation(
       (value: string, previous: string[]) => [...previous, value],
       [],
     )
+    .option(
+      "--include-private <path>",
+      "materialize a path the target commit declares private = true, which creation otherwise leaves empty and uninitialized",
+      (value: string, previous: string[]) => [...previous, value],
+      [],
+    )
     .argument("<path>", "path the new detached worktree is created at")
     .argument("<commit>", "commit the worktree and every recorded gitlink are placed at")
     .action((path, commit, options, command) => {
       const globals = command.optsWithGlobals() as { repo: string; json?: boolean }
       const excluded = (options as { excludeSubmodule?: string[] }).excludeSubmodule
+      const included = (options as { includePrivate?: string[] }).includePrivate
       captured = {
         node: commands.worktree.add,
         params: {
@@ -632,6 +639,7 @@ async function runInvocation(
           commit,
           ...(typeof options.reference === "string" ? { reference: options.reference } : {}),
           ...(excluded?.length ? { excludedSubmodules: excluded } : {}),
+          ...(included?.length ? { includePrivate: included } : {}),
         },
         json: globals.json === true,
         nul: false,

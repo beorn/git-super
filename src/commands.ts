@@ -342,6 +342,9 @@ const worktreeAdd = commandNode<CommandContext, WorktreeAddParams, GitSuperResul
         ...(input.excludedSubmodules === undefined
           ? {}
           : { excludedSubmodules: stringArray(input.excludedSubmodules, "excludedSubmodules") }),
+        ...(input.includePrivate === undefined
+          ? {}
+          : { includePrivate: stringArray(input.includePrivate, "includePrivate") }),
       }
     },
     (value) => {

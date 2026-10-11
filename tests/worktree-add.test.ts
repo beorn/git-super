@@ -781,6 +781,91 @@ describe("git super worktree add", () => {
     expect(existsSync(worktree)).toBe(false)
   })
 
+  /**
+   * @failure `git super worktree add` materializes a child the target commit declares `private = true`, so a
+   *          fresh worktree lays down a private store nobody chose and the removal gate then refuses on it
+   *          (28661 condition 2, @cto).
+   * @level   l2
+   * @consumer Yrd env open, and every caller that creates a worktree through git-super
+   */
+  it("leaves a declared-private child empty and uninitialized by default, with no --exclude-submodule", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-worktree-private-default-"))
+    roots.push(fixtureRoot)
+    const fixture = createSuperproject(fixtureRoot)
+    const secret = join(fixtureRoot, "secret")
+    initRepository(secret, "secret.ts", "export const secret = 1\n")
+    git(fixture.product, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", secret, "vendor/secret"])
+    // `private = true` is the declaration's one home (27162): creation reads it through the same reader the
+    // removal guard and yrd's creation path use, so the default is the declaration, never the caller's list.
+    git(fixture.product, ["config", "-f", ".gitmodules", "submodule.vendor/secret.private", "true"])
+    git(fixture.product, ["add", ".gitmodules", "vendor/secret"])
+    git(fixture.product, ["commit", "-q", "-m", "declare vendor/secret private"])
+    const head = git(fixture.product, ["rev-parse", "HEAD"])
+    const worktree = join(fixtureRoot, "candidate")
+    const stdout = outputSink()
+    const stderr = outputSink()
+
+    const code = await runCli(["--repo", fixture.product, "--json", "worktree", "add", worktree, head], stdout, stderr)
+
+    expect(code, stderr.output).toBe(0)
+    const result = JSON.parse(stdout.output) as { notCompared: { path: string; reason: string }[] }
+    expect(result.notCompared.map(({ path, reason }) => [path, reason])).toEqual([["vendor/secret", "excluded"]])
+    expect(git(join(worktree, "vendor/dep"), ["rev-parse", "HEAD"])).toBe(fixture.pin)
+    expect(readdirSync(join(worktree, "vendor/secret"))).toEqual([])
+    expect(git(worktree, ["submodule", "status", "--", "vendor/secret"])).toMatch(/^-/u)
+    const gitDir = git(worktree, ["rev-parse", "--absolute-git-dir"])
+    expect(existsSync(join(gitDir, "modules", "vendor/secret"))).toBe(false)
+    expect(existsSync(join(gitDir, "modules", "vendor/dep"))).toBe(true)
+  })
+
+  it("materializes a declared-private child only with --include-private", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-worktree-private-include-"))
+    roots.push(fixtureRoot)
+    const fixture = createSuperproject(fixtureRoot)
+    const secret = join(fixtureRoot, "secret")
+    initRepository(secret, "secret.ts", "export const secret = 1\n")
+    git(fixture.product, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", secret, "vendor/secret"])
+    git(fixture.product, ["config", "-f", ".gitmodules", "submodule.vendor/secret.private", "true"])
+    git(fixture.product, ["add", ".gitmodules", "vendor/secret"])
+    git(fixture.product, ["commit", "-q", "-m", "declare vendor/secret private"])
+    const head = git(fixture.product, ["rev-parse", "HEAD"])
+    const worktree = join(fixtureRoot, "candidate")
+    const stdout = outputSink()
+    const stderr = outputSink()
+
+    const code = await runCli(
+      ["--repo", fixture.product, "--json", "worktree", "add", worktree, head, "--include-private", "vendor/secret"],
+      stdout,
+      stderr,
+    )
+
+    expect(code, stderr.output).toBe(0)
+    const result = JSON.parse(stdout.output) as { notCompared: { path: string }[] }
+    expect(result.notCompared.map(({ path }) => path)).toEqual([])
+    expect(git(join(worktree, "vendor/secret"), ["rev-parse", "HEAD"])).toBe(git(secret, ["rev-parse", "HEAD"]))
+    expect(existsSync(join(worktree, "vendor/secret/secret.ts"))).toBe(true)
+  })
+
+  it("refuses --include-private for a path the commit does not declare private, before the worktree exists", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-worktree-private-refuse-"))
+    roots.push(fixtureRoot)
+    const fixture = createSuperproject(fixtureRoot)
+    const worktree = join(fixtureRoot, "candidate")
+    const stdout = outputSink()
+    const stderr = outputSink()
+
+    const code = await runCli(
+      ["--repo", fixture.product, "worktree", "add", worktree, "HEAD", "--include-private", "vendor/dep"],
+      stdout,
+      stderr,
+    )
+
+    expect(code).not.toBe(0)
+    expect(stderr.output).toContain("does not declare private = true")
+    expect(stderr.output).toContain("vendor/dep")
+    expect(existsSync(worktree)).toBe(false)
+  })
+
   it("fetches a pin the reference lacks instead of refusing it", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-worktree-fetch-"))
     roots.push(fixtureRoot)

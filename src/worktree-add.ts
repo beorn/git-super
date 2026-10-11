@@ -3,6 +3,8 @@ import { existsSync } from "node:fs"
 import { basename, dirname, isAbsolute, join, resolve } from "node:path"
 import type { ConditionalLogger } from "loggily"
 import type { NotCompared } from "./diff.ts"
+import { readPrivateSubmodulePaths } from "./commit-graph.ts"
+import { createLocalGitProcess } from "./process.ts"
 import { validateExcludedSubmodules } from "./git.ts"
 import { gitSuperResult, type GitResultDetail, type GitSuperResult } from "./result.ts"
 import { materializeSubmodulesFromLocalWorktreeParallel } from "./submodules.ts"
@@ -267,6 +269,13 @@ export type SuperWorktreeAddOptions = Readonly<{
    * Each one is reported as an `excluded` observation in `notCompared`.
    */
   excludedSubmodules?: readonly string[]
+  /**
+   * Literal root-relative paths the target commit declares `private = true` that this caller DOES mean to
+   * materialize. Creation excludes every declared-private child by default (28661 condition 2), so a private
+   * store exists only where someone deliberately initialized one; this is the one opt-in. A path the commit
+   * does not declare private is refused, never ignored.
+   */
+  includePrivate?: readonly string[]
   env?: NodeJS.ProcessEnv
   log?: ConditionalLogger
   report?: (line: string) => void
@@ -301,6 +310,19 @@ function detail(code: string, phase: string, message: string, remedy?: string): 
 
 function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+/** One failure detail, preserving a reader's own `resultDetail` and never collapsing it into a bare message. */
+function resultError(error: unknown, phase: string): GitResultDetail {
+  if (typeof error === "object" && error !== null && "resultDetail" in error) {
+    return (error as { resultDetail: GitResultDetail }).resultDetail
+  }
+  return detail(
+    "read-private-submodules-failed",
+    phase,
+    `Could not read the target commit's private-submodule declaration: ${message(error)}`,
+    "Resolve the reported Git condition on the target commit, then rerun the same git super worktree add command.",
+  )
 }
 
 function at(path: string, requested: string, commit: string | undefined): string {
@@ -364,9 +386,11 @@ export async function superWorktreeAdd(options: SuperWorktreeAddOptions): Promis
     ...(gitmodules === undefined ? {} : { gitmodules }),
   })
 
-  const excludedSubmodules = options.excludedSubmodules ?? []
+  const requestedSubmodules = options.excludedSubmodules ?? []
+  const includePrivate = options.includePrivate ?? []
   try {
-    validateExcludedSubmodules(excludedSubmodules)
+    validateExcludedSubmodules(requestedSubmodules)
+    validateExcludedSubmodules(includePrivate)
   } catch (error) {
     return failed(
       "failed",
@@ -378,6 +402,40 @@ export async function superWorktreeAdd(options: SuperWorktreeAddOptions): Promis
       ),
     )
   }
+
+  // 28661 condition 2 (@cto, on the removal gate): CREATION excludes the target commit's declared-private
+  // children by default, read through the ONE reader (`readPrivateSubmodulePaths`) the removal guard and yrd's
+  // creation path also use. A private store exists only where someone deliberately initialized one, so a fresh
+  // worktree must not lay down the fetch-cache store the removal gate then refuses on (27147, made symmetric).
+  // `--include-private <path>` is the one opt-in, for a caller that does mean to work in a private submodule —
+  // exactly the case the gate exists for. A path the commit does not declare private refuses, never passes.
+  let declaredPrivate: readonly string[]
+  try {
+    declaredPrivate = await readPrivateSubmodulePaths(createLocalGitProcess(env), repo, options.commit)
+  } catch (error) {
+    return failed("failed", resultError(error, "read-private-submodules"))
+  }
+  const unknownInclude = includePrivate.filter((included) => !declaredPrivate.includes(included))
+  if (unknownInclude.length > 0) {
+    const declares =
+      declaredPrivate.length === 0
+        ? "it declares no private submodule"
+        : `it declares ${declaredPrivate.map((entry) => JSON.stringify(entry)).join(", ")}`
+    return failed(
+      "failed",
+      detail(
+        "unknown-include-private",
+        "parameters",
+        `${at(path, options.commit, undefined)} refused before the worktree existed.\n` +
+          `--include-private names ${unknownInclude.map((entry) => JSON.stringify(entry)).join(", ")}, which ` +
+          `${options.commit} does not declare private = true (${declares}).`,
+        "Name a path the target commit declares private, or drop the flag: creation already leaves every declared-private child uninitialized.",
+      ),
+    )
+  }
+  const excludedSubmodules = [
+    ...new Set([...requestedSubmodules, ...declaredPrivate.filter((entry) => !includePrivate.includes(entry))]),
+  ].sort()
 
   try {
     await store.add({ kind: "detached", path, ref: options.commit, operation: `git super worktree add ${path}` })
