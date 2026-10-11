@@ -1006,61 +1006,75 @@ export function manifest(
    * retained manifest neither lists nor hashes the bytes inside it (28661; chief ruling c8a3b06d).
    */
   exclude: (path: string) => boolean = () => false,
+  /**
+   * The directory reader. Injected ONLY so a test can prove the walk never ENTERS an excluded store instead of
+   * trusting the filtered output; production always uses the real `readdirSync` (@cto 2026-10-11).
+   */
+  readdir: (directory: string) => readonly Dirent[] = (directory) => readdirSync(directory, { withFileTypes: true }),
 ): StoreManifest {
   const entries: Record<string, ManifestEntry> = {}
   const files: Record<string, string> = {}
   const externalObjectStores: ExternalObjectStore[] = []
-  for (const entry of readdirSync(root, { recursive: true, withFileTypes: true })) {
-    const path = join(entry.parentPath, entry.name)
-    if (exclude(path)) continue
-    const key = relative(root, path)
-    const metadata = within(custody.gitDir, path)
-    if (
-      (!workingTree || metadata) &&
-      entry.name.endsWith(".lock") &&
-      !isWriterLeasePath(path, workingTree ? custody.gitDir : root, workingTree || root === custody.gitDir)
-    ) {
-      throw new Error(`Git lock ${path} prevents worktree removal; resolve its holder (${describeLockBarrier(path)})`)
-    }
-    if (entry.isDirectory()) continue
-    if (entry.isSymbolicLink()) {
-      if (workingTree && !metadata) {
-        entries[key] = { kind: "symlink", declaration: readlinkSync(path) }
+  // A WALK, not `readdirSync(root, { recursive: true })`: an excluded directory is never ENTERED, so not even the
+  // names of the entries inside a declared-private store are read (c8a3b06d; @cto 2026-10-11). The recursive
+  // reader lists a directory's children regardless of an exclusion, which is itself a read of the store's names.
+  const visit = (directory: string): void => {
+    for (const entry of readdir(directory)) {
+      const path = join(directory, entry.name)
+      if (exclude(path)) continue
+      const key = relative(root, path)
+      const metadata = within(custody.gitDir, path)
+      if (
+        (!workingTree || metadata) &&
+        entry.name.endsWith(".lock") &&
+        !isWriterLeasePath(path, workingTree ? custody.gitDir : root, workingTree || root === custody.gitDir)
+      ) {
+        throw new Error(`Git lock ${path} prevents worktree removal; resolve its holder (${describeLockBarrier(path)})`)
+      }
+      if (entry.isDirectory()) {
+        visit(path)
         continue
       }
-      const modulePath = relative(custody.modules, path)
-      if (!within(custody.modules, path) || entry.name !== "objects" || !modulePath.includes(sep)) {
-        throw new Error(
-          `Git metadata link ${path} is not a submodule objects directory; preserve and resolve it before removal`,
-        )
+      if (entry.isSymbolicLink()) {
+        if (workingTree && !metadata) {
+          entries[key] = { kind: "symlink", declaration: readlinkSync(path) }
+          continue
+        }
+        const modulePath = relative(custody.modules, path)
+        if (!within(custody.modules, path) || entry.name !== "objects" || !modulePath.includes(sep)) {
+          throw new Error(
+            `Git metadata link ${path} is not a submodule objects directory; preserve and resolve it before removal`,
+          )
+        }
+        const declaration = readlinkSync(path)
+        let target: string
+        try {
+          target = realpathSync(path)
+          if (!statSync(target).isDirectory()) throw new Error("target is not a directory")
+        } catch (error) {
+          throw new Error(`Git objects link ${path} has an unavailable target ${declaration}; worktree preserved`, {
+            cause: error,
+          })
+        }
+        if (!within(custody.common, target) || within(custody.checkout, target) || within(custody.gitDir, target)) {
+          throw new Error(
+            `Git objects link ${path} targets ${target} outside common-store custody or inside removal paths ${custody.checkout} or ${custody.gitDir}; preserve its objects before removal`,
+          )
+        }
+        entries[key] = { kind: "objects-link", declaration, target }
+        externalObjectStores.push({ path: key, declaration, target })
+        continue
       }
-      const declaration = readlinkSync(path)
-      let target: string
-      try {
-        target = realpathSync(path)
-        if (!statSync(target).isDirectory()) throw new Error("target is not a directory")
-      } catch (error) {
-        throw new Error(`Git objects link ${path} has an unavailable target ${declaration}; worktree preserved`, {
-          cause: error,
-        })
+      if (!entry.isFile()) {
+        throw new Error(`Git store ${path} is not a regular file; preserve and resolve it before removal`)
       }
-      if (!within(custody.common, target) || within(custody.checkout, target) || within(custody.gitDir, target)) {
-        throw new Error(
-          `Git objects link ${path} targets ${target} outside common-store custody or inside removal paths ${custody.checkout} or ${custody.gitDir}; preserve its objects before removal`,
-        )
-      }
-      entries[key] = { kind: "objects-link", declaration, target }
-      externalObjectStores.push({ path: key, declaration, target })
-      continue
+      if (!hashFiles) continue
+      const sha256 = metadataFileDigest(path)
+      files[key] = sha256
+      entries[key] = { kind: "file", sha256 }
     }
-    if (!entry.isFile()) {
-      throw new Error(`Git store ${path} is not a regular file; preserve and resolve it before removal`)
-    }
-    if (!hashFiles) continue
-    const sha256 = metadataFileDigest(path)
-    files[key] = sha256
-    entries[key] = { kind: "file", sha256 }
   }
+  visit(root)
   return {
     entries: Object.fromEntries(Object.entries(entries).sort(([a], [b]) => a.localeCompare(b))),
     files: Object.fromEntries(Object.entries(files).sort(([a], [b]) => a.localeCompare(b))),
