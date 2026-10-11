@@ -577,9 +577,10 @@ async function runInvocation(
    * The decoder is reached through a SHAPED dynamic import, deliberately. gitomic's actor decoder is NOT in the
    * released `0.4.0` this package declares (`package.json` `^0.4.0`, `bun.lock` 0.4.0, and `source-siblings.json`
    * composes exactly that release commit in CI), so naming it directly does not compile against the declared
-   * dependency. The shape below compiles against 0.4.0 and, when a declaration AND a token are both present but
-   * the installed gitomic cannot decode them, REFUSES BY NAME rather than falling back to silence: a fleet token
-   * git-super cannot read is a real fault, not an ordinary absence.
+   * dependency. The shape below compiles against 0.4.0 and, when a declaration is present but the installed
+   * gitomic cannot decode it, REFUSES BY NAME rather than falling back to silence: a fleet declaration git-super
+   * cannot read is a real fault, not an ordinary absence. The refusal fires on the DECLARATION alone, before any
+   * token is inspected, so a 0.4.0 consumer that ships a declaration must pass --actor or install a newer gitomic.
    *
    * The decoder is imported DYNAMICALLY, on this one path. `gitomic` is a whole module graph, and `git super`
    * is loaded by every invocation and by the entire test suite; importing it at CLI-load time made an unrelated
@@ -609,8 +610,8 @@ async function runInvocation(
       )
     }
     const decoder = (await import("gitomic")) as unknown as Decoder
-    // A declaration IS there, so a token may be too: from here the decoder is REQUIRED. Its absence is a real
-    // fault — a fleet that stamps Actor-Session trailers and a git-super that cannot read them — and a silent
+    // A declaration IS there: from here the decoder is REQUIRED, token or no token. Its absence is a real fault —
+    // a fleet that declares actor attribution and a git-super that cannot read the declaration — and a silent
     // `null` would put a wrong "who decided" line in a DELETION record.
     if (decoder.parseActorTokenDeclaration === undefined || decoder.actorTrailersFromToken === undefined) {
       throw new Error(
