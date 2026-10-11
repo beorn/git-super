@@ -9,8 +9,12 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs"
 import { join } from "node:path"
 import { afterEach, expect, it } from "vitest"
 import { createLocalGitWorktreeStore } from "../src/worktree.ts"
-import { assertNoPrivateStoreAcrossPrune, PrivateStoreRefusalError } from "../src/worktree-removal.ts"
-import type { GitProcess } from "../src/process.ts"
+import {
+  assertNoPrivateStore,
+  assertNoPrivateStoreAcrossPrune,
+  PrivateStoreRefusalError,
+} from "../src/worktree-removal.ts"
+import { createLocalGitProcess, type GitProcess } from "../src/process.ts"
 import { canonicalTmpdir, createRepository, git } from "./fixture.ts"
 
 const roots: string[] = []
@@ -250,4 +254,41 @@ it("refuses with a typed refusal on the plain removal and on the prune", async (
     )
   expect(pruning).toBeInstanceOf(PrivateStoreRefusalError)
   expect(existsSync(store)).toBe(true)
+})
+
+// N3 (@cto): the refusal text hands operators an escape route — "pass --exclude-submodule for a path whose custody
+// you have already proved" — so that route is pinned here. An EXCLUDED declared-private path passes
+// assertNoPrivateStore (the exclusion IS how a caller proves custody), and the removal then reaches R2's custody
+// check, which refuses for its own reason. A later change that made the exclusion stop working would fail here.
+it("passes assertNoPrivateStore for an excluded declared-private path and reaches R2's custody check", async () => {
+  const root = mkdtempSync(join(canonicalTmpdir(), "git-super-private-excluded-"))
+  roots.push(root)
+  const { repo, linked, excluded, store } = privateFixture(root)
+  const adminDir = git(linked, "rev-parse", "--absolute-git-dir").trim()
+  const head = git(linked, "rev-parse", "--verify", "HEAD").trim()
+  const process = createLocalGitProcess()
+
+  // Excluded: the guard passes.
+  await expect(
+    assertNoPrivateStore(process, { adminDir, repository: repo, head, excludedSubmodules: [excluded] }),
+  ).resolves.toBeUndefined()
+  // Control: the same custody without the exclusion is the class, so the pass above is the exclusion's doing.
+  await expect(assertNoPrivateStore(process, { adminDir, repository: repo, head })).rejects.toBeInstanceOf(
+    PrivateStoreRefusalError,
+  )
+
+  const error = await createLocalGitWorktreeStore({ repo })
+    .remove(linked, { excludedSubmodules: [excluded] })
+    .then(
+      () => undefined,
+      (cause: unknown) => cause,
+    )
+
+  // Reached R2's custody check: the private-store refusal was PASSED, and the excluded checkout's own custody
+  // refusal is what remains. Nothing was deleted.
+  expect(error).toBeInstanceOf(Error)
+  expect(error).not.toBeInstanceOf(PrivateStoreRefusalError)
+  expect(String(error)).toContain(excluded)
+  expect(existsSync(store)).toBe(true)
+  expect(existsSync(linked)).toBe(true)
 })
