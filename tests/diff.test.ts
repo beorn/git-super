@@ -46,9 +46,14 @@ describe("superDiff", () => {
    * @consumer git super diff, including native argv and CLI narration
    * @testonly none
    */
-  test.each(["historical", "working"] as const)(
-    "reports exclusions before child access in %s comparisons",
-    async (mode) => {
+  // 28661: this pair builds a real fixture with two submodules and drives both `superDiff` and the CLI over it,
+  // spawning dozens of git processes. The 5s default is not a budget under a full parallel suite run: it timed
+  // out with this branch's extra tests in the run, and the abort left this file's mocked
+  // `childProcess.spawnSync` and its `syncBuiltinESMExports()` in place for the NEXT test in the same file,
+  // which then overflowed the stack on its first nested spawn. A realistic budget removes the flake; that
+  // contamination is why it is worth removing rather than re-running.
+  for (const mode of ["historical", "working"] as const) {
+    test(`reports exclusions before child access in ${mode} comparisons`, { timeout: 30_000 }, async () => {
       const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-excluded-"))
       roots.push(fixtureRoot)
       const fixture = createProductFixture(fixtureRoot)
@@ -115,8 +120,8 @@ describe("superDiff", () => {
         spy.mockRestore()
         syncBuiltinESMExports()
       }
-    },
-  )
+    })
+  }
   test("expands two moved gitlinks into root-relative inner files", () => {
     const fixture = mkdtempSync(join(tmpdir(), "git-super-diff-"))
     roots.push(fixture)
