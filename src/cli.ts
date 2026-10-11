@@ -571,8 +571,15 @@ async function runInvocation(
    * Who decided, for the discard journal (28661 gate `git-worktree-private-store`). git-super mints no identity
    * of its own: it reads the fleet's own declaration, `.githooks/actor-attribution.json` beside the repository,
    * and decodes the token that declaration names — the same decode the commit hook stamps trailers with. An
-   * absent declaration, an absent token or an undecodable claim is `null`, which the journal records as
-   * "no actor token": never blank, never guessed from $USER, and never silent about the absence.
+   * absent declaration or an absent token is `null`, which the journal records as "no actor token": never
+   * blank, never guessed from $USER, and never silent about the absence.
+   *
+   * The decoder is reached through a SHAPED dynamic import, deliberately. gitomic's actor decoder is NOT in the
+   * released `0.4.0` this package declares (`package.json` `^0.4.0`, `bun.lock` 0.4.0, and `source-siblings.json`
+   * composes exactly that release commit in CI), so naming it directly does not compile against the declared
+   * dependency. The shape below compiles against 0.4.0 and, when a declaration AND a token are both present but
+   * the installed gitomic cannot decode them, REFUSES BY NAME rather than falling back to silence: a fleet token
+   * git-super cannot read is a real fault, not an ordinary absence.
    *
    * The decoder is imported DYNAMICALLY, on this one path. `gitomic` is a whole module graph, and `git super`
    * is loaded by every invocation and by the entire test suite; importing it at CLI-load time made an unrelated
@@ -581,34 +588,53 @@ async function runInvocation(
    * `private-store verify` needs an actor — only a deliberate discard does, so only a deliberate discard pays.
    */
   const discardActor = async (repo: string, env: NodeJS.ProcessEnv): Promise<string | null> => {
-    let gitomic: typeof import("gitomic")
-    let declaration: ReturnType<typeof import("gitomic").parseActorTokenDeclaration>
+    type Declaration = Readonly<{ variable: string; sessionClaim: string; generationClaim: string }>
+    type Decoder = Readonly<{
+      parseActorTokenDeclaration?: (value: unknown, label?: string) => Declaration | undefined
+      actorTrailersFromToken?: (raw: string, declaration: Declaration) => unknown
+    }>
+    const declarationPath = join(repo, ".githooks", "actor-attribution.json")
+    let raw: string
     try {
-      gitomic = await import("gitomic")
-      declaration = gitomic.parseActorTokenDeclaration(
-        JSON.parse(readFileSync(join(repo, ".githooks", "actor-attribution.json"), "utf8")),
-        "actor-attribution.json",
-      )
+      raw = readFileSync(declarationPath, "utf8")
     } catch (cause) {
       // ABSENCE IS DECIDED BY THE ERROR, never by `existsSync` (which answers FALSE for an entry the kernel
       // refuses with EACCES — the same defect @dev/fixer found in the queue-core cure). A fleet that ships no
       // actor declaration, or a path that is not there, is the ordinary "no actor token" the journal records.
-      // Anything else — an unreadable file, malformed JSON, a declaration the decoder refuses, the decoder
-      // itself failing to load — is a real fault, and a silent `null` would put a wrong "who decided" line in
-      // a DELETION record. It refuses by name, and names `--actor <name>` as the way through.
       const code = (cause as NodeJS.ErrnoException | undefined)?.code
       if (code === "ENOENT" || code === "ENOTDIR") return null
       throw new Error(
-        `cannot read the actor declaration ${join(repo, ".githooks", "actor-attribution.json")} for the discard ` +
-          `journal (${cause instanceof Error ? cause.message : String(cause)}); pass --actor <name> or repair ` +
-          `the declaration before discarding a private store`,
+        `cannot read the actor declaration ${declarationPath} for the discard journal (${cause instanceof Error ? cause.message : String(cause)}); ` +
+          `pass --actor <name> or repair the declaration before discarding a private store`,
+      )
+    }
+    const decoder = (await import("gitomic")) as unknown as Decoder
+    // A declaration IS there, so a token may be too: from here the decoder is REQUIRED. Its absence is a real
+    // fault — a fleet that stamps Actor-Session trailers and a git-super that cannot read them — and a silent
+    // `null` would put a wrong "who decided" line in a DELETION record.
+    if (decoder.parseActorTokenDeclaration === undefined || decoder.actorTrailersFromToken === undefined) {
+      throw new Error(
+        `the installed gitomic cannot decode the fleet actor declaration ${declarationPath} for the discard journal ` +
+          `(it predates parseActorTokenDeclaration/actorTrailersFromToken); pass --actor <name> or install a gitomic that has them`,
+      )
+    }
+    let declaration: Declaration | undefined
+    try {
+      declaration = decoder.parseActorTokenDeclaration(JSON.parse(raw), "actor-attribution.json")
+    } catch (cause) {
+      // Malformed JSON, or a declaration the decoder refuses: a real fault, refused by name in the same voice.
+      throw new Error(
+        `the actor declaration ${declarationPath} is not usable for the discard journal (${cause instanceof Error ? cause.message : String(cause)}); ` +
+          `pass --actor <name> or repair the declaration before discarding a private store`,
       )
     }
     if (declaration === undefined) return null
     const token = env[declaration.variable]
     if (token === undefined || token === "") return null
-    const decoded = gitomic.actorTrailersFromToken(token, declaration)
-    return "trailers" in decoded ? decoded.trailers[0][1] : null
+    const decoded = decoder.actorTrailersFromToken(token, declaration) as
+      | Readonly<{ trailers?: readonly (readonly [string, string])[] }>
+      | undefined
+    return decoded?.trailers?.[0]?.[1] ?? null
   }
 
   const worktree = program
