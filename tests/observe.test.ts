@@ -125,6 +125,7 @@ test.each([
   "root",
   "neighbor",
   "queue-neighbor",
+  "queue-sibling",
   "queue-change",
   "queue-override",
   "queue-lock",
@@ -133,6 +134,7 @@ test.each([
   const f = fixture()
   const queueCase = change.startsWith("queue-")
   const neighbor = change === "neighbor" || change === "queue-neighbor"
+  const excluded = neighbor || change === "queue-sibling"
   const recordRef = queueCase ? "refs/yrd/main/queue" : "refs/changes/main/live"
   git(f.product, "update-ref", recordRef, f.input.root.targetOid)
   const input: ObservationInput = {
@@ -161,6 +163,7 @@ test.each([
         injected = true
         if (change === "new") git(f.product, "update-ref", "refs/changes/main/not-a-recognized-row", other)
         else if (change === "queue-new") git(f.product, "update-ref", "refs/yrd/main/changes/new", other)
+        else if (change === "queue-sibling") git(f.product, "update-ref", "refs/yrd/main-2/queue", other)
         else if (change === "queue-override") git(f.product, "update-ref", "refs/yrd/main/override", other)
         else if (change === "queue-lock") git(f.product, "update-ref", "refs/yrd/main/lock", other)
         else if (change === "removed") git(f.product, "update-ref", "-d", recordRef)
@@ -178,7 +181,7 @@ test.each([
   }
   const result = await observe(f.product, input, process)
   expect(injected, "child-read interleaving must actually run").toBe(true)
-  if (neighbor) {
+  if (excluded) {
     expect(result.outcome).toBe("observed")
   } else {
     expect(result).toMatchObject({ outcome: "changed-during-read", notices: [] })
