@@ -5,6 +5,8 @@
  * @reach fs-walk <fixture-only: createProductFixture under mkdtempSync(canonicalTmpdir())>
  */
 
+import { spawnSync } from "node:child_process"
+import { createHash } from "node:crypto"
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { isAbsolute, join, resolve } from "node:path"
 import { afterEach, describe, expect, test } from "vitest"
@@ -39,6 +41,36 @@ function outputSink(): { output: string; write(value: string): void } {
 
 function stage(repository: string, path: string): string {
   return git(repository, "ls-files", "--stage", "--", path)
+}
+
+/**
+ * Two deterministic blob contents whose object IDs share the same four hex characters, so Git
+ * itself calls that prefix "ambiguous". The bodies are fixed and the search is bounded, so the
+ * collision is the same every run and a failure to find one throws rather than silently testing
+ * nothing (#28554).
+ */
+function collidingBlobPair(): { prefix: string; contents: readonly [string, string] } {
+  const seen = new Map<string, string>()
+  for (let index = 0; index < 4_000; index++) {
+    const content = `ambiguous ${index}\n`
+    const prefix = createHash("sha1")
+      .update(`blob ${Buffer.byteLength(content)}\0`)
+      .update(content)
+      .digest("hex")
+      .slice(0, 4)
+    const first = seen.get(prefix)
+    if (first !== undefined) return { prefix, contents: [first, content] }
+    seen.set(prefix, content)
+  }
+  throw new Error("no 4-hex blob collision among 4000 deterministic contents")
+}
+
+function writeBlob(repository: string, content: string): void {
+  const written = spawnSync("git", ["-C", repository, "hash-object", "-w", "--stdin"], {
+    input: content,
+    encoding: "utf8",
+  })
+  if (written.status !== 0) throw new Error(`git hash-object failed: ${written.stderr}`)
 }
 
 function fetchWithoutCheckout(repository: string, path: string, commit: string): string {
@@ -340,5 +372,78 @@ describe("policy-free gitlink writes", () => {
     lock.release()
 
     await expect(pending).resolves.toMatchObject({ state: "updated", partial: false })
+  })
+
+  // @failure A gitlink write given an abbreviated commit silently leaves the index at the old
+  //          pin while answering "updated" — the no-op @dev/3 reported for a short sha (#28554).
+  // @level l1
+  // @consumer @hh/tooling/28554: callers that advance a submodule pin by an abbreviated object ID
+  test("resolves an abbreviated commit to the full object id, and the printed result matches the index", async () => {
+    const product = fixture("abbreviated-commit")
+    const next = advanceRepository(product.alpha, "alpha.ts", "export const alpha = 9\n")
+    fetchWithoutCheckout(product.product, "packages/alpha", next)
+    const abbreviated = next.slice(0, 10)
+    expect(abbreviated).not.toBe(next)
+    const stdout = outputSink()
+    const stderr = outputSink()
+
+    expect(
+      await runCli(["--repo", product.product, "gitlink", "write", "packages/alpha", abbreviated], stdout, stderr),
+    ).toBe(0)
+    expect(stderr.output).toBe("")
+    expect(stdout.output).toBe("updated\n")
+    // The abbreviation is resolved IN the submodule repository, so the index carries the FULL id.
+    expect(stage(product.product, "packages/alpha")).toBe(`160000 ${next} 0\tpackages/alpha`)
+  })
+
+  // @failure An abbreviation that names no commit refuses without naming the command form that
+  //          produces the accepted input, so the caller cannot act on the refusal (#28554).
+  // @level l1
+  // @consumer @hh/tooling/28554 refusal breadcrumb (NO SILENT ERRORS, docs/principles.md)
+  test("refuses an abbreviated commit that resolves to no commit, naming the full-sha command form", async () => {
+    const product = fixture("abbreviated-missing")
+    const before = stage(product.product, "packages/alpha")
+    const stdout = outputSink()
+    const stderr = outputSink()
+
+    expect(
+      await runCli(["--repo", product.product, "gitlink", "write", "packages/alpha", "0000000"], stdout, stderr),
+    ).toBe(2)
+    expect(stdout.output).toBe("failed\n")
+    // Breadcrumb: the refusal names the full-sha requirement AND the command that prints it.
+    expect(stderr.output).toContain("rev-parse")
+    expect(stderr.output).toContain("bun git-super --repo <dir> gitlink write packages/alpha <full-oid>")
+    expect(stage(product.product, "packages/alpha")).toBe(before)
+  })
+
+  // @failure An abbreviated object ID that names SEVERAL objects in the submodule refuses, but the
+  //          caller is not told which form works and Git's own ambiguity is discarded, so "names
+  //          several" and "names none" read identically (#28554).
+  // @level l1
+  // @consumer @hh/tooling/28554 ambiguous-prefix refusal path
+  test("refuses an ambiguous abbreviated commit, naming the working form and Git's own evidence", async () => {
+    const product = fixture("abbreviated-ambiguous")
+    const { prefix, contents } = collidingBlobPair()
+    const submodule = join(product.product, "packages/alpha")
+    for (const content of contents) writeBlob(submodule, content)
+    const before = stage(product.product, "packages/alpha")
+    const stdout = outputSink()
+    const stderr = outputSink()
+
+    expect(
+      await runCli(["--repo", product.product, "gitlink", "write", "packages/alpha", prefix, "--json"], stdout, stderr),
+    ).toBe(2)
+    expect(stderr.output).toBe("")
+    const result = JSON.parse(stdout.output) as {
+      state?: string
+      detail?: { code?: string; phase?: string; message?: string; evidence?: string }
+    }
+    expect(result).toMatchObject({ state: "failed", detail: { code: "invalid-commit", phase: "resolve-commit" } })
+    expect(result.detail?.message).toContain("does not resolve to exactly one commit")
+    expect(result.detail?.message).toContain("bun git-super --repo <dir> gitlink write packages/alpha <full-oid>")
+    // Git's own words survive into the refusal: the ambiguity is visible, not just the failure.
+    expect(result.detail?.evidence).toContain(prefix)
+    expect(result.detail?.evidence).toMatch(/ambiguous/iu)
+    expect(stage(product.product, "packages/alpha")).toBe(before)
   })
 })

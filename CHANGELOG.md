@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 — 2026-10-10
+
+- Export `POOL_ROOT_CONFIG_KEY` and `WorktreeHomeOptions` from the package root. `worktreeHomeRoot` now reads the repository's `worktree.poolRoot` declaration, resolves relative paths against its main worktree and preserves the environment/default fallback. This makes the published API usable by Bearly's worktree helpers.
+- Add checkout metadata inspection, durable private Git projections and read-only retention verification. Retirement preserves borrowed objects, requires projection-bound stop evidence and bounds Git children and retained metadata.
+- Preserve declared private-submodule exclusions and frozen merge exclusions through merge, push and materialization. Preview merges can disable retained pins with `--no-retain-pins`.
+- Improve recursive Git diagnostics and recovery: resolve abbreviated component commits without losing ambiguity, retain missing-store and failed-probe causes, wait through bounded index-lock contention, and recover worktree removal after its old object directory disappears.
+- Release verification checks exact workspace exclusions and outgoing pnpm artifact sizes.
 
 - `inspectRemoval` no longer unlinks retained-borrower registry entries. Inspection remains a snapshot; `remove` still drops gone or independent registrations under its mutation lock (#28218).
 
