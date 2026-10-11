@@ -62,6 +62,23 @@ function stringArray(value: unknown, name: string): string[] {
   return value as string[]
 }
 
+/**
+ * The override a person uses ON PURPOSE to delete a declared-private submodule store (28661 gate
+ * `git-worktree-private-store`). The reason is REQUIRED here as well as in the guard, because a CLI that took
+ * the flag without one would make the guard's own refusal the first thing the operator reads.
+ */
+function discardOverride(value: unknown): Readonly<{ reason: string; actor?: string | null }> {
+  const input = record(value)
+  if (typeof input.reason !== "string" || input.reason.trim() === "") {
+    throw new Error('worktree remove --discard-private-store requires --reason "<text>"')
+  }
+  const actor = input.actor
+  if (actor !== undefined && actor !== null && (typeof actor !== "string" || actor.trim() === "")) {
+    throw new Error("worktree remove discard actor must be a nonempty string or null")
+  }
+  return { reason: input.reason, ...(actor === undefined ? {} : { actor: actor as string | null }) }
+}
+
 const diff = commandNode<CommandContext, DiffParams, SuperDiffResult>({
   title: "Diff across a superproject",
   description: "List root-relative paths, expanding moved gitlinks into their owning repositories.",
@@ -397,6 +414,9 @@ const worktreeRemove = commandNode<CommandContext, WorktreeRemoveParams, GitSupe
         : {
             excludedSubmodules: stringArray(input.excludedSubmodules, "excludedSubmodules"),
           }),
+      ...(input.discardPrivateStore === undefined
+        ? {}
+        : { discardPrivateStore: discardOverride(input.discardPrivateStore) }),
     }
   }),
   run: (context, input) =>

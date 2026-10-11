@@ -295,3 +295,58 @@ it("passes assertNoPrivateStore for an excluded declared-private path and reache
   expect(existsSync(store)).toBe(true)
   expect(existsSync(linked)).toBe(true)
 })
+
+// The gate's own id, on the refusal a person reads: the census (`gateIdSites`) sees this guard only through a
+// literal `@gate/git-worktree-private-store` in the source, and the operator reads the same string.
+it("names the gate id and the override in the refusal it prints", async () => {
+  const root = mkdtempSync(join(canonicalTmpdir(), "git-super-private-gate-id-"))
+  roots.push(root)
+  const { repo, linked, store } = privateFixture(root)
+  const error = await createLocalGitWorktreeStore({ repo })
+    .remove(linked)
+    .then(
+      () => undefined,
+      (cause: unknown) => cause,
+    )
+  const text = String(error)
+  expect(text).toContain("@gate/git-worktree-private-store:")
+  expect(text).toContain('--discard-private-store --reason "<text>"')
+  expect(existsSync(store)).toBe(true)
+})
+
+// The override a person uses ON PURPOSE: an empty reason is not consent. A `--discard-private-store` whose
+// `--reason` went missing must refuse by name, never read as a deletion somebody intended (NO SILENT ERRORS).
+it("refuses the discard override when its reason is empty, and names the missing reason", async () => {
+  const root = mkdtempSync(join(canonicalTmpdir(), "git-super-private-discard-noreason-"))
+  roots.push(root)
+  const { repo, linked, store } = privateFixture(root)
+  const error = await createLocalGitWorktreeStore({ repo })
+    .remove(linked, { discardPrivateStore: { reason: "   " } })
+    .then(
+      () => undefined,
+      (cause: unknown) => cause,
+    )
+  expect(error).toBeInstanceOf(PrivateStoreRefusalError)
+  expect(String(error)).toContain("@gate/git-worktree-private-store:")
+  expect(String(error)).toContain("--reason")
+  expect(existsSync(store)).toBe(true)
+  expect(existsSync(linked)).toBe(true)
+})
+
+// The override with a reason deletes the store on purpose, and the journal carries the actor and the reason
+// BEFORE the bytes go — a record written after the deletion could not name what it destroyed.
+it("deletes the store on purpose with a reason, and journals the actor and the reason", async () => {
+  const root = mkdtempSync(join(canonicalTmpdir(), "git-super-private-discard-"))
+  roots.push(root)
+  const { repo, linked, store } = privateFixture(root)
+  const journal: Array<Readonly<{ store: string; reason: string; actor: string | null }>> = []
+  await createLocalGitWorktreeStore({
+    repo,
+    journal: (record) => journal.push(record),
+  }).remove(linked, { discardPrivateStore: { reason: "abandoned unpushed draft", actor: "seat-under-test" } })
+  expect(journal).toHaveLength(1)
+  expect(journal[0]?.store).toBe(store)
+  expect(journal[0]?.reason).toBe("abandoned unpushed draft")
+  expect(journal[0]?.actor).toBe("seat-under-test")
+  expect(existsSync(store)).toBe(false)
+})

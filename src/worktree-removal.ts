@@ -91,10 +91,32 @@ export type PrivateStoreCustody = Readonly<{
   head: string
   /** Paths the caller has ALREADY taken custody of. A declared-private path here is the caller's proof, not an exemption. */
   excludedSubmodules?: readonly string[]
+  /**
+   * The operator's explicit decision to delete a declared-private store on purpose (28661 gate
+   * `git-worktree-private-store`). The reason is REQUIRED: an override with an empty one is refused by name,
+   * never read as consent. One journal record per covered store is written BEFORE the deletion, so the actor
+   * and the reason outlive the bytes they describe.
+   */
+  discardPrivateStore?: Readonly<{ reason: string; actor?: string | null }>
+  /** The caller's sink for a discard record. Absent means the caller keeps no journal, not that none happened. */
+  journal?: (record: PrivateStoreDiscard) => void
 }>
 
 /** One refused store, named so a caller can be told exactly which bytes were about to go. */
 export type PrivateStoreRefusal = Readonly<{ name: string; path: string; head: string; store: string }>
+
+/**
+ * One store an override deleted on purpose, with the reason it was deleted and the actor who decided, when the
+ * caller could resolve one — `null` says plainly that it could not, so a journal never reads as "no actor
+ * needed". A deletion nobody can read the cause of later is a mistake with extra steps (@cto 2026-10-11).
+ */
+export type PrivateStoreDiscard = Readonly<{
+  name: string
+  path: string
+  store: string
+  reason: string
+  actor: string | null
+}>
 
 /**
  * The refusal as a CLASS, so a caller can tell "these bytes must not be deleted" from "git failed" without
@@ -168,12 +190,30 @@ export async function assertNoPrivateStore(process: GitProcess, custody: Private
     }
   }
   if (refusals.length === 0) return
+  const discard = custody.discardPrivateStore
+  if (discard !== undefined) {
+    // The reason is REQUIRED, and an empty one is refused by name rather than read as consent. A silent pass
+    // here would turn "delete on purpose" into "delete with nobody able to say why" (NO SILENT ERRORS).
+    if (discard.reason.trim() === "") {
+      throw new PrivateStoreRefusalError(
+        `@gate/git-worktree-private-store: --discard-private-store requires --reason "<text>": the guard refuses ` +
+          `to delete ${refusals.map((entry) => entry.store).join(", ")} on purpose with no reason anyone can read later`,
+        refusals,
+      )
+    }
+    const actor = discard.actor ?? null
+    for (const entry of refusals) {
+      custody.journal?.({ name: entry.name, path: entry.path, store: entry.store, reason: discard.reason, actor })
+    }
+    return
+  }
   throw new PrivateStoreRefusalError(
-    `worktree removal would destroy a private submodule store: ${refusals
+    `@gate/git-worktree-private-store: worktree removal would destroy a private submodule store: ${refusals
       .map((entry) => `${entry.path} (section ${entry.name}) store ${entry.store}, declared private at ${entry.head}`)
       .join("; ")}; worktree preserved; take custody of each store first (the operator empties the checkout, runs ` +
       `'git super worktree private-store verify <store> --checkout <checkout>', then removes the store), then ` +
-      `retry — or pass --exclude-submodule for a path whose custody you have already proved`,
+      `retry — or pass --exclude-submodule for a path whose custody you have already proved, or ` +
+      `--discard-private-store --reason "<text>" to delete the store on purpose`,
     refusals,
   )
 }
@@ -240,7 +280,13 @@ function previewLineKind(line: string): string {
  */
 export async function assertNoPrivateStoreAcrossPrune(
   process: GitProcess,
-  request: Readonly<{ repository: string; expire?: string }>,
+  request: Readonly<{
+    repository: string
+    expire?: string
+    /** The operator's override, threaded to the same guard every other removal asks. Absent means refuse. */
+    discardPrivateStore?: Readonly<{ reason: string; actor?: string | null }>
+    journal?: (record: PrivateStoreDiscard) => void
+  }>,
 ): Promise<void> {
   const previewArgs = [
     "worktree",
@@ -280,14 +326,21 @@ export async function assertNoPrivateStoreAcrossPrune(
     })
     if (headRun.code !== 0 || headRun.stdout.trim() === "") {
       throw new PrivateStoreRefusalError(
-        `git worktree prune would delete ${adminDir}, which holds a submodule store, and its recorded HEAD cannot be read ` +
+        `@gate/git-worktree-private-store: git worktree prune would delete ${adminDir}, which holds a submodule store, ` +
+          `and its recorded HEAD cannot be read ` +
           `(${headRun.stderr.trim() || "no HEAD"}); nothing was pruned; inspect that admin dir and its store before pruning`,
         // Explicit [], never the implicit default: this refusal names no store, and a consumer reads the field
         // itself rather than a message (27120, @cto).
         [],
       )
     }
-    await assertNoPrivateStore(process, { adminDir, repository: request.repository, head: headRun.stdout.trim() })
+    await assertNoPrivateStore(process, {
+      adminDir,
+      repository: request.repository,
+      head: headRun.stdout.trim(),
+      ...(request.discardPrivateStore === undefined ? {} : { discardPrivateStore: request.discardPrivateStore }),
+      ...(request.journal === undefined ? {} : { journal: request.journal }),
+    })
   }
 }
 

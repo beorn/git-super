@@ -27,7 +27,9 @@ import type { SuperStatusResult } from "./status.ts"
 import type { SuperSubmodulePrepareResult } from "./submodule-prepare.ts"
 import { delegateNativeGit, readNativeGit, type ProcessOutputSink } from "./process.ts"
 import { openInvocationProtocol, type InvocationProtocol } from "./protocol.ts"
-import { isAbsolute } from "node:path"
+import { readFileSync } from "node:fs"
+import { isAbsolute, join } from "node:path"
+import { actorTrailersFromToken, parseActorTokenDeclaration } from "gitomic"
 import {
   probeRepository,
   repositoryRoot,
@@ -566,6 +568,30 @@ async function runInvocation(
       }
     })
 
+  /**
+   * Who decided, for the discard journal (28661 gate `git-worktree-private-store`). git-super mints no identity
+   * of its own: it reads the fleet's own declaration, `.githooks/actor-attribution.json` beside the repository,
+   * and decodes the token that declaration names — the same decode the commit hook stamps trailers with. An
+   * absent declaration, an absent token or an undecodable claim is `null`, which the journal records as
+   * "no actor token": never blank, never guessed from $USER, and never silent about the absence.
+   */
+  const discardActor = (repo: string, env: NodeJS.ProcessEnv): string | null => {
+    let declaration
+    try {
+      declaration = parseActorTokenDeclaration(
+        JSON.parse(readFileSync(join(repo, ".githooks", "actor-attribution.json"), "utf8")),
+        "actor-attribution.json",
+      )
+    } catch {
+      return null
+    }
+    if (declaration === undefined) return null
+    const token = env[declaration.variable]
+    if (token === undefined || token === "") return null
+    const decoded = actorTrailersFromToken(token, declaration)
+    return "trailers" in decoded ? decoded.trailers[0][1] : null
+  }
+
   const worktree = program
     .command("worktree")
     .description("Create worktrees that carry a superproject's submodules")
@@ -623,10 +649,23 @@ async function runInvocation(
       (value: string, previous: string[]) => [...previous, value],
       [],
     )
+    .option(
+      "--discard-private-store",
+      "delete a declared-private submodule store on purpose; requires --reason (28661 gate git-worktree-private-store)",
+    )
+    .option("--reason <text>", "why the private store is deleted; required with --discard-private-store")
+    .option("--actor <name>", "who decided; defaults to the fleet actor token when one is set")
     .argument("<path>", "registered clean worktree to remove")
     .action((path, _options, command) => {
       const globals = command.optsWithGlobals() as { repo: string; json?: boolean }
-      const options = command.opts() as { retain: string; excludeSubmodule?: string[]; rehome: boolean }
+      const options = command.opts() as {
+        retain: string
+        excludeSubmodule?: string[]
+        rehome: boolean
+        discardPrivateStore?: boolean
+        reason?: string
+        actor?: string
+      }
       captured = {
         node: commands.worktree.remove,
         params: {
@@ -634,6 +673,14 @@ async function runInvocation(
           retain: options.retain,
           ...(options.rehome === false ? { noRehome: true } : {}),
           ...(options.excludeSubmodule?.length ? { excludedSubmodules: options.excludeSubmodule } : {}),
+          ...(options.discardPrivateStore === true
+            ? {
+                discardPrivateStore: {
+                  reason: options.reason ?? "",
+                  actor: options.actor ?? discardActor(globals.repo, process.env),
+                },
+              }
+            : {}),
         },
         json: globals.json === true,
         nul: false,
