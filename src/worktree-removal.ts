@@ -102,7 +102,14 @@ export type PrivateStoreRefusal = Readonly<{ name: string; path: string; head: s
  * anything else still stops the round. Same message, same named stores — only the type is new (@cto C4).
  */
 export class PrivateStoreRefusalError extends Error {
-  constructor(message: string) {
+  constructor(
+    message: string,
+    /**
+     * The refused stores, structured. A caller that must NAME the route (yrd's env close, 27120) reads the
+     * guard's own answer from here rather than re-deriving `modules/<name>` or parsing this message.
+     */
+    readonly refusals: readonly PrivateStoreRefusal[] = [],
+  ) {
     super(message)
     this.name = "PrivateStoreRefusalError"
   }
@@ -167,6 +174,7 @@ export async function assertNoPrivateStore(process: GitProcess, custody: Private
       .join("; ")}; worktree preserved; take custody of each store first (the operator empties the checkout, runs ` +
       `'git super worktree private-store verify <store> --checkout <checkout>', then removes the store), then ` +
       `retry — or pass --exclude-submodule for a path whose custody you have already proved`,
+    refusals,
   )
 }
 

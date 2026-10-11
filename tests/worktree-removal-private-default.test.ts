@@ -243,6 +243,9 @@ it("refuses with a typed refusal on the plain removal and on the prune", async (
       (cause: unknown) => cause,
     )
   expect(removal).toBeInstanceOf(PrivateStoreRefusalError)
+  // 27120: the refusal carries its stores STRUCTURED, so a caller that must name the route reads the guard's
+  // own answer instead of re-deriving modules/<name> or parsing this message.
+  expect((removal as PrivateStoreRefusalError).refusals.map((entry) => entry.store)).toContain(store)
   expect(existsSync(store)).toBe(true)
 
   rmSync(linked, { recursive: true, force: true })
