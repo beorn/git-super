@@ -29,7 +29,6 @@ import { delegateNativeGit, readNativeGit, type ProcessOutputSink } from "./proc
 import { openInvocationProtocol, type InvocationProtocol } from "./protocol.ts"
 import { readFileSync } from "node:fs"
 import { isAbsolute, join } from "node:path"
-import { actorTrailersFromToken, parseActorTokenDeclaration } from "gitomic"
 import {
   probeRepository,
   repositoryRoot,
@@ -574,21 +573,41 @@ async function runInvocation(
    * and decodes the token that declaration names — the same decode the commit hook stamps trailers with. An
    * absent declaration, an absent token or an undecodable claim is `null`, which the journal records as
    * "no actor token": never blank, never guessed from $USER, and never silent about the absence.
+   *
+   * The decoder is imported DYNAMICALLY, on this one path. `gitomic` is a whole module graph, and `git super`
+   * is loaded by every invocation and by the entire test suite; importing it at CLI-load time made an unrelated
+   * `diff` test time out and then overflow the stack under suite load (measured on this branch: 41 test files
+   * green with the import deferred, 2 failures with it eager, same tree, twice). No `diff`, `worktree add` or
+   * `private-store verify` needs an actor — only a deliberate discard does, so only a deliberate discard pays.
    */
-  const discardActor = (repo: string, env: NodeJS.ProcessEnv): string | null => {
-    let declaration
+  const discardActor = async (repo: string, env: NodeJS.ProcessEnv): Promise<string | null> => {
+    let gitomic: typeof import("gitomic")
+    let declaration: ReturnType<typeof import("gitomic").parseActorTokenDeclaration>
     try {
-      declaration = parseActorTokenDeclaration(
+      gitomic = await import("gitomic")
+      declaration = gitomic.parseActorTokenDeclaration(
         JSON.parse(readFileSync(join(repo, ".githooks", "actor-attribution.json"), "utf8")),
         "actor-attribution.json",
       )
-    } catch {
-      return null
+    } catch (cause) {
+      // ABSENCE IS DECIDED BY THE ERROR, never by `existsSync` (which answers FALSE for an entry the kernel
+      // refuses with EACCES — the same defect @dev/fixer found in the queue-core cure). A fleet that ships no
+      // actor declaration, or a path that is not there, is the ordinary "no actor token" the journal records.
+      // Anything else — an unreadable file, malformed JSON, a declaration the decoder refuses, the decoder
+      // itself failing to load — is a real fault, and a silent `null` would put a wrong "who decided" line in
+      // a DELETION record. It refuses by name, and names `--actor <name>` as the way through.
+      const code = (cause as NodeJS.ErrnoException | undefined)?.code
+      if (code === "ENOENT" || code === "ENOTDIR") return null
+      throw new Error(
+        `cannot read the actor declaration ${join(repo, ".githooks", "actor-attribution.json")} for the discard ` +
+          `journal (${cause instanceof Error ? cause.message : String(cause)}); pass --actor <name> or repair ` +
+          `the declaration before discarding a private store`,
+      )
     }
     if (declaration === undefined) return null
     const token = env[declaration.variable]
     if (token === undefined || token === "") return null
-    const decoded = actorTrailersFromToken(token, declaration)
+    const decoded = gitomic.actorTrailersFromToken(token, declaration)
     return "trailers" in decoded ? decoded.trailers[0][1] : null
   }
 
@@ -664,7 +683,7 @@ async function runInvocation(
     .option("--reason <text>", "why the private store is deleted; required with --discard-private-store")
     .option("--actor <name>", "who decided; defaults to the fleet actor token when one is set")
     .argument("<path>", "registered clean worktree to remove")
-    .action((path, _options, command) => {
+    .action(async (path, _options, command) => {
       const globals = command.optsWithGlobals() as { repo: string; json?: boolean }
       const options = command.opts() as {
         retain: string
@@ -685,7 +704,7 @@ async function runInvocation(
             ? {
                 discardPrivateStore: {
                   reason: options.reason ?? "",
-                  actor: options.actor ?? discardActor(globals.repo, process.env),
+                  actor: options.actor ?? (await discardActor(globals.repo, process.env)),
                 },
               }
             : {}),
