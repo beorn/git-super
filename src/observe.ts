@@ -185,7 +185,8 @@ async function prepared(
   return result.submodules
 }
 
-async function advertisements(git: GitProcess, repo: string, remote: string): Promise<Map<string, string>> {
+/** The single remote checker in this package. Shared with the private-store candidate check (#27120 AC1). */
+export async function advertisements(git: GitProcess, repo: string, remote: string): Promise<Map<string, string>> {
   const output = await required(git, repo, ["ls-remote", "--refs", remote])
   const refs = new Map<string, string>()
   for (const line of output.split("\n").filter(Boolean)) {

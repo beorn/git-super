@@ -20,6 +20,11 @@ import {
   type SuperSubmodulePrepareResult,
 } from "./submodule-prepare.ts"
 import { superWorktreeAdd, type SuperWorktreeAddOptions } from "./worktree-add.ts"
+import {
+  verifyPrivateStoreCandidate,
+  type PrivateStoreCandidateOptions,
+  type PrivateStoreCandidateResult,
+} from "./private-store-candidate.ts"
 import { verifyRetainedEntry, type RetentionVerifyOptions, type RetentionVerifyResult } from "./retention-verify.ts"
 import { superWorktreeRemove, type SuperWorktreeRemoveOptions } from "./worktree-remove.ts"
 
@@ -35,6 +40,8 @@ export type SubmodulePrepareParams = Omit<SuperSubmodulePrepareOptions, "repo" |
 export type WorktreeRemoveParams = Omit<SuperWorktreeRemoveOptions, "repo" | "report">
 export type WorktreeAddParams = Omit<SuperWorktreeAddOptions, "repo" | "env" | "log" | "report">
 export type RetentionVerifyParams = Omit<RetentionVerifyOptions, "clock">
+export type PrivateStoreVerifyParams = Omit<PrivateStoreCandidateOptions, "git">
+export type PrivateStoreVerifyNode = CommandNode<CommandContext, PrivateStoreVerifyParams, PrivateStoreCandidateResult>
 
 function params<T>(parse: (value: unknown) => T, missing?: (value: unknown) => string[]): ParseParamSchema<T> {
   return { parse, ...(missing === undefined ? {} : { missing }) }
@@ -400,6 +407,26 @@ const worktreeRemove = commandNode<CommandContext, WorktreeRemoveParams, GitSupe
     }),
 })
 
+const privateStoreVerify = commandNode<CommandContext, PrivateStoreVerifyParams, PrivateStoreCandidateResult>({
+  title: "Check one private submodule store against its remote, read-only",
+  description:
+    "Compare a private store's refs and HEAD with what its configured remotes advertise, mapped through the store's own fetch refspecs. Emits a point-in-time candidate verdict, never removal authority.",
+  params: params((value) => {
+    const input = record(value)
+    if (typeof input.store !== "string" || input.store.trim() === "") {
+      throw new Error("worktree private-store verify requires a store path")
+    }
+    if (input.checkout !== undefined && typeof input.checkout !== "string") {
+      throw new Error("checkout must be a string")
+    }
+    return {
+      store: input.store,
+      ...(input.checkout === undefined ? {} : { checkout: input.checkout as string }),
+    }
+  }),
+  run: (_context, input) => verifyPrivateStoreCandidate(input),
+})
+
 export type GitSuperCommands = Readonly<{
   diff: CommandNode<CommandContext, DiffParams, SuperDiffResult>
   status: CommandNode<CommandContext, StatusParams, SuperStatusResult>
@@ -419,6 +446,9 @@ export type GitSuperCommands = Readonly<{
     retention: Readonly<{
       verify: CommandNode<CommandContext, RetentionVerifyParams, RetentionVerifyResult>
     }>
+    "private-store": Readonly<{
+      verify: PrivateStoreVerifyNode
+    }>
   }>
 }>
 
@@ -431,5 +461,10 @@ export const commands = defineCommandNodes({
   push,
   gitlink: { write: gitlinkWrite },
   submodule: { prepare: submodulePrepare },
-  worktree: { add: worktreeAdd, remove: worktreeRemove, retention: { verify: retentionVerify } },
+  worktree: {
+    add: worktreeAdd,
+    remove: worktreeRemove,
+    retention: { verify: retentionVerify },
+    "private-store": { verify: privateStoreVerify },
+  },
 }) satisfies CommandNodeTree<CommandContext> as GitSuperCommands
