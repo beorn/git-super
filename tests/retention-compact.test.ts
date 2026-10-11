@@ -7,6 +7,7 @@
  */
 import { createHash } from "node:crypto"
 import {
+  chmodSync,
   cpSync,
   existsSync,
   mkdirSync,
@@ -326,6 +327,53 @@ describe("compactRetainedModules", () => {
       expect(recordedManifest.compaction).toBeUndefined()
       expect(existsSync(captured!.retained as string)).toBe(true)
     } finally {
+      warn.mockRestore()
+    }
+  }, 120_000)
+
+  it("keeps remove() resolved when retained-directory discovery fails after native --force", async () => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-retention-compact-discover-fail-"))
+    roots.push(root)
+    const dependency = join(root, "dependency")
+    const product = join(root, "product")
+    mkdirSync(dependency, { recursive: true })
+    gitCwd(dependency, "init", "-q", "-b", "main")
+    writeFileSync(join(dependency, "dep.ts"), "export const dep = 1\n")
+    gitCwd(dependency, "add", "dep.ts")
+    gitCwd(dependency, "commit", "-q", "-m", "dep")
+    mkdirSync(product, { recursive: true })
+    gitCwd(product, "init", "-q", "-b", "main")
+    gitCwd(product, "-c", "protocol.file.allow=always", "submodule", "add", "-q", dependency, "vendor/dep")
+    gitCwd(product, "commit", "-q", "-m", "add vendor/dep")
+    const worktree = join(root, "candidate")
+    const retainedRoot = join(root, "retained")
+    expect(await runCli(["--repo", product, "worktree", "add", worktree, "HEAD"], outputSink(), outputSink())).toBe(0)
+    const moduleGitDir = gitCwd(join(worktree, "vendor/dep"), "rev-parse", "--absolute-git-dir")
+    addLooseRemotes(moduleGitDir, 8)
+    let captured: WorktreeRemovalProof | undefined
+    let locked: string | undefined
+    const store = createLocalGitWorktreeStore({ repo: product })
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    try {
+      const outcome = await store.remove(worktree, {
+        retention: {
+          root: retainedRoot,
+          report: (proof) => {
+            captured = proof
+            if (proof.retained === null) return
+            locked = proof.retained
+            chmodSync(proof.retained, 0o000)
+          },
+        },
+      })
+      expect(existsSync(worktree)).toBe(false)
+      expect(outcome).toMatchObject({ compaction: { status: "failed", child: locked, step: "discovery" } })
+      expect(captured?.retained).toEqual(locked)
+      const recordedManifest = JSON.parse(readFileSync(captured!.manifest, "utf8")) as { compaction?: unknown }
+      expect(recordedManifest.compaction).toBeUndefined()
+      expect(existsSync(captured!.retained as string)).toBe(true)
+    } finally {
+      if (locked !== undefined) chmodSync(locked, 0o755)
       warn.mockRestore()
     }
   }, 120_000)

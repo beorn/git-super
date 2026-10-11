@@ -324,7 +324,15 @@ export function compactRetainedModules(proof: WorktreeRemovalProof, options: Com
   } catch (error) {
     return failedCompaction(retained, error)
   }
-  const children = findRetainedGitDirs(retained)
+  let children: string[]
+  try {
+    children = findRetainedGitDirs(retained)
+  } catch (error) {
+    return failedCompaction(
+      retained,
+      Object.assign(error instanceof Error ? error : new Error(String(error)), { step: "discovery" }),
+    )
+  }
   for (const gitDir of children) {
     try {
       compactOneGitDir(gitDir)
