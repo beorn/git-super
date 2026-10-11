@@ -50,17 +50,25 @@ function gitProcessFailed(result: GitProcessResult): boolean {
   return result.code !== 0 || result.timedOut === true || result.failure !== undefined
 }
 
+/** One submodule a commit declares `private = true`: its section NAME and its root-relative path. */
+export type DeclaredPrivateSubmodule = Readonly<{ name: string; path: string }>
+
 /**
- * The paths one frozen commit's `.gitmodules` declares `private = true`, sorted, read from its configuration
- * alone. It reads no gitlink and joins nothing, so a caller that only needs the declaration (which children to
- * leave out) does not inherit `readCommitSubmodules`' refusals about pins. A private flag on a section with no
- * path refuses by name; a commit with no `.gitmodules` declares nothing.
+ * The submodules one frozen commit's `.gitmodules` declares `private = true`, read from its configuration alone.
+ *
+ * NAME and PATH both matter and are returned together: Git keys a submodule's store by SECTION NAME
+ * (`<admin dir>/modules/<name>`, the path a removal destroys), while every checkout-side check speaks the PATH.
+ * This is the ONE declaration reader (28661): a second would be a second answer to "is this store private".
+ *
+ * It reads no gitlink and joins nothing, so a caller that only needs the declaration (which children to leave
+ * out, which stores a removal must not destroy) does not inherit `readCommitSubmodules`' refusals about pins.
+ * A private flag on a section with no path refuses by name; a commit with no `.gitmodules` declares nothing.
  */
-export async function readPrivateSubmodulePaths(
+export async function readPrivateSubmodules(
   git: GitProcess,
   repository: string,
   commit: string,
-): Promise<string[]> {
+): Promise<DeclaredPrivateSubmodule[]> {
   const manifestArgs = ["ls-tree", commit, "--", ".gitmodules"]
   const manifest = await git.run({ repo: repository, args: manifestArgs })
   if (gitProcessFailed(manifest)) throw operationError(repository, "read-target-manifest", manifestArgs, manifest)
@@ -78,7 +86,7 @@ export async function readPrivateSubmodulePaths(
       .join("\0"),
     commit,
   )
-  const paths: string[] = []
+  const declared: DeclaredPrivateSubmodule[] = []
   for (const [name, entry] of configuredByName) {
     if (entry.private !== "true") continue
     if (entry.path === undefined) {
@@ -92,9 +100,18 @@ export async function readPrivateSubmodulePaths(
       })
     }
     validateExcludedSubmodules([entry.path])
-    paths.push(entry.path)
+    declared.push({ name, path: entry.path })
   }
-  return paths.sort()
+  return declared.sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0))
+}
+
+/** The paths the same declaration names, sorted: the shape every checkout-side caller speaks. */
+export async function readPrivateSubmodulePaths(
+  git: GitProcess,
+  repository: string,
+  commit: string,
+): Promise<string[]> {
+  return (await readPrivateSubmodules(git, repository, commit)).map((entry) => entry.path)
 }
 
 /** Read strict submodule metadata and gitlinks from one frozen commit. */

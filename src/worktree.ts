@@ -9,6 +9,7 @@ import { createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS } from "./exclusive.ts"
 import {
   acquireRemovalWriterLeases,
   assertExcludedRemovalCustody,
+  assertNoPrivateStore,
   inspectRemovalStatus,
   prepareRemovalBorrowers,
   rehomeBorrowers,
@@ -334,6 +335,15 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
     await assertRemovalRoot(path)
     const gitDir = realpathSync(await git.text(path, ["rev-parse", "--absolute-git-dir"]))
     const common = realpathSync(await git.text(path, ["rev-parse", "--path-format=absolute", "--git-common-dir"]))
+    // 28661: the DECLARATION decides whether the store inside this admin dir is private, not the caller's
+    // exclusion list. Runs BEFORE the custody walk, so an empty list can no longer mean "no question asked";
+    // a caller proves custody by ADDING an exclusion, never by naming nothing.
+    await assertNoPrivateStore(configuredProcess(), {
+      adminDir: gitDir,
+      repository: repo,
+      head: await git.text(path, ["rev-parse", "--verify", "HEAD"]),
+      ...(excludedSubmodules === undefined ? {} : { excludedSubmodules }),
+    })
     const custody = await assertExcludedRemovalCustody(
       git,
       configuredProcess(),
@@ -753,3 +763,10 @@ async function unlockWorktree(git: Git, repo: string, path: string): Promise<voi
 function withHookPolicy(args: readonly string[], policy: WorktreeHookPolicy | undefined): string[] {
   return policy === "quarantine" ? ["-c", "core.hooksPath=/dev/null", ...args] : [...args]
 }
+
+/**
+ * 28661 re-export: the private-store refusal belongs to the same public surface as the removal it guards, so a
+ * caller that removes a worktree WITHOUT the git-super primitive (a plain `rmSync`, a bare `git worktree prune`)
+ * reaches the ONE implementation rather than writing a second one beside it.
+ */
+export { assertNoPrivateStore, type PrivateStoreCustody, type PrivateStoreRefusal } from "./worktree-removal.ts"

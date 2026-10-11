@@ -22,7 +22,7 @@ import { fileLockHolders, formatLockHolders } from "@bearly/flock/holders"
 import { spawnSync } from "node:child_process"
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { classifyExcludedPath, inspectExcludedCheckout, superStatus, type SuperStatusResult } from "./status.ts"
-import { readCommitSubmodules, type SelectedCommitSubmodules } from "./commit-graph.ts"
+import { readCommitSubmodules, readPrivateSubmodules, type SelectedCommitSubmodules } from "./commit-graph.ts"
 import { validateExcludedSubmodules } from "./git.ts"
 import type { GitProcess } from "./process.ts"
 import type { NotCompared } from "./diff.ts"
@@ -80,6 +80,74 @@ type ExcludedRemovalCustody = Readonly<{
   declaredPaths: readonly string[]
   borrowers: readonly RemovalParent[]
 }>
+
+/** What a removal guard needs to know about the store it is about to destroy (28661). */
+export type PrivateStoreCustody = Readonly<{
+  /** Absolute Git dir of the worktree being removed; the store it may destroy lives at `<adminDir>/modules/<name>`. */
+  adminDir: string
+  /** The superproject whose commits carry the `.gitmodules` declarations. */
+  repository: string
+  /** The target worktree's own HEAD commit. */
+  head: string
+  /** Paths the caller has ALREADY taken custody of. A declared-private path here is the caller's proof, not an exemption. */
+  excludedSubmodules?: readonly string[]
+}>
+
+/** One refused store, named so a caller can be told exactly which bytes were about to go. */
+export type PrivateStoreRefusal = Readonly<{ name: string; path: string; head: string; store: string }>
+
+/**
+ * The commits whose declaration decides whether a store inside `adminDir` is private: the target's own HEAD,
+ * plus the repository's current `main` when it differs (chief custody ruling (b), 2026-10-11 — a store is
+ * private for what it holds, not for how old the target's HEAD is). ONE function owns this key, so the ruling
+ * can change without a second copy of it appearing beside the guard.
+ */
+async function privateDeclarationHeads(process: GitProcess, repository: string, head: string): Promise<string[]> {
+  // "cannot answer" is a real answer here: a repository with no `main` still decides from the target's HEAD,
+  // and reporting its absence is some other tool's job, not this guard's.
+  const result = await process.run({ repo: repository, args: ["rev-parse", "--verify", "--quiet", "refs/heads/main"] })
+  const main = result.code === 0 ? result.stdout.trim() : ""
+  const heads = [head]
+  if (main !== "" && main !== head) heads.push(main)
+  return heads
+}
+
+/**
+ * Refuse a removal whose target admin dir holds the Git store of a submodule a removal-visible declaration
+ * calls private — unless the caller declared that path excluded.
+ *
+ * 28661. `assertExcludedRemovalCustody` returned early on an EMPTY exclusion list, so every caller naming no
+ * exclusion took Git's plain removal and destroyed `<admin dir>/modules/<name>` without ever proving the
+ * bytes inside it: bay cleanup, a reaper, a cleanup sweep, a hand run. The DECLARATION decides, never the
+ * caller's list. A caller may ADD an exclusion — that is how custody is proved, and R2 then judges the store —
+ * but it can never turn this refusal off by naming nothing.
+ *
+ * The guard reads declarations and EXISTENCE only: it never reads, copies, hashes or renames a byte inside the
+ * store (27058; chief ruling c8a3b06d).
+ */
+export async function assertNoPrivateStore(process: GitProcess, custody: PrivateStoreCustody): Promise<void> {
+  const modules = join(custody.adminDir, "modules")
+  if (!present(modules)) return
+  const excluded = new Set(custody.excludedSubmodules ?? [])
+  const refusals: PrivateStoreRefusal[] = []
+  for (const head of await privateDeclarationHeads(process, custody.repository, custody.head)) {
+    for (const declared of await readPrivateSubmodules(process, custody.repository, head)) {
+      if (excluded.has(declared.path)) continue
+      const store = join(modules, declared.name)
+      if (!present(store)) continue
+      if (refusals.some((entry) => entry.store === store)) continue
+      refusals.push({ name: declared.name, path: declared.path, head, store })
+    }
+  }
+  if (refusals.length === 0) return
+  throw new Error(
+    `worktree removal would destroy a private submodule store: ${refusals
+      .map((entry) => `${entry.path} (section ${entry.name}) store ${entry.store}, declared private at ${entry.head}`)
+      .join("; ")}; worktree preserved; take custody of each store first (the operator empties the checkout, runs ` +
+      `'git super worktree private-store verify <store> --checkout <checkout>', then removes the store), then ` +
+      `retry — or pass --exclude-submodule for a path whose custody you have already proved`,
+  )
+}
 
 export async function assertExcludedRemovalCustody(
   git: Git,
