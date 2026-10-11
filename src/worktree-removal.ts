@@ -103,10 +103,19 @@ export type PrivateStoreRefusal = Readonly<{ name: string; path: string; head: s
  * can change without a second copy of it appearing beside the guard.
  */
 async function privateDeclarationHeads(process: GitProcess, repository: string, head: string): Promise<string[]> {
-  // "cannot answer" is a real answer here: a repository with no `main` still decides from the target's HEAD,
-  // and reporting its absence is some other tool's job, not this guard's.
-  const result = await process.run({ repo: repository, args: ["rev-parse", "--verify", "--quiet", "refs/heads/main"] })
-  const main = result.code === 0 ? result.stdout.trim() : ""
+  // `for-each-ref` exits 0 with EMPTY output when the ref is absent, so "no main here" is an answer this guard
+  // can read without ever collapsing a broken transport into it. (`rev-parse --verify --quiet` exits 1, which a
+  // seam may surface as either a code or a throw, and one of those two would have had to be guessed at.)
+  const result = await process.run({
+    repo: repository,
+    args: ["for-each-ref", "--format=%(objectname)", "refs/heads/main"],
+  })
+  if (result.code !== 0) {
+    throw new Error(
+      `cannot read refs/heads/main in ${repository} before judging a private store: ${result.stderr.trim() || `exit ${result.code}`}`,
+    )
+  }
+  const main = result.stdout.trim()
   const heads = [head]
   if (main !== "" && main !== head) heads.push(main)
   return heads

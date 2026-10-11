@@ -139,3 +139,38 @@ it("still prunes an admin dir whose store belongs to no private submodule", asyn
 
   expect(existsSync(admin)).toBe(false)
 })
+
+// Custody ruling (b): a store is private for what it holds, not for how old the target's HEAD is. The target
+// here is checked out BEFORE the declaration, and main carries it, so the target's own HEAD declares nothing.
+it("refuses when only current main declares the store private (custody ruling (b))", async () => {
+  const root = mkdtempSync(join(canonicalTmpdir(), "git-super-private-default-main-"))
+  roots.push(root)
+  const repo = join(root, "product")
+  const component = join(root, "component")
+  createRepository(repo, "root.txt", "root\n")
+  createRepository(component, "component.txt", "component\n")
+  const excluded = "vendor/dep"
+  const name = "dep"
+  git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "--name", name, component, excluded)
+  git(repo, "commit", "-q", "-am", "add the submodule without declaring it private")
+  const linked = join(root, "linked")
+  git(repo, "worktree", "add", "-q", "--detach", linked, "HEAD")
+  git(linked, "-c", "protocol.file.allow=always", "submodule", "update", "--init", excluded)
+  const store = git(linked, "rev-parse", "--path-format=absolute", "--git-path", `modules/${name}`).trim()
+  // Declare it private on the repository's MAIN, leaving the target's own HEAD untouched.
+  git(repo, "config", "-f", ".gitmodules", `submodule.${name}.private`, "true")
+  git(repo, "add", ".gitmodules")
+  git(repo, "commit", "-q", "-m", "declare the submodule private on main")
+  expect(existsSync(store)).toBe(true)
+
+  const error = await createLocalGitWorktreeStore({ repo })
+    .remove(linked)
+    .then(
+      () => undefined,
+      (cause: unknown) => cause,
+    )
+
+  expect(error, "main's declaration decides even where the target HEAD predates it").toBeInstanceOf(Error)
+  expect(String(error)).toContain(store)
+  expect(existsSync(store)).toBe(true)
+})
