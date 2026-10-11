@@ -163,6 +163,52 @@ async function privateDeclarationHeads(process: GitProcess, repository: string, 
 }
 
 /**
+ * Every declared-private store that EXISTS under one admin dir's `modules` tree, each with the section name
+ * whose directory holds it. ONE reader (`readPrivateSubmodules`) keyed by the ONE declaration-head function, so
+ * the refusal guard and the retention copy can never disagree about which directories are private.
+ *
+ * `excluded` is the CALLER's custody proof and is honoured only where the caller asked for it (the guard).
+ * Retention passes none: a private store is NEVER copied into retained-modules, however its custody was proved
+ * (@cto 2026-10-11; chief ruling c8a3b06d).
+ */
+async function privateStoresIn(
+  process: GitProcess,
+  repository: string,
+  head: string,
+  adminDir: string,
+  excluded: ReadonlySet<string>,
+): Promise<PrivateStoreRefusal[]> {
+  const modules = join(adminDir, "modules")
+  if (!present(modules)) return []
+  const refusals: PrivateStoreRefusal[] = []
+  for (const at of await privateDeclarationHeads(process, repository, head)) {
+    for (const declared of await readPrivateSubmodules(process, repository, at)) {
+      if (excluded.has(declared.path)) continue
+      const store = join(modules, declared.name)
+      if (!present(store)) continue
+      if (refusals.some((entry) => entry.store === store)) continue
+      refusals.push({ name: declared.name, path: declared.path, head: at, store })
+    }
+  }
+  return refusals
+}
+
+/**
+ * The section names of the declared-private stores that exist under `adminDir`, for retention to LEAVE BEHIND.
+ * No exclusion set is applied: a store the declaration calls private is never copied into retained-modules, and a
+ * caller that proved custody of one has proved what it may DELETE, not what it may copy (28661; chief c8a3b06d).
+ */
+export async function declaredPrivateStoreNames(
+  process: GitProcess,
+  repository: string,
+  head: string,
+  adminDir: string,
+): Promise<readonly string[]> {
+  const stores = await privateStoresIn(process, repository, head, adminDir, new Set())
+  return [...new Set(stores.map((entry) => entry.name))].sort()
+}
+
+/**
  * Refuse a removal whose target admin dir holds the Git store of a submodule a removal-visible declaration
  * calls private — unless the caller declared that path excluded.
  *
@@ -176,19 +222,13 @@ async function privateDeclarationHeads(process: GitProcess, repository: string, 
  * store (27058; chief ruling c8a3b06d).
  */
 export async function assertNoPrivateStore(process: GitProcess, custody: PrivateStoreCustody): Promise<void> {
-  const modules = join(custody.adminDir, "modules")
-  if (!present(modules)) return
-  const excluded = new Set(custody.excludedSubmodules ?? [])
-  const refusals: PrivateStoreRefusal[] = []
-  for (const head of await privateDeclarationHeads(process, custody.repository, custody.head)) {
-    for (const declared of await readPrivateSubmodules(process, custody.repository, head)) {
-      if (excluded.has(declared.path)) continue
-      const store = join(modules, declared.name)
-      if (!present(store)) continue
-      if (refusals.some((entry) => entry.store === store)) continue
-      refusals.push({ name: declared.name, path: declared.path, head, store })
-    }
-  }
+  const refusals = await privateStoresIn(
+    process,
+    custody.repository,
+    custody.head,
+    custody.adminDir,
+    new Set(custody.excludedSubmodules ?? []),
+  )
   if (refusals.length === 0) return
   const discard = custody.discardPrivateStore
   if (discard !== undefined) {
@@ -956,12 +996,23 @@ export function metadataFileDigest(path: string): string {
   return createHash("sha256").update(readFileSync(path)).digest("hex")
 }
 
-export function manifest(root: string, custody: StoreCustody, hashFiles = true, workingTree = false): StoreManifest {
+export function manifest(
+  root: string,
+  custody: StoreCustody,
+  hashFiles = true,
+  workingTree = false,
+  /**
+   * Paths retention must LEAVE BEHIND. A declared-private store is never copied into a durable directory, so the
+   * retained manifest neither lists nor hashes the bytes inside it (28661; chief ruling c8a3b06d).
+   */
+  exclude: (path: string) => boolean = () => false,
+): StoreManifest {
   const entries: Record<string, ManifestEntry> = {}
   const files: Record<string, string> = {}
   const externalObjectStores: ExternalObjectStore[] = []
   for (const entry of readdirSync(root, { recursive: true, withFileTypes: true })) {
     const path = join(entry.parentPath, entry.name)
+    if (exclude(path)) continue
     const key = relative(root, path)
     const metadata = within(custody.gitDir, path)
     if (
@@ -1158,6 +1209,11 @@ export async function retainWorktreeModules(
   privateProjection?: PrivateGitProjection,
   onRetainedPath?: (path: string) => void,
   retirePrivate?: () => void,
+  /**
+   * Section names of declared-private stores to LEAVE OUT of the retained copy, read through the ONE reader by
+   * `declaredPrivateStoreNames`. A private store is never copied into retained-modules (28661; chief c8a3b06d).
+   */
+  privateStoreNames: readonly string[] = [],
 ): Promise<WorktreeRemovalProof> {
   const path = realpathSync(requested)
   if (privateProjection === undefined) {
@@ -1181,9 +1237,14 @@ export async function retainWorktreeModules(
     throw new Error(`worktree ${path} is the primary worktree; only a linked worktree can be removed`)
   }
   const modules = join(gitDir, "modules")
+  // 28661: the declared-private stores this copy must leave behind. Retention answers the SAME question the guard
+  // asks, through the same reader, so the copy can never retain what the refusal would have protected.
+  const privateStoreRoots = privateStoreNames.map((name) => join(modules, name))
+  const inPrivateStore = (candidate: string): boolean =>
+    privateStoreRoots.some((root) => candidate === root || within(root, candidate))
   const custody = { common, checkout: path, gitDir, modules }
   // Diagnose metadata links before Git discovery can hide their source and target in an object lookup failure.
-  manifest(gitDir, custody, false)
+  manifest(gitDir, custody, false, false, inPrivateStore)
   if (privateProjection !== undefined) {
     if (privateProjection.checkout !== path || gitDir !== join(path, ".git")) {
       throw new Error(`private projection metadata does not match ${path}`)
@@ -1205,7 +1266,7 @@ export async function retainWorktreeModules(
   let before = privateProjection === undefined ? await cleanSnapshot(git, path, inspect, excludedSubmodules) : undefined
   // Check metadata locks before copying. The modules subtree includes every store,
   // even one left by an earlier gitlink that the current tree no longer records.
-  const metadata = manifest(gitDir, custody)
+  const metadata = manifest(gitDir, custody, true, false, inPrivateStore)
   const requestedRoot = resolve(retention.root)
   // Resolve existing ancestors before creating anything, so a symlink cannot put
   // the only retained copy back inside either native deletion path.
@@ -1252,13 +1313,14 @@ export async function retainWorktreeModules(
   let expectedCopy: Readonly<Record<string, ManifestEntry>> = {}
   let retainedManifest: StoreManifest = { entries: {}, files: {}, externalObjectStores: [] }
   if (retained !== null) {
-    retainedManifest = manifest(copiedSource, custody, true, privateProjection !== undefined)
+    retainedManifest = manifest(copiedSource, custody, true, privateProjection !== undefined, inPrivateStore)
     cpSync(copiedSource, copiedTree, {
       recursive: true,
       errorOnExist: true,
       force: false,
       dereference: false,
       verbatimSymlinks: true,
+      ...(privateStoreRoots.length === 0 ? {} : { filter: (source: string) => !inPrivateStore(resolve(source)) }),
     })
     onRetainedPath?.(copiedTree)
     onRetainedPath?.(retained)
@@ -1276,7 +1338,7 @@ export async function retainWorktreeModules(
     if (
       JSON.stringify(manifest(copiedTree, copiedCustody, true, privateProjection !== undefined).entries) !==
         JSON.stringify(expectedCopy) ||
-      JSON.stringify(manifest(copiedSource, custody, true, privateProjection !== undefined).entries) !==
+      JSON.stringify(manifest(copiedSource, custody, true, privateProjection !== undefined, inPrivateStore).entries) !==
         JSON.stringify(retainedManifest.entries)
     ) {
       throw new Error(

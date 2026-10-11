@@ -11,6 +11,7 @@ import {
   assertExcludedRemovalCustody,
   assertNoPrivateStore,
   assertNoPrivateStoreAcrossPrune,
+  declaredPrivateStoreNames,
   inspectRemovalStatus,
   prepareRemovalBorrowers,
   rehomeBorrowers,
@@ -347,17 +348,21 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
     await assertRemovalRoot(path)
     const gitDir = realpathSync(await git.text(path, ["rev-parse", "--absolute-git-dir"]))
     const common = realpathSync(await git.text(path, ["rev-parse", "--path-format=absolute", "--git-common-dir"]))
+    const head = await git.text(path, ["rev-parse", "--verify", "HEAD"])
     // 28661: the DECLARATION decides whether the store inside this admin dir is private, not the caller's
     // exclusion list. Runs BEFORE the custody walk, so an empty list can no longer mean "no question asked";
     // a caller proves custody by ADDING an exclusion, never by naming nothing.
     await assertNoPrivateStore(configuredProcess(), {
       adminDir: gitDir,
       repository: repo,
-      head: await git.text(path, ["rev-parse", "--verify", "HEAD"]),
+      head,
       ...(excludedSubmodules === undefined ? {} : { excludedSubmodules }),
       ...(discardPrivateStore === undefined ? {} : { discardPrivateStore }),
       ...(options.journal === undefined ? {} : { journal: options.journal }),
     })
+    // 28661: the same declared-private stores the guard just judged, named for retention to LEAVE BEHIND. A
+    // private store is never copied into retained-modules, however its custody was proved (chief c8a3b06d).
+    const privateStoreNames = await declaredPrivateStoreNames(configuredProcess(), repo, head, gitDir)
     const custody = await assertExcludedRemovalCustody(
       git,
       configuredProcess(),
@@ -367,11 +372,12 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       excludedSubmodules,
     )
     if (custody.notCompared.some((entry) => entry.reason !== "excluded")) {
-      return { gitDir, rehome: undefined, notCompared: custody.notCompared }
+      return { gitDir, privateStoreNames, rehome: undefined, notCompared: custody.notCompared }
     }
     const rehome = await prepareRemovalBorrowers(git, path, common, gitDir, custody, excludedSubmodules)
     return {
       gitDir,
+      privateStoreNames,
       rehome,
       notCompared: [...custody.notCompared, ...rehome.notCompared],
     }
@@ -507,7 +513,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         if (removeOptions.retention !== undefined && removeOptions.unlock === true) {
           throw new Error(`retained worktree removal cannot unlock ${path}; resolve its holder first`)
         }
-        const { gitDir, rehome, notCompared } = await prepareRemoval(
+        const { gitDir, privateStoreNames, rehome, notCompared } = await prepareRemoval(
           path,
           removeOptions.excludedSubmodules,
           removeOptions.discardPrivateStore,
@@ -546,6 +552,10 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
               removeOptions.noRehome === true ? () => [] : rehome.run,
               removeOptions.excludedSubmodules,
               notCompared,
+              undefined,
+              undefined,
+              undefined,
+              privateStoreNames,
             )
           } else {
             if (removeOptions.unlock === true) await unlockWorktree(git, repo, path)
