@@ -16,6 +16,16 @@ export {
   type RetentionVerifyVerdict,
 } from "./retention-verify.ts"
 export {
+  inspectCheckoutGitMetadata,
+  projectPrivateGitWorktree,
+  retainPrivateGitProjection,
+  retirePrivateGitProjection,
+  type PrivateGitProjection,
+  type PrivateGitStopCertificate,
+  type PrivateGitProjectionOptions,
+  type PrivateGitProjectionResult,
+} from "./private-git-projection.ts"
+export {
   superSubmodulePrepare,
   prepareSubmoduleTreeUnderLock,
   type PreparedSubmodule,

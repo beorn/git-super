@@ -23,6 +23,8 @@ import { spawnSync } from "node:child_process"
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { classifyExcludedPath, inspectExcludedCheckout, superStatus, type SuperStatusResult } from "./status.ts"
 import { readCommitSubmodules, type SelectedCommitSubmodules } from "./commit-graph.ts"
+import type { PrivateGitProjection } from "./private-git-projection.ts"
+import { alternatesLineage } from "./alternates.ts"
 import { validateExcludedSubmodules } from "./git.ts"
 import type { GitProcess } from "./process.ts"
 import type { NotCompared } from "./diff.ts"
@@ -896,26 +898,54 @@ export async function retainWorktreeModules(
   rehome?: () => readonly string[],
   excludedSubmodules: readonly string[] = [],
   notCompared: readonly NotCompared[] = [],
+  privateProjection?: PrivateGitProjection,
   onRetainedPath?: (path: string) => void,
+  retirePrivate?: () => void,
 ): Promise<WorktreeRemovalProof> {
   const path = realpathSync(requested)
-  const registered = await inspect(repo, path)
-  if (!registered.registered) {
-    throw new Error(`worktree ${path} is not registered in ${repo}; inspect git worktree list`)
+  if (privateProjection === undefined) {
+    const registered = await inspect(repo, path)
+    if (!registered.registered) {
+      throw new Error(`worktree ${path} is not registered in ${repo}; inspect git worktree list`)
+    }
+    if (registered.locked !== undefined) {
+      throw new Error(`worktree ${path} is locked: ${registered.locked}; resolve its holder before removal`)
+    }
   }
-  if (registered.locked !== undefined) {
-    throw new Error(`worktree ${path} is locked: ${registered.locked}; resolve its holder before removal`)
-  }
-  const gitDir = realpathSync(await git.text(path, ["rev-parse", "--absolute-git-dir"]))
-  const common = realpathSync(await git.text(path, ["rev-parse", "--path-format=absolute", "--git-common-dir"]))
-  if (gitDir === common) {
+  const gitDir =
+    privateProjection === undefined
+      ? realpathSync(await git.text(path, ["rev-parse", "--absolute-git-dir"]))
+      : join(path, ".git")
+  const common =
+    privateProjection === undefined
+      ? realpathSync(await git.text(path, ["rev-parse", "--path-format=absolute", "--git-common-dir"]))
+      : gitDir
+  if (gitDir === common && privateProjection === undefined) {
     throw new Error(`worktree ${path} is the primary worktree; only a linked worktree can be removed`)
   }
   const modules = join(gitDir, "modules")
   const custody = { common, checkout: path, gitDir, modules }
   // Diagnose metadata links before Git discovery can hide their source and target in an object lookup failure.
   manifest(gitDir, custody, false, false)
-  const before = await cleanSnapshot(git, path, inspect, excludedSubmodules)
+  if (privateProjection !== undefined) {
+    if (privateProjection.checkout !== path || gitDir !== join(path, ".git")) {
+      throw new Error(`private projection metadata does not match ${path}`)
+    }
+    const allowedObjects = new Set(
+      privateProjection.mounts.filter((mount) => mount.mode === "ro").map((mount) => mount.source),
+    )
+    for (const repository of privateProjection.repositories) {
+      if (
+        !within(gitDir, repository.gitDirectory) ||
+        realpathSync(repository.gitDirectory) !== repository.gitDirectory
+      ) {
+        throw new Error(`private repository metadata escapes custody: ${repository.gitDirectory}`)
+      }
+      const objects = join(repository.gitDirectory, "objects")
+      await alternatesLineage([objects], "", { allowedObjects: new Set([...allowedObjects, objects]) })
+    }
+  }
+  let before = privateProjection === undefined ? await cleanSnapshot(git, path, inspect, excludedSubmodules) : undefined
   // Check metadata locks before copying. The modules subtree includes every store,
   // even one left by an earlier gitlink that the current tree no longer records.
   const metadata = manifest(gitDir, custody, true, false)
@@ -945,15 +975,27 @@ export async function retainWorktreeModules(
   onRetainedPath?.(canonical)
   const retainedRoot = mkdtempSync(join(canonical, `${basename(gitDir)}-`))
   onRetainedPath?.(retainedRoot)
-  const copiedSource = modules
-  const copiedCheckout = path
-  const copiedTree = join(retainedRoot, "modules")
-  const retained = existsSync(copiedSource) ? copiedTree : null
-  const copiedCustody = { ...custody, modules: retained ?? modules }
+  const copiedSource = privateProjection === undefined ? modules : path
+  const copiedCheckout = privateProjection === undefined ? path : join(retainedRoot, "checkout")
+  const copiedTree = privateProjection === undefined ? join(retainedRoot, "modules") : copiedCheckout
+  const retained = existsSync(copiedSource)
+    ? privateProjection === undefined
+      ? copiedTree
+      : join(copiedTree, ".git")
+    : null
+  const copiedCustody =
+    privateProjection === undefined
+      ? { ...custody, modules: retained ?? modules }
+      : {
+          common: join(copiedTree, ".git"),
+          checkout: copiedCheckout,
+          gitDir: join(copiedTree, ".git"),
+          modules: join(copiedTree, ".git/modules"),
+        }
   let expectedCopy: Readonly<Record<string, ManifestEntry>> = {}
   let retainedManifest: StoreManifest = { entries: {}, files: {}, externalObjectStores: [] }
   if (retained !== null) {
-    retainedManifest = manifest(copiedSource, custody, true)
+    retainedManifest = manifest(copiedSource, custody, true, privateProjection !== undefined)
     cpSync(copiedSource, copiedTree, {
       recursive: true,
       errorOnExist: true,
@@ -975,20 +1017,89 @@ export async function retainWorktreeModules(
       ]),
     )
     if (
-      JSON.stringify(manifest(copiedTree, copiedCustody, true).entries) !== JSON.stringify(expectedCopy) ||
-      JSON.stringify(manifest(copiedSource, custody, true).entries) !== JSON.stringify(retainedManifest.entries)
+      JSON.stringify(manifest(copiedTree, copiedCustody, true, privateProjection !== undefined).entries) !==
+        JSON.stringify(expectedCopy) ||
+      JSON.stringify(manifest(copiedSource, custody, true, privateProjection !== undefined).entries) !==
+        JSON.stringify(retainedManifest.entries)
     ) {
       throw new Error(
         `Git store ${modules} changed during retention at ${retained}; worktree preserved, retry after its writer stops`,
       )
     }
   }
-  const rehomedBorrowers = rehome === undefined ? rehomeBorrowers(common, gitDir, modules) : rehome()
+  if (privateProjection !== undefined && retained !== null) {
+    const allowedObjects = new Set(
+      privateProjection.mounts.filter((mount) => mount.mode === "ro").map((mount) => mount.source),
+    )
+    const knownMetadata = new Set(privateProjection.repositories.map((repository) => repository.gitDirectory))
+    for (const key of Object.keys(retainedManifest.entries)) {
+      const original = join(path, key)
+      if (within(gitDir, original)) {
+        if (
+          (basename(original) === "config" && !knownMetadata.has(dirname(original))) ||
+          ["config.worktree", "commondir", "gitdir"].includes(basename(original)) ||
+          key.split(sep).includes("hooks")
+        ) {
+          throw new Error(`unknown private Git metadata ${original}; preserve before custody`)
+        }
+      } else if (
+        basename(original) === ".git" &&
+        !privateProjection.repositories.some((repository) => original === join(repository.checkout, ".git"))
+      ) {
+        throw new Error(`unknown child metadata ${original}; preserve before custody`)
+      }
+    }
+    for (const repository of privateProjection.repositories) {
+      const copied = join(retained, relative(gitDir, repository.gitDirectory))
+      const configuration = join(copied, "config")
+      if (!lstatSync(configuration).isFile() || metadataFileDigest(configuration) !== repository.configurationSha256) {
+        throw new Error(`private Git configuration changed or is unknown: ${configuration}; preserve before custody`)
+      }
+      const objects = join(copied, "objects")
+      await alternatesLineage([objects], "", { allowedObjects: new Set([...allowedObjects, objects]) })
+      if (repository.path !== "") {
+        const pointer = join(copiedCheckout, repository.path, ".git")
+        if (!lstatSync(pointer).isFile() || readFileSync(pointer, "utf8") !== `gitdir: ${repository.gitDirectory}\n`) {
+          throw new Error(`copied child pointer changed or is unknown: ${pointer}; preserve before custody`)
+        }
+      }
+    }
+    for (const repository of privateProjection.repositories) {
+      if (repository.path === "") continue
+      const copied = join(retained, relative(gitDir, repository.gitDirectory))
+      const pointer = join(copiedCheckout, repository.path, ".git")
+      writeFileSync(pointer, `gitdir: ${copied}\n`)
+      expectedCopy = {
+        ...expectedCopy,
+        [relative(copiedCheckout, pointer)]: { kind: "file", sha256: metadataFileDigest(pointer) },
+      }
+    }
+    before = await cleanSnapshot(git, copiedCheckout, inspect, excludedSubmodules)
+    for (const repository of privateProjection.repositories) {
+      const copied = join(retained, relative(gitDir, repository.gitDirectory))
+      // Full integrity includes borrowed stores: the public root takes 62s and a large child 207–239s.
+      // Keep a finite five-minute bound for this full scan rather than the interactive deadline.
+      await git.run(copiedCheckout, ["--git-dir", copied, "fsck", "--full", "--no-reflogs"], false, 300_000)
+    }
+  }
+  const rehomedBorrowers =
+    privateProjection === undefined ? (rehome === undefined ? rehomeBorrowers(common, gitDir, modules) : rehome()) : []
   const inspectedPath = copiedCheckout
   const after = await cleanSnapshot(git, inspectedPath, inspect, excludedSubmodules)
+  const verifyPrivateManifest = (): void => {
+    if (
+      privateProjection !== undefined &&
+      (JSON.stringify(manifest(path, custody, true, true).entries) !== JSON.stringify(retainedManifest.entries) ||
+        JSON.stringify(manifest(copiedCheckout, copiedCustody, true, true).entries) !== JSON.stringify(expectedCopy))
+    ) {
+      throw new Error(`worktree ${path} changed during retention; preserved, retry after its writer stops`)
+    }
+  }
+  verifyPrivateManifest()
   if (JSON.stringify(after) !== JSON.stringify(before)) {
     throw new Error(`worktree ${path} changed during retention; preserved, retry after its writer stops`)
   }
+  if (before === undefined) throw new Error(`private snapshot missing for ${path}; worktree preserved`)
   const proof: WorktreeRemovalProof = {
     path,
     head: await git.commit(inspectedPath, "HEAD"),
@@ -1011,6 +1122,16 @@ export async function retainWorktreeModules(
   if (retained !== null && retainedManifest.externalObjectStores.length > 0) {
     registerRetainedBorrower(common, retained, proof.manifest)
   }
+  if (retained !== null && privateProjection !== undefined) {
+    for (const mount of privateProjection.mounts.filter((mount) => mount.mode === "ro")) {
+      registerRetainedBorrower(dirname(mount.source), retained, proof.manifest)
+    }
+  }
   retention.report(proof)
+  if (retirePrivate !== undefined) {
+    if (privateProjection === undefined) throw new Error("private retirement requires its projection record")
+    verifyPrivateManifest()
+    retirePrivate()
+  }
   return proof
 }

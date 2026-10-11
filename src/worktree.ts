@@ -520,6 +520,9 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
               removeOptions.noRehome === true ? () => [] : rehome.run,
               removeOptions.excludedSubmodules,
               notCompared,
+              undefined,
+              undefined,
+              undefined,
             )
           } else {
             if (removeOptions.unlock === true) await unlockWorktree(git, repo, path)
