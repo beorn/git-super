@@ -5,7 +5,7 @@
  * @reach fs-walk <fixture-only: synthetic repositories under the temp root>
  * @testonly none
  */
-import { existsSync, mkdtempSync, rmSync } from "node:fs"
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { afterEach, expect, it } from "vitest"
 import { createLocalGitWorktreeStore } from "../src/worktree.ts"
@@ -13,7 +13,10 @@ import { runCli } from "../src/cli.ts"
 import {
   assertNoPrivateStore,
   assertNoPrivateStoreAcrossPrune,
+  classifyDiscardedStores,
+  nameDiscardedStore,
   PrivateStoreRefusalError,
+  type PrivateStoreDiscard,
 } from "../src/worktree-removal.ts"
 import { createLocalGitProcess, type GitProcess } from "../src/process.ts"
 import { canonicalTmpdir, createRepository, git } from "./fixture.ts"
@@ -380,4 +383,44 @@ it.each(["--reason", "--actor"])("refuses %s beside a plain removal instead of i
   expect(stderr.output()).toContain(flag)
   expect(existsSync(store)).toBe(true)
   expect(existsSync(linked)).toBe(true)
+})
+// F2 (@dev/4 7d4a2522): the journal records the guard's DECISION, and that decision is made BEFORE the bytes go,
+// so a removal that fails after the guard must never read as a discard. Here the retention root is a FILE, so the
+// removal fails after the store was journaled and before anything was deleted. The store stays, and the split the
+// add path reports MEASURES that instead of trusting the journal.
+it("a removal that fails after the guard leaves the store standing, and the split measures it", async () => {
+  const root = mkdtempSync(join(canonicalTmpdir(), "git-super-private-post-journal-"))
+  roots.push(root)
+  const { repo, linked, store } = privateFixture(root)
+  const journal: PrivateStoreDiscard[] = []
+  const retainedAsAFile = join(root, "retained-is-a-file")
+  writeFileSync(retainedAsAFile, "not a directory\n")
+
+  const error = await createLocalGitWorktreeStore({ repo })
+    .remove(linked, {
+      discardPrivateStore: { reason: "abandoned unpushed draft", actor: "seat-under-test" },
+      journal: (record) => journal.push(record),
+      retention: { root: retainedAsAFile, report: () => {} },
+    })
+    .then(
+      () => undefined,
+      (cause: unknown) => cause,
+    )
+
+  // The journal DID record the decision, and the removal DID fail after it...
+  expect(journal).toHaveLength(1)
+  expect(error).toBeDefined()
+  // NOT a store refusal: the failure is the retention root, which runs AFTER the guard — that is what makes this
+  // the post-journal case and not a second test of the guard.
+  expect(error).not.toBeInstanceOf(PrivateStoreRefusalError)
+  expect(existsSync(linked)).toBe(true)
+  // ...so the bytes are still there, and the split says so: standing, never discarded.
+  expect(existsSync(store)).toBe(true)
+  expect(classifyDiscardedStores(journal)).toMatchObject({ discarded: [], standing: [{ store }] })
+  expect(classifyDiscardedStores(journal).standing.map(nameDiscardedStore)).toEqual([
+    `${store} (section private-store, from vendor/private)`,
+  ])
+  // The negative control: once the store IS gone, the same split calls it discarded.
+  rmSync(store, { recursive: true, force: true })
+  expect(classifyDiscardedStores(journal)).toMatchObject({ discarded: [{ store }], standing: [] })
 })

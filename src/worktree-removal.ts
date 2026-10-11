@@ -119,6 +119,31 @@ export type PrivateStoreDiscard = Readonly<{
 }>
 
 /**
+ * What a removal's journal records actually MEAN, measured rather than assumed (F2; @dev/4 7d4a2522).
+ *
+ * The guard journals the DECISION — it runs before the bytes go (`assertNoPrivateStore`, at `:246`) — so on a
+ * failed removal a record is evidence of intent, never of a completed delete. A caller that reports the outcome
+ * must therefore measure it: a store still present is STANDING, and only a store that is gone is discarded. The
+ * distinction is the difference between "I deleted your private bytes" and "I was about to and did not".
+ *
+ * `exists` is injectable so the split is testable without racing a real removal.
+ */
+export function classifyDiscardedStores(
+  records: readonly PrivateStoreDiscard[],
+  exists: (store: string) => boolean = existsSync,
+): Readonly<{ discarded: readonly PrivateStoreDiscard[]; standing: readonly PrivateStoreDiscard[] }> {
+  return {
+    discarded: records.filter((record) => !exists(record.store)),
+    standing: records.filter((record) => exists(record.store)),
+  }
+}
+
+/** One discard record rendered for operator-facing text: the store, its section and the checkout it came from. */
+export function nameDiscardedStore(record: PrivateStoreDiscard): string {
+  return `${record.store} (section ${record.name}, from ${record.path})`
+}
+
+/**
  * The refusal as a CLASS, so a caller can tell "these bytes must not be deleted" from "git failed" without
  * matching message text. A queue that has to discard a tree skips it, names it once and continues on a refusal;
  * anything else still stops the round. Same message, same named stores — only the type is new (@cto C4).

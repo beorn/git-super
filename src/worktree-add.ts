@@ -9,7 +9,7 @@ import { validateExcludedSubmodules } from "./git.ts"
 import { gitSuperResult, type GitResultDetail, type GitSuperResult } from "./result.ts"
 import { materializeSubmodulesFromLocalWorktreeParallel } from "./submodules.ts"
 import { createLocalGitWorktreeStore, type GitWorktreeStore } from "./worktree.ts"
-import type { PrivateStoreDiscard } from "./worktree-removal.ts"
+import { classifyDiscardedStores, nameDiscardedStore, type PrivateStoreDiscard } from "./worktree-removal.ts"
 
 /**
  * Owner attribution for a worktree registration (@i/4-supervision/24306).
@@ -537,13 +537,20 @@ export async function superWorktreeAdd(options: SuperWorktreeAddOptions): Promis
   } catch (error) {
     const reason = message(error)
     const { failure: undone, discarded } = await rollback(store, path)
-    // F2 (@cto 0d4c5e3a): a rollback that deleted declared-private bytes says so, by name, in the failure the
-    // operator reads. A deletion nobody can find later is a mistake with extra steps.
+    // F2 (@cto 0d4c5e3a; @dev/4 7d4a2522): a rollback that deleted declared-private bytes says so, by name, in the
+    // failure the operator reads. A deletion nobody can find later is a mistake with extra steps — and so is a
+    // CLAIM of deletion. The journal records the guard's DECISION, which happens before the bytes go, and this
+    // failure is exactly the case where they did not: so the outcome is MEASURED, a store still present is named
+    // as standing, and only a store that is gone is called discarded.
+    const { discarded: gone, standing } = classifyDiscardedStores(discarded)
     const deleted =
-      discarded.length === 0
+      (gone.length === 0
         ? ""
-        : `\nDiscarded ${String(discarded.length)} declared-private store${discarded.length === 1 ? "" : "s"} the add had just laid down: ` +
-          discarded.map((entry) => `${entry.path} (store ${entry.store})`).join(", ")
+        : `\nDiscarded ${String(gone.length)} declared-private store${gone.length === 1 ? "" : "s"} the add had just laid down: ` +
+          gone.map(nameDiscardedStore).join(", ")) +
+      (standing.length === 0
+        ? ""
+        : `\nStill standing (journaled for discard, but NOT deleted): ${standing.map(nameDiscardedStore).join(", ")}`)
     if (undone === undefined) {
       return failed(
         "failed",
