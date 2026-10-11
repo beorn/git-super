@@ -96,3 +96,46 @@ it("still removes an ordinary worktree that declares no private submodule", asyn
   await createLocalGitWorktreeStore({ repo }).remove(linked)
   expect(existsSync(linked)).toBe(false)
 })
+
+// The third shape: the checkout is ALREADY gone, so every guard that reads the checkout is blind, and prune
+// is exactly the command that then deletes the admin dir holding the store.
+it("refuses a prune whose own preview includes an admin dir holding a private store", async () => {
+  const root = mkdtempSync(join(canonicalTmpdir(), "git-super-private-default-prune-"))
+  roots.push(root)
+  const { repo, linked, store } = privateFixture(root)
+  rmSync(linked, { recursive: true, force: true })
+  expect(existsSync(store)).toBe(true)
+
+  const error = await createLocalGitWorktreeStore({ repo })
+    .prune()
+    .then(
+      () => undefined,
+      (cause: unknown) => cause,
+    )
+
+  expect(error, "prune must judge what it would delete before deleting it").toBeInstanceOf(Error)
+  expect(String(error)).toContain(store)
+  expect(existsSync(store)).toBe(true)
+})
+
+// A prune with nothing private in its preview still prunes: the refusal is not a freeze on pruning.
+it("still prunes an admin dir whose store belongs to no private submodule", async () => {
+  const root = mkdtempSync(join(canonicalTmpdir(), "git-super-private-default-prune-public-"))
+  roots.push(root)
+  const repo = join(root, "product")
+  const component = join(root, "component")
+  createRepository(repo, "root.txt", "root\n")
+  createRepository(component, "component.txt", "component\n")
+  git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "--name", "dep", component, "vendor/dep")
+  git(repo, "commit", "-q", "-am", "add the public submodule")
+  const linked = join(root, "linked")
+  git(repo, "worktree", "add", "-q", "--detach", linked, "HEAD")
+  git(linked, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "vendor/dep")
+  const admin = join(repo, ".git", "worktrees", "linked")
+  expect(existsSync(admin)).toBe(true)
+  rmSync(linked, { recursive: true, force: true })
+
+  await createLocalGitWorktreeStore({ repo }).prune()
+
+  expect(existsSync(admin)).toBe(false)
+})

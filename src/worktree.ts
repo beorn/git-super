@@ -10,6 +10,7 @@ import {
   acquireRemovalWriterLeases,
   assertExcludedRemovalCustody,
   assertNoPrivateStore,
+  assertNoPrivateStoreAcrossPrune,
   inspectRemovalStatus,
   prepareRemovalBorrowers,
   rehomeBorrowers,
@@ -629,14 +630,20 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
     async prune(
       pruneOptions: Readonly<{ expire?: string; verbose?: boolean; operation?: string }> = {},
     ): Promise<void> {
-      await mutate(pruneOptions.operation ?? "worktree prune", () =>
-        git.run(repo, [
+      await mutate(pruneOptions.operation ?? "worktree prune", async () => {
+        // 28661: prune deletes the admin dir of every registration whose checkout is gone, and with it the
+        // private store inside it. Ask Git what it WOULD remove and judge each candidate first; never prune blind.
+        await assertNoPrivateStoreAcrossPrune(configuredProcess(), {
+          repository: repo,
+          ...(pruneOptions.expire === undefined ? {} : { expire: pruneOptions.expire }),
+        })
+        return git.run(repo, [
           "worktree",
           "prune",
           ...(pruneOptions.expire === undefined ? [] : ["--expire", pruneOptions.expire]),
           ...(pruneOptions.verbose === true ? ["--verbose"] : []),
-        ]),
-      )
+        ])
+      })
     },
     async inspect(path: string): Promise<WorktreeInspection> {
       return inspectWorktree(git, repo, path)
@@ -769,4 +776,9 @@ function withHookPolicy(args: readonly string[], policy: WorktreeHookPolicy | un
  * caller that removes a worktree WITHOUT the git-super primitive (a plain `rmSync`, a bare `git worktree prune`)
  * reaches the ONE implementation rather than writing a second one beside it.
  */
-export { assertNoPrivateStore, type PrivateStoreCustody, type PrivateStoreRefusal } from "./worktree-removal.ts"
+export {
+  assertNoPrivateStore,
+  assertNoPrivateStoreAcrossPrune,
+  type PrivateStoreCustody,
+  type PrivateStoreRefusal,
+} from "./worktree-removal.ts"

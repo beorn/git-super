@@ -149,6 +149,76 @@ export async function assertNoPrivateStore(process: GitProcess, custody: Private
   )
 }
 
+/**
+ * The admin dirs `git worktree prune` WOULD delete, from its own preview. Git reports them on stderr, one
+ * `Removing <path>: <reason>` line each, relative to the common dir. Parsing Git's own plan is the point: the
+ * set is whatever the installed Git would act on, not a reimplementation of its expiry rules.
+ */
+function prunableAdminDirs(common: string, report: string): string[] {
+  const dirs: string[] = []
+  for (const line of report.split("\n")) {
+    const match = /^Removing (.+?): /u.exec(line.trim())
+    if (match?.[1] === undefined) continue
+    const dir = resolve(common, match[1])
+    if (!dirs.includes(dir)) dirs.push(dir)
+  }
+  return dirs
+}
+
+/**
+ * Refuse a `git worktree prune` that would delete the admin dir of a registration whose CHECKOUT is gone and
+ * whose admin dir holds a private submodule store.
+ *
+ * 28661. Prune removes every prunable registration's admin dir, and with it `<admin dir>/modules/<name>`. Every
+ * other guard in this file reads the checkout, so a gone checkout is exactly what makes them blind — the one
+ * shape prune exists to act on is the one they cannot see. The guard therefore asks Git what it WOULD remove
+ * (`--dry-run --verbose`) and judges each candidate BEFORE the real prune, reading the admin dir's own HEAD,
+ * which Git leaves in place for precisely these registrations.
+ */
+export async function assertNoPrivateStoreAcrossPrune(
+  process: GitProcess,
+  request: Readonly<{ repository: string; expire?: string }>,
+): Promise<void> {
+  const previewArgs = [
+    "worktree",
+    "prune",
+    "--dry-run",
+    "--verbose",
+    ...(request.expire === undefined ? [] : ["--expire", request.expire]),
+  ]
+  const preview = await process.run({ repo: request.repository, args: previewArgs })
+  if (preview.code !== 0) {
+    throw new Error(
+      `git worktree prune --dry-run failed in ${request.repository}: ${preview.stderr.trim() || preview.stdout.trim()}`,
+    )
+  }
+  const commonRun = await process.run({
+    repo: request.repository,
+    args: ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+  })
+  if (commonRun.code !== 0 || commonRun.stdout.trim() === "") {
+    throw new Error(
+      `cannot resolve the common dir of ${request.repository} before pruning it: ${commonRun.stderr.trim()}`,
+    )
+  }
+  const common = realpathSync(commonRun.stdout.trim())
+  for (const adminDir of prunableAdminDirs(common, `${preview.stdout}\n${preview.stderr}`)) {
+    // An admin dir with no store cannot destroy one; the question only arises where modules/ exists.
+    if (!present(join(adminDir, "modules"))) continue
+    const headRun = await process.run({
+      repo: request.repository,
+      args: ["--git-dir", adminDir, "rev-parse", "--verify", "HEAD"],
+    })
+    if (headRun.code !== 0 || headRun.stdout.trim() === "") {
+      throw new Error(
+        `git worktree prune would delete ${adminDir}, which holds a submodule store, and its recorded HEAD cannot be read ` +
+          `(${headRun.stderr.trim() || "no HEAD"}); nothing was pruned; inspect that admin dir and its store before pruning`,
+      )
+    }
+    await assertNoPrivateStore(process, { adminDir, repository: request.repository, head: headRun.stdout.trim() })
+  }
+}
+
 export async function assertExcludedRemovalCustody(
   git: Git,
   process: GitProcess,
