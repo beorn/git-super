@@ -9,6 +9,8 @@ import {
   type MergeParams,
   type PullParams,
   type PushParams,
+  type PrivateStoreVerifyNode,
+  type PrivateStoreVerifyParams,
   type RetentionVerifyParams,
   type StatusParams,
   type SubmodulePrepareParams,
@@ -20,6 +22,7 @@ import type { SuperIsAncestorResult } from "./merge-base.ts"
 import type { SuperMergeResult } from "./merge.ts"
 import type { GitSuperResult } from "./result.ts"
 import type { RetentionVerifyResult } from "./retention-verify.ts"
+import type { PrivateStoreCandidateResult } from "./private-store-candidate.ts"
 import type { SuperStatusResult } from "./status.ts"
 import type { SuperSubmodulePrepareResult } from "./submodule-prepare.ts"
 import { delegateNativeGit, readNativeGit, type ProcessOutputSink } from "./process.ts"
@@ -54,6 +57,12 @@ type CapturedInvocation =
   | Readonly<{
       node: typeof commands.worktree.retention.verify
       params: RetentionVerifyParams
+      json: boolean
+      nul: boolean
+    }>
+  | Readonly<{
+      node: PrivateStoreVerifyNode
+      params: PrivateStoreVerifyParams
       json: boolean
       nul: boolean
     }>
@@ -94,6 +103,7 @@ async function commandResult(
   | SuperMergeResult
   | SuperSubmodulePrepareResult
   | RetentionVerifyResult
+  | PrivateStoreCandidateResult
   | GitSuperResult
 > {
   const { resolveInvocation } = await import("@silvery/command")
@@ -107,6 +117,7 @@ async function commandResult(
       | SuperMergeResult
       | SuperSubmodulePrepareResult
       | RetentionVerifyResult
+      | PrivateStoreCandidateResult
       | GitSuperResult
     >,
     context,
@@ -119,7 +130,7 @@ async function commandResult(
 // Only these existing operations interpret superproject topology. Ordinary Git
 // commands are delegated by default; there is no registry of native commands.
 const ENRICHED_COMMANDS = new Set(["diff", "status", "merge-base", "merge", "pull", "push", "worktree"])
-const OWNED_WORKTREE_SUBCOMMANDS = new Set(["add", "remove", "retention"])
+const OWNED_WORKTREE_SUBCOMMANDS = new Set(["add", "remove", "retention", "private-store"])
 
 function inputObjects(command: string, args: readonly string[]): readonly { argument: string; object: string }[] {
   if (command === "status") return []
@@ -680,6 +691,46 @@ async function runInvocation(
       }
     })
 
+  // #27120 AC1: the read-only half of the ruled retirement route for an initialized private
+  // submodule. It answers one metadata question and is never removal authority.
+  const privateStore = worktree
+    .command("private-store")
+    .description("Read-only candidate check for one private submodule store")
+    .allowExcessArguments()
+    .action((_options, command) => {
+      const subcommand = command.args[0]
+      usage =
+        (subcommand === undefined
+          ? "git-super: worktree private-store needs a subcommand\n"
+          : `git-super: unknown worktree private-store subcommand '${subcommand}'\n`) + command.helpInformation()
+    })
+  privateStore
+    .command("verify")
+    .description(
+      commands.worktree["private-store"].verify.description ?? commands.worktree["private-store"].verify.title,
+    )
+    .option(
+      "--checkout <path>",
+      "the excluded checkout this store belongs to (required); its absent-or-empty state is the empty-first precondition",
+    )
+    .argument("<store>", "the private store directory, a worktree admin dir's modules/<name>")
+    .action((store, _options, command) => {
+      const globals = command.optsWithGlobals() as { repo: string; json?: boolean }
+      const options = command.opts() as { checkout?: string }
+      if (options.checkout === undefined || options.checkout === "") {
+        usage =
+          "git-super: worktree private-store verify requires --checkout <path>: the empty-first precondition is stated against it\n" +
+          command.helpInformation()
+        return
+      }
+      captured = {
+        node: commands.worktree["private-store"].verify,
+        params: { store, checkout: options.checkout },
+        json: globals.json === true,
+        nul: false,
+      }
+    })
+
   program
     .command("diff")
     .description(commands.diff.description ?? commands.diff.title)
@@ -785,6 +836,7 @@ async function runInvocation(
     | SuperMergeResult
     | SuperSubmodulePrepareResult
     | RetentionVerifyResult
+    | PrivateStoreCandidateResult
     | GitSuperResult
   try {
     let objects: GitObjectContext | undefined
@@ -839,6 +891,13 @@ async function runInvocation(
   }
 
   if (captured.node === commands["merge-base"] && !(result as SuperIsAncestorResult).isAncestor) return 1
+  // A verdict is a judgment, so it carries its own code rather than the generic 0: a caller scripted
+  // against it must not read "not a candidate" as success. Same code family as `super observe`.
+  if (captured.node === commands.worktree["private-store"].verify) {
+    const candidate = result as PrivateStoreCandidateResult
+    if (candidate.verdict === "candidate") return 0
+    return candidate.verdict === "not-a-candidate" ? 3 : candidate.verdict === "unproven" ? 4 : 2
+  }
   if (captured.node === commands.merge) {
     const merge = result as SuperMergeResult
     if (merge.state === "updated" || merge.state === "unchanged") return 0
@@ -986,6 +1045,12 @@ async function writeResult(
     for (const gate of verify.gates) {
       stdout.write(`${gate.status} ${gate.gate}: ${gate.message}\n`)
     }
+  } else if (captured.node === nodes.worktree["private-store"].verify) {
+    const candidate = result as PrivateStoreCandidateResult
+    stdout.write(`${candidate.verdict}\n`)
+    for (const reason of candidate.reasons) stdout.write(`${reason.code}: ${reason.message}\n`)
+    stdout.write(`${candidate.notCovered}\n`)
+    for (const path of candidate.paths) stdout.write(`${path}\n`)
   } else {
     const pull = result as GitSuperResult
     stdout.write(`${pull.state}\n`)
