@@ -714,7 +714,20 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
     const proofBefore = readFileSync(join(damaged.entry, "manifest.json"), "utf8")
     const copyBefore = treeDigest(damaged.gitDir)
 
-    const report = compactRetainedRoot(retainedRoot)
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    let report: ReturnType<typeof compactRetainedRoot>
+    try {
+      report = compactRetainedRoot(retainedRoot)
+      expect(warn.mock.calls).toEqual([
+        [
+          expect.stringContaining(
+            `git-super: retained compaction failed for ${join(damaged.entry, "modules")}: gate-2:`,
+          ),
+        ],
+      ])
+    } finally {
+      warn.mockRestore()
+    }
 
     // A refusal that happened before any write is a known class: skipped, left byte-identical, and
     // the run keeps going (CTO ruling 2026-10-12). It is never silence: the report names it.
@@ -738,8 +751,13 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
     const first = buildRetainedEntry(retainedRoot, "a-unwritable")
     const after = buildRetainedEntry(retainedRoot, "b-after")
     chmodSync(first.gitDir, 0o500)
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
     try {
       const report = compactRetainedRoot(retainedRoot)
+      expect(warn.mock.calls).toEqual([
+        [expect.stringContaining(`git-super: retained compaction failed for ${first.gitDir}: pack-refs:`)],
+      ])
+      expect(warn.mock.calls[0]?.[0]).toContain("Permission denied")
 
       // pack-refs cannot write: that is past the point of no return, so it stops the run rather than
       // joining the known refusals.
@@ -753,6 +771,7 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
       expect(report.counts["refused"]).toBe(0)
       expect(existsSync(join(after.gitDir, "logs/refs/remotes"))).toBe(true)
     } finally {
+      warn.mockRestore()
       chmodSync(first.gitDir, 0o755)
     }
   }, 120_000)
@@ -766,8 +785,13 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
     const unwritable = buildRetainedEntry(retainedRoot, "b-unwritable")
     const untouched = buildRetainedEntry(retainedRoot, "c-untouched")
     chmodSync(unwritable.gitDir, 0o500)
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
     try {
       const report = compactRetainedRoot(retainedRoot)
+      expect(warn.mock.calls).toEqual([
+        [expect.stringContaining(`git-super: retained compaction failed for ${unwritable.gitDir}: pack-refs:`)],
+      ])
+      expect(warn.mock.calls[0]?.[0]).toContain("Permission denied")
 
       // The first child compacted, the second failed after its copy had begun to change, and the run
       // stopped there. That child is PARTIAL: it carries its own label and is never counted with the
@@ -784,6 +808,7 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
       expect(existsSync(join(compacted.gitDir, "logs/refs/remotes"))).toBe(false)
       expect(existsSync(join(untouched.gitDir, "logs/refs/remotes"))).toBe(true)
     } finally {
+      warn.mockRestore()
       chmodSync(unwritable.gitDir, 0o755)
     }
   }, 120_000)
@@ -798,8 +823,13 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
     expect(existsSync(join(gitDir, "logs/refs/remotes"))).toBe(true)
     expect(existsSync(join(nested, "logs/refs/remotes"))).toBe(true)
     chmodSync(nested, 0o500)
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
     try {
       const report = compactRetainedRoot(retainedRoot)
+      expect(warn.mock.calls).toEqual([
+        [expect.stringContaining(`git-super: retained compaction failed for ${nested}: pack-refs:`)],
+      ])
+      expect(warn.mock.calls[0]?.[0]).toContain("Permission denied")
 
       expect(report.failed).toEqual({ entry, step: "pack-refs" })
       const stopped = report.entries.find((row) => row.entry === entry)
@@ -812,6 +842,7 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
       expect(existsSync(join(gitDir, "logs/refs/remotes"))).toBe(false)
       expect(existsSync(join(sibling.gitDir, "logs/refs/remotes"))).toBe(true)
     } finally {
+      warn.mockRestore()
       chmodSync(nested, 0o755)
     }
   }, 120_000)
@@ -885,11 +916,24 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
     const stdout = outputSink()
     const stderr = outputSink()
 
-    const code = await runCli(
-      ["--repo", repo, "--json", "worktree", "retention", "compact", "--root", retainedRoot],
-      stdout,
-      stderr,
-    )
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    let code: number
+    try {
+      code = await runCli(
+        ["--repo", repo, "--json", "worktree", "retention", "compact", "--root", retainedRoot],
+        stdout,
+        stderr,
+      )
+      expect(warn.mock.calls).toEqual([
+        [
+          expect.stringContaining(
+            `git-super: retained compaction failed for ${join(damaged.entry, "modules")}: gate-2:`,
+          ),
+        ],
+      ])
+    } finally {
+      warn.mockRestore()
+    }
 
     expect(code, stderr.output).toBe(1)
     const result = JSON.parse(stdout.output) as {
