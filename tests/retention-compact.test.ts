@@ -731,7 +731,7 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
       expect(existsSync(join(after.gitDir, "logs/refs/remotes"))).toBe(false)
       expect(warn).toHaveBeenCalledTimes(1)
       expect(warn).toHaveBeenCalledWith(
-        expect.stringContaining(`git-super: retained compaction failed for ${damaged.gitDir}: gate-2:`),
+        expect.stringContaining(`git-super: retained compaction failed for ${join(damaged.entry, "modules")}: gate-2:`),
       )
     } finally {
       warn.mockRestore()
@@ -933,7 +933,7 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
       expect(existsSync(join(damaged.gitDir, "logs/refs/remotes"))).toBe(true)
       expect(warn).toHaveBeenCalledTimes(1)
       expect(warn).toHaveBeenCalledWith(
-        expect.stringContaining(`git-super: retained compaction failed for ${damaged.gitDir}: gate-2:`),
+        expect.stringContaining(`git-super: retained compaction failed for ${join(damaged.entry, "modules")}: gate-2:`),
       )
     } finally {
       warn.mockRestore()
