@@ -6,6 +6,7 @@ import { appendFile, lstat, readFile } from "node:fs/promises"
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { fileURLToPath } from "node:url"
 import { createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS } from "./exclusive.ts"
+import { ARCHIVE_REF_PREFIX } from "./archive-ref.ts"
 import {
   acquireRemovalWriterLeases,
   assertExcludedRemovalCustody,
@@ -61,6 +62,8 @@ export type WorktreeInspection = Readonly<{
 export type RegisteredWorktree = Readonly<{
   path: string
   head?: string
+  /** Full local ref when this worktree has a branch checked out. */
+  branch?: string
   detached: boolean
   locked?: string
 }>
@@ -663,6 +666,38 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       return listWorktrees(git, repo)
     },
     /**
+     * Remove a local name only while its exact commit remains archived. The existing worktree writer lock
+     * excludes a concurrent store.add; the ref transaction also refuses a moved branch or archive.
+     * Callers own eligibility, attribution and journal policy. This never removes a worktree or remote ref.
+     */
+    async removeArchivedBranch(input: Readonly<{ branch: string; tip: string; archiveRef: string }>): Promise<void> {
+      await mutate(`retire branch ${input.branch}`, async () => {
+        const { branch, tip, archiveRef } = input
+        if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(tip)) {
+          throw new Error(`branch ${branch}: expected a full SHA1 or SHA256 tip, got ${JSON.stringify(tip)}`)
+        }
+        await git.run(repo, ["check-ref-format", "--branch", branch])
+        await git.run(repo, ["check-ref-format", archiveRef])
+        if (!archiveRef.startsWith(`${ARCHIVE_REF_PREFIX}/`)) {
+          throw new Error(`branch ${branch}: custody ref ${archiveRef} is outside ${ARCHIVE_REF_PREFIX}/`)
+        }
+        const ref = `refs/heads/${branch}`
+        const checkedOut = (await listWorktrees(git, repo)).find((row) => row.branch === ref)
+        if (checkedOut !== undefined) {
+          throw new Error(
+            `branch ${branch} is checked out at ${checkedOut.path}; keep it until the worktree releases it`,
+          )
+        }
+        await git.run(
+          repo,
+          ["-c", "core.fsync=loose-object,reference", "-c", "core.fsyncMethod=fsync", "update-ref", "--stdin"],
+          false,
+          timeouts.operation,
+          { stdin: `start\nverify ${archiveRef} ${tip}\ndelete ${ref} ${tip}\nprepare\ncommit\n` },
+        )
+      })
+    },
+    /**
      * This read-only inspection is a snapshot, not permission: remove rechecks admission under its mutation lock.
      * A removal refused by a non-excluded `notCompared` entry carries that refusal and inspects no `borrowers`.
      */
@@ -742,7 +777,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
 async function inspectWorktree(git: Git, repo: string, path: string): Promise<WorktreeInspection> {
   const row = (await listWorktrees(git, repo)).find((entry) => entry.path === resolve(path))
   if (row === undefined) return { registered: false }
-  const { path: _path, ...fields } = row
+  const { path: _path, branch: _branch, ...fields } = row
   return { registered: true, ...fields }
 }
 
@@ -757,10 +792,12 @@ async function listWorktrees(git: Git, repo: string): Promise<RegisteredWorktree
       throw new Error("git worktree list --porcelain -z returned a non-empty record without a worktree path")
     }
     const head = fields.find((field) => field.startsWith("HEAD "))?.slice("HEAD ".length)
+    const branch = fields.find((field) => field.startsWith("branch "))?.slice("branch ".length)
     const locked = fields.find((field) => field === "locked" || field.startsWith("locked "))
     rows.push({
       path: resolve(worktree.slice("worktree ".length)),
       ...(head === undefined ? {} : { head }),
+      ...(branch === undefined ? {} : { branch }),
       detached: fields.includes("detached"),
       ...(locked === undefined ? {} : { locked: locked === "locked" ? "" : locked.slice("locked ".length) }),
     })

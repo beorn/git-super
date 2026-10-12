@@ -78,6 +78,52 @@ function registrySnapshot(registry: string) {
 
 describe("createGitWorktreeStore", () => {
   /**
+   * @failure Retiring a branch loses its only ref, deletes a checked-out branch, or deletes a newer tip.
+   * @level l1
+   * @consumer Yrd archive-first local branch retirement (28791)
+   * Existing worktree removal tests exercise directories, not conditional branch-ref removal.
+   */
+  it("removes only an unchecked-out branch whose exact tip has archive custody", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-branch-retirement-"))
+    try {
+      const repo = join(root, "repo")
+      createRepository(repo, "root.txt", "root\n")
+      const store = createLocalGitWorktreeStore({ repo })
+      const tip = git(repo, ["rev-parse", "HEAD"]).trim()
+      const branch = "task/retire"
+      const archiveRef = "refs/archive/2026-10-12/test/task/retire"
+      git(repo, ["branch", branch])
+      await expect(store.removeArchivedBranch({ branch, tip, archiveRef })).rejects.toThrow()
+      expect(git(repo, ["rev-parse", `refs/heads/${branch}`]).trim()).toBe(tip)
+
+      git(repo, ["update-ref", archiveRef, tip])
+      const linked = join(root, "linked")
+      await store.add({ kind: "branch", path: linked, branch })
+      await expect(store.removeArchivedBranch({ branch, tip, archiveRef })).rejects.toThrow(/checked out/u)
+      expect(git(linked, ["symbolic-ref", "HEAD"]).trim()).toBe(`refs/heads/${branch}`)
+      git(linked, ["checkout", "--detach", "-q"])
+
+      git(repo, ["commit", "--allow-empty", "-qm", "newer tip"])
+      const newer = git(repo, ["rev-parse", "HEAD"]).trim()
+      git(repo, ["update-ref", `refs/heads/${branch}`, newer])
+      await expect(store.removeArchivedBranch({ branch, tip, archiveRef })).rejects.toThrow()
+      expect(git(repo, ["rev-parse", `refs/heads/${branch}`]).trim()).toBe(newer)
+
+      // A mismatched archive is not custody, even when the expected branch tip is current.
+      await expect(store.removeArchivedBranch({ branch, tip: newer, archiveRef })).rejects.toThrow()
+      expect(git(repo, ["rev-parse", `refs/heads/${branch}`]).trim()).toBe(newer)
+      git(repo, ["update-ref", `refs/heads/${branch}`, tip])
+      await store.removeArchivedBranch({ branch, tip, archiveRef })
+      expect(git(repo, ["for-each-ref", "--format=%(refname)", `refs/heads/${branch}`]).trim()).toBe("")
+      expect(git(repo, ["rev-parse", archiveRef]).trim()).toBe(tip)
+      expect(git(linked, ["rev-parse", "HEAD"]).trim()).toBe(tip)
+    } finally {
+      // raw-delete-allow: root is this test's fresh mkdtemp fixture, never a caller-supplied worktree.
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  /**
    * @failure Recovery globally prunes another destroyed registration and its object custody (#27477).
    * @level l1
    * @consumer Worktree recovery callers
@@ -157,7 +203,7 @@ describe("createGitWorktreeStore", () => {
    * @consumer Landing recovery and worktree inspection
    * @testonly none
    */
-  it("lists registered primary and locked linked worktrees using inspection fields", async () => {
+  it("lists registered branches and locked linked worktrees", async () => {
     const root = await mkdtemp(join(canonicalTmpdir(), "git-super-registration-list-"))
     try {
       const repo = join(root, "repo")
@@ -167,10 +213,12 @@ describe("createGitWorktreeStore", () => {
       await store.add({ kind: "detached", path: linked, ref: "HEAD", lockReason: "fixture holder" })
       const rows = await store.list()
       expect(rows).toEqual([
-        { path: repo, head: git(repo, ["rev-parse", "HEAD"]).trim(), detached: false },
+        { path: repo, head: git(repo, ["rev-parse", "HEAD"]).trim(), branch: "refs/heads/main", detached: false },
         { path: linked, head: git(repo, ["rev-parse", "HEAD"]).trim(), detached: true, locked: "fixture holder" },
       ])
-      for (const { path, ...fields } of rows) expect(await store.inspect(path)).toEqual({ registered: true, ...fields })
+      for (const { path, branch: _branch, ...fields } of rows) {
+        expect(await store.inspect(path)).toEqual({ registered: true, ...fields })
+      }
     } finally {
       await rm(root, { recursive: true, force: true })
     }
