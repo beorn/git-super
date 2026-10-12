@@ -368,6 +368,7 @@ export function compactRetainedModules(proof: RetainedCopyProof, options: Compac
 /** How C3 classifies one direct child of a declared retained-modules root, before any write. */
 export type RetainedEntryClass =
   | "eligible"
+  | "refused-gate-2"
   | "already-compacted"
   | "no-entries-map"
   | "incomplete-proof"
@@ -398,9 +399,29 @@ export type CompactRetainedRootReport = Readonly<{
   entries: readonly RetainedEntryReport[]
   /** Eligible children this run compacted, in sorted order. A dry run lists what it verified. */
   processed: readonly string[]
-  /** The first eligible child to fail verification; a run stops there. Null when none failed. */
+  /**
+   * The first child to fail AFTER its copy had begun to change (pack-refs, the reflog drop, the
+   * post-compaction checks, the proof rewrite). A run stops there and reports partial state. Null
+   * when none failed: a refusal that happened BEFORE any mutation is reported by class instead, so a
+   * known refusal cannot stop a stock run at its first child (CTO ruling, 2026-10-12).
+   */
   failed: Readonly<{ entry: string; step: string }> | null
 }>
+
+/**
+ * The steps a child can fail with before its copy has been written at all. Refusing one of these is
+ * a REPORTED class (`refused-gate-2`, the step named): the child is skipped, never rewritten, never
+ * removed, and the run continues. Any other step means the copy had begun to change, which is not a
+ * known class and stops the run.
+ */
+const PRE_MUTATION_REFUSALS: ReadonlySet<string> = new Set([
+  "no-manifest",
+  "incomplete-proof",
+  "foreign-proof",
+  "missing-copy",
+  "gate-2",
+  "discovery",
+])
 
 export type CompactRetainedRootOptions = Readonly<{
   /** Verify each eligible child's copy, report the forecast, and write nothing. */
@@ -446,6 +467,7 @@ export function compactRetainedRoot(root: string, options: CompactRetainedRootOp
   const reports: MutableReport[] = []
   const counts: Record<RetainedEntryClass, number> = {
     eligible: 0,
+    "refused-gate-2": 0,
     "already-compacted": 0,
     "no-entries-map": 0,
     "incomplete-proof": 0,
@@ -464,11 +486,22 @@ export function compactRetainedRoot(root: string, options: CompactRetainedRootOp
   let failed: { entry: string; step: string } | null = null
   const markRefused = (entry: string, step: string): void => {
     const row = reports.find((candidate) => candidate.entry === entry)
-    if (row !== undefined) row.refusedStep = step
+    if (row === undefined) return
+    row.refusedStep = step
+    row.classification = "refused-gate-2"
+    counts.eligible -= 1
+    counts["refused-gate-2"] += 1
   }
+  // A refusal before any write is a reported CLASS, not a stop: the child is left exactly as it is,
+  // the run carries on, and the report still names it and its step.
+  const refusal = (entry: string, step: string): void => markRefused(entry, step)
   for (const entry of selected) {
     const rebuilt = rebuildRetainedCopyProof(entry)
     if (typeof rebuilt === "string") {
+      if (PRE_MUTATION_REFUSALS.has(rebuilt)) {
+        refusal(entry, rebuilt)
+        continue
+      }
       failed = { entry, step: rebuilt }
       markRefused(entry, rebuilt)
       break
@@ -476,6 +509,10 @@ export function compactRetainedRoot(root: string, options: CompactRetainedRootOp
     if (dryRun) {
       const verified = verifyRetainedCopy(rebuilt, common)
       if (verified.status === "failed") {
+        if (PRE_MUTATION_REFUSALS.has(verified.step)) {
+          refusal(entry, verified.step)
+          continue
+        }
         failed = { entry, step: verified.step }
         markRefused(entry, verified.step)
         break
@@ -483,6 +520,10 @@ export function compactRetainedRoot(root: string, options: CompactRetainedRootOp
     } else {
       const result = compactRetainedModules(rebuilt, { common, preState: { kind: "gate-2" } })
       if (result.status === "failed") {
+        if (PRE_MUTATION_REFUSALS.has(result.step)) {
+          refusal(entry, result.step)
+          continue
+        }
         failed = { entry, step: result.step }
         markRefused(entry, result.step)
         break

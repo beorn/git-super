@@ -639,6 +639,7 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
 
     expect(report.counts).toEqual({
       eligible: 1,
+      "refused-gate-2": 0,
       "already-compacted": 1,
       "no-entries-map": 1,
       "incomplete-proof": 1,
@@ -701,7 +702,7 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
     expect(readFileSync(join(entry, "manifest.json"), "utf8")).toBe(before)
   })
 
-  it("stops and reports at the first eligible child whose copy fails gate-2, touching nothing after it", () => {
+  it("reports a gate-2 refusal by class and carries on to the next eligible child", () => {
     const scratch = mkdtempSync(join(canonicalTmpdir(), "git-super-c3-damaged-"))
     roots.push(scratch)
     const retainedRoot = join(scratch, "retained-modules")
@@ -709,14 +710,46 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
     const damaged = buildRetainedEntry(retainedRoot, "a-damaged")
     const after = buildRetainedEntry(retainedRoot, "b-after")
     writeFileSync(join(damaged.gitDir, "description"), "tampered after the proof was written\n")
+    const proofBefore = readFileSync(join(damaged.entry, "manifest.json"), "utf8")
+    const copyBefore = treeDigest(damaged.gitDir)
 
     const report = compactRetainedRoot(retainedRoot)
 
-    expect(report.failed).toEqual({ entry: damaged.entry, step: "gate-2" })
-    expect(report.processed).toEqual([])
-    expect(report.entries.find((row) => row.entry === damaged.entry)?.refusedStep).toBe("gate-2")
-    expect(existsSync(join(after.gitDir, "logs/refs/remotes"))).toBe(true)
+    // A refusal that happened before any write is a known class: skipped, left byte-identical, and
+    // the run keeps going (CTO ruling 2026-10-12). It is never silence: the report names it.
+    expect(report.failed).toBeNull()
+    expect(report.processed).toEqual([after.entry])
+    const refused = report.entries.find((row) => row.entry === damaged.entry)
+    expect(refused?.classification).toBe("refused-gate-2")
+    expect(refused?.refusedStep).toBe("gate-2")
+    expect(report.counts["refused-gate-2"]).toBe(1)
+    expect(report.counts.eligible).toBe(1)
+    expect(readFileSync(join(damaged.entry, "manifest.json"), "utf8")).toBe(proofBefore)
+    expect(treeDigest(damaged.gitDir)).toBe(copyBefore)
+    expect(existsSync(join(after.gitDir, "logs/refs/remotes"))).toBe(false)
   })
+
+  it("still stops the run on a failure that began mutating the copy", () => {
+    const scratch = mkdtempSync(join(canonicalTmpdir(), "git-super-c3-postmutation-"))
+    roots.push(scratch)
+    const retainedRoot = join(scratch, "retained-modules")
+    mkdirSync(retainedRoot, { recursive: true })
+    const first = buildRetainedEntry(retainedRoot, "a-unwritable")
+    const after = buildRetainedEntry(retainedRoot, "b-after")
+    chmodSync(first.gitDir, 0o500)
+    try {
+      const report = compactRetainedRoot(retainedRoot)
+
+      // pack-refs cannot write: that is past the point of no return, so it stops the run rather than
+      // joining the known refusals.
+      expect(report.failed?.entry).toBe(first.entry)
+      expect(report.failed?.step).toBe("pack-refs")
+      expect(report.processed).toEqual([])
+      expect(existsSync(join(after.gitDir, "logs/refs/remotes"))).toBe(true)
+    } finally {
+      chmodSync(first.gitDir, 0o755)
+    }
+  }, 120_000)
 
   it("refuses a manifest whose recorded entry name is not this child", () => {
     const scratch = mkdtempSync(join(canonicalTmpdir(), "git-super-c3-foreign-"))
@@ -731,8 +764,12 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
 
     const report = compactRetainedRoot(retainedRoot)
 
-    expect(report.failed).toEqual({ entry, step: "foreign-proof" })
+    // Another pre-mutation refusal: the class is the family and refusedStep names which refusal.
+    expect(report.failed).toBeNull()
     expect(report.processed).toEqual([])
+    const row = report.entries.find((candidate) => candidate.entry === entry)
+    expect(row?.classification).toBe("refused-gate-2")
+    expect(row?.refusedStep).toBe("foreign-proof")
   })
 
   it("refuses an absent root loudly instead of reporting an empty success", () => {
@@ -768,5 +805,37 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
     expect(result.processed).toHaveLength(1)
     expect(result.failed).toBeNull()
     expect(existsSync(join(gitDir, "logs/refs/remotes"))).toBe(false)
+  })
+
+  it("exits 1 when a child was refused, even though the run carried on past it", async () => {
+    const scratch = mkdtempSync(join(canonicalTmpdir(), "git-super-c3-cli-refused-"))
+    roots.push(scratch)
+    const retainedRoot = join(scratch, "retained-modules")
+    mkdirSync(retainedRoot, { recursive: true })
+    const damaged = buildRetainedEntry(retainedRoot, "a-damaged")
+    const healthy = buildRetainedEntry(retainedRoot, "b-healthy")
+    writeFileSync(join(damaged.gitDir, "description"), "tampered after the proof was written\n")
+    const repo = join(scratch, "repo")
+    createRepository(repo, "file.ts", "export const n = 1\n")
+    const stdout = outputSink()
+    const stderr = outputSink()
+
+    const code = await runCli(
+      ["--repo", repo, "--json", "worktree", "retention", "compact", "--root", retainedRoot],
+      stdout,
+      stderr,
+    )
+
+    expect(code, stderr.output).toBe(1)
+    const result = JSON.parse(stdout.output) as {
+      counts: Record<string, number>
+      processed: string[]
+      failed: unknown
+    }
+    expect(result.failed).toBeNull()
+    expect(result.counts["refused-gate-2"]).toBe(1)
+    expect(result.processed).toEqual([healthy.entry])
+    expect(existsSync(join(healthy.gitDir, "logs/refs/remotes"))).toBe(false)
+    expect(existsSync(join(damaged.gitDir, "logs/refs/remotes"))).toBe(true)
   })
 })

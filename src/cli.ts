@@ -932,7 +932,10 @@ async function runInvocation(
   if (captured.node === commands["merge-base"] && !(result as SuperIsAncestorResult).isAncestor) return 1
   // A stopped compaction is a judgment too: a run that refused at a child must not read as success.
   if (captured.node === commands.worktree.retention.compact) {
-    return (result as CompactRetainedRootReport).failed === null ? 0 : 1
+    const report = result as CompactRetainedRootReport
+    // A refusal before any write is reported by class and the run continues, but it is never
+    // success: the caller scripted against this must see 1 whenever a child was refused.
+    return report.failed === null && report.counts["refused-gate-2"] === 0 ? 0 : 1
   }
   // A verdict is a judgment, so it carries its own code rather than the generic 0: a caller scripted
   // against it must not read "not a candidate" as success. Same code family as `super observe`.
@@ -1096,7 +1099,9 @@ async function writeResult(
     )
     for (const entry of report.entries) {
       if (entry.classification === "eligible") continue
-      stdout.write(`${entry.classification} ${entry.entry}${entry.detail === null ? "" : ` (${entry.detail})`}\n`)
+      stdout.write(
+        `${entry.classification} ${entry.entry}${entry.refusedStep === null ? "" : ` ${entry.refusedStep}`}${entry.detail === null ? "" : ` (${entry.detail})`}\n`,
+      )
     }
     for (const entry of report.processed) {
       stdout.write(`${report.dryRun ? "would-compact" : "compacted"} ${entry}\n`)
