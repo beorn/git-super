@@ -103,6 +103,17 @@ describe("createGitWorktreeStore", () => {
       expect(git(linked, ["symbolic-ref", "HEAD"]).trim()).toBe(`refs/heads/${branch}`)
       git(linked, ["checkout", "--detach", "-q"])
 
+      // Porcelain hides the branch during rebase/bisect; the operation still owns it.
+      const admin = git(linked, ["rev-parse", "--absolute-git-dir"]).trim()
+      for (const state of ["rebase-merge/head-name", "rebase-apply/head-name", "BISECT_START"]) {
+        const path = join(admin, state)
+        await mkdir(dirname(path), { recursive: true })
+        await writeFile(path, state === "BISECT_START" ? branch : `refs/heads/${branch}`)
+        await expect(store.removeArchivedBranch({ branch, tip, archiveRef })).rejects.toThrow(/rebase|bisect/u)
+        expect(git(repo, ["rev-parse", `refs/heads/${branch}`]).trim()).toBe(tip)
+        await rename(path, `${path}.finished`)
+      }
+
       git(repo, ["commit", "--allow-empty", "-qm", "newer tip"])
       const newer = git(repo, ["rev-parse", "HEAD"]).trim()
       git(repo, ["update-ref", `refs/heads/${branch}`, newer])

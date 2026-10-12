@@ -1,4 +1,14 @@
-import { copyFileSync, existsSync, mkdirSync, realpathSync, renameSync, rmdirSync, rmSync } from "node:fs"
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmdirSync,
+  rmSync,
+  statSync,
+} from "node:fs"
 import { randomUUID } from "node:crypto"
 import { spawnSync } from "node:child_process"
 import { setTimeout as delay } from "node:timers/promises"
@@ -67,6 +77,36 @@ export type RegisteredWorktree = Readonly<{
   detached: boolean
   locked?: string
 }>
+
+/** A rebase or bisect owns a branch even when Git's worktree porcelain says detached.
+ * Shared with branch-triage; the operation's own state is the authority.
+ */
+export function worktreeOperationBranch(worktreePath: string): Readonly<{ branch: string; operation: string }> | null {
+  const dotGit = join(worktreePath, ".git")
+  if (!existsSync(dotGit)) return null
+  let gitDir = dotGit
+  if (!statSync(dotGit).isDirectory()) {
+    const declaration = /^gitdir:\s*(.+)$/mu.exec(readFileSync(dotGit, "utf8"))?.[1]?.trim()
+    if (declaration === undefined || declaration === "") {
+      throw new Error(`cannot read worktree operation at ${worktreePath}: ${dotGit} has no gitdir declaration`)
+    }
+    gitDir = isAbsolute(declaration) ? declaration : resolve(worktreePath, declaration)
+  }
+  for (const source of [
+    { file: "rebase-merge/head-name", operation: "rebase-merge" },
+    { file: "rebase-apply/head-name", operation: "rebase-apply" },
+    { file: "BISECT_START", operation: "bisect" },
+  ]) {
+    const path = join(gitDir, source.file)
+    if (!existsSync(path)) continue
+    const branch = readFileSync(path, "utf8")
+      .trim()
+      .replace(/^refs\/heads\//u, "")
+    if (branch === "") throw new Error(`cannot identify the branch held by ${source.operation}: ${path} is empty`)
+    return { branch, operation: source.operation }
+  }
+  return null
+}
 
 export type WorktreeAdd = Readonly<{ hooks?: WorktreeHookPolicy; lockReason?: string; operation?: string }> &
   (
@@ -682,11 +722,13 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
           throw new Error(`branch ${branch}: custody ref ${archiveRef} is outside ${ARCHIVE_REF_PREFIX}/`)
         }
         const ref = `refs/heads/${branch}`
-        const checkedOut = (await listWorktrees(git, repo)).find((row) => row.branch === ref)
-        if (checkedOut !== undefined) {
-          throw new Error(
-            `branch ${branch} is checked out at ${checkedOut.path}; keep it until the worktree releases it`,
-          )
+        for (const row of await listWorktrees(git, repo)) {
+          const operation = row.branch === undefined ? worktreeOperationBranch(row.path) : null
+          if (row.branch === ref || operation?.branch === branch) {
+            throw new Error(
+              `branch ${branch} is ${operation === null ? "checked out" : `held by ${operation.operation}`} at ${row.path}; keep it until the worktree releases it`,
+            )
+          }
         }
         await git.run(
           repo,
