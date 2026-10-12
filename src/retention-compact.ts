@@ -388,8 +388,9 @@ export type RetainedEntryReport = Readonly<{
   /**
    * Why a child was not eligible: which way a `no-manifest` manifest failed (absent, unreadable, not
    * an object), or which recorded location field an `incomplete-proof` child is missing. A
-   * `stopped-partial` child carries the partial-state note here, since its class alone would read as
-   * "nothing happened". Null otherwise: a class alone says what happened, and this says which way.
+   * `stopped-partial` child carries its partial-state note here: it MAY have changed already, so the
+   * class alone must never be read as "nothing happened". Null otherwise: a class alone says what
+   * happened, and this says which way.
    */
   detail: string | null
 }>
@@ -517,7 +518,7 @@ export function compactRetainedRoot(root: string, options: CompactRetainedRootOp
       entry,
       "stopped-partial",
       step,
-      "the copy had already begun to change when this step failed; it is partial, and a later verify will refuse it",
+      "may be partial: the failing step can write; run `retention verify` on it before trusting it",
     )
   for (const entry of selected) {
     const rebuilt = rebuildRetainedCopyProof(entry)

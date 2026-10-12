@@ -788,6 +788,34 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
     }
   }, 120_000)
 
+  it("labels the SAME child stopped-partial once its first gitdir compacted and a later one failed", () => {
+    // The case that makes `stopped-partial` true, and the one that triggered the original bug: ONE
+    // child whose first gitdir is compacted before its second fails (CTO 6de5bcf7). The three-children
+    // row above covers the cross-entry stop; its stopped child never changed, so it cannot prove this.
+    const { root, entry, gitDir, nested } = buildSyntheticEntry()
+    const retainedRoot = join(root, "retained")
+    const sibling = buildRetainedEntry(retainedRoot, "z-sibling")
+    expect(existsSync(join(gitDir, "logs/refs/remotes"))).toBe(true)
+    expect(existsSync(join(nested, "logs/refs/remotes"))).toBe(true)
+    chmodSync(nested, 0o500)
+    try {
+      const report = compactRetainedRoot(retainedRoot)
+
+      expect(report.failed).toEqual({ entry, step: "pack-refs" })
+      const stopped = report.entries.find((row) => row.entry === entry)
+      expect(stopped?.classification).toBe("stopped-partial")
+      expect(stopped?.step).toBe("pack-refs")
+      expect(stopped?.detail).toContain("partial")
+      expect(report.counts["stopped-partial"]).toBe(1)
+      expect(report.counts["refused"]).toBe(0)
+      // The first gitdir really was compacted, so this child is NOT untouched.
+      expect(existsSync(join(gitDir, "logs/refs/remotes"))).toBe(false)
+      expect(existsSync(join(sibling.gitDir, "logs/refs/remotes"))).toBe(true)
+    } finally {
+      chmodSync(nested, 0o755)
+    }
+  }, 120_000)
+
   it("refuses a manifest whose recorded entry name is not this child", () => {
     const scratch = mkdtempSync(join(canonicalTmpdir(), "git-super-c3-foreign-"))
     roots.push(scratch)
