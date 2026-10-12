@@ -729,13 +729,13 @@ describe("Phase 1 read commands", () => {
     roots.push(fixtureRoot)
     const fixture = createProductFixture(fixtureRoot)
 
-    await expect(
+    expect(() =>
       superIsAncestor({
         repo: fixture.product,
         ancestor: "f".repeat(40),
         descendant: fixture.productBase,
       }),
-    ).rejects.toThrow("no consulted repository owns commit")
+    ).toThrow("no consulted repository owns commit")
   })
 
   test("dispatches through the Silvery command tree and preserves JSON and NUL output parity", async () => {
