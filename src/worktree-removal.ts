@@ -47,49 +47,6 @@ export type PrivateStoreCustody = Readonly<{
 export type PrivateStoreRefusal = Readonly<{ name: string; path: string; head: string; store: string }>
 
 /**
- * What ONE observation of a store's path can say (@dev/4 7d4a2522, revised by @dev/4 e73f8644). The THREE outcomes
- * stay apart: a store PROVEN present; one PROVEN absent (ENOENT); and a lookup that could not answer
- * (EACCES/EPERM/ELOOP/ENOTDIR — a chmod000 parent is not a deleted store) is UNKNOWN, carrying the path and the
- * cause, never folded into either pile. `existsSync` alone conflated the last with the first.
- */
-export type StorePresence =
-  | Readonly<{ kind: "present" }>
-  | Readonly<{ kind: "absent" }>
-  | Readonly<{ kind: "unknown"; cause: string }>
-
-export type StoreLookup = (store: string) => StorePresence
-
-/**
- * ONE metadata observation of a store's path. `lstatSync` (not `statSync`/`existsSync`): a store is a directory
- * in place, and following a symlink would answer about a different path than the one being removed. Only ENOENT
- * proves absence; every other failure is `unknown` with its errno text — the difference between "I deleted your
- * private bytes" and "I could not tell whether they are there".
- */
-export function observeStorePresence(store: string): StorePresence {
-  try {
-    lstatSync(store)
-    return { kind: "present" }
-  } catch (error) {
-    const code = errnoCode(error)
-    if (code === "ENOENT") return { kind: "absent" }
-    // Bun/node already prefix the message with the errno code ("EACCES: permission denied, …"), so prefix only a
-    // throw that does not carry it: the reason must read once, not as "EACCES: EACCES: …".
-    const described = error instanceof Error ? error.message : String(error)
-    return {
-      kind: "unknown",
-      cause: code === undefined || described.startsWith(code) ? described : `${code}: ${described}`,
-    }
-  }
-}
-
-/** The errno code of a thrown fs error, or undefined when the throw is not an errno-shaped one. */
-function errnoCode(error: unknown): string | undefined {
-  return typeof error === "object" && error !== null && "code" in error && typeof error.code === "string"
-    ? error.code
-    : undefined
-}
-
-/**
  * The refusal as a CLASS, so a caller can tell "these bytes must not be deleted" from "git failed" without
  * matching message text. A queue that has to discard a tree skips it, names it once and continues on a refusal;
  * anything else still stops the round. Same message, same named stores — only the type is new (@cto C4).
@@ -162,21 +119,6 @@ async function privateStoresIn(
     }
   }
   return refusals
-}
-
-/**
- * The section names of the declared-private stores that exist under `adminDir`, for retention to LEAVE BEHIND.
- * No exclusion set is applied: a store the declaration calls private is never copied into retained-modules, and a
- * caller that proved custody of one has proved what it may DELETE, not what it may copy (28661; chief c8a3b06d).
- */
-export async function declaredPrivateStoreNames(
-  process: GitProcess,
-  repository: string,
-  head: string,
-  adminDir: string,
-): Promise<readonly string[]> {
-  const stores = await privateStoresIn(process, repository, head, adminDir, new Set())
-  return [...new Set(stores.map((entry) => entry.name))].sort()
 }
 
 /**
