@@ -26,6 +26,7 @@ import {
   type PrivateStoreCandidateResult,
 } from "./private-store-candidate.ts"
 import { verifyRetainedEntry, type RetentionVerifyOptions, type RetentionVerifyResult } from "./retention-verify.ts"
+import { compactRetainedRoot, type CompactRetainedRootReport } from "./retention-compact.ts"
 import { superWorktreeRemove, type SuperWorktreeRemoveOptions } from "./worktree-remove.ts"
 
 export type CommandContext = Readonly<{ repo: string; report?: (message: string) => void }>
@@ -40,6 +41,7 @@ export type SubmodulePrepareParams = Omit<SuperSubmodulePrepareOptions, "repo" |
 export type WorktreeRemoveParams = Omit<SuperWorktreeRemoveOptions, "repo" | "report">
 export type WorktreeAddParams = Omit<SuperWorktreeAddOptions, "repo" | "env" | "log" | "report">
 export type RetentionVerifyParams = Omit<RetentionVerifyOptions, "clock">
+export type RetentionCompactParams = Readonly<{ root: string; dryRun?: boolean; limit?: number }>
 export type PrivateStoreVerifyParams = Omit<PrivateStoreCandidateOptions, "git">
 export type PrivateStoreVerifyNode = CommandNode<CommandContext, PrivateStoreVerifyParams, PrivateStoreCandidateResult>
 
@@ -377,6 +379,37 @@ const retentionVerify = commandNode<CommandContext, RetentionVerifyParams, Reten
   run: (_context, input) => verifyRetainedEntry(input),
 })
 
+const retentionCompact = commandNode<CommandContext, RetentionCompactParams, CompactRetainedRootReport>({
+  title: "Compact existing retained GitSuper entries",
+  description:
+    "Pack refs and drop remote-tracking reflogs on each eligible child of a declared retained-modules root — the same compaction a verified close runs (C1), extended to older stock (C3). Drops remote-tracking reflogs; keeps local reflogs. Never removes an entry.",
+  params: params((value) => {
+    const input = record(value)
+    if (typeof input.root !== "string" || input.root.trim() === "") {
+      throw new Error("worktree retention compact requires --root <declared retained-modules root>")
+    }
+    if (input.dryRun !== undefined && typeof input.dryRun !== "boolean") {
+      throw new Error("worktree retention compact dryRun must be a boolean")
+    }
+    if (
+      input.limit !== undefined &&
+      (typeof input.limit !== "number" || !Number.isInteger(input.limit) || input.limit < 0)
+    ) {
+      throw new Error("worktree retention compact --limit must be a non-negative whole number")
+    }
+    return {
+      root: input.root,
+      ...(input.dryRun === true ? { dryRun: true } : {}),
+      ...(input.limit === undefined ? {} : { limit: input.limit as number }),
+    }
+  }),
+  run: (_context, input) =>
+    compactRetainedRoot(input.root, {
+      ...(input.dryRun === true ? { dryRun: true } : {}),
+      ...(input.limit === undefined ? {} : { limit: input.limit }),
+    }),
+})
+
 const worktreeRemove = commandNode<CommandContext, WorktreeRemoveParams, GitSuperResult>({
   title: "Remove a clean worktree with retained submodule stores",
   description: "Prove all repositories clean and unlocked, retain and verify Git stores, then remove once.",
@@ -444,6 +477,7 @@ export type GitSuperCommands = Readonly<{
     remove: CommandNode<CommandContext, WorktreeRemoveParams, GitSuperResult>
     retention: Readonly<{
       verify: CommandNode<CommandContext, RetentionVerifyParams, RetentionVerifyResult>
+      compact: CommandNode<CommandContext, RetentionCompactParams, CompactRetainedRootReport>
     }>
     "private-store": Readonly<{
       verify: PrivateStoreVerifyNode
@@ -463,7 +497,7 @@ export const commands = defineCommandNodes({
   worktree: {
     add: worktreeAdd,
     remove: worktreeRemove,
-    retention: { verify: retentionVerify },
+    retention: { verify: retentionVerify, compact: retentionCompact },
     "private-store": { verify: privateStoreVerify },
   },
 }) satisfies CommandNodeTree<CommandContext> as GitSuperCommands

@@ -11,6 +11,7 @@ import {
   type PushParams,
   type PrivateStoreVerifyNode,
   type PrivateStoreVerifyParams,
+  type RetentionCompactParams,
   type RetentionVerifyParams,
   type StatusParams,
   type SubmodulePrepareParams,
@@ -22,6 +23,7 @@ import type { SuperIsAncestorResult } from "./merge-base.ts"
 import type { SuperMergeResult } from "./merge.ts"
 import type { GitSuperResult } from "./result.ts"
 import type { RetentionVerifyResult } from "./retention-verify.ts"
+import type { CompactRetainedRootReport } from "./retention-compact.ts"
 import type { PrivateStoreCandidateResult } from "./private-store-candidate.ts"
 import type { SuperStatusResult } from "./status.ts"
 import type { SuperSubmodulePrepareResult } from "./submodule-prepare.ts"
@@ -66,6 +68,12 @@ type CapturedInvocation =
       json: boolean
       nul: boolean
     }>
+  | Readonly<{
+      node: typeof commands.worktree.retention.compact
+      params: RetentionCompactParams
+      json: boolean
+      nul: boolean
+    }>
 
 function stableValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(stableValue)
@@ -103,6 +111,7 @@ async function commandResult(
   | SuperMergeResult
   | SuperSubmodulePrepareResult
   | RetentionVerifyResult
+  | CompactRetainedRootReport
   | PrivateStoreCandidateResult
   | GitSuperResult
 > {
@@ -691,6 +700,35 @@ async function runInvocation(
       }
     })
 
+  retention
+    .command("compact")
+    .description(
+      "Pack refs and drop remote-tracking reflogs on each eligible child of a declared retained-modules root — C1's post-close compaction, extended to older stock. Drops remote-tracking reflogs; keeps local reflogs. Never removes an entry.",
+    )
+    .requiredOption("--root <directory>", "the declared retained-modules root whose direct children are compacted")
+    .option("--dry-run", "verify each eligible child's copy and report the forecast without writing")
+    .option("--limit <count>", "compact at most this many eligible children, in sorted order", (value) => {
+      const parsed = Number(value)
+      if (!Number.isInteger(parsed) || parsed < 0) {
+        throw new Error(`git-super: --limit must be a non-negative whole number, got '${value}'`)
+      }
+      return parsed
+    })
+    .action((_options, command) => {
+      const globals = command.optsWithGlobals() as { repo: string; json?: boolean }
+      const options = command.opts() as { root: string; dryRun?: boolean; limit?: number }
+      captured = {
+        node: commands.worktree.retention.compact,
+        params: {
+          root: options.root,
+          ...(options.dryRun === true ? { dryRun: true } : {}),
+          ...(options.limit === undefined ? {} : { limit: options.limit }),
+        },
+        json: globals.json === true,
+        nul: false,
+      }
+    })
+
   // #27120 AC1: the read-only half of the ruled retirement route for an initialized private
   // submodule. It answers one metadata question and is never removal authority.
   const privateStore = worktree
@@ -836,6 +874,7 @@ async function runInvocation(
     | SuperMergeResult
     | SuperSubmodulePrepareResult
     | RetentionVerifyResult
+    | CompactRetainedRootReport
     | PrivateStoreCandidateResult
     | GitSuperResult
   try {
@@ -891,6 +930,10 @@ async function runInvocation(
   }
 
   if (captured.node === commands["merge-base"] && !(result as SuperIsAncestorResult).isAncestor) return 1
+  // A stopped compaction is a judgment too: a run that refused at a child must not read as success.
+  if (captured.node === commands.worktree.retention.compact) {
+    return (result as CompactRetainedRootReport).failed === null ? 0 : 1
+  }
   // A verdict is a judgment, so it carries its own code rather than the generic 0: a caller scripted
   // against it must not read "not a candidate" as success. Same code family as `super observe`.
   if (captured.node === commands.worktree["private-store"].verify) {
@@ -1045,6 +1088,20 @@ async function writeResult(
     for (const gate of verify.gates) {
       stdout.write(`${gate.status} ${gate.gate}: ${gate.message}\n`)
     }
+  } else if (captured.node === nodes.worktree.retention.compact) {
+    const report = result as CompactRetainedRootReport
+    stdout.write(`${report.dryRun ? "dry-run" : "compact"} ${report.root}\n`)
+    stdout.write(
+      `children ${report.children}: eligible ${report.counts.eligible}, already-compacted ${report.counts["already-compacted"]}, no-entries-map ${report.counts["no-entries-map"]}, incomplete-proof ${report.counts["incomplete-proof"]}, no-manifest ${report.counts["no-manifest"]}${report.limit === null ? "" : `, limit ${report.limit}`}\n`,
+    )
+    for (const entry of report.entries) {
+      if (entry.classification === "eligible") continue
+      stdout.write(`${entry.classification} ${entry.entry}${entry.detail === null ? "" : ` (${entry.detail})`}\n`)
+    }
+    for (const entry of report.processed) {
+      stdout.write(`${report.dryRun ? "would-compact" : "compacted"} ${entry}\n`)
+    }
+    if (report.failed !== null) stdout.write(`failed ${report.failed.entry} ${report.failed.step}\n`)
   } else if (captured.node === nodes.worktree["private-store"].verify) {
     const candidate = result as PrivateStoreCandidateResult
     stdout.write(`${candidate.verdict}\n`)
