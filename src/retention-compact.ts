@@ -368,7 +368,8 @@ export function compactRetainedModules(proof: RetainedCopyProof, options: Compac
 /** How C3 classifies one direct child of a declared retained-modules root, before any write. */
 export type RetainedEntryClass =
   | "eligible"
-  | "refused-gate-2"
+  | "refused"
+  | "stopped-partial"
   | "already-compacted"
   | "no-entries-map"
   | "incomplete-proof"
@@ -379,12 +380,16 @@ export type RetainedEntryReport = Readonly<{
   classification: RetainedEntryClass
   /** The stored proof's recorded file count, when the child carries a readable manifest. */
   recordedFiles: number | null
-  /** The compaction step that refused this eligible child, when it failed verification. */
-  refusedStep: string | null
+  /**
+   * The step that refused this child before any write (`refused`), or that stopped the run after its
+   * copy had begun to change (`stopped-partial`). Null when the child was neither.
+   */
+  step: string | null
   /**
    * Why a child was not eligible: which way a `no-manifest` manifest failed (absent, unreadable, not
-   * an object), or which recorded location field an `incomplete-proof` child is missing. Null
-   * otherwise: a class alone says what happened, and this says which way.
+   * an object), or which recorded location field an `incomplete-proof` child is missing. A
+   * `stopped-partial` child carries the partial-state note here, since its class alone would read as
+   * "nothing happened". Null otherwise: a class alone says what happened, and this says which way.
    */
   detail: string | null
 }>
@@ -401,16 +406,18 @@ export type CompactRetainedRootReport = Readonly<{
   processed: readonly string[]
   /**
    * The first child to fail AFTER its copy had begun to change (pack-refs, the reflog drop, the
-   * post-compaction checks, the proof rewrite). A run stops there and reports partial state. Null
-   * when none failed: a refusal that happened BEFORE any mutation is reported by class instead, so a
-   * known refusal cannot stop a stock run at its first child (CTO ruling, 2026-10-12).
+   * post-compaction checks, the proof rewrite). That child is labelled `stopped-partial` and the run
+   * stops there with partial state. Null when none failed: a refusal that happened BEFORE any write
+   * is reported as class `refused` instead, so a known refusal cannot stop a stock run at its first
+   * child (CTO ruling 2026-10-12). A partial child is NEVER labelled or counted as a refusal — an
+   * operator reading `refused` must be able to believe the entry is untouched.
    */
   failed: Readonly<{ entry: string; step: string }> | null
 }>
 
 /**
  * The steps a child can fail with before its copy has been written at all. Refusing one of these is
- * a REPORTED class (`refused-gate-2`, the step named): the child is skipped, never rewritten, never
+ * a REPORTED class (`refused`, the step named): the child is skipped, never rewritten, never
  * removed, and the run continues. Any other step means the copy had begun to change, which is not a
  * known class and stops the run.
  */
@@ -461,13 +468,14 @@ export function compactRetainedRoot(root: string, options: CompactRetainedRootOp
     entry: string
     classification: RetainedEntryClass
     recordedFiles: number | null
-    refusedStep: string | null
+    step: string | null
     detail: string | null
   }
   const reports: MutableReport[] = []
   const counts: Record<RetainedEntryClass, number> = {
     eligible: 0,
-    "refused-gate-2": 0,
+    refused: 0,
+    "stopped-partial": 0,
     "already-compacted": 0,
     "no-entries-map": 0,
     "incomplete-proof": 0,
@@ -477,24 +485,40 @@ export function compactRetainedRoot(root: string, options: CompactRetainedRootOp
   for (const entry of children) {
     const classified = classifyRetainedEntry(entry)
     counts[classified.classification] += 1
-    reports.push({ ...classified, refusedStep: null })
+    reports.push({ ...classified, step: null })
     if (classified.classification === "eligible") eligible.push(entry)
   }
 
   const selected = limit === null ? eligible : eligible.slice(0, Math.max(0, limit))
   const processed: string[] = []
   let failed: { entry: string; step: string } | null = null
-  const markRefused = (entry: string, step: string): void => {
+  const relabel = (
+    entry: string,
+    classification: "refused" | "stopped-partial",
+    step: string,
+    detail: string | null,
+  ): void => {
     const row = reports.find((candidate) => candidate.entry === entry)
     if (row === undefined) return
-    row.refusedStep = step
-    row.classification = "refused-gate-2"
+    row.step = step
+    row.classification = classification
+    if (detail !== null) row.detail = detail
     counts.eligible -= 1
-    counts["refused-gate-2"] += 1
+    counts[classification] += 1
   }
   // A refusal before any write is a reported CLASS, not a stop: the child is left exactly as it is,
   // the run carries on, and the report still names it and its step.
-  const refusal = (entry: string, step: string): void => markRefused(entry, step)
+  const refusal = (entry: string, step: string): void => relabel(entry, "refused", step, null)
+  // A failure after the copy began to change stops the run. Its child is PARTIAL, so it gets its own
+  // label and is never counted with the refusals (CTO 2026-10-12, on @dev/review2's finding): an
+  // operator reading `refused` must be able to believe the entry is untouched.
+  const stopped = (entry: string, step: string): void =>
+    relabel(
+      entry,
+      "stopped-partial",
+      step,
+      "the copy had already begun to change when this step failed; it is partial, and a later verify will refuse it",
+    )
   for (const entry of selected) {
     const rebuilt = rebuildRetainedCopyProof(entry)
     if (typeof rebuilt === "string") {
@@ -503,7 +527,7 @@ export function compactRetainedRoot(root: string, options: CompactRetainedRootOp
         continue
       }
       failed = { entry, step: rebuilt }
-      markRefused(entry, rebuilt)
+      stopped(entry, rebuilt)
       break
     }
     if (dryRun) {
@@ -514,7 +538,7 @@ export function compactRetainedRoot(root: string, options: CompactRetainedRootOp
           continue
         }
         failed = { entry, step: verified.step }
-        markRefused(entry, verified.step)
+        stopped(entry, verified.step)
         break
       }
     } else {
@@ -525,7 +549,7 @@ export function compactRetainedRoot(root: string, options: CompactRetainedRootOp
           continue
         }
         failed = { entry, step: result.step }
-        markRefused(entry, result.step)
+        stopped(entry, result.step)
         break
       }
     }

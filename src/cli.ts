@@ -935,7 +935,7 @@ async function runInvocation(
     const report = result as CompactRetainedRootReport
     // A refusal before any write is reported by class and the run continues, but it is never
     // success: the caller scripted against this must see 1 whenever a child was refused.
-    return report.failed === null && report.counts["refused-gate-2"] === 0 ? 0 : 1
+    return report.failed === null && report.counts.refused === 0 ? 0 : 1
   }
   // A verdict is a judgment, so it carries its own code rather than the generic 0: a caller scripted
   // against it must not read "not a candidate" as success. Same code family as `super observe`.
@@ -1095,12 +1095,12 @@ async function writeResult(
     const report = result as CompactRetainedRootReport
     stdout.write(`${report.dryRun ? "dry-run" : "compact"} ${report.root}\n`)
     stdout.write(
-      `children ${report.children}: eligible ${report.counts.eligible}, already-compacted ${report.counts["already-compacted"]}, no-entries-map ${report.counts["no-entries-map"]}, incomplete-proof ${report.counts["incomplete-proof"]}, no-manifest ${report.counts["no-manifest"]}${report.limit === null ? "" : `, limit ${report.limit}`}\n`,
+      `children ${report.children}: eligible ${report.counts.eligible}, refused ${report.counts.refused}, stopped-partial ${report.counts["stopped-partial"]}, already-compacted ${report.counts["already-compacted"]}, no-entries-map ${report.counts["no-entries-map"]}, incomplete-proof ${report.counts["incomplete-proof"]}, no-manifest ${report.counts["no-manifest"]}${report.limit === null ? "" : `, limit ${report.limit}`}\n`,
     )
     for (const entry of report.entries) {
       if (entry.classification === "eligible") continue
       stdout.write(
-        `${entry.classification} ${entry.entry}${entry.refusedStep === null ? "" : ` ${entry.refusedStep}`}${entry.detail === null ? "" : ` (${entry.detail})`}\n`,
+        `${entry.classification} ${entry.entry}${entry.step === null ? "" : ` ${entry.step}`}${entry.detail === null ? "" : ` (${entry.detail})`}\n`,
       )
     }
     for (const entry of report.processed) {

@@ -639,7 +639,8 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
 
     expect(report.counts).toEqual({
       eligible: 1,
-      "refused-gate-2": 0,
+      refused: 0,
+      "stopped-partial": 0,
       "already-compacted": 1,
       "no-entries-map": 1,
       "incomplete-proof": 1,
@@ -720,9 +721,9 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
     expect(report.failed).toBeNull()
     expect(report.processed).toEqual([after.entry])
     const refused = report.entries.find((row) => row.entry === damaged.entry)
-    expect(refused?.classification).toBe("refused-gate-2")
-    expect(refused?.refusedStep).toBe("gate-2")
-    expect(report.counts["refused-gate-2"]).toBe(1)
+    expect(refused?.classification).toBe("refused")
+    expect(refused?.step).toBe("gate-2")
+    expect(report.counts["refused"]).toBe(1)
     expect(report.counts.eligible).toBe(1)
     expect(readFileSync(join(damaged.entry, "manifest.json"), "utf8")).toBe(proofBefore)
     expect(treeDigest(damaged.gitDir)).toBe(copyBefore)
@@ -745,9 +746,45 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
       expect(report.failed?.entry).toBe(first.entry)
       expect(report.failed?.step).toBe("pack-refs")
       expect(report.processed).toEqual([])
+      const stopped = report.entries.find((row) => row.entry === first.entry)
+      expect(stopped?.classification).toBe("stopped-partial")
+      expect(stopped?.detail).toContain("partial")
+      expect(report.counts["stopped-partial"]).toBe(1)
+      expect(report.counts["refused"]).toBe(0)
       expect(existsSync(join(after.gitDir, "logs/refs/remotes"))).toBe(true)
     } finally {
       chmodSync(first.gitDir, 0o755)
+    }
+  }, 120_000)
+
+  it("labels a mid-run stop stopped-partial, never refused, and leaves the next sibling alone", () => {
+    const scratch = mkdtempSync(join(canonicalTmpdir(), "git-super-c3-stopped-partial-"))
+    roots.push(scratch)
+    const retainedRoot = join(scratch, "retained-modules")
+    mkdirSync(retainedRoot, { recursive: true })
+    const compacted = buildRetainedEntry(retainedRoot, "a-compacted")
+    const unwritable = buildRetainedEntry(retainedRoot, "b-unwritable")
+    const untouched = buildRetainedEntry(retainedRoot, "c-untouched")
+    chmodSync(unwritable.gitDir, 0o500)
+    try {
+      const report = compactRetainedRoot(retainedRoot)
+
+      // The first child compacted, the second failed after its copy had begun to change, and the run
+      // stopped there. That child is PARTIAL: it carries its own label and is never counted with the
+      // refusals, so an operator reading `refused` can still believe every named child is untouched
+      // (CTO 2026-10-12, on @dev/review2's two-gitdir probe).
+      expect(report.processed).toEqual([compacted.entry])
+      expect(report.failed).toEqual({ entry: unwritable.entry, step: "pack-refs" })
+      const stopped = report.entries.find((row) => row.entry === unwritable.entry)
+      expect(stopped?.classification).toBe("stopped-partial")
+      expect(stopped?.step).toBe("pack-refs")
+      expect(stopped?.detail).toContain("partial")
+      expect(report.counts["stopped-partial"]).toBe(1)
+      expect(report.counts["refused"]).toBe(0)
+      expect(existsSync(join(compacted.gitDir, "logs/refs/remotes"))).toBe(false)
+      expect(existsSync(join(untouched.gitDir, "logs/refs/remotes"))).toBe(true)
+    } finally {
+      chmodSync(unwritable.gitDir, 0o755)
     }
   }, 120_000)
 
@@ -764,12 +801,12 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
 
     const report = compactRetainedRoot(retainedRoot)
 
-    // Another pre-mutation refusal: the class is the family and refusedStep names which refusal.
+    // Another pre-mutation refusal: the class is the family and step names which refusal.
     expect(report.failed).toBeNull()
     expect(report.processed).toEqual([])
     const row = report.entries.find((candidate) => candidate.entry === entry)
-    expect(row?.classification).toBe("refused-gate-2")
-    expect(row?.refusedStep).toBe("foreign-proof")
+    expect(row?.classification).toBe("refused")
+    expect(row?.step).toBe("foreign-proof")
   })
 
   it("refuses an absent root loudly instead of reporting an empty success", () => {
@@ -833,7 +870,7 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
       failed: unknown
     }
     expect(result.failed).toBeNull()
-    expect(result.counts["refused-gate-2"]).toBe(1)
+    expect(result.counts["refused"]).toBe(1)
     expect(result.processed).toEqual([healthy.entry])
     expect(existsSync(join(healthy.gitDir, "logs/refs/remotes"))).toBe(false)
     expect(existsSync(join(damaged.gitDir, "logs/refs/remotes"))).toBe(true)
