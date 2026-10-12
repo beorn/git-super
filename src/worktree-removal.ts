@@ -41,47 +41,16 @@ export type PrivateStoreCustody = Readonly<{
   head: string
   /** Paths the caller has ALREADY taken custody of. A declared-private path here is the caller's proof, not an exemption. */
   excludedSubmodules?: readonly string[]
-  /**
-   * The operator's explicit decision to delete a declared-private store on purpose (28661 gate
-   * `git-worktree-private-store`). The reason is REQUIRED: an override with an empty one is refused by name,
-   * never read as consent. One journal record per covered store is written BEFORE the deletion, so the actor
-   * and the reason outlive the bytes they describe.
-   */
-  discardPrivateStore?: Readonly<{ reason: string; actor?: string | null }>
-  /** The caller's sink for a discard record. Absent means the caller keeps no journal, not that none happened. */
-  journal?: (record: PrivateStoreDiscard) => void
 }>
 
 /** One refused store, named so a caller can be told exactly which bytes were about to go. */
 export type PrivateStoreRefusal = Readonly<{ name: string; path: string; head: string; store: string }>
 
 /**
- * One store an override deleted on purpose, with the reason it was deleted and the actor who decided, when the
- * caller could resolve one — `null` says plainly that it could not, so a journal never reads as "no actor
- * needed". A deletion nobody can read the cause of later is a mistake with extra steps (@cto 2026-10-11).
- */
-export type PrivateStoreDiscard = Readonly<{
-  name: string
-  path: string
-  store: string
-  reason: string
-  actor: string | null
-}>
-
-/**
- * What a removal's journal records actually MEAN, measured rather than assumed (F2; @dev/4 7d4a2522, revised by
- * @dev/4 e73f8644).
- *
- * The guard journals the DECISION — it runs before the bytes go (`assertNoPrivateStore`, at `:246`) — so on a
- * failed removal a record is evidence of intent, never of a completed delete. A caller that reports the outcome
- * must therefore measure it, and the measurement has THREE outcomes that must stay apart (@dev/4 e73f8644):
- * a store PROVEN absent (ENOENT) is discarded; a store observed present is standing; and a lookup that could not
- * answer (EACCES/EPERM/ELOOP/ENOTDIR — a chmod000 parent is not a deleted store) is UNKNOWN, carrying the path
- * and the cause, never folded into either pile. `existsSync` alone conflated the last with the first, and read
- * every path twice: the asymmetry that produced (true,false omits a path, false,true lists it twice) is exactly
- * what ONE observation per record removes.
- *
- * `lookup` is injectable so the split is testable without racing a real removal or depending on which uid runs.
+ * What ONE observation of a store's path can say (@dev/4 7d4a2522, revised by @dev/4 e73f8644). The THREE outcomes
+ * stay apart: a store PROVEN present; one PROVEN absent (ENOENT); and a lookup that could not answer
+ * (EACCES/EPERM/ELOOP/ENOTDIR — a chmod000 parent is not a deleted store) is UNKNOWN, carrying the path and the
+ * cause, never folded into either pile. `existsSync` alone conflated the last with the first.
  */
 export type StorePresence =
   | Readonly<{ kind: "present" }>
@@ -118,32 +87,6 @@ function errnoCode(error: unknown): string | undefined {
   return typeof error === "object" && error !== null && "code" in error && typeof error.code === "string"
     ? error.code
     : undefined
-}
-
-export function classifyDiscardedStores(
-  records: readonly PrivateStoreDiscard[],
-  lookup: StoreLookup = observeStorePresence,
-): Readonly<{
-  discarded: readonly PrivateStoreDiscard[]
-  standing: readonly PrivateStoreDiscard[]
-  unknown: readonly Readonly<{ record: PrivateStoreDiscard; cause: string }>[]
-}> {
-  const discarded: PrivateStoreDiscard[] = []
-  const standing: PrivateStoreDiscard[] = []
-  const unknown: { record: PrivateStoreDiscard; cause: string }[] = []
-  for (const record of records) {
-    // ONE observation per record, taken once and reused — never a second lookup whose answer could disagree.
-    const presence = lookup(record.store)
-    if (presence.kind === "absent") discarded.push(record)
-    else if (presence.kind === "present") standing.push(record)
-    else unknown.push({ record, cause: presence.cause })
-  }
-  return { discarded, standing, unknown }
-}
-
-/** One discard record rendered for operator-facing text: the store, its section and the checkout it came from. */
-export function nameDiscardedStore(record: PrivateStoreDiscard): string {
-  return `${record.store} (section ${record.name}, from ${record.path})`
 }
 
 /**
@@ -258,30 +201,12 @@ export async function assertNoPrivateStore(process: GitProcess, custody: Private
     new Set(custody.excludedSubmodules ?? []),
   )
   if (refusals.length === 0) return
-  const discard = custody.discardPrivateStore
-  if (discard !== undefined) {
-    // The reason is REQUIRED, and an empty one is refused by name rather than read as consent. A silent pass
-    // here would turn "delete on purpose" into "delete with nobody able to say why" (NO SILENT ERRORS).
-    if (discard.reason.trim() === "") {
-      throw new PrivateStoreRefusalError(
-        `@gate/git-worktree-private-store: --discard-private-store requires --reason "<text>": the guard refuses ` +
-          `to delete ${refusals.map((entry) => entry.store).join(", ")} on purpose with no reason anyone can read later`,
-        refusals,
-      )
-    }
-    const actor = discard.actor ?? null
-    for (const entry of refusals) {
-      custody.journal?.({ name: entry.name, path: entry.path, store: entry.store, reason: discard.reason, actor })
-    }
-    return
-  }
   throw new PrivateStoreRefusalError(
-    `@gate/git-worktree-private-store: worktree removal would destroy a private submodule store: ${refusals
+    `git-super: worktree removal would destroy a private submodule store: ${refusals
       .map((entry) => `${entry.path} (section ${entry.name}) store ${entry.store}, declared private at ${entry.head}`)
       .join("; ")}; worktree preserved; take custody of each store first (the operator empties the checkout, runs ` +
       `'git super worktree private-store verify <store> --checkout <checkout>', then removes the store), then ` +
-      `retry — or pass --exclude-submodule for a path whose custody you have already proved, or ` +
-      `--discard-private-store --reason "<text>" to delete the store on purpose`,
+      `retry — or pass --exclude-submodule for a path whose custody you have already proved`,
     refusals,
   )
 }

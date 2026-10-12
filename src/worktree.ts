@@ -791,5 +791,4 @@ export {
   PrivateStoreRefusalError,
   type PrivateStoreCustody,
   type PrivateStoreRefusal,
-  type PrivateStoreDiscard,
 } from "./worktree-removal.ts"
