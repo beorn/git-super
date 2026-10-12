@@ -31,7 +31,8 @@
     "./status": "./src/status.ts",
     "./submodules": "./src/submodules.ts",
     "./submodule-origin": "./src/submodule-origin.ts",
-    "./worktree": "./src/worktree.ts"
+    "./worktree": "./src/worktree.ts",
+    "./archive-ref": "./src/archive-ref.ts"
   },
   "publishConfig": {
     "access": "public",
@@ -99,6 +100,10 @@
       "./worktree": {
         "types": "./dist/worktree.d.ts",
         "import": "./dist/worktree.js"
+      },
+      "./archive-ref": {
+        "types": "./dist/archive-ref.d.ts",
+        "import": "./dist/archive-ref.js"
       }
     }
   },
@@ -149,7 +154,8 @@
       "src/status.ts",
       "src/submodules.ts",
       "src/submodule-origin.ts",
-      "src/worktree.ts"
+      "src/worktree.ts",
+      "src/archive-ref.ts"
     ],
     "format": "esm",
     "target": "es2022"
