@@ -89,7 +89,7 @@ function treeGitlinks(root: string, ref: string): TreeGitlink[] {
     .sort((left, right) => left.path.localeCompare(right.path))
 }
 
-export async function superIsAncestor(options: SuperIsAncestorOptions): Promise<SuperIsAncestorResult> {
+export function superIsAncestor(options: SuperIsAncestorOptions): SuperIsAncestorResult {
   validateExcludedSubmodules(options.excludedSubmodules)
   const root = repositoryRoot(options.repo)
   const consultedRepositories: ConsultedRepository[] = [{ path: ".", root }]
