@@ -713,21 +713,29 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
     writeFileSync(join(damaged.gitDir, "description"), "tampered after the proof was written\n")
     const proofBefore = readFileSync(join(damaged.entry, "manifest.json"), "utf8")
     const copyBefore = treeDigest(damaged.gitDir)
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    try {
+      const report = compactRetainedRoot(retainedRoot)
 
-    const report = compactRetainedRoot(retainedRoot)
-
-    // A refusal that happened before any write is a known class: skipped, left byte-identical, and
-    // the run keeps going (CTO ruling 2026-10-12). It is never silence: the report names it.
-    expect(report.failed).toBeNull()
-    expect(report.processed).toEqual([after.entry])
-    const refused = report.entries.find((row) => row.entry === damaged.entry)
-    expect(refused?.classification).toBe("refused")
-    expect(refused?.step).toBe("gate-2")
-    expect(report.counts["refused"]).toBe(1)
-    expect(report.counts.eligible).toBe(1)
-    expect(readFileSync(join(damaged.entry, "manifest.json"), "utf8")).toBe(proofBefore)
-    expect(treeDigest(damaged.gitDir)).toBe(copyBefore)
-    expect(existsSync(join(after.gitDir, "logs/refs/remotes"))).toBe(false)
+      // A refusal that happened before any write is a known class: skipped, left byte-identical, and
+      // the run keeps going (CTO ruling 2026-10-12). It is never silence: the report names it.
+      expect(report.failed).toBeNull()
+      expect(report.processed).toEqual([after.entry])
+      const refused = report.entries.find((row) => row.entry === damaged.entry)
+      expect(refused?.classification).toBe("refused")
+      expect(refused?.step).toBe("gate-2")
+      expect(report.counts["refused"]).toBe(1)
+      expect(report.counts.eligible).toBe(1)
+      expect(readFileSync(join(damaged.entry, "manifest.json"), "utf8")).toBe(proofBefore)
+      expect(treeDigest(damaged.gitDir)).toBe(copyBefore)
+      expect(existsSync(join(after.gitDir, "logs/refs/remotes"))).toBe(false)
+      expect(warn).toHaveBeenCalledTimes(1)
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining(`git-super: retained compaction failed for ${damaged.gitDir}: gate-2:`),
+      )
+    } finally {
+      warn.mockRestore()
+    }
   })
 
   it("still stops the run on a failure that began mutating the copy", () => {
@@ -738,6 +746,7 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
     const first = buildRetainedEntry(retainedRoot, "a-unwritable")
     const after = buildRetainedEntry(retainedRoot, "b-after")
     chmodSync(first.gitDir, 0o500)
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
     try {
       const report = compactRetainedRoot(retainedRoot)
 
@@ -752,7 +761,13 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
       expect(report.counts["stopped-partial"]).toBe(1)
       expect(report.counts["refused"]).toBe(0)
       expect(existsSync(join(after.gitDir, "logs/refs/remotes"))).toBe(true)
+      expect(warn).toHaveBeenCalledTimes(1)
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining(`git-super: retained compaction failed for ${first.gitDir}`),
+      )
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining(": pack-refs:"))
     } finally {
+      warn.mockRestore()
       chmodSync(first.gitDir, 0o755)
     }
   }, 120_000)
@@ -766,6 +781,7 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
     const unwritable = buildRetainedEntry(retainedRoot, "b-unwritable")
     const untouched = buildRetainedEntry(retainedRoot, "c-untouched")
     chmodSync(unwritable.gitDir, 0o500)
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
     try {
       const report = compactRetainedRoot(retainedRoot)
 
@@ -783,7 +799,13 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
       expect(report.counts["refused"]).toBe(0)
       expect(existsSync(join(compacted.gitDir, "logs/refs/remotes"))).toBe(false)
       expect(existsSync(join(untouched.gitDir, "logs/refs/remotes"))).toBe(true)
+      expect(warn).toHaveBeenCalledTimes(1)
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining(`git-super: retained compaction failed for ${unwritable.gitDir}`),
+      )
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining(": pack-refs:"))
     } finally {
+      warn.mockRestore()
       chmodSync(unwritable.gitDir, 0o755)
     }
   }, 120_000)
@@ -798,6 +820,7 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
     expect(existsSync(join(gitDir, "logs/refs/remotes"))).toBe(true)
     expect(existsSync(join(nested, "logs/refs/remotes"))).toBe(true)
     chmodSync(nested, 0o500)
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
     try {
       const report = compactRetainedRoot(retainedRoot)
 
@@ -811,7 +834,12 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
       // The first gitdir really was compacted, so this child is NOT untouched.
       expect(existsSync(join(gitDir, "logs/refs/remotes"))).toBe(false)
       expect(existsSync(join(sibling.gitDir, "logs/refs/remotes"))).toBe(true)
+      expect(warn).toHaveBeenCalledTimes(1)
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining(`git-super: retained compaction failed for ${nested}: pack-refs:`),
+      )
     } finally {
+      warn.mockRestore()
       chmodSync(nested, 0o755)
     }
   }, 120_000)
@@ -884,23 +912,31 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
     createRepository(repo, "file.ts", "export const n = 1\n")
     const stdout = outputSink()
     const stderr = outputSink()
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    try {
+      const code = await runCli(
+        ["--repo", repo, "--json", "worktree", "retention", "compact", "--root", retainedRoot],
+        stdout,
+        stderr,
+      )
 
-    const code = await runCli(
-      ["--repo", repo, "--json", "worktree", "retention", "compact", "--root", retainedRoot],
-      stdout,
-      stderr,
-    )
-
-    expect(code, stderr.output).toBe(1)
-    const result = JSON.parse(stdout.output) as {
-      counts: Record<string, number>
-      processed: string[]
-      failed: unknown
+      expect(code, stderr.output).toBe(1)
+      const result = JSON.parse(stdout.output) as {
+        counts: Record<string, number>
+        processed: string[]
+        failed: unknown
+      }
+      expect(result.failed).toBeNull()
+      expect(result.counts["refused"]).toBe(1)
+      expect(result.processed).toEqual([healthy.entry])
+      expect(existsSync(join(healthy.gitDir, "logs/refs/remotes"))).toBe(false)
+      expect(existsSync(join(damaged.gitDir, "logs/refs/remotes"))).toBe(true)
+      expect(warn).toHaveBeenCalledTimes(1)
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining(`git-super: retained compaction failed for ${damaged.gitDir}: gate-2:`),
+      )
+    } finally {
+      warn.mockRestore()
     }
-    expect(result.failed).toBeNull()
-    expect(result.counts["refused"]).toBe(1)
-    expect(result.processed).toEqual([healthy.entry])
-    expect(existsSync(join(healthy.gitDir, "logs/refs/remotes"))).toBe(false)
-    expect(existsSync(join(damaged.gitDir, "logs/refs/remotes"))).toBe(true)
   })
 })
