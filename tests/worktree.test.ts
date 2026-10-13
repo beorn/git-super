@@ -1828,11 +1828,12 @@ describe("createGitWorktreeStore", () => {
    * @testonly none
    */
   it.each([
-    { failure: "preparation", restoreFails: false },
-    { failure: "preparation", restoreFails: true },
-    { failure: "removal", restoreFails: false },
-    { failure: "removal", restoreFails: true },
-  ])("preserves contents after $failure failure (restoreFails=$restoreFails)", async ({ failure, restoreFails }) => {
+    { failure: "preparation", restoreFails: false, markerFails: false },
+    { failure: "preparation", restoreFails: true, markerFails: false },
+    { failure: "removal", restoreFails: false, markerFails: false },
+    { failure: "removal", restoreFails: true, markerFails: false },
+    { failure: "removal", restoreFails: true, markerFails: true },
+  ])("preserves contents after $failure failure", async ({ failure, restoreFails, markerFails }) => {
     const root = await mkdtemp(join(canonicalTmpdir(), "git-super-removal-recovery-"))
     const fs = await import("node:fs")
     const originalCopy = fs.copyFileSync
@@ -1870,6 +1871,13 @@ describe("createGitWorktreeStore", () => {
         }
         return originalCopy(from, to, mode)
       })
+      const originalWrite = fs.writeFileSync
+      const writeSpy = vi.spyOn(fs, "writeFileSync").mockImplementation((file, data, options) => {
+        if (markerFails && String(file).endsWith(".restore-failed")) {
+          throw new Error("injected marker write failure")
+        }
+        return originalWrite(file, data, options)
+      })
       let error: unknown
       try {
         await store.remove(target)
@@ -1878,6 +1886,7 @@ describe("createGitWorktreeStore", () => {
       } finally {
         copySpy.mockRestore()
         renameSpy.mockRestore()
+        writeSpy.mockRestore()
       }
       expect(error).toBeInstanceOf(Error)
       expect((error as Error).message).toContain(`injected ${failure} failure`)
@@ -1888,6 +1897,16 @@ describe("createGitWorktreeStore", () => {
       if (restoreFails) {
         expect((error as Error).message).toContain(stagingPath!)
         expect((error as Error).message).toContain("injected restoration failure")
+        if (markerFails) {
+          // The one error the caller holds must say the record is unmarked (#28906 SHOULD).
+          expect((error as Error).message).toMatch(/UNMARKED/)
+          expect((error as Error).message).toContain("injected marker write failure")
+        } else {
+          // The retained staging directory must carry the recovery marker so the clean-root
+          // sweep preserves it even after the admin entry is pruned (#28800 / #28906).
+          expect(existsSync(join(stagingPath!, ".restore-failed"))).toBe(true)
+          expect(readFileSync(join(stagingPath!, ".restore-failed"), "utf8")).toContain(target)
+        }
       } else {
         expect(existsSync(stagingPath!)).toBe(false)
         expect(git(target, ["rev-parse", "--is-inside-work-tree"]).trim()).toBe("true")
