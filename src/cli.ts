@@ -814,15 +814,18 @@ async function runInvocation(
     .option("--porcelain", "emit stable machine-readable status")
     .option("-z, --null", "terminate records with NUL instead of newline")
     .option("--index-file <absolute-path>", "hook context: the index git will commit (root repository only)")
+    .option("--removal", "removal safety verdict: exit 0 clean, 1 dirty (records as JSON), 2 unknown submodule state")
     .action((options, command) => {
       const globals = command.optsWithGlobals() as { repo: string; json?: boolean }
+      const removal = options.removal === true
       captured = {
         node: commands.status,
         params: {
           ...(options.indexFile === undefined ? {} : { indexFile: options.indexFile }),
           ...(options.excludeSubmodule?.length ? { excludedSubmodules: options.excludeSubmodule } : {}),
+          ...(removal ? { removal: true } : {}),
         },
-        json: globals.json === true,
+        json: globals.json === true || removal,
         nul: options.null === true,
       }
     })
@@ -930,6 +933,13 @@ async function runInvocation(
   }
 
   if (captured.node === commands["merge-base"] && !(result as SuperIsAncestorResult).isAncestor) return 1
+  // Removal safety is a verdict, not a plain status: a scripted reaper must see clean (0), dirty (1) and
+  // unknown submodule state (2) as distinct outcomes rather than a status that always succeeds. The JSON
+  // result (records + submoduleProblems) is the dirty/unknown payload.
+  if (captured.node === commands.status && (captured.params as StatusParams).removal === true) {
+    const status = result as SuperStatusResult
+    return status.submoduleProblems.length > 0 ? 2 : status.records.length > 0 ? 1 : 0
+  }
   // A stopped compaction is a judgment too: a run that refused at a child must not read as success.
   if (captured.node === commands.worktree.retention.compact) {
     const report = result as CompactRetainedRootReport

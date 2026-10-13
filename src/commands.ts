@@ -31,7 +31,7 @@ import { superWorktreeRemove, type SuperWorktreeRemoveOptions } from "./worktree
 
 export type CommandContext = Readonly<{ repo: string; report?: (message: string) => void }>
 export type DiffParams = Omit<SuperDiffOptions, "repo">
-export type StatusParams = Omit<SuperStatusOptions, "repo">
+export type StatusParams = Omit<SuperStatusOptions, "repo"> & Readonly<{ removal?: boolean }>
 export type MergeBaseParams = Omit<SuperIsAncestorOptions, "repo">
 export type MergeParams = Omit<SuperMergeOptions, "repo" | "git" | "exclusive" | "report">
 export type PullParams = Omit<SuperPullOptions, "repo" | "git" | "exclusive" | "report"> & { progress?: boolean }
@@ -91,14 +91,21 @@ const status = commandNode<CommandContext, StatusParams, SuperStatusResult>({
     if (input.indexFile !== undefined && typeof input.indexFile !== "string") {
       throw new Error("indexFile must be a string")
     }
+    if (input.removal !== undefined && typeof input.removal !== "boolean") {
+      throw new Error("removal must be a boolean")
+    }
     return {
       ...(input.indexFile === undefined ? {} : { indexFile: input.indexFile as string }),
       ...(input.excludedSubmodules === undefined
         ? {}
         : { excludedSubmodules: stringArray(input.excludedSubmodules, "excludedSubmodules") }),
+      ...(input.removal === undefined ? {} : { removal: input.removal as boolean }),
     }
   }),
-  run: (context, input) => superStatus({ repo: context.repo, ...input }),
+  run: (context, input) => {
+    const { removal: _removal, ...statusOptions } = input
+    return superStatus({ repo: context.repo, ...statusOptions })
+  },
 })
 
 const mergeBase = commandNode<CommandContext, MergeBaseParams, SuperIsAncestorResult>({

@@ -126,22 +126,54 @@ export type GitResult = Readonly<{
 }>
 
 const executionEnvironment = new AsyncLocalStorage<
-  Readonly<{ environment: NodeJS.ProcessEnv; objects?: GitObjectContext }>
+  Readonly<{ environment: NodeJS.ProcessEnv; objects?: GitObjectContext; timeoutMs?: number }>
 >()
 
 /** Internal custody scope: synchronous status shares the controlled private environment. */
 export function withGitEnvironment<T>(environment: NodeJS.ProcessEnv, run: () => T, objects?: GitObjectContext): T {
   if (objects !== undefined) validateGitObjectContext(objects)
-  return executionEnvironment.run(objects === undefined ? { environment } : { environment, objects }, run)
+  // A bounded scope established outside this one survives it: removal safety sets the timeout, then the
+  // object-context scope is nested inside.
+  const timeoutMs = executionEnvironment.getStore()?.timeoutMs
+  return executionEnvironment.run(
+    {
+      environment,
+      ...(objects === undefined ? {} : { objects }),
+      ...(timeoutMs === undefined ? {} : { timeoutMs }),
+    },
+    run,
+  )
+}
+
+/**
+ * Bound every synchronous Git child launched inside `run` so a hung process cannot outlive its caller.
+ * Removal safety (inspectRemovalStatus) establishes this scope; `undefined` leaves calls unbounded.
+ * The bound is per invocation, matching the 30 s bound the async reaper runner used before (28033).
+ */
+export function withGitTimeout<T>(timeoutMs: number | undefined, run: () => T): T {
+  if (timeoutMs !== undefined && (!Number.isFinite(timeoutMs) || timeoutMs <= 0)) {
+    throw new Error(`git super: timeout must be a positive number of milliseconds, got ${String(timeoutMs)}`)
+  }
+  const current = executionEnvironment.getStore()
+  return executionEnvironment.run(
+    {
+      environment: current?.environment ?? process.env,
+      ...(current?.objects === undefined ? {} : { objects: current.objects }),
+      ...(timeoutMs === undefined ? {} : { timeoutMs }),
+    },
+    run,
+  )
 }
 
 export function tryGit(cwd: string, args: readonly string[], indexFile?: string): GitResult {
   const env = cleanGitRepositoryEnvironment()
   if (indexFile !== undefined) env.GIT_INDEX_FILE = indexFile
+  const timeoutMs = executionEnvironment.getStore()?.timeoutMs
   const result = spawnSync("git", ["-C", cwd, ...args], {
     encoding: "utf8",
     env,
     maxBuffer: 64 * 1024 * 1024,
+    ...(timeoutMs === undefined ? {} : { timeout: timeoutMs }),
   })
   if (result.error) throw new Error(`failed to run git in ${cwd}: ${result.error.message}`)
   return {

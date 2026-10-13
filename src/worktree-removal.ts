@@ -25,7 +25,7 @@ import { classifyExcludedPath, inspectExcludedCheckout, superStatus, type SuperS
 import { readCommitSubmodules, readPrivateSubmodules, type SelectedCommitSubmodules } from "./commit-graph.ts"
 import type { PrivateGitProjection } from "./private-git-projection.ts"
 import { alternatesLineage } from "./alternates.ts"
-import { validateExcludedSubmodules } from "./git.ts"
+import { validateExcludedSubmodules, withGitTimeout } from "./git.ts"
 import type { GitProcess } from "./process.ts"
 import type { NotCompared } from "./diff.ts"
 import type { Git, WorktreeInspection } from "./worktree.ts"
@@ -624,9 +624,20 @@ function rehomeBorrowerCandidates(
   return [...rehomedBorrowers]
 }
 
+/**
+ * Per-invocation bound for removal safety. A single `git` call that has not answered in 30 s is a hang, and
+ * the async reaper runner bounded each status child at 30 s before the predicate was shared (28033). Callers
+ * may pass a different bound; `undefined` leaves the walk unbounded.
+ */
+export const DEFAULT_REMOVAL_STATUS_TIMEOUT_MS = 30_000
+
 /** Removal never treats an unreadable included repository as an absent population member. */
-export function inspectRemovalStatus(path: string, excludedSubmodules: readonly string[] = []): SuperStatusResult {
-  const status = superStatus({ repo: path, excludedSubmodules })
+export function inspectRemovalStatus(
+  path: string,
+  excludedSubmodules: readonly string[] = [],
+  timeoutMs: number | undefined = DEFAULT_REMOVAL_STATUS_TIMEOUT_MS,
+): SuperStatusResult {
+  const status = withGitTimeout(timeoutMs, () => superStatus({ repo: path, excludedSubmodules }))
   if (status.submoduleProblems.length > 0) {
     throw new Error(
       `worktree ${path} has unknown submodule state: ${status.submoduleProblems.map((problem) => `${problem.path}: ${problem.reason}${problem.gitDir === undefined ? "" : ` (gitdir ${problem.gitDir})`}`).join("; ")}; preserve and resolve it before removal`,
