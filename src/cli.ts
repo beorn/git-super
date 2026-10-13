@@ -2,6 +2,7 @@ import type { CommandNode } from "@silvery/command"
 import { constants as osConstants } from "node:os"
 import {
   type commands,
+  type BranchRetireParams,
   type CommandContext,
   type DiffParams,
   type GitlinkWriteParams,
@@ -27,6 +28,7 @@ import type { CompactRetainedRootReport } from "./retention-compact.ts"
 import type { PrivateStoreCandidateResult } from "./private-store-candidate.ts"
 import type { SuperStatusResult } from "./status.ts"
 import type { SuperSubmodulePrepareResult } from "./submodule-prepare.ts"
+import type { SuperBranchRetireResult } from "./branch-retire.ts"
 import { delegateNativeGit, readNativeGit, type ProcessOutputSink } from "./process.ts"
 import { openInvocationProtocol, type InvocationProtocol } from "./protocol.ts"
 import { isAbsolute } from "node:path"
@@ -55,6 +57,7 @@ type CapturedInvocation =
   | Readonly<{ node: typeof commands.gitlink.write; params: GitlinkWriteParams; json: boolean; nul: boolean }>
   | Readonly<{ node: typeof commands.submodule.prepare; params: SubmodulePrepareParams; json: boolean; nul: boolean }>
   | Readonly<{ node: typeof commands.worktree.add; params: WorktreeAddParams; json: boolean; nul: boolean }>
+  | Readonly<{ node: typeof commands.branch.retire; params: BranchRetireParams; json: boolean; nul: boolean }>
   | Readonly<{ node: typeof commands.worktree.remove; params: WorktreeRemoveParams; json: boolean; nul: boolean }>
   | Readonly<{
       node: typeof commands.worktree.retention.verify
@@ -113,6 +116,7 @@ async function commandResult(
   | RetentionVerifyResult
   | CompactRetainedRootReport
   | PrivateStoreCandidateResult
+  | SuperBranchRetireResult
   | GitSuperResult
 > {
   const { resolveInvocation } = await import("@silvery/command")
@@ -127,6 +131,7 @@ async function commandResult(
       | SuperSubmodulePrepareResult
       | RetentionVerifyResult
       | PrivateStoreCandidateResult
+      | SuperBranchRetireResult
       | GitSuperResult
     >,
     context,
@@ -138,8 +143,12 @@ async function commandResult(
 
 // Only these existing operations interpret superproject topology. Ordinary Git
 // commands are delegated by default; there is no registry of native commands.
-const ENRICHED_COMMANDS = new Set(["diff", "status", "merge-base", "merge", "pull", "push", "worktree"])
+const ENRICHED_COMMANDS = new Set(["branch", "diff", "status", "merge-base", "merge", "pull", "push", "worktree"])
 const OWNED_WORKTREE_SUBCOMMANDS = new Set(["add", "remove", "retention", "private-store"])
+// `branch` is also a native Git command, so only the forms git-super owns are
+// enriched — `retire` and this command's own help; every other form
+// (`git super branch -a`, `--list`, `--merged`, …) still delegates to native Git.
+const OWNED_BRANCH_SUBCOMMANDS = new Set(["retire", "-h", "--help"])
 
 function inputObjects(command: string, args: readonly string[]): readonly { argument: string; object: string }[] {
   if (command === "status") return []
@@ -309,6 +318,10 @@ async function enrichedInvocation(argv: readonly string[]): Promise<readonly str
   if (command === undefined || !ENRICHED_COMMANDS.has(command)) return undefined
   if (command === "worktree") {
     if (!OWNED_WORKTREE_SUBCOMMANDS.has(argv[commandIndex + 1] ?? "")) return undefined
+    return argv
+  }
+  if (command === "branch") {
+    if (!OWNED_BRANCH_SUBCOMMANDS.has(argv[commandIndex + 1] ?? "")) return undefined
     return argv
   }
   const globals = argv.slice(0, commandIndex)
@@ -634,6 +647,57 @@ async function runInvocation(
       }
     })
 
+  const branch = program
+    .command("branch")
+    .description("Retire local branch names whose exact commit is archived")
+    .addHelpText(
+      "after",
+      "\nOnly `branch retire` is git-super's; every other form (`branch -a`, `--list`, `--merged`, …) delegates to native Git.\n",
+    )
+    .allowExcessArguments()
+    .action((_options, command) => {
+      const subcommand = command.args[0]
+      usage =
+        (subcommand === undefined
+          ? "git-super: branch needs a subcommand\n"
+          : `git-super: unknown branch subcommand '${subcommand}'\n`) + command.helpInformation()
+    })
+  branch
+    .command("retire")
+    .description(commands.branch.retire.description ?? commands.branch.retire.title)
+    .requiredOption("--tip <commit>", "the branch's exact full commit; an advanced branch is kept")
+    .option(
+      "--archive <ref>",
+      "the archive ref whose readback must equal --tip (defaults to the canonical refs/archive/<date>/<actor>/<branch>)",
+    )
+    .option("--actor <seat>", "actor segment for the canonical archive ref; required when --archive is absent")
+    .option("--date <yyyy-mm-dd>", "UTC date for the canonical archive ref; defaults to today")
+    .option("--dry-run", "list the retirement without writing")
+    .argument("<branch>", "local branch name to retire")
+    .action((branchName, options, command) => {
+      const globals = command.optsWithGlobals() as { repo: string; json?: boolean }
+      const opts = command.opts() as {
+        tip: string
+        archive?: string
+        actor?: string
+        date?: string
+        dryRun?: boolean
+      }
+      captured = {
+        node: commands.branch.retire,
+        params: {
+          branch: branchName,
+          tip: opts.tip,
+          ...(opts.archive === undefined ? {} : { archive: opts.archive }),
+          ...(opts.actor === undefined ? {} : { actor: opts.actor }),
+          ...(opts.date === undefined ? {} : { date: opts.date }),
+          ...(opts.dryRun === true ? { dryRun: true } : {}),
+        },
+        json: globals.json === true,
+        nul: false,
+      }
+    })
+
   const worktree = program
     .command("worktree")
     .description("Create worktrees that carry a superproject's submodules")
@@ -938,6 +1002,7 @@ async function runInvocation(
     | RetentionVerifyResult
     | CompactRetainedRootReport
     | PrivateStoreCandidateResult
+    | SuperBranchRetireResult
     | GitSuperResult
   try {
     let objects: GitObjectContext | undefined
@@ -1031,6 +1096,7 @@ async function runInvocation(
     captured.node === commands.gitlink.write ||
     captured.node === commands.submodule.prepare ||
     captured.node === commands.worktree.add ||
+    captured.node === commands.branch.retire ||
     captured.node === commands.worktree.remove
   ) {
     const operation = result as GitSuperResult
@@ -1182,6 +1248,11 @@ async function writeResult(
     for (const reason of candidate.reasons) stdout.write(`${reason.code}: ${reason.message}\n`)
     stdout.write(`${candidate.notCovered}\n`)
     for (const path of candidate.paths) stdout.write(`${path}\n`)
+  } else if (captured.node === nodes.branch.retire) {
+    const retire = result as SuperBranchRetireResult
+    stdout.write(
+      `${retire.dryRun ? "would-retire" : "retired"} ${retire.branch} ${retire.tip} ${retire.archiveRef} ${retire.time}\n`,
+    )
   } else {
     const pull = result as GitSuperResult
     stdout.write(`${pull.state}\n`)
