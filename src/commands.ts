@@ -439,6 +439,7 @@ const worktreeRemove = commandNode<CommandContext, WorktreeRemoveParams, GitSupe
         : {
             excludedSubmodules: stringArray(input.excludedSubmodules, "excludedSubmodules"),
           }),
+      ...(input.preserved === undefined ? {} : { preserved: stringArray(input.preserved, "preserved") }),
     }
   }),
   run: (context, input) =>

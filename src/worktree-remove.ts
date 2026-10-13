@@ -34,6 +34,12 @@ export type SuperWorktreeRemoveOptions = Readonly<{
   report?: (message: string) => void
   excludedSubmodules?: readonly string[]
   noRehome?: boolean
+  /**
+   * 29073: refs the caller preserved the dirty stores to, so the retention gate admits each dirty
+   * store only against a named ref that resolves to a commit in that same store. Existence and store
+   * are verified by the gate; byte equality between the ref and the dirt is the caller's claim.
+   */
+  preserved?: readonly string[]
 }>
 
 export type SuperWorktreeRemoveResult = GitSuperResult &
@@ -64,6 +70,7 @@ export async function superWorktreeRemove(options: SuperWorktreeRemoveOptions): 
     const outcome = await store.remove(path, {
       ...(options.excludedSubmodules === undefined ? {} : { excludedSubmodules: options.excludedSubmodules }),
       ...(options.noRehome === undefined ? {} : { noRehome: options.noRehome }),
+      ...(options.preserved === undefined ? {} : { preserved: options.preserved }),
       retention: {
         root: options.retain,
         report: (retained) => {

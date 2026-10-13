@@ -755,12 +755,19 @@ async function runInvocation(
       (value: string, previous: string[]) => [...previous, value],
       [],
     )
+    .option(
+      "--preserved <ref>",
+      "admit a dirty store for removal only against a ref (comma-separated, repeatable) that resolves to a commit in that same store",
+      (value: string, previous: string[]) => [...previous, ...value.split(",").filter((ref) => ref !== "")],
+      [],
+    )
     .argument("<path>", "registered clean worktree to remove")
     .action((path, _options, command) => {
       const globals = command.optsWithGlobals() as { repo: string; json?: boolean }
       const options = command.opts() as {
         retain: string
         excludeSubmodule?: string[]
+        preserved?: string[]
         rehome: boolean
       }
       captured = {
@@ -770,6 +777,7 @@ async function runInvocation(
           retain: options.retain,
           ...(options.rehome === false ? { noRehome: true } : {}),
           ...(options.excludeSubmodule?.length ? { excludedSubmodules: options.excludeSubmodule } : {}),
+          ...(options.preserved?.length ? { preserved: options.preserved } : {}),
         },
         json: globals.json === true,
         nul: false,

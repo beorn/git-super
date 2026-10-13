@@ -536,6 +536,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         retention?: WorktreeRetention
         excludedSubmodules?: readonly string[]
         noRehome?: boolean
+        preserved?: readonly string[]
       }> = {},
     ): Promise<void | Readonly<{ borrowers: readonly string[] }> | Readonly<{ compaction: CompactionResult }>> {
       await assertRemovalRoot(path)
@@ -587,6 +588,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
               undefined,
               undefined,
               undefined,
+              removeOptions.preserved,
             )
           } else {
             if (removeOptions.unlock === true) await unlockWorktree(git, repo, path)
