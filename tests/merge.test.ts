@@ -1351,36 +1351,75 @@ describe("git super merge", () => {
     expect(componentMain).not.toBe(rootPin)
   })
 
+  /**
+   * One fixture in the `left-off-main` shape: alpha's own main diverged from the pin the root records, and the root
+   * pins the commit it already carries -- so the planner classifies the row `left-off-main` and leaves it alone.
+   */
+  function offMainLeftCase(root: string) {
+    const fixture = createProductFixture(root)
+    const main = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 'diverged'\n")
+    const alpha = join(fixture.product, "packages/alpha")
+    writeFileSync(join(alpha, "alpha.ts"), "export const alpha = 'already ahead'\n")
+    git(alpha, "add", "alpha.ts")
+    git(alpha, "commit", "-q", "-m", "advance alpha already at head")
+    const offMain = git(alpha, "rev-parse", "HEAD")
+    git(fixture.product, "add", "packages/alpha")
+    git(fixture.product, "commit", "-q", "-m", "pin existing off-main alpha")
+    return { fixture, main, offMain, candidate: candidateWithRootChange(fixture, "candidate-left") }
+  }
+
   it("reports untouched off-main pins without changing them", async () => {
     const leftRoot = mkdtempSync(join(tmpdir(), "git-super-merge-left-off-main-"))
     roots.push(leftRoot)
-    const left = createProductFixture(leftRoot)
-    const leftMain = advanceRepository(left.alpha, "alpha.ts", "export const alpha = 'diverged'\n")
-    const leftAlpha = join(left.product, "packages/alpha")
-    writeFileSync(join(leftAlpha, "alpha.ts"), "export const alpha = 'already ahead'\n")
-    git(leftAlpha, "add", "alpha.ts")
-    git(leftAlpha, "commit", "-q", "-m", "advance alpha already at head")
-    const leftOffMain = git(leftAlpha, "rev-parse", "HEAD")
-    git(left.product, "add", "packages/alpha")
-    git(left.product, "commit", "-q", "-m", "pin existing off-main alpha")
-    const leftCandidate = candidateWithRootChange(left, "candidate-left")
+    const left = offMainLeftCase(leftRoot)
     const leftStdout = outputSink()
     const leftStderr = outputSink()
 
     expect(
       await runCli(
-        ["--repo", left.product, "merge", leftCandidate, "-m", "merge untouched off-main"],
+        ["--repo", left.fixture.product, "merge", left.candidate, "-m", "merge untouched off-main"],
         leftStdout,
         leftStderr,
       ),
     ).toBe(0)
     expect(leftStderr.output).toContain("left-off-main")
     expect(leftStderr.output).toContain("packages/alpha")
-    expect(leftStderr.output).toContain(leftOffMain)
-    expect(leftStderr.output).toContain(leftMain)
-    expect(git(left.product, "ls-tree", "HEAD", "packages/alpha")).toContain(leftOffMain)
-    expect(git(left.product, "show", "-s", "--format=%B", "HEAD")).toContain(
-      `Settled: packages/alpha@${leftOffMain} left-off-main submodule-main@${leftMain}`,
+    expect(leftStderr.output).toContain(left.offMain)
+    expect(leftStderr.output).toContain(left.main)
+    expect(git(left.fixture.product, "ls-tree", "HEAD", "packages/alpha")).toContain(left.offMain)
+    expect(git(left.fixture.product, "show", "-s", "--format=%B", "HEAD")).toContain(
+      `Settled: packages/alpha@${left.offMain} left-off-main submodule-main@${left.main}`,
+    )
+  })
+
+  /**
+   * @failure The left-off-main row's own pin fields go unasserted: only the human report and the commit trailer are
+   *   checked, so a row that mis-names recordedPin/mainPin/landingPin on an EMPTY settle move still passes (28901,
+   *   from @dev/review2 on 28892).
+   * @level l1
+   * @consumer Yrd submit candidate verification
+   */
+  it("names recordedPin, mainPin and landingPin on the json row of an untouched off-main pin", async () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-merge-left-off-main-json-"))
+    roots.push(root)
+    const offMain = offMainLeftCase(root)
+    const stdout = outputSink()
+    const stderr = outputSink()
+
+    expect(
+      await runCli(["--repo", offMain.fixture.product, "--json", "merge", offMain.candidate], stdout, stderr),
+    ).toBe(0)
+    // `left-off-main` leaves the pin where it stands, so `landingPin` is `recordedPin` again and the settle move
+    // `recordedPin -> landingPin` is EMPTY -- the exact case a from/to pair printed as a move would invert.
+    const result = JSON.parse(stdout.output) as { gitlinks: unknown[] }
+    expect(result.gitlinks).toContainEqual(
+      expect.objectContaining({
+        path: "packages/alpha",
+        state: "left-off-main",
+        recordedPin: offMain.offMain,
+        mainPin: offMain.main,
+        landingPin: offMain.offMain,
+      }),
     )
   })
 
