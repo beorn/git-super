@@ -53,15 +53,26 @@ export type SuperMergeCompositionResult = Readonly<{
 
 export type SuperMergeGitlinkResult = Readonly<{
   path: string
-  from: string
-  to: string
+  /** The pin this root's HEAD already RECORDS for the component. */
+  recordedPin: string
+  /** The component main this merge read and stood the recorded pin against. */
+  mainPin: string
+  /**
+   * The pin this merge WILL RECORD, and the one a consumer publishes: `mainPin` for `raised`, `recordedPin` for
+   * `kept-ahead`, `kept-behind`, `left-off-main` and `as-written`, and the composition commit for `merged`. The merge
+   * is the only thing that decides it, so it is computed in ONE place (this file) and every reader reads the field.
+   *
+   * `recordedPin` and `mainPin` are two REFERENCE POINTS, not a move: `mainPin` is BEHIND the recorded pin whenever the
+   * component's own main has not caught up, so a pair printed under a move's names reads backwards. A reader that
+   * wants the move this merge makes reads `recordedPin` -> `landingPin`, which are equal when nothing moves.
+   */
+  landingPin: string
   /**
    * `merged` is a pin this merge COMPOSED: its two sides diverged, they changed
    * disjoint files, and the merge created the two-parent commit carrying both.
-   * `from` is that composed commit and `to` the submodule main it descends
-   * from, exactly as `kept-ahead` reads, so a consumer that publishes
-   * `kept-ahead` publishes this the same way: the composition's FIRST parent is
-   * that main, which makes the publication a plain fast-forward.
+   * Its `landingPin` is that composed commit and its `mainPin` the submodule main the commit descends from, exactly as
+   * `kept-ahead` reads, so a consumer that publishes `kept-ahead` publishes this the same way: the composition's FIRST
+   * parent is that main, which makes the publication a plain fast-forward.
    */
   state: "raised" | "kept-ahead" | "kept-behind" | "as-written" | "left-off-main" | "merged" | "not-run"
   /** Present on a `merged` row and on no other. */
@@ -228,8 +239,10 @@ export type SuperMergeOptions = Readonly<{
 
 type GitlinkPlan = Readonly<{
   path: string
-  from: string
-  to: string
+  /** The pin the tree being merged onto RECORDS for this component (the merge plan's `from`). */
+  recordedPin: string
+  /** The component's own main, which the merge read (the merge plan's `to`). */
+  mainPin: string
   state: "raised" | "kept-ahead" | "kept-behind" | "as-written" | "left-off-main"
   changedByMerge: boolean
   store?: string
@@ -875,11 +888,11 @@ async function mergeObserved(
       [],
       obviousDetail(
         "gitlink-off-main",
-        `Merge ${target} would change ${refusal.path} to ${refusal.from}, which fetched submodule main ${refusal.to} does not contain.`,
-        `git -C ${join(root, refusal.path)} merge-base --is-ancestor ${refusal.from} ${refusal.to}`,
+        `Merge ${target} would change ${refusal.path} to ${refusal.recordedPin}, which fetched submodule main ${refusal.mainPin} does not contain.`,
+        `git -C ${join(root, refusal.path)} merge-base --is-ancestor ${refusal.recordedPin} ${refusal.mainPin}`,
         `Rebase ${refusal.path} onto its configured submodule branch, then rerun the same git super merge command.`,
         "the submodule writer",
-        { paths: [refusal.path], objectIds: [refusal.from, refusal.to] },
+        { paths: [refusal.path], objectIds: [refusal.recordedPin, refusal.mainPin] },
       ),
     )
   }
@@ -893,8 +906,16 @@ async function mergeObserved(
    */
   const visiblePlans: SuperMergeGitlinkResult[] = plans.map(({ changedByMerge: _changedByMerge, ...plan }) => {
     const composition = composed.get(plan.path)
-    if (composition === undefined || plan.state !== "kept-ahead" || plan.from !== composition.sha) return plan
-    return { ...plan, composition: composition.evidence, state: "merged" }
+    const merged = composition !== undefined && plan.state === "kept-ahead" && plan.recordedPin === composition.sha
+    return {
+      path: plan.path,
+      recordedPin: plan.recordedPin,
+      mainPin: plan.mainPin,
+      landingPin: merged ? composition.sha : plan.state === "raised" ? plan.mainPin : plan.recordedPin,
+      state: merged ? ("merged" as const) : plan.state,
+      ...(merged ? { composition: composition.evidence } : {}),
+      ...(plan.store === undefined ? {} : { store: plan.store }),
+    }
   })
 
   // Existing parents can acquire children even when their selected pin is a raise to main.
@@ -932,7 +953,7 @@ async function mergeObserved(
   steps.begin("capture")
   const requestedMessage = options.message ?? `Merge ${target.slice(0, 12)} into ${head.slice(0, 12)}`
   const frozenPins = new Map((await readCommitSubmodules(git, root, tree)).map((entry) => [entry.path, entry.target]))
-  for (const plan of visiblePlans) if (plan.state === "raised") frozenPins.set(plan.path, plan.to)
+  for (const plan of visiblePlans) if (plan.state === "raised") frozenPins.set(plan.path, plan.landingPin)
   const frozenModules = await required(
     git,
     root,
@@ -942,8 +963,8 @@ async function mergeObserved(
   )
   const trailers = visiblePlans.map((plan) =>
     plan.state === "raised" || isSubmoduleExcluded(plan.path, excludedSubmodules)
-      ? `Settled: ${plan.path}@${plan.to}`
-      : `Settled: ${plan.path}@${plan.from} ${plan.state} submodule-main@${plan.to}`,
+      ? `Settled: ${plan.path}@${plan.landingPin}`
+      : `Settled: ${plan.path}@${plan.recordedPin} ${plan.state} submodule-main@${plan.mainPin}`,
   )
   try {
     const parsed = await run(git, root, ["interpret-trailers", "--parse"], timeoutMs, requestedMessage)
@@ -962,7 +983,7 @@ async function mergeObserved(
       root,
       head,
       tree,
-      new Map(visiblePlans.filter((plan) => plan.state === "raised").map((plan) => [plan.path, plan.to])),
+      new Map(visiblePlans.filter((plan) => plan.state === "raised").map((plan) => [plan.path, plan.landingPin])),
       timeoutMs,
       planned.stores,
       planned.mains,
@@ -1076,7 +1097,7 @@ async function mergeObserved(
   for (let index = 0; index < raises.length; index += 1) {
     const raise = raises[index]
     if (raise === undefined) continue
-    const args = ["update-index", "--cacheinfo", `160000,${raise.to},${raise.path}`]
+    const args = ["update-index", "--cacheinfo", `160000,${raise.landingPin},${raise.path}`]
     const written = await run(git, root, args, timeoutMs)
     if (written.code !== 0) {
       const notRun = raises.slice(index).map((plan) => ({ ...plan, state: "not-run" as const }))
@@ -1090,11 +1111,11 @@ async function mergeObserved(
           root,
           args,
           written,
-          `The prospective merge of ${target} was applied, but ${raise.path} was not raised from ${raise.from} to ${raise.to}.`,
+          `The prospective merge of ${target} was applied, but ${raise.path} was not raised from ${raise.recordedPin} to ${raise.landingPin}.`,
           `git -C ${root} status --short`,
           "Inspect and preserve the uncommitted merge before deciding whether a retry is safe.",
           "the caller",
-          { paths: [raise.path], objectIds: [raise.from, raise.to] },
+          { paths: [raise.path], objectIds: [raise.recordedPin, raise.landingPin] },
         ),
         preparedRows,
       )
@@ -1162,7 +1183,7 @@ async function mergeObserved(
       state: ok ? "initialized" : "initialization-failed",
     }
     if (!ok) {
-      const incoming = visiblePlans.find((plan) => plan.path === row.path)?.from
+      const incoming = visiblePlans.find((plan) => plan.path === row.path)?.recordedPin
       const cause = initializationFailed
         ? resultDetailFromGit(
             "added-submodule-initialization-failed",
@@ -1427,21 +1448,21 @@ async function writeRootReceipt(
     ]),
   )
   const paths = new Set<string>()
-  const changes = raises.map(({ path, from, to, state }) => {
+  const changes = raises.map(({ path, recordedPin, landingPin, state }) => {
     if (
       state !== "raised" ||
       paths.has(path) ||
-      !OBJECT_ID.test(from) ||
-      from.length !== merge.length ||
-      !OBJECT_ID.test(to) ||
-      to.length !== merge.length ||
-      from === to ||
-      actual.get(path) !== to
+      !OBJECT_ID.test(recordedPin) ||
+      recordedPin.length !== merge.length ||
+      !OBJECT_ID.test(landingPin) ||
+      landingPin.length !== merge.length ||
+      recordedPin === landingPin ||
+      actual.get(path) !== landingPin
     ) {
       throw new Error(`Receipt row ${path} does not match an actual automatic gitlink raise in ${merge}`)
     }
     paths.add(path)
-    return { path, mode: "160000", from, to }
+    return { path, mode: "160000", from: recordedPin, to: landingPin }
   })
   const payload = `${JSON.stringify({ version: 1, merge, changes })}\n`
   const blob = await required(git, root, ["hash-object", "-w", "--stdin"], phase, timeoutMs, payload)
@@ -2531,18 +2552,18 @@ async function composeForkedGitlinks(
   const merges = new Map<string, string>()
   for (const fork of forks) {
     const store = planned.stores.get(fork.path) ?? join(root, fork.path)
-    const baseArgs = ["merge-base", fork.to, fork.from]
+    const baseArgs = ["merge-base", fork.mainPin, fork.recordedPin]
     const base = await run(git, store, baseArgs, timeoutMs)
-    const componentMerge = `git -C ${store} merge-tree --write-tree ${fork.to} ${fork.from}`
+    const componentMerge = `git -C ${store} merge-tree --write-tree ${fork.mainPin} ${fork.recordedPin}`
     if (base.code === 1) {
       return {
         failure: obviousDetail(
           "gitlink-off-main",
-          `Merge ${target} would change ${fork.path} to ${fork.from}, which shares no history with fetched submodule main ${fork.to}, so the component cannot be merged.`,
-          `git -C ${store} merge-base ${fork.to} ${fork.from}`,
+          `Merge ${target} would change ${fork.path} to ${fork.recordedPin}, which shares no history with fetched submodule main ${fork.mainPin}, so the component cannot be merged.`,
+          `git -C ${store} merge-base ${fork.mainPin} ${fork.recordedPin}`,
           `Rebuild ${fork.path}'s change on its configured submodule branch, then rerun the same git super merge command.`,
           "the submodule writer",
-          { paths: [fork.path], objectIds: [fork.from, fork.to] },
+          { paths: [fork.path], objectIds: [fork.recordedPin, fork.mainPin] },
         ),
       }
     }
@@ -2551,7 +2572,7 @@ async function composeForkedGitlinks(
         failure: composeUnavailable(
           root,
           [fork.path],
-          `find the merge base of ${fork.to} and ${fork.from}`,
+          `find the merge base of ${fork.mainPin} and ${fork.recordedPin}`,
           gitFailureText(store, baseArgs, base),
         ),
       }
@@ -2560,13 +2581,13 @@ async function composeForkedGitlinks(
     const origin = declared.get(fork.path)
     const stages = [
       { stage: 1, mode: "160000", oid: baseSha },
-      { stage: 2, mode: "160000", oid: fork.to },
-      { stage: 3, mode: "160000", oid: fork.from },
+      { stage: 2, mode: "160000", oid: fork.mainPin },
+      { stage: 3, mode: "160000", oid: fork.recordedPin },
     ]
     conflicts.push(origin === undefined ? { path: fork.path, stages } : { path: fork.path, origin, stages })
     merges.set(fork.path, componentMerge)
     described.push(
-      `Component ${fork.path}: pin ${fork.from} forks from submodule main ${fork.to} at ${baseSha} (${componentMerge}).`,
+      `Component ${fork.path}: pin ${fork.recordedPin} forks from submodule main ${fork.mainPin} at ${baseSha} (${componentMerge}).`,
     )
   }
   return composeGitlinks(
@@ -3271,7 +3292,13 @@ async function planGitlinks(
     for (const entry of entries) {
       const path = nested ? `${prefix}/${entry.path}` : entry.path
       if (!nested && isSubmoduleExcluded(path, excludedSubmodules)) {
-        plans.push({ path, from: entry.target, to: entry.target, state: "as-written", changedByMerge: false })
+        plans.push({
+          path,
+          recordedPin: entry.target,
+          mainPin: entry.target,
+          state: "as-written",
+          changedByMerge: false,
+        })
         continue
       }
       const submodule = nested
@@ -3299,7 +3326,7 @@ async function planGitlinks(
       if (!sameHostedOwner(rootRemote, entry.url)) {
         if (changedByMerge) settleCheckout(entry.target)
         recordDescent("as-written")
-        plans.push({ path, from: entry.target, to: entry.target, state: "as-written", changedByMerge })
+        plans.push({ path, recordedPin: entry.target, mainPin: entry.target, state: "as-written", changedByMerge })
         continue
       }
       // The superproject is the PARENT, not the root: `submodule.<name>.branch`
@@ -3398,8 +3425,8 @@ async function planGitlinks(
           settleCheckout(main)
           plans.push({
             path,
-            from: entry.target,
-            to: main,
+            recordedPin: entry.target,
+            mainPin: main,
             state: "raised",
             changedByMerge,
             ...(read.store === undefined ? {} : { store: read.store }),
@@ -3410,8 +3437,8 @@ async function planGitlinks(
         recordDescent("kept-behind")
         plans.push({
           path,
-          from: entry.target,
-          to: main,
+          recordedPin: entry.target,
+          mainPin: main,
           state: "kept-behind",
           changedByMerge,
           ...(read.store === undefined ? {} : { store: read.store }),
@@ -3434,8 +3461,8 @@ async function planGitlinks(
         recordDescent(state)
         plans.push({
           path,
-          from: entry.target,
-          to: main,
+          recordedPin: entry.target,
+          mainPin: main,
           state,
           changedByMerge,
           ...(read.store === undefined ? {} : { store: read.store }),

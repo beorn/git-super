@@ -913,7 +913,15 @@ describe("Phase 1 read commands", () => {
             partial: false,
             repositories: [],
             gitlinks: input.excludedSubmodules?.length
-              ? [{ path: "packages/alpha", from: "a".repeat(40), to: "a".repeat(40), state: "as-written" as const }]
+              ? [
+                  {
+                    path: "packages/alpha",
+                    recordedPin: "a".repeat(40),
+                    mainPin: "a".repeat(40),
+                    landingPin: "a".repeat(40),
+                    state: "as-written" as const,
+                  },
+                ]
               : [],
             ...(input.excludedSubmodules?.length
               ? {

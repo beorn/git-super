@@ -1214,7 +1214,7 @@ describe("git super merge", () => {
     const result = await superMerge({ repo: fixture.product, commit: candidate })
     expect(result).toMatchObject({
       state: "updated",
-      gitlinks: [expect.objectContaining({ path: "packages/alpha", to: stable, state: "raised" })],
+      gitlinks: [expect.objectContaining({ path: "packages/alpha", landingPin: stable, state: "raised" })],
     })
     expect(git(fixture.product, "rev-parse", "HEAD:packages/alpha")).toBe(stable)
     expect(git(fixture.alpha, "rev-parse", "main")).toBe(fixture.alphaBase)
@@ -2198,7 +2198,15 @@ describe("git super merge", () => {
         paths: ["packages/alpha"],
         next: expect.stringContaining("Inspect the preserved root merge"),
       },
-      gitlinks: [{ path: "packages/alpha", from: fixture.alphaBase, to: newestAlpha, state: "raised" }],
+      gitlinks: [
+        {
+          path: "packages/alpha",
+          recordedPin: fixture.alphaBase,
+          mainPin: newestAlpha,
+          landingPin: newestAlpha,
+          state: "raised",
+        },
+      ],
       checkouts: [
         {
           path: "packages/alpha",
@@ -3858,8 +3866,9 @@ describe("git super merge", () => {
       gitlinks: [
         {
           path: "packages/alpha",
-          from: fixture.alphaBase,
-          to: newestAlpha,
+          recordedPin: fixture.alphaBase,
+          mainPin: newestAlpha,
+          landingPin: newestAlpha,
           state: "raised",
         },
       ],
@@ -4035,6 +4044,24 @@ function raiseNestedPinOnAlphaMain(fixture: NestedProductFixture, leafContent: s
   return raised
 }
 
+/**
+ * The gitlink the merge ACTUALLY WROTE for `fullPath` at `HEAD`, as a `mode oid` pair. A nested path is not in the
+ * root tree, so the walk descends through each enclosing submodule gitlink and reads the parent's own store -- the
+ * only place that pin is recorded. This is what makes a row's `landingPin` checkable rather than self-declared.
+ */
+function recordedGitlink(root: string, fullPath: string): string {
+  const parts = fullPath.split("/")
+  let repo = root
+  let treeish = "HEAD"
+  for (const [index, name] of parts.entries()) {
+    const [mode = "", , oid = ""] = git(repo, "ls-tree", treeish, name).split(/\s+/)
+    if (index === parts.length - 1) return `${mode} ${oid}`
+    if (mode === "160000") repo = join(root, ...parts.slice(0, index + 1))
+    treeish = oid
+  }
+  return ""
+}
+
 describe("git super merge — the nested gitlink chain (24454 row 4)", () => {
   it("walks into an Ahead parent and classifies its nested pin against the nested main", async () => {
     const root = mkdtempSync(join(tmpdir(), "git-super-merge-nested-"))
@@ -4042,6 +4069,14 @@ describe("git super merge — the nested gitlink chain (24454 row 4)", () => {
     const fixture = createNestedProductFixture(root)
     const moved = advanceNestedThroughAlpha(fixture, "candidate-nested", "export const leaf = 3\n")
     const result = await superMerge({ repo: fixture.product, commit: moved.candidate })
+
+    // EVERY ROW NAMES WHAT IT HOLDS (@cto 2026-10-13, 28892): `recordedPin` is the pin the target recorded,
+    // `mainPin` the component main, and `landingPin` the pin this merge WRITES -- `recordedPin` again whenever it
+    // leaves the pin where it stands (kept-ahead, kept-behind, left-off-main, as-written), the component main for a
+    // raise, the composed commit for `merged`. Checked against the tree the merge actually wrote.
+    for (const row of result.gitlinks) {
+      expect(recordedGitlink(fixture.product, row.path)).toBe(`160000 ${row.landingPin}`)
+    }
 
     // DEPTH 2 MUST APPEAR AT ALL. Before this row the planner stopped at depth 1
     // and this array held only `packages/alpha` and `vendor/beta`.
@@ -4052,11 +4087,12 @@ describe("git super merge — the nested gitlink chain (24454 row 4)", () => {
     expect(result).toMatchObject({
       state: "updated",
       gitlinks: expect.arrayContaining([
-        expect.objectContaining({ path: "packages/alpha", from: moved.alphaHead, state: "kept-ahead" }),
+        expect.objectContaining({ path: "packages/alpha", recordedPin: moved.alphaHead, state: "kept-ahead" }),
+        expect.objectContaining({ path: "packages/alpha", landingPin: moved.alphaHead, state: "kept-ahead" }),
         expect.objectContaining({
           path: "packages/alpha/apps/maddoc",
-          from: moved.leafHead,
-          to: fixture.leafBase,
+          recordedPin: moved.leafHead,
+          mainPin: fixture.leafBase,
           state: "kept-ahead",
         }),
       ]),
@@ -4128,12 +4164,18 @@ describe("git super merge — the nested gitlink chain (24454 row 4)", () => {
       expect.arrayContaining([
         expect.objectContaining({
           path: "packages/alpha/apps/maddoc",
-          from: fixture.leafBase,
-          to: newerLeaf,
+          recordedPin: fixture.leafBase,
+          mainPin: newerLeaf,
           state: "kept-behind",
         }),
+        expect.objectContaining({ path: "packages/alpha/apps/maddoc", landingPin: fixture.leafBase }),
       ]),
     )
+    // EVERY row lands the pin it names: checked against the tree the merge wrote, descending into alpha's own store
+    // for the nested pin, which is where that pin is actually recorded.
+    for (const row of result.gitlinks) {
+      expect(recordedGitlink(fixture.product, row.path)).toBe(`160000 ${row.landingPin}`)
+    }
     // The descent journal records this rung too (@cto, 24454 row-1 review). This
     // arm is the one worth pinning of the three non-Equal journal lines, because
     // it runs a lowering refusal BEFORE recording -- so the assertion also proves
@@ -4344,7 +4386,7 @@ describe("git super merge — the nested gitlink chain (24454 row 4)", () => {
     expect(result.state).toBe("updated")
     expect(result.gitlinks).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ path: "packages/alpha/apps/maddoc", to: stable, state: "kept-ahead" }),
+        expect.objectContaining({ path: "packages/alpha/apps/maddoc", mainPin: stable, state: "kept-ahead" }),
       ]),
     )
   })
@@ -4550,8 +4592,8 @@ describe("git super merge — a diverged gitlink the merge composes", () => {
 
     expect(result).toMatchObject({ state: "updated", partial: false })
     const settled = result.gitlinks.find((row) => row.path === "packages/alpha")
-    expect(settled).toMatchObject({ path: "packages/alpha", state: "merged", to: pins.ours })
-    const composed = settled?.from ?? ""
+    expect(settled).toMatchObject({ path: "packages/alpha", state: "merged", mainPin: pins.ours })
+    const composed = settled?.recordedPin ?? ""
     expect(composed).toMatch(/^[0-9a-f]{40}$/u)
     // (a) the component main tip is the FIRST parent and the pin the second.
     expect(git(submodule, "cat-file", "-p", composed).split("\n").slice(1, 3)).toEqual([
@@ -4595,8 +4637,8 @@ describe("git super merge — a diverged gitlink the merge composes", () => {
 
     expect(result).toMatchObject({ state: "updated", partial: false })
     const settled = result.gitlinks.find((row) => row.path === "packages/alpha")
-    expect(settled).toMatchObject({ path: "packages/alpha", state: "merged", to: pins.ours })
-    const composed = settled?.from ?? ""
+    expect(settled).toMatchObject({ path: "packages/alpha", state: "merged", mainPin: pins.ours })
+    const composed = settled?.recordedPin ?? ""
     expect(git(submodule, "cat-file", "-t", composed)).toBe("commit")
     expect(git(fixture.product, "ls-tree", "HEAD", "--", "packages/alpha")).toBe(
       `160000 commit ${composed}\tpackages/alpha`,
@@ -4641,7 +4683,7 @@ describe("git super merge — a diverged gitlink the merge composes", () => {
     expect(result).toMatchObject({ state: "updated", partial: false })
     const settled = result.gitlinks.find((row) => row.path === "packages/alpha")
     expect(settled).toMatchObject({ path: "packages/alpha", state: "merged" })
-    const composed = settled?.from ?? ""
+    const composed = settled?.recordedPin ?? ""
     expect(git(fixture.product, "ls-tree", "HEAD", "--", "packages/alpha")).toBe(
       `160000 commit ${composed}\tpackages/alpha`,
     )
@@ -4705,7 +4747,7 @@ describe("git super merge — a diverged gitlink the merge composes", () => {
     expect(result).toMatchObject({ state: "updated", partial: false })
     const settled = result.gitlinks.find((row) => row.path === "packages/alpha")
     expect(settled).toMatchObject({ path: "packages/alpha", state: "merged" })
-    const composed = settled?.from ?? ""
+    const composed = settled?.recordedPin ?? ""
     expect(git(fixture.alpha, "rev-parse", `${composed}^1`, `${composed}^2`)).toBe(`${ours}\n${theirs}`)
     expect(git(fixture.alpha, "show", `${composed}:shared.ts`)).toBe(
       ["MAIN", ...lines.slice(1, 6), "CHANGE"].join("\n"),
@@ -4772,7 +4814,7 @@ describe("git super merge — a diverged gitlink the merge composes", () => {
     const result = await superMerge({ repo: fixture.product, commit: candidate })
 
     expect(result).toMatchObject({ state: "updated", partial: false })
-    const composed = result.gitlinks.find((row) => row.path === "packages/alpha")?.from ?? ""
+    const composed = result.gitlinks.find((row) => row.path === "packages/alpha")?.recordedPin ?? ""
     expect(git(fixture.alpha, "rev-parse", `${composed}^1`, `${composed}^2`)).toBe(`${ours}\n${theirs}`)
     expect(git(fixture.alpha, "show", `${composed}:renamed.ts`)).toBe("export const alpha = 'change'")
     expect(git(fixture.alpha, "ls-tree", "--name-only", composed, "--", "alpha.ts")).toBe("")
@@ -4890,8 +4932,8 @@ describe("git super merge — a diverged gitlink the merge composes", () => {
 
     expect(result).toMatchObject({ state: "updated", partial: false })
     const settled = result.gitlinks.find((row) => row.path === "packages/alpha")
-    expect(settled).toMatchObject({ path: "packages/alpha", state: "merged", to: ours })
-    const composed = settled?.from ?? ""
+    expect(settled).toMatchObject({ path: "packages/alpha", state: "merged", mainPin: ours })
+    const composed = settled?.recordedPin ?? ""
     expect(composed).toMatch(/^[0-9a-f]{40}$/u)
     expect(git(submodule, "cat-file", "-e", `${composed}^{commit}`)).toBe("")
     expect(git(submodule, "cat-file", "-e", `${theirs}^{commit}`)).toBe("")
@@ -4992,8 +5034,8 @@ describe("git super merge — a one-sided fork the merge composes (25389)", () =
 
     expect(result).toMatchObject({ state: "updated", partial: false })
     const settled = result.gitlinks.find((row) => row.path === "packages/alpha")
-    expect(settled).toMatchObject({ state: "merged", to: fork.main })
-    const composed = settled?.from ?? ""
+    expect(settled).toMatchObject({ state: "merged", mainPin: fork.main })
+    const composed = settled?.recordedPin ?? ""
     expect(composed).toMatch(/^[0-9a-f]{40}$/u)
     // The component main is the FIRST parent and the pin the second, as in the two-sided composition.
     expect(git(join(fixture.product, "packages/alpha"), "cat-file", "-p", composed).split("\n").slice(1, 3)).toEqual([
@@ -5095,11 +5137,11 @@ describe("git super merge — a one-sided fork the merge composes (25389)", () =
       const settled = result.gitlinks.find((row) => row.path === fork.path)
       expect(settled, fork.path).toMatchObject({
         state: "merged",
-        to: fork.main,
+        mainPin: fork.main,
         composition: { base: fork.base, parent: fork.main, pin: fork.theirs },
       })
       expect(git(fixture.product, "ls-tree", "HEAD", "--", fork.path)).toBe(
-        `160000 commit ${settled?.from ?? ""}\t${fork.path}`,
+        `160000 commit ${settled?.recordedPin ?? ""}\t${fork.path}`,
       )
     }
     expect(retainedPins(fixture.alpha)).toHaveLength(1)
@@ -5143,7 +5185,7 @@ describe("git super merge — a one-sided fork the merge composes (25389)", () =
       composition: { base: beta.base, parent: beta.main, pin: beta.theirs },
     })
     expect(git(fixture.product, "ls-tree", "HEAD", "--", "vendor/beta")).toBe(
-      `160000 commit ${betaRow?.from ?? ""}\tvendor/beta`,
+      `160000 commit ${betaRow?.recordedPin ?? ""}\tvendor/beta`,
     )
     expect(git(fixture.product, "status", "--porcelain=v1")).toBe("")
   })
@@ -6048,7 +6090,7 @@ describe("git super merge — each phase reports how long it took (25303 tier 2)
 
     expect(result).toMatchObject({
       state: "updated",
-      gitlinks: [expect.objectContaining({ path: "packages/alpha", to: newestAlpha, state: "raised" })],
+      gitlinks: [expect.objectContaining({ path: "packages/alpha", landingPin: newestAlpha, state: "raised" })],
     })
     expect(edges).toEqual([
       "rev-parse --show-toplevel",

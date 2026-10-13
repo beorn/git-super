@@ -1070,10 +1070,10 @@ async function writeResult(
       }
       stderr.write(
         gitlink.state === "raised"
-          ? `${gitlink.path} ${gitlink.from.slice(0, 7)} -> ${gitlink.to.slice(0, 7)} (submodule main)\n`
+          ? `${gitlink.path} ${gitlink.recordedPin.slice(0, 7)} -> ${gitlink.landingPin.slice(0, 7)} (submodule main)\n`
           : gitlink.state === "left-off-main"
-            ? `left-off-main ${gitlink.path} ${gitlink.from} (submodule main ${gitlink.to})\n`
-            : `not-run ${gitlink.path} ${gitlink.from} -> ${gitlink.to} (submodule main)\n`,
+            ? `left-off-main ${gitlink.path} ${gitlink.recordedPin} (submodule main ${gitlink.mainPin})\n`
+            : `not-run ${gitlink.path} ${gitlink.recordedPin} -> ${gitlink.landingPin} (submodule main)\n`,
       )
     }
     if (merge.partial) {
