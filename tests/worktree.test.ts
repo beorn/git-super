@@ -1828,74 +1828,96 @@ describe("createGitWorktreeStore", () => {
    * @testonly none
    */
   it.each([
-    { failure: "preparation", restoreFails: false },
-    { failure: "preparation", restoreFails: true },
-    { failure: "removal", restoreFails: false },
-    { failure: "removal", restoreFails: true },
-  ])("preserves contents after $failure failure (restoreFails=$restoreFails)", async ({ failure, restoreFails }) => {
-    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-removal-recovery-"))
-    const fs = await import("node:fs")
-    const originalCopy = fs.copyFileSync
-    const originalRename = fs.renameSync
-    let stagingPath: string | undefined
-    try {
-      const repo = join(root, "repo")
-      createRepository(repo, "root.txt", "root\n")
-      const target = join(root, "target")
-      const baseProcess = createLocalGitProcess()
-      const store = createGitWorktreeStore({
-        repo,
-        gitProcess: {
-          run: async (request) => {
-            if (failure === "removal" && request.args.includes("worktree") && request.args.includes("remove")) {
-              return { code: 1, stdout: "", stderr: "injected removal failure" }
-            }
-            return baseProcess.run(request)
-          },
-        },
-      })
-      await store.add({ kind: "detached", path: target, ref: "HEAD" })
-      // Untracked contents must survive too, not only the committed fixture.
-      await writeFile(join(target, "uncommitted.txt"), "unique work\n")
-      const renameSpy = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
-        if (String(from) === target) stagingPath = String(to)
-        if (restoreFails && String(from) === stagingPath && String(to) === target) {
-          throw new Error("injected restoration failure")
-        }
-        return originalRename(from, to)
-      })
-      const copySpy = vi.spyOn(fs, "copyFileSync").mockImplementation((from, to, mode) => {
-        if (failure === "preparation" && String(to) === join(target, ".git")) {
-          throw new Error("injected preparation failure")
-        }
-        return originalCopy(from, to, mode)
-      })
-      let error: unknown
+    { failure: "preparation", restoreFails: false, markerFails: false },
+    { failure: "preparation", restoreFails: true, markerFails: false },
+    { failure: "removal", restoreFails: false, markerFails: false },
+    { failure: "removal", restoreFails: true, markerFails: false },
+    { failure: "removal", restoreFails: true, markerFails: true },
+  ])(
+    "preserves contents after $failure failure (restoreFails=$restoreFails)",
+    async ({ failure, restoreFails, markerFails }) => {
+      const root = await mkdtemp(join(canonicalTmpdir(), "git-super-removal-recovery-"))
+      const fs = await import("node:fs")
+      const originalCopy = fs.copyFileSync
+      const originalRename = fs.renameSync
+      let stagingPath: string | undefined
       try {
-        await store.remove(target)
-      } catch (caught) {
-        error = caught
+        const repo = join(root, "repo")
+        createRepository(repo, "root.txt", "root\n")
+        const target = join(root, "target")
+        const baseProcess = createLocalGitProcess()
+        const store = createGitWorktreeStore({
+          repo,
+          gitProcess: {
+            run: async (request) => {
+              if (failure === "removal" && request.args.includes("worktree") && request.args.includes("remove")) {
+                return { code: 1, stdout: "", stderr: "injected removal failure" }
+              }
+              return baseProcess.run(request)
+            },
+          },
+        })
+        await store.add({ kind: "detached", path: target, ref: "HEAD" })
+        // Untracked contents must survive too, not only the committed fixture.
+        await writeFile(join(target, "uncommitted.txt"), "unique work\n")
+        const renameSpy = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+          if (String(from) === target) stagingPath = String(to)
+          if (restoreFails && String(from) === stagingPath && String(to) === target) {
+            throw new Error("injected restoration failure")
+          }
+          return originalRename(from, to)
+        })
+        const copySpy = vi.spyOn(fs, "copyFileSync").mockImplementation((from, to, mode) => {
+          if (failure === "preparation" && String(to) === join(target, ".git")) {
+            throw new Error("injected preparation failure")
+          }
+          return originalCopy(from, to, mode)
+        })
+        const originalWrite = fs.writeFileSync
+        const writeSpy = vi.spyOn(fs, "writeFileSync").mockImplementation((file, data, options) => {
+          if (markerFails && String(file).endsWith(".restore-failed")) {
+            throw new Error("injected marker write failure")
+          }
+          return originalWrite(file, data, options)
+        })
+        let error: unknown
+        try {
+          await store.remove(target)
+        } catch (caught) {
+          error = caught
+        } finally {
+          copySpy.mockRestore()
+          renameSpy.mockRestore()
+          writeSpy.mockRestore()
+        }
+        expect(error).toBeInstanceOf(Error)
+        expect((error as Error).message).toContain(`injected ${failure} failure`)
+        const retained = restoreFails ? stagingPath : target
+        expect(retained).toBeDefined()
+        expect(await readFile(join(retained!, "root.txt"), "utf8")).toBe("root\n")
+        expect(await readFile(join(retained!, "uncommitted.txt"), "utf8")).toBe("unique work\n")
+        if (restoreFails) {
+          expect((error as Error).message).toContain(stagingPath!)
+          expect((error as Error).message).toContain("injected restoration failure")
+          if (markerFails) {
+            // The one error the caller holds must say the record is unmarked (#28906 SHOULD).
+            expect((error as Error).message).toMatch(/UNMARKED/)
+            expect((error as Error).message).toContain("injected marker write failure")
+          } else {
+            // The retained staging directory must carry the recovery marker so the clean-root
+            // sweep preserves it even after the admin entry is pruned (#28800 / #28906).
+            expect(existsSync(join(stagingPath!, ".restore-failed"))).toBe(true)
+            expect(readFileSync(join(stagingPath!, ".restore-failed"), "utf8")).toContain(target)
+          }
+        } else {
+          expect(existsSync(stagingPath!)).toBe(false)
+          expect(git(target, ["rev-parse", "--is-inside-work-tree"]).trim()).toBe("true")
+        }
       } finally {
-        copySpy.mockRestore()
-        renameSpy.mockRestore()
+        await rm(root, { recursive: true, force: true })
       }
-      expect(error).toBeInstanceOf(Error)
-      expect((error as Error).message).toContain(`injected ${failure} failure`)
-      const retained = restoreFails ? stagingPath : target
-      expect(retained).toBeDefined()
-      expect(await readFile(join(retained!, "root.txt"), "utf8")).toBe("root\n")
-      expect(await readFile(join(retained!, "uncommitted.txt"), "utf8")).toBe("unique work\n")
-      if (restoreFails) {
-        expect((error as Error).message).toContain(stagingPath!)
-        expect((error as Error).message).toContain("injected restoration failure")
-      } else {
-        expect(existsSync(stagingPath!)).toBe(false)
-        expect(git(target, ["rev-parse", "--is-inside-work-tree"]).trim()).toBe("true")
-      }
-    } finally {
-      await rm(root, { recursive: true, force: true })
-    }
-  })
+    },
+  )
 
   /**
    * @failure Worktree removal holds the mutation lock through bulk filesystem deletion (#27551).
