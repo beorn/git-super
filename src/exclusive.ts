@@ -73,7 +73,7 @@ export async function acquireExclusive(
     const now = Date.now()
     if (!contended) {
       contended = true
-      const held = describeHolder(path, now)
+      const held = describeRecordedLockHolder(path, now)
       options.onContended?.(`${held.holder} (${held.owner}, age ${held.age})`)
     }
     if (now >= deadline) throw busy(path, now, now - startedAt, timeoutMs, holder)
@@ -82,7 +82,7 @@ export async function acquireExclusive(
 }
 
 function busy(path: string, now: number, waitedMs: number, timeoutMs: number, contender?: string): Error {
-  const { owner, holder, age } = describeHolder(path, now)
+  const { owner, holder, age } = describeRecordedLockHolder(path, now)
   return new Error(
     `git-super: worktree mutation lock is busy after ${waitedMs}ms ` +
       `(timeout=${timeoutMs}ms; holder=${holder}; age=${age}; owner=${owner}; contender=pid:${process.pid}` +
@@ -90,8 +90,15 @@ function busy(path: string, now: number, waitedMs: number, timeoutMs: number, co
   )
 }
 
-/** Who the lock file says holds the lock; diagnostic only, never lock authority. */
-function describeHolder(path: string, now: number): Readonly<{ owner: string; holder: string; age: string }> {
+/**
+ * The holder RECORDED in the lock body — the last writer to name itself there, not live lock ownership. Diagnostic
+ * only, never lock authority. Exported as the one owner parser so a contention report elsewhere reads the format its
+ * writer owns (@hab/28846).
+ */
+export function describeRecordedLockHolder(
+  path: string,
+  now: number,
+): Readonly<{ owner: string; holder: string; age: string }> {
   let owner = "another process"
   let holder = "unknown operation"
   let age = "unknown"
