@@ -2,6 +2,7 @@ import { join } from "node:path"
 import type { ConsultedRepository, NotCompared } from "./diff.ts"
 import {
   gitError,
+  inspectUninitializedCheckout,
   isSubmoduleExcluded,
   probeRepository,
   repositoryRoot,
@@ -114,8 +115,20 @@ export function superIsAncestor(options: SuperIsAncestorOptions): SuperIsAncesto
       notCompared.push({ path: gitlink.path, reason: "excluded", message: "component excluded, not compared" })
       continue
     }
+    const child = join(root, gitlink.path)
+    const checkout = inspectUninitializedCheckout(child)
+    if (checkout === "absent" || checkout === "empty") {
+      // An uninitialized checkout holds no local work, so it can own nothing: name the
+      // absence and keep the verdict of the repositories that WERE consulted.
+      notCompared.push({
+        path: gitlink.path,
+        reason: "absent",
+        message: "not checked out here: no local work",
+        objectIds: [gitlink.pin],
+      })
+      continue
+    }
     try {
-      const child = join(root, gitlink.path)
       const nestedRoot = repositoryRoot(child)
       if (probeRepository(nestedRoot, runGit(child, ["rev-parse", "--show-prefix"])).kind === "absent") {
         throw new Error(`not initialized; initialize ${gitlink.path} before searching its commit ownership`)
@@ -148,7 +161,14 @@ export function superIsAncestor(options: SuperIsAncestorOptions): SuperIsAncesto
       ? " — the object IS in the superproject's store but no ref reaches it, so the superproject does not own it either;" +
         " run the comparison inside the repository the commit belongs to (git -C <submodule>)"
       : ""
-    throw new Error(`git super: no consulted repository owns commit ${spelled}${orphaned}`)
+    // "Unknown because not checked out here" must stay distinguishable from "unknown
+    // because nobody has it", so the absent components are named as the ancestry-unknown
+    // error names its unreadable ones.
+    const absentLines = notCompared
+      .filter(({ reason }) => reason === "absent")
+      .map(({ path, message }) => `${path}: ${message}`)
+    const absent = absentLines.length === 0 ? "" : `\n${absentLines.join("\n")}`
+    throw new Error(`git super: no consulted repository owns commit ${spelled}${orphaned}${absent}`)
   }
   if (owners.length > 1) {
     // Named, never silently preferred. Picking one here is how the wrong

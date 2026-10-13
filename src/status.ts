@@ -1,10 +1,11 @@
-import { lstatSync, readFileSync, readdirSync, statSync } from "node:fs"
+import { lstatSync, readFileSync, statSync } from "node:fs"
 import { isAbsolute, join, posix, resolve } from "node:path"
 import { recursiveNameStatusDiff, type ConsultedRepository, type NotCompared } from "./diff.ts"
 export type { ConsultedRepository } from "./diff.ts"
 import {
   gitError,
   indexGitlinks,
+  inspectUninitializedCheckout,
   isSubmoduleExcluded,
   probeRepository,
   repositoryRoot,
@@ -14,17 +15,6 @@ import {
 } from "./git.ts"
 
 export type SuperStatusOptions = Readonly<{ repo: string; indexFile?: string; excludedSubmodules?: readonly string[] }>
-
-/** Checkout metadata only: never follow a symlink or read a Git pointer/store. */
-export function inspectUninitializedCheckout(
-  path: string,
-): "absent" | "empty" | "nonempty" | "symlink" | "non-directory" {
-  const state = lstatSync(path, { throwIfNoEntry: false })
-  if (state === undefined) return "absent"
-  if (state.isSymbolicLink()) return "symlink"
-  if (!state.isDirectory()) return "non-directory"
-  return readdirSync(path).length === 0 ? "empty" : "nonempty"
-}
 
 /** Inspect selected checkout metadata without following an ancestor or reading Git pointer/store bytes. */
 export function inspectExcludedCheckout(root: string, path: string) {

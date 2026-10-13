@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process"
 import { AsyncLocalStorage } from "node:async_hooks"
-import { accessSync, constants, statSync } from "node:fs"
+import { accessSync, constants, lstatSync, readdirSync, statSync } from "node:fs"
 import { delimiter, isAbsolute } from "node:path"
 import { parseIndexEntries } from "./index-entries.ts"
 
@@ -199,6 +199,17 @@ export function runGit(cwd: string, args: readonly string[], indexFile?: string)
 
 export function repositoryRoot(path: string): string {
   return runGit(path, ["rev-parse", "--show-toplevel"]).trim()
+}
+
+/** Checkout metadata only: never follow a symlink or read a Git pointer/store. */
+export function inspectUninitializedCheckout(
+  path: string,
+): "absent" | "empty" | "nonempty" | "symlink" | "non-directory" {
+  const state = lstatSync(path, { throwIfNoEntry: false })
+  if (state === undefined) return "absent"
+  if (state.isSymbolicLink()) return "symlink"
+  if (!state.isDirectory()) return "non-directory"
+  return readdirSync(path).length === 0 ? "empty" : "nonempty"
 }
 
 /** Classify successful Git discovery answers, shared by synchronous and asynchronous callers.
