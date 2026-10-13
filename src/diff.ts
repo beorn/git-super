@@ -92,7 +92,7 @@ export type SuperDiffResult = Readonly<{
 /** An explicit omission from a comparison, never evidence that a component is clean. */
 export type NotCompared = Readonly<{
   path: string
-  reason: "removed" | "excluded" | "unreadable" | "inconsistent"
+  reason: "absent" | "removed" | "excluded" | "unreadable" | "inconsistent"
   message: string
   objectIds?: readonly string[]
   remedy?: string

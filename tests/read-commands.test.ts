@@ -21,7 +21,7 @@ import { join } from "node:path"
 import { flattenCommandNodes, resolveInvocation } from "@silvery/command"
 import { commands } from "../src/commands.ts"
 import { runCli } from "../src/cli.ts"
-import { superIsAncestor } from "../src/merge-base.ts"
+import { superIsAncestor, type SuperIsAncestorResult } from "../src/merge-base.ts"
 import { superStatus, type SuperStatusResult } from "../src/status.ts"
 import {
   addNestedAlphaSubmodule,
@@ -115,16 +115,68 @@ describe("Phase 1 read commands", () => {
   })
 
   /**
-   * @failure Discovery from empty child directories invents a parent owner instead of unknown ancestry (#27058).
+   * @failure An absent component checkout poisons the whole ancestry answer with exit 2 (#27006).
    * @level l1
-   * @consumer git super merge-base --is-ancestor
+   * @consumer worktree-cleanup ancestry reader; git super merge-base --is-ancestor
    * @testonly none
    */
-  test("ancestry refuses every uninitialized searched component without inventing parent owners", async () => {
-    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-empty-ancestry-"))
+  test.each(["empty", "missing"] as const)(
+    "ancestry names a %s component checkout as absent and keeps the root result",
+    async (shape) => {
+      const root = mkdtempSync(join(canonicalTmpdir(), "git-super-absent-ancestry-"))
+      roots.push(root)
+      const fixture = createProductFixture(root)
+      git(fixture.product, "submodule", "deinit", "-f", "--all")
+      if (shape === "missing") {
+        fileSystem.rmdirSync(join(fixture.product, "packages/alpha"))
+        fileSystem.rmdirSync(join(fixture.product, "vendor/beta"))
+      }
+      const stdout = outputSink()
+      const stderr = outputSink()
+      expect(
+        await runCli(
+          ["--repo", fixture.product, "--json", "merge-base", "--is-ancestor", fixture.productBase, "HEAD"],
+          stdout,
+          stderr,
+        ),
+      ).toBe(0)
+      const result = JSON.parse(stdout.output) as SuperIsAncestorResult
+      expect(result.isAncestor).toBe(true)
+      expect(result.owningRepository).toBe(".")
+      expect(result.notCompared).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            path: "packages/alpha",
+            reason: "absent",
+            message: "not checked out here: no local work",
+            objectIds: [fixture.alphaBase],
+          }),
+          expect.objectContaining({
+            path: "vendor/beta",
+            reason: "absent",
+            message: "not checked out here: no local work",
+            objectIds: [fixture.betaBase],
+          }),
+        ]),
+      )
+      expect(stderr.output).toContain("packages/alpha: not checked out here: no local work")
+      expect(stderr.output).toContain("vendor/beta: not checked out here: no local work")
+    },
+  )
+
+  /**
+   * @failure A populated component is skipped as absent, so its local content is never consulted (#27006 AC4).
+   * @level l1
+   * @consumer worktree-cleanup ancestry reader
+   * @testonly none
+   */
+  test("a populated component is never skipped as absent", async () => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-absent-populated-"))
     roots.push(root)
     const fixture = createProductFixture(root)
-    git(fixture.product, "submodule", "deinit", "-f", "--all")
+    git(fixture.product, "submodule", "deinit", "-f", "vendor/beta")
+    // The deinit'd directory is empty and holds no repository of its own; a stray file makes it populated.
+    writeFileSync(join(fixture.product, "vendor/beta/stray.txt"), "local work\n")
     const stdout = outputSink()
     const stderr = outputSink()
     expect(
@@ -134,10 +186,35 @@ describe("Phase 1 read commands", () => {
         stderr,
       ),
     ).toBe(2)
-    expect(stdout.output).toBe("")
     expect(stderr.output).toContain("ancestry unknown")
-    expect(stderr.output).toContain("packages/alpha")
     expect(stderr.output).toContain("vendor/beta")
+    expect(stderr.output).toContain("not initialized")
+  })
+
+  /**
+   * @failure An absent checkout credits the walked-up parent instead of naming the absence (#27058, #27006 M1).
+   * @level l1
+   * @consumer worktree-cleanup ancestry reader
+   * @testonly none
+   */
+  test("an absent checkout never invents a parent owner and is named when nobody owns the commit", async () => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-absent-ownerless-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    git(fixture.product, "submodule", "deinit", "-f", "--all")
+    const stdout = outputSink()
+    const stderr = outputSink()
+    // alphaBase lives only in the component; the product's own refs never reach it.
+    expect(
+      await runCli(
+        ["--repo", fixture.product, "--json", "merge-base", "--is-ancestor", fixture.alphaBase, "HEAD"],
+        stdout,
+        stderr,
+      ),
+    ).toBe(2)
+    expect(stdout.output).toBe("")
+    expect(stderr.output).toContain("no consulted repository owns commit")
+    expect(stderr.output).toContain("packages/alpha: not checked out here: no local work")
     expect(stderr.output).not.toContain("ambiguous")
   })
   // Gate A: existing extension calls use --repo/--json and formatted results.
