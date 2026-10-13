@@ -1888,6 +1888,10 @@ describe("createGitWorktreeStore", () => {
       if (restoreFails) {
         expect((error as Error).message).toContain(stagingPath!)
         expect((error as Error).message).toContain("injected restoration failure")
+        // The retained staging directory must carry the recovery marker so the clean-root
+        // sweep preserves it even after the admin entry is pruned (#28800 / #28906).
+        expect(existsSync(join(stagingPath!, ".restore-failed"))).toBe(true)
+        expect(readFileSync(join(stagingPath!, ".restore-failed"), "utf8")).toContain(target)
       } else {
         expect(existsSync(stagingPath!)).toBe(false)
         expect(git(target, ["rev-parse", "--is-inside-work-tree"]).trim()).toBe("true")

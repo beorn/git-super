@@ -8,6 +8,7 @@ import {
   rmdirSync,
   rmSync,
   statSync,
+  writeFileSync,
 } from "node:fs"
 import { randomUUID } from "node:crypto"
 import { spawnSync } from "node:child_process"
@@ -615,6 +616,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
           }
         } catch (error) {
           if (stagingPath !== undefined && existsSync(stagingPath)) {
+            const retainedStaging = stagingPath
             try {
               if (existsSync(resolvedPath)) {
                 // Only remove our Git stub. Unexpected contents block restoration
@@ -625,9 +627,20 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
               renameSync(stagingPath, resolvedPath)
               stagingPath = undefined
             } catch (restoreError) {
+              // The staging directory survives as the recovery record. Mark it so the clean-root
+              // sweep preserves it even after the admin entry is pruned: the sweep keys on this
+              // marker (#28800), and an unmarked directory is reclaimed as ordinary leftover trash
+              // once quiescent and holder-free (#28906).
+              try {
+                writeFileSync(join(retainedStaging, ".restore-failed"), `restore-failed\ntarget ${resolvedPath}\n`)
+              } catch (markerError) {
+                console.warn(
+                  `git-super: failed to write restore-failed marker in '${retainedStaging}': ${markerError instanceof Error ? markerError.message : String(markerError)}`,
+                )
+              }
               throw writerLeases.refusal(
                 new Error(
-                  `worktree removal failed: ${error instanceof Error ? error.message : String(error)}; restoration to '${resolvedPath}' failed: ${restoreError instanceof Error ? restoreError.message : String(restoreError)}; contents retained at '${stagingPath}'`,
+                  `worktree removal failed: ${error instanceof Error ? error.message : String(error)}; restoration to '${resolvedPath}' failed: ${restoreError instanceof Error ? restoreError.message : String(restoreError)}; contents retained at '${retainedStaging}'`,
                   { cause: new AggregateError([error, restoreError], "worktree removal and restoration failed") },
                 ),
               )
