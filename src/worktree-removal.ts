@@ -27,7 +27,7 @@ import type { PrivateGitProjection } from "./private-git-projection.ts"
 import { alternatesLineage } from "./alternates.ts"
 import { validateExcludedSubmodules, withGitTimeout } from "./git.ts"
 import type { GitProcess } from "./process.ts"
-import type { NotCompared } from "./diff.ts"
+import type { ConsultedRepository, NotCompared } from "./diff.ts"
 import type { Git, WorktreeInspection } from "./worktree.ts"
 import { removalBorrowers, type RemovalBorrower } from "./worktree-administration.ts"
 
@@ -646,16 +646,65 @@ export function inspectRemovalStatus(
   return status
 }
 
+/** The consulted store that owns a status record: the deepest consulted prefix that contains it (29073). */
+function storeOwningRecord(record: string, consulted: readonly ConsultedRepository[]): ConsultedRepository | undefined {
+  const recordPath = record.slice(3)
+  let owner = consulted.find((candidate) => candidate.path === ".")
+  for (const candidate of consulted) {
+    if (candidate.path === ".") continue
+    if (recordPath !== candidate.path && !recordPath.startsWith(`${candidate.path}/`)) continue
+    if (owner === undefined || candidate.path.length > owner.path.length) owner = candidate
+  }
+  return owner
+}
+
+/**
+ * Admit one store's dirt ONLY against a preserved ref that resolves to a commit in that SAME store;
+ * otherwise refuse exactly as before (29073, @cto ruling 2026-10-13). The dirt gate exists to say
+ * "preserve before removal", so the acknowledgement is proof the preservation happened, never a
+ * bypass and never a rewrite. Existence and store are verified here; byte equality between the ref
+ * and the dirt is the caller's (yrd's) claim, because this gate builds no snapshot tree of a dirty
+ * store. A ref in the wrong store, or a missing ref, admits nothing.
+ */
+async function admitDirtyStore(
+  git: Git,
+  store: string,
+  records: readonly string[],
+  preserved: readonly string[],
+): Promise<void> {
+  if (records.length === 0) return
+  for (const ref of preserved) {
+    const resolved = await git.optionalText(store, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`])
+    if (resolved !== undefined && resolved !== "") return
+  }
+  throw new Error(
+    `worktree ${store} is dirty: ${records.join("; ")}; preserve its changes before removal, or admit them with ` +
+      `--preserved <ref> naming a ref that resolves to a commit in this store`,
+  )
+}
+
 /** The existing status walker owns repository discovery; every native status is exact, including gitlink changes. */
 async function cleanSnapshot(
   git: Git,
   path: string,
   inspect: (repository: string, path: string) => Promise<WorktreeInspection>,
   excludedSubmodules: readonly string[] = [],
+  preserved: readonly string[] = [],
 ): Promise<readonly Readonly<{ path: string; head: string }>[]> {
   const status = inspectRemovalStatus(path, excludedSubmodules)
-  if (status.records.length > 0) {
-    throw new Error(`worktree ${path} is dirty: ${status.records.join("; ")}; preserve its changes before removal`)
+  // 29073: attribute every dirty record to the consulted store that owns it (the deepest consulted
+  // prefix that contains it), then admit that store's dirt only with a preserved ref that resolves
+  // to a commit in THAT store. The root's own records are admitted against the root store, each
+  // component's against its own; a ref in the wrong store, or a missing ref, admits nothing.
+  const dirtyByStore = new Map<string, { store: string; records: string[] }>()
+  for (const record of status.records) {
+    const store = storeOwningRecord(record, status.consultedRepositories)?.root ?? path
+    const group = dirtyByStore.get(store) ?? { store, records: [] }
+    group.records.push(record)
+    dirtyByStore.set(store, group)
+  }
+  for (const group of dirtyByStore.values()) {
+    await admitDirtyStore(git, group.store, group.records, preserved)
   }
   const snapshot: { path: string; head: string }[] = []
   for (const entry of status.consultedRepositories) {
@@ -686,11 +735,6 @@ async function cleanSnapshot(
     if (checked.submoduleProblems.length > 0) {
       throw new Error(
         `worktree ${entry.root} has unknown submodule state: ${checked.submoduleProblems.map((problem) => `${problem.path}: ${problem.reason}`).join("; ")}; preserve and resolve it before removal`,
-      )
-    }
-    if (checked.records.length > 0) {
-      throw new Error(
-        `worktree ${entry.root} is dirty: ${checked.records.join("; ")}; preserve its changes before removal`,
       )
     }
     const head = await git.commit(entry.root, "HEAD")
@@ -1034,6 +1078,7 @@ export async function retainWorktreeModules(
   privateProjection?: PrivateGitProjection,
   onRetainedPath?: (path: string) => void,
   retirePrivate?: () => void,
+  preserved: readonly string[] = [],
 ): Promise<WorktreeRemovalProof> {
   const path = realpathSync(requested)
   if (privateProjection === undefined) {
@@ -1078,7 +1123,8 @@ export async function retainWorktreeModules(
       await alternatesLineage([objects], "", { allowedObjects: new Set([...allowedObjects, objects]) })
     }
   }
-  let before = privateProjection === undefined ? await cleanSnapshot(git, path, inspect, excludedSubmodules) : undefined
+  let before =
+    privateProjection === undefined ? await cleanSnapshot(git, path, inspect, excludedSubmodules, preserved) : undefined
   // Check metadata locks before copying. The modules subtree includes every store,
   // even one left by an earlier gitlink that the current tree no longer records.
   const metadata = manifest(gitDir, custody, true, false)
@@ -1218,7 +1264,13 @@ export async function retainWorktreeModules(
   const rehomedBorrowers =
     privateProjection === undefined ? (rehome === undefined ? rehomeBorrowers(common, gitDir, modules) : rehome()) : []
   const inspectedPath = copiedCheckout
-  const after = await cleanSnapshot(git, inspectedPath, inspect, excludedSubmodules)
+  const after = await cleanSnapshot(
+    git,
+    inspectedPath,
+    inspect,
+    excludedSubmodules,
+    privateProjection === undefined ? preserved : [],
+  )
   const verifyPrivateManifest = (): void => {
     if (
       privateProjection !== undefined &&
