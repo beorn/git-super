@@ -616,7 +616,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
           }
         } catch (error) {
           if (stagingPath !== undefined && existsSync(stagingPath)) {
-            const retainedStaging = stagingPath
+            let retainedStaging = stagingPath
             try {
               if (existsSync(resolvedPath)) {
                 // Only remove our Git stub. Unexpected contents block restoration
@@ -636,8 +636,21 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
                 writeFileSync(join(retainedStaging, ".restore-failed"), `restore-failed\ntarget ${resolvedPath}\n`)
               } catch (markerError) {
                 const detail = markerError instanceof Error ? markerError.message : String(markerError)
-                markerNote = `; the recovery record is UNMARKED, so the clean-root sweep will reclaim it as leftover (marker write failed: ${detail})`
-                console.warn(`git-super: failed to write restore-failed marker in '${retainedStaging}': ${detail}`)
+                // The in-directory marker failed, so fall back to the sweep's other recogniser --
+                // the '.restore-failed' name suffix -- and keep the retained record recoverable
+                // instead of letting it be reclaimed as leftover trash (#28906 REVISE).
+                const suffixedStaging = `${retainedStaging}.restore-failed`
+                try {
+                  renameSync(retainedStaging, suffixedStaging)
+                  retainedStaging = suffixedStaging
+                  markerNote = `; the in-directory marker could not be written (${detail}), so the retained record is marked by its '.restore-failed' name suffix`
+                } catch (fallbackError) {
+                  const fallbackDetail = fallbackError instanceof Error ? fallbackError.message : String(fallbackError)
+                  markerNote = `; the recovery record is UNMARKED, so the clean-root sweep will reclaim it as leftover (marker write failed: ${detail}; '.restore-failed' name-suffix fallback failed: ${fallbackDetail})`
+                  console.warn(
+                    `git-super: failed to mark retained restore-failed record in '${retainedStaging}': ${detail}; name-suffix fallback failed: ${fallbackDetail}`,
+                  )
+                }
               }
               throw writerLeases.refusal(
                 new Error(
