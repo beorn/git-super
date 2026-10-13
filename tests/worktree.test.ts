@@ -1838,6 +1838,12 @@ describe("createGitWorktreeStore", () => {
     const fs = await import("node:fs")
     const originalCopy = fs.copyFileSync
     const originalRename = fs.renameSync
+    // The marker-failure case makes the store warn that the recovery record is UNMARKED.
+    // Capture that one line and assert it below. spyOn works under both supported runners:
+    // under the root harness it reuses the setup spy (which otherwise fails the test on any
+    // output); under git-super own config it makes a real spy. Every other case keeps
+    // whatever spy its runner installs, so stray output still fails.
+    const warnMock = markerFails ? vi.spyOn(console, "warn").mockImplementation(() => {}) : null
     let stagingPath: string | undefined
     try {
       const repo = join(root, "repo")
@@ -1901,6 +1907,11 @@ describe("createGitWorktreeStore", () => {
           // The one error the caller holds must say the record is unmarked (#28906 SHOULD).
           expect((error as Error).message).toMatch(/UNMARKED/)
           expect((error as Error).message).toContain("injected marker write failure")
+          // The store still says so on its own channel: the line is the recovery record
+          // being unmarked, not noise to swallow (#28906). Exactly once, so a second stray
+          // warning in this same case still fails.
+          expect(warnMock).toHaveBeenCalledTimes(1)
+          expect(warnMock).toHaveBeenCalledWith(expect.stringContaining("failed to write restore-failed marker"))
         } else {
           // The retained staging directory must carry the recovery marker so the clean-root
           // sweep preserves it even after the admin entry is pruned (#28800 / #28906).
@@ -1913,6 +1924,10 @@ describe("createGitWorktreeStore", () => {
       }
     } finally {
       await rm(root, { recursive: true, force: true })
+      // Restore the console spy only after the assertions above have read its calls:
+      // mockRestore clears the call history, so restoring it in the inner finally made
+      // the once-check read zero.
+      warnMock?.mockRestore()
     }
   })
 
