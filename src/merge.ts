@@ -53,7 +53,11 @@ export type SuperMergeCompositionResult = Readonly<{
 
 export type SuperMergeGitlinkResult = Readonly<{
   path: string
-  /** The pin this root's HEAD already RECORDS for the component. */
+  /**
+   * The gitlink the PROSPECTIVE merge tree records for the component -- what the root records for it at the merge
+   * target, before component settling rewrites it to `landingPin` (for a `merged` row it is already the composed
+   * child). A settle REFERENCE POINT, not a move's `from`: read `landingPin` for the move.
+   */
   recordedPin: string
   /** The component main this merge read and stood the recorded pin against. */
   mainPin: string
