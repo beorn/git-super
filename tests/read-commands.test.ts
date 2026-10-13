@@ -15,7 +15,7 @@ vi.mock("node:fs", async (importOriginal) => {
     readFileSync: (...args: Parameters<typeof actual.readFileSync>) => actual.default.readFileSync(...args),
   }
 })
-import { copyFileSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
+import { copyFileSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { flattenCommandNodes, resolveInvocation } from "@silvery/command"
@@ -231,6 +231,7 @@ describe("Phase 1 read commands", () => {
       ["rev-parse", "HEAD"],
       ["merge-base", "HEAD", "HEAD"],
       ["status", "--porcelain=v1", "-z"],
+      ["status", "README.md"],
       ["diff", "--", "--json"],
       ["push", "--quiet", "missing-remote", "HEAD"],
     ]) {
@@ -775,6 +776,134 @@ describe("Phase 1 read commands", () => {
     expect(code).toBe(2)
     expect(stderr.output).toContain("carries gitlinks")
     expect(stderr.output).toContain(`--repo ${fixture.product}`)
+  })
+
+  test("status refuses a path argument by naming THAT path's --repo form, never the cwd repo (28962)", async () => {
+    // A sweep reads an environment with `git super status <path>`. The gitlink
+    // refusal is right, but its cure named the CWD repo - a cure for a different
+    // tree, the one the caller did not ask about (28962).
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-status-path-refusal-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const environment = join(fixtureRoot, "environment")
+    git(fixture.product, "worktree", "add", "-q", "-b", "task/28962", environment)
+
+    const stdout = outputSink()
+    const stderr = outputSink()
+    const code = await runCli(["-C", fixture.product, "status", environment], stdout, stderr)
+
+    expect(code).toBe(2)
+    expect(stderr.output).toContain(`--repo ${environment}`)
+    expect(stderr.output).not.toContain(`--repo ${fixture.product}`)
+  })
+
+  test("status --repo <path> after the command is an explicit call, not the judged implicit form (28962)", async () => {
+    // commander accepts the global --repo after its subcommand, but the implicit-form
+    // gate read it only at argv[0]: this spelling was judged against the CWD and
+    // refused with a cure for the wrong tree (28962).
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-status-late-repo-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const environment = join(fixtureRoot, "environment")
+    git(fixture.product, "worktree", "add", "-q", "-b", "task/28962", environment)
+
+    const stdout = outputSink()
+    const stderr = outputSink()
+    const code = await runCli(["status", "--repo", environment], stdout, stderr)
+
+    expect(code).toBe(0)
+    expect(stderr.output).not.toContain("implicit superproject operation contracts")
+    // The consulted-repositories report is stderr text; stdout carries the records.
+    expect(stderr.output).toContain("Consulted repositories")
+  })
+
+  test("status names a written path as the cure only when it is a work tree root (@cto, @dev/12, 28962)", async () => {
+    // The goal is a cure that WORKS. A path that exists is not enough: --repo
+    // refuses a subdirectory ('is not a worktree root; its git dir resolves to the
+    // parent repository'), and a file or an empty directory is the same, so those
+    // keep the CWD repo cure they had (@cto should, @dev/12 must, 28962).
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-status-nonroot-path-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const file = join(fixtureRoot, "notes.txt")
+    writeFileSync(file, "not a repository\n")
+    const empty = join(fixtureRoot, "empty")
+    mkdirSync(empty, { recursive: true })
+    const subdirectory = join(fixture.product, "docs")
+    mkdirSync(subdirectory, { recursive: true })
+    writeFileSync(join(subdirectory, "readme.md"), "inside the work tree, not its root\n")
+
+    for (const written of [file, empty, subdirectory]) {
+      const stdout = outputSink()
+      const stderr = outputSink()
+      const code = await runCli(["-C", fixture.product, "status", written], stdout, stderr)
+
+      expect(code).toBe(2)
+      expect(stderr.output, written).not.toContain(`--repo ${written}`)
+      expect(stderr.output, written).toContain(`--repo ${fixture.product}`)
+    }
+  })
+
+  test("status does not name a bare repository as the cure: the explicit status cannot run in one (@cto, 28962)", async () => {
+    // @cto endorsed admitting a bare path on the ground that the explicit call
+    // resolves it. Measured: it does NOT - the explicit status itself runs
+    // rev-parse --show-toplevel and dies with 'fatal: this operation must be run in
+    // a work tree' in a bare repository, so a bare cure is exactly the unrunnable
+    // cure @dev/12 flagged. rev-parse --show-prefix ALONE returns empty for a bare
+    // repo, so the --show-toplevel in the probe is what rejects it; this row pins
+    // the fallback and the --show-toplevel's necessity (@cto, @dev/12, 28962).
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-status-bare-path-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const bare = join(fixtureRoot, "bare.git")
+    git(fixtureRoot, "init", "-q", "--bare", bare)
+
+    const stdout = outputSink()
+    const stderr = outputSink()
+    const code = await runCli(["-C", fixture.product, "status", bare], stdout, stderr)
+
+    expect(code).toBe(2)
+    expect(stderr.output).not.toContain(`--repo ${bare}`)
+    expect(stderr.output).toContain(`--repo ${fixture.product}`)
+  })
+
+  test("status resolves a relative path against -C and prints the absolute work tree (@dev/12, 28962)", async () => {
+    // A relative path resolves against the directory the implicit git context uses
+    // (-C), not the process cwd, and the cure prints the absolute toplevel: the
+    // fixture product's vendor/beta submodule root, named relatively, must come
+    // back absolute (@dev/12 should, 28962).
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-status-relative-path-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const submoduleRoot = join(fixture.product, "vendor", "beta")
+
+    const stdout = outputSink()
+    const stderr = outputSink()
+    const code = await runCli(["-C", fixture.product, "status", "vendor/beta"], stdout, stderr)
+
+    expect(code).toBe(2)
+    expect(stderr.output).toContain(`--repo ${submoduleRoot}`)
+    expect(stderr.output).not.toContain(`--repo vendor/beta`)
+  })
+
+  test("a leading native Git global keeps status on the implicit path, never commander (28962)", async () => {
+    // commander cannot parse -C, so routing `-C <path> status --repo <tree>` there
+    // would answer 'unknown option -C' (exit 1) instead of the refusal. The gate
+    // reads --repo as the explicit interface only when the argv opens with the
+    // subcommand itself; a native global stays on the implicit path (28962).
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-status-native-global-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const environment = join(fixtureRoot, "environment")
+    git(fixture.product, "worktree", "add", "-q", "-b", "task/28962", environment)
+
+    const stdout = outputSink()
+    const stderr = outputSink()
+    const code = await runCli(["-C", fixture.product, "status", "--repo", environment], stdout, stderr)
+
+    expect(code).toBe(2)
+    expect(stderr.output).toContain(`--repo ${environment}`)
+    expect(stderr.output).not.toContain("unknown option")
   })
 
   test("inverse control: a real merge-base non-ancestor answer is still exit 1, and only that", async () => {

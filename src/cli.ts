@@ -204,12 +204,64 @@ function inputObjects(command: string, args: readonly string[]): readonly { argu
   )
 }
 
+/**
+ * The tree a `status` caller named with a bare path argument. `status` declares no
+ * positional, so a path here is the caller naming the tree they meant - not a
+ * pathspec. The refusal's cure reads it so the named command addresses THAT tree
+ * instead of the CWD repo (28962). Returns undefined when no path was given; the
+ * value options that DO take a following word are skipped whole.
+ */
+function statusPathArgument(args: readonly string[]): string | undefined {
+  const valueOptions = new Set(["--exclude-submodule", "--index-file"])
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index]
+    if (argument === undefined) continue
+    if (argument.startsWith("-")) {
+      if (valueOptions.has(argument)) index += 1
+      continue
+    }
+    return argument
+  }
+  return undefined
+}
+
+/**
+ * The absolute work tree a `status` caller's path names - but only when that path
+ * IS a work tree root. --repo <path> refuses a subdirectory ('is not a worktree
+ * root; its git dir resolves to the parent repository'), so naming one prints a
+ * cure that cannot run; a file or an empty directory is the same (@cto, @dev/12,
+ * 28962). The probe runs THROUGH the caller's own globals, so a relative path
+ * resolves against the directory the implicit git context already uses, and the
+ * cure prints the absolute toplevel the explicit call needs.
+ */
+async function namesRepositoryPath(globals: readonly string[], path: string | undefined): Promise<string | undefined> {
+  if (path === undefined) return undefined
+  const probe = await readNativeGit([...globals, "-C", path, "rev-parse", "--show-toplevel", "--show-prefix"])
+  if (probe.code !== 0) return undefined
+  const [toplevel, prefix] = probe.stdout.split("\n")
+  if (toplevel === undefined || (prefix ?? "").trim() !== "") return undefined
+  return toplevel.trim()
+}
+
 async function enrichedInvocation(argv: readonly string[]): Promise<readonly string[] | undefined> {
   // Explicit extension calls retain their existing parser and result contract.
+  // The gate below refuses the IMPLICIT form, where gitlinks make the answer
+  // ambiguous. commander accepts the global --repo AFTER its subcommand, so
+  // `status --repo <path>` is an explicit call; reading --repo only at argv[0], it
+  // was judged against the CWD and refused with a cure for the wrong tree (28962).
+  // A leading native Git global (-C, --no-pager, ...) must never reach commander,
+  // so --repo counts as explicit only when the argv opens with the subcommand.
+  // Tokens after `--` are operands: a diff pathspec named --repo is not the option.
+  const endOfOptions = argv.indexOf("--")
+  const beforeOperands = endOfOptions === -1 ? argv : argv.slice(0, endOfOptions)
+  const namesRepository =
+    argv[0] === "--repo" ||
+    argv[0]?.startsWith("--repo=") === true ||
+    (ENRICHED_COMMANDS.has(argv[0] ?? "") &&
+      beforeOperands.some((argument) => argument === "--repo" || argument.startsWith("--repo=")))
   if (
     argv.length === 0 ||
-    argv[0] === "--repo" ||
-    argv[0]?.startsWith("--repo=") ||
+    namesRepository ||
     argv[0] === "--json" ||
     argv[0]?.startsWith("--object-directory") ||
     argv[0]?.startsWith("--alternate-object-directory")
@@ -271,9 +323,16 @@ async function enrichedInvocation(argv: readonly string[]): Promise<readonly str
   ])
   if (root.code !== 0) throw new Error(`git-super: cannot locate repository for ${argv.join(" ")}\n${root.stderr}`)
   const repo = root.stdout.trim()
+  // The refusal's cure must name a tree that actually works: the work tree the
+  // caller's path names when that path is one, else the CWD repo. It named the CWD
+  // repo unconditionally, so a sweep reading a yrd environment got a cure for
+  // /hh/dev - a tree it did not ask about - and the path was dropped without a word
+  // (28962).
+  const statusPath = command === "status" ? statusPathArgument(argv.slice(commandIndex + 1)) : undefined
+  const cure = (await namesRepositoryPath(globals, statusPath)) ?? repo
   const refuse = (reason: string) =>
     new Error(
-      `git-super: ${command}: ${reason}. Use the explicit git-super --repo ${repo} interface; implicit superproject operation contracts are not yet supported.`,
+      `git-super: ${command}: ${reason}. Use the explicit git-super --repo ${cure} interface; implicit superproject operation contracts are not yet supported.`,
     )
   let objects: readonly { argument: string; object: string }[]
   try {
