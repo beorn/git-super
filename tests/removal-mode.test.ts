@@ -11,7 +11,7 @@
  * @reach fs-walk <fixture-only: runCli and the CLI entry read mkdtempSync(tmpdir()) Git repos>
  */
 import { afterEach, describe, expect, test } from "vitest"
-import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { runCli } from "../src/cli.ts"
 import { repositoryRoot, withGitTimeout } from "../src/git.ts"
@@ -115,7 +115,28 @@ describe("bounded synchronous Git (tryGit timeout)", () => {
     roots.push(root)
     const repo = createProductFixture(root).product
     // 1 ms cannot cover a real `git rev-parse` spawn: the bound fires and the walk fails closed.
-    expect(() => withGitTimeout(1, () => repositoryRoot(repo))).toThrow(/failed to run git|timed out/u)
+    expect(() => withGitTimeout(1, () => repositoryRoot(repo))).toThrow(/did not finish within 1ms/u)
+  })
+
+  test("a stalled Git child ends as a named timeout, not a hang", () => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-removal-stall-"))
+    roots.push(root)
+    const shim = join(root, "bin")
+    mkdirSync(shim, { recursive: true })
+    // raw-delete-allow: fixture scratch this test created under tmpdir; removed by afterEach.
+    writeFileSync(join(shim, "git"), "#!/bin/sh\nexec sleep 60\n", { mode: 0o755 })
+    const priorPath = process.env.PATH
+    process.env.PATH = `${shim}:${priorPath ?? ""}`
+    try {
+      const started = Date.now()
+      expect(() => withGitTimeout(300, () => repositoryRoot(root))).toThrow(
+        /failed to run git in .*did not finish within 300ms/u,
+      )
+      // It returned on the bound, not after the stall.
+      expect(Date.now() - started).toBeLessThan(5_000)
+    } finally {
+      process.env.PATH = priorPath
+    }
   })
 
   test("inspectRemovalStatus passes an explicit bound through and stays unbounded when asked", () => {

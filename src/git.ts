@@ -175,7 +175,15 @@ export function tryGit(cwd: string, args: readonly string[], indexFile?: string)
     maxBuffer: 64 * 1024 * 1024,
     ...(timeoutMs === undefined ? {} : { timeout: timeoutMs }),
   })
-  if (result.error) throw new Error(`failed to run git in ${cwd}: ${result.error.message}`)
+  if (result.error) {
+    // A bounded call that errored is a named timeout, never a bare spawn error: the bound is the only
+    // reason a synchronous Git call is not simply allowed to finish (28033).
+    const detail =
+      timeoutMs === undefined
+        ? result.error.message
+        : `git ${args.join(" ")} did not finish within ${timeoutMs}ms: ${result.error.message}`
+    throw new Error(`failed to run git in ${cwd}: ${detail}`)
+  }
   return {
     exitCode: result.status ?? 1,
     stdout: result.stdout ?? "",
