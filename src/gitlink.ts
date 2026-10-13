@@ -1,6 +1,6 @@
 import { isAbsolute, join, resolve } from "node:path"
 
-import { createExclusive, type Exclusive } from "./exclusive.ts"
+import { createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS, type Exclusive } from "./exclusive.ts"
 import { parseIndexEntries, type IndexEntry } from "./index-entries.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
 import { gitSuperResult, type GitResultDetail, type GitSuperResult } from "./result.ts"
@@ -86,7 +86,13 @@ export async function writeGitlink(options: WriteGitlinkOptions): Promise<GitSup
     const exclusive: Exclusive =
       options.lock === "held"
         ? { run: (operation) => operation() }
-        : createExclusive(await lockDirectory(git, repository))
+        : // 28820: an ordinary gitlink write takes the same four-minute wait that merge and worktree add take.
+          // The omitted-option default is 30 s, which ordinary cleanup (41 s) and queue preview (35-46 s)
+          // outlast: Muse gitlink writes refused at 30.0 s while the lock freed seconds later. Budget
+          // arithmetic: the wait (240 s) plus each child Git call (DEFAULT_GIT_TIMEOUT_MS, 30 s) is one
+          // write's worst case; the direct CLI carries no outer cap, and the merge carrier passes
+          // `lock: "held"`, so it never waits here at all.
+          createExclusive(await lockDirectory(git, repository), { timeoutMs: DEFAULT_MUTATION_LOCK_WAIT_MS })
     return await exclusive.run(
       async () => {
         const before = await indexEntries(git, repository, options.path)

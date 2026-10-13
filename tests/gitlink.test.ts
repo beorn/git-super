@@ -9,7 +9,8 @@ import { spawnSync } from "node:child_process"
 import { createHash } from "node:crypto"
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { isAbsolute, join, resolve } from "node:path"
-import { afterEach, describe, expect, test } from "vitest"
+import { setTimeout as delay } from "node:timers/promises"
+import { afterEach, describe, expect, test, vi } from "vitest"
 
 import { runCli } from "../src/cli.ts"
 import { acquireExclusive } from "../src/exclusive.ts"
@@ -373,6 +374,56 @@ describe("policy-free gitlink writes", () => {
 
     await expect(pending).resolves.toMatchObject({ state: "updated", partial: false })
   })
+
+  /**
+   * @failure An ordinary gitlink write gives up at the omitted-option 30 s default while an ordinary cleanup
+   *          holds the shared mutation lock past 35 s, so a landing write fails with the lock free shortly after (28820).
+   * @level l1
+   * @consumer Yrd submit's gitlink writes, and every CLI caller of `git super gitlink`
+   * @runtime under a second: Date is virtual, the real lock is not.
+   */
+  test("waits out a real lock held past thirty seconds and then writes the pin (28820)", async () => {
+    const product = fixture("writer-budget-real")
+    const next = advanceRepository(product.alpha, "alpha.ts", "export const alpha = 11\n")
+    fetchWithoutCheckout(product.product, "packages/alpha", next)
+    const common = git(product.product, "rev-parse", "--git-common-dir")
+    const commonDirectory = isAbsolute(common) ? common : resolve(product.product, common)
+    // A REAL holder, setup outside the virtual clock, exactly as exclusive.test.ts holds one for 25274.
+    const held = await acquireExclusive(
+      join(commonDirectory, "yrd-worktree-mutations"),
+      { timeoutMs: 0 },
+      "ordinary cleanup",
+    )
+    let released = false
+    const release = () => {
+      if (released) return
+      released = true
+      held.release()
+    }
+    vi.useFakeTimers({ toFake: ["Date"] })
+    let pending: ReturnType<typeof writeGitlink> | undefined
+    try {
+      const startedAt = Date.now()
+      pending = writeGitlink({ repo: product.product, path: "packages/alpha", commit: next })
+      // The writer reaches the shared lock and registers its contention at the frozen time, so the deadline it
+      // computes is the pre-advance one. 300 ms is a wide margin over two local rev-parse calls on a fixture repo.
+      await delay(300)
+      // Past the omitted-option default (30 s) and well inside the four-minute budget.
+      vi.setSystemTime(startedAt + 31_000)
+      // Keep the REAL lock held across at least one poll at the advanced time: the writer must still be waiting
+      // when the holder releases, which is precisely what a 30 s deadline refuses. The refusal names the holder,
+      // so a wrong budget fails here with "worktree mutation lock is busy ... holder=ordinary cleanup".
+      await delay(50)
+      release()
+      const settled = await pending
+      expect(settled, JSON.stringify(settled)).toMatchObject({ state: "updated", partial: false })
+      expect(stage(product.product, "packages/alpha")).toBe(`160000 ${next} 0\tpackages/alpha`)
+    } finally {
+      release()
+      if (pending !== undefined) await Promise.allSettled([pending])
+      vi.useRealTimers()
+    }
+  }, 20_000)
 
   // @failure A gitlink write given an abbreviated commit silently leaves the index at the old
   //          pin while answering "updated" — the no-op @dev/3 reported for a short sha (#28554).
