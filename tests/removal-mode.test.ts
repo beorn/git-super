@@ -110,12 +110,25 @@ describe("status --removal verdict", () => {
 })
 
 describe("bounded synchronous Git (tryGit timeout)", () => {
-  test("withGitTimeout bounds a real Git call and fails loud instead of hanging", () => {
+  test("withGitTimeout bounds a Git call and fails loud instead of hanging", () => {
     const root = mkdtempSync(join(canonicalTmpdir(), "git-super-removal-timeout-"))
     roots.push(root)
     const repo = createProductFixture(root).product
-    // 1 ms cannot cover a real `git rev-parse` spawn: the bound fires and the walk fails closed.
-    expect(() => withGitTimeout(1, () => repositoryRoot(repo))).toThrow(/did not finish within 1ms/u)
+    // The child must outlive the bound for the bound to be the thing under test: a real `git rev-parse`
+    // can finish inside 1 ms on a fast box, and that made this row fail OPEN in CI (git-super run
+    // 38359675903). A `git` that sleeps cannot win that race, so the assertion is deterministic.
+    const shim = join(root, "bin")
+    mkdirSync(shim, { recursive: true })
+    // raw-delete-allow: fixture scratch this test created under tmpdir; removed by afterEach.
+    writeFileSync(join(shim, "git"), "#!/bin/sh\nexec sleep 2\n", { mode: 0o755 })
+    const priorPath = process.env.PATH
+    process.env.PATH = `${shim}:${priorPath ?? ""}`
+    try {
+      expect(() => withGitTimeout(1, () => repositoryRoot(repo))).toThrow(/did not finish within 1ms/u)
+    } finally {
+      if (priorPath === undefined) delete process.env.PATH
+      else process.env.PATH = priorPath
+    }
   })
 
   test("a stalled Git child ends as a named timeout, not a hang", () => {
