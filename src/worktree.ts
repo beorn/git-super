@@ -27,6 +27,7 @@ import {
   type WorktreeRemovalProof,
   type WorktreeRetention,
 } from "./worktree-removal.ts"
+export { inspectRemovalStatus } from "./worktree-removal.ts"
 import { compactRetainedModules, type CompactionResult } from "./retention-compact.ts"
 import { cleanGitEnvironment, probeRepository } from "./git.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
