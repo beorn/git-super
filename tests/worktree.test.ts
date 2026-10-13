@@ -1637,6 +1637,20 @@ describe("createGitWorktreeStore", () => {
     await writeFile(join(subWork, "sub.txt"), "sub content\n")
     git(subWork, ["add", "sub.txt"])
     git(subWork, ["commit", "-q", "-m", "init sub"])
+    const nested = join(root, "nested")
+    const nestedCommit = createRepository(nested, "nested.txt", "nested content\n")
+    git(subWork, [
+      "-c",
+      "protocol.file.allow=always",
+      "submodule",
+      "add",
+      "-q",
+      "--name",
+      "hooks/nested",
+      nested,
+      "nested",
+    ])
+    git(subWork, ["commit", "-q", "-am", "add nested borrower"])
     git(subWork, ["push", "-q", "origin", "main"])
 
     git(root, ["init", "-q", "-b", "main", repo])
@@ -1645,8 +1659,19 @@ describe("createGitWorktreeStore", () => {
     await writeFile(join(repo, "root.txt"), "root\n")
     git(repo, ["add", "root.txt"])
     git(repo, ["commit", "-q", "-m", "init root"])
-    git(repo, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", subRemote, "vendor/sub"])
+    git(repo, [
+      "-c",
+      "protocol.file.allow=always",
+      "submodule",
+      "add",
+      "-q",
+      "--name",
+      "refs/sub",
+      subRemote,
+      "vendor/sub",
+    ])
     git(repo, ["commit", "-q", "-m", "add submodule"])
+    git(repo, ["-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive"])
 
     try {
       const store = createLocalGitWorktreeStore({ repo })
@@ -1668,20 +1693,28 @@ describe("createGitWorktreeStore", () => {
 
       await store.add({ kind: "detached", path: borrower, ref: "HEAD" })
       const borrowerSub = join(borrower, "vendor/sub")
-      const lenderSubAdmin = join(repo, ".git", "worktrees", "lender", "modules", "vendor/sub")
-      const borrowerSubAdmin = join(repo, ".git", "worktrees", "borrower", "modules", "vendor/sub")
-      const durableSubObjects = join(repo, ".git", "modules", "vendor/sub", "objects")
+      const lenderSubAdmin = join(repo, ".git", "worktrees", "lender", "modules", "refs/sub")
+      const borrowerSubAdmin = join(repo, ".git", "worktrees", "borrower", "modules", "refs/sub")
+      const durableSubObjects = join(repo, ".git", "modules", "refs/sub", "objects")
       const lenderSubObjects = join(lenderSubAdmin, "objects")
 
       await store.materializeSubmodules(borrower)
       const altFile = join(borrowerSubAdmin, "objects", "info", "alternates")
       await writeFile(altFile, `${lenderSubObjects}\n${durableSubObjects}\n`, "utf8")
+      const nestedAdmin = join(borrowerSubAdmin, "modules", "hooks/nested")
+      const nestedAlternates = join(nestedAdmin, "objects/info/alternates")
+      await writeFile(nestedAlternates, `${join(lenderSubAdmin, "modules/hooks/nested/objects")}\n`, "utf8")
 
       git(borrowerSub, ["update-ref", "refs/heads/main", lenderCommit])
       git(borrowerSub, ["symbolic-ref", "HEAD", "refs/heads/main"])
 
       expect(git(borrowerSub, ["cat-file", "-t", lenderCommit]).trim()).toBe("commit")
 
+      // 28823: dependency inspection must descend through a namespace called refs,
+      // but never enumerate the Git store's refs/logs/hooks. Object-read assertions
+      // alone pass while irrelevant metadata makes every writer wait.
+      for (const name of ["refs", "logs", "hooks"]) await mkdir(join(borrowerSubAdmin, name), { recursive: true })
+      vi.mocked(readdirSync).mockClear()
       await store.remove(lender, {
         retention: {
           root: retainedDir,
@@ -1690,6 +1723,13 @@ describe("createGitWorktreeStore", () => {
       })
       expect(existsSync(lender)).toBe(false)
       expect(existsSync(lenderSubAdmin)).toBe(false)
+
+      const visited = new Set(vi.mocked(readdirSync).mock.calls.map(([path]) => String(path)))
+      expect(visited.has(join(borrowerSubAdmin, "objects", "info"))).toBe(true)
+      expect(visited.has(join(nestedAdmin, "objects", "info"))).toBe(true)
+      expect(await readFile(nestedAlternates, "utf8")).toBe("")
+      expect(git(join(borrowerSub, "nested"), ["cat-file", "-t", nestedCommit]).trim()).toBe("commit")
+      for (const name of ["refs", "logs", "hooks"]) expect(visited.has(join(borrowerSubAdmin, name)), name).toBe(false)
 
       const fsck = spawnSync("git", ["-C", borrowerSub, "fsck", "--full"], { encoding: "utf8" })
       expect(fsck.status).toBe(0)

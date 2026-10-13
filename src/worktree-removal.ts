@@ -314,7 +314,7 @@ export async function assertExcludedRemovalCustody(
     }
     const moduleState = lstatSync(modules)
     if (!moduleState.isDirectory() || moduleState.isSymbolicLink()) refuse(modules)
-    for (const entry of borrowerEntries(modules, includedStores)) {
+    for (const entry of borrowerEntries(modules, includedStores, "custody")) {
       const store = join(entry.parentPath, entry.name)
       // Only namespace ancestors of known included stores may be descended into.
       // The existing walker prunes each known store and yields unknown entries before descent.
@@ -337,10 +337,18 @@ export interface RehomeBorrowersOptions {
 }
 
 /** Protected roots are pruned before entry, including symlinks. */
-function* borrowerEntries(root: string, excludedStores: RemovalBorrower["excludedStores"]): Generator<Dirent> {
+function* borrowerEntries(
+  root: string,
+  excludedStores: RemovalBorrower["excludedStores"],
+  purpose: "custody" | "dependencies",
+): Generator<Dirent> {
+  const dependencyStore = purpose === "dependencies" && isGitDirectory(root, root, false)
   for (const entry of readdirSync(root, { withFileTypes: true })) {
     const path = join(root, entry.name)
     if (excludedStores?.some((excluded) => within(excluded.store, path))) continue
+    // Only a recognized Git store gives these names their metadata meaning.
+    // Namespace directories named refs/logs/hooks may contain real submodules.
+    if (dependencyStore && entry.isDirectory() && ["refs", "logs", "hooks"].includes(entry.name)) continue
     yield entry
     if (!entry.isDirectory()) continue
     // A directory directly inside a Git objects directory is `info` (the only one that can hold an
@@ -351,7 +359,7 @@ function* borrowerEntries(root: string, excludedStores: RemovalBorrower["exclude
     // already read through (hh 28572). Only `info` can carry a borrower marker, so the walk never
     // enters the others.
     if (basename(root) === "objects" && entry.name !== "info") continue
-    yield* borrowerEntries(path, excludedStores)
+    yield* borrowerEntries(path, excludedStores, purpose)
   }
 }
 
@@ -535,7 +543,7 @@ function rehomeBorrowerCandidates(
     try {
       for (const includedStore of candidate.includedStores ?? [candidateModules]) {
         if (!existsSync(includedStore)) continue
-        for (const entry of borrowerEntries(includedStore, candidate.excludedStores)) {
+        for (const entry of borrowerEntries(includedStore, candidate.excludedStores, "dependencies")) {
           if (entry.isSymbolicLink() && entry.name === "objects") {
             const objects = join(entry.parentPath, entry.name)
             let target: string
