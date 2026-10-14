@@ -1,6 +1,6 @@
 import { driveSync, statusTraversal } from "./status-traversal.ts"
 import { lstatSync } from "node:fs"
-import { join, resolve } from "node:path"
+import { join } from "node:path"
 import type { ConsultedRepository, NotCompared } from "./diff.ts"
 export type { ConsultedRepository } from "./diff.ts"
 import { inspectUninitializedCheckout, validateExcludedSubmodules } from "./git.ts"
