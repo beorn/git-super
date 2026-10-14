@@ -21,6 +21,7 @@ import {
   createProductFixture,
   createRepository,
   git,
+  type ProductFixture,
 } from "./fixture.ts"
 
 function outputSink(): { output: string; write(value: string): void } {
@@ -677,5 +678,253 @@ describe("git super diff --stat / --patch human output", () => {
     expect(stdout.output).toContain("== packages/alpha ==")
     expect(stdout.output).toContain("dirty (untracked files only)")
     expect(stderr.output).toContain("✓  packages/alpha")
+  })
+})
+
+type PublishedComponentFixture = ProductFixture & Readonly<{ publishedBeta: string; publishedMain: string }>
+
+/**
+ * 29363: beta's main gains a PUBLISHED commit and the product's main lands it, so the product's `origin/main` pins
+ * beta at that commit while the task branch's fork point (`productBase`) still pins `betaBase`. Composition then
+ * advances the branch's beta pin onto the published main exactly as the queue does, without the author touching
+ * beta. Measured from the fork point, that pin move reads as the author's change to `published-beta.ts`.
+ */
+function createPublishedComponentFixture(fixtureRoot: string): PublishedComponentFixture {
+  const fixture = createProductFixture(fixtureRoot)
+  const publishedBeta = advanceRepository(fixture.beta, "published-beta.ts", "export const published = 1\n")
+  const betaCheckout = join(fixture.product, "vendor/beta")
+  git(betaCheckout, "fetch", "-q", "origin")
+  git(betaCheckout, "checkout", "-q", publishedBeta)
+  git(fixture.product, "add", "vendor/beta")
+  git(fixture.product, "commit", "-q", "-m", "land beta: published-beta.ts")
+  const publishedMain = git(fixture.product, "rev-parse", "HEAD")
+  git(fixture.product, "update-ref", "refs/remotes/origin/main", publishedMain)
+  // The task branch forks from productBase; its index pins beta at betaBase while the checkout stays at the
+  // published commit, so the next `git add vendor/beta` is the composition step.
+  git(fixture.product, "checkout", "-q", "-b", "task", fixture.productBase)
+  return { ...fixture, publishedBeta, publishedMain }
+}
+
+describe("superDiff --component-base (29363: published component changes are not the author's)", () => {
+  /**
+   * @failure The scoped fix measures a moved gitlink from the branch's fork-point pin, so the published component
+   * commits composition pulled under the branch select their suites as if authored (10 files reached 74 suites, 8 min).
+   * @level l1
+   * @consumer km fix-scoped.sh committed scope (27381), via git super diff --component-base origin/main
+   * @testonly none
+   */
+  test("N authored root paths plus a gitlink advanced to the already-published component main select only the N root paths", () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-diff-component-base-"))
+    roots.push(fixtureRoot)
+    const fixture = createPublishedComponentFixture(fixtureRoot)
+    writeFileSync(join(fixture.product, "authored.ts"), "export const authored = 1\n")
+    git(fixture.product, "add", "authored.ts", "vendor/beta")
+    git(fixture.product, "commit", "-q", "-m", "authored root change, beta composed onto its published main")
+    const head = git(fixture.product, "rev-parse", "HEAD")
+
+    // Today's reading, kept as the control: from the fork point the published beta file is the branch's change.
+    const forkPoint = superDiff({ repo: fixture.product, refs: [`${fixture.productBase}..${head}`] })
+    expect(forkPoint.paths).toEqual(["authored.ts", "vendor/beta/published-beta.ts"])
+
+    const composed = superDiff({
+      repo: fixture.product,
+      refs: [`${fixture.productBase}..${head}`],
+      componentBase: "origin/main",
+    })
+    expect(composed.paths).toEqual(["authored.ts"])
+    // The component was consulted, over the composed base: nothing between the published pin and itself.
+    expect(composed.consultedRepositories.map(({ path }) => path)).toEqual([".", "vendor/beta"])
+    expect(composed.consultedRepositories.find(({ path }) => path === "vendor/beta")).toEqual({
+      path: "vendor/beta",
+      root: join(fixture.product, "vendor/beta"),
+      from: fixture.publishedBeta,
+      to: fixture.publishedBeta,
+    })
+    expect(composed.notCompared).toEqual([])
+  })
+
+  test("an authored component commit on top of the published main selects exactly its own files", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-diff-component-base-authored-"))
+    roots.push(fixtureRoot)
+    const fixture = createPublishedComponentFixture(fixtureRoot)
+    const betaCheckout = join(fixture.product, "vendor/beta")
+    const authoredBeta = advanceRepository(betaCheckout, "authored-beta.ts", "export const authored = 1\n")
+    writeFileSync(join(fixture.product, "authored.ts"), "export const authored = 1\n")
+    git(fixture.product, "add", "authored.ts", "vendor/beta")
+    git(fixture.product, "commit", "-q", "-m", "authored root and beta changes over the published main")
+    const head = git(fixture.product, "rev-parse", "HEAD")
+
+    const composed = superDiff({
+      repo: fixture.product,
+      refs: [`${fixture.productBase}..${head}`],
+      componentBase: "origin/main",
+    })
+    expect(composed.paths).toEqual(["authored.ts", "vendor/beta/authored-beta.ts"])
+    expect(composed.consultedRepositories.find(({ path }) => path === "vendor/beta")).toEqual({
+      path: "vendor/beta",
+      root: betaCheckout,
+      from: fixture.publishedBeta,
+      to: authoredBeta,
+    })
+
+    // The CLI carries the same option, and the committed-scope caller reads NUL-terminated names.
+    const stdout = outputSink()
+    const stderr = outputSink()
+    expect(
+      await runCli(
+        [
+          "--repo",
+          fixture.product,
+          "diff",
+          "--name-only",
+          "-z",
+          "--component-base",
+          "origin/main",
+          `${fixture.productBase}..${head}`,
+        ],
+        stdout,
+        stderr,
+      ),
+    ).toBe(0)
+    expect(stdout.output.split("\0").filter(Boolean)).toEqual(["authored.ts", "vendor/beta/authored-beta.ts"])
+  })
+
+  test("a gitlink the base ref does not record keeps its empty-tree expansion: every file of an added component is the branch's", () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-diff-component-base-added-"))
+    roots.push(fixtureRoot)
+    const fixture = createPublishedComponentFixture(fixtureRoot)
+    const gamma = join(fixtureRoot, "gamma")
+    createRepository(gamma, "gamma.ts", "export const gamma = 1\n")
+    git(fixture.product, "-c", "protocol.file.allow=always", "submodule", "add", "-q", gamma, "vendor/gamma")
+    git(fixture.product, "add", "vendor/beta")
+    git(fixture.product, "commit", "-q", "-m", "add gamma, beta composed onto its published main")
+    const head = git(fixture.product, "rev-parse", "HEAD")
+
+    const composed = superDiff({
+      repo: fixture.product,
+      refs: [`${fixture.productBase}..${head}`],
+      componentBase: "origin/main",
+    })
+    expect(composed.paths).toEqual([".gitmodules", "vendor/gamma/gamma.ts"])
+    expect(composed.consultedRepositories.find(({ path }) => path === "vendor/gamma")?.from).toBe(EMPTY_TREE)
+  })
+
+  test("a nested gitlink is measured from the pin the parent's PUBLISHED tree records, not from the parent's fork-point tree", () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-diff-component-base-nested-"))
+    roots.push(fixtureRoot)
+    // Fork point: alpha carries the leaf at leafBase. Published: the leaf bumps, alpha pins it, the product lands it.
+    const nested = addNestedAlphaSubmodule(createProductFixture(fixtureRoot))
+    const forkPoint = nested.productWithNestedBase
+    const alphaCheckout = join(nested.product, "packages/alpha")
+    const leafCheckout = join(alphaCheckout, "apps/maddoc")
+    const alphaAtFork = git(nested.product, "rev-parse", `${forkPoint}:packages/alpha`)
+    const publishedMain = bumpNestedAlphaSubmodule(nested)
+    git(nested.product, "update-ref", "refs/remotes/origin/main", publishedMain)
+    const alphaPublished = git(nested.product, "rev-parse", "origin/main:packages/alpha")
+    const leafPublished = git(alphaCheckout, "rev-parse", `${alphaPublished}:apps/maddoc`)
+    // The branch: alpha authored on top of its FORK pin (not composed), but its leaf authored on top of the
+    // PUBLISHED leaf. Only the parent's published tree says the leaf's published bump is not the author's.
+    git(nested.product, "checkout", "-q", "-b", "task", forkPoint)
+    git(alphaCheckout, "checkout", "-q", alphaAtFork)
+    const leafAuthored = advanceRepository(leafCheckout, "authored-leaf.ts", "export const authoredLeaf = 1\n")
+    writeFileSync(join(alphaCheckout, "authored-alpha.ts"), "export const authoredAlpha = 1\n")
+    git(alphaCheckout, "add", "authored-alpha.ts", "apps/maddoc")
+    git(alphaCheckout, "commit", "-q", "-m", "authored alpha change, leaf composed onto its published main")
+    const alphaAuthored = git(alphaCheckout, "rev-parse", "HEAD")
+    writeFileSync(join(nested.product, "authored.ts"), "export const authored = 1\n")
+    git(nested.product, "add", "authored.ts", "packages/alpha")
+    git(nested.product, "commit", "-q", "-m", "authored root change")
+    const head = git(nested.product, "rev-parse", "HEAD")
+
+    const composed = superDiff({
+      repo: nested.product,
+      refs: [`${forkPoint}..${head}`],
+      componentBase: "origin/main",
+    })
+    expect(composed.paths).toEqual([
+      "authored.ts",
+      "packages/alpha/apps/maddoc/authored-leaf.ts",
+      "packages/alpha/authored-alpha.ts",
+    ])
+    expect(composed.consultedRepositories.find(({ path }) => path === "packages/alpha")).toMatchObject({
+      from: alphaAtFork,
+      to: alphaAuthored,
+    })
+    expect(composed.consultedRepositories.find(({ path }) => path === "packages/alpha/apps/maddoc")).toMatchObject({
+      from: leafPublished,
+      to: leafAuthored,
+    })
+    // The control: from the fork-point tree the leaf's published bump (leaf.ts) reads as the author's.
+    expect(superDiff({ repo: nested.product, refs: [`${forkPoint}..${head}`] }).paths).toContain(
+      "packages/alpha/apps/maddoc/leaf.ts",
+    )
+  })
+
+  test("a published pin the component checkout cannot read refuses with exit 2 and a remedy naming that pin", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-diff-component-base-unreadable-"))
+    roots.push(fixtureRoot)
+    const fixture = createPublishedComponentFixture(fixtureRoot)
+    // Beta's main moves again, and the product's main records that pin without the checkout ever fetching it.
+    const publishedBeta2 = advanceRepository(fixture.beta, "published-beta-2.ts", "export const published = 2\n")
+    git(fixture.product, "checkout", "-q", "main")
+    git(fixture.product, "update-index", "--cacheinfo", `160000,${publishedBeta2},vendor/beta`)
+    git(fixture.product, "commit", "-q", "-m", "land beta: published-beta-2.ts")
+    git(fixture.product, "update-ref", "refs/remotes/origin/main", git(fixture.product, "rev-parse", "HEAD"))
+    git(fixture.product, "checkout", "-q", "task")
+    writeFileSync(join(fixture.product, "authored.ts"), "export const authored = 1\n")
+    git(fixture.product, "add", "authored.ts", "vendor/beta")
+    git(fixture.product, "commit", "-q", "-m", "authored root change, beta composed onto the earlier published pin")
+    const head = git(fixture.product, "rev-parse", "HEAD")
+
+    const stdout = outputSink()
+    const stderr = outputSink()
+    expect(
+      await runCli(
+        ["--repo", fixture.product, "diff", "--component-base", "origin/main", `${fixture.productBase}..${head}`],
+        stdout,
+        stderr,
+      ),
+    ).toBe(2)
+    expect(stderr.output).toContain(publishedBeta2)
+    expect(stderr.output).toContain(`${publishedBeta2}:refs/`)
+    const result = superDiff({
+      repo: fixture.product,
+      refs: [`${fixture.productBase}..${head}`],
+      componentBase: "origin/main",
+    })
+    expect(result.notCompared).toMatchObject([
+      { path: "vendor/beta", reason: "unreadable", objectIds: [publishedBeta2] },
+    ])
+    expect(result.paths).toEqual(["authored.ts"])
+  })
+
+  test("the option is defined for a committed two-endpoint range only; other forms refuse by name", () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-diff-component-base-form-"))
+    roots.push(fixtureRoot)
+    const fixture = createPublishedComponentFixture(fixtureRoot)
+    git(fixture.product, "add", "vendor/beta")
+    git(fixture.product, "commit", "-q", "-m", "beta composed onto its published main")
+    const head = git(fixture.product, "rev-parse", "HEAD")
+    for (const [form, options] of [
+      ["a working-tree comparison", {}],
+      ["an index comparison (--cached)", { cached: true }],
+      [`a single ref (${head})`, { refs: [head] }],
+      ["3 refs", { refs: [fixture.productBase, head, head] }],
+    ] as const) {
+      expect(() => superDiff({ repo: fixture.product, componentBase: "origin/main", ...options })).toThrow(
+        `not for ${form}`,
+      )
+    }
+    expect(() =>
+      superDiff({ repo: fixture.product, componentBase: "no-such-ref", refs: [`${fixture.productBase}..${head}`] }),
+    ).toThrow("--component-base no-such-ref does not resolve")
+    // The three accepted forms measure the same thing.
+    const twoDot = superDiff({
+      repo: fixture.product,
+      componentBase: "origin/main",
+      refs: [`${fixture.productBase}..${head}`],
+    })
+    const pair = superDiff({ repo: fixture.product, componentBase: "origin/main", refs: [fixture.productBase, head] })
+    expect(pair.paths).toEqual(twoDot.paths)
   })
 })
