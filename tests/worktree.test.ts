@@ -1388,6 +1388,38 @@ describe("createGitWorktreeStore", () => {
     }
   }, 30_000)
 
+  // The supplied port must own status too: a transport fault is not an empty or unborn checkout.
+  it.each(["refusal", "timeout"] as const)("refuses a mid-status supplied-port %s before removal", async (kind) => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-status-port-"))
+    const repo = join(root, "repo")
+    const linked = join(root, "linked")
+    createRepository(repo, "root.txt", "root\n")
+    const native = createLocalGitProcess()
+    let reachedStatus = false
+    const store = createGitWorktreeStore({
+      repo,
+      gitProcess: {
+        async run(request) {
+          if (request.args.includes("--porcelain=v1")) {
+            reachedStatus = true
+            if (kind === "refusal") throw new Error("supplied status port refused")
+            return { code: 0, stdout: "", stderr: "", timedOut: true }
+          }
+          return native.run(request)
+        },
+      },
+    })
+    try {
+      await store.add({ kind: "detached", path: linked, ref: "HEAD" })
+      await expect(store.remove(linked)).rejects.toThrow(kind === "refusal" ? /supplied status port refused/u : /timed out/u)
+      expect(reachedStatus).toBe(true)
+      expect(existsSync(join(linked, "root.txt"))).toBe(true)
+      expect(git(repo, ["worktree", "list", "--porcelain"])).toContain(`worktree ${linked}`)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it("uses the canonical GitProcess request internally", async () => {
     const repo = await mkdtemp(join(tmpdir(), "git-super-process-port-"))
     const requests: GitProcessRequest[] = []
