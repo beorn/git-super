@@ -1,22 +1,5 @@
-import { driveSync, diffTraversal, rangeTraversal, commonDiffArgs, parseRawDiff, type RawDiffRow } from "./status-traversal.ts"
-import { join, posix } from "node:path"
-import {
-  indexGitlinks,
-  isSubmoduleExcluded,
-  probeRepository,
-  repositoryRoot,
-  runGit,
-  tryGit,
-  validateExcludedSubmodules,
-} from "./git.ts"
-import { joinCommitSubmodules, parseCommitSubmoduleConfig, type CommitSubmodule } from "./commit-graph.ts"
-import { pinRef } from "./objects.ts"
-import { shellQuote } from "./shell-command.ts"
-import { resolveSubmoduleOrigin } from "./submodule-origin.ts"
-
-const ZERO_OID = "0".repeat(40)
-/** Git's empty tree: an added gitlink is measured from here to its pin, so every file in it reads as added. */
-const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+import { driveSync, diffTraversal, rangeTraversal, commonDiffArgs } from "./status-traversal.ts"
+import { repositoryRoot, runGit, validateExcludedSubmodules } from "./git.ts"
 
 export type ConsultedRepository = Readonly<{
   path: string
@@ -115,17 +98,9 @@ export type NotCompared = Readonly<{
   }>
 }>
 
-
-
 function nulFields(value: string): string[] {
   return value.split("\0").filter(Boolean)
 }
-
-
-
-
-
-
 
 type RecursiveNameStatusOptions = Readonly<{
   repo: string
@@ -146,7 +121,6 @@ type RecursiveNameStatusOptions = Readonly<{
  * over-selection 29363 removes.
  */
 
-
 export type RecursiveNameStatusResult = Readonly<{
   entries: readonly Readonly<{ path: string; status: string }>[]
   consultedRepositories: readonly ConsultedRepository[]
@@ -158,15 +132,14 @@ export type RecursiveNameStatusResult = Readonly<{
  * empty tree to its pin, so every file in it reads as added, as git's own --submodule=diff renders it (26972).
  */
 
-
 /** The submodule's own repository root, refusing an uninitialized checkout instead of resolving to the parent. */
-
 
 /** Parent-only frozen descriptors, using the existing raw-diff parser and graph-owned config join. */
 
-
 /** Internal recursive primitive shared by `diff` and `status`. */
-export function recursiveNameStatusDiff(options: RecursiveNameStatusOptions): RecursiveNameStatusResult { return driveSync(diffTraversal(options)) }
+export function recursiveNameStatusDiff(options: RecursiveNameStatusOptions): RecursiveNameStatusResult {
+  return driveSync(diffTraversal(options))
+}
 
 /**
  * The old endpoint a composed base gives a moved gitlink: the merge base of the pin the base ref records and the
@@ -174,7 +147,6 @@ export function recursiveNameStatusDiff(options: RecursiveNameStatusOptions): Re
  * one behind or equal to it measures nothing. No common history is a refusal — the branch pin is not a descendant
  * of anything the published main carries, and a guess in either direction would be silent.
  */
-
 
 function uniqueRepositories(repositories: readonly ConsultedRepository[]): ConsultedRepository[] {
   const seen = new Set<string>()
@@ -197,7 +169,9 @@ function uniqueRepositories(repositories: readonly ConsultedRepository[]): Consu
  * Omitted (never guessed) when the refs are not a clean two-endpoint pair: `--cached`,
  * a working-tree diff, 3+ ref args.
  */
-function rootRange(root: string, options: SuperDiffOptions): Readonly<{ from: string; to: string }> | undefined { return driveSync(rangeTraversal(root, options)) }
+function rootRange(root: string, options: SuperDiffOptions): Readonly<{ from: string; to: string }> | undefined {
+  return driveSync(rangeTraversal(root, options))
+}
 
 function entryRange(
   entry: ConsultedRepository,

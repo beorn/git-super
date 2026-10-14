@@ -3,7 +3,14 @@ import { isAbsolute, join, posix, resolve } from "node:path"
 import type { ConsultedRepository, NotCompared, SuperDiffOptions, RecursiveNameStatusResult } from "./diff.ts"
 import type { SuperStatusOptions, SuperStatusResult } from "./status.ts"
 import type { Git } from "./worktree.ts"
-import { gitError, inspectUninitializedCheckout, isSubmoduleExcluded, probeRepository, tryGit, validateExcludedSubmodules } from "./git.ts"
+import {
+  gitError,
+  inspectUninitializedCheckout,
+  isSubmoduleExcluded,
+  probeRepository,
+  tryGit,
+  validateExcludedSubmodules,
+} from "./git.ts"
 import { parseIndexEntries } from "./index-entries.ts"
 import { joinCommitSubmodules, parseCommitSubmoduleConfig, type CommitSubmodule } from "./commit-graph.ts"
 import { pinRef } from "./objects.ts"
@@ -28,11 +35,14 @@ function* discoverRoot(cwd: string): Traversal<string> {
   return (yield* gitText(cwd, ["rev-parse", "--show-toplevel"])).trim()
 }
 function* readIndexGitlinks(cwd: string, indexFile?: string) {
-  return parseIndexEntries(yield* gitText(cwd, ["ls-files", "--stage", "-z"], indexFile),
-    (field) => new Error("git super: malformed native index entry " + JSON.stringify(field) + "; reread ls-files --stage -z"))
+  return parseIndexEntries(
+    yield* gitText(cwd, ["ls-files", "--stage", "-z"], indexFile),
+    (field) =>
+      new Error("git super: malformed native index entry " + JSON.stringify(field) + "; reread ls-files --stage -z"),
+  )
     .filter((entry) => entry.mode === "160000")
-    .map((entry) => ({path: entry.path, indexPin: entry.stage === 0 ? entry.oid : undefined}))
-    .sort((a,b) => a.path.localeCompare(b.path))
+    .map((entry) => ({ path: entry.path, indexPin: entry.stage === 0 ? entry.oid : undefined }))
+    .sort((a, b) => a.path.localeCompare(b.path))
 }
 
 /** One traversal, native sync execution; transport faults end it rather than becoming exit data. */
@@ -41,30 +51,47 @@ export function driveSync<T>(traversal: Traversal<T>): T {
   while (!step.done) {
     try {
       const result = tryGit(step.value.cwd, [...step.value.args], step.value.indexFile)
-      step = traversal.next({status: result.exitCode, stdout: result.stdout, stderr: result.stderr})
+      step = traversal.next({ status: result.exitCode, stdout: result.stdout, stderr: result.stderr })
     } catch (error) {
       // A forced close discards the return value; it is never an observation.
-      try { traversal.return(undefined as never) } finally { throw error }
+      try {
+        traversal.return(undefined as never)
+      } finally {
+        throw error
+      }
     }
   }
   return step.value
 }
 /** Caller-owned async execution; each request carries its own index and explicit operation bound. */
-export async function driveAsync<T>(traversal: Traversal<T>, git: Pick<Git, "run">, timeoutMs: number): Promise<T> {
+async function driveAsync<T>(traversal: Traversal<T>, git: Pick<Git, "run">, timeoutMs: number): Promise<T> {
   let step = traversal.next()
   while (!step.done) {
     try {
       const request = step.value
-      const result = await git.run(request.cwd, request.args, true, timeoutMs,
-        request.indexFile === undefined ? undefined : {env: {GIT_INDEX_FILE: request.indexFile}})
-      step = traversal.next({status: result.code, stdout: result.stdout, stderr: result.stderr.trim()})
+      const result = await git.run(
+        request.cwd,
+        request.args,
+        true,
+        timeoutMs,
+        request.indexFile === undefined ? undefined : { env: { GIT_INDEX_FILE: request.indexFile } },
+      )
+      step = traversal.next({ status: result.code, stdout: result.stdout, stderr: result.stderr.trim() })
     } catch (error) {
-      try { traversal.return(undefined as never) } finally { throw error }
+      try {
+        traversal.return(undefined as never)
+      } finally {
+        throw error
+      }
     }
   }
   return step.value
 }
-export function statusWithGit(options: SuperStatusOptions, git: Pick<Git, "run">, timeoutMs: number): Promise<SuperStatusResult> {
+export function statusWithGit(
+  options: SuperStatusOptions,
+  git: Pick<Git, "run">,
+  timeoutMs: number,
+): Promise<SuperStatusResult> {
   return driveAsync(statusTraversal(options), git, timeoutMs)
 }
 
@@ -72,7 +99,7 @@ function nulFields(value: string): string[] {
   return value.split("\0").filter(Boolean)
 }
 
-export type RawDiffRow = Readonly<{
+type RawDiffRow = Readonly<{
   path: string
   status: string
   oldMode: string
@@ -81,7 +108,7 @@ export type RawDiffRow = Readonly<{
   newPin: string
 }>
 
-export function parseRawDiff(raw: string): RawDiffRow[] {
+function parseRawDiff(raw: string): RawDiffRow[] {
   const fields = nulFields(raw)
   const rows: RawDiffRow[] = []
   for (let index = 0; index < fields.length; index += 2) {
@@ -139,7 +166,7 @@ type RecursiveNameStatusOptions = Readonly<{
 }>
 
 function* recordedGitlink(root: string, ref: string, path: string): Traversal<string | undefined> {
-  const result = (yield* queryGit(root, ["ls-tree", "-z", ref, "--", path]))
+  const result = yield* queryGit(root, ["ls-tree", "-z", ref, "--", path])
   if (result.status !== 0) {
     throw new Error(
       `git super: --component-base ${ref} does not resolve in ${root}: ${result.stderr.trim() || `git ls-tree exited ${result.status}`}`,
@@ -176,8 +203,8 @@ function expandableGitlink(row: RawDiffRow, path: string): RawDiffRow {
 
 function* initializedCheckout(root: string, move: RawDiffRow, path: string, added: boolean): Traversal<string> {
   const directory = join(root, move.path)
-  const discovered = (yield* queryGit(directory, ["rev-parse", "--show-toplevel"]))
-  const prefix = discovered.status === 0 ? (yield* queryGit(directory, ["rev-parse", "--show-prefix"])) : undefined
+  const discovered = yield* queryGit(directory, ["rev-parse", "--show-toplevel"])
+  const prefix = discovered.status === 0 ? yield* queryGit(directory, ["rev-parse", "--show-prefix"]) : undefined
   const probe =
     discovered.status === 0 && prefix?.status === 0
       ? probeRepository(discovered.stdout.trim(), prefix.stdout)
@@ -194,7 +221,7 @@ function* comparisonSubmodules(root: string, options: SuperDiffOptions): Travers
   const selected = (yield* rangeTraversal(root, options))?.to ?? options.refs?.[0] ?? "HEAD"
   const frozen = (yield* gitText(root, ["rev-parse", `${selected}^{tree}`])).trim()
   const tree = parseRawDiff(
-    (yield* gitText(root, [
+    yield* gitText(root, [
       "diff",
       "--raw",
       "-z",
@@ -203,18 +230,18 @@ function* comparisonSubmodules(root: string, options: SuperDiffOptions): Travers
       "--ignore-submodules=dirty",
       EMPTY_TREE,
       frozen,
-    ])),
+    ]),
   )
   const gitlinks = new Map(tree.filter(({ newMode }) => newMode === "160000").map(({ path, newPin }) => [path, newPin]))
   if (gitlinks.size === 0) return new Map()
-  const configured = (yield* gitText(root, [
+  const configured = yield* gitText(root, [
     "config",
     "--null",
     "--blob",
     `${frozen}:.gitmodules`,
     "--get-regexp",
     "^submodule\\..*\\.(path|url|branch)$",
-  ]))
+  ])
   return new Map(
     joinCommitSubmodules(gitlinks, parseCommitSubmoduleConfig(configured, frozen), frozen).map((entry) => [
       entry.path,
@@ -224,7 +251,7 @@ function* comparisonSubmodules(root: string, options: SuperDiffOptions): Travers
 }
 
 export function* diffTraversal(options: RecursiveNameStatusOptions): Traversal<RecursiveNameStatusResult> {
-  const root = (yield* discoverRoot(options.repo))
+  const root = yield* discoverRoot(options.repo)
   const common = commonDiffArgs(options)
   const unfilteredOptions: SuperDiffOptions = {
     repo: options.repo,
@@ -232,11 +259,11 @@ export function* diffTraversal(options: RecursiveNameStatusOptions): Traversal<R
     ...(options.refs === undefined ? {} : { refs: options.refs }),
     ...(options.cached === true ? { cached: true } : {}),
   }
-  const filteredRows = parseRawDiff((yield* gitText(root, ["diff", "--raw", "-z", "--abbrev=40", ...common])))
+  const filteredRows = parseRawDiff(yield* gitText(root, ["diff", "--raw", "-z", "--abbrev=40", ...common]))
   const boundaryRows =
     options.diffFilter === undefined
       ? filteredRows
-      : parseRawDiff((yield* gitText(root, ["diff", "--raw", "-z", "--abbrev=40", ...commonDiffArgs(unfilteredOptions)])))
+      : parseRawDiff(yield* gitText(root, ["diff", "--raw", "-z", "--abbrev=40", ...commonDiffArgs(unfilteredOptions)]))
   const gitlinks = boundaryRows.filter((row) => row.oldMode === "160000" || row.newMode === "160000")
   const entries = filteredRows
     .filter((row) => row.oldMode !== "160000" && row.newMode !== "160000")
@@ -245,12 +272,12 @@ export function* diffTraversal(options: RecursiveNameStatusOptions): Traversal<R
   const notCompared: NotCompared[] = []
   const descriptors =
     options.excludedSubmodules?.length || gitlinks.some(({ newMode }) => newMode === "160000")
-      ? (yield* comparisonSubmodules(root, options))
+      ? yield* comparisonSubmodules(root, options)
       : new Map<string, CommitSubmodule>()
   if (options.excludedSubmodules?.length) {
     const working = !options.cached && (options.refs?.length ?? 0) <= 1 && !options.refs?.[0]?.includes("..")
     const candidates = working
-      ? (yield* readIndexGitlinks(root))
+      ? yield* readIndexGitlinks(root)
       : [...descriptors.values()].map(({ path, target }) => ({ path, indexPin: target }))
     for (const { path, indexPin } of candidates) {
       if (!working && !isSubmoduleExcluded(prefixPath(options.prefix, path), options.excludedSubmodules)) continue
@@ -287,24 +314,24 @@ export function* diffTraversal(options: RecursiveNameStatusOptions): Traversal<R
     const move = expandableGitlink(gitlink, prefixPath(options.prefix, gitlink.path))
     const isDirtySubmodule = move.oldPin === move.newPin
     const nestedPrefix = prefixPath(options.prefix, move.path)
-    const nestedRoot = (yield* initializedCheckout(root, move, nestedPrefix, gitlink.oldPin === ZERO_OID))
+    const nestedRoot = yield* initializedCheckout(root, move, nestedPrefix, gitlink.oldPin === ZERO_OID)
     // 29363: a composed base replaces the range's old endpoint with the pin the base ref records for this
     // component; a working-tree comparison (old == new) has no range to rebase.
     const recorded =
       options.componentBase === undefined || isDirtySubmodule
         ? undefined
-        : (yield* recordedGitlink(root, options.componentBase, gitlink.path))
+        : yield* recordedGitlink(root, options.componentBase, gitlink.path)
     const unreadable: { pin: string; result: StatusGitResult }[] = []
     for (const pin of new Set([move.oldPin, move.newPin, ...(recorded === undefined ? [] : [recorded])])) {
       if (pin === EMPTY_TREE || pin === ZERO_OID) continue
-      const result = (yield* queryGit(nestedRoot, ["cat-file", "-e", `${pin}^{commit}`]))
+      const result = yield* queryGit(nestedRoot, ["cat-file", "-e", `${pin}^{commit}`])
       if (result.status !== 0) unreadable.push({ pin, result })
     }
     if (unreadable.length > 0) {
       const descriptor = descriptors.get(move.path)
       const declaredUrl = descriptor?.url
       const relativeUrl = declaredUrl?.startsWith("./") || declaredUrl?.startsWith("../")
-      const parentOrigin = relativeUrl ? (yield* queryGit(root, ["remote", "get-url", "origin"])) : undefined
+      const parentOrigin = relativeUrl ? yield* queryGit(root, ["remote", "get-url", "origin"]) : undefined
       const url =
         declaredUrl === undefined || (relativeUrl && parentOrigin?.status !== 0)
           ? undefined
@@ -340,8 +367,9 @@ export function* diffTraversal(options: RecursiveNameStatusOptions): Traversal<R
       })
       continue
     }
-    const from = recorded === undefined ? move.oldPin : (yield* composedFrom(nestedRoot, nestedPrefix, recorded, move.newPin))
-    const nested = (yield* diffTraversal({
+    const from =
+      recorded === undefined ? move.oldPin : yield* composedFrom(nestedRoot, nestedPrefix, recorded, move.newPin)
+    const nested = yield* diffTraversal({
       repo: nestedRoot,
       ...(options.excludedSubmodules === undefined ? {} : { excludedSubmodules: options.excludedSubmodules }),
       prefix: nestedPrefix,
@@ -366,7 +394,7 @@ export function* diffTraversal(options: RecursiveNameStatusOptions): Traversal<R
               to: move.newPin,
             },
           }),
-    }))
+    })
     entries.push(...nested.entries)
     consultedRepositories.push(...nested.consultedRepositories)
     notCompared.push(...nested.notCompared)
@@ -376,7 +404,7 @@ export function* diffTraversal(options: RecursiveNameStatusOptions): Traversal<R
 }
 
 function* composedFrom(nestedRoot: string, path: string, recorded: string, newPin: string): Traversal<string> {
-  const result = (yield* queryGit(nestedRoot, ["merge-base", recorded, newPin]))
+  const result = yield* queryGit(nestedRoot, ["merge-base", recorded, newPin])
   if (result.status !== 0) {
     throw new Error(
       `git super: ${path} is pinned at ${newPin}, which shares no history with the pin ${recorded} the composed base records; nothing can be measured between them (${result.stderr.trim() || `git merge-base exited ${result.status}`})`,
@@ -385,7 +413,10 @@ function* composedFrom(nestedRoot: string, path: string, recorded: string, newPi
   return result.stdout.trim()
 }
 
-export function* rangeTraversal(root: string, options: SuperDiffOptions): Traversal<Readonly<{ from: string; to: string }> | undefined> {
+export function* rangeTraversal(
+  root: string,
+  options: SuperDiffOptions,
+): Traversal<Readonly<{ from: string; to: string }> | undefined> {
   const refs = options.refs ?? []
   if (refs.length === 2) {
     const [from, to] = refs
@@ -404,14 +435,14 @@ export function* rangeTraversal(root: string, options: SuperDiffOptions): Traver
 }
 
 function* headGitlinks(root: string): Traversal<Map<string, string>> {
-  const head = (yield* queryGit(root, ["rev-parse", "--verify", "--quiet", "HEAD"]))
+  const head = yield* queryGit(root, ["rev-parse", "--verify", "--quiet", "HEAD"])
   // An unborn repository has no HEAD tree; its indexed additions still remain explicit dirt.
   if (head.status === 1 && head.stderr === "") return new Map()
   if (head.status !== 0) {
     throw gitError(root, ["rev-parse", "--verify", "--quiet", "HEAD"], head.status, head.stderr)
   }
   const result = new Map<string, string>()
-  for (const field of nulFields((yield* gitText(root, ["ls-tree", "-r", "-z", "HEAD"])))) {
+  for (const field of nulFields(yield* gitText(root, ["ls-tree", "-r", "-z", "HEAD"]))) {
     const match = /^160000 commit ([0-9a-f]{40})\t(.+)$/u.exec(field)
     if (match?.[1] !== undefined && match[2] !== undefined) result.set(match[2], match[1])
   }
@@ -445,13 +476,13 @@ function* diffRecords(
   if (from === to) return { records: [], notCompared: [] }
   let result: RecursiveNameStatusResult
   try {
-    result = (yield* diffTraversal({
+    result = yield* diffTraversal({
       repo: root,
       prefix,
       refs: [`${from}..${to}`],
       consulted: { path: prefix, root, from, to },
       excludedSubmodules,
-    }))
+    })
   } catch (error) {
     // Comparison failed, but the selected checkout can still be consulted.
     // Preserve the exact query and failure as uncertainty, never clean status.
@@ -483,13 +514,13 @@ function* statusRepository(
   indexFile?: string,
   excludedSubmodules: readonly string[] = [],
 ): Traversal<SuperStatusResult> {
-  const gitlinks = (yield* readIndexGitlinks(root, indexFile))
+  const gitlinks = yield* readIndexGitlinks(root, indexFile)
   const indexed = new Map(gitlinks.map(({ path, indexPin }) => [path, indexPin]))
-  const head = (yield* headGitlinks(root))
+  const head = yield* headGitlinks(root)
   const paths = [...new Set([...head.keys(), ...indexed.keys()])].sort((left, right) => left.localeCompare(right))
   const checkedOutGitlinks = new Set<string>()
   const rootRecords = parsePorcelain(
-    (yield* gitText(
+    yield* gitText(
       root,
       [
         "--no-optional-locks",
@@ -502,11 +533,11 @@ function* statusRepository(
         "--ignore-submodules=all",
       ],
       indexFile,
-    )),
+    ),
   ).map((record) => prefixPorcelain(record, prefix))
   // --ignore-submodules=all suppresses staged pins too. Read the index without consulting child checkouts.
   const staged = nulFields(
-    (yield* gitText(
+    yield* gitText(
       root,
       [
         "diff",
@@ -517,7 +548,7 @@ function* statusRepository(
         excludedSubmodules.length ? "--ignore-submodules=dirty" : "--ignore-submodules=none",
       ],
       indexFile,
-    )),
+    ),
   )
   for (let index = 0; index < staged.length; index += 2) {
     const code = staged[index]
@@ -563,8 +594,8 @@ function* statusRepository(
         const pointer = /^gitdir: (.+)\r?\n?$/u.exec(readFileSync(metadata, "utf8").trim())?.[1]
         if (pointer !== undefined) gitDir = resolve(child, pointer)
       }
-      const nestedRoot = (yield* discoverRoot(child))
-      const probe = probeRepository(nestedRoot, (yield* gitText(child, ["rev-parse", "--show-prefix"])))
+      const nestedRoot = yield* discoverRoot(child)
+      const probe = probeRepository(nestedRoot, yield* gitText(child, ["rev-parse", "--show-prefix"]))
       if (childState.isSymbolicLink()) {
         submoduleProblems.push({
           kind: "repository-not-consulted",
@@ -586,7 +617,7 @@ function* statusRepository(
       const headPin = head.get(path)
       const indexPin = indexed.get(path)
       if (headPin !== undefined && indexPin !== undefined) {
-        const indexDiff = (yield* diffRecords(nestedRoot, headPin, indexPin, "index", nestedPrefix, excludedSubmodules))
+        const indexDiff = yield* diffRecords(nestedRoot, headPin, indexPin, "index", nestedPrefix, excludedSubmodules)
         const indexRecords = indexDiff.records
         for (const observation of indexDiff.notCompared) {
           notCompared.push(observation)
@@ -605,7 +636,7 @@ function* statusRepository(
         }
         if (indexPin !== checkoutPin) nestedRecords.push(` M ${nestedPrefix}`)
       }
-      const nested = (yield* statusRepository(
+      const nested = yield* statusRepository(
         nestedRoot,
         nestedPrefix,
         {
@@ -616,7 +647,7 @@ function* statusRepository(
         },
         undefined,
         excludedSubmodules,
-      ))
+      )
       nestedRecords.push(...nested.records)
       consultedRepositories.push(...nested.consultedRepositories)
       uninitializedSubmodules.push(...nested.uninitializedSubmodules)
@@ -652,7 +683,7 @@ function* statusRepository(
 
 export function* statusTraversal(options: SuperStatusOptions): Traversal<SuperStatusResult> {
   validateExcludedSubmodules(options.excludedSubmodules)
-  const root = (yield* discoverRoot(options.repo))
+  const root = yield* discoverRoot(options.repo)
   const indexFile = options.indexFile
   if (indexFile !== undefined) {
     if (!isAbsolute(indexFile)) throw new Error(`git super status: --index-file must be absolute: ${indexFile}`)
@@ -662,11 +693,11 @@ export function* statusTraversal(options: SuperStatusOptions): Traversal<SuperSt
       throw new Error(`git super status: --index-file is not a readable file: ${indexFile}`, { cause: error })
     }
   }
-  return (yield* statusRepository(
+  return yield* statusRepository(
     root,
     "",
     { path: ".", root, ...(indexFile === undefined ? {} : { indexFile }) },
     indexFile,
     options.excludedSubmodules,
-  ))
+  )
 }

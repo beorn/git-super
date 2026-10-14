@@ -1411,7 +1411,9 @@ describe("createGitWorktreeStore", () => {
     })
     try {
       await store.add({ kind: "detached", path: linked, ref: "HEAD" })
-      await expect(store.remove(linked)).rejects.toThrow(kind === "refusal" ? /supplied status port refused/u : /timed out/u)
+      await expect(store.remove(linked)).rejects.toThrow(
+        kind === "refusal" ? /supplied status port refused/u : /timed out/u,
+      )
       expect(reachedStatus).toBe(true)
       expect(existsSync(join(linked, "root.txt"))).toBe(true)
       expect(git(repo, ["worktree", "list", "--porcelain"])).toContain(`worktree ${linked}`)

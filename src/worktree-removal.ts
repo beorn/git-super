@@ -656,7 +656,10 @@ export async function inspectRemovalStatusWithGit(
   path: string,
   excludedSubmodules: readonly string[] = [],
 ): Promise<SuperStatusResult> {
-  return knownRemovalStatus(path, await statusWithGit({ repo: path, excludedSubmodules }, git, DEFAULT_REMOVAL_STATUS_TIMEOUT_MS))
+  return knownRemovalStatus(
+    path,
+    await statusWithGit({ repo: path, excludedSubmodules }, git, DEFAULT_REMOVAL_STATUS_TIMEOUT_MS),
+  )
 }
 
 function knownRemovalStatus(path: string, status: SuperStatusResult): SuperStatusResult {
@@ -753,7 +756,11 @@ async function cleanSnapshot(
         : excludedSubmodules
             .filter((excluded) => excluded.startsWith(`${prefix}/`))
             .map((excluded) => excluded.slice(prefix.length + 1))
-    const checked = await statusWithGit({ repo: entry.root, excludedSubmodules: localExclusions }, git, DEFAULT_REMOVAL_STATUS_TIMEOUT_MS)
+    const checked = await statusWithGit(
+      { repo: entry.root, excludedSubmodules: localExclusions },
+      git,
+      DEFAULT_REMOVAL_STATUS_TIMEOUT_MS,
+    )
     if (checked.submoduleProblems.length > 0) {
       throw new Error(
         `worktree ${entry.root} has unknown submodule state: ${checked.submoduleProblems.map((problem) => `${problem.path}: ${problem.reason}`).join("; ")}; preserve and resolve it before removal`,

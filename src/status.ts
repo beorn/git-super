@@ -1,19 +1,9 @@
 import { driveSync, statusTraversal } from "./status-traversal.ts"
-import { lstatSync, readFileSync, statSync } from "node:fs"
-import { isAbsolute, join, posix, resolve } from "node:path"
-import { recursiveNameStatusDiff, type ConsultedRepository, type NotCompared } from "./diff.ts"
+import { lstatSync } from "node:fs"
+import { join, resolve } from "node:path"
+import type { ConsultedRepository, NotCompared } from "./diff.ts"
 export type { ConsultedRepository } from "./diff.ts"
-import {
-  gitError,
-  indexGitlinks,
-  inspectUninitializedCheckout,
-  isSubmoduleExcluded,
-  probeRepository,
-  repositoryRoot,
-  runGit,
-  tryGit,
-  validateExcludedSubmodules,
-} from "./git.ts"
+import { inspectUninitializedCheckout, validateExcludedSubmodules } from "./git.ts"
 
 export type SuperStatusOptions = Readonly<{ repo: string; indexFile?: string; excludedSubmodules?: readonly string[] }>
 
@@ -85,16 +75,6 @@ export type SuperStatusResult = Readonly<{
   }>[]
 }>
 
-
-
-
-
-
-
-
-
-
-
-
-
-export function superStatus(options: SuperStatusOptions): SuperStatusResult { return driveSync(statusTraversal(options)) }
+export function superStatus(options: SuperStatusOptions): SuperStatusResult {
+  return driveSync(statusTraversal(options))
+}

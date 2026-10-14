@@ -21,7 +21,7 @@ import { ARCHIVE_REF_PREFIX } from "./archive-ref.ts"
 import {
   acquireRemovalWriterLeases,
   assertExcludedRemovalCustody,
-  inspectRemovalStatus,
+  inspectRemovalStatusWithGit,
   prepareRemovalBorrowers,
   rehomeBorrowers,
   retainWorktreeModules,
@@ -34,9 +34,8 @@ import { cleanGitEnvironment, probeRepository } from "./git.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
 import { createProgressReporter } from "./progress.ts"
 import { materializeSubmodulesWithProcess } from "./submodules.ts"
-import { superStatus, type SuperStatusResult } from "./status.ts"
+import type { SuperStatusResult } from "./status.ts"
 import { statusWithGit } from "./status-traversal.ts"
-import { inspectRemovalStatusWithGit } from "./worktree-removal.ts"
 import { removalBorrowers } from "./worktree-administration.ts"
 
 export type GitResult = Readonly<{ code: number; stdout: string; stderr: string }>
@@ -417,7 +416,8 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       branch?: string
       tip?: string
     }> = []
-    for (const entry of (await statusWithGit({ repo: path, excludedSubmodules: excluded }, git, timeouts.operation)).consultedRepositories) {
+    for (const entry of (await statusWithGit({ repo: path, excludedSubmodules: excluded }, git, timeouts.operation))
+      .consultedRepositories) {
       if (entry.path === ".") continue
       const child = realpathSync(entry.root)
       if (!within(path, child) || child === path) continue
