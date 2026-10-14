@@ -1,6 +1,7 @@
 import {
   copyFileSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
   realpathSync,
@@ -13,7 +14,7 @@ import {
 import { randomUUID } from "node:crypto"
 import { spawnSync } from "node:child_process"
 import { setTimeout as delay } from "node:timers/promises"
-import { appendFile, lstat, readFile } from "node:fs/promises"
+import { appendFile, lstat, readFile, writeFile } from "node:fs/promises"
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { fileURLToPath } from "node:url"
 import { createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS } from "./exclusive.ts"
@@ -950,13 +951,14 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
           )
         }
         const writerLeases = acquireRemovalWriterLeases(directory)
+        let releasedHold: { head: string; pointer: string; body: Uint8Array } | undefined
         try {
           if (retention === undefined) {
             rehomeBorrowers(common, directory, join(directory, "modules"))
           } else {
             const identity = await inspectWorktree(git, repo, path)
             const pointer = await readFile(join(directory, "gitdir"), "utf8")
-            const lock = identity.locked === undefined ? undefined : await readFile(join(directory, "locked"), "utf8")
+            const lock = identity.locked === undefined ? undefined : await readFile(join(directory, "locked"))
             const head = await git.text(repo, ["--git-dir", directory, "rev-parse", "--verify", "HEAD^{commit}"])
             await retainWorktreeModules(
               git,
@@ -981,19 +983,54 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
               current.locked !== identity.locked ||
               (await readFile(join(directory, "gitdir"), "utf8")) !== pointer ||
               (await git.text(repo, ["--git-dir", directory, "rev-parse", "--verify", "HEAD^{commit}"])) !== head ||
-              (lock !== undefined && (await readFile(join(directory, "locked"), "utf8")) !== lock)
+              (lock !== undefined && !lock.equals(await readFile(join(directory, "locked"))))
             ) {
               throw new Error(
                 `destroyed worktree ${path} identity or hold changed during retention; registration preserved`,
               )
             }
-            if (identity.locked !== undefined) await unlockWorktree(git, repo, path)
+            try {
+              lstatSync(path)
+              throw new Error(
+                `destroyed worktree ${path} checkout reappeared during retention; checkout and registration preserved`,
+              )
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+            }
+            if (lock !== undefined) {
+              releasedHold = { head, pointer, body: lock }
+              await unlockWorktree(git, repo, path)
+            }
           }
           await git.run(repo, ["worktree", "remove", "--force", path], false, timeouts.cleanup)
           if ((await inspectWorktree(git, repo, path)).registered) {
             throw new Error(`yrd: destroyed worktree '${path}' survived explicit recovery`)
           }
         } catch (error) {
+          if (releasedHold !== undefined) {
+            try {
+              const current = await inspectWorktree(git, repo, path)
+              if (
+                current.registered &&
+                current.head === releasedHold.head &&
+                (await readFile(join(directory, "gitdir"), "utf8")) === releasedHold.pointer
+              ) {
+                try {
+                  // Restore the captured hold atomically; a replacement holder wins, never gets overwritten.
+                  await writeFile(join(directory, "locked"), releasedHold.body, { flag: "wx" })
+                } catch (restoreError) {
+                  if ((restoreError as NodeJS.ErrnoException).code !== "EEXIST") throw restoreError
+                  // EEXIST proves another hold is already present; preserve it and still report removal failure.
+                }
+              }
+            } catch (restoreError) {
+              throw writerLeases.refusal(
+                new Error(`${String(error)}; original hold restoration failed: ${String(restoreError)}`, {
+                  cause: error,
+                }),
+              )
+            }
+          }
           throw writerLeases.refusal(error)
         } finally {
           writerLeases.release()
