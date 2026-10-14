@@ -28,6 +28,7 @@ import {
 import { verifyRetainedEntry, type RetentionVerifyOptions, type RetentionVerifyResult } from "./retention-verify.ts"
 import { compactRetainedRoot, type CompactRetainedRootReport } from "./retention-compact.ts"
 import { superWorktreeRemove, type SuperWorktreeRemoveOptions } from "./worktree-remove.ts"
+import { superBranchRetire, type SuperBranchRetireOptions, type SuperBranchRetireResult } from "./branch-retire.ts"
 
 export type CommandContext = Readonly<{ repo: string; report?: (message: string) => void }>
 export type DiffParams = Omit<SuperDiffOptions, "repo">
@@ -39,6 +40,7 @@ export type PushParams = Omit<SuperPushOptions, "repo" | "git" | "exclusive" | "
 export type GitlinkWriteParams = Omit<WriteGitlinkOptions, "repo" | "git">
 export type SubmodulePrepareParams = Omit<SuperSubmodulePrepareOptions, "repo" | "git" | "exclusive">
 export type WorktreeRemoveParams = Omit<SuperWorktreeRemoveOptions, "repo" | "report">
+export type BranchRetireParams = Omit<SuperBranchRetireOptions, "repo">
 export type WorktreeAddParams = Omit<SuperWorktreeAddOptions, "repo" | "env" | "log" | "report">
 export type RetentionVerifyParams = Omit<RetentionVerifyOptions, "clock">
 export type RetentionCompactParams = Readonly<{ root: string; dryRun?: boolean; limit?: number }>
@@ -437,6 +439,7 @@ const worktreeRemove = commandNode<CommandContext, WorktreeRemoveParams, GitSupe
         : {
             excludedSubmodules: stringArray(input.excludedSubmodules, "excludedSubmodules"),
           }),
+      ...(input.preserved === undefined ? {} : { preserved: stringArray(input.preserved, "preserved") }),
     }
   }),
   run: (context, input) =>
@@ -466,7 +469,48 @@ const privateStoreVerify = commandNode<CommandContext, PrivateStoreVerifyParams,
   run: (_context, input) => verifyPrivateStoreCandidate(input),
 })
 
+const branchRetire = commandNode<CommandContext, BranchRetireParams, SuperBranchRetireResult>({
+  title: "Retire a local branch whose exact tip is archived",
+  description:
+    "Delete refs/heads/<b> only while its archive ref reads back the branch's exact tip; refuse an unarchived, mismatched, absent or checked-out branch; --dry-run lists without writing.",
+  params: params(
+    (value) => {
+      const input = record(value)
+      if (typeof input.branch !== "string" || input.branch.trim() === "") {
+        throw new Error("branch retire requires a branch name")
+      }
+      if (typeof input.tip !== "string" || input.tip.trim() === "") {
+        throw new Error("branch retire requires --tip <commit>")
+      }
+      for (const field of ["archive", "actor", "date"] as const) {
+        if (input[field] !== undefined && typeof input[field] !== "string") {
+          throw new Error(`${field} must be a string`)
+        }
+      }
+      if (input.dryRun !== undefined && typeof input.dryRun !== "boolean") {
+        throw new Error("dryRun must be a boolean")
+      }
+      return {
+        branch: input.branch,
+        tip: input.tip,
+        ...(input.archive === undefined ? {} : { archive: input.archive as string }),
+        ...(input.actor === undefined ? {} : { actor: input.actor as string }),
+        ...(input.date === undefined ? {} : { date: input.date as string }),
+        ...(input.dryRun === true ? { dryRun: true } : {}),
+      }
+    },
+    (value) => {
+      const input = typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {}
+      return ["branch", "tip"].filter((name) => typeof input[name] !== "string")
+    },
+  ),
+  run: (context, input) => superBranchRetire({ repo: context.repo, ...input }),
+})
+
 export type GitSuperCommands = Readonly<{
+  branch: Readonly<{
+    retire: CommandNode<CommandContext, BranchRetireParams, SuperBranchRetireResult>
+  }>
   diff: CommandNode<CommandContext, DiffParams, SuperDiffResult>
   status: CommandNode<CommandContext, StatusParams, SuperStatusResult>
   "merge-base": CommandNode<CommandContext, MergeBaseParams, SuperIsAncestorResult>
@@ -493,6 +537,7 @@ export type GitSuperCommands = Readonly<{
 }>
 
 export const commands = defineCommandNodes({
+  branch: { retire: branchRetire },
   diff,
   status,
   "merge-base": mergeBase,

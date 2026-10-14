@@ -440,9 +440,28 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
   const mutate = async <Result>(holder: string, operation: () => Promise<Result>): Promise<Result> =>
     runWithMutationLock(await mutationLock(), holder, operation)
 
+  /**
+   * Why a worktree still holds this branch NAME, or undefined when none does.
+   * One predicate for both the retirement write and its dry run (28989): a dry
+   * run that disagreed with the write would be worse than no dry run at all.
+   */
+  const branchHolder = async (branch: string): Promise<string | undefined> => {
+    const ref = `refs/heads/${branch}`
+    for (const row of await listWorktrees(git, repo)) {
+      const operation = row.branch === undefined ? worktreeOperationBranch(row.path) : null
+      if (row.branch === ref || operation?.branch === branch) {
+        return `branch ${branch} is ${
+          operation === null ? "checked out" : `held by ${operation.operation}`
+        } at ${row.path}; keep it until the worktree releases it`
+      }
+    }
+    return undefined
+  }
+
   return Object.freeze({
     repo,
     git,
+    branchHolder,
     async ready(): Promise<void> {
       await mutationLock()
     },
@@ -517,6 +536,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         retention?: WorktreeRetention
         excludedSubmodules?: readonly string[]
         noRehome?: boolean
+        preserved?: readonly string[]
       }> = {},
     ): Promise<void | Readonly<{ borrowers: readonly string[] }> | Readonly<{ compaction: CompactionResult }>> {
       await assertRemovalRoot(path)
@@ -568,6 +588,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
               undefined,
               undefined,
               undefined,
+              removeOptions.preserved,
             )
           } else {
             if (removeOptions.unlock === true) await unlockWorktree(git, repo, path)
@@ -750,14 +771,8 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
           throw new Error(`branch ${branch}: custody ref ${archiveRef} is outside ${ARCHIVE_REF_PREFIX}/`)
         }
         const ref = `refs/heads/${branch}`
-        for (const row of await listWorktrees(git, repo)) {
-          const operation = row.branch === undefined ? worktreeOperationBranch(row.path) : null
-          if (row.branch === ref || operation?.branch === branch) {
-            throw new Error(
-              `branch ${branch} is ${operation === null ? "checked out" : `held by ${operation.operation}`} at ${row.path}; keep it until the worktree releases it`,
-            )
-          }
-        }
+        const held = await branchHolder(branch)
+        if (held !== undefined) throw new Error(held)
         await git.run(
           repo,
           ["-c", "core.fsync=loose-object,reference", "-c", "core.fsyncMethod=fsync", "update-ref", "--stdin"],

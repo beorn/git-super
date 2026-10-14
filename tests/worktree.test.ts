@@ -1637,6 +1637,20 @@ describe("createGitWorktreeStore", () => {
     await writeFile(join(subWork, "sub.txt"), "sub content\n")
     git(subWork, ["add", "sub.txt"])
     git(subWork, ["commit", "-q", "-m", "init sub"])
+    const nested = join(root, "nested")
+    const nestedCommit = createRepository(nested, "nested.txt", "nested content\n")
+    git(subWork, [
+      "-c",
+      "protocol.file.allow=always",
+      "submodule",
+      "add",
+      "-q",
+      "--name",
+      "hooks/nested",
+      nested,
+      "nested",
+    ])
+    git(subWork, ["commit", "-q", "-am", "add nested borrower"])
     git(subWork, ["push", "-q", "origin", "main"])
 
     git(root, ["init", "-q", "-b", "main", repo])
@@ -1645,8 +1659,19 @@ describe("createGitWorktreeStore", () => {
     await writeFile(join(repo, "root.txt"), "root\n")
     git(repo, ["add", "root.txt"])
     git(repo, ["commit", "-q", "-m", "init root"])
-    git(repo, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", subRemote, "vendor/sub"])
+    git(repo, [
+      "-c",
+      "protocol.file.allow=always",
+      "submodule",
+      "add",
+      "-q",
+      "--name",
+      "refs/sub",
+      subRemote,
+      "vendor/sub",
+    ])
     git(repo, ["commit", "-q", "-m", "add submodule"])
+    git(repo, ["-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive"])
 
     try {
       const store = createLocalGitWorktreeStore({ repo })
@@ -1668,20 +1693,28 @@ describe("createGitWorktreeStore", () => {
 
       await store.add({ kind: "detached", path: borrower, ref: "HEAD" })
       const borrowerSub = join(borrower, "vendor/sub")
-      const lenderSubAdmin = join(repo, ".git", "worktrees", "lender", "modules", "vendor/sub")
-      const borrowerSubAdmin = join(repo, ".git", "worktrees", "borrower", "modules", "vendor/sub")
-      const durableSubObjects = join(repo, ".git", "modules", "vendor/sub", "objects")
+      const lenderSubAdmin = join(repo, ".git", "worktrees", "lender", "modules", "refs/sub")
+      const borrowerSubAdmin = join(repo, ".git", "worktrees", "borrower", "modules", "refs/sub")
+      const durableSubObjects = join(repo, ".git", "modules", "refs/sub", "objects")
       const lenderSubObjects = join(lenderSubAdmin, "objects")
 
       await store.materializeSubmodules(borrower)
       const altFile = join(borrowerSubAdmin, "objects", "info", "alternates")
       await writeFile(altFile, `${lenderSubObjects}\n${durableSubObjects}\n`, "utf8")
+      const nestedAdmin = join(borrowerSubAdmin, "modules", "hooks/nested")
+      const nestedAlternates = join(nestedAdmin, "objects/info/alternates")
+      await writeFile(nestedAlternates, `${join(lenderSubAdmin, "modules/hooks/nested/objects")}\n`, "utf8")
 
       git(borrowerSub, ["update-ref", "refs/heads/main", lenderCommit])
       git(borrowerSub, ["symbolic-ref", "HEAD", "refs/heads/main"])
 
       expect(git(borrowerSub, ["cat-file", "-t", lenderCommit]).trim()).toBe("commit")
 
+      // 28823: dependency inspection must descend through a namespace called refs,
+      // but never enumerate the Git store's refs/logs/hooks. Object-read assertions
+      // alone pass while irrelevant metadata makes every writer wait.
+      for (const name of ["refs", "logs", "hooks"]) await mkdir(join(borrowerSubAdmin, name), { recursive: true })
+      vi.mocked(readdirSync).mockClear()
       await store.remove(lender, {
         retention: {
           root: retainedDir,
@@ -1690,6 +1723,13 @@ describe("createGitWorktreeStore", () => {
       })
       expect(existsSync(lender)).toBe(false)
       expect(existsSync(lenderSubAdmin)).toBe(false)
+
+      const visited = new Set(vi.mocked(readdirSync).mock.calls.map(([path]) => String(path)))
+      expect(visited.has(join(borrowerSubAdmin, "objects", "info"))).toBe(true)
+      expect(visited.has(join(nestedAdmin, "objects", "info"))).toBe(true)
+      expect(await readFile(nestedAlternates, "utf8")).toBe("")
+      expect(git(join(borrowerSub, "nested"), ["cat-file", "-t", nestedCommit]).trim()).toBe("commit")
+      for (const name of ["refs", "logs", "hooks"]) expect(visited.has(join(borrowerSubAdmin, name)), name).toBe(false)
 
       const fsck = spawnSync("git", ["-C", borrowerSub, "fsck", "--full"], { encoding: "utf8" })
       expect(fsck.status).toBe(0)
@@ -1839,6 +1879,13 @@ describe("createGitWorktreeStore", () => {
     const fs = await import("node:fs")
     const originalCopy = fs.copyFileSync
     const originalRename = fs.renameSync
+    // When both recognisers fail the store warns that the recovery record is UNMARKED.
+    // Capture that one line and assert it below; a marker-only failure recovers through the
+    // name suffix and stays silent. spyOn works under both supported runners:
+    // under the root harness it reuses the setup spy (which otherwise fails the test on any
+    // output); under git-super own config it makes a real spy. Every other case keeps
+    // whatever spy its runner installs, so stray output still fails.
+    const warnMock = markerFails ? vi.spyOn(console, "warn").mockImplementation(() => {}) : null
     let stagingPath: string | undefined
     try {
       const repo = join(root, "repo")
@@ -1912,15 +1959,19 @@ describe("createGitWorktreeStore", () => {
           expect((error as Error).message).toContain("injected marker write failure")
           if (fallbackFails) {
             // Both recognisers failed, so the one error the caller holds must say the record
-            // is unmarked and will be reclaimed as leftover (#28906).
+            // is unmarked and will be reclaimed as leftover, on its own channel too (#28906).
             expect((error as Error).message).toMatch(/UNMARKED/)
             expect((error as Error).message).toContain("injected suffix fallback failure")
+            expect(warnMock).toHaveBeenCalledTimes(1)
+            expect(warnMock).toHaveBeenCalledWith(expect.stringContaining("name-suffix fallback failed"))
           } else {
             // The marker write failed but the record stays recognisable to the sweep through
-            // its existing name-suffix contract, so recovery survives (#28906 REVISE).
+            // its existing name-suffix contract, so recovery survives and nothing is reclaimed
+            // as leftover: no UNMARKED text, and no warning (#28906 REVISE).
             expect(existsSync(stagingPath!)).toBe(false)
             expect((error as Error).message).toContain(".restore-failed' name suffix")
             expect((error as Error).message).not.toMatch(/UNMARKED/)
+            expect(warnMock).not.toHaveBeenCalled()
           }
         } else {
           // The retained staging directory must carry the recovery marker so the clean-root
@@ -1934,6 +1985,10 @@ describe("createGitWorktreeStore", () => {
       }
     } finally {
       await rm(root, { recursive: true, force: true })
+      // Restore the console spy only after the assertions above have read its calls:
+      // mockRestore clears the call history, so restoring it in the inner finally made
+      // the once-check read zero.
+      warnMock?.mockRestore()
     }
   })
 

@@ -2,6 +2,7 @@ import type { CommandNode } from "@silvery/command"
 import { constants as osConstants } from "node:os"
 import {
   type commands,
+  type BranchRetireParams,
   type CommandContext,
   type DiffParams,
   type GitlinkWriteParams,
@@ -27,6 +28,7 @@ import type { CompactRetainedRootReport } from "./retention-compact.ts"
 import type { PrivateStoreCandidateResult } from "./private-store-candidate.ts"
 import type { SuperStatusResult } from "./status.ts"
 import type { SuperSubmodulePrepareResult } from "./submodule-prepare.ts"
+import type { SuperBranchRetireResult } from "./branch-retire.ts"
 import { delegateNativeGit, readNativeGit, type ProcessOutputSink } from "./process.ts"
 import { openInvocationProtocol, type InvocationProtocol } from "./protocol.ts"
 import { isAbsolute } from "node:path"
@@ -55,6 +57,7 @@ type CapturedInvocation =
   | Readonly<{ node: typeof commands.gitlink.write; params: GitlinkWriteParams; json: boolean; nul: boolean }>
   | Readonly<{ node: typeof commands.submodule.prepare; params: SubmodulePrepareParams; json: boolean; nul: boolean }>
   | Readonly<{ node: typeof commands.worktree.add; params: WorktreeAddParams; json: boolean; nul: boolean }>
+  | Readonly<{ node: typeof commands.branch.retire; params: BranchRetireParams; json: boolean; nul: boolean }>
   | Readonly<{ node: typeof commands.worktree.remove; params: WorktreeRemoveParams; json: boolean; nul: boolean }>
   | Readonly<{
       node: typeof commands.worktree.retention.verify
@@ -113,6 +116,7 @@ async function commandResult(
   | RetentionVerifyResult
   | CompactRetainedRootReport
   | PrivateStoreCandidateResult
+  | SuperBranchRetireResult
   | GitSuperResult
 > {
   const { resolveInvocation } = await import("@silvery/command")
@@ -127,6 +131,7 @@ async function commandResult(
       | SuperSubmodulePrepareResult
       | RetentionVerifyResult
       | PrivateStoreCandidateResult
+      | SuperBranchRetireResult
       | GitSuperResult
     >,
     context,
@@ -138,8 +143,12 @@ async function commandResult(
 
 // Only these existing operations interpret superproject topology. Ordinary Git
 // commands are delegated by default; there is no registry of native commands.
-const ENRICHED_COMMANDS = new Set(["diff", "status", "merge-base", "merge", "pull", "push", "worktree"])
+const ENRICHED_COMMANDS = new Set(["branch", "diff", "status", "merge-base", "merge", "pull", "push", "worktree"])
 const OWNED_WORKTREE_SUBCOMMANDS = new Set(["add", "remove", "retention", "private-store"])
+// `branch` is also a native Git command, so only the forms git-super owns are
+// enriched — `retire` and this command's own help; every other form
+// (`git super branch -a`, `--list`, `--merged`, …) still delegates to native Git.
+const OWNED_BRANCH_SUBCOMMANDS = new Set(["retire", "-h", "--help"])
 
 function inputObjects(command: string, args: readonly string[]): readonly { argument: string; object: string }[] {
   if (command === "status") return []
@@ -204,12 +213,64 @@ function inputObjects(command: string, args: readonly string[]): readonly { argu
   )
 }
 
+/**
+ * The tree a `status` caller named with a bare path argument. `status` declares no
+ * positional, so a path here is the caller naming the tree they meant - not a
+ * pathspec. The refusal's cure reads it so the named command addresses THAT tree
+ * instead of the CWD repo (28962). Returns undefined when no path was given; the
+ * value options that DO take a following word are skipped whole.
+ */
+function statusPathArgument(args: readonly string[]): string | undefined {
+  const valueOptions = new Set(["--exclude-submodule", "--index-file"])
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index]
+    if (argument === undefined) continue
+    if (argument.startsWith("-")) {
+      if (valueOptions.has(argument)) index += 1
+      continue
+    }
+    return argument
+  }
+  return undefined
+}
+
+/**
+ * The absolute work tree a `status` caller's path names - but only when that path
+ * IS a work tree root. --repo <path> refuses a subdirectory ('is not a worktree
+ * root; its git dir resolves to the parent repository'), so naming one prints a
+ * cure that cannot run; a file or an empty directory is the same (@cto, @dev/12,
+ * 28962). The probe runs THROUGH the caller's own globals, so a relative path
+ * resolves against the directory the implicit git context already uses, and the
+ * cure prints the absolute toplevel the explicit call needs.
+ */
+async function namesRepositoryPath(globals: readonly string[], path: string | undefined): Promise<string | undefined> {
+  if (path === undefined) return undefined
+  const probe = await readNativeGit([...globals, "-C", path, "rev-parse", "--show-toplevel", "--show-prefix"])
+  if (probe.code !== 0) return undefined
+  const [toplevel, prefix] = probe.stdout.split("\n")
+  if (toplevel === undefined || (prefix ?? "").trim() !== "") return undefined
+  return toplevel.trim()
+}
+
 async function enrichedInvocation(argv: readonly string[]): Promise<readonly string[] | undefined> {
   // Explicit extension calls retain their existing parser and result contract.
+  // The gate below refuses the IMPLICIT form, where gitlinks make the answer
+  // ambiguous. commander accepts the global --repo AFTER its subcommand, so
+  // `status --repo <path>` is an explicit call; reading --repo only at argv[0], it
+  // was judged against the CWD and refused with a cure for the wrong tree (28962).
+  // A leading native Git global (-C, --no-pager, ...) must never reach commander,
+  // so --repo counts as explicit only when the argv opens with the subcommand.
+  // Tokens after `--` are operands: a diff pathspec named --repo is not the option.
+  const endOfOptions = argv.indexOf("--")
+  const beforeOperands = endOfOptions === -1 ? argv : argv.slice(0, endOfOptions)
+  const namesRepository =
+    argv[0] === "--repo" ||
+    argv[0]?.startsWith("--repo=") === true ||
+    (ENRICHED_COMMANDS.has(argv[0] ?? "") &&
+      beforeOperands.some((argument) => argument === "--repo" || argument.startsWith("--repo=")))
   if (
     argv.length === 0 ||
-    argv[0] === "--repo" ||
-    argv[0]?.startsWith("--repo=") ||
+    namesRepository ||
     argv[0] === "--json" ||
     argv[0]?.startsWith("--object-directory") ||
     argv[0]?.startsWith("--alternate-object-directory")
@@ -259,6 +320,10 @@ async function enrichedInvocation(argv: readonly string[]): Promise<readonly str
     if (!OWNED_WORKTREE_SUBCOMMANDS.has(argv[commandIndex + 1] ?? "")) return undefined
     return argv
   }
+  if (command === "branch") {
+    if (!OWNED_BRANCH_SUBCOMMANDS.has(argv[commandIndex + 1] ?? "")) return undefined
+    return argv
+  }
   const globals = argv.slice(0, commandIndex)
   const bare = await readNativeGit([...globals, "rev-parse", "--is-bare-repository"])
   if (bare.code !== 0 || !["true\n", "false\n"].includes(bare.stdout)) {
@@ -271,9 +336,16 @@ async function enrichedInvocation(argv: readonly string[]): Promise<readonly str
   ])
   if (root.code !== 0) throw new Error(`git-super: cannot locate repository for ${argv.join(" ")}\n${root.stderr}`)
   const repo = root.stdout.trim()
+  // The refusal's cure must name a tree that actually works: the work tree the
+  // caller's path names when that path is one, else the CWD repo. It named the CWD
+  // repo unconditionally, so a sweep reading a yrd environment got a cure for
+  // /hh/dev - a tree it did not ask about - and the path was dropped without a word
+  // (28962).
+  const statusPath = command === "status" ? statusPathArgument(argv.slice(commandIndex + 1)) : undefined
+  const cure = (await namesRepositoryPath(globals, statusPath)) ?? repo
   const refuse = (reason: string) =>
     new Error(
-      `git-super: ${command}: ${reason}. Use the explicit git-super --repo ${repo} interface; implicit superproject operation contracts are not yet supported.`,
+      `git-super: ${command}: ${reason}. Use the explicit git-super --repo ${cure} interface; implicit superproject operation contracts are not yet supported.`,
     )
   let objects: readonly { argument: string; object: string }[]
   try {
@@ -575,6 +647,57 @@ async function runInvocation(
       }
     })
 
+  const branch = program
+    .command("branch")
+    .description("Retire local branch names whose exact commit is archived")
+    .addHelpText(
+      "after",
+      "\nOnly `branch retire` is git-super's; every other form (`branch -a`, `--list`, `--merged`, …) delegates to native Git.\n",
+    )
+    .allowExcessArguments()
+    .action((_options, command) => {
+      const subcommand = command.args[0]
+      usage =
+        (subcommand === undefined
+          ? "git-super: branch needs a subcommand\n"
+          : `git-super: unknown branch subcommand '${subcommand}'\n`) + command.helpInformation()
+    })
+  branch
+    .command("retire")
+    .description(commands.branch.retire.description ?? commands.branch.retire.title)
+    .requiredOption("--tip <commit>", "the branch's exact full commit; an advanced branch is kept")
+    .option(
+      "--archive <ref>",
+      "the archive ref whose readback must equal --tip (defaults to the canonical refs/archive/<date>/<actor>/<branch>)",
+    )
+    .option("--actor <seat>", "actor segment for the canonical archive ref; required when --archive is absent")
+    .option("--date <yyyy-mm-dd>", "UTC date for the canonical archive ref; defaults to today")
+    .option("--dry-run", "list the retirement without writing")
+    .argument("<branch>", "local branch name to retire")
+    .action((branchName, options, command) => {
+      const globals = command.optsWithGlobals() as { repo: string; json?: boolean }
+      const opts = command.opts() as {
+        tip: string
+        archive?: string
+        actor?: string
+        date?: string
+        dryRun?: boolean
+      }
+      captured = {
+        node: commands.branch.retire,
+        params: {
+          branch: branchName,
+          tip: opts.tip,
+          ...(opts.archive === undefined ? {} : { archive: opts.archive }),
+          ...(opts.actor === undefined ? {} : { actor: opts.actor }),
+          ...(opts.date === undefined ? {} : { date: opts.date }),
+          ...(opts.dryRun === true ? { dryRun: true } : {}),
+        },
+        json: globals.json === true,
+        nul: false,
+      }
+    })
+
   const worktree = program
     .command("worktree")
     .description("Create worktrees that carry a superproject's submodules")
@@ -632,12 +755,19 @@ async function runInvocation(
       (value: string, previous: string[]) => [...previous, value],
       [],
     )
+    .option(
+      "--preserved <ref>",
+      "admit a dirty store for removal only against a ref (comma-separated, repeatable) that resolves to a commit in that same store",
+      (value: string, previous: string[]) => [...previous, ...value.split(",").filter((ref) => ref !== "")],
+      [],
+    )
     .argument("<path>", "registered clean worktree to remove")
     .action((path, _options, command) => {
       const globals = command.optsWithGlobals() as { repo: string; json?: boolean }
       const options = command.opts() as {
         retain: string
         excludeSubmodule?: string[]
+        preserved?: string[]
         rehome: boolean
       }
       captured = {
@@ -647,6 +777,7 @@ async function runInvocation(
           retain: options.retain,
           ...(options.rehome === false ? { noRehome: true } : {}),
           ...(options.excludeSubmodule?.length ? { excludedSubmodules: options.excludeSubmodule } : {}),
+          ...(options.preserved?.length ? { preserved: options.preserved } : {}),
         },
         json: globals.json === true,
         nul: false,
@@ -879,6 +1010,7 @@ async function runInvocation(
     | RetentionVerifyResult
     | CompactRetainedRootReport
     | PrivateStoreCandidateResult
+    | SuperBranchRetireResult
     | GitSuperResult
   try {
     let objects: GitObjectContext | undefined
@@ -972,6 +1104,7 @@ async function runInvocation(
     captured.node === commands.gitlink.write ||
     captured.node === commands.submodule.prepare ||
     captured.node === commands.worktree.add ||
+    captured.node === commands.branch.retire ||
     captured.node === commands.worktree.remove
   ) {
     const operation = result as GitSuperResult
@@ -1123,6 +1256,11 @@ async function writeResult(
     for (const reason of candidate.reasons) stdout.write(`${reason.code}: ${reason.message}\n`)
     stdout.write(`${candidate.notCovered}\n`)
     for (const path of candidate.paths) stdout.write(`${path}\n`)
+  } else if (captured.node === nodes.branch.retire) {
+    const retire = result as SuperBranchRetireResult
+    stdout.write(
+      `${retire.dryRun ? "would-retire" : "retired"} ${retire.branch} ${retire.tip} ${retire.archiveRef} ${retire.time}\n`,
+    )
   } else {
     const pull = result as GitSuperResult
     stdout.write(`${pull.state}\n`)
