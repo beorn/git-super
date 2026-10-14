@@ -5,13 +5,100 @@
  * @testonly none
  */
 import { existsSync } from "node:fs"
-import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { describe, expect, it } from "vitest"
+import { tryAcquireFlock } from "@bearly/flock"
+import { createGitWorktreeStore } from "../src/worktree.ts"
+import { createLocalGitProcess } from "../src/process.ts"
 import { superWorktreeRemove } from "../src/worktree-remove.ts"
 import { addNestedAlphaSubmodule, canonicalTmpdir, createProductFixture, createRepository, git } from "./fixture.ts"
 
 describe("git-super worktree remove of a vendor component worktree (28393)", () => {
+  /**
+   * @failure Root removal leaves linked child registrations behind or hides partial cleanup failures (29340).
+   * @level l1 @consumer every Git Super root remover, including Yrd native environment close
+   * The Yrd journey proves ref/copy custody; this table owns nested native registration and failure sequencing.
+   */
+  it.each(["released", "held", "rebound", "failed", "post-remove-failed"] as const)(
+    "cleans only destroyed nested registrations after root removal: %s",
+    async (mode) => {
+      const root = await mkdtemp(join(canonicalTmpdir(), "git-super-nested-release-"))
+      let lease: ReturnType<typeof tryAcquireFlock> | undefined
+      try {
+        const fixture = addNestedAlphaSubmodule(createProductFixture(root))
+        const target = join(root, "target")
+        git(fixture.product, "worktree", "add", "--detach", target)
+        const alpha = join(target, "packages/alpha")
+        const leaf = join(alpha, "apps/maddoc")
+        git(fixture.alpha, "worktree", "add", "-b", "task/child", alpha, "HEAD")
+        git(fixture.leaf, "worktree", "add", "-b", "task/leaf", leaf, "HEAD")
+        const leafAdmin = git(leaf, "rev-parse", "--absolute-git-dir")
+        const leafTip = git(leaf, "rev-parse", "HEAD")
+        const pointer = await Bun.file(join(leaf, ".git")).text()
+        if (mode === "held") {
+          const directory = join(leafAdmin, "yrd-worktree-mutations")
+          await mkdir(directory, { recursive: true })
+          lease = tryAcquireFlock(join(directory, "writer.lock"), { body: "native child holder" })
+          expect(lease).not.toBeNull()
+        }
+        const local = createLocalGitProcess()
+        let rootRemoved = false
+        let rebound = false
+        const store = createGitWorktreeStore({
+          repo: fixture.product,
+          gitProcess: {
+            async run(request) {
+              const removing = request.args.includes("worktree") && request.args.includes("remove")
+              if (mode === "failed" && removing && request.args.includes(leaf)) {
+                return { code: 1, stdout: "", stderr: "fixture child cleanup failure" }
+              }
+              const result = await local.run(request)
+              if (mode === "post-remove-failed" && removing && request.args.includes(leaf) && result.code === 0) {
+                throw new Error("fixture failed after child removal")
+              }
+              if (removing && request.args.includes(target) && result.code === 0) rootRemoved = true
+              if (mode === "rebound" && rootRemoved && !rebound && request.args.includes("list")) {
+                rebound = true
+                await mkdir(leaf, { recursive: true })
+                await writeFile(join(leaf, ".git"), pointer)
+                await writeFile(join(leaf, "rebound.txt"), "new checkout owner\n")
+              }
+              return result
+            },
+          },
+        })
+        const outcome = await store.remove(target).then(
+          () => ({ ok: true, error: "" }),
+          (cause: unknown) => ({ ok: false, error: String(cause) }),
+        )
+        expect(existsSync(join(target, ".git"))).toBe(false)
+        expect((await store.inspect(target)).registered).toBe(false)
+        const leafRegistered = git(fixture.leaf, "worktree", "list", "--porcelain").includes(`worktree ${leaf}\n`)
+        if (mode === "released") {
+          expect(outcome).toEqual({ ok: true, error: "" })
+          expect(leafRegistered).toBe(false)
+          expect(git(fixture.alpha, "worktree", "list", "--porcelain")).not.toContain(`worktree ${alpha}\n`)
+        } else {
+          expect(outcome.ok).toBe(false)
+          expect(outcome.error).toContain("root removed; child")
+          expect(outcome.error).toContain(leaf)
+          expect(outcome.error).toContain("recoverDestroyed")
+          expect(leafRegistered).toBe(mode !== "post-remove-failed")
+          if (mode === "post-remove-failed") expect(outcome.error).toContain("registration removed; cleanup incomplete")
+          if (mode === "held") expect(outcome.error).toContain("native child holder")
+          if (mode === "failed") expect(outcome.error).toContain("fixture child cleanup failure")
+          if (mode === "rebound") expect(await Bun.file(join(leaf, "rebound.txt")).text()).toBe("new checkout owner\n")
+        }
+        expect(git(fixture.leaf, "rev-parse", "refs/heads/task/leaf")).toBe(leafTip)
+      } finally {
+        lease?.release()
+        // raw-delete-allow: this row's isolated mkdtemp fixture, never an authored checkout
+        await rm(root, { recursive: true, force: true })
+      }
+    },
+  )
+
   it("retires a clean linked worktree registered only in the submodule gitdir", async () => {
     const root = await mkdtemp(join(canonicalTmpdir(), "git-super-component-remove-"))
     try {
