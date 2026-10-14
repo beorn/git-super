@@ -261,6 +261,7 @@ describe("createGitWorktreeStore", () => {
         const manifest = JSON.parse(await readFile(proofs[0]!.manifest, "utf8")) as { checkout?: string }
         expect(manifest.checkout).toBe("absent")
       } finally {
+        // raw-delete-allow: root is this test's fresh mkdtemp fixture, never a caller-supplied checkout or Git store.
         await rm(root, { recursive: true, force: true })
       }
     },
