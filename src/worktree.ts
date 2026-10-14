@@ -34,7 +34,7 @@ import { cleanGitEnvironment, probeRepository } from "./git.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
 import { createProgressReporter } from "./progress.ts"
 import { materializeSubmodulesWithProcess } from "./submodules.ts"
-import type { SuperStatusResult } from "./status.ts"
+import { superStatus, type SuperStatusResult } from "./status.ts"
 import { removalBorrowers } from "./worktree-administration.ts"
 
 export type GitResult = Readonly<{ code: number; stdout: string; stderr: string }>
@@ -399,6 +399,53 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       notCompared: [...custody.notCompared, ...rehome.notCompared],
     }
   }
+  // Reuse removal's consulted population: native children can belong to independent
+  // stores even though their checkouts die with the root directory.
+  const captureLinkedChildren = async (path: string, rootGitDir: string, excluded: readonly string[]) => {
+    const within = (parent: string, child: string) => {
+      const local = relative(parent, child)
+      return local === "" || (local !== ".." && !local.startsWith(`..${sep}`) && !isAbsolute(local))
+    }
+    const children: Array<{
+      path: string
+      common: string
+      admin: string
+      pointer: string
+      primary: string
+      branch?: string
+      tip?: string
+    }> = []
+    for (const entry of superStatus({ repo: path, excludedSubmodules: excluded }).consultedRepositories) {
+      if (entry.path === ".") continue
+      const child = realpathSync(entry.root)
+      if (!within(path, child) || child === path) continue
+      const admin = realpathSync(await git.text(child, ["rev-parse", "--absolute-git-dir"]))
+      const common = realpathSync(await git.text(child, ["rev-parse", "--path-format=absolute", "--git-common-dir"]))
+      if (admin === common || within(path, common) || within(rootGitDir, common)) continue
+      const rows = await listWorktrees(git, common)
+      const registered = rows.find((row) => row.path === child)
+      const primaryRow = rows[0]
+      if (registered === undefined || primaryRow === undefined) {
+        throw new Error(`linked child ${child} has no exact native registration in ${common}`)
+      }
+      // A bare store appears as its own worktree-list row. It is a valid
+      // independent primary for recovery, but has no worktree top-level.
+      const primary =
+        primaryRow.path === common
+          ? common
+          : realpathSync(await git.text(primaryRow.path, ["rev-parse", "--show-toplevel"]))
+      if (within(path, primary) || within(rootGitDir, primary)) continue
+      if (realpathSync(await git.text(primary, ["rev-parse", "--absolute-git-dir"])) !== common) {
+        throw new Error(`linked child ${child} has no independent primary for ${common}`)
+      }
+      const pointer = resolve(admin, (await readFile(join(admin, "gitdir"), "utf8")).trim())
+      if (pointer !== join(child, ".git")) {
+        throw new Error(`linked child ${child} has mismatched administration backpointer ${pointer}`)
+      }
+      children.push({ path: child, common, admin, pointer, primary, branch: registered.branch, tip: registered.head })
+    }
+    return children.sort((a, b) => b.path.length - a.path.length)
+  }
   const runWithMutationLock = async <Result>(
     dir: string,
     holder: string,
@@ -546,6 +593,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       let borrowed: Readonly<{ borrowers: readonly string[] }> | undefined
       let removalProof: WorktreeRemovalProof | undefined
       let compaction: CompactionResult | undefined
+      let children: Awaited<ReturnType<typeof captureLinkedChildren>> = []
       await mutate(removeOptions.operation ?? `worktree remove ${path}`, async () => {
         if (removeOptions.retention !== undefined && removeOptions.unlock === true) {
           throw new Error(`retained worktree removal cannot unlock ${path}; resolve its holder first`)
@@ -594,6 +642,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
             if (removeOptions.unlock === true) await unlockWorktree(git, repo, path)
             if (removeOptions.noRehome !== true) rehome.run()
           }
+          children = await captureLinkedChildren(resolvedPath, gitDir, removeOptions.excludedSubmodules ?? [])
 
           // Target-only two-phase removal (#27551, CTO ruling beadc3d2):
           // Phase 1 (under mutation lock):
@@ -728,6 +777,52 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         }
       }
       if (borrowed !== undefined) return borrowed
+      const failures: Error[] = []
+      for (const child of children) {
+        try {
+          // Any new contents belong to the next owner, even if the old pointer was reused.
+          await lstat(child.path).then(
+            () => {
+              throw new Error("checkout path survives or was rebound; left untouched")
+            },
+            (error: NodeJS.ErrnoException) => {
+              if (error.code !== "ENOENT") throw error
+            },
+          )
+          if (
+            realpathSync(child.common) !== child.common ||
+            realpathSync(await git.text(child.primary, ["rev-parse", "--absolute-git-dir"])) !== child.common
+          ) {
+            throw new Error("independent primary store changed since capture")
+          }
+          const current = (await listWorktrees(git, child.common)).find((row) => row.path === child.path)
+          if (current === undefined) continue
+          if (
+            current.branch !== child.branch ||
+            current.head !== child.tip ||
+            resolve(child.admin, (await readFile(join(child.admin, "gitdir"), "utf8")).trim()) !== child.pointer
+          ) {
+            throw new Error("native registration or administration identity changed since capture")
+          }
+          await createGitWorktreeStore({ ...options, repo: child.primary }).recoverDestroyed(child.path)
+        } catch (cause) {
+          let state: string
+          try {
+            state = (await listWorktrees(git, child.common)).some((row) => row.path === child.path)
+              ? "registration kept"
+              : "registration removed; cleanup incomplete"
+          } catch (inspectionError) {
+            state = `registration state unreadable: ${String(inspectionError)}`
+          }
+          failures.push(
+            new Error(
+              `root removed; child ${child.path} ${state}: ${String(cause)}; inspect ${child.common} and retry createGitWorktreeStore({ repo: ${JSON.stringify(child.primary)}, gitProcess }).recoverDestroyed(${JSON.stringify(child.path)})`,
+              { cause },
+            ),
+          )
+        }
+      }
+      if (failures.length > 0) throw new AggregateError(failures, failures.map((error) => error.message).join("; "))
       if (compaction !== undefined) return { compaction }
       return undefined
     },
