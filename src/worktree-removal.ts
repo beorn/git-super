@@ -1360,8 +1360,9 @@ async function retainResolvedWorktreeModules(context: {
   if (JSON.stringify(after) !== JSON.stringify(before)) {
     throw new Error(`worktree ${path} changed during retention; preserved, retry after its writer stops`)
   }
-  if (before === undefined && destroyedHead === undefined)
-    {throw new Error(`private snapshot missing for ${path}; worktree preserved`)}
+  if (before === undefined && destroyedHead === undefined) {
+    throw new Error(`private snapshot missing for ${path}; worktree preserved`)
+  }
   const proof: WorktreeRemovalProof = {
     path,
     head: destroyedHead ?? (await git.commit(inspectedPath, "HEAD")),
