@@ -1,3 +1,4 @@
+import { driveSync, diffTraversal, rangeTraversal, commonDiffArgs, parseRawDiff, type RawDiffRow } from "./status-traversal.ts"
 import { join, posix } from "node:path"
 import {
   indexGitlinks,
@@ -114,63 +115,17 @@ export type NotCompared = Readonly<{
   }>
 }>
 
-type RawDiffRow = Readonly<{
-  path: string
-  status: string
-  oldMode: string
-  newMode: string
-  oldPin: string
-  newPin: string
-}>
+
 
 function nulFields(value: string): string[] {
   return value.split("\0").filter(Boolean)
 }
 
-function parseRawDiff(raw: string): RawDiffRow[] {
-  const fields = nulFields(raw)
-  const rows: RawDiffRow[] = []
-  for (let index = 0; index < fields.length; index += 2) {
-    const header = fields[index]
-    const path = fields[index + 1]
-    if (header === undefined || path === undefined) throw new Error("git super: malformed NUL-delimited raw diff")
-    const match = /^:([0-7]{6}) ([0-7]{6}) ([0-9a-f]{40}) ([0-9a-f]{40}) ([A-Z][0-9]*)$/u.exec(header)
-    if (!match) throw new Error(`git super: malformed raw diff row ${JSON.stringify(header)}`)
-    const [, oldMode, newMode, oldPin, newPin, status] = match
-    if (
-      oldMode === undefined ||
-      newMode === undefined ||
-      oldPin === undefined ||
-      newPin === undefined ||
-      status === undefined
-    ) {
-      throw new Error(`git super: incomplete raw diff row ${JSON.stringify(header)}`)
-    }
-    rows.push({
-      path,
-      oldMode,
-      newMode,
-      oldPin,
-      newPin,
-      status,
-    })
-  }
-  return rows
-}
 
-function commonDiffArgs(options: SuperDiffOptions): string[] {
-  return [
-    "--no-renames",
-    options.excludedSubmodules?.length ? "--ignore-submodules=dirty" : "--ignore-submodules=none",
-    ...(options.cached ? ["--cached"] : []),
-    ...(options.diffFilter === undefined ? [] : [`--diff-filter=${options.diffFilter}`]),
-    ...(options.refs ?? []),
-  ]
-}
 
-function prefixPath(root: string, path: string): string {
-  return posix.join(root, path)
-}
+
+
+
 
 type RecursiveNameStatusOptions = Readonly<{
   repo: string
@@ -190,19 +145,7 @@ type RecursiveNameStatusOptions = Readonly<{
  * caller named it as the composed base, and measuring from the range's old endpoint instead would be the quiet
  * over-selection 29363 removes.
  */
-function recordedGitlink(root: string, ref: string, path: string): string | undefined {
-  const result = tryGit(root, ["ls-tree", "-z", ref, "--", path])
-  if (result.exitCode !== 0) {
-    throw new Error(
-      `git super: --component-base ${ref} does not resolve in ${root}: ${result.stderr.trim() || `git ls-tree exited ${result.exitCode}`}`,
-    )
-  }
-  const row = result.stdout.split("\0").find((line) => line.length > 0)
-  if (row === undefined) return undefined
-  const [meta] = row.split("\t")
-  const [mode, type, oid] = (meta ?? "").split(" ")
-  return mode === "160000" && type === "commit" && oid !== undefined ? oid : undefined
-}
+
 
 export type RecursiveNameStatusResult = Readonly<{
   entries: readonly Readonly<{ path: string; status: string }>[]
@@ -214,229 +157,16 @@ export type RecursiveNameStatusResult = Readonly<{
  * The commit range one gitlink row expands over, or a refusal naming its case. An added gitlink is a move from git's
  * empty tree to its pin, so every file in it reads as added, as git's own --submodule=diff renders it (26972).
  */
-function expandableGitlink(row: RawDiffRow, path: string): RawDiffRow {
-  const gitlinkBefore = row.oldMode === "160000"
-  const gitlinkAfter = row.newMode === "160000"
-  const absentBefore = row.oldMode === "000000"
-  if (gitlinkBefore && gitlinkAfter && row.oldPin !== ZERO_OID && row.newPin !== ZERO_OID) return row
-  if (absentBefore && gitlinkAfter) {
-    if (row.newPin === ZERO_OID) {
-      throw new Error(
-        `git super: ${path} is an added gitlink whose new pin git reports as zero; no commit exists to expand`,
-      )
-    }
-    return { ...row, oldMode: "160000", oldPin: EMPTY_TREE }
-  }
-  if (gitlinkBefore && (row.newMode === "000000" || row.newPin === ZERO_OID)) {
-    throw new Error(`git super: ${path} is a removed gitlink; no new commit exists to expand its deleted files from`)
-  }
-  if (gitlinkBefore) {
-    throw new Error(`git super: ${path} changed from a gitlink to a file; no commit range exists for expansion`)
-  }
-  throw new Error(`git super: ${path} changed from a file to a gitlink; no old commit exists to expand from`)
-}
+
 
 /** The submodule's own repository root, refusing an uninitialized checkout instead of resolving to the parent. */
-function initializedCheckout(root: string, move: RawDiffRow, path: string, added: boolean): string {
-  const directory = join(root, move.path)
-  const discovered = tryGit(directory, ["rev-parse", "--show-toplevel"])
-  const prefix = discovered.exitCode === 0 ? tryGit(directory, ["rev-parse", "--show-prefix"]) : undefined
-  const probe =
-    discovered.exitCode === 0 && prefix?.exitCode === 0
-      ? probeRepository(discovered.stdout.trim(), prefix.stdout)
-      : undefined
-  if (probe === undefined || probe.kind === "absent") {
-    throw new Error(
-      `git super: ${path} is ${added ? "an added" : "a moved"} gitlink at ${move.newPin}; its checkout is not initialized`,
-    )
-  }
-  return probe.root
-}
+
 
 /** Parent-only frozen descriptors, using the existing raw-diff parser and graph-owned config join. */
-function comparisonSubmodules(root: string, options: SuperDiffOptions): Map<string, CommitSubmodule> {
-  const selected = rootRange(root, options)?.to ?? options.refs?.[0] ?? "HEAD"
-  const frozen = runGit(root, ["rev-parse", `${selected}^{tree}`]).trim()
-  const tree = parseRawDiff(
-    runGit(root, [
-      "diff",
-      "--raw",
-      "-z",
-      "--abbrev=40",
-      "--no-renames",
-      "--ignore-submodules=dirty",
-      EMPTY_TREE,
-      frozen,
-    ]),
-  )
-  const gitlinks = new Map(tree.filter(({ newMode }) => newMode === "160000").map(({ path, newPin }) => [path, newPin]))
-  if (gitlinks.size === 0) return new Map()
-  const configured = runGit(root, [
-    "config",
-    "--null",
-    "--blob",
-    `${frozen}:.gitmodules`,
-    "--get-regexp",
-    "^submodule\\..*\\.(path|url|branch)$",
-  ])
-  return new Map(
-    joinCommitSubmodules(gitlinks, parseCommitSubmoduleConfig(configured, frozen), frozen).map((entry) => [
-      entry.path,
-      entry,
-    ]),
-  )
-}
+
 
 /** Internal recursive primitive shared by `diff` and `status`. */
-export function recursiveNameStatusDiff(options: RecursiveNameStatusOptions): RecursiveNameStatusResult {
-  const root = repositoryRoot(options.repo)
-  const common = commonDiffArgs(options)
-  const unfilteredOptions: SuperDiffOptions = {
-    repo: options.repo,
-    ...(options.excludedSubmodules === undefined ? {} : { excludedSubmodules: options.excludedSubmodules }),
-    ...(options.refs === undefined ? {} : { refs: options.refs }),
-    ...(options.cached === true ? { cached: true } : {}),
-  }
-  const filteredRows = parseRawDiff(runGit(root, ["diff", "--raw", "-z", "--abbrev=40", ...common]))
-  const boundaryRows =
-    options.diffFilter === undefined
-      ? filteredRows
-      : parseRawDiff(runGit(root, ["diff", "--raw", "-z", "--abbrev=40", ...commonDiffArgs(unfilteredOptions)]))
-  const gitlinks = boundaryRows.filter((row) => row.oldMode === "160000" || row.newMode === "160000")
-  const entries = filteredRows
-    .filter((row) => row.oldMode !== "160000" && row.newMode !== "160000")
-    .map((row) => ({ path: prefixPath(options.prefix, row.path), status: row.status }))
-  const consultedRepositories: ConsultedRepository[] = [options.consulted]
-  const notCompared: NotCompared[] = []
-  const descriptors =
-    options.excludedSubmodules?.length || gitlinks.some(({ newMode }) => newMode === "160000")
-      ? comparisonSubmodules(root, options)
-      : new Map<string, CommitSubmodule>()
-  if (options.excludedSubmodules?.length) {
-    const working = !options.cached && (options.refs?.length ?? 0) <= 1 && !options.refs?.[0]?.includes("..")
-    const candidates = working
-      ? indexGitlinks(root)
-      : [...descriptors.values()].map(({ path, target }) => ({ path, indexPin: target }))
-    for (const { path, indexPin } of candidates) {
-      if (!working && !isSubmoduleExcluded(prefixPath(options.prefix, path), options.excludedSubmodules)) continue
-      if (gitlinks.some((row) => row.path === path)) continue
-      if (indexPin === undefined) {
-        notCompared.push({
-          path: prefixPath(options.prefix, path),
-          reason: "unreadable",
-          message: "unmerged gitlink has no resolved index pin",
-        })
-        continue
-      }
-      gitlinks.push({ path, oldMode: "160000", newMode: "160000", oldPin: indexPin, newPin: indexPin, status: "M" })
-    }
-  }
-
-  for (const gitlink of gitlinks) {
-    if (isSubmoduleExcluded(prefixPath(options.prefix, gitlink.path), options.excludedSubmodules)) {
-      notCompared.push({
-        path: prefixPath(options.prefix, gitlink.path),
-        reason: "excluded",
-        message: "component excluded, not compared",
-      })
-      continue
-    }
-    if (gitlink.oldMode === "160000" && gitlink.newMode === "000000") {
-      notCompared.push({
-        path: prefixPath(options.prefix, gitlink.path),
-        reason: "removed",
-        message: "component removed, not compared",
-      })
-      continue
-    }
-    const move = expandableGitlink(gitlink, prefixPath(options.prefix, gitlink.path))
-    const isDirtySubmodule = move.oldPin === move.newPin
-    const nestedPrefix = prefixPath(options.prefix, move.path)
-    const nestedRoot = initializedCheckout(root, move, nestedPrefix, gitlink.oldPin === ZERO_OID)
-    // 29363: a composed base replaces the range's old endpoint with the pin the base ref records for this
-    // component; a working-tree comparison (old == new) has no range to rebase.
-    const recorded =
-      options.componentBase === undefined || isDirtySubmodule
-        ? undefined
-        : recordedGitlink(root, options.componentBase, gitlink.path)
-    const unreadable = [...new Set([move.oldPin, move.newPin, ...(recorded === undefined ? [] : [recorded])])]
-      .filter((pin) => pin !== EMPTY_TREE && pin !== ZERO_OID)
-      .map((pin) => ({ pin, result: tryGit(nestedRoot, ["cat-file", "-e", `${pin}^{commit}`]) }))
-      .filter(({ result }) => result.exitCode !== 0)
-    if (unreadable.length > 0) {
-      const descriptor = descriptors.get(move.path)
-      const declaredUrl = descriptor?.url
-      const relativeUrl = declaredUrl?.startsWith("./") || declaredUrl?.startsWith("../")
-      const parentOrigin = relativeUrl ? tryGit(root, ["remote", "get-url", "origin"]) : undefined
-      const url =
-        declaredUrl === undefined || (relativeUrl && parentOrigin?.exitCode !== 0)
-          ? undefined
-          : resolveSubmoduleOrigin(root, parentOrigin?.stdout.trim(), declaredUrl)
-      const remedy =
-        url === undefined
-          ? declaredUrl === undefined
-            ? `Frozen .gitmodules in ${root} has no remote URL for ${move.path}; restore that descriptor before fetching.`
-            : `Cannot resolve frozen relative URL ${declaredUrl} for ${move.path}: git remote get-url origin in ${root} failed (${parentOrigin?.stderr}); restore that parent origin before fetching.`
-          : unreadable
-              .map(({ pin }) =>
-                [
-                  "git",
-                  "-C",
-                  nestedRoot,
-                  "fetch",
-                  "--no-tags",
-                  "--no-recurse-submodules",
-                  "--no-write-fetch-head",
-                  url,
-                  `${pin}:${pinRef(pin)}`,
-                ]
-                  .map(shellQuote)
-                  .join(" "),
-              )
-              .join("\n")
-      notCompared.push({
-        path: nestedPrefix,
-        reason: "unreadable",
-        objectIds: unreadable.map(({ pin }) => pin),
-        message: `cannot read component objects in ${nestedRoot}: ${unreadable.map(({ pin, result }) => `${pin} (${result.stderr || `git cat-file exited ${result.exitCode}`})`).join("; ")}`,
-        remedy,
-      })
-      continue
-    }
-    const from = recorded === undefined ? move.oldPin : composedFrom(nestedRoot, nestedPrefix, recorded, move.newPin)
-    const nested = recursiveNameStatusDiff({
-      repo: nestedRoot,
-      ...(options.excludedSubmodules === undefined ? {} : { excludedSubmodules: options.excludedSubmodules }),
-      prefix: nestedPrefix,
-      ...(recorded === undefined ? {} : { componentBase: recorded }),
-      ...(isDirtySubmodule
-        ? {
-            refs: [move.oldPin],
-            ...(options.diffFilter === undefined ? {} : { diffFilter: options.diffFilter }),
-            consulted: {
-              path: nestedPrefix,
-              root: nestedRoot,
-              from: move.oldPin,
-            },
-          }
-        : {
-            refs: [`${from}..${move.newPin}`],
-            ...(options.diffFilter === undefined ? {} : { diffFilter: options.diffFilter }),
-            consulted: {
-              path: nestedPrefix,
-              root: nestedRoot,
-              from,
-              to: move.newPin,
-            },
-          }),
-    })
-    entries.push(...nested.entries)
-    consultedRepositories.push(...nested.consultedRepositories)
-    notCompared.push(...nested.notCompared)
-  }
-
-  return { entries, consultedRepositories, notCompared }
-}
+export function recursiveNameStatusDiff(options: RecursiveNameStatusOptions): RecursiveNameStatusResult { return driveSync(diffTraversal(options)) }
 
 /**
  * The old endpoint a composed base gives a moved gitlink: the merge base of the pin the base ref records and the
@@ -444,15 +174,7 @@ export function recursiveNameStatusDiff(options: RecursiveNameStatusOptions): Re
  * one behind or equal to it measures nothing. No common history is a refusal — the branch pin is not a descendant
  * of anything the published main carries, and a guess in either direction would be silent.
  */
-function composedFrom(nestedRoot: string, path: string, recorded: string, newPin: string): string {
-  const result = tryGit(nestedRoot, ["merge-base", recorded, newPin])
-  if (result.exitCode !== 0) {
-    throw new Error(
-      `git super: ${path} is pinned at ${newPin}, which shares no history with the pin ${recorded} the composed base records; nothing can be measured between them (${result.stderr.trim() || `git merge-base exited ${result.exitCode}`})`,
-    )
-  }
-  return result.stdout.trim()
-}
+
 
 function uniqueRepositories(repositories: readonly ConsultedRepository[]): ConsultedRepository[] {
   const seen = new Set<string>()
@@ -475,23 +197,7 @@ function uniqueRepositories(repositories: readonly ConsultedRepository[]): Consu
  * Omitted (never guessed) when the refs are not a clean two-endpoint pair: `--cached`,
  * a working-tree diff, 3+ ref args.
  */
-function rootRange(root: string, options: SuperDiffOptions): Readonly<{ from: string; to: string }> | undefined {
-  const refs = options.refs ?? []
-  if (refs.length === 2) {
-    const [from, to] = refs
-    if (from !== undefined && to !== undefined) return { from, to }
-  }
-  const single = refs.length === 1 ? refs[0] : undefined
-  if (single === undefined) return undefined
-  const symmetric = /^(.+?)\.{3}(.+)$/u.exec(single)
-  if (symmetric?.[1] !== undefined && symmetric[2] !== undefined) {
-    const [, left, right] = symmetric
-    return { from: runGit(root, ["merge-base", left, right]).trim(), to: right }
-  }
-  const twoDot = /^(.+?)\.{2}(.+)$/u.exec(single)
-  if (twoDot?.[1] !== undefined && twoDot[2] !== undefined) return { from: twoDot[1], to: twoDot[2] }
-  return undefined
-}
+function rootRange(root: string, options: SuperDiffOptions): Readonly<{ from: string; to: string }> | undefined { return driveSync(rangeTraversal(root, options)) }
 
 function entryRange(
   entry: ConsultedRepository,

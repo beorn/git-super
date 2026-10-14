@@ -22,6 +22,7 @@ import { fileLockHolders, formatLockHolders } from "@bearly/flock/holders"
 import { spawnSync } from "node:child_process"
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { classifyExcludedPath, inspectExcludedCheckout, superStatus, type SuperStatusResult } from "./status.ts"
+import { statusWithGit } from "./status-traversal.ts"
 import { readCommitSubmodules, readPrivateSubmodules, type SelectedCommitSubmodules } from "./commit-graph.ts"
 import type { PrivateGitProjection } from "./private-git-projection.ts"
 import { alternatesLineage } from "./alternates.ts"
@@ -646,6 +647,19 @@ export function inspectRemovalStatus(
   timeoutMs: number | undefined = DEFAULT_REMOVAL_STATUS_TIMEOUT_MS,
 ): SuperStatusResult {
   const status = withGitTimeout(timeoutMs, () => superStatus({ repo: path, excludedSubmodules }))
+  return knownRemovalStatus(path, status)
+}
+
+/** Internal supplied-port counterpart; public synchronous inspection retains its native driver. */
+export async function inspectRemovalStatusWithGit(
+  git: Git,
+  path: string,
+  excludedSubmodules: readonly string[] = [],
+): Promise<SuperStatusResult> {
+  return knownRemovalStatus(path, await statusWithGit({ repo: path, excludedSubmodules }, git, DEFAULT_REMOVAL_STATUS_TIMEOUT_MS))
+}
+
+function knownRemovalStatus(path: string, status: SuperStatusResult): SuperStatusResult {
   if (status.submoduleProblems.length > 0) {
     throw new Error(
       `worktree ${path} has unknown submodule state: ${status.submoduleProblems.map((problem) => `${problem.path}: ${problem.reason}${problem.gitDir === undefined ? "" : ` (gitdir ${problem.gitDir})`}`).join("; ")}; preserve and resolve it before removal`,
@@ -699,7 +713,7 @@ async function cleanSnapshot(
   excludedSubmodules: readonly string[] = [],
   preserved: readonly string[] = [],
 ): Promise<readonly Readonly<{ path: string; head: string }>[]> {
-  const status = inspectRemovalStatus(path, excludedSubmodules)
+  const status = await inspectRemovalStatusWithGit(git, path, excludedSubmodules)
   // 29073: attribute every dirty record to the consulted store that owns it (the deepest consulted
   // prefix that contains it), then admit that store's dirt only with a preserved ref that resolves
   // to a commit in THAT store. The root's own records are admitted against the root store, each
@@ -739,7 +753,7 @@ async function cleanSnapshot(
         : excludedSubmodules
             .filter((excluded) => excluded.startsWith(`${prefix}/`))
             .map((excluded) => excluded.slice(prefix.length + 1))
-    const checked = superStatus({ repo: entry.root, excludedSubmodules: localExclusions })
+    const checked = await statusWithGit({ repo: entry.root, excludedSubmodules: localExclusions }, git, DEFAULT_REMOVAL_STATUS_TIMEOUT_MS)
     if (checked.submoduleProblems.length > 0) {
       throw new Error(
         `worktree ${entry.root} has unknown submodule state: ${checked.submoduleProblems.map((problem) => `${problem.path}: ${problem.reason}`).join("; ")}; preserve and resolve it before removal`,

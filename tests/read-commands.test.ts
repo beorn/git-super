@@ -23,6 +23,9 @@ import { commands } from "../src/commands.ts"
 import { runCli } from "../src/cli.ts"
 import { superIsAncestor, type SuperIsAncestorResult } from "../src/merge-base.ts"
 import { superStatus, type SuperStatusResult } from "../src/status.ts"
+import { statusWithGit } from "../src/status-traversal.ts"
+import { createGit } from "../src/worktree.ts"
+import { createLocalGitProcess } from "../src/process.ts"
 import {
   addNestedAlphaSubmodule,
   advanceRepository,
@@ -644,6 +647,14 @@ describe("Phase 1 read commands", () => {
     const plain = superStatus({ repo: fixture.product })
     expect(plain.consultedRepositories.find(({ path }) => path === "packages/alpha")?.from).toBe(fixture.alphaBase)
     const selected = superStatus({ repo: fixture.product, indexFile })
+    // The supplied-port removal reader must judge the same temporary root index;
+    // silently reading the default index would retain the old alpha pin.
+    const supplied = await statusWithGit(
+      { repo: fixture.product, indexFile },
+      createGit(createLocalGitProcess(), {}, 30_000),
+      30_000,
+    )
+    expect(supplied).toEqual(selected)
     expect(selected.consultedRepositories[0]).toMatchObject({ path: ".", indexFile })
     expect(selected.consultedRepositories.find(({ path }) => path === "packages/alpha")).toMatchObject({
       from: alphaHead,

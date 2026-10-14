@@ -35,6 +35,8 @@ import { createLocalGitProcess, type GitProcess, type GitProcessResult } from ".
 import { createProgressReporter } from "./progress.ts"
 import { materializeSubmodulesWithProcess } from "./submodules.ts"
 import { superStatus, type SuperStatusResult } from "./status.ts"
+import { statusWithGit } from "./status-traversal.ts"
+import { inspectRemovalStatusWithGit } from "./worktree-removal.ts"
 import { removalBorrowers } from "./worktree-administration.ts"
 
 export type GitResult = Readonly<{ code: number; stdout: string; stderr: string }>
@@ -202,8 +204,8 @@ export function createGit(
     const unsettled = unsettledReason(result, timeoutMs)
     if (unsettled !== undefined) {
       const message = `git ${args.join(" ")} ${unsettled} in ${repo}`
-      if (!allowFailure) throw new Error(message)
-      return { code: result.code === 0 ? 1 : result.code, stdout: result.stdout, stderr: result.stderr || message }
+      // A failed transport is never an exit-code answer, even for optional reads.
+      throw new Error(message)
     }
     if (!allowFailure && result.code !== 0) {
       throw new Error(result.stderr.trim() || result.stdout.trim() || `git ${args.join(" ")} exited ${result.code}`)
@@ -415,7 +417,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       branch?: string
       tip?: string
     }> = []
-    for (const entry of superStatus({ repo: path, excludedSubmodules: excluded }).consultedRepositories) {
+    for (const entry of (await statusWithGit({ repo: path, excludedSubmodules: excluded }, git, timeouts.operation)).consultedRepositories) {
       if (entry.path === ".") continue
       const child = realpathSync(entry.root)
       if (!within(path, child) || child === path) continue
@@ -897,7 +899,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         Readonly<{ borrowers: readonly string[] }>
     > {
       const prepared = await prepareRemoval(path, inspectOptions.excludedSubmodules)
-      const status = inspectRemovalStatus(path, inspectOptions.excludedSubmodules)
+      const status = await inspectRemovalStatusWithGit(git, path, inspectOptions.excludedSubmodules)
       // 27811: prepareRemoval prepares no borrower custody exactly when a non-excluded entry already refuses removal,
       // and remove() reports that refusal before it needs custody. Inspection returns the same refusal, so its caller
       // sees what removal would say; a refused removal inspects no borrowers, so the list is empty beside that refusal.
