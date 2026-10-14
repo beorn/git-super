@@ -1361,13 +1361,12 @@ async function retainResolvedWorktreeModules(context: {
     throw new Error(`worktree ${path} changed during retention; preserved, retry after its writer stops`)
   }
   if (before === undefined && destroyedHead === undefined)
-    throw new Error(`private snapshot missing for ${path}; worktree preserved`)
+    {throw new Error(`private snapshot missing for ${path}; worktree preserved`)}
   const proof: WorktreeRemovalProof = {
     path,
     head: destroyedHead ?? (await git.commit(inspectedPath, "HEAD")),
     ...(destroyedHead === undefined ? {} : { checkout: "absent" as const }),
-    repositories:
-      destroyedHead === undefined ? before!.map((entry) => join(path, relative(inspectedPath, entry.path))) : [],
+    repositories: before === undefined ? [] : before.map((entry) => join(path, relative(inspectedPath, entry.path))),
     modules,
     retained,
     manifest: join(retainedRoot, "manifest.json"),
