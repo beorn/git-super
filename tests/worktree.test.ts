@@ -248,12 +248,13 @@ describe("createGitWorktreeStore", () => {
           proofs.push(proof)
           if (mode === "retention-failure") throw new Error("retention receipt unavailable")
           if (mode === "changed-holder") writeFileSync(join(admin, "locked"), "manual replacement\n")
-          if (mode === "recreated-checkout")
+          if (mode === "recreated-checkout") {
             queueMicrotask(() => {
               mkdirSync(linked)
               writeFileSync(join(linked, ".git"), `gitdir: ${admin}\n`)
               writeFileSync(join(linked, "new-authored-payload"), "arrived after admission\n")
             })
+          }
         },
       }
       const recovery = store.recoverDestroyed(linked, "recover native destroyed fixture", retention)
@@ -280,8 +281,9 @@ describe("createGitWorktreeStore", () => {
           locked: mode === "changed-holder" || mode === "remove-failure-new-holder" ? "manual replacement" : hold,
         })
         expect(existsSync(moduleDir)).toBe(true)
-        if (mode === "recreated-checkout")
+        if (mode === "recreated-checkout") {
           expect(readFileSync(join(linked, "new-authored-payload"), "utf8")).toBe("arrived after admission\n")
+        }
         expect(
           git(fixture.product, [
             "--git-dir",
