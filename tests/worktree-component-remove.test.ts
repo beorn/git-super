@@ -99,6 +99,34 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
     },
   )
 
+  it("retires a destroyed child registered in an independent bare store", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-bare-child-release-"))
+    try {
+      const product = join(root, "product")
+      const childSeed = join(root, "child-seed")
+      const childPrimary = join(root, "child.git")
+      const target = join(root, "target")
+      const child = join(target, "vendor/child")
+      createRepository(product, "root.txt", "root\n")
+      createRepository(childSeed, "child.txt", "child\n")
+      git(root, "clone", "--bare", "-q", childSeed, childPrimary)
+      git(product, "-c", "protocol.file.allow=always", "submodule", "add", "-q", childPrimary, "vendor/child")
+      git(product, "commit", "-q", "-m", "declare child")
+      const tip = git(childPrimary, "rev-parse", "HEAD")
+      git(product, "worktree", "add", "--detach", target)
+      git(childPrimary, "worktree", "add", "-b", "topic/child", child, tip)
+
+      await createGitWorktreeStore({ repo: product, gitProcess: createLocalGitProcess() }).remove(target)
+
+      expect(existsSync(target)).toBe(false)
+      expect(git(childPrimary, "worktree", "list", "--porcelain")).not.toContain(`worktree ${child}\n`)
+      expect(git(childPrimary, "rev-parse", "refs/heads/topic/child")).toBe(tip)
+    } finally {
+      // raw-delete-allow: this isolated mkdtemp fixture owns every path beneath root
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it("retires a clean linked worktree registered only in the submodule gitdir", async () => {
     const root = await mkdtemp(join(canonicalTmpdir(), "git-super-component-remove-"))
     try {

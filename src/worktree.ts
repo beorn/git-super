@@ -428,7 +428,12 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       if (registered === undefined || primaryRow === undefined) {
         throw new Error(`linked child ${child} has no exact native registration in ${common}`)
       }
-      const primary = realpathSync(await git.text(primaryRow.path, ["rev-parse", "--show-toplevel"]))
+      // A bare store appears as its own worktree-list row. It is a valid
+      // independent primary for recovery, but has no worktree top-level.
+      const primary =
+        primaryRow.path === common
+          ? common
+          : realpathSync(await git.text(primaryRow.path, ["rev-parse", "--show-toplevel"]))
       if (within(path, primary) || within(rootGitDir, primary)) continue
       if (realpathSync(await git.text(primary, ["rev-parse", "--absolute-git-dir"])) !== common) {
         throw new Error(`linked child ${child} has no independent primary for ${common}`)
