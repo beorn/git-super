@@ -1132,9 +1132,45 @@ describe("git super merge", () => {
     const candidate = candidateWithRootChange(fixture, "candidate-writer-wait")
     const lockDirectory = join(fixture.product, ".git", "yrd-worktree-mutations")
     const held = await acquireExclusive(lockDirectory, { timeoutMs: 0 }, "git super merge")
-    // CLI startup takes time before lock acquisition; leave enough margin beyond its 30 s default.
-    const release = Bun.sleep(40_000).then(() => held.release())
+    // The 30 s boundary is SET, not slept: Date and the reporter's interval are faked so the >=4 progress
+    // lines and the ordinary waiter's timeout cost no wall clock. Only Date/setInterval are faked, so the
+    // real git I/O and the lock poll delay still run.
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] })
+    const reports: string[] = []
+    let released = false
+    const release = (): void => {
+      if (released) return
+      released = true
+      held.release()
+    }
+    let running: ReturnType<typeof superMerge> | undefined
     try {
+      const startedAt = Date.now()
+      running = superMerge({ repo: fixture.product, commit: candidate, report: (line) => reports.push(line) })
+      for (let poll = 0; poll < 400 && reports.length === 0; poll += 1) await Bun.sleep(5)
+      // The first contention report is emitted synchronously when the lock is found held.
+      expect(reports).toHaveLength(1)
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(reports.length).toBeGreaterThanOrEqual(4)
+      // In-process there is no separate stderr: every line the reporter emits is a waiting-lock line.
+      expect(
+        reports.every((line) =>
+          /^git-super merge: waiting for writer lock held by git super merge \(pid:\d+, age \d+ms\)\n$/u.test(line),
+        ),
+      ).toBe(true)
+      // Past the old 30 s default the merge is still waiting under the shared four-minute policy, while a
+      // waiter on the default cap times out. The clock is driven forward in steps until that waiter trips,
+      // so the assertion never depends on when its own first poll lands.
+      vi.setSystemTime(startedAt + 31_000)
+      let mergeOutcome: unknown = "pending"
+      void running.then(
+        (value) => {
+          mergeOutcome = value
+        },
+        (error: unknown) => {
+          mergeOutcome = error
+        },
+      )
       const ordinaryWait = acquireExclusive(lockDirectory, {}, "ordinary mutation").then(
         (lock) => {
           lock.release()
@@ -1142,22 +1178,26 @@ describe("git super merge", () => {
         },
         (error: unknown) => error,
       )
-      const stdout = outputSink()
-      const stderr = outputSink()
-      expect(await runCli(["--repo", fixture.product, "--json", "merge", candidate], stdout, stderr)).toBe(0)
-      expect(JSON.parse(stdout.output)).toMatchObject({ state: "updated", partial: false })
-      const reports = stderr.output.match(
-        /git-super merge: waiting for writer lock held by git super merge \(pid:\d+, age \d+ms\)\n/gu,
-      )
-      expect(reports?.length).toBeGreaterThanOrEqual(4)
-      expect(reports?.join("")).toBe(stderr.output)
-      const ordinaryResult = await ordinaryWait
+      let ordinaryResult: unknown = "pending"
+      void ordinaryWait.then((value) => {
+        ordinaryResult = value
+      })
+      for (let step = 0; step < 20 && ordinaryResult === "pending"; step += 1) {
+        await Bun.sleep(20)
+        await vi.advanceTimersByTimeAsync(5_000)
+      }
       expect(ordinaryResult).toBeInstanceOf(Error)
       expect((ordinaryResult as Error).message).toMatch(/timeout=30000ms; holder=git super merge/u)
+      // More than the old 30 s cap has now passed on the clock and the merge has still not settled.
+      expect(mergeOutcome).toBe("pending")
+      release()
+      expect(await running).toMatchObject({ state: "updated", partial: false })
     } finally {
-      await release
+      release()
+      if (running !== undefined) await Promise.allSettled([running])
+      vi.useRealTimers()
     }
-  }, 75_000)
+  }, 30_000)
 
   /**
    * @failure Merge's lock call site silently reverts to a 30 s wait despite the shared four-minute policy (25274).
