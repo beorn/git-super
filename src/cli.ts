@@ -915,6 +915,10 @@ async function runInvocation(
     .option("--diff-filter <letters>", "select paths by Git diff status")
     .option("--stat", "show per-repository diffstat, including each moved gitlink's own submodule diff")
     .option("-p, --patch", "show per-repository patch, including each moved gitlink's own submodule diff")
+    .option(
+      "--component-base <ref>",
+      "measure each moved gitlink from the pin <ref> records for it (the component main a landing carries), not from the range's old pin",
+    )
     .argument("[refs...]", "Git revision range or refs")
     .action((refs, options, command) => {
       const globals = command.optsWithGlobals() as { repo: string; json?: boolean }
@@ -925,6 +929,7 @@ async function runInvocation(
           ...(options.excludeSubmodule?.length ? { excludedSubmodules: options.excludeSubmodule } : {}),
           ...(options.cached ? { cached: true } : {}),
           ...(options.diffFilter === undefined ? {} : { diffFilter: options.diffFilter }),
+          ...(options.componentBase === undefined ? {} : { componentBase: options.componentBase }),
           ...(options.stat === true ? { stat: true } : {}),
           ...(options.patch === true ? { patch: true } : {}),
         },
