@@ -1,5 +1,5 @@
 /** Create-only archive custody for callers that retire Git refs. */
-import { tryGit } from "./git.ts"
+import { gitError, tryGit } from "./git.ts"
 
 /** One archive namespace shared by branch-retirement callers. */
 export const ARCHIVE_REF_PREFIX = "refs/archive"
@@ -18,6 +18,34 @@ export function archiveActorSegment(actor: string): string {
 /** The archive ref for one retired branch: `refs/archive/<date>/<actor>/<branch>`. */
 export function archiveRefFor(branch: string, actor: string, date: string): string {
   return `${ARCHIVE_REF_PREFIX}/${date}/${archiveActorSegment(actor)}/${branch}`
+}
+
+/** Read existing custody for this exact branch and tip, regardless of the retiring actor or UTC day. */
+export function findArchiveRefFor(repoRoot: string, branch: string, tip: string): string | undefined {
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(tip)) {
+    throw new Error(`the archive tip ${JSON.stringify(tip)} is not a full SHA1 or SHA256 object ID`)
+  }
+  const args = ["for-each-ref", `--points-at=${tip}`, "--format=%(objectname)%09%(refname)", `${ARCHIVE_REF_PREFIX}/`]
+  const result = tryGit(repoRoot, args)
+  if (result.exitCode !== 0) throw gitError(repoRoot, args, result.exitCode, result.stderr)
+  for (const line of result.stdout.split("\n")) {
+    if (line === "") continue
+    const fields = line.split("\t")
+    const [value, ref] = fields
+    if (
+      fields.length !== 2 ||
+      value === undefined ||
+      ref === undefined ||
+      !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(value)
+    ) {
+      throw new Error(`cannot read archive custody in ${repoRoot}: malformed for-each-ref row ${JSON.stringify(line)}`)
+    }
+    const name = /^refs\/archive\/(\d{4}-\d{2}-\d{2})\/([^/]+)\/(.+)$/u.exec(ref)
+    if (value === tip && name?.[2] !== undefined && archiveActorSegment(name[2]) === name[2] && name[3] === branch) {
+      return ref
+    }
+  }
+  return undefined
 }
 
 /** `created` distinguishes a fresh archive ref from an idempotent re-run; both mean the tip is archived. */

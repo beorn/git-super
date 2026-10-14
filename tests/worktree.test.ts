@@ -12,6 +12,7 @@ import { dirname, join, relative } from "node:path"
 import { describe, expect, it, vi } from "vitest"
 import { tryAcquireFlock } from "@bearly/flock"
 import { acquireExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS } from "../src/exclusive.ts"
+import { findArchiveRefFor } from "../src/archive-ref.ts"
 import {
   createGitWorktreeStore,
   createLocalGitWorktreeStore,
@@ -93,10 +94,17 @@ describe("createGitWorktreeStore", () => {
       const branch = "task/retire"
       const archiveRef = "refs/archive/2026-10-12/test/task/retire"
       git(repo, ["branch", branch])
+      expect(findArchiveRefFor(repo, branch, tip)).toBeUndefined()
+      expect(() => findArchiveRefFor(join(root, "missing"), branch, tip)).toThrow(/for-each-ref.*failed/u)
+      // Another branch at the same tip is not this branch's retirement custody.
+      git(repo, ["update-ref", `${archiveRef}-other`, tip])
+      expect(findArchiveRefFor(repo, branch, tip)).toBeUndefined()
       await expect(store.removeArchivedBranch({ branch, tip, archiveRef })).rejects.toThrow()
       expect(git(repo, ["rev-parse", `refs/heads/${branch}`]).trim()).toBe(tip)
 
       git(repo, ["update-ref", archiveRef, tip])
+      // The prior actor and day come from the existing archive, never this invocation.
+      expect(findArchiveRefFor(repo, branch, tip)).toBe(archiveRef)
       const linked = join(root, "linked")
       await store.add({ kind: "branch", path: linked, branch })
       await expect(store.removeArchivedBranch({ branch, tip, archiveRef })).rejects.toThrow(/checked out/u)
