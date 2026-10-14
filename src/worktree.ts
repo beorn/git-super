@@ -914,7 +914,11 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         uninitializedSubmodules: status.uninitializedSubmodules,
       }
     },
-    async recoverDestroyed(path: string, operation = `recover destroyed worktree ${path}`): Promise<void> {
+    async recoverDestroyed(
+      path: string,
+      operation = `recover destroyed worktree ${path}`,
+      retention?: WorktreeRetention,
+    ): Promise<void> {
       await mutate(operation, async () => {
         try {
           await lstat(join(path, ".git"))
@@ -947,7 +951,44 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         }
         const writerLeases = acquireRemovalWriterLeases(directory)
         try {
-          rehomeBorrowers(common, directory, join(directory, "modules"))
+          if (retention === undefined) {
+            rehomeBorrowers(common, directory, join(directory, "modules"))
+          } else {
+            const identity = await inspectWorktree(git, repo, path)
+            const pointer = await readFile(join(directory, "gitdir"), "utf8")
+            const lock = identity.locked === undefined ? undefined : await readFile(join(directory, "locked"), "utf8")
+            const head = await git.text(repo, ["--git-dir", directory, "rev-parse", "--verify", "HEAD^{commit}"])
+            await retainWorktreeModules(
+              git,
+              repo,
+              path,
+              retention,
+              (repository, target) => inspectWorktree(git, repository, target),
+              writerLeases.proof,
+              writerLeases.created,
+              undefined,
+              undefined,
+              undefined,
+              undefined,
+              undefined,
+              undefined,
+              undefined,
+              { gitDir: directory, common, head },
+            )
+            const current = await inspectWorktree(git, repo, path)
+            if (
+              !current.registered ||
+              current.locked !== identity.locked ||
+              (await readFile(join(directory, "gitdir"), "utf8")) !== pointer ||
+              (await git.text(repo, ["--git-dir", directory, "rev-parse", "--verify", "HEAD^{commit}"])) !== head ||
+              (lock !== undefined && (await readFile(join(directory, "locked"), "utf8")) !== lock)
+            ) {
+              throw new Error(
+                `destroyed worktree ${path} identity or hold changed during retention; registration preserved`,
+              )
+            }
+            if (identity.locked !== undefined) await unlockWorktree(git, repo, path)
+          }
           await git.run(repo, ["worktree", "remove", "--force", path], false, timeouts.cleanup)
           if ((await inspectWorktree(git, repo, path)).registered) {
             throw new Error(`yrd: destroyed worktree '${path}' survived explicit recovery`)
