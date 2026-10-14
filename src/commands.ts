@@ -80,6 +80,7 @@ const diff = commandNode<CommandContext, DiffParams, SuperDiffResult>({
       ...(typeof input.diffFilter === "string" ? { diffFilter: input.diffFilter } : {}),
       ...(input.stat === true ? { stat: true } : {}),
       ...(input.patch === true ? { patch: true } : {}),
+      ...(typeof input.componentBase === "string" ? { componentBase: input.componentBase } : {}),
     }
   }),
   run: (context, input) => superDiff({ repo: context.repo, ...input }),

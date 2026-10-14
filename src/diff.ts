@@ -38,6 +38,16 @@ export type SuperDiffOptions = Readonly<{
   diffFilter?: string
   stat?: boolean
   patch?: boolean
+  /**
+   * The composed base (29363): a root ref — `origin/main` for the scoped fix — whose recorded gitlinks are the
+   * component mains a landing will carry. A moved gitlink it records is measured from `merge-base(recorded, new)`
+   * to `new`, so the published component commits that composition pulls under a branch contribute nothing, an
+   * authored-only pin measures exactly the authored commits, and a pin behind the published main measures nothing.
+   * A gitlink the ref does not record keeps the range's own old endpoint (git's empty tree for an added one). The
+   * recursion carries each component's recorded pin down, so a nested gitlink resolves against the published
+   * parent tree. A ref that does not resolve, or a pin that shares no history with the recorded one, refuses.
+   */
+  componentBase?: string
 }>
 
 export type DiffFileStat = Readonly<{
@@ -170,7 +180,29 @@ type RecursiveNameStatusOptions = Readonly<{
   cached?: boolean
   diffFilter?: string
   consulted: ConsultedRepository
+  /** See {@link SuperDiffOptions.componentBase}; at a nested level it is the parent component's recorded pin. */
+  componentBase?: string
 }>
+
+/**
+ * The gitlink `ref` records at `path` in `root`, or undefined when the ref carries no gitlink there (an added
+ * component, or a path that is a file in that tree). A ref that does not resolve is an error, never "no pin": the
+ * caller named it as the composed base, and measuring from the range's old endpoint instead would be the quiet
+ * over-selection 29363 removes.
+ */
+function recordedGitlink(root: string, ref: string, path: string): string | undefined {
+  const result = tryGit(root, ["ls-tree", "-z", ref, "--", path])
+  if (result.exitCode !== 0) {
+    throw new Error(
+      `git super: --component-base ${ref} does not resolve in ${root}: ${result.stderr.trim() || `git ls-tree exited ${result.exitCode}`}`,
+    )
+  }
+  const row = result.stdout.split("\0").find((line) => line.length > 0)
+  if (row === undefined) return undefined
+  const [meta] = row.split("\t")
+  const [mode, type, oid] = (meta ?? "").split(" ")
+  return mode === "160000" && type === "commit" && oid !== undefined ? oid : undefined
+}
 
 export type RecursiveNameStatusResult = Readonly<{
   entries: readonly Readonly<{ path: string; status: string }>[]
@@ -321,7 +353,13 @@ export function recursiveNameStatusDiff(options: RecursiveNameStatusOptions): Re
     const isDirtySubmodule = move.oldPin === move.newPin
     const nestedPrefix = prefixPath(options.prefix, move.path)
     const nestedRoot = initializedCheckout(root, move, nestedPrefix, gitlink.oldPin === ZERO_OID)
-    const unreadable = [...new Set([move.oldPin, move.newPin])]
+    // 29363: a composed base replaces the range's old endpoint with the pin the base ref records for this
+    // component; a working-tree comparison (old == new) has no range to rebase.
+    const recorded =
+      options.componentBase === undefined || isDirtySubmodule
+        ? undefined
+        : recordedGitlink(root, options.componentBase, gitlink.path)
+    const unreadable = [...new Set([move.oldPin, move.newPin, ...(recorded === undefined ? [] : [recorded])])]
       .filter((pin) => pin !== EMPTY_TREE && pin !== ZERO_OID)
       .map((pin) => ({ pin, result: tryGit(nestedRoot, ["cat-file", "-e", `${pin}^{commit}`]) }))
       .filter(({ result }) => result.exitCode !== 0)
@@ -365,10 +403,12 @@ export function recursiveNameStatusDiff(options: RecursiveNameStatusOptions): Re
       })
       continue
     }
+    const from = recorded === undefined ? move.oldPin : composedFrom(nestedRoot, nestedPrefix, recorded, move.newPin)
     const nested = recursiveNameStatusDiff({
       repo: nestedRoot,
       ...(options.excludedSubmodules === undefined ? {} : { excludedSubmodules: options.excludedSubmodules }),
       prefix: nestedPrefix,
+      ...(recorded === undefined ? {} : { componentBase: recorded }),
       ...(isDirtySubmodule
         ? {
             refs: [move.oldPin],
@@ -380,12 +420,12 @@ export function recursiveNameStatusDiff(options: RecursiveNameStatusOptions): Re
             },
           }
         : {
-            refs: [`${move.oldPin}..${move.newPin}`],
+            refs: [`${from}..${move.newPin}`],
             ...(options.diffFilter === undefined ? {} : { diffFilter: options.diffFilter }),
             consulted: {
               path: nestedPrefix,
               root: nestedRoot,
-              from: move.oldPin,
+              from,
               to: move.newPin,
             },
           }),
@@ -396,6 +436,22 @@ export function recursiveNameStatusDiff(options: RecursiveNameStatusOptions): Re
   }
 
   return { entries, consultedRepositories, notCompared }
+}
+
+/**
+ * The old endpoint a composed base gives a moved gitlink: the merge base of the pin the base ref records and the
+ * branch's new pin, inside the component. A new pin ahead of the recorded one measures only the commits past it;
+ * one behind or equal to it measures nothing. No common history is a refusal — the branch pin is not a descendant
+ * of anything the published main carries, and a guess in either direction would be silent.
+ */
+function composedFrom(nestedRoot: string, path: string, recorded: string, newPin: string): string {
+  const result = tryGit(nestedRoot, ["merge-base", recorded, newPin])
+  if (result.exitCode !== 0) {
+    throw new Error(
+      `git super: ${path} is pinned at ${newPin}, which shares no history with the pin ${recorded} the composed base records; nothing can be measured between them (${result.stderr.trim() || `git merge-base exited ${result.exitCode}`})`,
+    )
+  }
+  return result.stdout.trim()
 }
 
 function uniqueRepositories(repositories: readonly ConsultedRepository[]): ConsultedRepository[] {
@@ -564,9 +620,34 @@ function computeRepositoryPatch(entry: ConsultedRepository, options: SuperDiffOp
   }
 }
 
+/**
+ * A composed base is defined for a committed two-endpoint range and nothing else: a working-tree or index comparison
+ * has no old endpoint to rebase onto the recorded pin, and a single ref is a tree, not a range. Refusing names the
+ * accepted forms, so the caller cannot read a silently unrebased comparison as the composed one (@cto, 29363).
+ */
+function validateComponentBaseForm(root: string, options: SuperDiffOptions): void {
+  if (options.componentBase === undefined) return
+  const refs = options.refs ?? []
+  const form =
+    options.cached === true
+      ? "an index comparison (--cached)"
+      : refs.length === 0
+        ? "a working-tree comparison"
+        : refs.length > 2
+          ? `${refs.length} refs`
+          : rootRange(root, options) === undefined
+            ? `a single ref (${refs[0]})`
+            : undefined
+  if (form === undefined) return
+  throw new Error(
+    `git super: --component-base ${options.componentBase} is defined for a committed two-endpoint range (A..B, A...B or two refs), not for ${form}; it measures each moved gitlink from the pin the ref records, and only a range has an old endpoint to replace`,
+  )
+}
+
 export function superDiff(options: SuperDiffOptions): SuperDiffResult {
   validateExcludedSubmodules(options.excludedSubmodules)
   const root = repositoryRoot(options.repo)
+  validateComponentBaseForm(root, options)
   const consulted = { path: ".", root } as const
   const shared = {
     repo: root,
@@ -574,6 +655,7 @@ export function superDiff(options: SuperDiffOptions): SuperDiffResult {
     prefix: "",
     ...(options.refs === undefined ? {} : { refs: options.refs }),
     ...(options.cached === true ? { cached: true } : {}),
+    ...(options.componentBase === undefined ? {} : { componentBase: options.componentBase }),
   } as const
   const changed = recursiveNameStatusDiff({
     ...shared,
