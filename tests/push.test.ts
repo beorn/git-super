@@ -2508,7 +2508,11 @@ describe("cold first publication retains an existing child pin (26421)", () => {
     expect(retained && refused).toBe(true)
     expect(result, JSON.stringify(result)).toMatchObject({ state: "failed", partial: true })
     expect(result.repositories.flatMap((repository) => repository.refs)).toEqual(
-      expect.arrayContaining([expect.objectContaining({ destination: firstRef, state: "updated" })]),
+      expect.arrayContaining([
+        expect.objectContaining({ destination: firstRef, state: "updated" }),
+        // 28867 (@cto 50bb54be): the later ref its leased push wrote before the failing read is in the receipt too.
+        expect.objectContaining({ destination: laterRef, state: "updated" }),
+      ]),
     )
     expect(git(shape.remotes.child, "rev-parse", firstRef)).toBe(shape.childSource)
     // 28867: no recheck reads the later ref under the lock, so its leased create-only push runs before the read that
