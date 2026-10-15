@@ -526,6 +526,8 @@ export async function resolveSubmoduleBranch(
   component: string,
   entry: CommitSubmodule,
   remote: string,
+  /** `localOnly` refuses, by name, a branch only the remote can answer, instead of running `ls-remote` (29560). */
+  options: Readonly<{ localOnly?: boolean }> = {},
 ): Promise<string> {
   const phase = "resolve-submodule-branch"
   const key = `submodule.${entry.name}.branch`
@@ -558,6 +560,12 @@ export async function resolveSubmoduleBranch(
       refuse("invalid-superproject-branch", `${superproject} HEAD does not name a local branch.`)
     }
     branch = head.stdout.trim().slice("refs/heads/".length)
+  }
+  if (branch === undefined && options.localOnly === true) {
+    refuse(
+      "submodule-branch-not-local",
+      `${key} is not set and ${entry.path} declares no branch; its remote default needs ls-remote, which a local-only read does not run.`,
+    )
   }
   if (branch === undefined) {
     const args = ["ls-remote", "--symref", remote, "HEAD"]

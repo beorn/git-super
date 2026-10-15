@@ -22,6 +22,7 @@
     "./exclusive": "./src/exclusive.ts",
     "./gitlink": "./src/gitlink.ts",
     "./gitlink-carrier": "./src/gitlink-carrier.ts",
+    "./local-main": "./src/local-main.ts",
     "./objects": "./src/objects.ts",
     "./process": "./src/process.ts",
     "./pull": "./src/pull.ts",
@@ -60,6 +61,10 @@
       "./gitlink-carrier": {
         "types": "./dist/gitlink-carrier.d.ts",
         "import": "./dist/gitlink-carrier.js"
+      },
+      "./local-main": {
+        "types": "./dist/local-main.d.ts",
+        "import": "./dist/local-main.js"
       },
       "./objects": {
         "types": "./dist/objects.d.ts",
@@ -145,6 +150,7 @@
       "src/exclusive.ts",
       "src/gitlink.ts",
       "src/gitlink-carrier.ts",
+      "src/local-main.ts",
       "src/objects.ts",
       "src/process.ts",
       "src/pull.ts",
