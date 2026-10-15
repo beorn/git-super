@@ -42,6 +42,41 @@ afterEach(() => {
 
 describe("superDiff", () => {
   /**
+   * @failure CLI parsing drops -- and Git mistakes deleted paths for revisions (#29476).
+   * @level l1
+   * @consumer git super diff --stat --patch --json A B -- paths
+   * @testonly none
+   */
+  test("preserves deleted path filters after the option separator", async () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-path-filter-"))
+    roots.push(root)
+    createRepository(root, "deleted file.ts", "first\nsecond\n")
+    writeFileSync(join(root, "--repo"), "option-shaped path\n")
+    writeFileSync(join(root, "unrelated.ts"), "before\n")
+    git(root, "add", ".")
+    git(root, "commit", "-qm", "add path-filter fixture")
+    const before = git(root, "rev-parse", "HEAD")
+    git(root, "rm", "--", "deleted file.ts", "--repo")
+    const after = advanceRepository(root, "unrelated.ts", "after\n")
+    const stdout = outputSink()
+    const stderr = outputSink()
+    const code = await runCli(
+      ["--repo", root, "--json", "diff", "--stat", "--patch", before, after, "--", "deleted file.ts", "--repo"],
+      stdout,
+      stderr,
+    )
+    expect(code, stderr.output).toBe(0)
+    const result = JSON.parse(stdout.output)
+    expect(result.paths).toEqual(["--repo", "deleted file.ts"])
+    expect(result.stats[0].files).toEqual([
+      { path: "--repo", added: 0, deleted: 1, binary: false },
+      { path: "deleted file.ts", added: 0, deleted: 2, binary: false },
+    ])
+    expect(result.patches[0].patch).toContain("deleted file mode")
+    expect(result.patches[0].patch).not.toContain("unrelated.ts")
+  })
+
+  /**
    * @failure An explicit exclusion still reads the child's Git content or silently hides included working dirt (#27058 AC3).
    * @level l1
    * @consumer git super diff, including native argv and CLI narration
