@@ -554,6 +554,40 @@ describe("explicit recursive push mechanics", () => {
     }
   }
 
+  // 29528 AC1: a later requirement's named remote witness also retains its historical ancestors.
+  // Existing one-requirement checks cannot expose discarded observations between requirements.
+  test("check reuses an observed descendant pin across this push's historical requirements", async () => {
+    const fixture = recursivePushFixture("check-observed-descendant")
+    const intermediate = advanceRepository(fixture.child, "child.txt", "three\n")
+    git(fixture.root, "add", "child")
+    git(fixture.root, "commit", "-q", "-m", "root records intermediate")
+    const descendant = advanceRepository(fixture.child, "child.txt", "four\n")
+    git(fixture.root, "add", "child")
+    git(fixture.root, "commit", "-q", "-m", "root records descendant")
+    const rootSource = git(fixture.root, "rev-parse", "HEAD")
+    const witnessRef = `refs/git-super/pins/${descendant}`
+    git(fixture.child, "push", "-q", "origin", `${descendant}:${witnessRef}`)
+
+    const { result, read } = await checkWith({ ...fixture, rootSource, childSource: descendant })
+
+    expect(result, JSON.stringify(result)).toMatchObject({ state: "updated", partial: false })
+    expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(rootSource)
+    for (const ancestor of [fixture.childSource, intermediate]) {
+      const retained = result.repositories.find((row) => row.detail?.message.includes(ancestor))
+      expect(retained).toMatchObject({ repository: fixture.child, state: "unchanged" })
+      expect(retained?.detail?.message).toContain(witnessRef)
+      expect(retained?.detail?.message).toContain(descendant)
+    }
+    expect(read).toEqual([
+      "refs/heads/main",
+      witnessRef,
+      "refs/heads/main",
+      `refs/git-super/pins/${intermediate}`,
+      "refs/heads/main",
+      `refs/git-super/pins/${fixture.childSource}`,
+    ])
+  })
+
   test("check passes a pin reached only by the seat's pushed child task branch, not its tip", async () => {
     const fixture = recursivePushFixture("check-task-branch")
     crowd(fixture)
