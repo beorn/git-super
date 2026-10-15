@@ -157,6 +157,7 @@ export async function assertNoPrivateStore(process: GitProcess, custody: Private
 export type WorktreeRemovalProof = Readonly<{
   path: string
   head: string
+  checkout?: "absent"
   repositories: readonly string[]
   modules: string
   retained: string | null
@@ -1108,9 +1109,10 @@ export async function retainWorktreeModules(
   onRetainedPath?: (path: string) => void,
   retirePrivate?: () => void,
   preserved: readonly string[] = [],
+  destroyed?: Readonly<{ gitDir: string; common: string; head: string }>,
 ): Promise<WorktreeRemovalProof> {
-  const path = realpathSync(requested)
-  if (privateProjection === undefined) {
+  const path = destroyed === undefined ? realpathSync(requested) : resolve(requested)
+  if (privateProjection === undefined && destroyed === undefined) {
     const registered = await inspect(repo, path)
     if (!registered.registered) {
       throw new Error(`worktree ${path} is not registered in ${repo}; inspect git worktree list`)
@@ -1120,16 +1122,77 @@ export async function retainWorktreeModules(
     }
   }
   const gitDir =
-    privateProjection === undefined
-      ? realpathSync(await git.text(path, ["rev-parse", "--absolute-git-dir"]))
-      : join(path, ".git")
+    destroyed !== undefined
+      ? destroyed.gitDir
+      : privateProjection === undefined
+        ? realpathSync(await git.text(path, ["rev-parse", "--absolute-git-dir"]))
+        : join(path, ".git")
   const common =
-    privateProjection === undefined
-      ? realpathSync(await git.text(path, ["rev-parse", "--path-format=absolute", "--git-common-dir"]))
-      : gitDir
+    destroyed !== undefined
+      ? destroyed.common
+      : privateProjection === undefined
+        ? realpathSync(await git.text(path, ["rev-parse", "--path-format=absolute", "--git-common-dir"]))
+        : gitDir
   if (gitDir === common && privateProjection === undefined) {
     throw new Error(`worktree ${path} is the primary worktree; only a linked worktree can be removed`)
   }
+  return retainResolvedWorktreeModules({
+    git,
+    path,
+    gitDir,
+    common,
+    retention,
+    inspect,
+    writerLocks,
+    createdWriterLocks,
+    rehome,
+    excludedSubmodules,
+    notCompared,
+    privateProjection,
+    onRetainedPath,
+    retirePrivate,
+    preserved,
+    destroyedHead: destroyed?.head,
+  })
+}
+
+/** The single copy/verify/rehome stage for an extant or a destroyed checkout. */
+async function retainResolvedWorktreeModules(context: {
+  git: Git
+  path: string
+  gitDir: string
+  common: string
+  retention: WorktreeRetention
+  inspect: (repository: string, path: string) => Promise<WorktreeInspection>
+  writerLocks: readonly WriterLockProof[]
+  createdWriterLocks: readonly WriterLockProof[]
+  rehome: (() => readonly string[]) | undefined
+  excludedSubmodules: readonly string[]
+  notCompared: readonly NotCompared[]
+  privateProjection: PrivateGitProjection | undefined
+  onRetainedPath: ((path: string) => void) | undefined
+  retirePrivate: (() => void) | undefined
+  preserved: readonly string[]
+  destroyedHead: string | undefined
+}): Promise<WorktreeRemovalProof> {
+  const {
+    git,
+    path,
+    gitDir,
+    common,
+    retention,
+    inspect,
+    writerLocks,
+    createdWriterLocks,
+    rehome,
+    excludedSubmodules,
+    notCompared,
+    privateProjection,
+    onRetainedPath,
+    retirePrivate,
+    preserved,
+    destroyedHead,
+  } = context
   const modules = join(gitDir, "modules")
   const custody = { common, checkout: path, gitDir, modules }
   // Diagnose metadata links before Git discovery can hide their source and target in an object lookup failure.
@@ -1153,7 +1216,9 @@ export async function retainWorktreeModules(
     }
   }
   let before =
-    privateProjection === undefined ? await cleanSnapshot(git, path, inspect, excludedSubmodules, preserved) : undefined
+    privateProjection === undefined && destroyedHead === undefined
+      ? await cleanSnapshot(git, path, inspect, excludedSubmodules, preserved)
+      : undefined
   // Check metadata locks before copying. The modules subtree includes every store,
   // even one left by an earlier gitlink that the current tree no longer records.
   const metadata = manifest(gitDir, custody, true, false)
@@ -1293,13 +1358,16 @@ export async function retainWorktreeModules(
   const rehomedBorrowers =
     privateProjection === undefined ? (rehome === undefined ? rehomeBorrowers(common, gitDir, modules) : rehome()) : []
   const inspectedPath = copiedCheckout
-  const after = await cleanSnapshot(
-    git,
-    inspectedPath,
-    inspect,
-    excludedSubmodules,
-    privateProjection === undefined ? preserved : [],
-  )
+  const after =
+    destroyedHead === undefined
+      ? await cleanSnapshot(
+          git,
+          inspectedPath,
+          inspect,
+          excludedSubmodules,
+          privateProjection === undefined ? preserved : [],
+        )
+      : undefined
   const verifyPrivateManifest = (): void => {
     if (
       privateProjection !== undefined &&
@@ -1313,11 +1381,14 @@ export async function retainWorktreeModules(
   if (JSON.stringify(after) !== JSON.stringify(before)) {
     throw new Error(`worktree ${path} changed during retention; preserved, retry after its writer stops`)
   }
-  if (before === undefined) throw new Error(`private snapshot missing for ${path}; worktree preserved`)
+  if (before === undefined && destroyedHead === undefined) {
+    throw new Error(`private snapshot missing for ${path}; worktree preserved`)
+  }
   const proof: WorktreeRemovalProof = {
     path,
-    head: await git.commit(inspectedPath, "HEAD"),
-    repositories: before.map((entry) => join(path, relative(inspectedPath, entry.path))),
+    head: destroyedHead ?? (await git.commit(inspectedPath, "HEAD")),
+    ...(destroyedHead === undefined ? {} : { checkout: "absent" as const }),
+    repositories: before === undefined ? [] : before.map((entry) => join(path, relative(inspectedPath, entry.path))),
     modules,
     retained,
     manifest: join(retainedRoot, "manifest.json"),

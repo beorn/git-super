@@ -4,7 +4,7 @@
  * @consumer Yrd worktree and deployment stores
  * @reach fs-walk <fixture-only: worktree stores and retention checks read isolated mkdtemp Git repositories>
  */
-import { existsSync, readdirSync, readFileSync } from "node:fs"
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs"
 import { mkdir, mkdtemp, readFile, readlink, rename, rm, symlink, utimes, writeFile } from "node:fs/promises"
 import { spawnSync } from "node:child_process"
 import { tmpdir } from "node:os"
@@ -171,6 +171,147 @@ describe("createGitWorktreeStore", () => {
       expect(objectStoreSnapshot(otherAdmin)).toEqual(before)
       expect(existsSync(unreadableAdmin)).toBe(true)
     } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  /**
+   * @failure Destroyed-checkout recovery erases unique historical child data or releases its hold before custody (#29385).
+   * @level l1
+   * @consumer Candidate and integration-root orphan lifecycle
+   * @testonly none
+   */
+  it.each([
+    "unlocked",
+    "dead-holder",
+    "retention-failure",
+    "changed-holder",
+    "recreated-checkout",
+    "remove-failure",
+    "remove-failure-new-holder",
+  ])("retains destroyed-checkout module custody before unregistering: %s", async (mode) => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-destroyed-custody-"))
+    try {
+      const fixture = createProductFixture(root)
+      const native = createLocalGitProcess()
+      const store = createGitWorktreeStore({
+        repo: fixture.product,
+        gitProcess: {
+          run: (request) => {
+            if (mode.startsWith("remove-failure") && request.args[0] === "worktree" && request.args[1] === "remove") {
+              if (mode === "remove-failure-new-holder") writeFileSync(join(admin, "locked"), "manual replacement\n")
+              return Promise.resolve({ code: 1, stdout: "", stderr: "controlled native removal failure" })
+            }
+            return native.run(request)
+          },
+        },
+      })
+      const { linked, moduleDir } = await addAlphaWorktree(store, root, "destroyed")
+      const child = join(linked, "packages/alpha")
+      git(child, ["checkout", "-qb", "unique-child"])
+      await writeFile(join(child, "unique.txt"), "only this child store owns these bytes\n")
+      git(child, ["add", "unique.txt"])
+      git(child, ["commit", "-qm", "unique child custody"])
+      const tip = git(child, ["rev-parse", "HEAD"]).trim()
+      // Retention must include stores no longer named by the current root gitlinks.
+      git(linked, ["rm", "-fq", "packages/alpha"])
+      git(linked, ["commit", "-qm", "remove historical gitlink"])
+      const head = git(linked, ["rev-parse", "HEAD"]).trim()
+      const admin = git(linked, ["rev-parse", "--absolute-git-dir"]).trim()
+      const hold = mode === "unlocked" ? undefined : "pid:2147483647"
+      if (hold !== undefined) await store.lock(linked, hold)
+      await rename(linked, `${linked}-moved`)
+      const proofs: WorktreeRemovalProof[] = []
+      const retention = {
+        root: join(root, "retained"),
+        report(proof: WorktreeRemovalProof) {
+          expect(existsSync(admin)).toBe(true)
+          expect(
+            hold === undefined
+              ? !existsSync(join(admin, "locked"))
+              : readFileSync(join(admin, "locked"), "utf8").trim() === hold,
+          ).toBe(true)
+          expect(proof).toMatchObject({ checkout: "absent", head, repositories: [] })
+          const retainedChild = join(proof.retained!, relative(join(admin, "modules"), moduleDir))
+          expect(
+            git(fixture.product, [
+              "--git-dir",
+              retainedChild,
+              "--work-tree",
+              fixture.product,
+              "rev-parse",
+              "refs/heads/unique-child",
+            ]).trim(),
+          ).toBe(tip)
+          expect(
+            git(fixture.product, [
+              "--git-dir",
+              retainedChild,
+              "--work-tree",
+              fixture.product,
+              "show",
+              `${tip}:unique.txt`,
+            ]),
+          ).toBe("only this child store owns these bytes\n")
+          proofs.push(proof)
+          if (mode === "retention-failure") throw new Error("retention receipt unavailable")
+          if (mode === "changed-holder") writeFileSync(join(admin, "locked"), "manual replacement\n")
+          if (mode === "recreated-checkout") {
+            queueMicrotask(() => {
+              mkdirSync(linked)
+              writeFileSync(join(linked, ".git"), `gitdir: ${admin}\n`)
+              writeFileSync(join(linked, "new-authored-payload"), "arrived after admission\n")
+            })
+          }
+        },
+      }
+      const recovery = store.recoverDestroyed(linked, "recover native destroyed fixture", retention)
+      if (
+        [
+          "retention-failure",
+          "changed-holder",
+          "recreated-checkout",
+          "remove-failure",
+          "remove-failure-new-holder",
+        ].includes(mode)
+      ) {
+        await expect(recovery).rejects.toThrow(
+          mode === "retention-failure"
+            ? "retention receipt unavailable"
+            : mode.startsWith("remove-failure")
+              ? "controlled native removal failure"
+              : mode === "recreated-checkout"
+                ? /checkout|appeared|exists/u
+                : /lock|hold/u,
+        )
+        expect(await store.inspect(linked)).toMatchObject({
+          registered: true,
+          locked: mode === "changed-holder" || mode === "remove-failure-new-holder" ? "manual replacement" : hold,
+        })
+        expect(existsSync(moduleDir)).toBe(true)
+        if (mode === "recreated-checkout") {
+          expect(readFileSync(join(linked, "new-authored-payload"), "utf8")).toBe("arrived after admission\n")
+        }
+        expect(
+          git(fixture.product, [
+            "--git-dir",
+            moduleDir,
+            "--work-tree",
+            fixture.product,
+            "rev-parse",
+            "refs/heads/unique-child",
+          ]).trim(),
+        ).toBe(tip)
+      } else {
+        await recovery
+        expect(await store.inspect(linked)).toEqual({ registered: false })
+        expect(existsSync(admin)).toBe(false)
+      }
+      expect(proofs).toHaveLength(1)
+      const manifest = JSON.parse(await readFile(proofs[0]!.manifest, "utf8")) as { checkout?: string }
+      expect(manifest.checkout).toBe("absent")
+    } finally {
+      // raw-delete-allow: root is this test's fresh mkdtemp fixture, never a caller-supplied checkout or Git store.
       await rm(root, { recursive: true, force: true })
     }
   })
