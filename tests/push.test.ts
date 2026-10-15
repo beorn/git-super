@@ -8,6 +8,7 @@ import { acquireExclusive, createExclusive, type Exclusive } from "../src/exclus
 import { createLocalGitProcess, type GitProcess } from "../src/process.ts"
 import { capturePushIntent, pushRefUpdates, remoteContainsCommit, superPush } from "../src/push.ts"
 import { decodePushIntent, encodePushIntent, PUSH_INTENT_TRAILER } from "../src/push-intent.ts"
+import type { RefUpdate } from "../src/result.ts"
 import { advanceRepository, canonicalTmpdir as tmpdir, createRepository, git } from "./fixture.ts"
 
 const roots: string[] = []
@@ -1405,9 +1406,11 @@ describe("explicit recursive push mechanics", () => {
   // 25570: `ls-remote <remote> <ref>` filters on the client, so each observation carried the remote's whole
   // advertisement. Observed by name, a destination advertises itself and nothing else, and writes no local ref.
   test("observes a destination by name: only that ref is advertised, and no local ref is written", async () => {
-    const { fixture, repository, remote, source } = pushFixture("observe-by-name")
-    git(repository, "push", "-q", remote, `${source}:refs/heads/task/seed`)
-    for (let index = 0; index < 30; index++) git(remote, "update-ref", `refs/heads/task/crowd-${index}`, source)
+    const { fixture, repository, remote, source: before } = pushFixture("observe-by-name")
+    git(repository, "push", "-q", remote, `${before}:refs/heads/main`)
+    git(repository, "push", "-q", remote, `${before}:refs/heads/task/seed`)
+    for (let index = 0; index < 30; index++) git(remote, "update-ref", `refs/heads/task/crowd-${index}`, before)
+    const source = advanceRepository(repository, "README.md", "advanced\n")
     const packets = join(fixture, "observe-packets.log")
     writeFileSync(packets, "")
     const local = createLocalGitProcess()
@@ -1423,18 +1426,19 @@ describe("explicit recursive push mechanics", () => {
 
     const result = await pushRefUpdates({
       root: repository,
-      updates: [update(repository, remote, source, { state: "missing" })],
+      updates: [update(repository, remote, source, { state: "oid", oid: before })],
       git: traced,
     })
 
     expect(result).toMatchObject({ state: "updated", partial: false })
     expect(git(remote, "rev-parse", "refs/heads/main")).toBe(source)
-    expect(observations.length).toBeGreaterThanOrEqual(2)
+    // 28867: the plan's read is the only one; the lease and the push's porcelain row answer the rest.
+    expect(observations).toHaveLength(1)
     for (const args of observations) expect(args.at(-1)).toMatch(/^\+refs\/heads\/main:refs\/git-super\/observed\//u)
     const advertised = readFileSync(packets, "utf8")
       .split("\n")
       .filter((line) => /packet:.*< [0-9a-f]{40} refs\//u.test(line))
-    // Absent before the write (nothing advertised), present after it (main alone), never a crowd branch.
+    // Present when the plan reads it (main alone advertised), never a crowd branch.
     expect(advertised.length).toBeGreaterThanOrEqual(1)
     expect(advertised.every((line) => line.endsWith(" refs/heads/main"))).toBe(true)
     expect(git(repository, "for-each-ref", "--format=%(refname)", "refs/git-super/observed")).toBe("")
@@ -1443,16 +1447,17 @@ describe("explicit recursive push mechanics", () => {
   test("preserves a successful write as unknown when post-push observation fails", async () => {
     const { repository, remote, source } = pushFixture("post-write-observation")
     const local = createLocalGitProcess()
-    let observations = 0
+    let pushed = false
     const unreadableAfterWrite: GitProcess = {
       async run(request) {
-        if (isObservation(request.args)) {
-          observations += 1
-          if (observations === 3) {
-            return { code: 128, stdout: "", stderr: "remote disappeared after write" }
-          }
+        if (pushed && isObservation(request.args)) {
+          return { code: 128, stdout: "", stderr: "remote disappeared after write" }
         }
-        return local.run(request)
+        const result = await local.run(request)
+        if (request.args[0] !== "push") return result
+        pushed = true
+        // 28867: a clean push's porcelain rows decide without a read. Without them the remote is read after the write.
+        return { ...result, stdout: "" }
       },
     }
 
@@ -2373,7 +2378,19 @@ describe("cold first publication retains an existing child pin (26421)", () => {
       },
     }
     const result = await cold.push(route, process)
-    expect(result).toMatchObject({ state: fault === "raced-conflict" ? "unknown" : "failed", partial: false })
+    expect(result).toMatchObject({ state: "failed", partial: false })
+    if (fault === "raced-conflict") {
+      // 28867 (@cto 0d28de34): the lease the server refused is the moved destination the recheck used to name.
+      expect(result.repositories.flatMap((repository) => repository.refs)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            destination: ref,
+            state: "failed",
+            detail: expect.objectContaining({ code: "destination-changed" }),
+          }),
+        ]),
+      )
+    }
     expect(JSON.stringify(fault === "raced-conflict" ? result.repositories : result.detail)).toContain(
       fault === "transport"
         ? "declared child transport refused"
@@ -2494,7 +2511,9 @@ describe("cold first publication retains an existing child pin (26421)", () => {
       expect.arrayContaining([expect.objectContaining({ destination: firstRef, state: "updated" })]),
     )
     expect(git(shape.remotes.child, "rev-parse", firstRef)).toBe(shape.childSource)
-    expect(git(shape.remotes.other, "for-each-ref", "--format=%(objectname)", laterRef)).toBe("")
+    // 28867: no recheck reads the later ref under the lock, so its leased create-only push runs before the read that
+    // fails (the retained-source check). The immutable ref names its own object; the publication still fails, partial.
+    expect(git(shape.remotes.other, "for-each-ref", "--format=%(objectname)", laterRef)).toBe(shape.before.other)
     expect(git(shape.remotes.other, "rev-parse", "refs/heads/main")).toBe(shape.before.other)
     expect(git(shape.remotes.root, "rev-parse", "refs/heads/main")).toBe(shape.rootBefore)
   })
@@ -2513,15 +2532,15 @@ describe("a frozen push works only on the children its merge moved (25303, obser
     expect(git(shape.remotes.other, "for-each-ref", "--format=%(refname)", "refs/git-super/pins")).toBe("")
     const touchingOther = shape.calls.filter(({ args }) => args.some((arg) => arg.includes(shape.hosted("other"))))
     expect(touchingOther).toEqual([])
-    // The moved child's main is observed once per plan and once after its
-    // push, never twice in one plan.
+    // The moved child's main is read once per plan, never twice in one plan; its lease and the push's porcelain row
+    // answer the recheck and the read after the push (28867).
     const childMainReads = shape.calls.filter(
       ({ args }) =>
         isObservation(args) &&
         args.includes(shape.hosted("child")) &&
         args.some((arg) => arg.startsWith("+refs/heads/main:")),
     )
-    expect(childMainReads.length).toBe(4)
+    expect(childMainReads.length).toBe(2)
   })
 
   test("does not fetch back a pin the retention push found already at its source", async () => {
@@ -3252,6 +3271,227 @@ describe("a nested gitlink counts as moved only when its own pin moved (25303, r
         expect(git(remotes.leaf, "rev-parse", "refs/heads/main")).toBe(diverged)
         expect(git(remotes.root, "rev-parse", "refs/heads/main")).toBe(rootBefore)
       }
+    },
+  )
+})
+
+/**
+ * @failure A leased push reads its destination again under the lock and again after a clean push, although its lease
+ * and its porcelain row already answer: two SSH round trips per pushed component in every yrd submit (28867). Or the
+ * shortcut misreports: a moved destination is not named `destination-changed`, or a clean push classifies differently
+ * from what reading the remote would have said.
+ * @level l3
+ * @consumer yrd submit's retention-ref publication (publishMovedGitlinks reads `destination-changed` per ref) and every
+ * git super push; @cto ruling 0d28de34 on 28867.
+ * @testonly none
+ */
+describe("a leased push trusts its lease and its porcelain rows (28867)", () => {
+  type Calls = { observes: number; observesAfterPush: number; pushes: number }
+
+  /** Count remote destination reads and pushes; `stripRows` hides the push's porcelain rows (the push still ran). */
+  function counting(stripRows = false): Readonly<{ git: GitProcess; calls: Calls }> {
+    const local = createLocalGitProcess()
+    const calls: Calls = { observes: 0, observesAfterPush: 0, pushes: 0 }
+    return {
+      calls,
+      git: {
+        async run(request) {
+          if (request.args[0] === "fetch" && request.args.includes("--dry-run")) {
+            calls.observes++
+            if (calls.pushes > 0) calls.observesAfterPush++
+          }
+          const result = await local.run(request)
+          if (request.args[0] !== "push") return result
+          calls.pushes++
+          return stripRows ? { ...result, stdout: "" } : result
+        },
+      },
+    }
+  }
+
+  test("one leased ref costs one read and one push", async () => {
+    const { repository, remote, source } = pushFixture("leased-one")
+    const counted = counting()
+
+    const result = await pushRefUpdates({
+      root: repository,
+      updates: [update(repository, remote, source, { state: "missing" })],
+      git: counted.git,
+    })
+
+    expect(result).toMatchObject({ state: "updated", partial: false })
+    expect(counted.calls).toEqual({ observes: 1, observesAfterPush: 0, pushes: 1 })
+    expect(git(remote, "rev-parse", "refs/heads/main")).toBe(source)
+  })
+
+  test("a lease the remote refuses names the moved destination on its ref", async () => {
+    const { repository, remote, source: before } = pushFixture("leased-race")
+    git(repository, "push", "-q", remote, `${before}:refs/heads/main`)
+    const source = advanceRepository(repository, "README.md", "source\n")
+    git(repository, "checkout", "-q", "-b", "race", before)
+    const other = advanceRepository(repository, "README.md", "other\n")
+    git(repository, "push", "-q", remote, `${other}:refs/heads/race`)
+    git(repository, "checkout", "-q", "main")
+    const racing: Exclusive = {
+      async run(operation) {
+        git(remote, "update-ref", "refs/heads/main", other)
+        return operation()
+      },
+    }
+    const counted = counting()
+
+    const result = await pushRefUpdates({
+      root: repository,
+      updates: [update(repository, remote, source, { state: "oid", oid: before })],
+      exclusive: racing,
+      git: counted.git,
+    })
+
+    expect(result).toMatchObject({ state: "failed", partial: false })
+    expect(result.repositories[0]?.refs[0]).toMatchObject({
+      destination: "refs/heads/main",
+      state: "failed",
+      detail: { code: "destination-changed" },
+    })
+    // The plan's read, the refused push, and one read naming what the remote now holds; no recheck under the lock.
+    expect(counted.calls).toEqual({ observes: 2, observesAfterPush: 1, pushes: 1 })
+    expect(git(remote, "rev-parse", "refs/heads/main")).toBe(other)
+  })
+
+  test.each([
+    { atomic: false, observes: 4 },
+    { atomic: true, observes: 2 },
+  ])(
+    "a group of two leased refs rechecks under the lock unless atomic (atomic $atomic)",
+    async ({ atomic, observes }) => {
+      const { repository, remote, source } = pushFixture(`leased-two-${atomic}`)
+      const counted = counting()
+
+      const result = await pushRefUpdates({
+        root: repository,
+        updates: [
+          update(repository, remote, source, { state: "missing" }),
+          { repository, remote, source, destination: "refs/heads/second", expectedDestination: { state: "missing" } },
+        ],
+        atomic,
+        git: counted.git,
+      })
+
+      expect(result).toMatchObject({ state: "updated", partial: false })
+      expect(counted.calls).toEqual({ observes, observesAfterPush: 0, pushes: 1 })
+    },
+  )
+
+  type Fixture = ReturnType<typeof pushFixture>
+  type Scenario = Readonly<{
+    name: string
+    atomic?: boolean
+    prepare(fixture: Fixture): Readonly<{ updates: RefUpdate[]; exclusive?: Exclusive }>
+  }>
+  const scenarios: readonly Scenario[] = [
+    {
+      name: "new ref (*)",
+      prepare: ({ repository, remote, source }) => ({
+        updates: [update(repository, remote, source, { state: "missing" })],
+      }),
+    },
+    {
+      name: "fast-forward ( )",
+      prepare: ({ repository, remote, source }) => {
+        git(repository, "push", "-q", remote, `${source}:refs/heads/main`)
+        const wanted = advanceRepository(repository, "README.md", "wanted\n")
+        return { updates: [update(repository, remote, wanted, { state: "oid", oid: source })] }
+      },
+    },
+    {
+      name: "forced (+)",
+      prepare: ({ repository, remote, source }) => {
+        git(repository, "checkout", "-q", "-b", "side", source)
+        const competing = advanceRepository(repository, "README.md", "competing\n")
+        git(repository, "push", "-q", remote, `${competing}:refs/heads/main`)
+        git(repository, "checkout", "-q", "main")
+        const wanted = advanceRepository(repository, "README.md", "wanted\n")
+        return {
+          updates: [
+            {
+              ...update(repository, remote, wanted, { state: "oid", oid: competing }),
+              allowNonFastForward: true,
+            },
+          ],
+        }
+      },
+    },
+    {
+      name: "deleted (-)",
+      prepare: ({ repository, remote, source }) => {
+        git(repository, "push", "-q", remote, `${source}:refs/heads/gone`)
+        return {
+          updates: [
+            {
+              repository,
+              remote,
+              source: "",
+              destination: "refs/heads/gone",
+              expectedDestination: { state: "oid", oid: source },
+            },
+          ],
+        }
+      },
+    },
+    {
+      name: "a concurrent identical push (=)",
+      prepare: ({ repository, remote, source }) => ({
+        updates: [update(repository, remote, source, { state: "missing" })],
+        exclusive: {
+          async run(operation) {
+            git(repository, "push", "-q", remote, `${source}:refs/heads/main`)
+            return operation()
+          },
+        },
+      }),
+    },
+    {
+      name: "an identical member of an atomic group (= and *)",
+      atomic: true,
+      prepare: ({ repository, remote, source }) => {
+        git(repository, "push", "-q", remote, `${source}:refs/heads/main`)
+        return {
+          updates: [
+            update(repository, remote, source, { state: "oid", oid: source }),
+            { repository, remote, source, destination: "refs/heads/second", expectedDestination: { state: "missing" } },
+          ],
+        }
+      },
+    },
+  ]
+
+  test.each(scenarios)(
+    "a clean push's porcelain rows classify as reading the remote would: $name",
+    async (scenario) => {
+      const verdicts = []
+      for (const stripRows of [false, true]) {
+        const fixture = pushFixture(`porcelain-${scenarios.indexOf(scenario)}-${String(stripRows)}`)
+        const { updates, exclusive } = scenario.prepare(fixture)
+        const counted = counting(stripRows)
+        const result = await pushRefUpdates({
+          root: fixture.repository,
+          updates,
+          ...(scenario.atomic === undefined ? {} : { atomic: scenario.atomic }),
+          ...(exclusive === undefined ? {} : { exclusive }),
+          git: counted.git,
+        })
+        // The rows decide without a read; with the rows hidden the old path reads every destination after the push.
+        expect(counted.calls.pushes).toBe(1)
+        expect(counted.calls.observesAfterPush).toBe(stripRows ? updates.length : 0)
+        verdicts.push({
+          state: result.state,
+          refs: result.repositories.flatMap((repository) =>
+            repository.refs.map((ref) => ({ destination: ref.destination, state: ref.state })),
+          ),
+        })
+      }
+      expect(verdicts[0]).toEqual(verdicts[1])
+      expect(verdicts[0]?.state).not.toBe("unknown")
     },
   )
 })

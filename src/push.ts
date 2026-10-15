@@ -635,14 +635,92 @@ async function verifyFastForwardUpdate(git: GitProcess, update: PlannedUpdate): 
   )
 }
 
+/** git's documented `push --porcelain` row: `<flag>\t<from>:<to>\t<summary>`. */
+type PorcelainRow = Readonly<{ flag: string; source: string; destination: string; summary: string }>
+
+const PORCELAIN_REF = /^([ +\-*!=])\t([^\t]*):([^\t]+)\t(.*)$/u
+
+/** One porcelain push row, or undefined for any other line: the one row grammar every push here reads. */
+function porcelainRow(line: string): PorcelainRow | undefined {
+  const match = PORCELAIN_REF.exec(line)
+  if (match === null) return undefined
+  const [, flag = "", source = "", destination = "", summary = ""] = match
+  return { flag, source, destination, summary }
+}
+/** Flags of a ref the push left holding its source: fast-forward, forced, deleted, new, already up to date. */
+const PUSHED_FLAGS: ReadonlySet<string> = new Set([" ", "+", "-", "*", "="])
+/** The summary git prints, untranslated, for a ref whose `--force-with-lease` expectation the remote no longer held. */
+const STALE_LEASE_SUMMARY = "[rejected] (stale info)"
+
+/**
+ * Each update's one row from a push's porcelain stdout. Undefined when any line is outside the documented format or
+ * any update has no row, or more than one: the caller then observes the remote rather than assume an outcome.
+ */
+function porcelainRows(
+  stdout: string,
+  updates: readonly PlannedUpdate[],
+): ReadonlyMap<PlannedUpdate, PorcelainRow> | undefined {
+  const rows: PorcelainRow[] = []
+  for (const line of stdout.split(/\r?\n/u)) {
+    if (line === "" || line === "Done" || line.startsWith("To ")) continue
+    const row = porcelainRow(line)
+    if (row === undefined) return undefined
+    rows.push(row)
+  }
+  if (rows.length !== updates.length) return undefined
+  const byUpdate = new Map<PlannedUpdate, PorcelainRow>()
+  for (const update of updates) {
+    const matching = rows.filter((row) => row.source === update.source && row.destination === update.destination)
+    const [only] = matching
+    if (matching.length !== 1 || only === undefined) return undefined
+    byUpdate.set(update, only)
+  }
+  return byUpdate
+}
+
+/** What the destination holds after a push whose row reports it pushed: the update's own source, or nothing. */
+function pushedDestination(update: PlannedUpdate): ExpectedDestination {
+  return update.source === "" ? { state: "missing" } : { state: "oid", oid: update.source }
+}
+
+/** One ref's verdict from the value its destination holds after the push, read or implied by its porcelain row. */
+function refAfterPush(
+  update: PlannedUpdate,
+  observed: ExpectedDestination,
+  pushFailure: GitResultDetail | undefined,
+): GitSuperRefResult {
+  if (isIdenticalSuccess(update.source, observed)) {
+    const state = isIdenticalSuccess(update.source, update.expectedDestination) ? "unchanged" : "updated"
+    return refResult(update, state)
+  }
+  if (pushFailure === undefined) {
+    const unknown = detail(
+      "push-observation-mismatch",
+      "observe-push-result",
+      `Git reported success but ${update.remote} ${update.destination} does not equal ${update.source}.`,
+      { remedy: "Preserve the command output and inspect the remote before any retry." },
+    )
+    return refResult(update, "unknown", unknown)
+  }
+  return sameExpected(update.expectedDestination, observed)
+    ? refResult(update, "failed", pushFailure)
+    : refResult(update, "unknown", pushFailure)
+}
+
 async function applyGroup(
   git: GitProcess,
   group: PushGroup,
   options: Pick<PushRefUpdatesOptions, "atomic" | "pushOptions" | "receivePack" | "signed" | "verify">,
 ): Promise<GitSuperRepositoryResult> {
-  const rechecked = await Promise.all(
-    group.updates.map((update) => observeDestination(git, update, "recheck-destination")),
-  )
+  // 28867 (@cto 0d28de34): an explicit lease IS the recheck, done by the server in the push itself. It stands in for
+  // this read only when one refused lease fails the whole group: an atomic push, or a group of one. In a non-atomic
+  // group of several, this recheck is what keeps one moved destination from becoming a partial push.
+  const leaseRechecks =
+    group.updates.every((update) => update.explicitExpectation) &&
+    (options.atomic === true || group.updates.length === 1)
+  const rechecked = leaseRechecks
+    ? []
+    : await Promise.all(group.updates.map((update) => observeDestination(git, update, "recheck-destination")))
   for (const [index, observed] of rechecked.entries()) {
     const update = group.updates[index]
     if (
@@ -695,6 +773,13 @@ async function applyGroup(
     ...group.updates.map((update) => `${update.source}:${update.destination}`),
   ]
   const pushed = await git.run({ repo: group.repository, args })
+  // A clean push reports each ref's outcome in its porcelain row; reading the remote again after it only catches a
+  // writer racing in behind us. Anything short of one parsed success row per update observes, never assumes.
+  const rows = porcelainRows(pushed.stdout, group.updates)
+  if (pushed.code === 0 && rows !== undefined && [...rows.values()].every((row) => PUSHED_FLAGS.has(row.flag))) {
+    const refs = group.updates.map((update) => refAfterPush(update, pushedDestination(update), undefined))
+    return { repository: group.repository, state: repositoryState(refs), refs }
+  }
   const observations = await Promise.allSettled(
     group.updates.map((update) => observeDestination(git, update, "observe-push-result")),
   )
@@ -731,22 +816,19 @@ async function applyGroup(
       return refResult(update, "unknown", unknown)
     }
     const observed = observation.value
-    if (isIdenticalSuccess(update.source, observed)) {
-      const state = isIdenticalSuccess(update.source, update.expectedDestination) ? "unchanged" : "updated"
-      return refResult(update, state)
+    // A lease the server refused, on a destination that now holds neither the expected value nor ours, is the
+    // moved destination the recheck used to name before the push: the same failed `destination-changed` verdict.
+    const row = rows?.get(update)
+    if (
+      pushFailure !== undefined &&
+      row?.flag === "!" &&
+      row.summary === STALE_LEASE_SUMMARY &&
+      !sameExpected(update.expectedDestination, observed) &&
+      !isIdenticalSuccess(update.source, observed)
+    ) {
+      return refResult(update, "failed", mismatchDetail(update, observed, "push-refs"))
     }
-    if (pushFailure === undefined) {
-      const unknown = detail(
-        "push-observation-mismatch",
-        "observe-push-result",
-        `Git reported success but ${group.remote} ${update.destination} does not equal ${update.source}.`,
-        { remedy: "Preserve the command output and inspect the remote before any retry." },
-      )
-      return refResult(update, "unknown", unknown)
-    }
-    return sameExpected(update.expectedDestination, observed)
-      ? refResult(update, "failed", pushFailure)
-      : refResult(update, "unknown", pushFailure)
+    return refAfterPush(update, observed, pushFailure)
   })
   return {
     repository: group.repository,
@@ -2056,8 +2138,6 @@ type LeasedChildPush = Readonly<{
   publication?: Readonly<{ destination: string; source: string; expected: ExpectedDestination }>
 }>
 
-const PORCELAIN_REF = /^([ +\-*!=])\t([^\t]*):([^\t]+)\t(.*)$/u
-
 /** One child's leased atomic push, judged by git's own `--porcelain` report: no observation before or after. */
 async function pushLeasedChild(
   git: GitProcess,
@@ -2085,10 +2165,8 @@ async function pushLeasedChild(
   const pushed = await git.run({ repo: child.repository, args })
   const reported = new Map<string, { flag: string; summary: string }>()
   for (const line of pushed.stdout.split(/\r?\n/u)) {
-    const match = PORCELAIN_REF.exec(line)
-    if (match?.[1] !== undefined && match[3] !== undefined) {
-      reported.set(match[3], { flag: match[1], summary: match[4] ?? "" })
-    }
+    const row = porcelainRow(line)
+    if (row !== undefined) reported.set(row.destination, { flag: row.flag, summary: row.summary })
   }
   let failure: GitResultDetail | undefined
   if (pushed.code !== 0 || pushed.timedOut === true || pushed.failure !== undefined) {
