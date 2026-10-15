@@ -3716,16 +3716,32 @@ async function resolveSubmoduleMainFromAlternates(
   return undefined
 }
 
-async function fetchSubmoduleMain(
+/** A child main as the local stores hold it: the branch, its owner store, the origin check and the ref read. */
+type LocalSubmoduleMain = Readonly<{
+  branch: string
+  ref: string
+  alternate: AlternateResolution | undefined
+  owner: string
+  /** The owner's configured `remote.origin.url`. */
+  origin: string
+  sameOrigin: boolean
+  source: string
+  resolveArgs: readonly string[]
+  resolved: GitProcessResult
+}>
+
+/**
+ * Resolve a child's main from the local stores, the one way a merge does, without fetching. `fetchSubmoduleMain`
+ * decides from this whether to refresh; `localMainsAtPin` answers from it alone (29560).
+ */
+async function readLocalSubmoduleMain(
   git: GitProcess,
   superproject: string,
   submodule: string,
   entry: CommitSubmodule,
   timeoutMs: number,
-  noFetch?: boolean,
-  unboundedLocalMain?: boolean,
-  report?: (line: string) => void,
-): Promise<SubmoduleMain> {
+  localOnly = false,
+): Promise<LocalSubmoduleMain> {
   if (entry.url === undefined) throw new Error(`Submodule ${entry.path} has no declared URL while reading its main`)
   const branch = await resolveSubmoduleBranch(
     { run: (request) => git.run({ ...request, timeoutMs }) },
@@ -3733,6 +3749,7 @@ async function fetchSubmoduleMain(
     submodule,
     entry,
     entry.url,
+    { localOnly },
   )
   const { path, target: pin } = entry
   const ref = `refs/remotes/origin/${branch}`
@@ -3755,9 +3772,26 @@ async function fetchSubmoduleMain(
   const origin = originRead.stdout.trim()
   const sameOrigin = sameHostedRepository(origin, entry.url)
   const source = sameOrigin ? origin : entry.url
-  const refreshMessage = `${MAIN_REFRESH_MESSAGE} ${source}`
   const resolveArgs = ["rev-parse", `${ref}^{commit}`]
-  let resolved = await run(git, owner, resolveArgs, timeoutMs)
+  const resolved = await run(git, owner, resolveArgs, timeoutMs)
+  return { branch, ref, alternate, owner, origin, sameOrigin, source, resolveArgs, resolved }
+}
+
+async function fetchSubmoduleMain(
+  git: GitProcess,
+  superproject: string,
+  submodule: string,
+  entry: CommitSubmodule,
+  timeoutMs: number,
+  noFetch?: boolean,
+  unboundedLocalMain?: boolean,
+  report?: (line: string) => void,
+): Promise<SubmoduleMain> {
+  const local = await readLocalSubmoduleMain(git, superproject, submodule, entry, timeoutMs)
+  const { branch, ref, alternate, owner, origin, sameOrigin, source, resolveArgs } = local
+  const { path, target: pin } = entry
+  const refreshMessage = `${MAIN_REFRESH_MESSAGE} ${source}`
+  let resolved = local.resolved
   if (resolved.code !== 0 && noFetch) throw submoduleMainError(owner, path, pin, resolveArgs, resolved)
   const warn = (operation: string, evidence: string): void => {
     const line = `git-super merge: ${path} refresh cache in ${owner}: ${operation}; ${evidence.trim().replaceAll(/\s+/gu, " ")}; treating observation as expired\n`
@@ -3838,6 +3872,77 @@ async function fetchSubmoduleMain(
     ...(alternate === undefined ? {} : { store: owner }),
     ...(usedUnboundedLocalMain ? { unboundedLocalMain: true } : {}),
   }
+}
+
+/** One answer of `localMainsAtPin`: whether the path's local main is its pin, and why. */
+export type LocalMainAtPin = Readonly<{ path: string; atPin: boolean; reason: string }>
+
+/**
+ * Which of `paths`, root gitlinks of `commit` in `repository`, have a local component main equal to their pin,
+ * resolved exactly as a merge that does not fetch resolves it (`readLocalSubmoduleMain`). It never fetches and never
+ * writes.
+ *
+ * A merge leaves such a gitlink where it is, because its main is the pin and there is nothing to raise. Every other
+ * answer is `atPin: false` with its reason: a main ahead or behind, another origin, no readable main or store, or a
+ * path that is not a root gitlink. A caller that leaves out only `atPin` paths therefore keeps every other component
+ * as it is today (29560, @cto 0a2690f0: absent never reads as zero).
+ */
+export async function localMainsAtPin(
+  options: Readonly<{
+    repository: string
+    commit: string
+    paths: readonly string[]
+    process?: GitProcess
+    timeoutMs?: number
+  }>,
+): Promise<readonly LocalMainAtPin[]> {
+  if (options.paths.length === 0) return []
+  const git = options.process ?? createLocalGitProcess()
+  const timeoutMs = options.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS
+  const read = await readCommitSubmodules(git, options.repository, options.commit)
+  if (!Array.isArray(read))
+    throw new Error(`git-super: ${options.commit} submodules read as a selection, expected a list`)
+  const byPath = new Map(read.map((entry) => [entry.path, entry]))
+  const answers: LocalMainAtPin[] = []
+  for (const path of options.paths) {
+    const entry = byPath.get(path)
+    if (entry === undefined) {
+      answers.push({ path, atPin: false, reason: `not a root gitlink at ${options.commit}` })
+      continue
+    }
+    try {
+      const local = await readLocalSubmoduleMain(
+        git,
+        options.repository,
+        join(options.repository, path),
+        entry,
+        timeoutMs,
+        true,
+      )
+      const seen = local.resolved.stdout.trim()
+      if (!local.sameOrigin) {
+        answers.push({
+          path,
+          atPin: false,
+          reason: `origin ${local.origin} in ${local.owner} is not the declared ${entry.url ?? "(no url)"}`,
+        })
+      } else if (local.resolved.code !== 0) {
+        const said = local.resolved.stderr.trim() || `git exited ${String(local.resolved.code)}`
+        answers.push({ path, atPin: false, reason: `${local.ref} is unreadable in ${local.owner}: ${said}` })
+      } else if (seen !== entry.target) {
+        answers.push({
+          path,
+          atPin: false,
+          reason: `${local.ref} in ${local.owner} is ${seen}, not the pin ${entry.target}`,
+        })
+      } else {
+        answers.push({ path, atPin: true, reason: `${local.ref} in ${local.owner} is the pin` })
+      }
+    } catch (error) {
+      answers.push({ path, atPin: false, reason: error instanceof Error ? error.message : String(error) })
+    }
+  }
+  return answers
 }
 
 function submoduleMainError(
