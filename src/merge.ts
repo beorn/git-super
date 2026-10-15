@@ -3900,8 +3900,9 @@ export async function localMainsAtPin(
   const git = options.process ?? createLocalGitProcess()
   const timeoutMs = options.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS
   const read = await readCommitSubmodules(git, options.repository, options.commit)
-  if (!Array.isArray(read))
+  if (!Array.isArray(read)) {
     throw new Error(`git-super: ${options.commit} submodules read as a selection, expected a list`)
+  }
   const byPath = new Map(read.map((entry) => [entry.path, entry]))
   const answers: LocalMainAtPin[] = []
   for (const path of options.paths) {
