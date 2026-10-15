@@ -3286,7 +3286,9 @@ describe("a nested gitlink counts as moved only when its own pin moved (25303, r
  * from what reading the remote would have said.
  * @level l3
  * @consumer yrd submit's retention-ref publication (publishMovedGitlinks reads `destination-changed` per ref) and every
- * git super push; @cto ruling 0d28de34 on 28867.
+ * git super push; @cto ruling 0d28de34 on 28867. Yrd pins these remote reads too, in vendor/yrd's
+ * packages/yrd-queue-core/tests/exact-remote-reads.test.ts ("submit publishes, then retains, a moved gitlink…"): a
+ * change to them re-pins that test in the same root submit.
  * @testonly none
  */
 describe("a leased push trusts its lease and its porcelain rows (28867)", () => {
