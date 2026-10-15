@@ -915,6 +915,9 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         uninitializedSubmodules: status.uninitializedSubmodules,
       }
     },
+    /** Retention records the destroyed checkout's own HEAD in its proof but does not archive it. The current
+     * pool/candidate callers use disposable compositions whose inputs queue change records retain; a caller
+     * passing a seat environment must first hold that HEAD with an archive ref. */
     async recoverDestroyed(
       path: string,
       operation = `recover destroyed worktree ${path}`,
