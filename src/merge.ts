@@ -3874,8 +3874,14 @@ async function fetchSubmoduleMain(
   }
 }
 
-/** One answer of `localMainsAtPin`: whether the path's local main is its pin, and why. */
-export type LocalMainAtPin = Readonly<{ path: string; atPin: boolean; reason: string }>
+/**
+ * One answer of `localMainsAtPin`: whether the path's local main is its pin, and why. `error` is true when the query
+ * could not read the local state at all (not a root gitlink, an unreadable main ref, a failed Git call), and false
+ * when it read it and declined: the main is another commit, the store's origin is another repository, or the
+ * component declares no branch a local read could use. A caller keeps every declined path; an error is worth a
+ * warning, because a query that fails for every path quietly restores the full cost (29560, @cto 7015ba5e).
+ */
+export type LocalMainAtPin = Readonly<{ path: string; atPin: boolean; error: boolean; reason: string }>
 
 /**
  * Which of `paths`, root gitlinks of `commit` in `repository`, have a local component main equal to their pin,
@@ -3908,7 +3914,7 @@ export async function localMainsAtPin(
   for (const path of options.paths) {
     const entry = byPath.get(path)
     if (entry === undefined) {
-      answers.push({ path, atPin: false, reason: `not a root gitlink at ${options.commit}` })
+      answers.push({ path, atPin: false, error: true, reason: `not a root gitlink at ${options.commit}` })
       continue
     }
     try {
@@ -3925,22 +3931,36 @@ export async function localMainsAtPin(
         answers.push({
           path,
           atPin: false,
+          error: false,
           reason: `origin ${local.origin} in ${local.owner} is not the declared ${entry.url ?? "(no url)"}`,
         })
       } else if (local.resolved.code !== 0) {
         const said = local.resolved.stderr.trim() || `git exited ${String(local.resolved.code)}`
-        answers.push({ path, atPin: false, reason: `${local.ref} is unreadable in ${local.owner}: ${said}` })
+        answers.push({
+          path,
+          atPin: false,
+          error: true,
+          reason: `${local.ref} is unreadable in ${local.owner}: ${said}`,
+        })
       } else if (seen !== entry.target) {
         answers.push({
           path,
           atPin: false,
+          error: false,
           reason: `${local.ref} in ${local.owner} is ${seen}, not the pin ${entry.target}`,
         })
       } else {
-        answers.push({ path, atPin: true, reason: `${local.ref} in ${local.owner} is the pin` })
+        answers.push({ path, atPin: true, error: false, reason: `${local.ref} in ${local.owner} is the pin` })
       }
     } catch (error) {
-      answers.push({ path, atPin: false, reason: error instanceof Error ? error.message : String(error) })
+      // The one refusal that is a decline, not a failure: a branch only the remote can name, which this never asks.
+      const code = (error as { resultDetail?: { code?: unknown } }).resultDetail?.code
+      answers.push({
+        path,
+        atPin: false,
+        error: code !== "submodule-branch-not-local",
+        reason: error instanceof Error ? error.message : String(error),
+      })
     }
   }
   return answers

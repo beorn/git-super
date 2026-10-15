@@ -60,7 +60,9 @@ describe("localMainsAtPin answers from the local stores the way a merge without 
     const { process, commands } = recording()
     const commit = git(w.product, "rev-parse", "HEAD")
     const answers = await localMainsAtPin({ repository: w.product, commit, paths: ["vendor/c"], process })
-    expect(answers).toEqual([{ path: "vendor/c", atPin: true, reason: expect.stringContaining("is the pin") }])
+    expect(answers).toEqual([
+      { path: "vendor/c", atPin: true, error: false, reason: expect.stringContaining("is the pin") },
+    ])
     expect(commands.filter((args) => args.includes("fetch") || args.includes("ls-remote"))).toEqual([])
   })
 
@@ -74,28 +76,33 @@ describe("localMainsAtPin answers from the local stores the way a merge without 
     const commit = git(w.product, "rev-parse", "HEAD")
     const answers = await localMainsAtPin({ repository: w.product, commit, paths: ["vendor/c"] })
     expect(answers).toEqual([
-      { path: "vendor/c", atPin: false, reason: expect.stringContaining(`is ${ahead}, not the pin ${w.pin}`) },
+      {
+        path: "vendor/c",
+        atPin: false,
+        error: false,
+        reason: expect.stringContaining(`is ${ahead}, not the pin ${w.pin}`),
+      },
     ])
   })
 
-  it("answers every other case with its reason, never as confirmed", async () => {
+  it("answers every other case with its reason, never as confirmed, and flags the ones it could not read", async () => {
     const w = world()
     const commit = git(w.product, "rev-parse", "HEAD")
     const store = join(w.product, "vendor/c")
     // A path that is not a root gitlink.
     expect(await localMainsAtPin({ repository: w.product, commit, paths: ["vendor/none"] })).toEqual([
-      { path: "vendor/none", atPin: false, reason: `not a root gitlink at ${commit}` },
+      { path: "vendor/none", atPin: false, error: true, reason: `not a root gitlink at ${commit}` },
     ])
     // A store whose origin is another repository.
     git(store, "remote", "set-url", "origin", "https://github.com/beorn/another-repository.git")
     const foreign = await localMainsAtPin({ repository: w.product, commit, paths: ["vendor/c"] })
-    expect(foreign[0]).toMatchObject({ path: "vendor/c", atPin: false })
+    expect(foreign[0]).toMatchObject({ path: "vendor/c", atPin: false, error: false })
     expect(foreign[0]?.reason).toContain("is not the declared")
     git(store, "remote", "set-url", "origin", HOSTED)
     // A store with no main to read.
     git(store, "update-ref", "-d", "refs/remotes/origin/main")
     const unreadable = await localMainsAtPin({ repository: w.product, commit, paths: ["vendor/c"] })
-    expect(unreadable[0]).toMatchObject({ path: "vendor/c", atPin: false })
+    expect(unreadable[0]).toMatchObject({ path: "vendor/c", atPin: false, error: true })
     expect(unreadable[0]?.reason).toContain("is unreadable")
     // A component that declares no branch: only the remote could name its default, and the query never asks.
     git(w.product, "config", "-f", ".gitmodules", "--unset", "submodule.vendor/c.branch")
@@ -107,7 +114,7 @@ describe("localMainsAtPin answers from the local stores the way a merge without 
       paths: ["vendor/c"],
       process: undeclared.process,
     })
-    expect(branchless[0]).toMatchObject({ path: "vendor/c", atPin: false })
+    expect(branchless[0]).toMatchObject({ path: "vendor/c", atPin: false, error: false })
     expect(branchless[0]?.reason).toContain("declares no branch")
     expect(undeclared.commands.filter((args) => args.includes("ls-remote") || args.includes("fetch"))).toEqual([])
     // No paths, no Git.
