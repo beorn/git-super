@@ -11,7 +11,7 @@ vi.mock("node:child_process", async (importOriginal) => {
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { superDiff } from "../src/diff.ts"
+import { superDiff, type SuperDiffResult } from "../src/diff.ts"
 import { runCli } from "../src/cli.ts"
 import {
   addNestedAlphaSubmodule,
@@ -66,14 +66,14 @@ describe("superDiff", () => {
       stderr,
     )
     expect(code, stderr.output).toBe(0)
-    const result = JSON.parse(stdout.output)
+    const result = JSON.parse(stdout.output) as SuperDiffResult
     expect(result.paths).toEqual(["--repo", "deleted file.ts"])
-    expect(result.stats[0].files).toEqual([
+    expect(result.stats?.[0]?.files).toEqual([
       { path: "--repo", added: 0, deleted: 1, binary: false },
       { path: "deleted file.ts", added: 0, deleted: 2, binary: false },
     ])
-    expect(result.patches[0].patch).toContain("deleted file mode")
-    expect(result.patches[0].patch).not.toContain("unrelated.ts")
+    expect(result.patches?.[0]?.patch).toContain("deleted file mode")
+    expect(result.patches?.[0]?.patch).not.toContain("unrelated.ts")
   })
 
   /**
