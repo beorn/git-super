@@ -922,10 +922,14 @@ async function runInvocation(
     .argument("[refs...]", "Git revision range or refs")
     .action((refs, options, command) => {
       const globals = command.optsWithGlobals() as { repo: string; json?: boolean }
+      // Commander removes -- from positionals; Git still needs it before deleted or option-shaped paths.
+      const separator = argv.indexOf("--")
+      const paths = separator === -1 ? [] : argv.slice(separator + 1)
+      const diffRefs = separator === -1 ? refs : [...refs.slice(0, refs.length - paths.length), "--", ...paths]
       captured = {
         node: commands.diff,
         params: {
-          refs,
+          refs: diffRefs,
           ...(options.excludeSubmodule?.length ? { excludedSubmodules: options.excludeSubmodule } : {}),
           ...(options.cached ? { cached: true } : {}),
           ...(options.diffFilter === undefined ? {} : { diffFilter: options.diffFilter }),
