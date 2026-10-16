@@ -593,7 +593,18 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
           throw new Error(`worktree ${path}: expected a full SHA1 or SHA256 tip, got ${JSON.stringify(expectedTip)}`)
         }
         const target = realpathSync(path)
-        if (!(await listWorktrees(git, repo)).some((row) => row.path === target)) {
+        const registered = await listWorktrees(git, repo)
+        let exact = registered.some((row) => row.path === target)
+        if (!exact) {
+          // Absorbed submodules register their primary administration directory, not their checkout.
+          const common = realpathSync(
+            (await git.run(target, ["rev-parse", "--path-format=absolute", "--git-common-dir"])).stdout.trim(),
+          )
+          const directory = realpathSync((await git.run(target, ["rev-parse", "--absolute-git-dir"])).stdout.trim())
+          const toplevel = realpathSync((await git.run(target, ["rev-parse", "--show-toplevel"])).stdout.trim())
+          exact = directory === common && toplevel === target && registered.some((row) => row.path === common)
+        }
+        if (!exact) {
           throw new Error(`worktree ${path}: no exact registration in ${repo}; refusing to detach HEAD`)
         }
         const symbolic = await git.run(target, ["symbolic-ref", "--quiet", "--no-recurse", "HEAD"], true)
