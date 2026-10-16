@@ -215,7 +215,7 @@ An explicit `:<destination>` refspec deletes that ref only with an exact `--forc
 
 Hooks, credential helpers, and remote helpers stay native Git behavior. A timeout, a rejected hook, an unreachable remote, an unreadable response, or a post-write check that disagrees is never turned into an empty or successful result. Selecting no refs at all is an input error with an explanation, not a silent success. Push is covered by `tests/push.test.ts`.
 
-### Landing across repositories
+### Merging across repositories
 
 Gerrit's cross-repository topics and Aviator's ChangeSets each group several repositories' changes into one submission gesture, but neither documents an atomic guarantee once repositories start merging independently. Gerrit: a same-repository topic submits atomically, while a multi-repository topic can fail into a partial submission ([cross-repository-changes](https://gerrit-review.googlesource.com/Documentation/cross-repository-changes.html)); Gerrit documents compensating revert commits, reviewed and submitted normally, but it does not guarantee automatic rollback of a partial multi-repository submission. Aviator: a ChangeSet is validated as a whole and fails before merging if any check fails, but partial-merge behavior once some repositories in a set have already merged isn't documented ([ChangeSets](https://docs.aviator.co/mergequeue/concepts/changesets)). git-super does not claim an automatic cross-repository rollback guarantee either; see [Yrd's own README](https://github.com/beorn/yrd#readme) for submission policy, which this section does not repeat.
 
@@ -227,7 +227,7 @@ A fresh clone can fetch the record and retry publication of its exact merge usin
 
 On first publication of an existing project, a cold owned child store may lack both the pinned commit and its retention ref. Git Super reads that exact ref first. If absent, it fetches advertised branch and tag tips from the frozen child remote and proves one contains the commit before creating the immutable retention ref with an absent lease. An identical concurrent winner succeeds; a conflicting ref, an unreachable commit or a failed read refuses. Adoption retention finishes before child branches or root refs move, and successful retention remains visible if a later publication fails. Warm unchanged children still perform no remote work.
 
-These mechanisms provide ordered publication and retry, not cross-repository rollback. A queue must publish its checked record durably before beginning the landing and retain its root leases for recovery. [Yrd](https://github.com/beorn/yrd#readme) owns queue activation and restart orchestration; the Git Super mechanisms alone do not enable that integration.
+These mechanisms provide ordered publication and retry, not cross-repository rollback. A queue must publish its checked record durably before beginning the merge and retain its root leases for recovery. [Yrd](https://github.com/beorn/yrd#readme) owns queue activation and restart orchestration; the Git Super mechanisms alone do not enable that integration.
 
 ### Worktree with submodules
 
