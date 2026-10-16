@@ -1484,6 +1484,39 @@ describe("git super merge", () => {
    * product's gitlink is written with `update-index --cacheinfo`, so the
    * product's own submodule store has never seen the object.
    */
+  /**
+   * @failure Component promotion loses the previous main from its first-parent chain (29650).
+   * @level l1 @consumer Yrd component publication and first-parent cursor readers
+   * Existing ahead-pin cases put main on the candidate's first-parent chain; this one merges main as parent two.
+   */
+  it("preserves component main on the first-parent chain when the task merged main in (29650)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-merge-first-parent-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const authoring = join(root, "alpha-authoring")
+    git(root, "clone", "-q", fixture.alpha, authoring)
+    advanceRepository(authoring, "task.ts", "export const task = 1\n")
+    const main = advanceRepository(fixture.alpha, "main.ts", "export const main = 1\n")
+    git(authoring, "fetch", "-q", "origin")
+    git(authoring, "merge", "-q", "--no-ff", "origin/main", "-m", "merge main into task")
+    const incoming = git(authoring, "rev-parse", "HEAD")
+    expect(git(authoring, "rev-parse", `${incoming}^2`)).toBe(main)
+    git(authoring, "push", "-q", "origin", `${incoming}:refs/git-super/pins/${incoming}`)
+    git(fixture.product, "switch", "-q", "-c", "candidate-main-as-parent-two")
+    git(fixture.product, "update-index", "--add", "--cacheinfo", `160000,${incoming},packages/alpha`)
+    git(fixture.product, "commit", "-q", "-m", "pin task that merged main in")
+    const candidate = git(fixture.product, "rev-parse", "HEAD")
+    git(fixture.product, "switch", "-q", "main")
+
+    const result = await superMerge({ repo: fixture.product, commit: candidate })
+    expect(result).toMatchObject({ state: "updated", partial: false })
+    const selected = git(fixture.product, "rev-parse", "HEAD:packages/alpha")
+    const child = join(fixture.product, "packages/alpha")
+    expect(git(child, "rev-list", "--first-parent", selected).split("\n")).toContain(main)
+    expect(git(child, "show", `${selected}:task.ts`)).toBe("export const task = 1")
+    expect(git(child, "show", `${selected}:main.ts`)).toBe("export const main = 1")
+  })
+
   it("settles kept-ahead for a pin published only as a pin ref, which its store has never seen", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-cleanroom-"))
     roots.push(fixtureRoot)
