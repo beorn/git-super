@@ -3,7 +3,7 @@
  * real path stops the apply — SIGTERM to the top pid, or SIGINT to the process group — and (b) the backstop leaves no
  * process of the pull alive, and the next pull proceeds. The root's post-merge hook runs once, after the checkouts.
  */
-import { afterEach, describe, expect, test } from "vitest"
+import { afterEach, describe, expect, test, vi } from "vitest"
 import {
   chmodSync,
   existsSync,
@@ -203,17 +203,34 @@ describe("git super pull: the apply is not stopped by a signal (24907 row 2)", (
     const w = world("backstop", {
       "post-merge": `${RECORD_POST_MERGE}\necho $$ > "$MARKS/hook.pid"\nexec sleep 600`,
     })
-    const result = await createLocalGitProcess().run({
-      repo: w.checkout,
-      args: ["super", "--json", "pull", "--ff-only", "origin", "main"],
-      env: { PATH: w.path, GIT_SUPER_PROGRESS: "1" },
-      timeoutMs: 1_500,
-      backstopMs: 4_000,
-    })
+    // The runner's SIGTERM and backstop are wall-clock timers from the spawn. On a slow runner they fired before the
+    // hook ran: during the fetch, before the apply defers signals, or during the root merge (29563, both macOS
+    // failures). Only those two timers are virtual here, and they fire once the hung hook has recorded its pid.
+    const pidFile = join(w.marks, "hook.pid")
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] })
+    let result: Awaited<ReturnType<ReturnType<typeof createLocalGitProcess>["run"]>>
+    try {
+      const running = createLocalGitProcess().run({
+        repo: w.checkout,
+        args: ["super", "--json", "pull", "--ff-only", "origin", "main"],
+        env: { PATH: w.path, GIT_SUPER_PROGRESS: "1" },
+        timeoutMs: 1_500,
+        backstopMs: 4_000,
+      })
+      await until(
+        () => existsSync(pidFile) && /^\d+\n$/u.test(readFileSync(pidFile, "utf8")),
+        "the post-merge hook to record its pid",
+      )
+      await vi.advanceTimersByTimeAsync(1_500)
+      await vi.advanceTimersByTimeAsync(2_500)
+      result = await running
+    } finally {
+      vi.useRealTimers()
+    }
     expect(result.timedOut).toBe(true)
     // The kill first (a5dcfc6b): the hung hook, which only the record names, dies, and no group it named keeps a
     // member. The report's wording is checked after, so a missing record fails here, not on the message.
-    const hook = Number(readFileSync(join(w.marks, "hook.pid"), "utf8").trim())
+    const hook = Number(readFileSync(pidFile, "utf8").trim())
     const alive = (pid: number) => {
       try {
         process.kill(pid, 0)
