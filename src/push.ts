@@ -1189,6 +1189,7 @@ export async function capturePushIntent(
     }
     if (update.expectedDestination === undefined) throw new Error(`No observed destination for ${requirement.path}`)
     if (update.expectedDestination.state === "oid") {
+      const remedy = `Rebase the change's component branch onto main ${update.expectedDestination.oid}, or merge it into a new branch started at ${update.expectedDestination.oid} so main stays the first parent; then re-record its gitlink and submit again.`
       const args = ["merge-base", "--is-ancestor", update.expectedDestination.oid, update.source]
       const ancestry = await git.run({ repo: requirement.repository, args })
       if (ancestryAnswerNo(ancestry) && !changed.has(requirement.path)) {
@@ -1201,11 +1202,27 @@ export async function capturePushIntent(
           requirement.path,
           update.expectedDestination.oid,
           update.source,
-          `Merge the component's main ${update.expectedDestination.oid} into the change's component branch, re-record its gitlink, and submit again.`,
+          remedy,
         )
       }
       if (!ancestryAnswerYes(ancestry)) {
         throw operationError(requirement.repository, args, "freeze-child-fast-forward", ancestry)
+      }
+      // An all-parent fast-forward can still discard the published main's first-parent spine (29650).
+      const spineArgs = ["rev-list", "--first-parent", update.source]
+      const spine = await git.run({ repo: requirement.repository, args: spineArgs, timeoutMs })
+      if (spine.code !== 0 || !ancestrySettled(spine)) {
+        throw operationError(requirement.repository, spineArgs, "freeze-child-first-parent", spine)
+      }
+      if (!spine.stdout.trim().split(/\r?\n/u).includes(update.expectedDestination.oid)) {
+        const message = `Component ${requirement.path} proposed publication ${update.source} omits current main ${update.expectedDestination.oid} from its first-parent chain. ${remedy}`
+        throw Object.assign(new Error(message), {
+          resultDetail: detail("gitlink-publication-first-parent-gap", "freeze-child-first-parent", message, {
+            objectIds: [update.expectedDestination.oid, update.source],
+            paths: [requirement.path],
+            remedy,
+          }),
+        })
       }
     }
     children.push({
