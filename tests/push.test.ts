@@ -526,7 +526,7 @@ describe("explicit recursive push mechanics", () => {
   // 25570, @cto dc89c537: check proves REACHABILITY one exact ref at a time, never from the remote's whole
   // advertisement (8,584 heads on hh-dev's origin) and never from "the remote holds the object": a held commit no
   // ref reaches is pruned later, so it must refuse. Each row names the one ref that should answer.
-  const checkWith = async (fixture: ReturnType<typeof recursivePushFixture>) => {
+  const checkWith = async (fixture: ReturnType<typeof recursivePushFixture>, unreadableRef?: string) => {
     // hh declares every submodule's branch, so the child's main is named, never asked of the remote's HEAD.
     git(fixture.root, "config", "submodule.child.branch", "main")
     const local = createLocalGitProcess()
@@ -534,6 +534,14 @@ describe("explicit recursive push mechanics", () => {
     const recording: GitProcess = {
       run(request) {
         requests.push({ repo: request.repo, args: request.args })
+        if (
+          unreadableRef !== undefined &&
+          request.repo === fixture.child &&
+          isObservation(request.args) &&
+          request.args.at(-1)?.startsWith(`+${unreadableRef}:`)
+        ) {
+          return Promise.resolve({ code: 128, stdout: "", stderr: "descendant ref read failed" })
+        }
         return local.run(request)
       },
     }
@@ -553,6 +561,87 @@ describe("explicit recursive push mechanics", () => {
       git(fixture.childRemote, "update-ref", `refs/heads/task/crowd-${index}`, fixture.childBefore)
     }
   }
+
+  // 29528 AC1: a later requirement's named remote witness also retains its historical ancestors.
+  // Existing one-requirement checks cannot expose discarded observations between requirements.
+  test.each([false, true])("check reuses an observed descendant pin with an earlier miss: %s", async (earlierMiss) => {
+    const fixture = recursivePushFixture("check-observed-descendant")
+    const intermediate = advanceRepository(fixture.child, "child.txt", "three\n")
+    git(fixture.root, "add", "child")
+    git(fixture.root, "commit", "-q", "-m", "root records intermediate")
+    const descendant = advanceRepository(fixture.child, "child.txt", "four\n")
+    git(fixture.root, "add", "child")
+    git(fixture.root, "commit", "-q", "-m", "root records descendant")
+    if (earlierMiss) {
+      git(fixture.root, "update-index", "--cacheinfo", `160000,${intermediate},child`)
+      git(fixture.root, "commit", "-q", "-m", "root returns to intermediate")
+    }
+    const rootSource = git(fixture.root, "rev-parse", "HEAD")
+    const witnessRef = `refs/git-super/pins/${descendant}`
+    git(fixture.child, "push", "-q", "origin", `${descendant}:${witnessRef}`)
+
+    const { result, read } = await checkWith({ ...fixture, rootSource, childSource: descendant })
+
+    expect(result, JSON.stringify(result)).toMatchObject({ state: "updated", partial: false })
+    expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(rootSource)
+    for (const ancestor of [fixture.childSource, intermediate]) {
+      const retained = result.repositories.find((row) => row.detail?.message.includes(ancestor))
+      expect(retained).toMatchObject({ repository: fixture.child, state: "unchanged" })
+      expect(retained?.detail?.message).toContain(witnessRef)
+      expect(retained?.detail?.message).toContain(descendant)
+    }
+    expect(read).toEqual([
+      "refs/heads/main",
+      earlierMiss ? `refs/git-super/pins/${intermediate}` : witnessRef,
+      "refs/heads/main",
+      earlierMiss ? witnessRef : `refs/git-super/pins/${intermediate}`,
+      "refs/heads/main",
+      `refs/git-super/pins/${fixture.childSource}`,
+    ])
+  })
+
+  // AC2/3: neither a missing witness, a misleading pin name, nor a failed read can authorize root publication.
+  // Single-requirement checks do not test which evidence survives between historical requirements.
+  test.each(["absent", "misleading", "unreadable"] as const)(
+    "check refuses historical requirements when the descendant witness is %s",
+    async (caseName) => {
+      const fixture = recursivePushFixture(`check-descendant-${caseName}`)
+      const intermediate = advanceRepository(fixture.child, "child.txt", "three\n")
+      git(fixture.root, "add", "child")
+      git(fixture.root, "commit", "-q", "-m", "root records intermediate")
+      const descendant = advanceRepository(fixture.child, "child.txt", "four\n")
+      git(fixture.root, "add", "child")
+      git(fixture.root, "commit", "-q", "-m", "root records descendant")
+      const witnessRef = `refs/git-super/pins/${descendant}`
+      if (caseName !== "absent") {
+        const actualOid = caseName === "misleading" ? fixture.childBefore : descendant
+        git(fixture.child, "push", "-q", "origin", `${actualOid}:${witnessRef}`)
+      }
+
+      const { result, read } = await checkWith(
+        { ...fixture, childSource: descendant, rootSource: git(fixture.root, "rev-parse", "HEAD") },
+        caseName === "unreadable" ? witnessRef : undefined,
+      )
+
+      expect(result).toMatchObject({
+        state: "failed",
+        partial: false,
+        detail: {
+          code: caseName === "unreadable" ? "submodule-availability-unknown" : "submodule-commit-unavailable",
+        },
+      })
+      if (caseName === "unreadable") expect(result.detail?.message).toContain("descendant ref read failed")
+      expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(fixture.rootBefore)
+      expect(read).toEqual([
+        "refs/heads/main",
+        witnessRef,
+        "refs/heads/main",
+        `refs/git-super/pins/${intermediate}`,
+        "refs/heads/main",
+        `refs/git-super/pins/${fixture.childSource}`,
+      ])
+    },
+  )
 
   test("check passes a pin reached only by the seat's pushed child task branch, not its tip", async () => {
     const fixture = recursivePushFixture("check-task-branch")

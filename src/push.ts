@@ -1953,6 +1953,20 @@ export async function remoteContainsCommit(options: RemoteCommitAvailabilityOpti
 /** What check mode learned about one remote: reached, or not reached after reading these refs by name. */
 type Reach = Readonly<{ reached: boolean; read: readonly string[] }>
 
+type RemoteWitness = Readonly<{ remote: string; ref: string; oid: string }>
+
+async function witnessReachesCommit(
+  git: GitProcess,
+  requirement: CommitRequirement,
+  witness: RemoteWitness,
+): Promise<boolean> {
+  const args = ["merge-base", "--is-ancestor", requirement.target, witness.oid]
+  const contains = await git.run({ repo: requirement.repository, args })
+  if (ancestryAnswerYes(contains)) return true
+  if (ancestryAnswerNo(contains)) return false
+  throw operationError(requirement.repository, args, "check-remote-availability", contains)
+}
+
 /**
  * Whether a ref on `remote` REACHES `commit`, asked one exact ref at a time, first hit wins (25570, @cto dc89c537).
  *
@@ -1964,7 +1978,12 @@ type Reach = Readonly<{ reached: boolean; read: readonly string[] }>
  * one ref advertised, its objects fetched, nothing written), and ancestry is decided locally. Listing the remote
  * instead carried its whole advertisement, 8,584 heads on hh-dev's origin, per moved submodule.
  */
-async function remoteReachesCommit(git: GitProcess, requirement: CommitRequirement, remote: string): Promise<Reach> {
+async function remoteReachesCommit(
+  git: GitProcess,
+  requirement: CommitRequirement,
+  remote: string,
+  remember: (witness: RemoteWitness) => void,
+): Promise<Reach> {
   const { repository, target: commit } = requirement
   const local = await required(
     git,
@@ -1995,12 +2014,10 @@ async function remoteReachesCommit(git: GitProcess, requirement: CommitRequireme
       "check-remote-availability",
     )
     if (observed.state === "missing") return false
-    const args = ["merge-base", "--is-ancestor", commit, observed.oid]
-    const contains = await git.run({ repo: repository, args })
-    if (contains.code !== 0 && contains.code !== 1) {
-      throw operationError(repository, args, "check-remote-availability", contains)
-    }
-    return contains.code === 0
+    const witness = { remote, ref, oid: observed.oid }
+    const reached = await witnessReachesCommit(git, requirement, witness)
+    remember(witness)
+    return reached
   }
   for (const ref of [...branches, `refs/git-super/pins/${commit}`]) {
     if (await reaches(ref)) return { reached: true, read }
@@ -2010,7 +2027,11 @@ async function remoteReachesCommit(git: GitProcess, requirement: CommitRequireme
   return { reached: await reaches(`refs/heads/${main}`), read }
 }
 
-async function commitAvailableOnAnyRemote(git: GitProcess, requirement: CommitRequirement): Promise<Reach> {
+async function commitAvailableOnAnyRemote(
+  git: GitProcess,
+  requirement: CommitRequirement,
+  remember: (witness: RemoteWitness) => void,
+): Promise<Reach> {
   const listed = await required(git, requirement.repository, ["remote"], "list-submodule-remotes")
   const remotes = listed.split(/\r?\n/u).filter((remote) => remote !== "")
   if (remotes.length === 0) {
@@ -2027,7 +2048,7 @@ async function commitAvailableOnAnyRemote(git: GitProcess, requirement: CommitRe
   const read: string[] = []
   for (const remote of remotes) {
     try {
-      const reach = await remoteReachesCommit(git, requirement, remote)
+      const reach = await remoteReachesCommit(git, requirement, remote, remember)
       if (reach.reached) return reach
       read.push(...reach.read.map((ref) => `${remote} ${ref}`))
     } catch (error) {
@@ -2539,12 +2560,57 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
         }
       }
       const available: GitSuperRepositoryResult[] = []
+      const witnesses = new Map<string, RemoteWitness[]>()
+      const checked: (
+        | Readonly<{ requirement: CommitRequirement; reach: Reach }>
+        | Readonly<{ requirement: CommitRequirement; error: unknown }>
+      )[] = []
       for (const requirement of requirements) {
-        const reach = await commitAvailableOnAnyRemote(git, requirement)
-        if (reach.reached) {
+        const known = witnesses.get(requirement.repository) ?? []
+        witnesses.set(requirement.repository, known)
+        try {
+          const reach = await commitAvailableOnAnyRemote(git, requirement, (witness) => {
+            if (
+              !known.some((row) => row.remote === witness.remote && row.ref === witness.ref && row.oid === witness.oid)
+            ) {
+              known.push(witness)
+            }
+          })
+          checked.push({ requirement, reach })
+        } catch (error) {
+          checked.push({ requirement, error })
+        }
+      }
+      for (const check of checked) {
+        const { requirement } = check
+        if ("reach" in check && check.reach.reached) {
           available.push(availabilityResult(requirement, "unchanged"))
           continue
         }
+        let retained: RemoteWitness | undefined
+        for (const witness of witnesses.get(requirement.repository) ?? []) {
+          if (await witnessReachesCommit(git, requirement, witness)) {
+            retained = witness
+            break
+          }
+        }
+        if (retained !== undefined) {
+          available.push(
+            availabilityResult(
+              requirement,
+              "unchanged",
+              detail(
+                "submodule-commit-available",
+                "check-submodule-availability",
+                `Commit ${requirement.target} from ${requirement.path} is retained by ${retained.remote} ${retained.ref} at ${retained.oid}, observed during this push's check.`,
+                { paths: [requirement.path], objectIds: [requirement.target, retained.oid] },
+              ),
+            ),
+          )
+          continue
+        }
+        if ("error" in check) throw check.error
+        const { reach } = check
         const failure = detail(
           "submodule-commit-unavailable",
           "check-submodule-availability",
