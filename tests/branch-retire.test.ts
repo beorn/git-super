@@ -400,4 +400,20 @@ describe("legacy archive retirement", () => {
       expect(git(f.repo, "rev-parse", f.replacementRef)).toBe(f.tip)
     },
   )
+  test("reports a dangling symbolic legacy name recreated after deletion", () => {
+    const f = fixture()
+    const original = nativeGit.tryGit
+    vi.spyOn(nativeGit, "tryGit").mockImplementation((...args) => {
+      const result = original(...args)
+      if (args[1].includes("update-ref") && result.exitCode === 0) {
+        git(f.repo, "symbolic-ref", f.legacyRef, "refs/heads/missing-target")
+      }
+      return result
+    })
+    const result = archive.removeLegacyArchiveRef(f.repo, f.legacyRef, f.replacementRef, f.tip)
+    expect(result).toMatchObject({ ok: false, removed: true })
+    if (!result.ok) expect(result.reason).toContain(f.legacyRef)
+    expect(git(f.repo, "symbolic-ref", f.legacyRef)).toBe("refs/heads/missing-target")
+    expect(git(f.repo, "rev-parse", f.replacementRef)).toBe(f.tip)
+  })
 })

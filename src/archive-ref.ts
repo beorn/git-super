@@ -203,19 +203,17 @@ export function removeLegacyArchiveRef(
     removed = true
     const afterLegacy = read(legacyRef)
     const afterReplacement = read(replacementRef)
-    const replacementSymbolic = tryGit(repoRoot, ["symbolic-ref", "--quiet", replacementRef])
-    if (replacementSymbolic.exitCode === 0) {
-      throw new Error(
-        `replacement ${replacementRef} became symbolic to ${replacementSymbolic.stdout.trim()}; inspect both ${legacyRef} and ${replacementRef} before retry`,
-      )
-    }
-    if (replacementSymbolic.exitCode !== 1) {
-      throw gitError(
-        repoRoot,
-        ["symbolic-ref", "--quiet", replacementRef],
-        replacementSymbolic.exitCode,
-        replacementSymbolic.stderr,
-      )
+    // rev-parse cannot distinguish an absent name from a dangling symbolic ref.
+    for (const ref of [legacyRef, replacementRef]) {
+      const symbolic = tryGit(repoRoot, ["symbolic-ref", "--quiet", ref])
+      if (symbolic.exitCode === 0) {
+        throw new Error(
+          `${ref} became symbolic to ${symbolic.stdout.trim()} after deletion; inspect both ${legacyRef} and ${replacementRef} before retry`,
+        )
+      }
+      if (symbolic.exitCode !== 1) {
+        throw gitError(repoRoot, ["symbolic-ref", "--quiet", ref], symbolic.exitCode, symbolic.stderr)
+      }
     }
     if (afterLegacy !== undefined || afterReplacement !== tip) {
       throw new Error(
