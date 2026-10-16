@@ -586,8 +586,17 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
     async unlock(path: string): Promise<void> {
       await mutate(`worktree unlock ${path}`, () => unlockWorktree(git, repo, path))
     },
-    /** Release a local branch without checking out files or changing index, leases or worktree locks. */
-    async detachAt(path: string, expectedTip: string): Promise<Readonly<{ branch: string; tip: string }>> {
+    /**
+     * Release the exact full local branch without changing files, index, leases or worktree locks.
+     * W1: the mutation lock excludes cooperating store writers, but raw external Git can switch HEAD's
+     * symref to another branch at the same OID after this read. The old-OID update rejects an advanced
+     * tip, not that same-OID symref race; callers must exclude external checkout writers.
+     */
+    async detachAt(
+      path: string,
+      expectedTip: string,
+      expectedBranch: string,
+    ): Promise<Readonly<{ branch: string; tip: string }>> {
       return mutate(`detach worktree ${path}`, async () => {
         if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(expectedTip)) {
           throw new Error(`worktree ${path}: expected a full SHA1 or SHA256 tip, got ${JSON.stringify(expectedTip)}`)
@@ -616,6 +625,9 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
           throw new Error(`worktree ${path}: HEAD references ${branch}, expected refs/heads/<branch>`)
         }
         await git.run(target, ["check-ref-format", branch])
+        if (branch !== expectedBranch) {
+          throw new Error(`worktree ${path}: HEAD references ${branch}, expected ${expectedBranch}`)
+        }
         const tip = await git.commit(target, branch)
         if (tip !== expectedTip) {
           throw new Error(`worktree ${path}: branch ${branch} tip moved from ${expectedTip} to ${tip}`)
@@ -903,8 +915,11 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
      * Remove a local name only while its exact commit remains archived. The existing worktree writer lock
      * excludes a concurrent store.add; the ref transaction also refuses a moved branch or archive.
      * Callers own eligibility, attribution and journal policy. This never removes a worktree or remote ref.
+     * beforeRemove rechecks caller authority under the acquired lock; throwing preserves the branch.
      */
-    async removeArchivedBranch(input: Readonly<{ branch: string; tip: string; archiveRef: string }>): Promise<void> {
+    async removeArchivedBranch(
+      input: Readonly<{ branch: string; tip: string; archiveRef: string; beforeRemove?: () => Promise<void> }>,
+    ): Promise<void> {
       await mutate(`retire branch ${input.branch}`, async () => {
         const { branch, tip, archiveRef } = input
         if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(tip)) {
@@ -916,6 +931,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
           throw new Error(`branch ${branch}: custody ref ${archiveRef} is outside ${ARCHIVE_REF_PREFIX}/`)
         }
         const ref = `refs/heads/${branch}`
+        await input.beforeRemove?.()
         const held = await branchHolder(branch)
         if (held !== undefined) throw new Error(held)
         await git.run(

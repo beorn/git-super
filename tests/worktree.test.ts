@@ -85,7 +85,7 @@ describe("createGitWorktreeStore", () => {
    * Existing removal coverage deletes directories and cannot prove in-place checkout preservation.
    * @testonly none
    */
-  it.each(["preserve", "moved-tip", "late-moved-tip", "non-local", "detached"])(
+  it.each(["preserve", "moved-tip", "late-moved-tip", "switched-same-tip", "non-local", "detached"])(
     "detaches only the expected local tip without touching checkout custody: %s",
     async (mode) => {
       const root = await mkdtemp("/var/tmp/git-super-detach-")
@@ -137,6 +137,10 @@ describe("createGitWorktreeStore", () => {
           git(linked, ["symbolic-ref", "HEAD", "refs/tags/not-a-branch"])
         }
         if (mode === "detached") git(linked, ["update-ref", "--no-deref", "HEAD", tip, tip])
+        if (mode === "switched-same-tip") {
+          git(repo, ["branch", "task/reassigned", tip])
+          git(linked, ["symbolic-ref", "HEAD", "refs/heads/task/reassigned"])
+        }
         const preservedPaths = [
           join(admin, "index"),
           join(admin, "locked"),
@@ -147,10 +151,10 @@ describe("createGitWorktreeStore", () => {
         const before = preservedPaths.map((path) => readFileSync(path))
         const headBefore = readFileSync(join(admin, "HEAD"))
         if (mode === "preserve") {
-          await expect(store.detachAt(linked, tip)).resolves.toEqual({ branch, tip })
+          await expect(store.detachAt(linked, tip, branch)).resolves.toEqual({ branch, tip })
           expect(readFileSync(join(admin, "HEAD"), "utf8")).toBe(`${tip}\n`)
         } else {
-          await expect(store.detachAt(linked, tip)).rejects.toThrow(/tip|HEAD|reference|lock ref/u)
+          await expect(store.detachAt(linked, tip, branch)).rejects.toThrow(/tip|HEAD|reference|lock ref/u)
           expect(readFileSync(join(admin, "HEAD"))).toEqual(headBefore)
         }
         expect(preservedPaths.map((path) => readFileSync(path))).toEqual(before)
@@ -219,6 +223,38 @@ describe("createGitWorktreeStore", () => {
       await expect(store.removeArchivedBranch({ branch, tip: newer, archiveRef })).rejects.toThrow()
       expect(git(repo, ["rev-parse", `refs/heads/${branch}`]).trim()).toBe(newer)
       git(repo, ["update-ref", `refs/heads/${branch}`, tip])
+
+      // Caller authority can change during a writer-lock wait, after its preflight.
+      const lockDir = join(repo, ".git", "yrd-worktree-mutations")
+      const writer = await acquireExclusive(lockDir)
+      let callerHeld = false
+      let checkedUnderLock = false
+      const contended = createLocalGitWorktreeStore({
+        repo,
+        report: () => {
+          callerHeld = true
+          writer.release()
+        },
+      })
+      try {
+        await expect(
+          contended.removeArchivedBranch({
+            branch,
+            tip,
+            archiveRef,
+            beforeRemove: async () => {
+              const probe = tryAcquireFlock(join(lockDir, "writer.lock"))
+              checkedUnderLock = probe === null
+              probe?.release()
+              if (callerHeld) throw new Error("caller acquired a hold during the lock wait")
+            },
+          }),
+        ).rejects.toThrow("caller acquired a hold during the lock wait")
+      } finally {
+        writer.release()
+      }
+      expect(checkedUnderLock).toBe(true)
+      expect(git(repo, ["rev-parse", `refs/heads/${branch}`]).trim()).toBe(tip)
       await store.removeArchivedBranch({ branch, tip, archiveRef })
       expect(git(repo, ["for-each-ref", "--format=%(refname)", `refs/heads/${branch}`]).trim()).toBe("")
       expect(git(repo, ["rev-parse", archiveRef]).trim()).toBe(tip)
