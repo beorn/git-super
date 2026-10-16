@@ -165,7 +165,7 @@ export function withGitTimeout<T>(timeoutMs: number | undefined, run: () => T): 
   )
 }
 
-export function tryGit(cwd: string, args: readonly string[], indexFile?: string): GitResult {
+export function tryGit(cwd: string, args: readonly string[], indexFile?: string, input?: string): GitResult {
   const env = cleanGitRepositoryEnvironment()
   if (indexFile !== undefined) env.GIT_INDEX_FILE = indexFile
   const timeoutMs = executionEnvironment.getStore()?.timeoutMs
@@ -173,6 +173,7 @@ export function tryGit(cwd: string, args: readonly string[], indexFile?: string)
     encoding: "utf8",
     env,
     maxBuffer: 64 * 1024 * 1024,
+    ...(input === undefined ? {} : { input }),
     ...(timeoutMs === undefined ? {} : { timeout: timeoutMs }),
   })
   if (result.error) {

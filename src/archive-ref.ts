@@ -1,4 +1,4 @@
-/** Create-only archive custody for callers that retire Git refs. */
+/** Archive custody and exact-name retirement for Git refs. */
 import { gitError, tryGit } from "./git.ts"
 
 /** One archive namespace shared by branch-retirement callers. */
@@ -18,6 +18,12 @@ export function archiveActorSegment(actor: string): string {
 /** The archive ref for one retired branch: `refs/archive/<date>/<actor>/<branch>`. */
 export function archiveRefFor(branch: string, actor: string, date: string): string {
   return `${ARCHIVE_REF_PREFIX}/${date}/${archiveActorSegment(actor)}/${branch}`
+}
+
+/** The existing dated-name grammar, shared by custody reads and legacy-name retirement. */
+function datedArchiveBranch(ref: string): string | undefined {
+  const name = /^refs\/archive\/(\d{4}-\d{2}-\d{2})\/([^/]+)\/(.+)$/u.exec(ref)
+  return name?.[2] !== undefined && archiveActorSegment(name[2]) === name[2] ? name[3] : undefined
 }
 
 /** Read archive custody through the one archive-name parser; malformed evidence is never omitted. */
@@ -49,11 +55,9 @@ export function readArchiveRows(
     ) {
       throw new Error(`cannot read archive custody in ${repoRoot}: malformed for-each-ref row ${JSON.stringify(line)}`)
     }
-    const name = /^refs\/archive\/(\d{4}-\d{2}-\d{2})\/([^/]+)\/(.+)$/u.exec(ref)
-    if (name?.[2] === undefined || archiveActorSegment(name[2]) !== name[2] || name[3] === undefined) {
-      throw new Error(`${repoRoot}: malformed archive name ${ref}`)
-    }
-    rows.push({ branch: name[3], tip: value, ref })
+    const branch = datedArchiveBranch(ref)
+    if (branch === undefined) throw new Error(`${repoRoot}: malformed archive name ${ref}`)
+    rows.push({ branch, tip: value, ref })
   }
   return rows
 }
@@ -117,4 +121,113 @@ export function ensureArchiveRef(repoRoot: string, archiveRef: string, tip: stri
     }
   }
   return { ok: true, created: true }
+}
+
+export type RemoveLegacyArchiveRefResult =
+  | {
+      readonly ok: true
+      readonly removed: true
+      readonly legacyRef: string
+      readonly replacementRef: string
+      readonly tip: string
+    }
+  | { readonly ok: false; readonly removed: boolean | "unknown"; readonly reason: string }
+
+/**
+ * Retire one obsolete archive name while its identically named dated custody stays pinned.
+ * The caller owns attribution and its decision journal. A failed post-write read reports
+ * removed=true when Git committed the deletion; absence on a later invocation is a refusal.
+ */
+export function removeLegacyArchiveRef(
+  repoRoot: string,
+  legacyRef: string,
+  replacementRef: string,
+  tip: string,
+): RemoveLegacyArchiveRefResult {
+  let removed: boolean | "unknown" = false
+  try {
+    if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(tip)) {
+      throw new Error(`expected a full SHA1 or SHA256 tip, got ${JSON.stringify(tip)}`)
+    }
+    if (!legacyRef.startsWith(`${ARCHIVE_REF_PREFIX}/`) || datedArchiveBranch(legacyRef) !== undefined) {
+      throw new Error(`legacy ref ${legacyRef} must be an undated name under ${ARCHIVE_REF_PREFIX}/`)
+    }
+    if (datedArchiveBranch(replacementRef) !== legacyRef.slice(ARCHIVE_REF_PREFIX.length + 1)) {
+      throw new Error(
+        `replacement ${replacementRef} must be a dated archive for the exact legacy suffix of ${legacyRef}`,
+      )
+    }
+    for (const ref of [legacyRef, replacementRef]) {
+      const valid = tryGit(repoRoot, ["check-ref-format", ref])
+      if (valid.exitCode !== 0) throw new Error(`invalid archive ref ${JSON.stringify(ref)}: ${valid.stderr}`)
+      const symbolic = tryGit(repoRoot, ["symbolic-ref", "--quiet", ref])
+      if (symbolic.exitCode === 0) {
+        throw new Error(`archive ref ${ref} is symbolic (${symbolic.stdout.trim()}); keep it`)
+      }
+      if (symbolic.exitCode !== 1) {
+        throw gitError(repoRoot, ["symbolic-ref", "--quiet", ref], symbolic.exitCode, symbolic.stderr)
+      }
+    }
+    const read = (ref: string): string | undefined => {
+      const args = ["rev-parse", "--verify", "--quiet", ref]
+      const result = tryGit(repoRoot, args)
+      if (result.exitCode === 1 && result.stdout.trim() === "") return undefined
+      if (result.exitCode !== 0) throw gitError(repoRoot, args, result.exitCode, result.stderr)
+      const oid = result.stdout.trim()
+      if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(oid)) {
+        throw new Error(`archive ${ref} read malformed object ID ${JSON.stringify(oid)}`)
+      }
+      return oid
+    }
+    const replacementTip = read(replacementRef)
+    const legacyTip = read(legacyRef)
+    if (legacyTip === undefined) {
+      throw new Error(
+        `legacy ref ${legacyRef} is absent; replacement ${replacementRef} reads ${replacementTip ?? "absent"}, expected ${tip}; no deletion attempted`,
+      )
+    }
+    if (legacyTip !== tip || replacementTip !== tip) {
+      throw new Error(
+        `expected ${tip}; legacy ${legacyRef} reads ${legacyTip}, replacement ${replacementRef} reads ${replacementTip ?? "absent"}; both refs kept`,
+      )
+    }
+    const args = [...DURABLE_GIT_CONFIG, "update-ref", "--no-deref", "--stdin"]
+    removed = "unknown"
+    const result = tryGit(
+      repoRoot,
+      args,
+      undefined,
+      `start\nverify ${replacementRef} ${tip}\ndelete ${legacyRef} ${tip}\nprepare\ncommit\n`,
+    )
+    if (result.exitCode !== 0) throw gitError(repoRoot, args, result.exitCode, result.stderr)
+    removed = true
+    const afterLegacy = read(legacyRef)
+    const afterReplacement = read(replacementRef)
+    const replacementSymbolic = tryGit(repoRoot, ["symbolic-ref", "--quiet", replacementRef])
+    if (replacementSymbolic.exitCode === 0) {
+      throw new Error(
+        `replacement ${replacementRef} became symbolic to ${replacementSymbolic.stdout.trim()}; inspect both ${legacyRef} and ${replacementRef} before retry`,
+      )
+    }
+    if (replacementSymbolic.exitCode !== 1) {
+      throw gitError(
+        repoRoot,
+        ["symbolic-ref", "--quiet", replacementRef],
+        replacementSymbolic.exitCode,
+        replacementSymbolic.stderr,
+      )
+    }
+    if (afterLegacy !== undefined || afterReplacement !== tip) {
+      throw new Error(
+        `post-delete readback: legacy ${legacyRef} reads ${afterLegacy ?? "absent"}; replacement ${replacementRef} reads ${afterReplacement ?? "absent"}, expected ${tip}`,
+      )
+    }
+    return { ok: true, removed: true, legacyRef, replacementRef, tip }
+  } catch (cause) {
+    return {
+      ok: false,
+      removed,
+      reason: `${repoRoot}: ${removed === true ? "deletion committed; " : removed === "unknown" ? "deletion outcome unconfirmed; inspect both refs before retry; " : "no deletion attempted; "}${cause instanceof Error ? cause.message : String(cause)}`,
+    }
+  }
 }

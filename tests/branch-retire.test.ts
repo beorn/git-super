@@ -1,7 +1,9 @@
 /**
  * @reach fs-walk <fixture-only: runCli and CLI entry read mkdtempSync(tmpdir()) Git repos>
  */
-import { afterEach, describe, expect, test } from "vitest"
+import { afterEach, describe, expect, test, vi } from "vitest"
+import * as archive from "../src/archive-ref.ts"
+import * as nativeGit from "../src/git.ts"
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { runCli } from "../src/cli.ts"
@@ -10,6 +12,7 @@ import { canonicalTmpdir, createRepository, git } from "./fixture.ts"
 const roots: string[] = []
 
 afterEach(() => {
+  vi.restoreAllMocks()
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
 })
 
@@ -250,4 +253,151 @@ describe("branch retire", () => {
     expect(stdout.output).toContain(fixture.archiveRef)
     expect(headOf(fixture.repo, "refs/heads/task/28989")).toBe("")
   })
+})
+
+/**
+ * @failure Obsolete archive names block custody reads, but deleting a name without matching dated custody loses evidence.
+ * @level l1
+ * @consumer Explicit legacy archive cleanup after reviewed custody copies (#29600)
+ * @testonly none
+ */
+describe("legacy archive retirement", () => {
+  function fixture() {
+    const existing = retireFixture("matching")
+    const legacyRef = "refs/archive/chief/old-work"
+    const replacementRef = "refs/archive/2026-10-16/dev-6/chief/old-work"
+    git(existing.repo, "update-ref", legacyRef, existing.tip)
+    git(existing.repo, "update-ref", replacementRef, existing.tip)
+    return { ...existing, legacyRef, replacementRef }
+  }
+
+  function refs(repo: string) {
+    return git(repo, "for-each-ref", "--format=%(refname) %(objectname) %(symref)")
+  }
+
+  test("removes only the obsolete name, preserves custody, and explains an absent retry", () => {
+    const f = fixture()
+    expect(() => archive.readArchiveRows(f.repo)).toThrow(f.legacyRef)
+    const result = archive.removeLegacyArchiveRef(f.repo, f.legacyRef, f.replacementRef, f.tip)
+    expect(result).toEqual({
+      ok: true,
+      removed: true,
+      legacyRef: f.legacyRef,
+      replacementRef: f.replacementRef,
+      tip: f.tip,
+    })
+    expect(headOf(f.repo, f.legacyRef)).toBe("")
+    expect(git(f.repo, "rev-parse", f.replacementRef)).toBe(f.tip)
+    expect(git(f.repo, "rev-parse", "refs/heads/task/28989")).toBe(f.tip)
+    expect(archive.readArchiveRows(f.repo)).toContainEqual({
+      branch: "chief/old-work",
+      ref: f.replacementRef,
+      tip: f.tip,
+    })
+    const retry = archive.removeLegacyArchiveRef(f.repo, f.legacyRef, f.replacementRef, f.tip)
+    expect(retry).toMatchObject({ ok: false, removed: false })
+    if (!retry.ok) {
+      expect(retry.reason).toContain("absent")
+      expect(retry.reason).toContain(f.replacementRef)
+      expect(retry.reason).toContain(f.tip)
+    }
+  })
+
+  test.each([
+    "dated legacy",
+    "outside archive",
+    "undated replacement",
+    "different suffix",
+    "short tip",
+    "missing replacement",
+    "moved legacy",
+    "moved replacement",
+    "symbolic legacy",
+    "symbolic replacement",
+  ])("refuses %s without changing any ref", (kind) => {
+    const f = fixture()
+    let legacy = f.legacyRef
+    let replacement = f.replacementRef
+    let tip = f.tip
+    if (kind === "dated legacy") legacy = f.archiveRef
+    if (kind === "outside archive") legacy = "refs/heads/task/28989"
+    if (kind === "undated replacement") replacement = f.legacyRef
+    if (kind === "different suffix") replacement = f.archiveRef
+    if (kind === "short tip") tip = tip.slice(0, 12)
+    if (kind === "missing replacement") git(f.repo, "update-ref", "-d", replacement, tip)
+    if (kind === "moved legacy") git(f.repo, "update-ref", legacy, f.base, tip)
+    if (kind === "moved replacement") git(f.repo, "update-ref", replacement, f.base, tip)
+    if (kind === "symbolic legacy") git(f.repo, "symbolic-ref", legacy, "refs/heads/task/28989")
+    if (kind === "symbolic replacement") git(f.repo, "symbolic-ref", replacement, "refs/heads/task/28989")
+    const before = refs(f.repo)
+    const result = archive.removeLegacyArchiveRef(f.repo, legacy, replacement, tip)
+    expect(result).toMatchObject({ ok: false, removed: false })
+    if (!result.ok) expect(result.reason.length).toBeGreaterThan(0)
+    expect(refs(f.repo)).toBe(before)
+  })
+
+  // Inject at the native Git boundary, retaining real refs and the real transaction:
+  // moving either ref after admission must abort deletion, not just report it later.
+  test.each(["legacyRef", "replacementRef", "legacySymref", "replacementSymref"] as const)(
+    "pins %s through a concurrent move",
+    (changed) => {
+      const f = fixture()
+      const original = nativeGit.tryGit
+      let moved = false
+      vi.spyOn(nativeGit, "tryGit").mockImplementation((...args) => {
+        if (!moved && args[1].includes("update-ref")) {
+          moved = true
+          if (changed === "legacySymref" || changed === "replacementSymref") {
+            git(
+              f.repo,
+              "symbolic-ref",
+              changed === "legacySymref" ? f.legacyRef : f.replacementRef,
+              "refs/heads/task/28989",
+            )
+          } else git(f.repo, "update-ref", f[changed], f.base, f.tip)
+        }
+        return original(...args)
+      })
+      const result = archive.removeLegacyArchiveRef(f.repo, f.legacyRef, f.replacementRef, f.tip)
+      expect(moved).toBe(true)
+      if (changed === "legacySymref") {
+        expect(result).toMatchObject({ ok: true, removed: true })
+        expect(headOf(f.repo, f.legacyRef)).toBe("")
+      } else if (changed === "replacementSymref") {
+        expect(result).toMatchObject({ ok: false, removed: true })
+        if (!result.ok) {
+          expect(result.reason).toContain("symbolic")
+          expect(result.reason).toContain("refs/heads/task/28989")
+        }
+        expect(headOf(f.repo, f.legacyRef)).toBe("")
+      } else {
+        expect(result).toMatchObject({ ok: false, removed: "unknown" })
+        expect(git(f.repo, "rev-parse", f.legacyRef)).toBe(changed === "legacyRef" ? f.base : f.tip)
+      }
+      expect(git(f.repo, "rev-parse", f.replacementRef)).toBe(changed === "replacementRef" ? f.base : f.tip)
+      expect(git(f.repo, "rev-parse", "refs/heads/task/28989")).toBe(f.tip)
+    },
+  )
+  test.each(["runner return", "post-write observation"] as const)(
+    "reports deletion certainty when %s fails",
+    (failure) => {
+      const f = fixture()
+      const original = nativeGit.tryGit
+      let committed = false
+      vi.spyOn(nativeGit, "tryGit").mockImplementation((...args) => {
+        if (committed) throw new Error("injected post-write Git failure")
+        const result = original(...args)
+        if (args[1].includes("update-ref") && result.exitCode === 0) {
+          committed = true
+          if (failure === "runner return") throw new Error("injected post-write Git failure")
+        }
+        return result
+      })
+      const result = archive.removeLegacyArchiveRef(f.repo, f.legacyRef, f.replacementRef, f.tip)
+      expect(result).toMatchObject({ ok: false, removed: failure === "runner return" ? "unknown" : true })
+      if (!result.ok) expect(result.reason).toContain("injected post-write Git failure")
+      expect(headOf(f.repo, f.legacyRef)).toBe("")
+      expect(git(f.repo, "rev-parse", f.replacementRef)).toBe(f.tip)
+    },
+  )
 })
