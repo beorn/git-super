@@ -1489,7 +1489,7 @@ describe("git super merge", () => {
    * @level l1 @consumer Yrd component publication and first-parent cursor readers
    * Existing ahead-pin cases put main on the candidate's first-parent chain; this one merges main as parent two.
    */
-  it("preserves component main on the first-parent chain when the task merged main in (29650)", async () => {
+  it("refuses publication when the task merged component main as parent two (29650)", async () => {
     const root = mkdtempSync(join(tmpdir(), "git-super-merge-first-parent-"))
     roots.push(root)
     const fixture = createProductFixture(root)
@@ -1507,30 +1507,21 @@ describe("git super merge", () => {
     git(fixture.product, "commit", "-q", "-m", "pin task that merged main in")
     const candidate = git(fixture.product, "rev-parse", "HEAD")
     git(fixture.product, "switch", "-q", "main")
+    const before = git(fixture.product, "rev-parse", "HEAD")
 
     const result = await superMerge({ repo: fixture.product, commit: candidate })
-    expect(result).toMatchObject({ state: "updated", partial: false })
-    const selected = git(fixture.product, "rev-parse", "HEAD:packages/alpha")
-    const child = join(fixture.product, "packages/alpha")
-    // A parent records its immutable pin; the frozen publication source may wrap that same tree.
-    expect(selected).toBe(incoming)
-    const encoded = git(fixture.product, "show", "-s", "--format=%B", "HEAD")
-      .split("\n")
-      .find((line) => line.startsWith(`${PUSH_INTENT_TRAILER}:`))
-      ?.slice(PUSH_INTENT_TRAILER.length + 1)
-      .trim()
-    expect(encoded).toBeDefined()
-    const row = decodePushIntent(encoded!).children.find((entry) => entry.path === "packages/alpha")
-    expect(row?.pin).toBe(incoming)
-    const publication = row?.publication
-    expect(publication).toBeDefined()
-    expect(publication!.expectedDestination).toEqual({ state: "oid", oid: main })
-    expect(git(child, "rev-list", "--first-parent", publication!.source).split("\n")).toContain(main)
-    expect(git(child, "rev-parse", `${publication!.source}^1`)).toBe(main)
-    expect(git(child, "rev-parse", `${publication!.source}^2`)).toBe(incoming)
-    expect(git(child, "rev-parse", `${publication!.source}^{tree}`)).toBe(git(child, "rev-parse", `${incoming}^{tree}`))
-    expect(git(child, "show", `${selected}:task.ts`)).toBe("export const task = 1")
-    expect(git(child, "show", `${selected}:main.ts`)).toBe("export const main = 1")
+    expect(result).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: {
+        code: "gitlink-publication-first-parent-gap",
+        phase: "freeze-child-first-parent",
+        paths: ["packages/alpha"],
+        objectIds: [main, incoming],
+      },
+    })
+    expect(git(fixture.product, "rev-parse", "HEAD")).toBe(before)
+    expect(git(fixture.alpha, "rev-parse", "main")).toBe(main)
   })
 
   it("settles kept-ahead for a pin published only as a pin ref, which its store has never seen", async () => {
@@ -4519,43 +4510,76 @@ describe("git super merge — the nested gitlink chain (24454 row 4)", () => {
     )
   })
 
-  it("freezes a publication row for the nested pin, ordered leaf-first", async () => {
-    const root = mkdtempSync(join(tmpdir(), "git-super-merge-nested-freeze-"))
-    roots.push(root)
-    const fixture = createNestedProductFixture(root)
-    const moved = advanceNestedThroughAlpha(fixture, "candidate-freeze", "export const leaf = 4\n")
-    const result = await superMerge({ repo: fixture.product, commit: moved.candidate })
-    expect(result.state).toBe("updated")
+  it.each(["linear", "main-parent-two"] as const)(
+    "freezes nested publication leaf-first or refuses a first-parent gap (%s)",
+    async (shape) => {
+      const root = mkdtempSync(join(tmpdir(), "git-super-merge-nested-freeze-"))
+      roots.push(root)
+      const fixture = createNestedProductFixture(root)
+      const before = git(fixture.product, "rev-parse", "HEAD")
+      let leafMain = fixture.leafBase
+      const moved =
+        shape === "linear"
+          ? advanceNestedThroughAlpha(fixture, "candidate-freeze", "export const leaf = 4\n")
+          : (() => {
+              const leaf = join(fixture.product, "packages/alpha/apps/maddoc")
+              advanceRepository(leaf, "task.ts", "export const task = 1\n")
+              leafMain = advanceRepository(fixture.leaf, "main.ts", "export const main = 1\n")
+              git(leaf, "fetch", "-q", "origin")
+              git(leaf, "merge", "-q", "--no-ff", "origin/main", "-m", "merge main into nested task")
+              const leafHead = git(leaf, "rev-parse", "HEAD")
+              expect(git(leaf, "rev-parse", `${leafHead}^2`)).toBe(leafMain)
+              git(leaf, "push", "-q", "origin", `${leafHead}:refs/git-super/pins/${leafHead}`)
+              return { ...repinNestedThroughAlpha(fixture, "candidate-first-parent-gap", leafHead), leafHead }
+            })()
+      const result = await superMerge({ repo: fixture.product, commit: moved.candidate })
+      if (shape === "main-parent-two") {
+        expect(result).toMatchObject({
+          state: "failed",
+          partial: false,
+          detail: {
+            code: "gitlink-publication-first-parent-gap",
+            phase: "freeze-child-first-parent",
+            paths: ["packages/alpha/apps/maddoc"],
+            objectIds: [leafMain, moved.leafHead],
+          },
+        })
+        expect(git(fixture.product, "rev-parse", "HEAD")).toBe(before)
+        expect(git(fixture.leaf, "rev-parse", "main")).toBe(leafMain)
+        return
+      }
+      expect(result.state).toBe("updated")
 
-    const message = git(fixture.product, "log", "-1", "--format=%B", "HEAD")
-    const encoded = message
-      .split(/\r?\n/u)
-      .find((line) => line.startsWith(`${PUSH_INTENT_TRAILER}:`))
-      ?.slice(PUSH_INTENT_TRAILER.length + 1)
-      .trim()
-    expect(encoded, `the merge must carry a ${PUSH_INTENT_TRAILER} trailer`).toBeDefined()
-    const intent = decodePushIntent(encoded ?? "")
-    const paths = intent.children.map((child) => child.path)
+      const message = git(fixture.product, "log", "-1", "--format=%B", "HEAD")
+      const encoded = message
+        .split(/\r?\n/u)
+        .find((line) => line.startsWith(`${PUSH_INTENT_TRAILER}:`))
+        ?.slice(PUSH_INTENT_TRAILER.length + 1)
+        .trim()
+      expect(encoded, `the merge must carry a ${PUSH_INTENT_TRAILER} trailer`).toBeDefined()
+      const intent = decodePushIntent(encoded ?? "")
+      const paths = intent.children.map((child) => child.path)
 
-    // OBJECTS EXISTING IS NOT A LANDING. Without a publication row the nested pin
-    // is only retained at refs/git-super/pins and maddoc main never moves, so
-    // alpha main would pin a maddoc commit maddoc main does not contain -- the
-    // 24493 half-landing, one level down.
-    const nested = intent.children.find((child) => child.path === "packages/alpha/apps/maddoc")
-    expect(nested, "the nested pin must have a frozen row at all").toBeDefined()
-    expect(nested?.pin).toBe(moved.leafHead)
-    expect(nested?.publication?.source, "and a publication row that MOVES its main").toBe(moved.leafHead)
+      // OBJECTS EXISTING IS NOT A LANDING. Without a publication row the nested pin
+      // is only retained at refs/git-super/pins and maddoc main never moves, so
+      // alpha main would pin a maddoc commit maddoc main does not contain -- the
+      // 24493 half-landing, one level down.
+      const nested = intent.children.find((child) => child.path === "packages/alpha/apps/maddoc")
+      expect(nested, "the nested pin must have a frozen row at all").toBeDefined()
+      expect(nested?.pin).toBe(moved.leafHead)
+      expect(nested?.publication?.source, "and a publication row that MOVES its main").toBe(moved.leafHead)
 
-    // LEAF-FIRST, ASSERTED BY POSITION. The consumer pushes publication rows in
-    // this order and `groupUpdates` preserves first-seen order inside its
-    // non-root partition, so this ordering is what keeps alpha main from moving
-    // before the maddoc commit it pins is publishable.
-    expect(paths.indexOf("packages/alpha/apps/maddoc")).toBeGreaterThanOrEqual(0)
-    expect(
-      paths.indexOf("packages/alpha/apps/maddoc"),
-      "maddoc's row must precede alpha's, or alpha main lands pinning a commit maddoc main lacks",
-    ).toBeLessThan(paths.indexOf("packages/alpha"))
-  })
+      // LEAF-FIRST, ASSERTED BY POSITION. The consumer pushes publication rows in
+      // this order and `groupUpdates` preserves first-seen order inside its
+      // non-root partition, so this ordering is what keeps alpha main from moving
+      // before the maddoc commit it pins is publishable.
+      expect(paths.indexOf("packages/alpha/apps/maddoc")).toBeGreaterThanOrEqual(0)
+      expect(
+        paths.indexOf("packages/alpha/apps/maddoc"),
+        "maddoc's row must precede alpha's, or alpha main lands pinning a commit maddoc main lacks",
+      ).toBeLessThan(paths.indexOf("packages/alpha"))
+    },
+  )
 })
 
 /**
