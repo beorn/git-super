@@ -586,6 +586,34 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
     async unlock(path: string): Promise<void> {
       await mutate(`worktree unlock ${path}`, () => unlockWorktree(git, repo, path))
     },
+    /** Release a local branch without checking out files or changing index, leases or worktree locks. */
+    async detachAt(path: string, expectedTip: string): Promise<Readonly<{ branch: string; tip: string }>> {
+      return mutate(`detach worktree ${path}`, async () => {
+        if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(expectedTip)) {
+          throw new Error(`worktree ${path}: expected a full SHA1 or SHA256 tip, got ${JSON.stringify(expectedTip)}`)
+        }
+        const target = realpathSync(path)
+        if (!(await listWorktrees(git, repo)).some((row) => row.path === target)) {
+          throw new Error(`worktree ${path}: no exact registration in ${repo}; refusing to detach HEAD`)
+        }
+        const symbolic = await git.run(target, ["symbolic-ref", "--quiet", "--no-recurse", "HEAD"], true)
+        if (symbolic.code !== 0) {
+          throw new Error(`worktree ${path}: HEAD is not a readable symbolic reference: ${symbolic.stderr.trim()}`)
+        }
+        const branch = symbolic.stdout.trim()
+        if (!branch.startsWith("refs/heads/")) {
+          throw new Error(`worktree ${path}: HEAD references ${branch}, expected refs/heads/<branch>`)
+        }
+        await git.run(target, ["check-ref-format", branch])
+        const tip = await git.commit(target, branch)
+        if (tip !== expectedTip) {
+          throw new Error(`worktree ${path}: branch ${branch} tip moved from ${expectedTip} to ${tip}`)
+        }
+        // The expected old OID also refuses a branch that advances after the read above.
+        await git.run(target, ["update-ref", "--no-deref", "HEAD", expectedTip, expectedTip])
+        return { branch, tip: expectedTip }
+      })
+    },
     async remove(
       path: string,
       removeOptions: Readonly<{

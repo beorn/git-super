@@ -79,6 +79,93 @@ function registrySnapshot(registry: string) {
 
 describe("createGitWorktreeStore", () => {
   /**
+   * @failure Branch release resets staged/dirty/private bytes or detaches a moved or non-local HEAD.
+   * @level l1
+   * @consumer Yrd drop preserves a live checkout while releasing its original branch (29600)
+   * Existing removal coverage deletes directories and cannot prove in-place checkout preservation.
+   * @testonly none
+   */
+  it.each(["preserve", "moved-tip", "late-moved-tip", "non-local", "detached"])(
+    "detaches only the expected local tip without touching checkout custody: %s",
+    async (mode) => {
+      const root = await mkdtemp("/var/tmp/git-super-detach-")
+      try {
+        const repo = join(root, "repo")
+        const tip = createRepository(repo, "tracked.txt", "committed\n")
+        const linked = join(root, "linked")
+        const branch = "refs/heads/task/drop"
+        const native = createLocalGitProcess()
+        let newer = ""
+        const store = createGitWorktreeStore({
+          repo,
+          gitProcess: {
+            run: async (request) => {
+              if (mode === "late-moved-tip" && request.args.includes("update-ref")) {
+                git(repo, ["update-ref", branch, newer, tip])
+              }
+              return native.run(request)
+            },
+          },
+        })
+        await store.add({ kind: "new-branch", path: linked, branch: "task/drop", ref: tip })
+        const admin = git(linked, ["rev-parse", "--absolute-git-dir"]).trim()
+        await store.lock(linked, "fixture custody lock")
+        await writeFile(join(linked, ".agent-lease.json"), "private lease bytes\n")
+        await writeFile(join(linked, ".gitignore"), "private/\n")
+        await mkdir(join(linked, "private"))
+        await writeFile(join(linked, "private", "secret"), Buffer.from([0, 255, 42]))
+        await writeFile(join(linked, "untracked.txt"), "untracked custody\n")
+        await writeFile(join(linked, "tracked.txt"), "staged\n")
+        git(linked, ["add", "tracked.txt"])
+        await writeFile(join(linked, "tracked.txt"), "dirty after staging\n")
+        if (mode === "moved-tip" || mode === "late-moved-tip") {
+          git(repo, [
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.test",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "newer tip",
+          ])
+          newer = git(repo, ["rev-parse", "HEAD"]).trim()
+          if (mode === "moved-tip") git(repo, ["update-ref", branch, newer, tip])
+        }
+        if (mode === "non-local") {
+          git(repo, ["update-ref", "refs/tags/not-a-branch", tip])
+          git(linked, ["symbolic-ref", "HEAD", "refs/tags/not-a-branch"])
+        }
+        if (mode === "detached") git(linked, ["update-ref", "--no-deref", "HEAD", tip, tip])
+        const preservedPaths = [
+          join(admin, "index"),
+          join(admin, "locked"),
+          ...["tracked.txt", ".agent-lease.json", ".gitignore", "private/secret", "untracked.txt"].map((path) =>
+            join(linked, path),
+          ),
+        ]
+        const before = preservedPaths.map((path) => readFileSync(path))
+        const headBefore = readFileSync(join(admin, "HEAD"))
+        if (mode === "preserve") {
+          await expect(store.detachAt(linked, tip)).resolves.toEqual({ branch, tip })
+          expect(readFileSync(join(admin, "HEAD"), "utf8")).toBe(`${tip}\n`)
+        } else {
+          await expect(store.detachAt(linked, tip)).rejects.toThrow(/tip|HEAD|reference|lock ref/u)
+          expect(readFileSync(join(admin, "HEAD"))).toEqual(headBefore)
+        }
+        expect(preservedPaths.map((path) => readFileSync(path))).toEqual(before)
+        expect(git(repo, ["rev-parse", branch]).trim()).toBe(
+          mode === "moved-tip" || mode === "late-moved-tip" ? newer : tip,
+        )
+        expect(git(linked, ["show", ":tracked.txt"])).toBe("staged\n")
+      } finally {
+        // raw-delete-allow: root is this test's fresh isolated mkdtemp fixture.
+        await rm(root, { recursive: true, force: true })
+      }
+    },
+  )
+
+  /**
    * @failure Retiring a branch loses its only ref, deletes a checked-out branch, or deletes a newer tip.
    * @level l1
    * @consumer Yrd archive-first local branch retirement (28791)
