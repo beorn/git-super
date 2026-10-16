@@ -223,6 +223,10 @@ describe("createGitWorktreeStore", () => {
       expect(git(repo, ["for-each-ref", "--format=%(refname)", `refs/heads/${branch}`]).trim()).toBe("")
       expect(git(repo, ["rev-parse", archiveRef]).trim()).toBe(tip)
       expect(git(linked, ["rev-parse", "HEAD"]).trim()).toBe(tip)
+      // Recovery cannot silently omit malformed custody while declaring its census complete.
+      const malformedArchive = "refs/archive/unreadable-custody"
+      git(repo, ["update-ref", malformedArchive, tip])
+      expect(() => findArchiveRefFor(repo, branch, tip)).toThrow(malformedArchive)
     } finally {
       // raw-delete-allow: root is this test's fresh mkdtemp fixture, never a caller-supplied worktree.
       await rm(root, { recursive: true, force: true })

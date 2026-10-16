@@ -20,14 +20,23 @@ export function archiveRefFor(branch: string, actor: string, date: string): stri
   return `${ARCHIVE_REF_PREFIX}/${date}/${archiveActorSegment(actor)}/${branch}`
 }
 
-/** Read existing custody for this exact branch and tip, regardless of the retiring actor or UTC day. */
-export function findArchiveRefFor(repoRoot: string, branch: string, tip: string): string | undefined {
-  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(tip)) {
+/** Read archive custody through the one archive-name parser; malformed evidence is never omitted. */
+export function readArchiveRows(
+  repoRoot: string,
+  tip?: string,
+): readonly { branch: string; tip: string; ref: string }[] {
+  if (tip !== undefined && !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(tip)) {
     throw new Error(`the archive tip ${JSON.stringify(tip)} is not a full SHA1 or SHA256 object ID`)
   }
-  const args = ["for-each-ref", `--points-at=${tip}`, "--format=%(objectname)%09%(refname)", `${ARCHIVE_REF_PREFIX}/`]
+  const args = [
+    "for-each-ref",
+    ...(tip === undefined ? [] : [`--points-at=${tip}`]),
+    "--format=%(objectname)%09%(refname)",
+    `${ARCHIVE_REF_PREFIX}/`,
+  ]
   const result = tryGit(repoRoot, args)
   if (result.exitCode !== 0) throw gitError(repoRoot, args, result.exitCode, result.stderr)
+  const rows: { branch: string; tip: string; ref: string }[] = []
   for (const line of result.stdout.split("\n")) {
     if (line === "") continue
     const fields = line.split("\t")
@@ -41,11 +50,17 @@ export function findArchiveRefFor(repoRoot: string, branch: string, tip: string)
       throw new Error(`cannot read archive custody in ${repoRoot}: malformed for-each-ref row ${JSON.stringify(line)}`)
     }
     const name = /^refs\/archive\/(\d{4}-\d{2}-\d{2})\/([^/]+)\/(.+)$/u.exec(ref)
-    if (value === tip && name?.[2] !== undefined && archiveActorSegment(name[2]) === name[2] && name[3] === branch) {
-      return ref
+    if (name?.[2] === undefined || archiveActorSegment(name[2]) !== name[2] || name[3] === undefined) {
+      throw new Error(`${repoRoot}: malformed archive name ${ref}`)
     }
+    rows.push({ branch: name[3], tip: value, ref })
   }
-  return undefined
+  return rows
+}
+
+/** Read existing custody for this exact branch and tip, regardless of the retiring actor or UTC day. */
+export function findArchiveRefFor(repoRoot: string, branch: string, tip: string): string | undefined {
+  return readArchiveRows(repoRoot, tip).find((row) => row.branch === branch)?.ref
 }
 
 /** `created` distinguishes a fresh archive ref from an idempotent re-run; both mean the tip is archived. */
