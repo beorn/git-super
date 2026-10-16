@@ -1,13 +1,17 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+/**
+ * @reach fs-walk <fixture-only: exact frozen-tree reads in temporary Git repositories, no estate scan>
+ */
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { afterEach, describe, expect, test } from "vitest"
+import { afterEach, describe, expect, test, vi } from "vitest"
 
 import { changedCommitGitlinks, readCommitSubmodules } from "../src/commit-graph.ts"
+import * as commitGraph from "../src/commit-graph.ts"
 import { superDiff } from "../src/diff.ts"
 import { classifyExcludedPath } from "../src/status.ts"
 import { createLocalGitProcess, type GitProcess } from "../src/process.ts"
-import { advanceRepository, createProductFixture, git } from "./fixture.ts"
+import { addNestedAlphaSubmodule, advanceRepository, createProductFixture, git } from "./fixture.ts"
 
 const roots: string[] = []
 
@@ -16,6 +20,123 @@ afterEach(() => {
 })
 
 describe("commit submodule graph", () => {
+  /**
+   * @failure A retirement read substitutes child HEAD or mistakes a missing file for an unreadable pinned object.
+   * @level l1
+   * @consumer Root's four-hour clearing through git-super/commit-graph#readCommitPath
+   */
+  // Descriptor reads never inspect a path inside a child. This is the canonical
+  // frozen-path boundary, distinct from the clearing's ledger-policy tests.
+  test("reads frozen exact paths through nested gitlinks without following child HEAD", async () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-commit-path-"))
+    roots.push(root)
+    const fixture = addNestedAlphaSubmodule(createProductFixture(root))
+    const read = commitGraph.readCommitPath
+    expect(read).toBeTypeOf("function")
+    const leaf = join(fixture.product, "packages/alpha/apps/maddoc")
+    const expected = git(leaf, "rev-parse", `${fixture.leafBase}:leaf.ts`)
+    advanceRepository(leaf, "only-at-head.ts", "newer than the pinned leaf\n")
+    const local = createLocalGitProcess()
+    const readonly: GitProcess = {
+      run(request) {
+        if (
+          !["ls-tree", "rev-parse"].includes(
+            request.args[0] === "--literal-pathspecs" ? request.args[1]! : request.args[0]!,
+          )
+        ) {
+          throw new Error(`path read attempted a write: ${request.args.join(" ")}`)
+        }
+        return local.run(request)
+      },
+    }
+    await expect(
+      read(readonly, fixture.product, fixture.productWithNestedBase, "packages/alpha/apps/maddoc/leaf.ts"),
+    ).resolves.toEqual({ mode: "100644", type: "blob", objectId: expected })
+    await expect(
+      read(readonly, fixture.product, fixture.productWithNestedBase, "packages/alpha/apps/maddoc/only-at-head.ts"),
+    ).resolves.toBeNull()
+    await expect(read(readonly, fixture.product, fixture.productWithNestedBase, "packages")).resolves.toMatchObject({
+      type: "tree",
+    })
+    await expect(
+      read(readonly, fixture.product, fixture.productWithNestedBase, "packages/alpha"),
+    ).resolves.toMatchObject({ mode: "160000", type: "commit" })
+    await expect(
+      read(readonly, fixture.product, fixture.productWithNestedBase, "removed/child/test.ts"),
+    ).resolves.toBeNull()
+  })
+
+  test("exact path reads preserve literal metacharacters and report a symlink as its stored blob", async () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-literal-path-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    writeFileSync(join(fixture.product, "a*b.test.ts"), "literal\n")
+    writeFileSync(join(fixture.product, "axb.test.ts"), "different\n")
+    symlinkSync("absent-target", join(fixture.product, "link.test.ts"))
+    git(fixture.product, "add", ".")
+    git(fixture.product, "commit", "-q", "-m", "literal and symlink paths")
+    const head = git(fixture.product, "rev-parse", "HEAD")
+    const process = createLocalGitProcess()
+    await expect(commitGraph.readCommitPath(process, fixture.product, head, "a*b.test.ts")).resolves.toEqual({
+      mode: "100644",
+      type: "blob",
+      objectId: git(fixture.product, "rev-parse", `${head}:a*b.test.ts`),
+    })
+    await expect(commitGraph.readCommitPath(process, fixture.product, head, "link.test.ts")).resolves.toMatchObject({
+      mode: "120000",
+      type: "blob",
+    })
+    await expect(commitGraph.readCommitPath(process, fixture.product, head, "link.test.ts/child")).resolves.toBeNull()
+  })
+
+  // The graph reader's ordinary successful-absence cases cannot witness failed
+  // Git processes, an unreadable object, or discovery that walked to a parent.
+  test.each(["nonzero", "timeout", "failure", "throw", "missing-commit", "uninitialized"] as const)(
+    "exact path reads never turn %s into file absence",
+    async (kind) => {
+      const root = mkdtempSync(join(tmpdir(), "git-super-path-error-"))
+      roots.push(root)
+      const fixture = createProductFixture(root)
+      if (kind === "uninitialized") rmSync(join(fixture.product, "packages/alpha/.git"))
+      const local = createLocalGitProcess()
+      const process: GitProcess = {
+        run(request) {
+          if (kind === "throw") throw new Error("fixture process could not start")
+          if (["nonzero", "timeout", "failure"].includes(kind)) {
+            return Promise.resolve({
+              code: kind === "nonzero" ? 1 : 0,
+              stdout: "",
+              stderr: "fixture read error",
+              signal: null,
+              timedOut: kind === "timeout",
+              ...(kind === "failure" ? { failure: "fixture failure" } : {}),
+            })
+          }
+          return local.run(request)
+        },
+      }
+      const commit = kind === "missing-commit" ? "0".repeat(40) : fixture.productBase
+      const path = "packages/alpha/alpha.ts"
+      await expect(commitGraph.readCommitPath(process, fixture.product, commit, path)).rejects.toMatchObject({
+        message: expect.stringContaining(path),
+        resultDetail: { code: kind === "timeout" ? "git-timeout" : "git-failed", paths: [path], objectIds: [commit] },
+      })
+    },
+  )
+
+  test.each(["", "/absolute", "../outside", "a/../b", "a//b", "C:/outside", "a\\b"])(
+    "exact path reads reject invalid path %j before any Git probe",
+    async (path) => {
+      const run = vi.fn(async () => {
+        throw new Error("invalid input reached Git")
+      })
+      await expect(
+        commitGraph.readCommitPath({ run }, "/explicit/repository", "1".repeat(40), path),
+      ).rejects.toMatchObject({ resultDetail: { code: "invalid-target-path" } })
+      expect(run).not.toHaveBeenCalled()
+    },
+  )
+
   /**
    * @failure Create loses staged identity, attributes staged defects to HEAD, or invents absence despite staged content (27058).
    * @level l1

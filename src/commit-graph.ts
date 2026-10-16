@@ -1,6 +1,7 @@
+import { join } from "node:path"
 import type { GitProcess, GitProcessResult } from "./process.ts"
 import type { GitResultDetail } from "./result.ts"
-import { validateExcludedSubmodules } from "./git.ts"
+import { probeRepository, validateExcludedSubmodules } from "./git.ts"
 import { parseIndexEntries, type IndexEntry } from "./index-entries.ts"
 
 export type CommitGitlink = Readonly<{ path: string; target: string }>
@@ -48,6 +49,87 @@ function operationError(
 
 function gitProcessFailed(result: GitProcessResult): boolean {
   return result.code !== 0 || result.timedOut === true || result.failure !== undefined
+}
+
+/**
+ * Read one literal path at a frozen root commit, following only recorded gitlink
+ * pins. Requires initialized child repositories; never fetches or materializes.
+ * Only a successful tree read can prove absence. A symlink is a blob, not a path
+ * to follow, and a terminal tree or gitlink remains distinguishable from a blob.
+ */
+export async function readCommitPath(
+  git: GitProcess,
+  repository: string,
+  commit: string,
+  path: string,
+): Promise<SelectedCommitPath["treeEntry"]> {
+  const fail = (code: string, reason: string, cause?: unknown) => {
+    const message = `${JSON.stringify(path)} at ${commit} in ${repository}: ${reason}`
+    return Object.assign(new Error(message, { cause }), {
+      resultDetail: detail(code, "read-commit-path", message, {
+        paths: [path],
+        objectIds: [commit],
+        remedy: "Check the exact commit and initialized child repository, then retry the same path read.",
+      }),
+    })
+  }
+  try {
+    validateExcludedSubmodules([path])
+    if (/^[a-z]:/iu.test(path)) throw new Error("a drive-qualified path is not root-relative")
+  } catch (cause) {
+    throw fail("invalid-target-path", "expected a literal normalized root-relative path", cause)
+  }
+  if (!/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/iu.test(commit)) {
+    throw fail("invalid-target-tree", "expected an exact commit object ID")
+  }
+  const query = async (repo: string, args: readonly string[]) => {
+    try {
+      const result = await git.run({ repo, args })
+      if (gitProcessFailed(result)) throw operationError(repo, "read-commit-path", args, result)
+      return result.stdout
+    } catch (cause) {
+      const code =
+        cause instanceof Error && "resultDetail" in cause ? (cause.resultDetail as GitResultDetail).code : "git-failed"
+      throw fail(code, `${repo}: ${cause instanceof Error ? cause.message : String(cause)}`, cause)
+    }
+  }
+  let repo = repository
+  let pinned = commit
+  let prefix: string[] = []
+  const parts = path.split("/")
+  for (const [index, part] of parts.entries()) {
+    prefix.push(part)
+    const relative = prefix.join("/")
+    const output = await query(repo, ["--literal-pathspecs", "ls-tree", "-z", "--full-tree", pinned, "--", relative])
+    if (output === "") return null
+    const records = output.split("\0")
+    const match = /^(\d{6}) (blob|tree|commit) ([0-9a-f]{40}(?:[0-9a-f]{24})?)\t(.*)$/su.exec(records[0] ?? "")
+    if (
+      records.length !== 2 ||
+      records[1] !== "" ||
+      match?.[4] !== relative ||
+      match[1] === undefined ||
+      match[2] === undefined ||
+      match[3] === undefined
+    ) {
+      throw fail("invalid-target-tree", `malformed exact-path tree answer from ${repo} at ${pinned}`)
+    }
+    const entry = { mode: match[1], type: match[2], objectId: match[3] }
+    if (index === parts.length - 1) return entry
+    if (entry.mode === "160000" && entry.type === "commit") {
+      const child = join(repo, relative)
+      const discovered = (await query(child, ["rev-parse", "--show-toplevel"])).trim()
+      const childPrefix = await query(child, ["rev-parse", "--show-prefix"])
+      const probe = probeRepository(discovered, childPrefix)
+      if (probe.kind === "absent") {
+        throw fail("git-failed", `child ${child} at pin ${entry.objectId} is not an initialized repository`)
+      }
+      repo = probe.root
+      pinned = entry.objectId
+      prefix = []
+    } else if (entry.type !== "tree") return null
+  }
+  throw fail("invalid-target-path", "no path segment was inspected")
 }
 
 /** One submodule a commit declares `private = true`: its section NAME and its root-relative path. */
