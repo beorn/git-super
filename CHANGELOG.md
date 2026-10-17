@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.7.0 — 2026-10-17
+
+- Export `shellQuote` through `git-super/shell-command`, including its published JavaScript and types. It quotes one argument for a POSIX shell; SSH retry commands and pull hook wrappers now reuse that implementation.
+- Add archive-backed local branch retirement with `git super branch retire <branch> --tip <commit>`. Retirement requires the exact tip in archive custody and preserves advanced or held branches.
+- Compact retained child Git metadata after native worktree removal, preserving ref values and local reflogs. Expose retained-copy verification and compaction, unregister destroyed nested linked checkouts, and report partial cleanup and retained-copy failures explicitly.
+- Improve recursive push results with explicit lease checks, porcelain outcomes and remote readback for ambiguous results. Component publication preserves the published main first-parent chain, and observed descendants can prove ancestor custody without another remote read.
+- Add `diff --component-base <ref>`, cross-gitlink `readCommitPath`, and exact-tip worktree detachment without changing checkout files.
+- API change: `superIsAncestor` returns synchronously and throws directly. Callers using promise-specific `.then` or `.catch` should use the returned result and ordinary `try`/`catch`.
+- API change: `readPrivateSubmodulePaths` is replaced by `readPrivateSubmodules`, which returns named `{ name, path }` records. Callers needing only paths should select each record's `path`.
+
 ## 0.6.0 — 2026-10-10
 
 - Export `POOL_ROOT_CONFIG_KEY` and `WorktreeHomeOptions` from the package root. `worktreeHomeRoot` now reads the repository's `worktree.poolRoot` declaration, resolves relative paths against its main worktree and preserves the environment/default fallback. This makes the published API usable by Bearly's worktree helpers.
