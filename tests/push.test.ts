@@ -2768,16 +2768,17 @@ describe("a frozen push works only on the children its merge moved (25303, obser
   })
 
   /**
-   * 29688: the same race one step further. The batch fetch reads an advertised ref by NAME, so it can
-   * land a tip the advertisement never named; a ref that moves AGAIN before the re-read leaves the
-   * re-read's value absent too, and the acquisition refuses. That ref is not a push target, so a
-   * legitimate non-main task push must not die on it.
-   * @failure a task-branch push is refused because the unrelated refs/yrd/main/runner moved twice
-   * @level l2
-   * @consumer vendor/git-super/src/push.ts advertisedTips — preservation push
+   * 29688: the race @dev/2 met. An unrelated, parentless ref advances once between the advertisement and
+   * the batch fetch — which reads a ref BY NAME, so it lands a tip the advertisement never named — and
+   * again before the re-read that decides whether the advertised object is still the tip. `ref` names the
+   * namespace under test: the check path's baselines are scoped to branch refs, so a ref outside
+   * refs/heads/ must never be acquired, while one inside it keeps the loud refusal.
    */
-  test("survives an advertised ref advancing twice between advertisement and a real fetch (29688)", async () => {
-    const { fixture, repository, remote, source } = pushFixture("moving-advertised-ref-twice")
+  async function doublyMovingRef(
+    name: string,
+    ref: string,
+  ): Promise<Readonly<{ checked: Awaited<ReturnType<typeof superPush>>; fetched: readonly string[] }>> {
+    const { fixture, repository, remote, source } = pushFixture(name)
     // A file:// URL, so the fetch is the precise smart transport a real remote gives: fetching one ref
     // does not sweep in objects reachable from no requested ref, which a plain local path may do.
     git(repository, "remote", "add", "origin", `file://${remote}`)
@@ -2785,11 +2786,11 @@ describe("a frozen push works only on the children its merge moved (25303, obser
     const foreign = join(fixture, "foreign")
     git(fixture, "clone", "-q", remote, foreign)
     const advertised = advanceRepository(foreign, "foreign.txt", "advertised\n")
-    git(foreign, "push", "-q", "origin", `${advertised}:refs/heads/foreign`)
+    git(foreign, "push", "-q", "origin", `${advertised}:${ref}`)
     expect(() => git(repository, "cat-file", "-e", `${advertised}^{commit}`)).toThrow()
 
-    // The two later tips the ref will hold, both UNRELATED to the advertised object, so that fetching the
-    // ref never drags the advertised object in. The registry runner ref is parentless in exactly this way.
+    // Both later tips are UNRELATED to the advertised object, so fetching the ref never drags the
+    // advertised object in. The registry runner ref is parentless in exactly this way.
     const movedSeed = join(fixture, "moved")
     const fetched = createRepository(movedSeed, "moved.txt", "fetched\n")
     git(movedSeed, "remote", "add", "origin", remote)
@@ -2798,21 +2799,23 @@ describe("a frozen push works only on the children its merge moved (25303, obser
     git(thirdSeed, "remote", "add", "origin", remote)
 
     const local = createLocalGitProcess()
+    const fetches: string[] = []
     let moved = false
     const racing: GitProcess = {
       async run(request) {
-        const forForeign = request.args[0] === "fetch" && request.args.includes("refs/heads/foreign")
-        if (forForeign && !moved) {
+        const forRef = request.args[0] === "fetch" && request.args.includes(ref)
+        if (forRef) fetches.push(ref)
+        if (forRef && !moved) {
           // The ref advances between the ADVERTISEMENT and this fetch, which reads it by NAME: the fetch
           // therefore lands a tip the advertisement never named, and the advertised object stays absent.
-          git(movedSeed, "push", "-q", "--force", "origin", `${fetched}:refs/heads/foreign`)
+          git(movedSeed, "push", "-q", "--force", "origin", `${fetched}:${ref}`)
         }
         const result = await local.run(request)
-        if (forForeign && !moved) {
+        if (forRef && !moved) {
           // …and it advances once more before the re-read that decides whether the advertised object is
           // still the tip, so the re-read names a value this clone has never fetched.
           moved = true
-          git(thirdSeed, "push", "-q", "--force", "origin", `${third}:refs/heads/foreign`)
+          git(thirdSeed, "push", "-q", "--force", "origin", `${third}:${ref}`)
         }
         return result
       },
@@ -2824,9 +2827,35 @@ describe("a frozen push works only on the children its merge moved (25303, obser
       recurseSubmodules: "check",
       git: racing,
     })
-    expect(moved, "the race fired: the unrelated ref moved between the fetch and the re-read").toBe(true)
-    expect(checked.detail?.message, JSON.stringify(checked)).not.toMatch(/remains missing/u)
+    return { checked, fetched: fetches }
+  }
+
+  /**
+   * @failure a task-branch push is refused because the unrelated refs/yrd/main/runner moved twice while
+   *          the check path acquired every advertised ref
+   * @level l2
+   * @consumer vendor/git-super/src/push.ts superPush recurseSubmodules=check — preservation push
+   */
+  test("does not acquire a moving ref outside the branch namespace, so a queue ref cannot stop a task push (29688)", async () => {
+    // The SPECIMEN's namespace: refs/yrd/main/runner is queue machinery, not history a task push builds on.
+    const { checked, fetched } = await doublyMovingRef("moving-runner-ref", "refs/yrd/main/runner")
+    expect(fetched, "the check path scopes its baselines to refs/heads/, so it never acquires this ref").toEqual([])
     expect(checked).toMatchObject({ state: "updated", partial: false })
+  })
+
+  /**
+   * 29688 control: the same double move inside the branch namespace still refuses, with the existing
+   * message naming both objects. A branch ref's history CAN bound what the pushed source builds on, so it
+   * must still be acquired and a genuine failure must still be loud.
+   * @failure the scoping fix silently weakens acquisition for branch refs
+   * @level l2
+   * @consumer vendor/git-super/src/push.ts advertisedTips — preservation push
+   */
+  test("still refuses the same double move on a branch ref, with the existing message (29688 control)", async () => {
+    const { checked, fetched } = await doublyMovingRef("moving-branch-ref-twice", "refs/heads/foreign")
+    expect(fetched, "a branch ref IS acquired: its history can bound what this push builds on").not.toEqual([])
+    expect(checked).toMatchObject({ state: "failed", partial: false })
+    expect(checked.detail?.message).toMatch(/Advertised object .* at refs\/heads\/foreign from origin remains missing/u)
   })
 
   test("peels a fetched annotated tag in the second batch without rereading present refs", async () => {

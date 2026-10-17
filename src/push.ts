@@ -2551,7 +2551,16 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
     if (options.recurseSubmodules === "check") {
       let requirements: CommitRequirement[]
       try {
-        const baselines = await advertisedTips(git, root, remote, await readAdvertisement(git, root, remote))
+        // 29688: these baselines only EXCLUDE history from the walk below, so scoping them to branch refs
+        // can never drop a requirement; reading every ref let a fast-moving queue ref
+        // (refs/yrd/main/runner) refuse an unrelated task push when it moved twice between the fetch and
+        // the re-read. Git's own --recurse-submodules=check bounds the same way, by the remote's branches.
+        const baselines = await advertisedTips(
+          git,
+          root,
+          remote,
+          await readAdvertisement(git, root, remote, ["refs/heads/"]),
+        )
         requirements = await collectCommitRequirements(
           git,
           root,
