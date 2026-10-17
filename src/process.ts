@@ -20,6 +20,7 @@ import { constants as osConstants, tmpdir } from "node:os"
 import { delimiter, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { fullJitter } from "@bearly/pacing"
+import { shellQuote } from "./shell-command.ts"
 
 export { applyGitObjectContext, cleanGitEnvironment, validateGitObjectContext, type GitObjectContext } from "./git.ts"
 
@@ -308,14 +309,13 @@ export function verboseSshRetryEnvironment(
   env: NodeJS.ProcessEnv,
   coreSshCommand: string | undefined,
 ): Readonly<{ env: NodeJS.ProcessEnv; command: string }> {
-  const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`
   const selected =
     env.GIT_SSH_COMMAND !== undefined
       ? env.GIT_SSH_COMMAND
       : coreSshCommand !== undefined
         ? coreSshCommand
         : env.GIT_SSH !== undefined
-          ? quote(env.GIT_SSH)
+          ? shellQuote(env.GIT_SSH)
           : "ssh"
   if (selected.trim() === "") throw new Error("git-super: effective SSH command is empty after a publickey refusal")
   const command = `${selected} -v`

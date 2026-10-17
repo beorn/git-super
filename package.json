@@ -29,6 +29,7 @@
     "./push-intent": "./src/push-intent.ts",
     "./push": "./src/push.ts",
     "./result": "./src/result.ts",
+    "./shell-command": "./src/shell-command.ts",
     "./status": "./src/status.ts",
     "./submodules": "./src/submodules.ts",
     "./submodule-origin": "./src/submodule-origin.ts",
@@ -89,6 +90,10 @@
       "./result": {
         "types": "./dist/result.d.ts",
         "import": "./dist/result.js"
+      },
+      "./shell-command": {
+        "types": "./dist/shell-command.d.ts",
+        "import": "./dist/shell-command.js"
       },
       "./status": {
         "types": "./dist/status.d.ts",
@@ -157,6 +162,7 @@
       "src/push-intent.ts",
       "src/push.ts",
       "src/result.ts",
+      "src/shell-command.ts",
       "src/status.ts",
       "src/submodules.ts",
       "src/submodule-origin.ts",

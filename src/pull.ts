@@ -11,6 +11,7 @@ import { ensureCommitObject } from "./objects.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
 import { materializeSubmodulesWithProcess, type SubmoduleMaterializationResult } from "./submodules.ts"
 import { gitSuperResult, type GitResultDetail, type GitSuperRepositoryResult, type GitSuperResult } from "./result.ts"
+import { shellQuote } from "./shell-command.ts"
 
 /** Added-checkout receipts expose the shared materializer's actual borrow partition. */
 type PullRepositoryResult = GitSuperRepositoryResult &
@@ -167,7 +168,7 @@ async function hooksWithoutPostMerge(
       const stat = statSync(real, { throwIfNoEntry: false })
       if (stat === undefined || !stat.isFile() || (stat.mode & 0o111) === 0) continue
       const wrapper = join(dir, name)
-      writeFileSync(wrapper, `#!/bin/sh\nexec '${real.replaceAll("'", "'\\''")}' "$@"\n`)
+      writeFileSync(wrapper, `#!/bin/sh\nexec ${shellQuote(real)} "$@"\n`)
       chmodSync(wrapper, 0o755)
     }
   }

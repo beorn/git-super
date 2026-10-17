@@ -1,9 +1,10 @@
 /**
- * @failure A source export can be omitted from publication, or name a dist file tsdown never builds.
- * @level l1
- * @consumer 21076 old-pin pack proof and npm consumers of git-super/gitlink-carrier
+ * @failure A public export can be unimportable, omitted from publication, or name an unbuilt dist file.
+ * @level l2
+ * @consumer npm consumers of git-super/gitlink-carrier and Yrd's git-super/shell-command import
  */
 
+import { spawnSync } from "node:child_process"
 import { readFileSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -30,4 +31,22 @@ test("tsdown builds every publishConfig export (26412)", () => {
     if (!entries.has(src)) missing.push(`${name} -> ${src}`)
   }
   expect(missing).toEqual([])
+})
+
+test("a consumer imports shellQuote publicly and preserves one POSIX argument", () => {
+  const value = "path with spaces/'quoted'/$HOME;$(printf expanded)\nlast line"
+  const result = spawnSync(
+    process.execPath,
+    [
+      "--eval",
+      `import { shellQuote } from "git-super/shell-command";
+const value = ${JSON.stringify(value)};
+const output = Bun.spawnSync(["sh", "-c", "printf %s " + shellQuote(value)]);
+if (output.exitCode !== 0) throw new Error(output.stderr.toString());
+process.stdout.write(output.stdout);`,
+    ],
+    { cwd: root, encoding: "utf8" },
+  )
+  expect(result.status, result.stderr).toBe(0)
+  expect(result.stdout).toBe(value)
 })

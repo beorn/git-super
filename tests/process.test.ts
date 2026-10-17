@@ -15,6 +15,7 @@ import {
 import { tmpdir } from "node:os"
 import { delimiter, join } from "node:path"
 import { createLocalGitProcess } from "../src/process.ts"
+import { shellQuote } from "../src/shell-command.ts"
 import * as processPort from "git-super/process"
 import type { SupervisedProcess } from "git-super/process"
 import { advanceRepository, canonicalTmpdir, createRepository, git } from "./fixture.ts"
@@ -155,7 +156,6 @@ while (!existsSync(${JSON.stringify(release)})) {
 }
 `,
     )
-    const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`
     const runner = createLocalGitProcess(
       { ...process.env, GIT_OBJECT_DIRECTORY: decoy, GIT_ALTERNATE_OBJECT_DIRECTORIES: decoy },
       { objects: { directory: primary, alternates: [alternate] } },
@@ -163,7 +163,7 @@ while (!existsSync(${JSON.stringify(release)})) {
     const controller = new AbortController()
     const pending = runner.run({
       repo,
-      args: ["-c", `alias.pause=!${quote(process.execPath)} ${quote(fixture)}`, "pause"],
+      args: ["-c", `alias.pause=!${shellQuote(process.execPath)} ${shellQuote(fixture)}`, "pause"],
       signal: controller.signal,
     })
     try {
