@@ -2767,6 +2767,68 @@ describe("a frozen push works only on the children its merge moved (25303, obser
     expect(advanced).toBe(true)
   })
 
+  /**
+   * 29688: the same race one step further. The batch fetch reads an advertised ref by NAME, so it can
+   * land a tip the advertisement never named; a ref that moves AGAIN before the re-read leaves the
+   * re-read's value absent too, and the acquisition refuses. That ref is not a push target, so a
+   * legitimate non-main task push must not die on it.
+   * @failure a task-branch push is refused because the unrelated refs/yrd/main/runner moved twice
+   * @level l2
+   * @consumer vendor/git-super/src/push.ts advertisedTips — preservation push
+   */
+  test("survives an advertised ref advancing twice between advertisement and a real fetch (29688)", async () => {
+    const { fixture, repository, remote, source } = pushFixture("moving-advertised-ref-twice")
+    // A file:// URL, so the fetch is the precise smart transport a real remote gives: fetching one ref
+    // does not sweep in objects reachable from no requested ref, which a plain local path may do.
+    git(repository, "remote", "add", "origin", `file://${remote}`)
+    git(repository, "push", "-q", "origin", `${source}:refs/heads/main`)
+    const foreign = join(fixture, "foreign")
+    git(fixture, "clone", "-q", remote, foreign)
+    const advertised = advanceRepository(foreign, "foreign.txt", "advertised\n")
+    git(foreign, "push", "-q", "origin", `${advertised}:refs/heads/foreign`)
+    expect(() => git(repository, "cat-file", "-e", `${advertised}^{commit}`)).toThrow()
+
+    // The two later tips the ref will hold, both UNRELATED to the advertised object, so that fetching the
+    // ref never drags the advertised object in. The registry runner ref is parentless in exactly this way.
+    const movedSeed = join(fixture, "moved")
+    const fetched = createRepository(movedSeed, "moved.txt", "fetched\n")
+    git(movedSeed, "remote", "add", "origin", remote)
+    const thirdSeed = join(fixture, "third")
+    const third = createRepository(thirdSeed, "third.txt", "third\n")
+    git(thirdSeed, "remote", "add", "origin", remote)
+
+    const local = createLocalGitProcess()
+    let moved = false
+    const racing: GitProcess = {
+      async run(request) {
+        const forForeign = request.args[0] === "fetch" && request.args.includes("refs/heads/foreign")
+        if (forForeign && !moved) {
+          // The ref advances between the ADVERTISEMENT and this fetch, which reads it by NAME: the fetch
+          // therefore lands a tip the advertisement never named, and the advertised object stays absent.
+          git(movedSeed, "push", "-q", "--force", "origin", `${fetched}:refs/heads/foreign`)
+        }
+        const result = await local.run(request)
+        if (forForeign && !moved) {
+          // …and it advances once more before the re-read that decides whether the advertised object is
+          // still the tip, so the re-read names a value this clone has never fetched.
+          moved = true
+          git(thirdSeed, "push", "-q", "--force", "origin", `${third}:refs/heads/foreign`)
+        }
+        return result
+      },
+    }
+    const checked = await superPush({
+      repo: repository,
+      remote: "origin",
+      refspecs: [`${source}:refs/heads/preservation`],
+      recurseSubmodules: "check",
+      git: racing,
+    })
+    expect(moved, "the race fired: the unrelated ref moved between the fetch and the re-read").toBe(true)
+    expect(checked.detail?.message, JSON.stringify(checked)).not.toMatch(/remains missing/u)
+    expect(checked).toMatchObject({ state: "updated", partial: false })
+  })
+
   test("peels a fetched annotated tag in the second batch without rereading present refs", async () => {
     const { fixture, repository, remote, source } = pushFixture("fetched-tag")
     git(repository, "remote", "add", "origin", remote)
