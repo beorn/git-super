@@ -9,6 +9,7 @@
 - Add `diff --component-base <ref>`, cross-gitlink `readCommitPath`, and exact-tip worktree detachment without changing checkout files.
 - API change: `superIsAncestor` returns synchronously and throws directly. Callers using promise-specific `.then` or `.catch` should use the returned result and ordinary `try`/`catch`.
 - API change: `readPrivateSubmodulePaths` is replaced by `readPrivateSubmodules`, which returns named `{ name, path }` records. Callers needing only paths should select each record's `path`.
+- Development: use Vitest 5 for standalone tests, matching workspace validation.
 
 ## 0.6.0 — 2026-10-10
 
