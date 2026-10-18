@@ -918,7 +918,7 @@ describe("superDiff --component-base (29363: published component changes are not
     expect(composed.consultedRepositories.find(({ path }) => path === "vendor/gamma")?.from).toBe(EMPTY_TREE)
   })
 
-  test.each(["authored", "at-target", "unavailable"] as const)(
+  test.each(["authored", "at-target", "unavailable", "spawn-error"] as const)(
     "a nested gitlink uses the target parent's recorded pin: %s (30108)",
     async (mode) => {
       const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-diff-component-base-nested-"))
@@ -977,25 +977,37 @@ describe("superDiff --component-base (29363: published component changes are not
       git(leafCheckout, "update-ref", "refs/remotes/origin/main", git(leafCheckout, "rev-parse", leafPublished + "^"))
       const native = superDiff({ repo: nested.product, refs: [forkPoint + ".." + head], stat: true, patch: true })
       const original = childProcess.spawnSync
-      const spy =
-        mode === "unavailable"
-          ? vi.spyOn(childProcess, "spawnSync").mockImplementation((command, args, options) => {
-              if (
-                Array.isArray(args) &&
-                args[1] === nested.product &&
-                args[2] === "ls-tree" &&
-                args[4] === publishedMain
-              ) {
-                // Fail only the extra target-tree read through native Git; every native comparison still runs unchanged.
-                return original(
-                  command,
-                  args.map((arg, index) => (index === 4 ? "refs/heads/missing-comparison-target" : arg)),
-                  options,
-                )
+      const unavailable = mode === "unavailable" || mode === "spawn-error"
+      const failure = mode === "spawn-error" ? "comparison-target EAGAIN" : "missing-comparison-target"
+      const spy = unavailable
+        ? vi.spyOn(childProcess, "spawnSync").mockImplementation((command, args, options) => {
+            if (
+              Array.isArray(args) &&
+              args[1] === nested.product &&
+              args[2] === "ls-tree" &&
+              args[4] === publishedMain
+            ) {
+              if (mode === "spawn-error") {
+                return {
+                  pid: 0,
+                  output: [],
+                  stdout: "",
+                  stderr: "",
+                  status: null,
+                  signal: null,
+                  error: new Error(failure),
+                }
               }
-              return original(command, args, options)
-            })
-          : undefined
+              // Fail only the extra target-tree read through native Git; every native comparison still runs unchanged.
+              return original(
+                command,
+                args.map((arg, index) => (index === 4 ? "refs/heads/missing-comparison-target" : arg)),
+                options,
+              )
+            }
+            return original(command, args, options)
+          })
+        : undefined
       if (spy !== undefined) syncBuiltinESMExports()
       try {
         const refs = ["origin/main..." + head]
@@ -1007,7 +1019,7 @@ describe("superDiff --component-base (29363: published component changes are not
         expect(actual.notCompared).toEqual([])
         const parent = actual.consultedRepositories.find(({ path }) => path === "packages/alpha")
         const leaf = actual.consultedRepositories.find(({ path }) => path === "packages/alpha/apps/maddoc")
-        if (mode === "unavailable") {
+        if (unavailable) {
           expect(
             spy?.mock.calls.filter(
               ([, args]) => Array.isArray(args) && args[1] === nested.product && args.includes("origin/main^{commit}"),
@@ -1019,7 +1031,7 @@ describe("superDiff --component-base (29363: published component changes are not
                 kind: "unavailable",
                 target: "origin/main",
                 commit: publishedMain,
-                error: expect.stringContaining("missing-comparison-target"),
+                error: expect.stringContaining(failure),
               },
             })
           }
@@ -1041,10 +1053,28 @@ describe("superDiff --component-base (29363: published component changes are not
         expect(await runCli(["--repo", nested.product, "--json", "diff", ...refs], stdout, stderr)).toBe(0)
         const json = JSON.parse(stdout.output) as SuperDiffResult
         expect(json.consultedRepositories).toEqual(actual.consultedRepositories)
-        if (mode === "unavailable") {
+        if (unavailable) {
           expect(stderr.output).toContain("packages/alpha")
           expect(stderr.output).toContain("origin/main")
-          expect(stderr.output).toContain("missing-comparison-target")
+          expect(stderr.output).toContain(failure)
+        }
+        if (mode === "spawn-error") {
+          // Required comparison reads must still fail; only attribution reads are report-only.
+          spy?.mockImplementation((command, args, options) => {
+            if (Array.isArray(args) && args[1] === alphaCheckout && args[2] === "cat-file") {
+              return {
+                pid: 0,
+                output: [],
+                stdout: "",
+                stderr: "",
+                status: null,
+                signal: null,
+                error: new Error(failure),
+              }
+            }
+            return original(command, args, options)
+          })
+          expect(() => superDiff({ repo: nested.product, refs })).toThrow(failure)
         }
       } finally {
         spy?.mockRestore()

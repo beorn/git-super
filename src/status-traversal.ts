@@ -19,7 +19,7 @@ import { resolveSubmoduleOrigin } from "./submodule-origin.ts"
 
 const ZERO_OID = "0".repeat(40)
 const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
-type StatusGitRequest = Readonly<{ cwd: string; args: readonly string[]; indexFile?: string }>
+type StatusGitRequest = Readonly<{ cwd: string; args: readonly string[]; indexFile?: string; reportOnly?: true }>
 type StatusGitResult = Readonly<{ status: number; stdout: string; stderr: string }>
 type Traversal<T> = Generator<StatusGitRequest, T, StatusGitResult>
 
@@ -45,14 +45,19 @@ function* readIndexGitlinks(cwd: string, indexFile?: string) {
     .sort((a, b) => a.path.localeCompare(b.path))
 }
 
-/** One traversal, native sync execution; transport faults end it rather than becoming exit data. */
+/** Required native transport faults end the traversal; report-only reads reach their owning catch. */
 export function driveSync<T>(traversal: Traversal<T>): T {
   let step = traversal.next()
   while (!step.done) {
+    const request = step.value
     try {
-      const result = tryGit(step.value.cwd, [...step.value.args], step.value.indexFile)
+      const result = tryGit(request.cwd, [...request.args], request.indexFile)
       step = traversal.next({ status: result.exitCode, stdout: result.stdout, stderr: result.stderr })
     } catch (error) {
+      if (request.reportOnly) {
+        step = traversal.throw(error)
+        continue
+      }
       // A forced close discards the return value; it is never an observation.
       try {
         traversal.return(undefined as never)
@@ -67,8 +72,8 @@ export function driveSync<T>(traversal: Traversal<T>): T {
 async function driveAsync<T>(traversal: Traversal<T>, git: Pick<Git, "run">, timeoutMs: number): Promise<T> {
   let step = traversal.next()
   while (!step.done) {
+    const request = step.value
     try {
-      const request = step.value
       const result = await git.run(
         request.cwd,
         request.args,
@@ -78,6 +83,10 @@ async function driveAsync<T>(traversal: Traversal<T>, git: Pick<Git, "run">, tim
       )
       step = traversal.next({ status: result.code, stdout: result.stdout, stderr: result.stderr.trim() })
     } catch (error) {
+      if (request.reportOnly) {
+        step = traversal.throw(error)
+        continue
+      }
       try {
         traversal.return(undefined as never)
       } finally {
@@ -170,9 +179,13 @@ function* recordedGitlink(
   root: string,
   ref: string,
   path: string,
-  purpose = "--component-base",
+  purpose: "--component-base" | "comparison target" = "--component-base",
 ): Traversal<string | undefined> {
-  const result = yield* queryGit(root, ["ls-tree", "-z", ref, "--", path])
+  const result: StatusGitResult = yield {
+    cwd: root,
+    args: ["ls-tree", "-z", ref, "--", path],
+    ...(purpose === "comparison target" ? { reportOnly: true } : {}),
+  }
   if (result.status !== 0) {
     throw new Error(
       `git super: ${purpose} ${ref} does not resolve in ${root}: ${result.stderr.trim() || `git ls-tree exited ${result.status}`}`,
