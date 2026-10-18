@@ -3189,6 +3189,18 @@ describe("a frozen push works only on the children its merge moved (25303, obser
         message: expect.stringContaining(`does not contain required commit ${moved}`),
         resultDetail: { code: "gitlink-publication-non-fast-forward" },
       })
+      await expect(capture).rejects.toHaveProperty(
+        "resultDetail.remedy",
+        expect.stringContaining("at the moment you act"),
+      )
+      await expect(capture).rejects.toHaveProperty(
+        "resultDetail.remedy",
+        expect.stringContaining("needs no separate approval"),
+      )
+      await expect(capture).rejects.toHaveProperty(
+        "resultDetail.remedy",
+        expect.stringContaining("no force, no rebase, no write to"),
+      )
       expect(calls.filter(isObservation).length).toBeGreaterThan(0)
     },
   )

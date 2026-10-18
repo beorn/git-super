@@ -1189,7 +1189,7 @@ export async function capturePushIntent(
     }
     if (update.expectedDestination === undefined) throw new Error(`No observed destination for ${requirement.path}`)
     if (update.expectedDestination.state === "oid") {
-      const remedy = `Rebase the change's component branch onto main ${update.expectedDestination.oid}, or merge it into a new branch started at ${update.expectedDestination.oid} so main stays the first parent; then re-record its gitlink and submit again.`
+      const remedy = `Start a new branch from ${requirement.path}'s current main at the moment you act (this refusal names ${update.expectedDestination.oid}, which may have moved), merge the preserved tip into it so current main stays the first parent, re-record the gitlink at the merge commit, and retry the normal root compose. That is a no-rewrite merge with a fast-forward branch update: no force, no rebase, no write to ${requirement.path}'s main, nothing deleted. It needs no separate approval. If any of those properties does not hold, ask for approval before you act.`
       const args = ["merge-base", "--is-ancestor", update.expectedDestination.oid, update.source]
       const ancestry = await git.run({ repo: requirement.repository, args })
       if (ancestryAnswerNo(ancestry) && !changed.has(requirement.path)) {
