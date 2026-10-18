@@ -58,6 +58,13 @@ Normal path or porcelain output stays on stdout. A rendered report of the reposi
 
 `diff` reports removed components in `notCompared` with `reason: "removed"` and continues comparing readable repositories. It does not open a removed component. Missing component objects are collected as `reason: "unreadable"`, with the repository, object IDs and fetch remedy; the CLI prints every observation before exiting `2`. Readable paths remain available in the partial result. Consumers must inspect `notCompared` before treating a comparison as complete.
 
+For a committed, single explicit `A...B` comparison, component rows may also carry `targetComparison`:
+
+- `{ kind: "at-target", target: "A", commit: "<resolved root commit>" }` means the branch's component pin exactly equals the pin that target commit records. Human section headings and pointer lines say `already in A`; path/NUL output and native diff products stay unchanged. This measures equality, without claiming who made the change.
+- `{ kind: "unavailable", target: "A", commit: "<resolved root commit>", error: "<cause>" }` means an extra attribution read failed. The cause is reported on stderr and retained in JSON; this observation changes neither native comparison products nor exit status.
+
+Only exact equality is labelled. A pin behind, ahead of or diverged from the target stays unlabelled; absence of the field is no claim of authorship. Explicit `--component-base` remains the tool for measuring authored-only changes. Working-tree, cached, two-dot and other ref forms do not receive target attribution. Nested components use the pin recorded by their target parent, rather than a component's own moving `origin/main`.
+
 `diff`, `status`, `merge-base`, `pull` and `worktree remove` accept repeated `--exclude-submodule <path>` options after the command. Each path is literal and relative to the superproject root; its descendants are excluded too. JSON results name excluded paths in `notCompared`, and human output explains each skip on stderr. Comparison exclusions skip component content without declaring it clean. Pull admits empty uninitialized excluded checkouts and absent additions; unsafe checkouts refuse. Removal also requires parent identity and surviving store custody: stores within either deletion path refuse, and external stores remain untouched.
 
 ```json

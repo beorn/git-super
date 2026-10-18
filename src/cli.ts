@@ -1189,15 +1189,32 @@ async function writeResult(
       )
     }
   }
+  if (captured.node === nodes.diff) {
+    for (const entry of (result as SuperDiffResult).consultedRepositories) {
+      const comparison = entry.targetComparison
+      if (comparison === undefined || (captured.json && comparison.kind === "at-target")) continue
+      stderr.write(
+        comparison.kind === "at-target"
+          ? `${entry.path}: already in ${comparison.target} @ ${comparison.commit}\n`
+          : `${entry.path}: comparison with ${comparison.target} @ ${comparison.commit} unavailable: ${comparison.error}\n`,
+      )
+    }
+  }
   if (captured.json) {
     stdout.write(stableJson(result))
   } else if (captured.node === nodes.diff) {
     const diff = result as SuperDiffResult
+    const targetLabel = (path: string): string => {
+      const comparison = diff.consultedRepositories.find((entry) => entry.path === path)?.targetComparison
+      return comparison?.kind === "at-target"
+        ? ` (already in ${comparison.target} @ ${comparison.commit.slice(0, 7)})`
+        : ""
+    }
     if (diff.paths.length > 0) {
       stdout.write(`${diff.paths.join(captured.nul ? "\0" : "\n")}${captured.nul ? "\0" : "\n"}`)
     }
     for (const stat of diff.stats ?? []) {
-      stdout.write(`\n== ${stat.repository} ==\n`)
+      stdout.write(`\n== ${stat.repository}${targetLabel(stat.repository)} ==\n`)
       if (stat.untrackedOnly) {
         stdout.write(" dirty (untracked files only)\n")
         continue
@@ -1211,11 +1228,12 @@ async function writeResult(
           `${stat.totals.deleted} deletion${stat.totals.deleted === 1 ? "" : "s"}(-)\n`,
       )
       for (const move of stat.pointerMoves) {
-        stdout.write(` ${move.path}: pointer ${move.from.slice(0, 7)} -> ${move.to.slice(0, 7)}\n`)
+        const path = stat.repository === "." ? move.path : `${stat.repository}/${move.path}`
+        stdout.write(` ${move.path}: pointer ${move.from.slice(0, 7)} -> ${move.to.slice(0, 7)}${targetLabel(path)}\n`)
       }
     }
     for (const patch of diff.patches ?? []) {
-      stdout.write(`\n== ${patch.repository} ==\n${patch.patch}`)
+      stdout.write(`\n== ${patch.repository}${targetLabel(patch.repository)} ==\n${patch.patch}`)
     }
     await writeReport(diff.consultedRepositories, stderr)
   } else if (captured.node === nodes.status) {

@@ -1,3 +1,6 @@
+/**
+ * @reach fs-walk <fixture-only: mkdtempSync product and submodule repositories>
+ */
 import { afterEach, describe, expect, test, vi } from "vitest"
 import childProcess from "node:child_process"
 import { syncBuiltinESMExports } from "node:module"
@@ -88,7 +91,7 @@ describe("superDiff", () => {
   // `childProcess.spawnSync` and its `syncBuiltinESMExports()` in place for the NEXT test in the same file,
   // which then overflowed the stack on its first nested spawn. A realistic budget removes the flake; that
   // contamination is why it is worth removing rather than re-running.
-  for (const mode of ["historical", "working"] as const) {
+  for (const mode of ["historical", "three-dot", "working"] as const) {
     test(`reports exclusions before child access in ${mode} comparisons`, { timeout: 30_000 }, async () => {
       const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-excluded-"))
       roots.push(fixtureRoot)
@@ -115,7 +118,7 @@ describe("superDiff", () => {
       try {
         const options = {
           repo: fixture.product,
-          ...(mode === "historical" ? { refs: [`${fixture.productBase}..${head}`] } : {}),
+          ...(mode !== "working" ? { refs: [fixture.productBase + (mode === "three-dot" ? "..." : "..") + head] } : {}),
           excludedSubmodules: ["packages/alpha"],
           stat: true,
           patch: true,
@@ -125,7 +128,7 @@ describe("superDiff", () => {
         expect(result).toMatchObject({
           notCompared: [expect.objectContaining({ path: "packages/alpha", reason: "excluded" })],
         })
-        expect(result.paths).toEqual([mode === "historical" ? "vendor/beta/new-beta.ts" : "vendor/beta/beta.ts"])
+        expect(result.paths).toEqual([mode !== "working" ? "vendor/beta/new-beta.ts" : "vendor/beta/beta.ts"])
         expect(result.consultedRepositories.map(({ path }) => path)).toEqual([".", "vendor/beta"])
         expect(result.stats?.flatMap(({ files }) => files.map(({ path }) => path))).not.toContain("packages/alpha")
         if (mode === "working") {
@@ -145,7 +148,7 @@ describe("superDiff", () => {
               "diff",
               "--exclude-submodule",
               "packages/alpha",
-              ...(mode === "historical" ? [`${fixture.productBase}..${head}`] : []),
+              ...(mode !== "working" ? [fixture.productBase + (mode === "three-dot" ? "..." : "..") + head] : []),
             ],
             stdout,
             stderr,
@@ -208,6 +211,11 @@ describe("superDiff", () => {
     const patch = result.patches?.find((entry) => entry.repository === "vendor/dependency")?.patch ?? ""
     expect(patch).toContain("+++ b/dependency.ts")
     expect(patch).toContain("+++ b/notes.md")
+    const threeDot = superDiff({ repo: product, refs: [base + "...HEAD"], stat: true, patch: true })
+    expect(threeDot.paths).toEqual(result.paths)
+    expect(threeDot.consultedRepositories).toEqual(result.consultedRepositories)
+    expect(threeDot.stats).toEqual(result.stats)
+    expect(threeDot.patches).toEqual(result.patches)
   })
 
   test("expands a gitlink nested inside an added gitlink", () => {
@@ -308,6 +316,7 @@ describe("superDiff", () => {
     })
     expect(result.consultedRepositories.map(({ path }) => path)).toEqual(["."])
     expect(result.stats?.[0]?.files.map(({ path }) => path)).toEqual([".gitmodules", "root.ts"])
+    expect(superDiff({ repo: product, refs: [base + "...HEAD"], stat: true })).toEqual(result)
     for (const json of [false, true]) {
       const stdout = outputSink()
       const stderr = outputSink()
@@ -789,6 +798,7 @@ describe("superDiff --component-base (29363: published component changes are not
       expect(await runCli(["--repo", fixture.product, "diff", "--stat", ...refs], stdout, stderr)).toBe(0)
       if (mode === "at-target") {
         expect(stdout.output).toMatch(/== vendor\/beta[^\n]*already in origin\/main[^\n]*==/u)
+        expect(stdout.output).toMatch(/vendor\/beta: pointer[^\n]*already in origin\/main/u)
       } else {
         expect(stdout.output).not.toContain("already in origin/main")
         expect(stdout.output).toContain("authored-beta.ts")
@@ -799,6 +809,9 @@ describe("superDiff --component-base (29363: published component changes are not
         0,
       )
       expect(names.output).toBe(native.paths.map((path) => path + "\0").join(""))
+      const patch = outputSink()
+      expect(await runCli(["--repo", fixture.product, "diff", "--patch", ...refs], patch, outputSink())).toBe(0)
+      if (mode === "at-target") expect(patch.output).toMatch(/== vendor\/beta[^\n]*already in origin\/main[^\n]*==/u)
     },
   )
 
@@ -905,56 +918,140 @@ describe("superDiff --component-base (29363: published component changes are not
     expect(composed.consultedRepositories.find(({ path }) => path === "vendor/gamma")?.from).toBe(EMPTY_TREE)
   })
 
-  test("a nested gitlink is measured from the pin the parent's PUBLISHED tree records, not from the parent's fork-point tree", () => {
-    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-diff-component-base-nested-"))
-    roots.push(fixtureRoot)
-    // Fork point: alpha carries the leaf at leafBase. Published: the leaf bumps, alpha pins it, the product lands it.
-    const nested = addNestedAlphaSubmodule(createProductFixture(fixtureRoot))
-    const forkPoint = nested.productWithNestedBase
-    const alphaCheckout = join(nested.product, "packages/alpha")
-    const leafCheckout = join(alphaCheckout, "apps/maddoc")
-    const alphaAtFork = git(nested.product, "rev-parse", `${forkPoint}:packages/alpha`)
-    const publishedMain = bumpNestedAlphaSubmodule(nested)
-    git(nested.product, "update-ref", "refs/remotes/origin/main", publishedMain)
-    const alphaPublished = git(nested.product, "rev-parse", "origin/main:packages/alpha")
-    const leafPublished = git(alphaCheckout, "rev-parse", `${alphaPublished}:apps/maddoc`)
-    // The branch: alpha authored on top of its FORK pin (not composed), but its leaf authored on top of the
-    // PUBLISHED leaf. Only the parent's published tree says the leaf's published bump is not the author's.
-    git(nested.product, "checkout", "-q", "-b", "task", forkPoint)
-    git(alphaCheckout, "checkout", "-q", alphaAtFork)
-    const leafAuthored = advanceRepository(leafCheckout, "authored-leaf.ts", "export const authoredLeaf = 1\n")
-    writeFileSync(join(alphaCheckout, "authored-alpha.ts"), "export const authoredAlpha = 1\n")
-    git(alphaCheckout, "add", "authored-alpha.ts", "apps/maddoc")
-    git(alphaCheckout, "commit", "-q", "-m", "authored alpha change, leaf composed onto its published main")
-    const alphaAuthored = git(alphaCheckout, "rev-parse", "HEAD")
-    writeFileSync(join(nested.product, "authored.ts"), "export const authored = 1\n")
-    git(nested.product, "add", "authored.ts", "packages/alpha")
-    git(nested.product, "commit", "-q", "-m", "authored root change")
-    const head = git(nested.product, "rev-parse", "HEAD")
+  test.each(["authored", "at-target", "unavailable"] as const)(
+    "a nested gitlink uses the target parent's recorded pin: %s (30108)",
+    async (mode) => {
+      const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-diff-component-base-nested-"))
+      roots.push(fixtureRoot)
+      // Fork point: alpha carries the leaf at leafBase. Published: the leaf bumps, alpha pins it, the product lands it.
+      const nested = addNestedAlphaSubmodule(createProductFixture(fixtureRoot))
+      const forkPoint = nested.productWithNestedBase
+      const alphaCheckout = join(nested.product, "packages/alpha")
+      const leafCheckout = join(alphaCheckout, "apps/maddoc")
+      const alphaAtFork = git(nested.product, "rev-parse", `${forkPoint}:packages/alpha`)
+      const publishedMain = bumpNestedAlphaSubmodule(nested)
+      git(nested.product, "update-ref", "refs/remotes/origin/main", publishedMain)
+      const alphaPublished = git(nested.product, "rev-parse", "origin/main:packages/alpha")
+      const leafPublished = git(alphaCheckout, "rev-parse", `${alphaPublished}:apps/maddoc`)
+      // The branch: alpha authored on top of its FORK pin (not composed), but its leaf authored on top of the
+      // PUBLISHED leaf. Only the parent's published tree says the leaf's published bump is not the author's.
+      git(nested.product, "checkout", "-q", "-b", "task", forkPoint)
+      git(alphaCheckout, "checkout", "-q", alphaAtFork)
+      const leafAuthored =
+        mode === "authored"
+          ? advanceRepository(leafCheckout, "authored-leaf.ts", "export const authoredLeaf = 1\n")
+          : leafPublished
+      writeFileSync(join(alphaCheckout, "authored-alpha.ts"), "export const authoredAlpha = 1\n")
+      git(alphaCheckout, "add", "authored-alpha.ts", "apps/maddoc")
+      git(alphaCheckout, "commit", "-q", "-m", "authored alpha change, leaf composed onto its published main")
+      const alphaAuthored = git(alphaCheckout, "rev-parse", "HEAD")
+      writeFileSync(join(nested.product, "authored.ts"), "export const authored = 1\n")
+      git(nested.product, "add", "authored.ts", "packages/alpha")
+      git(nested.product, "commit", "-q", "-m", "authored root change")
+      const head = git(nested.product, "rev-parse", "HEAD")
 
-    const composed = superDiff({
-      repo: nested.product,
-      refs: [`${forkPoint}..${head}`],
-      componentBase: "origin/main",
-    })
-    expect(composed.paths).toEqual([
-      "authored.ts",
-      "packages/alpha/apps/maddoc/authored-leaf.ts",
-      "packages/alpha/authored-alpha.ts",
-    ])
-    expect(composed.consultedRepositories.find(({ path }) => path === "packages/alpha")).toMatchObject({
-      from: alphaAtFork,
-      to: alphaAuthored,
-    })
-    expect(composed.consultedRepositories.find(({ path }) => path === "packages/alpha/apps/maddoc")).toMatchObject({
-      from: leafPublished,
-      to: leafAuthored,
-    })
-    // The control: from the fork-point tree the leaf's published bump (leaf.ts) reads as the author's.
-    expect(superDiff({ repo: nested.product, refs: [`${forkPoint}..${head}`] }).paths).toContain(
-      "packages/alpha/apps/maddoc/leaf.ts",
-    )
-  })
+      const composed = superDiff({
+        repo: nested.product,
+        refs: [`${forkPoint}..${head}`],
+        componentBase: "origin/main",
+      })
+      expect(composed.paths).toEqual([
+        "authored.ts",
+        ...(mode === "authored" ? ["packages/alpha/apps/maddoc/authored-leaf.ts"] : []),
+        "packages/alpha/authored-alpha.ts",
+      ])
+      expect(composed.consultedRepositories.find(({ path }) => path === "packages/alpha")).toMatchObject({
+        from: alphaAtFork,
+        to: alphaAuthored,
+      })
+      expect(composed.consultedRepositories.find(({ path }) => path === "packages/alpha/apps/maddoc")).toMatchObject({
+        from: leafPublished,
+        to: leafAuthored,
+      })
+      // The control: from the fork-point tree the leaf's published bump (leaf.ts) reads as the author's.
+      expect(superDiff({ repo: nested.product, refs: [`${forkPoint}..${head}`] }).paths).toContain(
+        "packages/alpha/apps/maddoc/leaf.ts",
+      )
+
+      // A component's own origin/main is deliberately stale; only the root target's parent pin is authoritative.
+      git(leafCheckout, "update-ref", "refs/remotes/origin/main", git(leafCheckout, "rev-parse", leafPublished + "^"))
+      const native = superDiff({ repo: nested.product, refs: [forkPoint + ".." + head], stat: true, patch: true })
+      const original = childProcess.spawnSync
+      const spy =
+        mode === "unavailable"
+          ? vi.spyOn(childProcess, "spawnSync").mockImplementation((command, args, options) => {
+              if (
+                Array.isArray(args) &&
+                args[1] === nested.product &&
+                args[2] === "ls-tree" &&
+                args[4] === publishedMain
+              ) {
+                // Fail only the extra target-tree read through native Git; every native comparison still runs unchanged.
+                return original(
+                  command,
+                  args.map((arg, index) => (index === 4 ? "refs/heads/missing-comparison-target" : arg)),
+                  options,
+                )
+              }
+              return original(command, args, options)
+            })
+          : undefined
+      if (spy !== undefined) syncBuiltinESMExports()
+      try {
+        const refs = ["origin/main..." + head]
+        const actual = superDiff({ repo: nested.product, refs, stat: true, patch: true })
+        expect(actual.paths).toEqual(native.paths)
+        expect(actual.deletedPaths).toEqual(native.deletedPaths)
+        expect(actual.stats).toEqual(native.stats)
+        expect(actual.patches).toEqual(native.patches)
+        expect(actual.notCompared).toEqual([])
+        const parent = actual.consultedRepositories.find(({ path }) => path === "packages/alpha")
+        const leaf = actual.consultedRepositories.find(({ path }) => path === "packages/alpha/apps/maddoc")
+        if (mode === "unavailable") {
+          expect(
+            spy?.mock.calls.filter(
+              ([, args]) => Array.isArray(args) && args[1] === nested.product && args.includes("origin/main^{commit}"),
+            ),
+          ).toHaveLength(1)
+          for (const entry of [parent, leaf]) {
+            expect(entry).toMatchObject({
+              targetComparison: {
+                kind: "unavailable",
+                target: "origin/main",
+                commit: publishedMain,
+                error: expect.stringContaining("missing-comparison-target"),
+              },
+            })
+          }
+          expect(
+            spy?.mock.calls.some(
+              ([, args]) => Array.isArray(args) && args[1] === alphaCheckout && args[2] === "ls-tree",
+            ),
+          ).toBe(false)
+        } else {
+          expect(parent).not.toHaveProperty("targetComparison")
+          if (mode === "at-target") {
+            expect(leaf).toMatchObject({
+              targetComparison: { kind: "at-target", target: "origin/main", commit: publishedMain },
+            })
+          } else expect(leaf).not.toHaveProperty("targetComparison")
+        }
+        const stdout = outputSink()
+        const stderr = outputSink()
+        expect(await runCli(["--repo", nested.product, "--json", "diff", ...refs], stdout, stderr)).toBe(0)
+        const json = JSON.parse(stdout.output) as SuperDiffResult
+        expect(json.consultedRepositories).toEqual(actual.consultedRepositories)
+        if (mode === "unavailable") {
+          expect(stderr.output).toContain("packages/alpha")
+          expect(stderr.output).toContain("origin/main")
+          expect(stderr.output).toContain("missing-comparison-target")
+        }
+      } finally {
+        spy?.mockRestore()
+        if (spy !== undefined) syncBuiltinESMExports()
+      }
+    },
+  )
 
   test("a published pin the component checkout cannot read refuses with exit 2 and a remedy naming that pin", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-diff-component-base-unreadable-"))

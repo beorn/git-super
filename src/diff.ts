@@ -1,4 +1,4 @@
-import { driveSync, diffTraversal, rangeTraversal, commonDiffArgs } from "./status-traversal.ts"
+import { driveSync, diffTraversal, rangeTraversal, targetTraversal, commonDiffArgs } from "./status-traversal.ts"
 import { repositoryRoot, runGit, validateExcludedSubmodules } from "./git.ts"
 
 export type ConsultedRepository = Readonly<{
@@ -12,6 +12,10 @@ export type ConsultedRepository = Readonly<{
    */
   from?: string
   to?: string
+  /** Equality with an explicit three-dot target's recorded pin; no claim about who made the change. */
+  targetComparison?: Readonly<
+    { target: string; commit: string } & ({ kind: "at-target" } | { kind: "unavailable"; error: string })
+  >
 }>
 
 export type SuperDiffOptions = Readonly<{
@@ -112,6 +116,7 @@ type RecursiveNameStatusOptions = Readonly<{
   consulted: ConsultedRepository
   /** See {@link SuperDiffOptions.componentBase}; at a nested level it is the parent component's recorded pin. */
   componentBase?: string
+  targetContext?: Readonly<{ target: string; commit: string } & ({ ref: string } | { error: string })>
 }>
 
 /**
@@ -329,6 +334,7 @@ export function superDiff(options: SuperDiffOptions): SuperDiffResult {
   const root = repositoryRoot(options.repo)
   validateComponentBaseForm(root, options)
   const consulted = { path: ".", root } as const
+  const targetContext = driveSync(targetTraversal(root, options))
   const shared = {
     repo: root,
     ...(options.excludedSubmodules === undefined ? {} : { excludedSubmodules: options.excludedSubmodules }),
@@ -339,6 +345,7 @@ export function superDiff(options: SuperDiffOptions): SuperDiffResult {
   } as const
   const changed = recursiveNameStatusDiff({
     ...shared,
+    ...(targetContext === undefined ? {} : { targetContext }),
     ...(options.diffFilter === undefined ? {} : { diffFilter: options.diffFilter }),
     consulted,
   })

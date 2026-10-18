@@ -163,13 +163,19 @@ type RecursiveNameStatusOptions = Readonly<{
   consulted: ConsultedRepository
   /** See {@link SuperDiffOptions.componentBase}; at a nested level it is the parent component's recorded pin. */
   componentBase?: string
+  targetContext?: Readonly<{ target: string; commit: string } & ({ ref: string } | { error: string })>
 }>
 
-function* recordedGitlink(root: string, ref: string, path: string): Traversal<string | undefined> {
+function* recordedGitlink(
+  root: string,
+  ref: string,
+  path: string,
+  purpose = "--component-base",
+): Traversal<string | undefined> {
   const result = yield* queryGit(root, ["ls-tree", "-z", ref, "--", path])
   if (result.status !== 0) {
     throw new Error(
-      `git super: --component-base ${ref} does not resolve in ${root}: ${result.stderr.trim() || `git ls-tree exited ${result.status}`}`,
+      `git super: ${purpose} ${ref} does not resolve in ${root}: ${result.stderr.trim() || `git ls-tree exited ${result.status}`}`,
     )
   }
   const row = result.stdout.split("\0").find((line) => line.length > 0)
@@ -315,6 +321,28 @@ export function* diffTraversal(options: RecursiveNameStatusOptions): Traversal<R
     const isDirtySubmodule = move.oldPin === move.newPin
     const nestedPrefix = prefixPath(options.prefix, move.path)
     const nestedRoot = yield* initializedCheckout(root, move, nestedPrefix, gitlink.oldPin === ZERO_OID)
+    let targetComparison: ConsultedRepository["targetComparison"]
+    let nestedTarget: RecursiveNameStatusOptions["targetContext"]
+    const target = options.targetContext
+    if (target !== undefined) {
+      const identity = { target: target.target, commit: target.commit }
+      if ("error" in target) {
+        targetComparison = { ...identity, kind: "unavailable", error: target.error }
+        nestedTarget = target
+      } else {
+        try {
+          const recordedTarget = yield* recordedGitlink(root, target.ref, move.path, "comparison target")
+          if (recordedTarget !== undefined) {
+            nestedTarget = { ...identity, ref: recordedTarget }
+            if (move.newPin === recordedTarget) targetComparison = { ...identity, kind: "at-target" }
+          }
+        } catch (error) {
+          const cause = error instanceof Error ? error.message : String(error)
+          targetComparison = { ...identity, kind: "unavailable", error: cause }
+          nestedTarget = { ...identity, error: cause }
+        }
+      }
+    }
     // 29363: a composed base replaces the range's old endpoint with the pin the base ref records for this
     // component; a working-tree comparison (old == new) has no range to rebase.
     const recorded =
@@ -373,6 +401,7 @@ export function* diffTraversal(options: RecursiveNameStatusOptions): Traversal<R
       repo: nestedRoot,
       ...(options.excludedSubmodules === undefined ? {} : { excludedSubmodules: options.excludedSubmodules }),
       prefix: nestedPrefix,
+      ...(nestedTarget === undefined ? {} : { targetContext: nestedTarget }),
       ...(recorded === undefined ? {} : { componentBase: recorded }),
       ...(isDirtySubmodule
         ? {
@@ -381,6 +410,7 @@ export function* diffTraversal(options: RecursiveNameStatusOptions): Traversal<R
             consulted: {
               path: nestedPrefix,
               root: nestedRoot,
+              ...(targetComparison === undefined ? {} : { targetComparison }),
               from: move.oldPin,
             },
           }
@@ -390,6 +420,7 @@ export function* diffTraversal(options: RecursiveNameStatusOptions): Traversal<R
             consulted: {
               path: nestedPrefix,
               root: nestedRoot,
+              ...(targetComparison === undefined ? {} : { targetComparison }),
               from,
               to: move.newPin,
             },
@@ -413,25 +444,50 @@ function* composedFrom(nestedRoot: string, path: string, recorded: string, newPi
   return result.stdout.trim()
 }
 
-export function* rangeTraversal(
-  root: string,
-  options: SuperDiffOptions,
-): Traversal<Readonly<{ from: string; to: string }> | undefined> {
+function rangeRefs(options: SuperDiffOptions): Readonly<{ from: string; to: string; symmetric: boolean }> | undefined {
   const refs = options.refs ?? []
   if (refs.length === 2) {
     const [from, to] = refs
-    if (from !== undefined && to !== undefined) return { from, to }
+    if (from !== undefined && to !== undefined) return { from, to, symmetric: false }
   }
   const single = refs.length === 1 ? refs[0] : undefined
   if (single === undefined) return undefined
   const symmetric = /^(.+?)\.{3}(.+)$/u.exec(single)
   if (symmetric?.[1] !== undefined && symmetric[2] !== undefined) {
     const [, left, right] = symmetric
-    return { from: (yield* gitText(root, ["merge-base", left, right])).trim(), to: right }
+    return { from: left, to: right, symmetric: true }
   }
   const twoDot = /^(.+?)\.{2}(.+)$/u.exec(single)
-  if (twoDot?.[1] !== undefined && twoDot[2] !== undefined) return { from: twoDot[1], to: twoDot[2] }
+  if (twoDot?.[1] !== undefined && twoDot[2] !== undefined) {
+    return { from: twoDot[1], to: twoDot[2], symmetric: false }
+  }
   return undefined
+}
+
+export function* rangeTraversal(
+  root: string,
+  options: SuperDiffOptions,
+): Traversal<Readonly<{ from: string; to: string }> | undefined> {
+  const selected = rangeRefs(options)
+  if (selected === undefined) return undefined
+  return {
+    from: selected.symmetric
+      ? (yield* gitText(root, ["merge-base", selected.from, selected.to])).trim()
+      : selected.from,
+    to: selected.to,
+  }
+}
+
+/** Resolve the target once; child comparisons carry the pin its parent tree records. */
+export function* targetTraversal(
+  root: string,
+  options: SuperDiffOptions,
+): Traversal<RecursiveNameStatusOptions["targetContext"]> {
+  if (options.cached === true) return undefined
+  const selected = rangeRefs(options)
+  if (selected?.symmetric !== true) return undefined
+  const commit = (yield* gitText(root, ["rev-parse", "--verify", selected.from + "^{commit}"])).trim()
+  return { target: selected.from, commit, ref: commit }
 }
 
 function* headGitlinks(root: string): Traversal<Map<string, string>> {
