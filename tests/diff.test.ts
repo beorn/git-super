@@ -742,6 +742,67 @@ function createPublishedComponentFixture(fixtureRoot: string): PublishedComponen
 
 describe("superDiff --component-base (29363: published component changes are not the author's)", () => {
   /**
+   * @failure A native three-dot component delta already at the selected target reads as branch-authored scope.
+   * @level l1
+   * @consumer 30108 CLI scope review and public ConsultedRepository target comparison
+   * @testonly none
+   */
+  test.each(["at-target", "authored"] as const)(
+    "three-dot scope distinguishes a component %s without changing native products (30108)",
+    async (mode) => {
+      const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-three-dot-target-"))
+      roots.push(fixtureRoot)
+      const fixture = createPublishedComponentFixture(fixtureRoot)
+      if (mode === "authored") {
+        advanceRepository(join(fixture.product, "vendor/beta"), "authored-beta.ts", "export const authored = 1\n")
+      }
+      writeFileSync(join(fixture.product, "authored.ts"), "export const authored = 1\n")
+      git(fixture.product, "add", "authored.ts", "vendor/beta")
+      git(fixture.product, "commit", "-q", "-m", "root work with composed beta")
+      const head = git(fixture.product, "rev-parse", "HEAD")
+      const refs = ["origin/main..." + head]
+      const actual = superDiff({ repo: fixture.product, refs, stat: true, patch: true })
+      const native = superDiff({
+        repo: fixture.product,
+        refs: [fixture.productBase + ".." + head],
+        stat: true,
+        patch: true,
+      })
+      expect(actual.paths).toEqual(native.paths)
+      expect(actual.deletedPaths).toEqual(native.deletedPaths)
+      expect(actual.stats).toEqual(native.stats)
+      expect(actual.patches).toEqual(native.patches)
+      expect(Object.keys(actual.stats?.[0]?.range ?? {}).sort()).toEqual(["from", "to"])
+      expect(actual.notCompared).toEqual([])
+      const beta = actual.consultedRepositories.find(({ path }) => path === "vendor/beta")
+      if (mode === "at-target") {
+        expect(beta).toMatchObject({
+          targetComparison: { kind: "at-target", target: "origin/main", commit: fixture.publishedMain },
+        })
+      } else {
+        expect(actual.paths).toContain("vendor/beta/authored-beta.ts")
+        expect(beta).not.toHaveProperty("targetComparison")
+      }
+
+      const stdout = outputSink()
+      const stderr = outputSink()
+      expect(await runCli(["--repo", fixture.product, "diff", "--stat", ...refs], stdout, stderr)).toBe(0)
+      if (mode === "at-target") {
+        expect(stdout.output).toMatch(/== vendor\/beta[^\n]*already in origin\/main[^\n]*==/u)
+      } else {
+        expect(stdout.output).not.toContain("already in origin/main")
+        expect(stdout.output).toContain("authored-beta.ts")
+      }
+
+      const names = outputSink()
+      expect(await runCli(["--repo", fixture.product, "diff", "--name-only", "-z", ...refs], names, outputSink())).toBe(
+        0,
+      )
+      expect(names.output).toBe(native.paths.map((path) => path + "\0").join(""))
+    },
+  )
+
+  /**
    * @failure The scoped fix measures a moved gitlink from the branch's fork-point pin, so the published component
    * commits composition pulled under the branch select their suites as if authored (10 files reached 74 suites, 8 min).
    * @level l1
