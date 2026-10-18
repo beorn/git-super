@@ -1523,6 +1523,8 @@ describe("git super merge", () => {
     expect(result.detail?.remedy).toContain("at the moment you act")
     expect(result.detail?.remedy).toContain("needs no separate approval")
     expect(result.detail?.remedy).toContain("no force, no rebase, no write to")
+    expect(result.detail?.remedy).toContain("nothing deleted")
+    expect(result.detail?.remedy).toContain("If any of those properties does not hold, ask for approval before you act")
     expect(git(fixture.product, "rev-parse", "HEAD")).toBe(before)
     expect(git(fixture.alpha, "rev-parse", "main")).toBe(main)
   })

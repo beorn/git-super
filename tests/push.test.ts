@@ -3201,6 +3201,11 @@ describe("a frozen push works only on the children its merge moved (25303, obser
         "resultDetail.remedy",
         expect.stringContaining("no force, no rebase, no write to"),
       )
+      await expect(capture).rejects.toHaveProperty("resultDetail.remedy", expect.stringContaining("nothing deleted"))
+      await expect(capture).rejects.toHaveProperty(
+        "resultDetail.remedy",
+        expect.stringContaining("If any of those properties does not hold, ask for approval before you act"),
+      )
       expect(calls.filter(isObservation).length).toBeGreaterThan(0)
     },
   )
