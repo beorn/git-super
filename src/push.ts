@@ -1252,14 +1252,24 @@ async function frozenChildUpdates(
   updates: RefUpdate[] | undefined
   retention: RefUpdate[]
   publications: RefUpdate[]
+  handledSources: Set<string>
 }> {
   const updates: RefUpdate[] = []
   const retention: RefUpdate[] = []
   const publications: RefUpdate[] = []
+  const handledSources = new Set<string>()
   const direct = new Set(rootUpdates.map((update) => update.source).filter((source) => source !== ""))
-  if (direct.size === 0) return { updates: undefined, retention, publications }
+  if (direct.size === 0) return { updates: undefined, retention, publications, handledSources }
+  const destinations = new Set(rootUpdates.filter((update) => update.source !== "").map((update) => update.destination))
   const advertisement = await readAdvertisement(git, root, remote)
-  const advertised = await advertisedTips(git, root, remote, advertisement)
+  // Only branch history and exact selected destinations bound this request. Auxiliary
+  // refs can move independently; fewer exclusion baselines only discover more work.
+  const advertised = await advertisedTips(
+    git,
+    root,
+    remote,
+    advertisement.filter((row) => row.ref.startsWith("refs/heads/") || destinations.has(row.ref)),
+  )
   // WORK IS PROPORTIONAL TO THE CHANGE (25303). What the remote's root already
   // records at a destination this push moves was published by the push that
   // put it there, so only the gitlinks a merge moves past that are retained or
@@ -1268,10 +1278,14 @@ async function frozenChildUpdates(
   // unchanged child's main moving elsewhere could stop the line for a change
   // that never touched it. A destination the remote lacks has no base, so
   // every gitlink counts as changed there.
-  const destinations = new Set(rootUpdates.filter((update) => update.source !== "").map((update) => update.destination))
   const bases: CommitGitlink[][] = []
+  const mainBases: CommitGitlink[][] = []
   for (const row of advertisement) {
-    if (destinations.has(row.ref)) bases.push(await readCommitGitlinks(git, root, row.oid))
+    if (destinations.has(row.ref)) {
+      const base = await readCommitGitlinks(git, root, row.oid)
+      bases.push(base)
+      if (row.ref === "refs/heads/main") mainBases.push(base)
+    }
   }
   const reachable = await required(
     git,
@@ -1289,7 +1303,18 @@ async function frozenChildUpdates(
     if (!sameHostedRepository(intent.rootRemote, actualRemote)) {
       throw new Error(`Merge ${source} freezes root remote ${intent.rootRemote}, but this push selects ${actualRemote}`)
     }
-    if (direct.has(source)) found = true
+    if (direct.has(source)) {
+      found = true
+      handledSources.add(source)
+    }
+    let publishesMain = false
+    for (const update of rootUpdates) {
+      if (update.destination !== "refs/heads/main" || update.source === "") continue
+      const args = ["merge-base", "--is-ancestor", source, update.source]
+      const contains = await git.run({ repo: root, args })
+      if (ancestryAnswerYes(contains)) publishesMain = true
+      else if (!ancestryAnswerNo(contains)) throw operationError(root, args, "bind-frozen-root-destination", contains)
+    }
     const selected = await collectCommitRequirements(git, root, [source], undefined, intent)
     retention.push(...selected.flatMap((requirement) => requirement.retention ?? []))
     const moved = await readCommitGitlinks(git, root, source)
@@ -1299,12 +1324,17 @@ async function frozenChildUpdates(
       const against = await changedRowPaths(git, base, moved, selected)
       changed = new Set([...changed].filter((path) => against.has(path)))
     }
+    let mainChanged = new Set(selected.map((requirement) => requirement.path))
+    for (const base of mainBases) {
+      const against = await changedRowPaths(git, base, moved, selected)
+      mainChanged = new Set([...mainChanged].filter((path) => against.has(path)))
+    }
     for (const row of intent.children) {
       const requirement = selected.find((entry) => entry.path === row.path && entry.target === row.pin)
       if (requirement === undefined) {
         throw new Error(`Frozen child ${row.path}@${row.pin} is not selected by merge ${source}`)
       }
-      if (!changed.has(row.path)) continue
+      if (!changed.has(row.path) && !(publishesMain && mainChanged.has(row.path))) continue
       if (sameHostedOwner(intent.rootRemote, row.remote)) {
         for (const pin of new Set([row.pin, ...(row.publication === undefined ? [] : [row.publication.source])])) {
           retention.push({
@@ -1335,6 +1365,9 @@ async function frozenChildUpdates(
       if (!ancestryAnswerYes(contains)) {
         throw operationError(requirement.repository, args, "bind-frozen-publication", contains)
       }
+      // A captured future publication is not authority for a task/record push.
+      // Keep source custody, but select branch leases only for the requiring main.
+      if (!publishesMain || !mainChanged.has(row.path)) continue
       const update = { repository: requirement.repository, remote: row.remote, ...row.publication }
       publications.push(update)
       if (direct.has(source)) updates.push(update)
@@ -1345,7 +1378,7 @@ async function frozenChildUpdates(
       }
     }
   }
-  return { updates: found ? updates : undefined, retention, publications }
+  return { updates: found ? updates : undefined, retention, publications, handledSources }
 }
 
 async function verifyRetainedSource(git: GitProcess, update: RefUpdate): Promise<void> {
@@ -2684,10 +2717,10 @@ export async function superPush(options: SuperPushOptions): Promise<GitSuperResu
     const frozen = await frozenChildUpdates(git, root, remote, rootUpdates)
     progress.phase("scan-frozen-history 1/1")
     const childUpdates: RefUpdate[] = frozen.updates ?? []
-    if (frozen.updates === undefined) {
+    {
       const requirementDestinations = new Map<string, { requirement: CommitRequirement; destinations: Set<string> }>()
       for (const update of rootUpdates) {
-        if (update.source === "") continue
+        if (update.source === "" || frozen.handledSources.has(update.source)) continue
         const reqs = await collectCommitRequirements(git, root, [update.source])
         for (const req of reqs) {
           const key = `${req.repository}\0${req.target}\0${req.entry.name}\0${req.entry.branch ?? ""}`

@@ -1913,39 +1913,46 @@ describe("explicit recursive push mechanics", () => {
    * @level l2
    * @consumer superPush on-demand task preservation with a frozen merge capsule
    */
-  test.each([false, true])("frozen task preservation leaves child mains unchanged with unrelated main moved=%s (30071)", async (moveOther) => {
-    const shape = twoChildFrozenMerge(`task-preserve-${moveOther}`)
-    let otherMain = shape.before.other
-    const taskRef = "refs/heads/task/preservation"
-    const local = createLocalGitProcess()
-    let observedRoot = false
-    const racing: GitProcess = {
-      async run(request) {
-        const result = await local.run(request)
-        if (moveOther && !observedRoot && request.repo === shape.root && request.args[0] === "ls-remote") {
-          observedRoot = true
-          otherMain = shape.moveMain("other")
-        }
-        return result
-      },
-    }
+  test.each([
+    { moveOther: false, includeMain: false },
+    { moveOther: true, includeMain: false },
+    { moveOther: false, includeMain: true },
+  ])(
+    "frozen task preservation leaves child mains unchanged, moved=$moveOther mixed=$includeMain (30071)",
+    async ({ moveOther, includeMain }) => {
+      const shape = twoChildFrozenMerge(`task-preserve-${moveOther}-${includeMain}`)
+      let otherMain = shape.before.other
+      const taskRef = "refs/heads/task/preservation"
+      const local = createLocalGitProcess()
+      let observedRoot = false
+      const racing: GitProcess = {
+        async run(request) {
+          const result = await local.run(request)
+          if (moveOther && !observedRoot && request.repo === shape.root && request.args[0] === "ls-remote") {
+            observedRoot = true
+            otherMain = shape.moveMain("other")
+          }
+          return result
+        },
+      }
 
-    const result = await superPush({
-      repo: shape.root,
-      remote: "origin",
-      refspecs: [`${shape.merge}:${taskRef}`],
-      recurseSubmodules: "on-demand",
-      git: racing,
-    })
+      const result = await superPush({
+        repo: shape.root,
+        remote: "origin",
+        refspecs: [`${shape.merge}:${taskRef}`, ...(includeMain ? [`${shape.rootBefore}:refs/heads/main`] : [])],
+        recurseSubmodules: "on-demand",
+        git: racing,
+      })
 
-    expect(result, JSON.stringify(result)).toMatchObject({ state: "updated", partial: false })
-    if (moveOther) expect(observedRoot).toBe(true)
-    expect(git(shape.remotes.child, "rev-parse", "refs/heads/main")).toBe(shape.before.child)
-    expect(git(shape.remotes.other, "rev-parse", "refs/heads/main")).toBe(otherMain)
-    expect(git(shape.remotes.child, "rev-parse", `refs/git-super/pins/${shape.childSource}`)).toBe(shape.childSource)
-    expect(git(shape.remotes.root, "rev-parse", "refs/heads/main")).toBe(shape.rootBefore)
-    expect(git(shape.remotes.root, "rev-parse", taskRef)).toBe(shape.merge)
-  })
+      expect(result, JSON.stringify(result)).toMatchObject({ state: "updated", partial: false })
+      if (moveOther) expect(observedRoot).toBe(true)
+      expect(git(shape.remotes.child, "rev-parse", "refs/heads/main")).toBe(shape.before.child)
+      expect(git(shape.remotes.other, "rev-parse", "refs/heads/main")).toBe(otherMain)
+      expect(git(shape.remotes.child, "rev-parse", `refs/git-super/pins/${shape.childSource}`)).toBe(shape.childSource)
+      expect(git(shape.remotes.root, "rev-parse", "refs/heads/main")).toBe(shape.rootBefore)
+      expect(git(shape.remotes.root, "rev-parse", taskRef)).toBe(shape.merge)
+    },
+  )
 
   /**
    * 26853: preservation is a task-branch on-demand push. An unrelated
@@ -1968,12 +1975,15 @@ describe("explicit recursive push mechanics", () => {
     const local = createLocalGitProcess()
     let advanced = false
     const racing: GitProcess = {
-      run(request) {
-        if (!advanced && request.args[0] === "fetch" && request.args.includes("refs/yrd/main/runner")) {
+      async run(request) {
+        const result = await local.run(request)
+        // Move during planning even when the planner correctly never fetches
+        // the auxiliary ref; fetching that ref is not part of this contract.
+        if (!advanced && request.repo === fixture.root && request.args[0] === "ls-remote") {
           advanced = true
           git(fixture.rootRemote, "update-ref", "refs/yrd/main/runner", movedRunner)
         }
-        return local.run(request)
+        return result
       },
     }
 
@@ -2817,7 +2827,9 @@ describe("a frozen push works only on the children its merge moved (25303, obser
     name: string,
     ref: string,
     mode: "check" | "on-demand" = "check",
-  ): Promise<Readonly<{ checked: Awaited<ReturnType<typeof superPush>>; fetched: readonly string[]; advanced: boolean }>> {
+  ): Promise<
+    Readonly<{ checked: Awaited<ReturnType<typeof superPush>>; fetched: readonly string[]; advanced: boolean }>
+  > {
     const { fixture, repository, remote, source } = pushFixture(name)
     // A file:// URL, so the fetch is the precise smart transport a real remote gives: fetching one ref
     // does not sweep in objects reachable from no requested ref, which a plain local path may do.
