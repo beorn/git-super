@@ -301,6 +301,28 @@ describe("Phase 1 read commands", () => {
     }
   })
 
+  test("branch --repo --list delegates to native Git and branch retire stays owned", async () => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-branch-list-"))
+    roots.push(root)
+    const repo = join(root, "repo")
+    createRepository(repo, "README", "listed\n")
+    const helpOut = outputSink()
+    const helpErr = outputSink()
+    expect(await runCli(["branch", "--help"], helpOut, helpErr)).toBe(0)
+    expect(helpOut.output).toContain("delegates to native Git")
+    expect(helpErr.output).toBe("")
+    const stdout = outputSink()
+    const stderr = outputSink()
+    expect(
+      await runCli(["--repo", repo, "branch", "--list", "--format=%(refname:short)"], stdout, stderr),
+    ).toBe(0)
+    expect(stderr.output).toBe("")
+    expect(stdout.output.split("\n").map((line) => line.trim())).toContain("main")
+    const retireErr = outputSink()
+    expect(await runCli(["--repo", repo, "branch", "retire"], outputSink(), retireErr)).not.toBe(0)
+    expect(retireErr.output).toContain("required option '--tip <commit>'")
+  })
+
   test("status prefixes tracked and untracked changes inside every checked-out submodule", () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-status-"))
     roots.push(fixtureRoot)

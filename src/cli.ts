@@ -418,6 +418,26 @@ export async function runCli(
   return code
 }
 
+/** `--repo <path> branch <unowned>` is the help's native delegation, not a git-super option. */
+function delegatedBranchArgs(argv: readonly string[]): readonly string[] | undefined {
+  let repo: string | undefined
+  let index = 0
+  if (argv[0] === "--repo") {
+    if (argv[1] === undefined) return undefined
+    repo = argv[1]
+    index = 2
+  } else if (argv[0]?.startsWith("--repo=") === true) {
+    repo = argv[0].slice("--repo=".length)
+    if (repo.length === 0) return undefined
+    index = 1
+  } else {
+    return undefined
+  }
+  if (argv[index] !== "branch") return undefined
+  if (OWNED_BRANCH_SUBCOMMANDS.has(argv[index + 1] ?? "")) return undefined
+  return ["-C", repo, ...argv.slice(index)]
+}
+
 async function runInvocation(
   argv: readonly string[],
   stdout: OutputSink,
@@ -435,6 +455,12 @@ async function runInvocation(
   }
   let delegated = false
   try {
+    const nativeBranch = delegatedBranchArgs(argv)
+    if (nativeBranch !== undefined) {
+      delegated = true
+      await protocol?.close()
+      return await delegateNativeGit(nativeBranch, stdout, stderr, replaceProcess)
+    }
     const enriched = await enrichedInvocation(argv)
     // execve on the executable path leaves native Git owning the PID, byte
     // streams and cancellation. In-process callers retain their process owner.
