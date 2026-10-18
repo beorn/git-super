@@ -1914,14 +1914,32 @@ describe("explicit recursive push mechanics", () => {
    * @consumer superPush on-demand task preservation with a frozen merge capsule
    */
   test.each([
-    { moveOther: false, includeMain: false },
-    { moveOther: true, includeMain: false },
-    { moveOther: false, includeMain: true },
+    { moveOther: false, includeMain: false, publishOther: false },
+    { moveOther: true, includeMain: false, publishOther: false },
+    { moveOther: false, includeMain: true, publishOther: false },
+    { moveOther: false, includeMain: true, publishOther: true },
   ])(
-    "frozen task preservation leaves child mains unchanged, moved=$moveOther mixed=$includeMain (30071)",
-    async ({ moveOther, includeMain }) => {
-      const shape = twoChildFrozenMerge(`task-preserve-${moveOther}-${includeMain}`)
+    "frozen task child stays isolated, moved=$moveOther mixed=$includeMain ordinary=$publishOther (30071)",
+    async ({ moveOther, includeMain, publishOther }) => {
+      const shape = twoChildFrozenMerge(`task-preserve-${moveOther}-${includeMain}-${publishOther}`)
       let otherMain = shape.before.other
+      let rootMain = shape.rootBefore
+      if (publishOther) {
+        // A distinct main source must still publish its own child. Parent it at
+        // rootBefore so the task-only child never enters main's history.
+        otherMain = advanceRepository(join(shape.root, "other"), "other.txt", "ordinary main work\n")
+        git(shape.root, "update-index", "--cacheinfo", `160000,${shape.before.child},child`)
+        git(shape.root, "add", "other")
+        rootMain = git(
+          shape.root,
+          "commit-tree",
+          git(shape.root, "write-tree"),
+          "-p",
+          shape.rootBefore,
+          "-m",
+          "ordinary main",
+        )
+      }
       const taskRef = "refs/heads/task/preservation"
       const local = createLocalGitProcess()
       let observedRoot = false
@@ -1939,7 +1957,7 @@ describe("explicit recursive push mechanics", () => {
       const result = await superPush({
         repo: shape.root,
         remote: "origin",
-        refspecs: [`${shape.merge}:${taskRef}`, ...(includeMain ? [`${shape.rootBefore}:refs/heads/main`] : [])],
+        refspecs: [`${shape.merge}:${taskRef}`, ...(includeMain ? [`${rootMain}:refs/heads/main`] : [])],
         recurseSubmodules: "on-demand",
         git: racing,
       })
@@ -1949,7 +1967,7 @@ describe("explicit recursive push mechanics", () => {
       expect(git(shape.remotes.child, "rev-parse", "refs/heads/main")).toBe(shape.before.child)
       expect(git(shape.remotes.other, "rev-parse", "refs/heads/main")).toBe(otherMain)
       expect(git(shape.remotes.child, "rev-parse", `refs/git-super/pins/${shape.childSource}`)).toBe(shape.childSource)
-      expect(git(shape.remotes.root, "rev-parse", "refs/heads/main")).toBe(shape.rootBefore)
+      expect(git(shape.remotes.root, "rev-parse", "refs/heads/main")).toBe(rootMain)
       expect(git(shape.remotes.root, "rev-parse", taskRef)).toBe(shape.merge)
     },
   )
