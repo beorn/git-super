@@ -313,9 +313,7 @@ describe("Phase 1 read commands", () => {
     expect(helpErr.output).toBe("")
     const stdout = outputSink()
     const stderr = outputSink()
-    expect(
-      await runCli(["--repo", repo, "branch", "--list", "--format=%(refname:short)"], stdout, stderr),
-    ).toBe(0)
+    expect(await runCli(["--repo", repo, "branch", "--list", "--format=%(refname:short)"], stdout, stderr)).toBe(0)
     expect(stderr.output).toBe("")
     expect(stdout.output.split("\n").map((line) => line.trim())).toContain("main")
     const retireErr = outputSink()
