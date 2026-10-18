@@ -1909,6 +1909,45 @@ describe("explicit recursive push mechanics", () => {
   )
 
   /**
+   * @failure A frozen task push advances child main or demands its stale no-op lease.
+   * @level l2
+   * @consumer superPush on-demand task preservation with a frozen merge capsule
+   */
+  test.each([false, true])("frozen task preservation leaves child mains unchanged with unrelated main moved=%s (30071)", async (moveOther) => {
+    const shape = twoChildFrozenMerge(`task-preserve-${moveOther}`)
+    let otherMain = shape.before.other
+    const taskRef = "refs/heads/task/preservation"
+    const local = createLocalGitProcess()
+    let observedRoot = false
+    const racing: GitProcess = {
+      async run(request) {
+        const result = await local.run(request)
+        if (moveOther && !observedRoot && request.repo === shape.root && request.args[0] === "ls-remote") {
+          observedRoot = true
+          otherMain = shape.moveMain("other")
+        }
+        return result
+      },
+    }
+
+    const result = await superPush({
+      repo: shape.root,
+      remote: "origin",
+      refspecs: [`${shape.merge}:${taskRef}`],
+      recurseSubmodules: "on-demand",
+      git: racing,
+    })
+
+    expect(result, JSON.stringify(result)).toMatchObject({ state: "updated", partial: false })
+    if (moveOther) expect(observedRoot).toBe(true)
+    expect(git(shape.remotes.child, "rev-parse", "refs/heads/main")).toBe(shape.before.child)
+    expect(git(shape.remotes.other, "rev-parse", "refs/heads/main")).toBe(otherMain)
+    expect(git(shape.remotes.child, "rev-parse", `refs/git-super/pins/${shape.childSource}`)).toBe(shape.childSource)
+    expect(git(shape.remotes.root, "rev-parse", "refs/heads/main")).toBe(shape.rootBefore)
+    expect(git(shape.remotes.root, "rev-parse", taskRef)).toBe(shape.merge)
+  })
+
+  /**
    * 26853: preservation is a task-branch on-demand push. An unrelated
    * refs/yrd/main/runner that advances between advertisement and fetch must
    * not fail plan-push; the missing-object refusal stays in the sibling test.
@@ -2777,7 +2816,8 @@ describe("a frozen push works only on the children its merge moved (25303, obser
   async function doublyMovingRef(
     name: string,
     ref: string,
-  ): Promise<Readonly<{ checked: Awaited<ReturnType<typeof superPush>>; fetched: readonly string[] }>> {
+    mode: "check" | "on-demand" = "check",
+  ): Promise<Readonly<{ checked: Awaited<ReturnType<typeof superPush>>; fetched: readonly string[]; advanced: boolean }>> {
     const { fixture, repository, remote, source } = pushFixture(name)
     // A file:// URL, so the fetch is the precise smart transport a real remote gives: fetching one ref
     // does not sweep in objects reachable from no requested ref, which a plain local path may do.
@@ -2801,8 +2841,15 @@ describe("a frozen push works only on the children its merge moved (25303, obser
     const local = createLocalGitProcess()
     const fetches: string[] = []
     let moved = false
+    let advanced = false
     const racing: GitProcess = {
       async run(request) {
+        if (mode === "on-demand" && !advanced && request.args[0] === "ls-remote" && request.args.includes("--refs")) {
+          const result = await local.run(request)
+          git(movedSeed, "push", "-q", "--force", "origin", `${fetched}:${ref}`)
+          advanced = true
+          return result
+        }
         const forRef = request.args[0] === "fetch" && request.args.includes(ref)
         if (forRef) fetches.push(ref)
         if (forRef && !moved) {
@@ -2824,10 +2871,10 @@ describe("a frozen push works only on the children its merge moved (25303, obser
       repo: repository,
       remote: "origin",
       refspecs: [`${source}:refs/heads/preservation`],
-      recurseSubmodules: "check",
+      recurseSubmodules: mode,
       git: racing,
     })
-    return { checked, fetched: fetches }
+    return { checked, fetched: fetches, advanced }
   }
 
   /**
@@ -2856,6 +2903,17 @@ describe("a frozen push works only on the children its merge moved (25303, obser
     expect(fetched, "a branch ref IS acquired: its history can bound what this push builds on").not.toEqual([])
     expect(checked).toMatchObject({ state: "failed", partial: false })
     expect(checked.detail?.message).toMatch(/Advertised object .* at refs\/heads\/foreign from origin remains missing/u)
+  })
+
+  /**
+   * @failure On-demand task preservation fails when an unrelated queue runner moves twice.
+   * @level l2
+   * @consumer superPush on-demand preservation, unlike the existing check-mode case
+   */
+  test("on-demand task preservation survives a doubly moving queue runner (30071)", async () => {
+    const { checked, advanced } = await doublyMovingRef("on-demand-runner-twice", "refs/yrd/main/runner", "on-demand")
+    expect(advanced).toBe(true)
+    expect(checked, JSON.stringify(checked)).toMatchObject({ state: "updated", partial: false })
   })
 
   test("peels a fetched annotated tag in the second batch without rereading present refs", async () => {
