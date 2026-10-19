@@ -12,8 +12,11 @@ export type Exclusive = Readonly<{
 export type ExclusiveOptions = Readonly<{
   timeoutMs?: number
   pollIntervalMs?: number
-  /** Called once, when the first acquire finds the lock held, with who holds it (24907). */
-  onContended?: (holder: string) => void
+  /**
+   * Called once, when the first acquire finds the lock held, with who holds it (24907) and a reader that
+   * describes the lock again on each progress tick, so a long wait never re-reports a departed holder (30095).
+   */
+  onContended?: (holder: string, refresh: () => string) => void
 }>
 
 export type WriterLock = Readonly<{ release(): void }>
@@ -73,8 +76,11 @@ export async function acquireExclusive(
     const now = Date.now()
     if (!contended) {
       contended = true
-      const held = describeRecordedLockHolder(path, now)
-      options.onContended?.(`${held.holder} (${held.owner}, age ${held.age})`)
+      const describe = (at: number): string => {
+        const held = describeRecordedLockHolder(path, at)
+        return `${held.holder} (${held.owner}, age ${held.age})`
+      }
+      options.onContended?.(describe(now), () => describe(Date.now()))
     }
     if (now >= deadline) throw busy(path, now, now - startedAt, timeoutMs, holder)
     await delay(Math.min(pollMs, 1 + Math.floor(fullJitter(pollMs, pollMs, 0))))

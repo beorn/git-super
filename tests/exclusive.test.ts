@@ -172,4 +172,59 @@ describe("exclusive writer policy", () => {
       }
     },
   )
+
+  /**
+   * @failure A contended wait keeps re-reporting the first poll's holder and a frozen age after that
+   *          holder released the flock, so the operator reads a departed pid as the live blocker (30095).
+   * @level l1
+   * @consumer Yrd submit merge and post-merge worktree add
+   */
+  test("reports the lock's live holder on each tick, not the first poll's", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "git-super-exclusive-"))
+    const lockPath = join(dir, "writer.lock")
+    const first = await acquireExclusive(dir, { timeoutMs: 0 }, "first operation")
+    const seen: { holder: string; refresh: () => string }[] = []
+    const ticked: string[] = []
+    let released = false
+    vi.spyOn(Math, "random").mockReturnValue(0.999)
+    vi.mocked(delay).mockImplementation(async () => {
+      if (released) return
+      // the holder changed while we waited: the next progress tick must describe the file as it is now
+      await writeFile(
+        lockPath,
+        JSON.stringify({
+          pid: 424242,
+          holder: "second operation",
+          startedAt: new Date(Date.now() - 900).toISOString(),
+        }),
+      )
+      const entry = seen[0]
+      if (entry === undefined) throw new Error("contention was not reported before the poll delay")
+      ticked.push(entry.refresh())
+      first.release()
+      released = true
+    })
+    try {
+      const second = await acquireExclusive(
+        dir,
+        {
+          timeoutMs: 1_000,
+          pollIntervalMs: 10,
+          onContended: (holder, refresh) => seen.push({ holder, refresh }),
+        },
+        "contender",
+      )
+      second.release()
+      expect(seen).toHaveLength(1)
+      expect(seen[0]?.holder).toContain("first operation")
+      expect(ticked[0]).toContain("second operation")
+      expect(ticked[0]).toContain("pid:424242")
+      expect(ticked[0]).toMatch(/age \d+ms/u)
+    } finally {
+      if (!released) first.release()
+      vi.mocked(delay).mockRestore()
+      vi.restoreAllMocks()
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
 })
