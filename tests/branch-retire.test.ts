@@ -276,6 +276,33 @@ describe("legacy archive retirement", () => {
     return git(repo, "for-each-ref", "--format=%(refname) %(objectname) %(symref)")
   }
 
+  /**
+   * @failure The relaxed dated parser also authorized removeLegacyArchiveRef replacements. A
+   *          seat-qualified dated name such as refs/archive/2026-10-19/@dev/chief/old-work reads
+   *          as legacy evidence, never branch custody, so admitting it as a replacement deleted the
+   *          undated refs/archive/chief/old-work while readArchiveRows excluded its replacement:
+   *          the store lost the only name the reader matches (30263 review2).
+   * @level l1
+   * @consumer explicit legacy archive cleanup after reviewed custody copies (#29600)
+   * @testonly none
+   */
+  test("refuses a seat-qualified dated replacement the reader excludes and retains both refs", () => {
+    const f = fixture()
+    const replacement = "refs/archive/2026-10-19/@dev/chief/old-work"
+    git(f.repo, "update-ref", replacement, f.tip)
+    // This name is readable evidence but never branch custody.
+    expect(archive.readArchiveRows(f.repo).some((row) => row.ref === replacement)).toBe(false)
+    const before = refs(f.repo)
+
+    const result = archive.removeLegacyArchiveRef(f.repo, f.legacyRef, replacement, f.tip)
+
+    expect(result).toMatchObject({ ok: false, removed: false })
+    if (!result.ok) expect(result.reason).toContain(f.legacyRef)
+    expect(refs(f.repo)).toBe(before)
+    expect(git(f.repo, "rev-parse", f.legacyRef)).toBe(f.tip)
+    expect(git(f.repo, "rev-parse", replacement)).toBe(f.tip)
+  })
+
   test("removes only the obsolete name, preserves custody, and explains an absent retry", () => {
     const f = fixture()
     // The undated name no longer blocks the read; it is evidence, never branch custody.

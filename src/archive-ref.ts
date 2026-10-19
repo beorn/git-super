@@ -54,9 +54,15 @@ function archiveName(ref: string): ArchiveName | undefined {
   return legacy?.[2] === undefined ? undefined : { kind: "legacy" }
 }
 
-/** The dated-name grammar, shared by custody reads and legacy-name retirement. */
-function datedArchiveBranch(ref: string): string | undefined {
-  return /^refs\/archive\/\d{4}-\d{2}-\d{2}\/([^/]+)\/(.+)$/u.exec(ref)?.[2]
+/** Branch custody claimed by the one parser: only the canonical dated grammar. */
+function branchCustodyName(ref: string): string | undefined {
+  const name = archiveName(ref)
+  return name?.kind === "branch" ? name.branch : undefined
+}
+
+/** Any dated archive name is not an undated legacy name, whether or not it claims branch custody. */
+function isDatedArchiveName(ref: string): boolean {
+  return /^refs\/archive\/\d{4}-\d{2}-\d{2}\//u.test(ref)
 }
 
 /** Read archive custody through the one archive-name parser; malformed evidence is never omitted. */
@@ -183,10 +189,13 @@ export function removeLegacyArchiveRef(
     if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(tip)) {
       throw new Error(`expected a full SHA1 or SHA256 tip, got ${JSON.stringify(tip)}`)
     }
-    if (!legacyRef.startsWith(`${ARCHIVE_REF_PREFIX}/`) || datedArchiveBranch(legacyRef) !== undefined) {
+    if (!legacyRef.startsWith(`${ARCHIVE_REF_PREFIX}/`) || isDatedArchiveName(legacyRef)) {
       throw new Error(`legacy ref ${legacyRef} must be an undated name under ${ARCHIVE_REF_PREFIX}/`)
     }
-    if (datedArchiveBranch(replacementRef) !== legacyRef.slice(ARCHIVE_REF_PREFIX.length + 1)) {
+    // Only canonical dated branch custody may replace a legacy name: a seat-qualified or other
+    // legacy dated name reads as evidence, so admitting it here would delete the legacy ref while
+    // the reader excludes its replacement.
+    if (branchCustodyName(replacementRef) !== legacyRef.slice(ARCHIVE_REF_PREFIX.length + 1)) {
       throw new Error(
         `replacement ${replacementRef} must be a dated archive for the exact legacy suffix of ${legacyRef}`,
       )
