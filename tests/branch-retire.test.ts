@@ -256,7 +256,8 @@ describe("branch retire", () => {
 })
 
 /**
- * @failure Obsolete archive names block custody reads, but deleting a name without matching dated custody loses evidence.
+ * @failure An obsolete archive name must be readable evidence (30263) while deleting it without
+ *          matching dated custody would lose evidence; both properties hold at once.
  * @level l1
  * @consumer Explicit legacy archive cleanup after reviewed custody copies (#29600)
  * @testonly none
@@ -277,7 +278,10 @@ describe("legacy archive retirement", () => {
 
   test("removes only the obsolete name, preserves custody, and explains an absent retry", () => {
     const f = fixture()
-    expect(() => archive.readArchiveRows(f.repo)).toThrow(f.legacyRef)
+    // The undated name no longer blocks the read; it is evidence, never branch custody.
+    const before = archive.readArchiveRows(f.repo)
+    expect(before).toContainEqual({ branch: "chief/old-work", ref: f.replacementRef, tip: f.tip })
+    expect(before.some((row) => row.ref === f.legacyRef)).toBe(false)
     const result = archive.removeLegacyArchiveRef(f.repo, f.legacyRef, f.replacementRef, f.tip)
     expect(result).toEqual({
       ok: true,

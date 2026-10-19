@@ -20,10 +20,43 @@ export function archiveRefFor(branch: string, actor: string, date: string): stri
   return `${ARCHIVE_REF_PREFIX}/${date}/${archiveActorSegment(actor)}/${branch}`
 }
 
-/** The existing dated-name grammar, shared by custody reads and legacy-name retirement. */
+/**
+ * Every archive-name shape the estate actually holds, measured 2026-10-19 (30263):
+ *
+ *   * `refs/archive/<date>/<actor>/<branch>` with a slug-stable actor — the current grammar;
+ *   * `refs/archive/<date>/<actor>/<branch>` where the actor carries a seat qualifier, such as
+ *     `@dev/13`, so the name cannot say where the actor ends and the branch begins;
+ *   * `refs/archive/<actor>/<branch>` — pre-dated custody, likewise ambiguous about its actor;
+ *   * `refs/archive/bundles/<date>/<name>/<n>` and `refs/archive/preserve-<label>/<sha>` — bundle
+ *     and preservation custody.
+ *
+ * Only the first shape claims branch custody. The other three stay readable evidence: they are
+ * never deleted here and never matched as a branch, because guessing would either miss custody or
+ * point it at the wrong branch.
+ *
+ * A name outside all four shapes is still corruption: the caller names it rather than skipping it.
+ * One legacy ref used to abort the whole read, so every branch retirement in the store refused.
+ */
+type ArchiveName = Readonly<{ kind: "branch"; branch: string }> | Readonly<{ kind: "legacy" }>
+
+function archiveName(ref: string): ArchiveName | undefined {
+  if (/^refs\/archive\/bundles\//u.test(ref)) return { kind: "legacy" }
+  if (/^refs\/archive\/preserve-[^/]+\/[0-9a-f]{7,64}$/u.test(ref)) return { kind: "legacy" }
+  const dated = /^refs\/archive\/\d{4}-\d{2}-\d{2}\/([^/]+)\/(.+)$/u.exec(ref)
+  const [actor, branch] = dated?.slice(1, 3) ?? []
+  if (actor !== undefined && branch !== undefined) {
+    // A slug-stable actor is the current grammar. An actor such as `@dev/13` carries a seat
+    // qualifier, so the name cannot say where the actor ends and the branch begins; it stays
+    // readable evidence and never claims branch custody.
+    return archiveActorSegment(actor) === actor ? { kind: "branch", branch } : { kind: "legacy" }
+  }
+  const legacy = /^refs\/archive\/([^/]+)\/(.+)$/u.exec(ref)
+  return legacy?.[2] === undefined ? undefined : { kind: "legacy" }
+}
+
+/** The dated-name grammar, shared by custody reads and legacy-name retirement. */
 function datedArchiveBranch(ref: string): string | undefined {
-  const name = /^refs\/archive\/(\d{4}-\d{2}-\d{2})\/([^/]+)\/(.+)$/u.exec(ref)
-  return name?.[2] !== undefined && archiveActorSegment(name[2]) === name[2] ? name[3] : undefined
+  return /^refs\/archive\/\d{4}-\d{2}-\d{2}\/([^/]+)\/(.+)$/u.exec(ref)?.[2]
 }
 
 /** Read archive custody through the one archive-name parser; malformed evidence is never omitted. */
@@ -55,9 +88,10 @@ export function readArchiveRows(
     ) {
       throw new Error(`cannot read archive custody in ${repoRoot}: malformed for-each-ref row ${JSON.stringify(line)}`)
     }
-    const branch = datedArchiveBranch(ref)
-    if (branch === undefined) throw new Error(`${repoRoot}: malformed archive name ${ref}`)
-    rows.push({ branch, tip: value, ref })
+    const name = archiveName(ref)
+    if (name === undefined) throw new Error(`${repoRoot}: malformed archive name ${ref}`)
+    // Legacy custody is evidence, but this reader answers branch custody only.
+    if (name.kind === "branch") rows.push({ branch: name.branch, tip: value, ref })
   }
   return rows
 }
