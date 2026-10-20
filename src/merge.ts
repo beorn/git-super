@@ -2656,49 +2656,78 @@ async function orientCompositionResolution(
   timeoutMs: number,
   knownMains: Map<string, SubmoduleMain>,
   report: ((line: string) => void) | undefined,
-): Promise<SubmoduleCommitResolution> {
-  if (
-    (await containsCommit(git, store, resolution.baseSha, resolution.currentSha, timeoutMs)) !== true ||
-    (await containsCommit(git, store, resolution.baseSha, resolution.incomingSha, timeoutMs)) !== true
-  ) {
-    return resolution
-  }
-  const rootRemote = await rootPushIdentity(git, root)
-  if (!sameHostedOwner(rootRemote, resolution.origin)) return resolution
-  let main = knownMains.get(resolution.path)
-  if (main === undefined) {
-    const entry = (await readCommitSubmodules(git, root, head)).find((item) => item.path === resolution.path) ??
-      (await readCommitSubmodules(git, root, target)).find((item) => item.path === resolution.path) ?? {
-        name: resolution.path,
-        path: resolution.path,
-        target: resolution.currentSha,
-        url: resolution.origin,
-      }
-    main = await fetchSubmoduleMain(
-      git,
-      root,
-      store,
-      { ...entry, target: resolution.currentSha, url: resolution.origin },
-      timeoutMs,
-      false,
-      undefined,
-      report,
-    )
-    knownMains.set(resolution.path, main)
-  }
-  const currentSpine = await run(git, store, ["rev-list", "--first-parent", resolution.currentSha], timeoutMs)
-  const incomingSpine = await run(git, store, ["rev-list", "--first-parent", resolution.incomingSha], timeoutMs)
-  if (currentSpine.code !== 0 || incomingSpine.code !== 0) return resolution
-  const currentHasMain = currentSpine.stdout.trim().split(/\r?\n/u).includes(main.oid)
-  const incomingHasMain = incomingSpine.stdout.trim().split(/\r?\n/u).includes(main.oid)
-  if (!currentHasMain && incomingHasMain) {
+): Promise<Readonly<{ resolution: SubmoduleCommitResolution }> | Readonly<{ failure: GitResultDetail }>> {
+  const operation = `orient ${resolution.path} (${resolution.currentSha} and ${resolution.incomingSha}) from base ${resolution.baseSha}`
+  const currentContainsBase = await containsCommit(git, store, resolution.baseSha, resolution.currentSha, timeoutMs)
+  const incomingContainsBase =
+    currentContainsBase === true
+      ? await containsCommit(git, store, resolution.baseSha, resolution.incomingSha, timeoutMs)
+      : false
+  if (typeof currentContainsBase === "string" || typeof incomingContainsBase === "string") {
+    const detail = typeof currentContainsBase === "string" ? currentContainsBase : incomingContainsBase
     return {
-      ...resolution,
-      currentSha: resolution.incomingSha,
-      incomingSha: resolution.currentSha,
+      failure: composeUnavailable(root, [resolution.path], operation, String(detail)),
     }
   }
-  return resolution
+  if (!currentContainsBase || !incomingContainsBase) {
+    return { resolution }
+  }
+  const reader = { run: (request: GitProcessRequest) => git.run({ timeoutMs, ...request }) }
+  let main = knownMains.get(resolution.path)
+  let currentSpine: string
+  let incomingSpine: string
+  try {
+    const rootRemote = await rootPushIdentity(git, root)
+    if (!sameHostedOwner(rootRemote, resolution.origin)) return { resolution }
+    if (main === undefined) {
+      const entry = (await readCommitSubmodules(reader, root, head)).find((item) => item.path === resolution.path) ??
+        (await readCommitSubmodules(reader, root, target)).find((item) => item.path === resolution.path) ?? {
+          name: resolution.path,
+          path: resolution.path,
+          target: resolution.currentSha,
+          url: resolution.origin,
+        }
+      main = await fetchSubmoduleMain(
+        git,
+        root,
+        store,
+        { ...entry, target: resolution.currentSha, url: resolution.origin },
+        timeoutMs,
+        false,
+        undefined,
+        report,
+      )
+      knownMains.set(resolution.path, main)
+    }
+    currentSpine = await required(
+      git,
+      store,
+      ["rev-list", "--first-parent", resolution.currentSha],
+      "compose-gitlinks",
+      timeoutMs,
+    )
+    incomingSpine = await required(
+      git,
+      store,
+      ["rev-list", "--first-parent", resolution.incomingSha],
+      "compose-gitlinks",
+      timeoutMs,
+    )
+  } catch (error) {
+    return { failure: composeUnavailable(root, [resolution.path], operation, messageOf(error)) }
+  }
+  const currentHasMain = currentSpine.split(/\r?\n/u).includes(main.oid)
+  const incomingHasMain = incomingSpine.split(/\r?\n/u).includes(main.oid)
+  if (!currentHasMain && incomingHasMain) {
+    return {
+      resolution: {
+        ...resolution,
+        currentSha: resolution.incomingSha,
+        incomingSha: resolution.currentSha,
+      },
+    }
+  }
+  return { resolution }
 }
 
 /**
@@ -2820,9 +2849,19 @@ async function composeGitlinks(
     if (incomingContainsCurrent && currentContainsBase) {
       settledResolutions.push({ kind: "pin", path: resolution.path, sha: resolution.incomingSha })
     } else if (knownMains !== undefined) {
-      settledResolutions.push(
-        await orientCompositionResolution(git, root, head, target, store, resolution, timeoutMs, knownMains, report),
+      const oriented = await orientCompositionResolution(
+        git,
+        root,
+        head,
+        target,
+        store,
+        resolution,
+        timeoutMs,
+        knownMains,
+        report,
       )
+      if ("failure" in oriented) return oriented
+      settledResolutions.push(oriented.resolution)
     } else {
       settledResolutions.push(resolution)
     }

@@ -4828,6 +4828,124 @@ describe("git super merge — a diverged gitlink the merge composes", () => {
     expect(git(fixture.product, "status", "--porcelain=v1")).toBe("")
   })
 
+  /** @failure Swallowing an operational Git failure in orientCompositionResolution's ancestry or first-parent spine
+   *          probes proceeds with the unverified parent order and hides the underlying Git diagnostic behind a later
+   *          publication refusal (30431). */
+  it("preserves Git probe diagnostics when catch-up composition orientation fails (30431)", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-compose-orient-error-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const pins = divergedAlphaPins(
+      fixture,
+      [["main-side.ts", "export const main = 1\n"]],
+      [["change-side.ts", "export const change = 1\n"]],
+    )
+    const submodule = join(fixture.product, "packages/alpha")
+    git(fixture.product, "switch", "-q", "candidate-diverged-pin")
+    git(submodule, "checkout", "-q", pins.theirs)
+    const local = createLocalGitProcess()
+
+    let injectedAncestryError = false
+    const ancestryFailure = await superMerge({
+      repo: fixture.product,
+      commit: "main",
+      git: {
+        run: async (request) => {
+          if (
+            !injectedAncestryError &&
+            request.repo === submodule &&
+            request.args[0] === "merge-base" &&
+            request.args[1] === "--is-ancestor" &&
+            request.args[2] === fixture.alphaBase
+          ) {
+            injectedAncestryError = true
+            return {
+              args: request.args,
+              code: 128,
+              durationMs: 1,
+              repo: request.repo,
+              stderr: "fatal: simulated orientation ancestry failure\n",
+              stdout: "",
+              timedOut: false,
+            }
+          }
+          return local.run(request)
+        },
+      },
+    })
+
+    expect
+      .soft({
+        code: ancestryFailure.detail?.code,
+        partial: ancestryFailure.partial,
+        paths: ancestryFailure.detail?.paths,
+        phase: ancestryFailure.detail?.phase,
+        state: ancestryFailure.state,
+      })
+      .toEqual({
+        code: "gitlink-compose-unavailable",
+        partial: false,
+        paths: ["packages/alpha"],
+        phase: "compose-gitlinks",
+        state: "failed",
+      })
+    expect
+      .soft(ancestryFailure.detail?.message)
+      .toContain(
+        `git -C ${submodule} merge-base --is-ancestor ${fixture.alphaBase} ${pins.theirs} exited 128: fatal: simulated orientation ancestry failure`,
+      )
+
+    let injectedSpineError = false
+    const spineFailure = await superMerge({
+      repo: fixture.product,
+      commit: "main",
+      git: {
+        run: async (request) => {
+          if (
+            !injectedSpineError &&
+            request.repo === submodule &&
+            request.args[0] === "rev-list" &&
+            request.args[1] === "--first-parent"
+          ) {
+            injectedSpineError = true
+            return {
+              args: request.args,
+              code: 128,
+              durationMs: 1,
+              repo: request.repo,
+              stderr: "fatal: simulated orientation spine failure",
+              stdout: "",
+              timedOut: false,
+            }
+          }
+          return local.run(request)
+        },
+      },
+    })
+
+    expect
+      .soft({
+        code: spineFailure.detail?.code,
+        partial: spineFailure.partial,
+        paths: spineFailure.detail?.paths,
+        phase: spineFailure.detail?.phase,
+        state: spineFailure.state,
+      })
+      .toEqual({
+        code: "gitlink-compose-unavailable",
+        partial: false,
+        paths: ["packages/alpha"],
+        phase: "compose-gitlinks",
+        state: "failed",
+      })
+    expect
+      .soft(spineFailure.detail?.message)
+      .toContain(
+        `git rev-list --first-parent ${pins.theirs} failed in ${submodule} (exit 128): fatal: simulated orientation spine failure`,
+      )
+    expect(git(fixture.product, "status", "--porcelain=v1")).toBe("")
+  })
+
   /** @failure A preview's merge publishes the composed child as a permanent pin at the component origin and in its
    *          store, though its caller keeps custody of the result itself (27510). */
   it("composes the same child with no pin anywhere when the caller keeps custody (retainPins false, 27510)", async () => {
