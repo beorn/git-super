@@ -714,6 +714,7 @@ async function mergeObserved(
   let tree: string
   let composed: ReadonlyMap<string, ComposedGitlink> = new Map()
   let forkComposed: ReadonlyMap<string, ComposedGitlink> = new Map()
+  const knownMains = new Map<string, SubmoduleMain>()
   if (options.continue) {
     if (continuationTree === undefined) {
       return failed(
@@ -796,6 +797,8 @@ async function mergeObserved(
             options.message,
             timeoutMs,
             retainPins,
+            knownMains,
+            options.report,
           )
         : await composeDivergedGitlinks(
             git,
@@ -806,6 +809,8 @@ async function mergeObserved(
             options.message,
             timeoutMs,
             retainPins,
+            knownMains,
+            options.report,
           )
     if (composition === undefined) {
       const gitlinkPaths = [
@@ -841,6 +846,7 @@ async function mergeObserved(
       options.report,
       excludedSubmodules,
       retainPins,
+      knownMains,
     )
   } catch (error) {
     return failed(root, [], resultError(error, "inspect-gitlinks"))
@@ -879,6 +885,7 @@ async function mergeObserved(
         options.report,
         excludedSubmodules,
         retainPins,
+        knownMains,
       )
     } catch (error) {
       return failed(root, [], resultError(error, "inspect-gitlinks"))
@@ -2211,6 +2218,8 @@ async function composeDivergedGitlinks(
   message: string | undefined,
   timeoutMs: number,
   retainPins: boolean,
+  knownMains: Map<string, SubmoduleMain>,
+  report: ((line: string) => void) | undefined,
 ): Promise<ComposedGitlinks | Readonly<{ failure: GitResultDetail }> | undefined> {
   const { entries, paths, stageEvidence } = conflict
   if (paths.length === 0 || entries.some((entry) => entry.mode !== "160000")) return undefined
@@ -2253,6 +2262,8 @@ async function composeDivergedGitlinks(
     message,
     timeoutMs,
     retainPins,
+    knownMains,
+    report,
   )
 }
 
@@ -2367,6 +2378,8 @@ async function composeWrongStoreGitlinks(
   message: string | undefined,
   timeoutMs: number,
   retainPins: boolean,
+  knownMains: Map<string, SubmoduleMain>,
+  report: ((line: string) => void) | undefined,
 ): Promise<ComposedGitlinks | Readonly<{ failure: GitResultDetail }> | undefined> {
   if (failure.code !== "submodule-history-unreadable") return undefined
   const unreadable = failure.objectIds?.filter((oid) => oid !== head && oid !== target).at(-1)
@@ -2450,6 +2463,8 @@ async function composeWrongStoreGitlinks(
     message,
     timeoutMs,
     retainPins,
+    knownMains,
+    report,
   )
   if (composed === undefined) return undefined
   if ("failure" in composed) return composed
@@ -2626,6 +2641,67 @@ type CompositionEvidence = Readonly<{
 }>
 
 /**
+ * A two-sided conflict takes stage 2 from HEAD and stage 3 from target. In the queue direction HEAD is main and target
+ * is the task branch; in a catch-up merge on a task branch HEAD is the task branch and target is main (30431). Always
+ * put the side that carries the component's main on its first-parent chain first, so the composition commit's first
+ * parent is component main in both directions.
+ */
+async function orientCompositionResolution(
+  git: GitProcess,
+  root: string,
+  head: string,
+  target: string,
+  store: string,
+  resolution: SubmoduleCommitResolution,
+  timeoutMs: number,
+  knownMains: Map<string, SubmoduleMain>,
+  report: ((line: string) => void) | undefined,
+): Promise<SubmoduleCommitResolution> {
+  if (
+    (await containsCommit(git, store, resolution.baseSha, resolution.currentSha, timeoutMs)) !== true ||
+    (await containsCommit(git, store, resolution.baseSha, resolution.incomingSha, timeoutMs)) !== true
+  ) {
+    return resolution
+  }
+  const rootRemote = await rootPushIdentity(git, root)
+  if (!sameHostedOwner(rootRemote, resolution.origin)) return resolution
+  let main = knownMains.get(resolution.path)
+  if (main === undefined) {
+    const entry = (await readCommitSubmodules(git, root, head)).find((item) => item.path === resolution.path) ??
+      (await readCommitSubmodules(git, root, target)).find((item) => item.path === resolution.path) ?? {
+        name: resolution.path,
+        path: resolution.path,
+        target: resolution.currentSha,
+        url: resolution.origin,
+      }
+    main = await fetchSubmoduleMain(
+      git,
+      root,
+      store,
+      { ...entry, target: resolution.currentSha, url: resolution.origin },
+      timeoutMs,
+      false,
+      undefined,
+      report,
+    )
+    knownMains.set(resolution.path, main)
+  }
+  const currentSpine = await run(git, store, ["rev-list", "--first-parent", resolution.currentSha], timeoutMs)
+  const incomingSpine = await run(git, store, ["rev-list", "--first-parent", resolution.incomingSha], timeoutMs)
+  if (currentSpine.code !== 0 || incomingSpine.code !== 0) return resolution
+  const currentHasMain = currentSpine.stdout.trim().split(/\r?\n/u).includes(main.oid)
+  const incomingHasMain = incomingSpine.stdout.trim().split(/\r?\n/u).includes(main.oid)
+  if (!currentHasMain && incomingHasMain) {
+    return {
+      ...resolution,
+      currentSha: resolution.incomingSha,
+      incomingSha: resolution.currentSha,
+    }
+  }
+  return resolution
+}
+
+/**
  * Compose every diverged gitlink in `conflicts` into one tree: create each component merge commit, state it onto
  * `onto`, and retain it at the component remote (24951, 25389). The two-sided caller passes the root conflict's
  * stages and the tree merge-tree wrote; the one-sided caller passes component-level stages and the tree its plan
@@ -2642,6 +2718,8 @@ async function composeGitlinks(
   message: string | undefined,
   timeoutMs: number,
   retainPins: boolean,
+  knownMains?: Map<string, SubmoduleMain>,
+  report?: (line: string) => void,
 ): Promise<ComposedGitlinks | Readonly<{ failure: GitResultDetail }> | undefined> {
   const { entries, head, rootConflict, stageEvidence, target } = evidence
   const paths = conflicts.map((conflict) => conflict.path)
@@ -2741,7 +2819,13 @@ async function composeGitlinks(
     }
     if (incomingContainsCurrent && currentContainsBase) {
       settledResolutions.push({ kind: "pin", path: resolution.path, sha: resolution.incomingSha })
-    } else settledResolutions.push(resolution)
+    } else if (knownMains !== undefined) {
+      settledResolutions.push(
+        await orientCompositionResolution(git, root, head, target, store, resolution, timeoutMs, knownMains, report),
+      )
+    } else {
+      settledResolutions.push(resolution)
+    }
   }
   const settled = { ...plan, resolutions: settledResolutions }
 
@@ -3099,6 +3183,7 @@ async function planGitlinks(
   report: ((line: string) => void) | undefined,
   excludedSubmodules: readonly string[],
   retainPins: boolean,
+  knownMains?: Map<string, SubmoduleMain>,
 ): Promise<GitlinkPlans> {
   const plans: GitlinkPlan[] = []
   const descents: SuperMergeDescentResult[] = []
@@ -3276,8 +3361,10 @@ async function planGitlinks(
           entry.url !== undefined &&
           sameHostedOwner(rootRemote, entry.url),
       )
-      const outcomes = await mapInOrder(owned, MAIN_FETCH_CONCURRENCY, (entry) =>
-        fetchSubmoduleMain(
+      const outcomes = await mapInOrder(owned, MAIN_FETCH_CONCURRENCY, (entry) => {
+        const cached = knownMains?.get(entry.path)
+        if (cached !== undefined) return Promise.resolve({ ok: true as const, main: cached })
+        return fetchSubmoduleMain(
           git,
           repository,
           stores.get(entry.path) ?? join(repository, entry.path),
@@ -3287,10 +3374,13 @@ async function planGitlinks(
           unboundedLocalMain,
           report,
         ).then(
-          (main) => ({ ok: true as const, main }),
+          (main) => {
+            knownMains?.set(entry.path, main)
+            return { ok: true as const, main }
+          },
           (error: unknown) => ({ ok: false as const, error }),
-        ),
-      )
+        )
+      })
       owned.forEach((entry, index) => prefetched.set(entry.path, outcomes[index] as (typeof outcomes)[number]))
     }
     for (const entry of entries) {

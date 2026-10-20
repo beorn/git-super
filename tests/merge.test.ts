@@ -4776,6 +4776,58 @@ describe("git super merge — a diverged gitlink the merge composes", () => {
     })
   })
 
+  /** @failure A catch-up merge on a task branch (HEAD is the task branch, target is main) composes the component
+   *          with the task pin as parent one and component main as parent two, which freeze-child-first-parent
+   *          then refuses with gitlink-publication-first-parent-gap (30431). */
+  it("orients the composed component commit with component main as parent one in the catch-up direction (30431)", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-compose-catchup-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const pins = divergedAlphaPins(
+      fixture,
+      [["main-side.ts", "export const main = 1\n"]],
+      [["change-side.ts", "export const change = 1\n"]],
+    )
+    const submodule = join(fixture.product, "packages/alpha")
+    git(fixture.product, "switch", "-q", "candidate-diverged-pin")
+    git(submodule, "checkout", "-q", pins.theirs)
+
+    const result = await superMerge({
+      repo: fixture.product,
+      commit: "main",
+    })
+
+    expect({
+      code: result.detail?.code,
+      partial: result.partial,
+      phase: result.detail?.phase,
+      state: result.state,
+    }).toEqual({
+      code: undefined,
+      partial: false,
+      phase: undefined,
+      state: "updated",
+    })
+    const settled = result.gitlinks.find((row) => row.path === "packages/alpha")
+    expect(settled).toMatchObject({
+      path: "packages/alpha",
+      state: "merged",
+      mainPin: pins.ours,
+      composition: { base: fixture.alphaBase, parent: pins.ours, pin: pins.theirs, files: { parent: 1, pin: 1 } },
+    })
+    const composed = settled?.recordedPin ?? ""
+    expect(composed).toMatch(/^[0-9a-f]{40}$/u)
+    expect(git(submodule, "cat-file", "-p", composed).split("\n").slice(1, 3)).toEqual([
+      `parent ${pins.ours}`,
+      `parent ${pins.theirs}`,
+    ])
+    expect(git(submodule, "log", "-1", "--format=%s", composed)).toBe(
+      `Merge packages/alpha ${pins.theirs.slice(0, 12)} into submodule main ${pins.ours.slice(0, 12)}`,
+    )
+    expect(git(submodule, "rev-parse", "HEAD")).toBe(composed)
+    expect(git(fixture.product, "status", "--porcelain=v1")).toBe("")
+  })
+
   /** @failure A preview's merge publishes the composed child as a permanent pin at the component origin and in its
    *          store, though its caller keeps custody of the result itself (27510). */
   it("composes the same child with no pin anywhere when the caller keeps custody (retainPins false, 27510)", async () => {
