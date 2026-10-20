@@ -22,6 +22,46 @@ const gitWorktreeModule = new URL("../src/worktree.ts", import.meta.url).href
  * @testonly none
  */
 describe("ordinary check publication history", () => {
+  // @failure Saved child archives cannot witness a parent publication, or a
+  // local archive is mistaken for remote custody. Branch/pin cases cannot see
+  // a containing archive descendant. @level l3 @consumer saved-copy writers
+  test.each(["exact", "descendant", "local-only", "wrong-remote"] as const)(
+    "checks owning-remote archive custody: %s",
+    async (shape) => {
+      const fixture = recursivePushFixture(`archive-${shape}`)
+      const archive = `refs/archive/2026-10-20/worktree/child/${fixture.childSource}`
+      const tip =
+        shape === "descendant"
+          ? advanceRepository(fixture.child, "child.txt", "archived descendant\n")
+          : fixture.childSource
+      git(fixture.child, "update-ref", archive, tip)
+      if (shape !== "local-only") {
+        git(fixture.child, "push", "-q", "origin", `${shape === "wrong-remote" ? fixture.childBefore : tip}:${archive}`)
+      }
+      const destination = `refs/archive/2026-10-20/worktree/root/${fixture.rootSource}`
+      const result = await superPush({
+        repo: fixture.root,
+        remote: "origin",
+        refspecs: [`${fixture.rootSource}:${destination}`],
+        recurseSubmodules: "check",
+      })
+      if (shape === "exact" || shape === "descendant") {
+        expect(result, JSON.stringify(result)).toMatchObject({ state: "updated", partial: false })
+        expect(git(fixture.rootRemote, "rev-parse", destination)).toBe(fixture.rootSource)
+        expect(git(fixture.childRemote, "rev-parse", archive)).toBe(tip)
+      } else {
+        expect(result, JSON.stringify(result)).toMatchObject({
+          state: "failed",
+          partial: false,
+          detail: { code: "submodule-commit-unavailable" },
+        })
+        expect(git(fixture.rootRemote, "for-each-ref", "--format=%(refname)", destination)).toBe("")
+      }
+      expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(fixture.childBefore)
+      expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(fixture.rootBefore)
+    },
+  )
+
   test("inherits a published parent pin without discovering its absent child", async () => {
     const fixture = recursivePushFixture("publication-published-parent")
     git(fixture.child, "push", "-q", "origin", `${fixture.childSource}:refs/heads/main`)

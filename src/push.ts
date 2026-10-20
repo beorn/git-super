@@ -1,5 +1,6 @@
 import { isAbsolute, join, resolve } from "node:path"
 import { batchCheck, type BatchCheckResult, type GitResult } from "gitomic"
+import { ARCHIVE_REF_PREFIX } from "./archive-ref.ts"
 
 import {
   changedGitlinks,
@@ -2023,7 +2024,7 @@ async function witnessReachesCommit(
  * Held is not reachable: a server serves any object it still holds, and an object no ref reaches is pruned later,
  * so a stale gitlink after a force-pushed child branch would pass a fetch by SHA today and dangle tomorrow.
  * Reachability implies held, so nothing else is asked. The refs, in order: every local branch of the child that
- * contains the commit, by its remote name (the ordinary pre-queue state, a seat's task branch pushed as itself);
+ * contains the commit, by its remote name, and local archive refs containing it;
  * then git-super's retention ref for the commit; then the child's main. Each is read by name (observeDestination:
  * one ref advertised, its objects fetched, nothing written), and ancestry is decided locally. Listing the remote
  * instead carried its whole advertisement, 8,584 heads on hh-dev's origin, per moved submodule.
@@ -2044,15 +2045,18 @@ async function remoteReachesCommit(
       commit,
       "--format=%(refname)%00%(upstream:remotename)%00%(upstream:remoteref)",
       "refs/heads/",
+      `${ARCHIVE_REF_PREFIX}/`,
     ],
-    "list-branches-containing-pin",
+    "list-refs-containing-pin",
   )
-  const branches = local
+  const candidates = local
     .split(/\r?\n/u)
     .filter((row) => row !== "")
     .map((row) => {
       const [name = "", upstreamRemote = "", upstreamRef = ""] = row.split("\0")
-      return upstreamRemote === remote && upstreamRef.startsWith("refs/heads/") ? upstreamRef : name
+      return name.startsWith("refs/heads/") && upstreamRemote === remote && upstreamRef.startsWith("refs/heads/")
+        ? upstreamRef
+        : name
     })
   const read: string[] = []
   const reaches = async (ref: string): Promise<boolean> => {
@@ -2069,7 +2073,7 @@ async function remoteReachesCommit(
     remember(witness)
     return reached
   }
-  for (const ref of [...branches, `refs/git-super/pins/${commit}`]) {
+  for (const ref of [...candidates, `refs/git-super/pins/${commit}`]) {
     if (await reaches(ref)) return { reached: true, read }
   }
   // Resolved last: an unconfigured branch is asked of the remote's HEAD, which a hit above never pays for.
