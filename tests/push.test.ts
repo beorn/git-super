@@ -62,9 +62,9 @@ describe("ordinary check publication history", () => {
         ) {
           exercised = true
           if (shape === "deleted-before-observation") git(fixture.childRemote, "update-ref", "-d", archive)
-          else if (shape === "moved-before-observation")
+          else if (shape === "moved-before-observation") {
             git(fixture.childRemote, "update-ref", archive, fixture.childBefore)
-          else return { code: 74, stdout: "", stderr: "fixture cannot read exact archive destination" }
+          } else return { code: 74, stdout: "", stderr: "fixture cannot read exact archive destination" }
         }
         // Check mode observes a witness; it does not lock every child ref
         // until the parent write. Pin that precise limitation, not a claim
