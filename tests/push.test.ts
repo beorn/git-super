@@ -25,42 +25,91 @@ describe("ordinary check publication history", () => {
   // @failure Saved child archives cannot witness a parent publication, or a
   // local archive is mistaken for remote custody. Branch/pin cases cannot see
   // a containing archive descendant. @level l3 @consumer saved-copy writers
-  test.each(["exact", "descendant", "local-only", "wrong-remote"] as const)(
-    "checks owning-remote archive custody: %s",
-    async (shape) => {
-      const fixture = recursivePushFixture(`archive-${shape}`)
-      const archive = `refs/archive/2026-10-20/worktree/child/${fixture.childSource}`
-      const tip =
-        shape === "descendant"
-          ? advanceRepository(fixture.child, "child.txt", "archived descendant\n")
-          : fixture.childSource
-      git(fixture.child, "update-ref", archive, tip)
-      if (shape !== "local-only") {
-        git(fixture.child, "push", "-q", "origin", `${shape === "wrong-remote" ? fixture.childBefore : tip}:${archive}`)
-      }
-      const destination = `refs/archive/2026-10-20/worktree/root/${fixture.rootSource}`
-      const result = await superPush({
-        repo: fixture.root,
-        remote: "origin",
-        refspecs: [`${fixture.rootSource}:${destination}`],
-        recurseSubmodules: "check",
+  test.each([
+    "exact",
+    "descendant",
+    "local-only",
+    "wrong-remote",
+    "deleted-before-observation",
+    "moved-before-observation",
+    "unreadable-observation",
+    "moved-after-witness",
+  ] as const)("checks owning-remote archive custody: %s", async (shape) => {
+    const fixture = recursivePushFixture(`archive-${shape}`)
+    const archive = `refs/archive/2026-10-20/worktree/child/${fixture.childSource}`
+    const tip =
+      shape === "descendant"
+        ? advanceRepository(fixture.child, "child.txt", "archived descendant\n")
+        : fixture.childSource
+    git(fixture.child, "update-ref", archive, tip)
+    if (shape !== "local-only") {
+      git(fixture.child, "push", "-q", "origin", `${shape === "wrong-remote" ? fixture.childBefore : tip}:${archive}`)
+    }
+    const destination = `refs/archive/2026-10-20/worktree/root/${fixture.rootSource}`
+    const native = createLocalGitProcess()
+    let exercised = false
+    const process: GitProcess = {
+      run: async (request) => {
+        const observing =
+          request.repo === fixture.child &&
+          request.args[0] === "fetch" &&
+          request.args.includes("--dry-run") &&
+          request.args.some((arg) => arg.startsWith(`+${archive}:`))
+        if (
+          !exercised &&
+          observing &&
+          ["deleted-before-observation", "moved-before-observation", "unreadable-observation"].includes(shape)
+        ) {
+          exercised = true
+          if (shape === "deleted-before-observation") git(fixture.childRemote, "update-ref", "-d", archive)
+          else if (shape === "moved-before-observation")
+            git(fixture.childRemote, "update-ref", archive, fixture.childBefore)
+          else return { code: 74, stdout: "", stderr: "fixture cannot read exact archive destination" }
+        }
+        // Check mode observes a witness; it does not lock every child ref
+        // until the parent write. Pin that precise limitation, not a claim
+        // that a later movement is rejected by a nonexistent final reread.
+        if (
+          !exercised &&
+          shape === "moved-after-witness" &&
+          request.repo === fixture.root &&
+          request.args[0] === "push" &&
+          !request.args.includes("--dry-run")
+        ) {
+          exercised = true
+          git(fixture.childRemote, "update-ref", archive, fixture.childBefore)
+        }
+        return native.run(request)
+      },
+    }
+    const result = await superPush({
+      repo: fixture.root,
+      remote: "origin",
+      refspecs: [`${fixture.rootSource}:${destination}`],
+      recurseSubmodules: "check",
+      git: process,
+    })
+    if (shape.includes("observation") || shape === "moved-after-witness") expect(exercised).toBe(true)
+    if (shape === "exact" || shape === "descendant" || shape === "moved-after-witness") {
+      expect(result, JSON.stringify(result)).toMatchObject({ state: "updated", partial: false })
+      expect(git(fixture.rootRemote, "rev-parse", destination)).toBe(fixture.rootSource)
+      expect(git(fixture.childRemote, "rev-parse", archive)).toBe(
+        shape === "moved-after-witness" ? fixture.childBefore : tip,
+      )
+    } else {
+      expect(result, JSON.stringify(result)).toMatchObject({
+        state: "failed",
+        partial: false,
+        detail:
+          shape === "unreadable-observation"
+            ? { code: "submodule-availability-unknown", phase: "check-submodule-availability" }
+            : { code: "submodule-commit-unavailable" },
       })
-      if (shape === "exact" || shape === "descendant") {
-        expect(result, JSON.stringify(result)).toMatchObject({ state: "updated", partial: false })
-        expect(git(fixture.rootRemote, "rev-parse", destination)).toBe(fixture.rootSource)
-        expect(git(fixture.childRemote, "rev-parse", archive)).toBe(tip)
-      } else {
-        expect(result, JSON.stringify(result)).toMatchObject({
-          state: "failed",
-          partial: false,
-          detail: { code: "submodule-commit-unavailable" },
-        })
-        expect(git(fixture.rootRemote, "for-each-ref", "--format=%(refname)", destination)).toBe("")
-      }
-      expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(fixture.childBefore)
-      expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(fixture.rootBefore)
-    },
-  )
+      expect(git(fixture.rootRemote, "for-each-ref", "--format=%(refname)", destination)).toBe("")
+    }
+    expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(fixture.childBefore)
+    expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(fixture.rootBefore)
+  })
 
   test("inherits a published parent pin without discovering its absent child", async () => {
     const fixture = recursivePushFixture("publication-published-parent")
@@ -93,7 +142,11 @@ describe("ordinary check publication history", () => {
   })
 
   // AC2/AC3 share a parent-publication boundary: parent reachability never substitutes for a changed nested pin.
-  test.each([false, true])("a published moved parent with nested changed=%s", async (changed) => {
+  test.each([
+    [false, false],
+    [true, false],
+    [true, true],
+  ] as const)("a published moved parent with nested changed=%s archive=%s", async (changed, archived) => {
     const fixture = nestedRecursivePushFixture(`publication-nested-${changed}`)
     const baselineParent = git(fixture.child, "rev-parse", `${fixture.childSource}^`)
     const baselineRoot = git(fixture.root, "rev-parse", `${fixture.rootSource}^`)
@@ -111,6 +164,11 @@ describe("ordinary check publication history", () => {
           "move parent with same nested pin",
         )
     git(fixture.child, "push", "-q", "origin", `${movedParent}:refs/heads/main`)
+    if (archived) {
+      const archive = `refs/archive/2026-10-20/worktree/leaf/${fixture.leafSource}`
+      git(fixture.leaf, "update-ref", archive, fixture.leafSource)
+      git(fixture.leaf, "push", "-q", "origin", `${fixture.leafSource}:${archive}`)
+    }
     git(fixture.root, "read-tree", baselineRoot)
     git(fixture.root, "update-index", "--cacheinfo", `160000,${movedParent},child`)
     const source = git(
@@ -131,7 +189,7 @@ describe("ordinary check publication history", () => {
       recurseSubmodules: "check",
     })
 
-    if (changed) {
+    if (changed && !archived) {
       expect(result, JSON.stringify(result)).toMatchObject({
         state: "failed",
         partial: false,
@@ -168,48 +226,60 @@ describe("ordinary check publication history", () => {
     expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(fixture.childBefore)
   })
 
-  test.each(["linear removal", "second-parent removal"] as const)(
-    "refuses an unpublished child introduced before %s",
-    async (history) => {
-      const fixture = recursivePushFixture(`publication-${history.replaceAll(" ", "-")}`)
-      let source: string
-      if (history === "linear removal") {
-        git(fixture.root, "update-index", "--force-remove", "child", ".gitmodules")
-        git(fixture.root, "commit", "-q", "-m", "remove child from candidate tip")
-        source = git(fixture.root, "rev-parse", "HEAD")
-      } else {
-        const baselineTree = git(fixture.root, "rev-parse", `${fixture.rootBefore}^{tree}`)
-        const left = git(fixture.root, "commit-tree", baselineTree, "-p", fixture.rootBefore, "-m", "left")
-        source = git(
-          fixture.root,
-          "commit-tree",
-          baselineTree,
-          "-p",
-          left,
-          "-p",
-          fixture.rootSource,
-          "-m",
-          "merge removes second-parent introduced pin",
-        )
-      }
+  test.each([
+    ["linear removal", false],
+    ["second-parent removal", false],
+    ["linear removal", true],
+    ["second-parent removal", true],
+  ] as const)("checks a historical child before %s with archive=%s", async (history, archived) => {
+    const fixture = recursivePushFixture(`publication-${history.replaceAll(" ", "-")}`)
+    let source: string
+    if (history === "linear removal") {
+      git(fixture.root, "update-index", "--force-remove", "child", ".gitmodules")
+      git(fixture.root, "commit", "-q", "-m", "remove child from candidate tip")
+      source = git(fixture.root, "rev-parse", "HEAD")
+    } else {
+      const baselineTree = git(fixture.root, "rev-parse", `${fixture.rootBefore}^{tree}`)
+      const left = git(fixture.root, "commit-tree", baselineTree, "-p", fixture.rootBefore, "-m", "left")
+      source = git(
+        fixture.root,
+        "commit-tree",
+        baselineTree,
+        "-p",
+        left,
+        "-p",
+        fixture.rootSource,
+        "-m",
+        "merge removes second-parent introduced pin",
+      )
+    }
+    if (archived) {
+      const archive = `refs/archive/2026-10-20/worktree/historical/${fixture.childSource}`
+      git(fixture.child, "update-ref", archive, fixture.childSource)
+      git(fixture.child, "push", "-q", "origin", `${fixture.childSource}:${archive}`)
+    }
 
-      const result = await superPush({
-        repo: fixture.root,
-        remote: "origin",
-        refspecs: [`${source}:refs/heads/preservation`],
-        recurseSubmodules: "check",
-      })
+    const result = await superPush({
+      repo: fixture.root,
+      remote: "origin",
+      refspecs: [`${source}:refs/heads/preservation`],
+      recurseSubmodules: "check",
+    })
 
+    if (archived) {
+      expect(result, JSON.stringify(result)).toMatchObject({ state: "updated", partial: false })
+      expect(git(fixture.rootRemote, "rev-parse", "refs/heads/preservation")).toBe(source)
+    } else {
       expect(result).toMatchObject({
         state: "failed",
         partial: false,
         detail: { code: "submodule-commit-unavailable", paths: ["child"], objectIds: [fixture.childSource] },
       })
       expect(result.repositories.find((row) => row.repository === fixture.root)?.state).toBe("not-run")
-      expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(fixture.rootBefore)
-      expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(fixture.childBefore)
-    },
-  )
+    }
+    expect(git(fixture.rootRemote, "rev-parse", "refs/heads/main")).toBe(fixture.rootBefore)
+    expect(git(fixture.childRemote, "rev-parse", "refs/heads/main")).toBe(fixture.childBefore)
+  })
 })
 
 afterEach(() => {
