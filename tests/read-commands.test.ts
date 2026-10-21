@@ -975,6 +975,43 @@ describe("Phase 1 read commands", () => {
     ).toThrow("no consulted repository owns commit")
   })
 
+  test("merge-base prints the underlying git failure for a missing object, as a refusal, never a measured no (30528)", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-missing-object-cause-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+
+    const stdout = outputSink()
+    const stderr = outputSink()
+    const code = await runCli(
+      ["--repo", fixture.product, "merge-base", "--is-ancestor", "d".repeat(40), fixture.productBase],
+      stdout,
+      stderr,
+    )
+
+    expect(code).toBe(2)
+    expect(code).not.toBe(1)
+    expect(stderr.output).toContain("no consulted repository owns commit")
+    expect(stderr.output).toContain("Not a valid object name")
+  })
+
+  test("merge-base exits 2 with the cause when the repository cannot answer at all, never the measured no (30528)", async () => {
+    // A repository that cannot resolve its own descendant is a read failure,
+    // not an ancestry answer; merge-base's 1 is reserved for a real negative.
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-broken-repo-"))
+    roots.push(fixtureRoot)
+    const broken = join(fixtureRoot, "not-a-product")
+    mkdirSync(broken)
+    git(broken, "init", "-q")
+
+    const stdout = outputSink()
+    const stderr = outputSink()
+    const code = await runCli(["--repo", broken, "merge-base", "--is-ancestor", "a".repeat(40), "HEAD"], stdout, stderr)
+
+    expect(code).toBe(2)
+    expect(code).not.toBe(1)
+    expect(stderr.output).toMatch(/fatal:|Needed a single revision|could not resolve/i)
+  })
+
   test("dispatches through the Silvery command tree and preserves JSON and NUL output parity", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-cli-"))
     roots.push(fixtureRoot)

@@ -9,6 +9,7 @@ import {
   runGit,
   tryGit,
   validateExcludedSubmodules,
+  type GitResult,
 } from "./git.ts"
 
 export type SuperIsAncestorOptions = Readonly<{
@@ -55,8 +56,12 @@ function resolveAncestorInRoot(root: string, ancestor: string): string {
   )
 }
 
+function objectProbe(root: string, revision: string): GitResult {
+  return tryGit(root, ["cat-file", "-e", `${revision}^{commit}`])
+}
+
 function objectExists(root: string, revision: string): boolean {
-  return tryGit(root, ["cat-file", "-e", `${revision}^{commit}`]).exitCode === 0
+  return objectProbe(root, revision).exitCode === 0
 }
 
 function isAncestor(root: string, ancestor: string, descendant: string): boolean {
@@ -106,7 +111,8 @@ export function superIsAncestor(options: SuperIsAncestorOptions): SuperIsAncesto
   // against the superproject tip, and returned a confident `false` — reporting
   // landed work as not landed. That manufactured a "km-revert" finding against
   // a rescue ref whose pin had only ever moved forward.
-  const presentAtRoot = objectExists(root, ancestor)
+  const rootProbe = objectProbe(root, ancestor)
+  const presentAtRoot = rootProbe.exitCode === 0
   if (presentAtRoot && reachableFromAnyRef(root, ancestor)) {
     owners.push({ path: ".", root, target: options.descendant })
   }
@@ -168,7 +174,13 @@ export function superIsAncestor(options: SuperIsAncestorOptions): SuperIsAncesto
       .filter(({ reason }) => reason === "absent")
       .map(({ path, message }) => `${path}: ${message}`)
     const absent = absentLines.length === 0 ? "" : `\n${absentLines.join("\n")}`
-    throw new Error(`git super: no consulted repository owns commit ${spelled}${orphaned}${absent}`)
+    // A read failure is not an answer. Print what Git itself said about the
+    // root, so a missing object is never read as a measured "not an ancestor"
+    // (30528); exit 2 already separates this refusal from a true no.
+    const probe = presentAtRoot
+      ? ""
+      : `\nroot read: git -C ${root} cat-file -e ${ancestor}^{commit} exited ${rootProbe.exitCode}${rootProbe.stderr ? `: ${rootProbe.stderr}` : ""}`
+    throw new Error(`git super: no consulted repository owns commit ${spelled}${orphaned}${absent}${probe}`)
   }
   if (owners.length > 1) {
     // Named, never silently preferred. Picking one here is how the wrong
