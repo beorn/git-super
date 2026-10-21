@@ -332,12 +332,8 @@ export interface RehomeBorrowersOptions {
 }
 
 /** Protected roots are pruned before entry, including symlinks. */
-function* borrowerEntries(
-  root: string,
-  excludedStores: RemovalBorrower["excludedStores"],
-  purpose: "custody" | "dependencies",
-): Generator<Dirent> {
-  const dependencyStore = purpose === "dependencies" && isGitDirectory(root, root, false)
+function* borrowerEntries(root: string, excludedStores: RemovalBorrower["excludedStores"]): Generator<Dirent> {
+  const dependencyStore = isGitDirectory(root, root, false)
   for (const entry of readdirSync(root, { withFileTypes: true })) {
     const path = join(root, entry.name)
     if (excludedStores?.some((excluded) => within(excluded.store, path))) continue
@@ -354,7 +350,7 @@ function* borrowerEntries(
     // already read through (hh 28572). Only `info` can carry a borrower marker, so the walk never
     // enters the others.
     if (basename(root) === "objects" && entry.name !== "info") continue
-    yield* borrowerEntries(path, excludedStores, purpose)
+    yield* borrowerEntries(path, excludedStores)
   }
 }
 
@@ -538,7 +534,7 @@ function rehomeBorrowerCandidates(
     try {
       for (const includedStore of candidate.includedStores ?? [candidateModules]) {
         if (!existsSync(includedStore)) continue
-        for (const entry of borrowerEntries(includedStore, candidate.excludedStores, "dependencies")) {
+        for (const entry of borrowerEntries(includedStore, candidate.excludedStores)) {
           if (entry.isSymbolicLink() && entry.name === "objects") {
             const objects = join(entry.parentPath, entry.name)
             let target: string

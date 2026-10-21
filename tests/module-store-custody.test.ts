@@ -183,12 +183,34 @@ describe("slot module store custody", () => {
     const slot = await linkedSlot(fixtureRoot("module-local-archive"))
     const tip = localCommit(slot.child)
     git(slot.child, "update-ref", `refs/archive/${DATE}/someone/kept`, tip)
+    // HEAD leaves the commit, so nothing but the local archive ref holds it.
+    git(slot.child, "checkout", "-q", "--detach", "HEAD~1")
     dropAlphaFromHead(slot.linked)
     const inventory = inspectModuleStores(slot.linked, slot.gitDir)
     expect(inventory.stores[0]!.valueCommits).toBe(1)
     const archived = archiveModuleStores(inventory.stores, { actor: "dev-test", date: DATE })
-    expect(archived[0]!.archived).toEqual([`refs/archive/${DATE}/dev-test/packages/alpha/HEAD`])
-    expect(git(slot.fixture.alpha, "rev-parse", `refs/archive/${DATE}/dev-test/packages/alpha/HEAD`)).toBe(tip)
+    const kept = `refs/archive/${DATE}/dev-test/packages/alpha/archive/${DATE}/someone/kept`
+    expect(archived[0]!.archived).toEqual([kept])
+    expect(git(slot.fixture.alpha, "rev-parse", kept).trim()).toBe(tip)
+  })
+
+  test("a second archive the same day never replaces the first; the new one takes its short id (row 1)", async () => {
+    const slot = await linkedSlot(fixtureRoot("module-archive-twice"))
+    const earlier = `refs/archive/${DATE}/dev-test/packages/alpha/HEAD`
+    const first = localCommit(slot.child)
+    git(slot.child, "push", "-q", "origin", `HEAD:${earlier}`)
+    writeFileSync(join(slot.child, "second.txt"), "more bytes that exist only here\n")
+    git(slot.child, "add", "-A")
+    git(slot.child, "commit", "-q", "-m", "second local work")
+    const second = git(slot.child, "rev-parse", "HEAD").trim()
+    dropAlphaFromHead(slot.linked)
+    const archived = archiveModuleStores(inspectModuleStores(slot.linked, slot.gitDir).stores, {
+      actor: "dev-test",
+      date: DATE,
+    })
+    expect(archived[0]!.archived).toEqual([`${earlier}-${second.slice(0, 12)}`])
+    expect(git(slot.fixture.alpha, "rev-parse", earlier).trim()).toBe(first)
+    expect(git(slot.fixture.alpha, "rev-parse", `${earlier}-${second.slice(0, 12)}`).trim()).toBe(second)
   })
 
   test("a commit the remote holds only under refs/archive is released (row 1)", async () => {

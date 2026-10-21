@@ -23,6 +23,8 @@ export type ModuleStore = Readonly<{
   valueCommits: number
   /** The refs holding those commits, with the archive name each is pushed under. */
   refs: readonly Readonly<{ source: string; label: string }>[]
+  /** The `refs/archive/*` names the remote already holds, so an archive push never takes one and replaces it. */
+  remoteArchiveRefs: readonly string[]
   /** Archive refs this removal created, in the order they were pushed. */
   archived: readonly string[]
 }>
@@ -135,6 +137,18 @@ function refsMatching(gitDir: string, prefixes: readonly string[]): string[] {
   return listed.stdout.split("\n").filter((ref) => ref.trim() !== "")
 }
 
+/** The object a store ref or sha names, so an archive name can carry it. */
+function objectId(gitDir: string, source: string): string {
+  const resolved = storeGit(gitDir, ["rev-parse", "--verify", "--quiet", source])
+  const id = resolved.stdout.trim()
+  if (resolved.status !== 0 || id === "") {
+    throw new Error(
+      `module store ${gitDir} could not resolve ${source} (${resolved.stderr.trim() || `exit ${String(resolved.status)}`}); worktree preserved`,
+    )
+  }
+  return id
+}
+
 /** The commits among `shas` whose objects the store does not have yet. */
 function missingObjects(gitDir: string, shas: readonly string[]): string[] {
   if (shas.length === 0) return []
@@ -157,7 +171,10 @@ function missingObjects(gitDir: string, shas: readonly string[]): string[] {
  * fetched first, because reachability needs them. A remote that cannot be read stops removal, with no fallback
  * to the local copies.
  */
-function remoteDurableTips(gitDir: string, remote: string): Readonly<{ defaultBranch?: string; tips: string[] }> {
+function remoteDurableTips(
+  gitDir: string,
+  remote: string,
+): Readonly<{ defaultBranch?: string; tips: string[]; archiveRefs: string[] }> {
   const listed = storeGit(gitDir, ["ls-remote", "--symref", remote, "HEAD", "refs/archive/*"], REMOTE_READ_TIMEOUT_MS)
   if (listed.status !== 0) {
     throw new Error(
@@ -215,18 +232,19 @@ function remoteDurableTips(gitDir: string, remote: string): Readonly<{ defaultBr
       )
     }
   }
-  return { ...(defaultBranch === undefined ? {} : { defaultBranch }), tips }
+  return { ...(defaultBranch === undefined ? {} : { defaultBranch }), tips, archiveRefs: [...archive.keys()] }
 }
 
 /** A ref that could hold work, and the name its commit is archived under. */
 type LocalRef = Readonly<{ source: string; label: string }>
 
 /**
- * The store's own refs that could hold work: HEAD, every branch, every tag, and every stash entry. A stash
- * entry has no ref name of its own, so its commit is archived under its position.
+ * The store's own refs that could hold work: HEAD, every branch, every tag, every local archive ref (it dies with
+ * the store, so it holds work rather than proving it is kept), and every stash entry. A stash entry has no ref
+ * name of its own, so its commit is archived under its position.
  */
 function localRefs(gitDir: string): LocalRef[] {
-  const refs = refsMatching(gitDir, ["refs/heads", "refs/tags"])
+  const refs = refsMatching(gitDir, ["refs/heads", "refs/tags", "refs/archive"])
   const head = storeGit(gitDir, ["rev-parse", "--verify", "--quiet", "HEAD"])
   const headTip = head.status === 0 ? head.stdout.trim() : ""
   // Stash entries are commits reachable only through refs/stash's reflog, so its tip alone is not enough.
@@ -252,7 +270,7 @@ function localRefs(gitDir: string): LocalRef[] {
   }
   return [
     ...(headTip === "" ? [] : [{ source: headTip, label: "HEAD" }]),
-    ...refs.map((ref) => ({ source: ref, label: ref.replace(/^refs\/(heads|tags)\//u, "$1/") })),
+    ...refs.map((ref) => ({ source: ref, label: ref.replace(/^refs\/(heads|tags|archive)\//u, "$1/") })),
     ...stash,
   ]
 }
@@ -302,9 +320,10 @@ export function moduleStoreValue(gitDir: string): Readonly<{
   remote?: string
   defaultBranch?: string
   head?: string
+  remoteArchiveRefs: readonly string[]
 }> {
   const remote = storeRemote(gitDir)
-  const durable = remote === undefined ? { tips: [] } : remoteDurableTips(gitDir, remote)
+  const durable = remote === undefined ? { tips: [], archiveRefs: [] } : remoteDurableTips(gitDir, remote)
   const exclusions = durable.tips
   const local = localRefs(gitDir)
   const valueCommits = count(
@@ -316,6 +335,7 @@ export function moduleStoreValue(gitDir: string): Readonly<{
   return {
     valueCommits,
     refs: local.filter((ref) => count(gitDir, [ref.source], exclusions) > 0),
+    remoteArchiveRefs: durable.archiveRefs,
     ...(remote === undefined ? {} : { remote }),
     ...(durable.defaultBranch === undefined ? {} : { defaultBranch: durable.defaultBranch }),
     ...(headShort === undefined ? {} : { head: headShort }),
@@ -446,6 +466,7 @@ function judgeStores(
       gitDir: entry.path,
       valueCommits: value.valueCommits,
       refs: value.refs,
+      remoteArchiveRefs: value.remoteArchiveRefs,
       archived: [],
       ...(value.head === undefined ? {} : { head: value.head }),
       ...(value.remote === undefined ? {} : { remote: value.remote }),
@@ -473,11 +494,16 @@ export function archiveModuleStores(
       )
     }
     const archived: string[] = []
+    const taken = new Set(store.remoteArchiveRefs)
     for (const ref of store.refs) {
-      const destination = archiveRefFor(`${store.name}/${ref.label}`, target.actor, target.date)
+      const named = archiveRefFor(`${store.name}/${ref.label}`, target.actor, target.date)
+      // A name the remote already holds keeps another commit (the commits it holds are not value), so this one
+      // takes its object's short id instead. An archive is never replaced, and the push needs no force; a name
+      // taken in the meantime fails the push and stops the removal.
+      const destination = taken.has(named) ? `${named}-${objectId(store.gitDir, ref.source).slice(0, 12)}` : named
       const pushed = storeGit(
         store.gitDir,
-        ["push", "--force", store.remote, `${ref.source}:${destination}`],
+        ["push", store.remote, `${ref.source}:${destination}`],
         ARCHIVE_PUSH_TIMEOUT_MS,
       )
       if (pushed.status !== 0) {
