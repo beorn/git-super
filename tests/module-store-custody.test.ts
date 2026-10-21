@@ -507,7 +507,16 @@ describe("slot module store custody", () => {
     expect(admitted.submoduleProblems).toEqual([])
     // The same store with a remote that cannot be read is unknown, never "holds nothing".
     const pushedStore = join(pushed.product, ".git/modules/packages/alpha")
-    storeGitOutput(pushed.product, pushedStore, "config", "remote.origin.url", join(pushed.alpha, "..", "gone"))
+    // Write the store's config file directly: its core.worktree names the removed checkout, and an older
+    // git (CI's ubuntu-latest) still enters it under --git-dir --bare and dies with "cannot chdir".
+    git(
+      pushed.product,
+      "config",
+      "--file",
+      join(pushedStore, "config"),
+      "remote.origin.url",
+      join(pushed.alpha, "..", "gone"),
+    )
     const unread = superStatus({ repo: pushed.product })
     expect(unread.uninitializedSubmodules).not.toContain("packages/alpha")
     expect(unread.submoduleProblems).toHaveLength(1)
