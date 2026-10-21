@@ -93,11 +93,12 @@ function selectedCustodyAdapters(
     if (gitProcess.stream === undefined) {
       throw new Error("selected Git process does not support bounded output streaming")
     }
+    const selectedSignal = streamOptions.signal ?? signal
     return gitProcess.stream({
       repo,
       args,
       env: { ...baseEnv, ...streamOptions.env, GIT_NO_REPLACE_OBJECTS: "1", GIT_NO_LAZY_FETCH: "1" },
-      ...((streamOptions.signal ?? signal) === undefined ? {} : { signal: streamOptions.signal ?? signal }),
+      ...(selectedSignal === undefined ? {} : { signal: selectedSignal }),
       timeoutMs: Math.min(streamOptions.timeoutMs ?? Number.POSITIVE_INFINITY, left),
       maxBytes: Math.min(streamOptions.maxBytes ?? COMPONENT_STREAM_MAX_BYTES, COMPONENT_STREAM_MAX_BYTES),
       maxLines: Math.min(streamOptions.maxLines ?? COMPONENT_STREAM_MAX_LINES, COMPONENT_STREAM_MAX_LINES),

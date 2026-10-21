@@ -806,7 +806,11 @@ async function runInvocation(
           ...(options.rehome === false ? { noRehome: true } : {}),
           ...(options.componentCustody === undefined
             ? {}
-            : { componentCustody: JSON.parse(options.componentCustody) as WorktreeRemoveParams["componentCustody"] }),
+            : {
+                componentCustody: JSON.parse(options.componentCustody) as NonNullable<
+                  WorktreeRemoveParams["componentCustody"]
+                >,
+              }),
           ...(options.excludeSubmodule?.length ? { excludedSubmodules: options.excludeSubmodule } : {}),
           ...(options.preserved?.length ? { preserved: options.preserved } : {}),
         },
