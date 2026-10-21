@@ -114,6 +114,9 @@ function scan(
     stream: GitStreamFactory
     bounds: { maxEffectiveOids: number; componentMs: number }
     clock: () => number
+    sourceMode: "retention" | "complete-commit"
+    sources: readonly { component: string; gitDir: string; workTree: string }[]
+    deadline: number
   }> = {},
 ): Promise<ContentsScan> {
   return scanContents(copyRoot, entries, [], { sidecarDir: tmp("git-super-contents-sidecars-"), ...options })
@@ -175,8 +178,55 @@ describe("retention contents scan — gate 4 (#27443(b))", () => {
     const result = await scan(borrower, componentEntries(".git"))
     expect(result.status).toBe("pass")
     expect(result.components[0]!.effective).toBeGreaterThan(0)
+    expect(result.components[0]).not.toHaveProperty("gitDir")
     expect(result.components[0]!.atRisk).toBe(0)
     expect((await atRiskOf(result)).map((row) => row.oid)).not.toContain(lender.head)
+  })
+
+  test("complete-commit mode inventories commits available through alternates without subtracting them", async () => {
+    const lender = repoWithCommit("git-super-contents-complete-lender-")
+    const borrower = tmp("git-super-contents-complete-borrower-")
+    git(borrower, ["init", "-q", "-b", "main"])
+    mkdirSync(join(borrower, ".git", "objects", "info"), { recursive: true })
+    writeFileSync(join(borrower, ".git", "objects", "info", "alternates"), `${join(lender.root, ".git", "objects")}\n`)
+    writeFileSync(join(borrower, ".git", "refs", "heads", "borrowed"), `${lender.head}\n`)
+    const source = [{ component: "component-a", gitDir: join(borrower, ".git"), workTree: borrower }]
+    const complete = await scan(borrower, {}, { sourceMode: "complete-commit", sources: source })
+    const retained = await scan(borrower, componentEntries(".git"))
+    expect(complete.status).toBe("pass")
+    expect(complete.components[0]?.gitDir).toBe(join(borrower, ".git"))
+    expect((await atRiskOf(complete)).map((row) => row.oid)).toContain(lender.head)
+    expect((await atRiskOf(complete)).every((row) => row.type === "commit")).toBe(true)
+    expect(retained.status).toBe("pass")
+    expect((await atRiskOf(retained)).map((row) => row.oid)).not.toContain(lender.head)
+  })
+
+  test("complete-commit mode refuses an empty source inventory", async () => {
+    const result = await scan(
+      tmp("git-super-contents-empty-sources-"),
+      {},
+      {
+        sourceMode: "complete-commit",
+        sources: [],
+      },
+    )
+    expect(result.status).toBe("unknown")
+    expect(result.detail).toContain("source inventory is empty")
+  })
+
+  test("complete-commit mode bounds reflog records before sorting roots", async () => {
+    const { root } = repoWithCommit("git-super-contents-complete-reflog-bound-")
+    const result = await scan(
+      root,
+      {},
+      {
+        sourceMode: "complete-commit",
+        sources: [{ component: "component-a", gitDir: join(root, ".git"), workTree: root }],
+        bounds: { maxEffectiveOids: 0, componentMs: 10_000 },
+      },
+    )
+    expect(result.status).toBe("unknown")
+    expect(result.detail).toContain("logs/HEAD exceeds the 0-line bound")
   })
 
   test("a dangling alternate is unknown, never a silent skip", async () => {
@@ -211,6 +261,19 @@ describe("retention contents scan — gate 4 (#27443(b))", () => {
     expect(result.detail).toContain("a".repeat(40))
   })
 
+  test("a gitlink index OID is checked by its child store, while ordinary index OIDs remain roots", async () => {
+    const { root } = repoWithCommit("git-super-contents-gitlink-index-")
+    const childCommit = "a".repeat(40)
+    const missingBlob = "b".repeat(40)
+    git(root, ["update-index", "--add", "--cacheinfo", `160000,${childCommit},child`])
+    git(root, ["update-index", "--add", "--cacheinfo", `100644,${missingBlob},missing.txt`])
+
+    const result = await scan(root, componentEntries(".git"))
+    expect(result.status).toBe("blocked")
+    expect(result.components[0]!.missingRoots).toBe(1)
+    expect(result.components[0]!.missingRootsSample).toEqual([missingBlob])
+  })
+
   test("the creation reflog's zero OIDs are excluded, never missing roots", async () => {
     const { root } = repoWithCommit("git-super-contents-")
     const result = await scan(root, componentEntries(".git"))
@@ -228,6 +291,13 @@ describe("retention contents scan — gate 4 (#27443(b))", () => {
     })
     expect(result.status).toBe("unknown")
     expect(result.detail).toContain("component bound")
+  })
+
+  test("an exhausted shared proof deadline is unknown before a component query", async () => {
+    const { root } = repoWithCommit("git-super-contents-deadline-")
+    const result = await scan(root, componentEntries(".git"), { deadline: 0 })
+    expect(result.status).toBe("unknown")
+    expect(result.detail).toContain("shared proof deadline")
   })
 
   test("a hung git child is killed at the requested timeout, never blocking the scan", async () => {

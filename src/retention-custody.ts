@@ -87,6 +87,10 @@ export interface CustodyScanOptions {
   readonly stream?: GitStreamFactory
   readonly bounds?: CustodyBounds
   readonly clock?: () => number
+  /** Shared absolute proof deadline in the same clock domain as `clock`; exhaustion is unknown. */
+  readonly deadline?: number
+  /** When present, only this target branch and exact-suffix primary pin refs are durable witnesses. */
+  readonly witnessPolicy?: Readonly<{ targetBranch: string }>
 }
 
 const HEX40 = /^[0-9a-f]{40}$/u
@@ -104,6 +108,12 @@ class UnknownError extends Error {
 
 function isDurableRef(ref: string): boolean {
   return DURABLE_REF.test(ref) || PIN_REF.test(ref)
+}
+
+function isPolicyRef(ref: string, tip: string, targetBranch: string): boolean {
+  if (ref === `refs/heads/${targetBranch}`) return true
+  const pin = /^(?:refs\/git-super\/pins|refs\/yrd\/pins)\/([0-9a-f]{40})$/u.exec(ref)
+  return pin?.[1] === tip
 }
 
 function within(parent: string, path: string): boolean {
@@ -157,11 +167,11 @@ function alternateClosure(
   return { status: "ok", stores }
 }
 
-function objectFormat(
+async function objectFormat(
   gitDir: string,
   run: GitRun,
-): { status: "ok"; format: string } | { status: "unknown"; detail: string } {
-  const result = run([`--git-dir=${gitDir}`, "rev-parse", "--show-object-format"])
+): Promise<{ status: "ok"; format: string } | { status: "unknown"; detail: string }> {
+  const result = await run([`--git-dir=${gitDir}`, "rev-parse", "--show-object-format"])
   refuseSuccessfulStderr(result, `rev-parse --show-object-format in ${gitDir}`)
   if (result.code !== 0) {
     return { status: "unknown", detail: `rev-parse --show-object-format failed in ${gitDir}: ${result.stderr.trim()}` }
@@ -200,23 +210,37 @@ async function indexWitnessStores(
   bounds: CustodyBounds,
   clock: () => number,
   sidecarDir: string,
+  witnessPolicy?: Readonly<{ targetBranch: string }>,
+  deadline?: number,
 ): Promise<{ records: DurableRefRecord[]; formats: Map<string, string> }> {
   const records: DurableRefRecord[] = []
   const formats = new Map<string, string>()
   for (const store of stores) {
     const gitDir = dirname(store)
-    const format = objectFormat(gitDir, run)
+    const format = await objectFormat(gitDir, run)
     if (format.status !== "ok") throw new UnknownError(format.detail)
     formats.set(store, format.format)
+    if (witnessPolicy !== undefined) {
+      const shallow = await run([`--git-dir=${gitDir}`, "rev-parse", "--is-shallow-repository"])
+      refuseSuccessfulStderr(shallow, `rev-parse --is-shallow-repository in ${gitDir}`)
+      if (shallow.code !== 0 || !["true", "false"].includes(shallow.stdout.trim())) {
+        throw new UnknownError(
+          `rev-parse --is-shallow-repository failed in ${gitDir}: ${shallow.stderr.trim() || shallow.stdout.trim()}`,
+        )
+      }
+      if (shallow.stdout.trim() === "true") {
+        throw new UnknownError(`witness graph in ${gitDir} is shallow and cannot prove complete custody`)
+      }
+    }
     const closureResult = alternateClosure(store, removal)
     if (closureResult.status !== "ok") throw new UnknownError(closureResult.detail)
     // A hung `fsck` is killed at the declared deadline and reported unknown, never blocking.
-    const fsck = run([`--git-dir=${gitDir}`, "fsck", "--full", "--no-progress"], { timeoutMs: bounds.fsckMs })
+    const fsck = await run([`--git-dir=${gitDir}`, "fsck", "--full", "--no-progress"], { timeoutMs: bounds.fsckMs })
     refuseSuccessfulStderr(fsck, `fsck --full in witness store ${gitDir}`)
     if (fsck.code !== 0) {
       throw new UnknownError(`fsck --full failed in witness store ${gitDir}: ${fsck.stderr.trim()}`)
     }
-    const refs = run([`--git-dir=${gitDir}`, "for-each-ref", "--format=%(refname)%09%(objectname)"])
+    const refs = await run([`--git-dir=${gitDir}`, "for-each-ref", "--format=%(refname)%09%(objectname)"])
     refuseSuccessfulStderr(refs, `for-each-ref in witness store ${gitDir}`)
     if (refs.code !== 0) {
       throw new UnknownError(`for-each-ref failed in witness store ${gitDir}: ${refs.stderr.trim()}`)
@@ -230,7 +254,9 @@ async function indexWitnessStores(
       }
       // A transient operation ref, remote-tracking ref or detached HEAD is never a durable
       // witness: only a named branch, tag or GitSuper pin qualifies (contract gate 5).
-      if (!isDurableRef(ref)) continue
+      if (witnessPolicy === undefined ? !isDurableRef(ref) : !isPolicyRef(ref, tip, witnessPolicy.targetBranch)) {
+        continue
+      }
       durable.push({ ref, tip })
     }
     durable.sort((left, right) => (left.ref < right.ref ? -1 : left.ref > right.ref ? 1 : 0))
@@ -243,6 +269,8 @@ async function indexWitnessStores(
       const sidecar = await externalSortToSidecar(reachableOidLines(lineStream, gitDir, entry.tip), {
         dir: sidecarDir,
         runLines: DEFAULT_SORT_RUN_LINES,
+        deadline,
+        clock,
       })
       const outcome = await lineStream.outcome
       assertStreamComplete(outcome, {
@@ -254,6 +282,7 @@ async function indexWitnessStores(
       if (clock() - started > bounds.reachableMs) {
         throw new UnknownError(`rev-list ${entry.tip} in ${gitDir} exceeded the ${bounds.reachableMs} ms bound`)
       }
+      if (deadline !== undefined && clock() >= deadline) throw new UnknownError("shared proof deadline is exhausted")
       records.push({ store, ref: entry.ref, tip: entry.tip, format: format.format, sidecar })
     }
   }
@@ -270,6 +299,8 @@ async function runCustody(
   bounds: CustodyBounds,
   clock: () => number,
   sidecarDir: string,
+  witnessPolicy?: Readonly<{ targetBranch: string }>,
+  deadline?: number,
 ): Promise<CustodyScan> {
   const stores = [...new Set(witnessStores.map((store) => realpathSync(store)))]
     .filter((store) => !removal.some((root) => within(root, store)))
@@ -285,11 +316,44 @@ async function runCustody(
       missingCount: 0,
     }
   }
-  const { records, formats } = await indexWitnessStores(stores, removal, stream, run, bounds, clock, sidecarDir)
+  const remaining = (): number => {
+    const left = deadline === undefined ? Number.POSITIVE_INFINITY : deadline - clock()
+    if (left <= 0) throw new UnknownError("shared proof deadline is exhausted")
+    return left
+  }
+  const proofRun: GitRun = async (args, runOptions = {}) => {
+    const timeoutMs = Math.min(runOptions.timeoutMs ?? Number.POSITIVE_INFINITY, remaining())
+    return run(witnessPolicy === undefined ? args : ["--no-replace-objects", ...args], {
+      ...runOptions,
+      ...(Number.isFinite(timeoutMs) ? { timeoutMs } : {}),
+      ...(witnessPolicy === undefined
+        ? {}
+        : { env: { ...runOptions.env, GIT_NO_REPLACE_OBJECTS: "1", GIT_NO_LAZY_FETCH: "1" } }),
+    })
+  }
+  const proofStream: GitStreamFactory = (args, streamOptions = {}) =>
+    stream(witnessPolicy === undefined ? args : ["--no-replace-objects", ...args], {
+      ...streamOptions,
+      timeoutMs: Math.min(streamOptions.timeoutMs ?? Number.POSITIVE_INFINITY, remaining()),
+      ...(witnessPolicy === undefined
+        ? {}
+        : { env: { ...streamOptions.env, GIT_NO_REPLACE_OBJECTS: "1", GIT_NO_LAZY_FETCH: "1" } }),
+    })
+  const { records, formats } = await indexWitnessStores(
+    stores,
+    removal,
+    proofStream,
+    proofRun,
+    bounds,
+    clock,
+    sidecarDir,
+    witnessPolicy,
+    deadline,
+  )
   const width = String(Math.max(1, records.length)).length
   const index = await mergeLabeledFiles(
     records.map((record, rank) => ({ path: record.sidecar.path, label: String(rank).padStart(width, "0") })),
-    { dir: sidecarDir },
+    { dir: sidecarDir, deadline, clock },
   )
   const witnessWriter = new SidecarWriter(sidecarDir, "txt")
   const missingWriter = new SidecarWriter(sidecarDir, "txt")
@@ -297,9 +361,11 @@ async function runCustody(
   const missing: CustodyTarget[] = []
   let witnessCount = 0
   let missingCount = 0
+  let merged = 0
   try {
     for (const component of components) {
-      const format = objectFormat(join(copyRoot, component.component), run)
+      remaining()
+      const format = await objectFormat(component.gitDir ?? join(copyRoot, component.component), proofRun)
       if (format.status !== "ok") throw new UnknownError(format.detail)
       await mergeSorted(
         [
@@ -307,6 +373,7 @@ async function runCustody(
           { label: "witness-index", lines: readLines(index.path), keyOf: oidKey },
         ],
         (key, groups) => {
+          if ((merged++ & 1023) === 0) remaining()
           const atRiskLines = groups.find((group) => group.label === "at-risk")?.lines
           if (atRiskLines === undefined || atRiskLines.length === 0) return
           const source = atRiskLines[0]?.split("\t")[2] ?? "owned"
@@ -337,7 +404,9 @@ async function runCustody(
             })
           }
         },
+        { deadline, clock },
       )
+      remaining()
     }
   } catch (error) {
     witnessWriter.abort()
@@ -351,6 +420,7 @@ async function runCustody(
   if (missingCount > 0) missingSidecar = await missingWriter.finish()
   else missingWriter.abort()
   const witnesses = [...identities.values()]
+  remaining()
   const first = missing[0]
   if (missingCount > 0 && first !== undefined) {
     return {
@@ -403,6 +473,8 @@ export async function scanCustody(
       bounds,
       clock,
       options.sidecarDir,
+      options.witnessPolicy,
+      options.deadline,
     )
   } catch (error) {
     return {

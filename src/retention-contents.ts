@@ -6,7 +6,7 @@
  * set). `IndependentStores(g,R)` is the union of the effective sets of external alternate and
  * objects-link targets that are present, independently owned and disjoint from `R`.
  * `AtRisk(g) = Effective(g) \ IndependentStores(g,R)`. `Roots(g)` is every ref, reflog old/new,
- * pseudo-ref and index OID.
+ * pseudo-ref and index OID, except gitlink entries whose commits belong to the child component.
  *
  * Every large set is streamed: the two object sets are compared by a k-way merge over the sorted
  * `cat-file` streams (already OID-sorted) and the roots, and the result lands in content-addressed
@@ -24,6 +24,7 @@ import type { ManifestEntry } from "./worktree-removal.ts"
 import {
   assertStreamComplete,
   DEFAULT_SORT_RUN_LINES,
+  MAX_LINE_LENGTH,
   externalSortToSidecar,
   gitLineStream,
   mergeSorted,
@@ -46,15 +47,34 @@ export interface GitRunResult {
 export interface GitRunOptions {
   /** Hard per-child deadline. A child that outlives it is killed and reported `timedOut`. */
   readonly timeoutMs?: number
+  readonly executable?: string
+  readonly env?: NodeJS.ProcessEnv
+  readonly signal?: AbortSignal
+  readonly killSignal?: NodeJS.Signals
 }
 
-export type GitRun = (args: readonly string[], options?: GitRunOptions) => GitRunResult
+export type GitRun = (args: readonly string[], options?: GitRunOptions) => GitRunResult | Promise<GitRunResult>
 
 /** Streams a git child's stdout as bounded lines; the seam tests use to fake a large or broken output. */
 export type GitStreamFactory = (args: readonly string[], options?: GitStreamOptions) => GitLineStream
 
 /** The production line stream: a real child, killed at its byte/line cap or deadline. */
-export const defaultGitStream: GitStreamFactory = gitLineStream
+export const defaultGitStream: GitStreamFactory = (args, options = {}) =>
+  gitLineStream(args, {
+    ...options,
+    ...(options.env === undefined
+      ? {}
+      : {
+          env: {
+            PATH: process.env.PATH ?? "",
+            HOME: process.env.HOME ?? "",
+            GIT_CONFIG_NOSYSTEM: "1",
+            GIT_TERMINAL_PROMPT: "0",
+            GIT_OPTIONAL_LOCKS: "0",
+            ...options.env,
+          },
+        }),
+  })
 
 export interface ContentsBounds {
   /** 4,000,000 effective OIDs per candidate component in the contract's initial pass. */
@@ -68,9 +88,11 @@ export const DEFAULT_CONTENTS_BOUNDS: ContentsBounds = { maxEffectiveOids: 4_000
 export interface ComponentContents {
   /** The component git directory, relative to the retained copy root. */
   readonly component: string
+  /** Actual component Git directory when supplied by a live census adapter. */
+  readonly gitDir?: string
   readonly effective: number
   readonly independent: number
-  /** OIDs reachable in this component but not in any independent store; the gate 5 input. */
+  /** Gate 5 input: at-risk objects in retention mode, or every effective commit in complete mode. */
   readonly atRisk: number
   /**
    * The sorted at-risk sidecar: one `<oid>\t<objectType>\t<source>` line per at-risk OID. Its
@@ -96,8 +118,20 @@ export interface ContentsScanOptions {
   readonly sidecarDir: string
   readonly run?: GitRun
   readonly stream?: GitStreamFactory
+  /** `complete-commit` inventories every effective commit without independent-store subtraction. */
+  readonly sourceMode?: "retention" | "complete-commit"
+  /** Explicit source Git identities from the live recursive census; otherwise use the manifest adapter. */
+  readonly sources?: readonly ComponentGitSource[]
+  /** Shared absolute proof deadline in the same clock domain as `clock`; exhaustion is unknown. */
+  readonly deadline?: number
   readonly bounds?: ContentsBounds
   readonly clock?: () => number
+}
+
+export interface ComponentGitSource {
+  readonly component: string
+  readonly gitDir: string
+  readonly workTree: string
 }
 
 const PSEUDO_REFS = [
@@ -130,19 +164,21 @@ export function defaultGitRun(args: readonly string[], options: GitRunOptions = 
   // spawnSync requires a non-negative integer and treats 0 as "no timeout"; clamp to >=1 ms so a
   // zero or fractional bound still kills a hung child instead of throwing or disarming the guard.
   const timeoutMs = options.timeoutMs === undefined ? undefined : Math.max(1, Math.ceil(options.timeoutMs))
-  const result = spawnSync("git", [...args], {
+  const result = spawnSync(options.executable ?? "git", [...args], {
     encoding: "utf8",
     maxBuffer: 1 << 30,
     ...(timeoutMs === undefined ? {} : { timeout: timeoutMs }),
     // SIGKILL, not the default SIGTERM: a child that traps or ignores SIGTERM would otherwise run
     // to natural completion and the "hard" deadline would not be hard.
-    killSignal: "SIGKILL",
+    killSignal: options.killSignal ?? "SIGKILL",
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
     env: {
       PATH: process.env.PATH ?? "",
       HOME: process.env.HOME ?? "",
       GIT_CONFIG_NOSYSTEM: "1",
       GIT_TERMINAL_PROMPT: "0",
       GIT_OPTIONAL_LOCKS: "0",
+      ...options.env,
     },
   })
   // spawnSync reports a timeout kill as ETIMEDOUT on `error`, with `status` null. Reporting it as a
@@ -221,6 +257,17 @@ function closure(
 
 export type ReflogEntry = Readonly<{ oldOid: string; newOid: string; message: string }>
 
+function parseReflogEntry(path: string, line: string): ReflogEntry {
+  const [oldOid, newOid] = line.split(" ")
+  // The ident may contain a TAB. Only the committer timezone delimits the message.
+  const metadata = line.match(/^[^ ]+ [^ ]+ .*?> -?\d+ [+-]\d{4}(?:\t(.*))?$/u)
+  if (oldOid === undefined || newOid === undefined || !HEX40.test(oldOid) || !HEX40.test(newOid) || metadata === null) {
+    throw new UnknownError(`malformed reflog record in ${path}: ${line.slice(0, 120)}`)
+  }
+  // Git omits the TAB when the creation record has no message.
+  return { oldOid, newOid, message: metadata[1] ?? "" }
+}
+
 /** Read Git's raw reflog records once; retention and author provenance share this decoder. */
 export function* readReflogEntries(path: string): Generator<ReflogEntry> {
   let content: string
@@ -231,20 +278,7 @@ export function* readReflogEntries(path: string): Generator<ReflogEntry> {
   }
   for (const line of content.split("\n")) {
     if (line === "") continue
-    const [oldOid, newOid] = line.split(" ")
-    // The ident may contain a TAB. Only the committer timezone delimits the message.
-    const metadata = line.match(/^[^ ]+ [^ ]+ .*?> -?\d+ [+-]\d{4}(?:\t(.*))?$/u)
-    if (
-      oldOid === undefined ||
-      newOid === undefined ||
-      !HEX40.test(oldOid) ||
-      !HEX40.test(newOid) ||
-      metadata === null
-    ) {
-      throw new UnknownError(`malformed reflog record in ${path}: ${line.slice(0, 120)}`)
-    }
-    // Git omits the TAB when the creation record has no message.
-    yield { oldOid, newOid, message: metadata[1] ?? "" }
+    yield parseReflogEntry(path, line)
   }
 }
 
@@ -254,8 +288,17 @@ export function* readReflogEntries(path: string): Generator<ReflogEntry> {
  * a symbolic HEAD both name them, and neither is an object the store must carry). Unreadable or
  * malformed root state throws; `scanContents` reports that as `unknown`.
  */
-function* rootOidLines(gitDir: string, run: GitRun): Generator<string> {
-  const refs = run([`--git-dir=${gitDir}`, "for-each-ref", "--format=%(objectname) %(refname)"])
+async function* rootOidLines(
+  gitDir: string,
+  run: GitRun,
+  options: {
+    readonly completeMode: boolean
+    readonly deadline: number | undefined
+    readonly clock: () => number
+    readonly maxEffectiveOids: number
+  },
+): AsyncGenerator<string> {
+  const refs = await run([`--git-dir=${gitDir}`, "for-each-ref", "--format=%(objectname) %(refname)"])
   refuseSuccessfulStderr(refs, `for-each-ref in ${gitDir}`)
   if (refs.code !== 0) throw new UnknownError(`for-each-ref failed in ${gitDir}: ${refs.stderr.trim()}`)
   for (const line of refs.stdout.split("\n")) {
@@ -266,7 +309,7 @@ function* rootOidLines(gitDir: string, run: GitRun): Generator<string> {
     }
     if (!ZERO_OID.test(oid)) yield `${oid}\tref ${name ?? ""}`.trimEnd()
   }
-  const head = run([`--git-dir=${gitDir}`, "rev-parse", "HEAD"])
+  const head = await run([`--git-dir=${gitDir}`, "rev-parse", "HEAD"])
   refuseSuccessfulStderr(head, `rev-parse HEAD in ${gitDir}`)
   if (head.code === 0) {
     const oid = head.stdout.trim()
@@ -276,8 +319,22 @@ function* rootOidLines(gitDir: string, run: GitRun): Generator<string> {
   }
   const logs = join(gitDir, "logs")
   if (existsSync(logs)) {
+    let reflogLines = 0
     for (const path of reflogFiles(logs)) {
-      for (const { oldOid: old, newOid: next } of readReflogEntries(path)) {
+      const entries: Iterable<ReflogEntry> | AsyncIterable<ReflogEntry> = options.completeMode
+        ? (async function* () {
+            for await (const line of readLines(path, {
+              ...(options.deadline === undefined ? {} : { deadline: options.deadline }),
+              clock: options.clock,
+              maxLineLength: MAX_LINE_LENGTH,
+              maxLines: Math.max(0, options.maxEffectiveOids - reflogLines),
+            })) {
+              reflogLines += 1
+              yield parseReflogEntry(path, line)
+            }
+          })()
+        : readReflogEntries(path)
+      for await (const { oldOid: old, newOid: next } of entries) {
         const source = `reflog ${relative(gitDir, path)}`
         if (!ZERO_OID.test(old)) yield `${old}\t${source}`
         if (!ZERO_OID.test(next)) yield `${next}\t${source}`
@@ -294,13 +351,17 @@ function* rootOidLines(gitDir: string, run: GitRun): Generator<string> {
     }
     for (const oid of found) yield `${oid}\tpseudo-ref ${name}`
   }
-  const index = run([`--git-dir=${gitDir}`, "ls-files", "--stage"])
+  const index = await run([`--git-dir=${gitDir}`, "ls-files", "--stage"])
   refuseSuccessfulStderr(index, `ls-files --stage in ${gitDir}`)
   if (index.code === 0) {
     for (const line of index.stdout.split("\n")) {
       if (line === "") continue
-      const oid = line.split(/\s+/u)[1]
-      if (oid !== undefined && HEX40.test(oid)) yield `${oid}\tindex`
+      const match = line.match(/^(\d{6}) ([0-9a-f]{40}) ([0-3])\t(.+)$/u)
+      if (match === null) throw new UnknownError(`malformed ls-files --stage row in ${gitDir}: ${line.slice(0, 120)}`)
+      const [, mode, oid] = match
+      // A mode-160000 index entry is a submodule commit ID stored by that child repository.
+      // It is not an object the superproject's own object database must carry.
+      if (mode !== "160000" && oid !== undefined && !ZERO_OID.test(oid)) yield `${oid}\tindex`
     }
   } else if (/index file smaller|bad index|unknown index|fatal: index/u.test(index.stderr)) {
     throw new UnknownError(`unreadable index in ${gitDir}: ${index.stderr.trim()}`)
@@ -333,35 +394,53 @@ async function* validatedOidLines(stream: GitLineStream, label: string): AsyncGe
   }
 }
 
-async function scanComponent(
-  component: string,
-  copyRoot: string,
+async function scanComponentGitDir(
+  source: ComponentGitSource,
   removal: readonly string[],
   run: GitRun,
   stream: GitStreamFactory,
   bounds: ContentsBounds,
   clock: () => number,
   sidecarDir: string,
+  sourceMode: "retention" | "complete-commit",
+  deadline: number | undefined,
+  exposeGitDir: boolean,
 ): Promise<ComponentContents> {
+  const { component, gitDir, workTree } = source
   const started = clock()
-  const gitDir = join(copyRoot, component)
   const remaining = (): number => {
-    const left = started + bounds.componentMs - clock()
-    if (left <= 0) {
-      throw new UnknownError(`${component}: the ${bounds.componentMs} ms component bound is already exhausted`)
-    }
+    const left = Math.min(started + bounds.componentMs, deadline ?? Number.POSITIVE_INFINITY) - clock()
+    if (left <= 0) throw new UnknownError(`${component}: the component bound or shared proof deadline is exhausted`)
     return left
   }
   // Every synchronous root query carries the component's REMAINING budget, so a stalled
   // for-each-ref/rev-parse/ls-files yields `unknown` at the bound instead of blocking the scan
   // (the streamed object lists are bounded the same way, below).
-  const componentRun: GitRun = (args) => run(args, { timeoutMs: remaining() })
-  const rootsRef = await externalSortToSidecar(rootOidLines(gitDir, componentRun), {
-    dir: sidecarDir,
-    runLines: DEFAULT_SORT_RUN_LINES,
-  })
+  const proofEnv =
+    sourceMode === "complete-commit" ? { GIT_NO_REPLACE_OBJECTS: "1", GIT_NO_LAZY_FETCH: "1" } : undefined
+  const componentRun: GitRun = async (args, runOptions = {}) =>
+    run(sourceMode === "complete-commit" ? ["--no-replace-objects", ...args] : args, {
+      ...runOptions,
+      timeoutMs: Math.min(runOptions.timeoutMs ?? Number.POSITIVE_INFINITY, remaining()),
+      ...(proofEnv === undefined ? {} : { env: { ...runOptions.env, ...proofEnv } }),
+    })
+  const rootsRef = await externalSortToSidecar(
+    rootOidLines(gitDir, componentRun, {
+      completeMode: sourceMode === "complete-commit",
+      deadline,
+      clock,
+      maxEffectiveOids: bounds.maxEffectiveOids,
+    }),
+    {
+      dir: sidecarDir,
+      runLines: DEFAULT_SORT_RUN_LINES,
+      deadline,
+      clock,
+    },
+  )
   const objects = join(gitDir, "objects")
-  const closureResult = closure(objects, removal, new Set())
+  const closureResult =
+    sourceMode === "retention" ? closure(objects, removal, new Set()) : { status: "ok" as const, stores: [objects] }
   if (closureResult.status !== "ok") throw new UnknownError(`${component}: ${closureResult.detail}`)
   // IndependentStores(g,R) also includes an actual external `objects`-symlink target: its store
   // survives E and those objects are borrowed, never owned (contract gate 4). Dropping the
@@ -371,7 +450,7 @@ async function scanComponent(
     if (store === objects) continue
     independentStores.add(store)
   }
-  const linkMetadata = lstatSync(objects, { throwIfNoEntry: false })
+  const linkMetadata = sourceMode === "retention" ? lstatSync(objects, { throwIfNoEntry: false }) : undefined
   if (linkMetadata?.isSymbolicLink() === true) {
     let linkTarget: string
     try {
@@ -388,42 +467,60 @@ async function scanComponent(
     independentStores.add(linkTarget)
   }
   const effectiveStream = stream(
-    [`--git-dir=${gitDir}`, `--work-tree=${copyRoot}`, "cat-file", "--batch-all-objects", "--batch-check"],
-    { timeoutMs: remaining(), maxLines: bounds.maxEffectiveOids },
+    [
+      ...(sourceMode === "complete-commit" ? ["--no-replace-objects"] : []),
+      `--git-dir=${gitDir}`,
+      `--work-tree=${workTree}`,
+      "cat-file",
+      "--batch-all-objects",
+      "--batch-check",
+    ],
+    {
+      timeoutMs: Math.min(bounds.componentMs, remaining()),
+      maxLines: bounds.maxEffectiveOids,
+      ...(proofEnv === undefined ? {} : { env: proofEnv }),
+    },
   )
-  const independentStreams = [...independentStores]
-    .sort()
-    .map((store) =>
-      stream(
-        [
-          `--git-dir=${join(store, "..")}`,
-          `--work-tree=${copyRoot}`,
-          "cat-file",
-          "--batch-all-objects",
-          "--batch-check",
-        ],
-        { timeoutMs: remaining(), maxLines: bounds.maxEffectiveOids },
-      ),
-    )
+  const independentStreams = [...independentStores].sort().map((store) =>
+    stream(
+      [
+        ...(sourceMode === "complete-commit" ? ["--no-replace-objects"] : []),
+        `--git-dir=${join(store, "..")}`,
+        `--work-tree=${workTree}`,
+        "cat-file",
+        "--batch-all-objects",
+        "--batch-check",
+      ],
+      {
+        timeoutMs: Math.min(bounds.componentMs, remaining()),
+        maxLines: bounds.maxEffectiveOids,
+        ...(proofEnv === undefined ? {} : { env: proofEnv }),
+      },
+    ),
+  )
   const atRiskWriter = new SidecarWriter(sidecarDir, "txt")
   const missingWriter = new SidecarWriter(sidecarDir, "txt")
   let effective = 0
   let independent = 0
   let atRisk = 0
   let missing = 0
+  let merged = 0
   const missingRootsSample: string[] = []
   try {
     await mergeSorted(
       [
         { label: "effective", lines: validatedOidLines(effectiveStream, component), keyOf: oidKey },
-        ...independentStreams.map((source, index) => ({
-          label: `independent:${index}`,
-          lines: validatedOidLines(source, `independent store ${index} of ${component}`),
-          keyOf: oidKey,
-        })),
+        ...(sourceMode === "complete-commit"
+          ? []
+          : independentStreams.map((source, index) => ({
+              label: `independent:${index}`,
+              lines: validatedOidLines(source, `independent store ${index} of ${component}`),
+              keyOf: oidKey,
+            }))),
         { label: "roots", lines: readLines(rootsRef.path), keyOf: oidKey },
       ],
       (key, groups) => {
+        if ((merged++ & 1023) === 0) remaining()
         const effectiveLines = groups.filter((group) => group.label === "effective").flatMap((group) => group.lines)
         const independentLines = groups
           .filter((group) => group.label.startsWith("independent:"))
@@ -433,7 +530,10 @@ async function scanComponent(
         if (independentLines.length > 0) independent += 1
         const rootSources = [...new Set(rootLines.map((line) => line.slice(line.indexOf("\t") + 1)))].join(", ")
         const first = effectiveLines[0]
-        if (first !== undefined && independentLines.length === 0) {
+        if (
+          first !== undefined &&
+          (sourceMode === "complete-commit" ? first.endsWith("\tcommit") : independentLines.length === 0)
+        ) {
           const type = first.slice(first.indexOf("\t") + 1)
           atRisk += 1
           atRiskWriter.add(`${key}\t${type}\t${rootSources === "" ? "owned" : rootSources}`)
@@ -444,6 +544,7 @@ async function scanComponent(
           missingWriter.add(`${key}\t${rootSources}`)
         }
       },
+      { deadline, clock },
     )
     for (const source of [effectiveStream, ...independentStreams]) {
       const outcome = await source.outcome
@@ -464,11 +565,12 @@ async function scanComponent(
   if (missing > 0) missingRootsSidecar = await missingWriter.finish()
   else missingWriter.abort()
   const elapsedMs = clock() - started
-  if (elapsedMs > bounds.componentMs) {
+  if (elapsedMs > bounds.componentMs || (deadline !== undefined && clock() > deadline)) {
     throw new UnknownError(`${component} exceeded the ${bounds.componentMs} ms component bound after ${effective} OIDs`)
   }
   return {
     component,
+    ...(exposeGitDir ? { gitDir } : {}),
     effective,
     independent,
     atRisk,
@@ -497,8 +599,31 @@ export async function scanContents(
   const clock = options.clock ?? Date.now
   const components: ComponentContents[] = []
   try {
-    for (const component of componentsFromManifest(entries)) {
-      components.push(await scanComponent(component, copyRoot, removal, run, stream, bounds, clock, options.sidecarDir))
+    const sources =
+      options.sources ??
+      componentsFromManifest(entries).map((component) => ({
+        component,
+        gitDir: join(copyRoot, component),
+        workTree: copyRoot,
+      }))
+    if (options.sourceMode === "complete-commit" && sources.length === 0) {
+      throw new UnknownError("complete-commit source inventory is empty")
+    }
+    for (const source of sources) {
+      components.push(
+        await scanComponentGitDir(
+          source,
+          removal,
+          run,
+          stream,
+          bounds,
+          clock,
+          options.sidecarDir,
+          options.sourceMode ?? "retention",
+          options.deadline,
+          options.sources !== undefined || options.sourceMode === "complete-commit",
+        ),
+      )
     }
   } catch (error) {
     return {

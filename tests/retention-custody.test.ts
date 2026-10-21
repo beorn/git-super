@@ -97,6 +97,56 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     expect(scan.missing).toEqual([])
   })
 
+  test("complete-commit witness policy uses the actual component Git directory and exact target/pin refs", async () => {
+    const store = repoWithCommit("git-super-custody-policy-")
+    const unrelatedRoot = tmp("git-super-custody-policy-root-")
+    const sidecarDir = tmp("git-super-custody-policy-sidecars-")
+    const component = {
+      ...(await componentOf([store.head], sidecarDir)),
+      gitDir: join(store.root, ".git"),
+    }
+    const opts = {
+      sidecarDir,
+      witnessPolicy: { targetBranch: "release" },
+    }
+    const noPolicyRef = await scanCustody(unrelatedRoot, [component], [join(store.root, ".git", "objects")], [], opts)
+    expect(noPolicyRef.status).toBe("blocked")
+    git(store.root, ["update-ref", `refs/yrd/pins/${store.head}`, store.head])
+    const pinned = await scanCustody(unrelatedRoot, [component], [join(store.root, ".git", "objects")], [], opts)
+    expect(pinned.status).toBe("pass")
+    expect(pinned.witnesses[0]).toMatchObject({ ref: `refs/yrd/pins/${store.head}`, tip: store.head })
+  })
+
+  test("an exhausted shared proof deadline is unknown before witness queries", async () => {
+    const store = repoWithCommit("git-super-custody-deadline-")
+    const sidecarDir = tmp("git-super-custody-deadline-sidecars-")
+    const component = await componentOf([store.head], sidecarDir)
+    const scan = await scanCustody(store.root, [component], [join(store.root, ".git", "objects")], [], {
+      sidecarDir,
+      deadline: 0,
+      witnessPolicy: { targetBranch: "main" },
+    })
+    expect(scan.status).toBe("unknown")
+    expect(scan.detail).toContain("shared proof deadline")
+  })
+
+  test("a shallow witness graph is unknown even when its refs and fsck pass", async () => {
+    const store = repoWithCommit("git-super-custody-shallow-")
+    const sidecarDir = tmp("git-super-custody-shallow-sidecars-")
+    const component = await componentOf([store.head], sidecarDir)
+    const shallow: GitRun = (args, options) =>
+      args.includes("--is-shallow-repository")
+        ? { code: 0, stdout: "true\n", stderr: "" }
+        : defaultGitRun(args, options)
+    const scan = await scanCustody(store.root, [component], [join(store.root, ".git", "objects")], [], {
+      sidecarDir,
+      run: shallow,
+      witnessPolicy: { targetBranch: "main" },
+    })
+    expect(scan.status).toBe("unknown")
+    expect(scan.detail).toContain("is shallow")
+  })
+
   test("an OID reachable only inside a ref's closure is found through the merge, not by tip equality", async () => {
     const store = repoWithCommit("git-super-custody-")
     const sidecarDir = tmp("git-super-custody-sidecars-")

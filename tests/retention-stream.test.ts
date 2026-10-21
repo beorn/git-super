@@ -55,6 +55,26 @@ function sha256(bytes: Buffer): string {
 }
 
 describe("retention stream primitives (#27443(b))", () => {
+  test("a selected executable receives exactly its supplied environment", async () => {
+    const stream = gitLineStream(["-e", "process.stdout.write(process.env.ONLY ?? 'missing')"], {
+      executable: process.execPath,
+      env: { ONLY: "selected" },
+    })
+    expect(await collect(stream.lines)).toEqual(["selected"])
+    expect((await stream.outcome).code).toBe(0)
+  })
+
+  test("the line cap also catches an unterminated final output row", async () => {
+    const stream = gitLineStream(["-e", "process.stdout.write('a\\nb\\nc')"], {
+      executable: process.execPath,
+      maxLines: 2,
+    })
+    expect(await collect(stream.lines)).toEqual(["a", "b"])
+    const outcome = await stream.outcome
+    expect(outcome.lines).toBe(2)
+    expect(outcome.capped).toBe(true)
+  })
+
   test("externalSortToSidecar sorts, deduplicates, and names the file by its own bytes", async () => {
     const dir = tmp("git-super-stream-")
     const ref = await externalSortToSidecar(linesOf(["ccc", "aaa", "bbb", "aaa"]), { dir })

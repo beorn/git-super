@@ -26,7 +26,6 @@ import {
   writeFileSync,
   writeSync,
 } from "node:fs"
-import { createInterface } from "node:readline"
 import { join } from "node:path"
 import { StringDecoder } from "node:string_decoder"
 
@@ -157,18 +156,90 @@ async function digestFile(path: string): Promise<{ sha256: string; bytes: number
 }
 
 /** Iterates the non-empty lines of a file with a bounded read buffer. */
-export async function* readLines(path: string): AsyncGenerator<string> {
-  const reader = createInterface({ input: createReadStream(path), crlfDelay: Infinity })
-  try {
-    for await (const line of reader) {
-      if (line !== "") yield line
+export interface ReadLinesOptions {
+  readonly deadline?: number
+  readonly clock?: () => number
+  readonly maxLines?: number
+  readonly maxLineLength?: number
+}
+
+/** Reads lines with bounded chunk buffering; optional proof limits refuse a partial file. */
+export async function* readLines(path: string, options: ReadLinesOptions = {}): AsyncGenerator<string> {
+  const source = createReadStream(path)
+  const decoder = new StringDecoder("utf8")
+  const clock = options.clock ?? Date.now
+  let buffer = ""
+  let lines = 0
+  let deadlineHit = false
+  const ms = options.deadline === undefined ? undefined : options.deadline - clock()
+  if (ms !== undefined && ms <= 0) {
+    source.destroy()
+    throw new Error(`shared proof deadline is exhausted reading ${path}`)
+  }
+  const timer =
+    ms === undefined
+      ? undefined
+      : setTimeout(
+          () => {
+            deadlineHit = true
+            source.destroy(new Error("shared proof deadline is exhausted"))
+          },
+          Math.max(1, ms),
+        )
+  const lineLimit = options.maxLineLength
+  const emit = (line: string): string | undefined => {
+    const normalized = line.endsWith("\r") ? line.slice(0, -1) : line
+    if (lineLimit !== undefined && normalized.length > lineLimit) {
+      throw new Error(`line in ${path} exceeds the ${lineLimit}-character bound`)
     }
+    if (normalized === "") return undefined
+    if (options.maxLines !== undefined && lines >= options.maxLines) {
+      throw new Error(`${path} exceeds the ${options.maxLines}-line bound`)
+    }
+    lines += 1
+    return normalized
+  }
+  try {
+    for await (const chunk of source) {
+      if (options.deadline !== undefined && clock() >= options.deadline) {
+        throw new Error(`shared proof deadline is exhausted reading ${path}`)
+      }
+      buffer += decoder.write(chunk as Buffer)
+      let newline = buffer.indexOf("\n")
+      while (newline !== -1) {
+        const line = emit(buffer.slice(0, newline))
+        buffer = buffer.slice(newline + 1)
+        if (line !== undefined) yield line
+        newline = buffer.indexOf("\n")
+      }
+      if (lineLimit !== undefined && buffer.length > lineLimit) {
+        throw new Error(`line in ${path} exceeds the ${lineLimit}-character bound`)
+      }
+    }
+    buffer += decoder.end()
+    const tail = emit(buffer)
+    if (tail !== undefined) yield tail
+    if (options.deadline !== undefined && clock() >= options.deadline) {
+      throw new Error(`shared proof deadline is exhausted reading ${path}`)
+    }
+  } catch (error) {
+    if (deadlineHit) throw new Error(`shared proof deadline is exhausted reading ${path}`)
+    throw error
   } finally {
-    reader.close()
+    if (timer !== undefined) clearTimeout(timer)
+    source.destroy()
   }
 }
 
 export interface GitStreamOptions {
+  /** Selected native Git executable; defaults to `git` for the retained-manifest caller. */
+  readonly executable?: string
+  /** Complete selected-process environment; when absent, use the scrubbed default environment. */
+  readonly env?: NodeJS.ProcessEnv
+  /** External cancellation signal for a selected transaction. */
+  readonly signal?: AbortSignal
+  /** Signal used for externally requested cancellation; scanner deadlines still use SIGKILL. */
+  readonly killSignal?: NodeJS.Signals
   /** Hard deadline; the child is killed with SIGKILL at it and reported `timedOut`. */
   readonly timeoutMs?: number
   /** Hard byte cap; the child is killed when stdout exceeds it and reported `capped`. */
@@ -245,7 +316,7 @@ export function assertStreamComplete(outcome: GitStreamOutcome, messages: Stream
   if (fault !== undefined) throw new IncompleteStreamError(messages[fault])
 }
 
-const MAX_LINE_LENGTH = 1 << 20
+export const MAX_LINE_LENGTH = 1 << 20
 
 /**
  * Spawns git and yields its stdout lines as they arrive, tracking bytes/lines for the caller's
@@ -253,9 +324,11 @@ const MAX_LINE_LENGTH = 1 << 20
  * work instead of buffering an unbounded string first.
  */
 export function gitLineStream(args: readonly string[], options: GitStreamOptions = {}): GitLineStream {
-  const child = spawn("git", [...args], {
+  const child = spawn(options.executable ?? "git", [...args], {
     stdio: ["ignore", "pipe", "pipe"],
-    env: {
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
+    ...(options.killSignal === undefined ? {} : { killSignal: options.killSignal }),
+    env: options.env ?? {
       PATH: process.env.PATH ?? "",
       HOME: process.env.HOME ?? "",
       GIT_CONFIG_NOSYSTEM: "1",
@@ -394,6 +467,11 @@ export function gitLineStream(args: readonly string[], options: GitStreamOptions
       if (!capped) {
         const tail = remainder + decoder.end()
         if (tail !== "") {
+          if (options.maxLines !== undefined && lines >= options.maxLines) {
+            capped = true
+            kill()
+            return
+          }
           if (pending.length >= QUEUE_LINES) await waitForCapacity()
           lines += 1
           push(tail)
@@ -454,12 +532,28 @@ export type MergeConsumer = (
   groups: readonly Readonly<{ label: string; lines: readonly string[] }>[],
 ) => void | Promise<void>
 
+export interface SharedDeadlineOptions {
+  /** Shared absolute deadline in the same clock domain as `clock`. */
+  readonly deadline?: number | undefined
+  readonly clock?: (() => number) | undefined
+}
+
+function checkSharedDeadline(options: SharedDeadlineOptions): void {
+  if (options.deadline !== undefined && (options.clock ?? Date.now)() >= options.deadline) {
+    throw new Error("shared proof deadline is exhausted")
+  }
+}
+
 /**
  * k-way merge over already-sorted line sources. For each distinct key (in ascending string order)
  * the consumer receives every source's consecutive lines for that key. Memory is one pending line
  * per source plus the per-key groups, never the whole set.
  */
-export async function mergeSorted(sources: readonly MergeSource[], consume: MergeConsumer): Promise<void> {
+export async function mergeSorted(
+  sources: readonly MergeSource[],
+  consume: MergeConsumer,
+  options: SharedDeadlineOptions = {},
+): Promise<void> {
   const state = sources.map((source) => ({
     label: source.label,
     keyOf: source.keyOf ?? ((line: string) => line),
@@ -472,7 +566,9 @@ export async function mergeSorted(sources: readonly MergeSource[], consume: Merg
     if (next.done === true) source.done = true
     else source.current = next.value
   }
+  let merged = 0
   for (;;) {
+    if ((merged++ & 1023) === 0) checkSharedDeadline(options)
     let minKey: string | undefined
     for (const source of state) {
       if (source.done || source.current === undefined) continue
@@ -500,7 +596,7 @@ export async function mergeSorted(sources: readonly MergeSource[], consume: Merg
   }
 }
 
-export interface SidecarSortOptions {
+export interface SidecarSortOptions extends SharedDeadlineOptions {
   readonly dir: string
   /** Soft bound on lines held in memory for one sort run. */
   readonly runLines?: number
@@ -549,6 +645,7 @@ export async function externalSortToSidecar(
   let buffer: string[] = []
   try {
     for await (const line of lines) {
+      if ((buffer.length & 1023) === 0) checkSharedDeadline(options)
       if (line === "") continue
       buffer.push(line)
       if (buffer.length >= runLines) {
@@ -571,6 +668,8 @@ export async function externalSortToSidecar(
       suffix: options.suffix ?? "txt",
       maxFanIn: options.maxFanIn ?? DEFAULT_MAX_FAN_IN,
       deleteInputs: true,
+      deadline: options.deadline,
+      clock: options.clock,
     })
   } catch (error) {
     for (const run of runs) {
@@ -584,7 +683,7 @@ export async function externalSortToSidecar(
   }
 }
 
-export interface MergeFilesOptions {
+export interface MergeFilesOptions extends SharedDeadlineOptions {
   readonly dir: string
   readonly keyOf: (line: string) => string
   /** Chooses the single output line for a key, or drops the key with `undefined`. */
@@ -624,6 +723,7 @@ export async function mergeSortedFilesToSidecar(
         const picked = options.pick(groups.flatMap((group) => group.lines))
         if (picked !== undefined) writer.add(picked)
       },
+      options,
     )
     for (const path of level) removeTemp(path, temporary)
     return await writer.finish()
@@ -647,6 +747,7 @@ async function reduceMergeGroup(group: readonly string[], options: MergeFilesOpt
         const picked = options.pick(groups.flatMap((entry) => entry.lines))
         if (picked !== undefined) writeSync(fd, Buffer.from(`${picked}\n`, "utf8"))
       },
+      options,
     )
   } finally {
     closeSync(fd)
@@ -679,6 +780,7 @@ function pickFirst(groups: readonly Readonly<{ label: string; lines: readonly st
 async function writeMergePick(
   entries: readonly Readonly<{ path: string; lines: () => AsyncIterable<string> }>[],
   path: string,
+  deadlineOptions: SharedDeadlineOptions,
 ): Promise<void> {
   const fd = openSync(path, "w")
   try {
@@ -688,6 +790,7 @@ async function writeMergePick(
         const picked = pickFirst(groups)
         if (picked !== undefined) writeSync(fd, Buffer.from(`${picked}\n`, "utf8"))
       },
+      deadlineOptions,
     )
   } finally {
     closeSync(fd)
@@ -702,7 +805,7 @@ async function writeMergePick(
  */
 export async function mergeLabeledFiles(
   sources: readonly LabeledSortSource[],
-  options: { readonly dir: string; readonly maxFanIn?: number },
+  options: { readonly dir: string; readonly maxFanIn?: number } & SharedDeadlineOptions,
 ): Promise<SidecarRef> {
   const fanIn = Math.max(2, options.maxFanIn ?? DEFAULT_MAX_FAN_IN)
   const dir = options.dir
@@ -714,12 +817,13 @@ export async function mergeLabeledFiles(
       lines: () => decorateLines(readLines(source.path), source.label),
     }))
     while (level.length > fanIn) {
+      checkSharedDeadline(options)
       const next: Array<{ path: string; lines: () => AsyncIterable<string> }> = []
       for (let index = 0; index < level.length; index += fanIn) {
         const group = level.slice(index, index + fanIn)
         const path = tempName(dir, "labeled")
         temps.push(path)
-        await writeMergePick(group, path)
+        await writeMergePick(group, path, options)
         next.push({ path, lines: () => readLines(path) })
       }
       level = next
@@ -731,6 +835,7 @@ export async function mergeLabeledFiles(
         const picked = pickFirst(groups)
         if (picked !== undefined) writer.add(picked)
       },
+      options,
     )
     return await writer.finish()
   } finally {
