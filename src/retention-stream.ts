@@ -71,10 +71,12 @@ export class SidecarWriter {
   private count = 0
   private finished = false
 
-  constructor(
-    readonly dir: string,
-    private readonly suffix = "txt",
-  ) {
+  readonly dir: string
+  private readonly suffix: string
+
+  constructor(dir: string, suffix = "txt") {
+    this.dir = dir
+    this.suffix = suffix
     this.tempPath = tempName(dir, "sidecar")
     try {
       mkdirSync(dir, { recursive: true })
