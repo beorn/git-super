@@ -828,6 +828,25 @@ describe("Phase 1 read commands", () => {
     expect(stderr.output).not.toContain(`--repo ${fixture.product}`)
   })
 
+  test("a linked worktree's bare status names the context it judged and the exact --repo command (30539)", async () => {
+    // A HEAD that carries gitlinks is refused on purpose. The refusal has to say
+    // WHICH tree it read and hand back a command that runs there; without both, a
+    // clean check that spans submodules stayed unreachable without guessing --repo.
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-status-linked-context-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const environment = join(fixtureRoot, "environment")
+    git(fixture.product, "worktree", "add", "-q", "-b", "task/30539", environment)
+
+    const stdout = outputSink()
+    const stderr = outputSink()
+    const code = await runCli(["-C", environment, "status"], stdout, stderr)
+
+    expect(code).toBe(2)
+    expect(stderr.output).toContain(`worktree context (${environment})`)
+    expect(stderr.output).toContain(`git-super --repo ${environment} status`)
+  })
+
   test("status --repo <path> after the command is an explicit call, not the judged implicit form (28962)", async () => {
     // commander accepts the global --repo after its subcommand, but the implicit-form
     // gate read it only at argv[0]: this spelling was judged against the CWD and
