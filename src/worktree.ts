@@ -1683,7 +1683,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       inspectOptions: Readonly<{ excludedSubmodules?: readonly string[] }> = {},
     ): Promise<
       Pick<SuperStatusResult, "records" | "notCompared" | "consultedRepositories" | "uninitializedSubmodules"> &
-        Readonly<{ borrowers: readonly string[]; releasedStores: readonly ModuleStore[] }>
+        Readonly<{ borrowers: readonly string[]; moduleStores: readonly ModuleStore[] }>
     > {
       const prepared = await prepareRemoval(path, inspectOptions.excludedSubmodules)
       const status = await inspectRemovalStatusWithGit(git, path, inspectOptions.excludedSubmodules)
@@ -1697,7 +1697,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       }
       return {
         borrowers: prepared.rehome === undefined ? [] : prepared.rehome.inspect(),
-        releasedStores: prepared.stores,
+        moduleStores: prepared.stores,
         records: status.records,
         notCompared: [...prepared.notCompared, ...status.notCompared],
         consultedRepositories: status.consultedRepositories,

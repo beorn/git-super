@@ -43,7 +43,7 @@ function* discoverRoot(cwd: string): Traversal<string> {
  * a .gitmodules that cannot be read is `unreadable`, never "no declarations". */
 type ModuleLookup =
   | Readonly<{ kind: "none" }>
-  | Readonly<{ kind: "repository"; dir: string; name: string }>
+  | Readonly<{ kind: "repository"; dir: string }>
   | Readonly<{ kind: "unreadable"; reason: string }>
 function* moduleRepository(root: string, path: string): Traversal<ModuleLookup> {
   // NUL-terminated pairs keep a name or path containing spaces intact; `key\nvalue\0`.
@@ -76,7 +76,7 @@ function* moduleRepository(root: string, path: string): Traversal<ModuleLookup> 
   const absolute = isAbsolute(expected) ? expected : resolve(root, expected)
   return lstatSync(absolute, { throwIfNoEntry: false }) === undefined
     ? { kind: "none" }
-    : { kind: "repository", dir: absolute, name }
+    : { kind: "repository", dir: absolute }
 }
 function* readIndexGitlinks(cwd: string, indexFile?: string) {
   return parseIndexEntries(

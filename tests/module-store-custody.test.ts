@@ -95,6 +95,10 @@ describe("slot module store custody", () => {
     expect(inventory.stores).toEqual([
       expect.objectContaining({ name: "packages/alpha", valueCommits: 1, remote: "origin", head: tip.slice(0, 12) }),
     ])
+    // The plan line an inspection prints before any push never claims the archive has happened.
+    expect(describeModuleStores(inventory.stores)).toEqual([
+      `module store packages/alpha holds 1 commit(s) to archive, HEAD ${tip.slice(0, 12)}`,
+    ])
     const archived = archiveModuleStores(inventory.stores, { actor: "dev-test", date: DATE })
     expect(archived[0]!.archived).toEqual([`refs/archive/${DATE}/dev-test/packages/alpha/HEAD`])
     expect(git(slot.fixture.alpha, "rev-parse", `refs/archive/${DATE}/dev-test/packages/alpha/HEAD`).trim()).toBe(tip)

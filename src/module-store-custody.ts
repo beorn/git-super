@@ -502,7 +502,10 @@ export function describeModuleStores(stores: readonly ModuleStore[]): string[] {
           : `${store.remote} ${store.defaultBranch === undefined ? "" : `${store.defaultBranch} and `}archive refs hold it`
       return `module store ${store.name} released: ${where}, 0 commits unique${head}`
     }
-    const where = store.archived.length === 0 ? "an archive push still pending" : store.archived.join(", ")
-    return `module store ${store.name} archived: ${String(store.valueCommits)} commit(s) to ${where}${head}`
+    // Before the push (an inspection's removal plan) the line must not claim an archive that has not happened.
+    if (store.archived.length === 0) {
+      return `module store ${store.name} holds ${String(store.valueCommits)} commit(s) to archive${head}`
+    }
+    return `module store ${store.name} archived: ${String(store.valueCommits)} commit(s) to ${store.archived.join(", ")}${head}`
   })
 }
