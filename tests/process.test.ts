@@ -39,9 +39,13 @@ describe("GitProcess", () => {
       `#!/bin/sh\nprintf '%s|%s|%s|%s\\n' "$CUSTODY_STREAM_MARKER" "\${GIT_CONFIG_NOSYSTEM-absent}" "\${GIT_OPTIONAL_LOCKS-absent}" "\${GIT_TERMINAL_PROMPT-absent}"\n`,
     )
     chmodSync(executable, 0o755)
-    vi.stubEnv("PATH", `${root}${delimiter}${process.env.PATH ?? ""}`)
+    vi.stubEnv("CUSTODY_STREAM_MARKER", "ambient-environment")
     try {
-      const selectedEnvironment: NodeJS.ProcessEnv = { ...process.env, CUSTODY_STREAM_MARKER: "selected-environment" }
+      const selectedEnvironment: NodeJS.ProcessEnv = {
+        ...process.env,
+        PATH: `${root}${delimiter}${process.env.PATH ?? ""}`,
+        CUSTODY_STREAM_MARKER: "selected-environment",
+      }
       delete selectedEnvironment.GIT_CONFIG_NOSYSTEM
       delete selectedEnvironment.GIT_OPTIONAL_LOCKS
       delete selectedEnvironment.GIT_TERMINAL_PROMPT

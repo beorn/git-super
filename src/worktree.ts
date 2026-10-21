@@ -445,6 +445,20 @@ async function buildComponentCensus(
   }
   // The shared traversal is also the canonical cycle/dedup check used by retention.
   await alternatesLineage([...identities.map((entry) => entry.objectDirectory), ...witnessStores], "")
+  // Excluding root commits from the component ledger does not exempt the
+  // surviving root store from depending on a store that removal destroys.
+  const rootObjects = identities[0]?.objectDirectory
+  if (rootObjects === undefined) {
+    throw custodyIdentityError("root persistent primary object store is missing from the census")
+  }
+  const rootAlternates = await alternatesLineage([rootObjects], rootObjects, {
+    allowedObjects: new Set(objectOwners.keys()),
+  })
+  for (const store of rootAlternates) {
+    if (withinRemoval(store)) {
+      throw custodyIdentityError(`root persistent primary alternate ${store} is inside the removal set`)
+    }
+  }
   const fingerprintValue = JSON.stringify({
     sources: identities.map(({ component, gitDir, commonDir, objectDirectory, workTree }) => ({
       component,

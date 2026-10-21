@@ -517,41 +517,45 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
    * @level l1 @consumer automatic environment removal through GitSuper
    * Gate 5 has a direct unit pin; this confirms the live census passes the true removal boundary to it.
    */
-  it("refuses a witness graph that borrows from the disappearing component store", async () => {
-    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-component-custody-disappearing-source-"))
-    try {
-      const fixture = createProductFixture(root)
-      const target = join(root, "target")
-      git(fixture.product, "worktree", "add", "--detach", target)
-      git(target, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
-      const alphaSource = join(target, "packages/alpha")
-      const alphaSourceObjects = git(alphaSource, "rev-parse", "--path-format=absolute", "--git-path", "objects")
-      const alphaPrimary = join(fixture.product, "packages/alpha")
-      const alphaPrimaryObjects = git(alphaPrimary, "rev-parse", "--path-format=absolute", "--git-path", "objects")
-      await mkdir(join(alphaPrimaryObjects, "info"), { recursive: true })
-      await writeFile(join(alphaPrimaryObjects, "info", "alternates"), `${alphaSourceObjects}\n`)
+  it.each(["component", "root"] as const)(
+    "refuses a %s witness graph that borrows from the disappearing component store",
+    async (borrower) => {
+      const root = await mkdtemp(join(canonicalTmpdir(), "git-super-component-custody-disappearing-source-"))
+      try {
+        const fixture = createProductFixture(root)
+        const target = join(root, "target")
+        git(fixture.product, "worktree", "add", "--detach", target)
+        git(target, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
+        const alphaSource = join(target, "packages/alpha")
+        const alphaSourceObjects = git(alphaSource, "rev-parse", "--path-format=absolute", "--git-path", "objects")
+        const primary = borrower === "root" ? fixture.product : join(fixture.product, "packages/alpha")
+        const primaryObjects = git(primary, "rev-parse", "--path-format=absolute", "--git-path", "objects")
+        await mkdir(join(primaryObjects, "info"), { recursive: true })
+        await writeFile(join(primaryObjects, "info", "alternates"), `${alphaSourceObjects}\n`)
 
-      const outcome = await createGitWorktreeStore({
-        repo: fixture.product,
-        gitProcess: createLocalGitProcess(),
-      }).remove(target, {
-        retention: { root: join(root, "retained"), report: () => undefined },
-        componentCustody: { primaryRoot: fixture.product, targetBranch: "main" },
-      })
+        const outcome = await createGitWorktreeStore({
+          repo: fixture.product,
+          gitProcess: createLocalGitProcess(),
+        }).remove(target, {
+          retention: { root: join(root, "retained"), report: () => undefined },
+          componentCustody: { primaryRoot: fixture.product, targetBranch: "main" },
+        })
 
-      expect(outcome).toMatchObject({
-        custodyRefusal: {
-          status: "unknown",
-          source: "surviving primary Git graph",
-          detail: expect.stringContaining("inside the removal set"),
-        },
-      })
-      expect(existsSync(target)).toBe(true)
-    } finally {
-      // raw-delete-allow: this isolated mkdtemp root owns every path beneath it
-      await rm(root, { recursive: true, force: true })
-    }
-  })
+        expect(outcome).toMatchObject({
+          custodyRefusal: {
+            status: "unknown",
+            source: borrower === "root" ? "recursive component census" : "surviving primary Git graph",
+            detail: expect.stringContaining("inside the removal set"),
+          },
+        })
+        expect(existsSync(target)).toBe(true)
+        expect(git(fixture.product, "worktree", "list", "--porcelain")).toContain(`worktree ${target}\n`)
+      } finally {
+        // raw-delete-allow: this isolated mkdtemp root owns every path beneath it
+        await rm(root, { recursive: true, force: true })
+      }
+    },
+  )
 
   it("returns a structured custody refusal and preserves the target when the primary lacks the named branch", async () => {
     const root = await mkdtemp(join(canonicalTmpdir(), "git-super-component-custody-refusal-"))
