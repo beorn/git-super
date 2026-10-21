@@ -204,8 +204,9 @@ async function buildComponentCensus(
   }
   const query = async (cwd: string, args: readonly string[]): Promise<string> => {
     const result = await input.adapters.run(["-C", cwd, ...args])
-    if (result.code !== 0)
+    if (result.code !== 0) {
       throw custodyIdentityError(`${cwd}: ${result.stderr.trim() || `git ${args.join(" ")} failed`}`)
+    }
     remaining()
     return result.stdout.trim()
   }
@@ -244,8 +245,9 @@ async function buildComponentCensus(
       return part === "" || (part !== ".." && !part.startsWith(`..${sep}`) && !isAbsolute(part))
     })
   const branch = await input.adapters.run(["check-ref-format", "--branch", input.policy.targetBranch])
-  if (branch.code !== 0)
+  if (branch.code !== 0) {
     throw custodyIdentityError(`target branch ${JSON.stringify(input.policy.targetBranch)} is invalid`)
+  }
   const status = await statusWithGit(
     { repo: input.worktree, excludedSubmodules: input.excludedSubmodules },
     boundedGit,
@@ -288,8 +290,9 @@ async function buildComponentCensus(
     [".", canonical(input.policy.primaryRoot, "persistent primary root")],
   ])
   for (const entry of primaryStatus.consultedRepositories) {
-    if (entry.path !== ".")
+    if (entry.path !== ".") {
       primaryRepositories.set(entry.path, canonical(entry.root, `primary component ${entry.path}`))
+    }
   }
   const repositories = [
     { component: ".", root: canonical(input.worktree, "removal checkout") },
@@ -343,8 +346,9 @@ async function buildComponentCensus(
     identities.push({ ...source, commonDir, objectDirectory })
 
     const registrations = parseRegisteredWorktrees(await query(commonDir, ["worktree", "list", "--porcelain", "-z"]))
-    if (registrations.length === 0)
+    if (registrations.length === 0) {
       throw custodyIdentityError(`${repository.component}: ${commonDir} has no native worktree registration`)
+    }
     if (
       !registrations.some((entry) => {
         const registeredPath = canonical(entry.path, `${repository.component} source registration`)
@@ -359,8 +363,9 @@ async function buildComponentCensus(
       )
     }
     const selectedPrimary = primaryRepositories.get(repository.component)
-    if (selectedPrimary === undefined)
+    if (selectedPrimary === undefined) {
       throw custodyIdentityError(`${repository.component}: primary registration is missing`)
+    }
     const primaryPath = resolve(selectedPrimary)
     if (withinRemoval(primaryPath)) {
       throw custodyIdentityError(`${repository.component}: primary ${primaryPath} is in the removal set`)
@@ -398,6 +403,11 @@ async function buildComponentCensus(
     if (repository.component === "." && (primaryCommon !== commonDir || primaryObjects !== objectDirectory)) {
       throw custodyIdentityError(
         `root persistent primary ${primaryPath} has Git identity ${primaryCommon}/${primaryObjects}, expected source root identity ${commonDir}/${objectDirectory}`,
+      )
+    }
+    if (repository.component === "." && (withinRemoval(commonDir) || withinRemoval(objectDirectory))) {
+      throw custodyIdentityError(
+        `root persistent primary ${primaryPath} shares Git stores with the removal set: ${commonDir}/${objectDirectory}`,
       )
     }
     registerObjectOwner(primaryObjects, primaryCommon, `${repository.component} primary ${primaryGitDir}`)
@@ -1211,15 +1221,19 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
                     `temporary proof sidecar ${sidecarReal} is inside a source, witness, or removal store`,
                   )
                 }
-                const contents = await scanContents(path, {}, initialCensus.removal, {
-                  sidecarDir: proofSidecarDir,
-                  sources: initialCensus.sources,
-                  sourceMode: "complete-commit",
-                  run: adapters.run,
-                  stream: adapters.stream,
-                  deadline: proofDeadline,
-                })
-                if (contents.status !== "pass") {
+                const ledgerSources = initialCensus.sources.filter((source) => source.component !== ".")
+                const contents =
+                  ledgerSources.length === 0
+                    ? undefined
+                    : await scanContents(path, {}, initialCensus.removal, {
+                        sidecarDir: proofSidecarDir,
+                        sources: ledgerSources,
+                        sourceMode: "complete-commit",
+                        run: adapters.run,
+                        stream: adapters.stream,
+                        deadline: proofDeadline,
+                      })
+                if (contents !== undefined && contents.status !== "pass") {
                   const first = contents.components.find((entry) => entry.missingRoots > 0)
                   custodyRefusal = {
                     status: contents.status,
@@ -1229,11 +1243,12 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
                     ...(first?.missingRootsSample[0] === undefined ? {} : { oid: first.missingRootsSample[0] }),
                   }
                 } else {
+                  const contentComponents = contents?.components ?? []
                   const witnesses: WitnessIdentity[] = []
                   const witnessKeys = new Set<string>()
                   let witnessCount = 0
                   let custodyFailure: ComponentCustodyRefusal | undefined
-                  for (const component of contents.components) {
+                  for (const component of contentComponents) {
                     const store = initialCensus.witnessStoreByComponent.find(
                       (entry) => entry.component === component.component,
                     )?.store
@@ -1283,7 +1298,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
                         objectDirectory,
                       }),
                     )
-                    const atRiskDigest = contents.components
+                    const atRiskDigest = contentComponents
                       .map(
                         (entry) =>
                           `${entry.component}\t${entry.gitDir ?? ""}\t${entry.atRisk}\t${entry.atRiskSidecar.sha256}`,
@@ -1304,8 +1319,8 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
                       targetBranch: removeOptions.componentCustody.targetBranch,
                       sources: sourceSummary,
                       witnesses,
-                      componentCount: contents.components.length,
-                      effectiveCommitCount: contents.components.reduce((count, entry) => count + entry.atRisk, 0),
+                      componentCount: contentComponents.length,
+                      effectiveCommitCount: contentComponents.reduce((count, entry) => count + entry.atRisk, 0),
                       witnessCount,
                       digest,
                       elapsedMs: Date.now() + timeouts.cleanup - proofDeadline,

@@ -204,10 +204,11 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
   it("proves all removal commits in the persistent primary target branch before removing", async () => {
     const root = await mkdtemp(join(canonicalTmpdir(), "git-super-component-custody-"))
     try {
-      const product = join(root, "product")
+      const fixture = createProductFixture(root)
+      const product = fixture.product
       const target = join(root, "target")
-      createRepository(product, "root.txt", "root\n")
       git(product, "worktree", "add", "--detach", target)
+      git(target, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
 
       const result = await superWorktreeRemove({
         repo: product,
@@ -219,13 +220,77 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
       expect(result.state, result.detail?.message ?? JSON.stringify(result)).toBe("updated")
       expect(result.proof?.componentCustody).toMatchObject({
         targetBranch: "main",
-        componentCount: 1,
-        effectiveCommitCount: 1,
-        witnessCount: 1,
+        componentCount: 2,
+        effectiveCommitCount: 2,
+        witnessCount: 2,
       })
       expect(existsSync(target)).toBe(false)
     } finally {
       // raw-delete-allow: this isolated mkdtemp fixture owns every path beneath root
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it("removes a root-only worktree while preserving uncustodied root commits", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-root-only-custody-"))
+    try {
+      const product = join(root, "product")
+      const target = join(root, "target")
+      createRepository(product, "root.txt", "root\n")
+      git(product, "worktree", "add", "--detach", target)
+      const head = git(product, "rev-parse", "HEAD")
+      const tree = git(product, "rev-parse", "HEAD^{tree}")
+      const dangling = git(product, "commit-tree", tree, "-p", head, "-m", "root-only dangling commit")
+      git(product, "update-ref", "refs/heads/queue/root-only", dangling)
+
+      const result = await superWorktreeRemove({
+        repo: product,
+        path: target,
+        retain: join(root, "retained"),
+        componentCustody: { primaryRoot: product, targetBranch: "main" },
+      })
+
+      expect(result.state, result.detail?.message ?? JSON.stringify(result)).toBe("updated")
+      expect(result.proof?.componentCustody).toMatchObject({
+        targetBranch: "main",
+        componentCount: 0,
+        effectiveCommitCount: 0,
+        witnessCount: 0,
+      })
+      expect(git(product, "cat-file", "-e", `${dangling}^{commit}`)).toBe("")
+      expect(git(product, "rev-parse", "refs/heads/queue/root-only")).toBe(dangling)
+      expect(existsSync(target)).toBe(false)
+    } finally {
+      // raw-delete-allow: this isolated fixture tree owns every path beneath root
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it("returns unknown when the removal root does not share the persistent primary Git stores", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-root-identity-mismatch-"))
+    try {
+      const product = join(root, "product")
+      const primary = join(root, "primary")
+      const target = join(root, "target")
+      createRepository(product, "root.txt", "root\n")
+      createRepository(primary, "primary.txt", "primary\n")
+      git(product, "worktree", "add", "--detach", target)
+
+      const outcome = await createGitWorktreeStore({
+        repo: product,
+        gitProcess: createLocalGitProcess(),
+      }).remove(target, {
+        retention: { root: join(root, "retained"), report: () => undefined },
+        componentCustody: { primaryRoot: primary, targetBranch: "main" },
+      })
+
+      expect(outcome).toMatchObject({
+        custodyRefusal: { status: "unknown", component: ".", source: "recursive component census" },
+      })
+      expect(JSON.stringify(outcome)).toContain("root persistent primary")
+      expect(existsSync(target)).toBe(true)
+    } finally {
+      // raw-delete-allow: this isolated fixture tree owns every path beneath root
       await rm(root, { recursive: true, force: true })
     }
   })
@@ -239,13 +304,14 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
   it("includes a commit introduced after the initial census in the acquired final proof", async () => {
     const root = await mkdtemp(join(canonicalTmpdir(), "git-super-component-custody-new-commit-"))
     try {
-      const product = join(root, "product")
+      const fixture = createProductFixture(root)
+      const product = fixture.product
       const target = join(root, "target")
-      createRepository(product, "root.txt", "root\n")
       git(product, "worktree", "add", "--detach", target)
-      const tree = git(product, "rev-parse", "HEAD^{tree}")
-      const parent = git(product, "rev-parse", "HEAD")
-      let censusLists = 0
+      git(target, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
+      const alphaSource = join(target, "packages/alpha")
+      const tree = git(alphaSource, "rev-parse", "HEAD^{tree}")
+      const parent = git(alphaSource, "rev-parse", "HEAD")
       let introduced: string | undefined
       const local = createLocalGitProcess()
       const localStream = local.stream!
@@ -254,23 +320,11 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
         gitProcess: {
           run: local.run,
           stream: (request) => {
-            const stream = localStream(request)
-            if (
-              introduced !== undefined ||
-              request.args[0] !== "-C" ||
-              request.args[1] !== join(product, ".git") ||
-              !request.args.includes("worktree") ||
-              !request.args.includes("list") ||
-              ++censusLists !== 3
-            )
-              return stream
-            return {
-              ...stream,
-              outcome: stream.outcome.then((outcome) => {
-                introduced = git(product, "commit-tree", tree, "-p", parent, "-m", "introduced before final proof")
-                return outcome
-              }),
+            if (introduced === undefined && request.args.includes("--batch-all-objects")) {
+              introduced = git(alphaSource, "commit-tree", tree, "-p", parent, "-m", "introduced before final proof")
             }
+            const stream = localStream(request)
+            return stream
           },
         },
       })
@@ -281,7 +335,9 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
       })
 
       expect(introduced).toMatch(/^[0-9a-f]{40}$/u)
-      expect(outcome).toMatchObject({ custodyRefusal: { status: "blocked", component: ".", oid: introduced } })
+      expect(outcome).toMatchObject({
+        custodyRefusal: { status: "blocked", component: "packages/alpha", oid: introduced },
+      })
       expect(existsSync(target)).toBe(true)
     } finally {
       // raw-delete-allow: this isolated mkdtemp root owns every path beneath it
@@ -429,13 +485,14 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
         "-m",
         "alternate-only dangling commit",
       )
-      const alphaObjects = git(alphaPrimary, "rev-parse", "--path-format=absolute", "--git-path", "objects")
-      const rootObjects = git(fixture.product, "rev-parse", "--path-format=absolute", "--git-path", "objects")
-      await mkdir(join(rootObjects, "info"), { recursive: true })
-      await writeFile(join(rootObjects, "info", "alternates"), `${alphaObjects}\n`)
-      // The root policy permits a content-addressed pin for this alternate-supplied base commit.
-      // That isolates the new dangling commit as the sole missing custody item in the root ledger.
-      git(fixture.product, "update-ref", `refs/git-super/pins/${alphaHead}`, alphaHead)
+      const alphaSource = join(target, "packages/alpha")
+      const alphaObjects = git(alphaSource, "rev-parse", "--path-format=absolute", "--git-path", "objects")
+      const alternateObjects = git(alphaPrimary, "rev-parse", "--path-format=absolute", "--git-path", "objects")
+      const alternatesFile = join(alphaObjects, "info", "alternates")
+      const priorAlternates = existsSync(alternatesFile) ? readFileSync(alternatesFile, "utf8") : ""
+      await mkdir(join(alphaObjects, "info"), { recursive: true })
+      const separator = priorAlternates === "" || priorAlternates.endsWith("\n") ? "" : "\n"
+      await writeFile(alternatesFile, `${priorAlternates}${separator}${alternateObjects}\n`)
 
       const outcome = await createGitWorktreeStore({
         repo: fixture.product,
@@ -446,7 +503,7 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
       })
 
       expect(outcome, JSON.stringify(outcome)).toMatchObject({
-        custodyRefusal: { status: "blocked", oid: dangling },
+        custodyRefusal: { status: "blocked", component: "packages/alpha", oid: dangling },
       })
       expect(existsSync(target)).toBe(true)
     } finally {
@@ -468,10 +525,11 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
       git(fixture.product, "worktree", "add", "--detach", target)
       git(target, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
       const alphaSource = join(target, "packages/alpha")
-      const alphaObjects = git(alphaSource, "rev-parse", "--path-format=absolute", "--git-path", "objects")
-      const rootObjects = git(fixture.product, "rev-parse", "--path-format=absolute", "--git-path", "objects")
-      await mkdir(join(rootObjects, "info"), { recursive: true })
-      await writeFile(join(rootObjects, "info", "alternates"), `${alphaObjects}\n`)
+      const alphaSourceObjects = git(alphaSource, "rev-parse", "--path-format=absolute", "--git-path", "objects")
+      const alphaPrimary = join(fixture.product, "packages/alpha")
+      const alphaPrimaryObjects = git(alphaPrimary, "rev-parse", "--path-format=absolute", "--git-path", "objects")
+      await mkdir(join(alphaPrimaryObjects, "info"), { recursive: true })
+      await writeFile(join(alphaPrimaryObjects, "info", "alternates"), `${alphaSourceObjects}\n`)
 
       const outcome = await createGitWorktreeStore({
         repo: fixture.product,
@@ -498,10 +556,11 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
   it("returns a structured custody refusal and preserves the target when the primary lacks the named branch", async () => {
     const root = await mkdtemp(join(canonicalTmpdir(), "git-super-component-custody-refusal-"))
     try {
-      const product = join(root, "product")
+      const fixture = createProductFixture(root)
+      const product = fixture.product
       const target = join(root, "target")
-      createRepository(product, "root.txt", "root\n")
       git(product, "worktree", "add", "--detach", target)
+      git(target, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
 
       const result = await superWorktreeRemove({
         repo: product,
@@ -512,7 +571,7 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
 
       expect(result.state).toBe("unchanged")
       expect(result.reason).toBe("component-custody")
-      expect(result.custody).toMatchObject({ status: "blocked", component: "." })
+      expect(result.custody).toMatchObject({ status: "blocked", component: "packages/alpha" })
       expect(existsSync(target)).toBe(true)
     } finally {
       // raw-delete-allow: this isolated mkdtemp fixture owns every path beneath root

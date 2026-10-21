@@ -871,8 +871,9 @@ export function acquireRemovalWriterLeases(
       .filter((directory) => isGitDirectory(directory, removalRoot, true))
       .map((directory) => join(directory, "yrd-worktree-mutations", "writer.lock"))
     for (const owner of externalRoots) {
-      if (!isGitDirectory(owner, owner, true))
+      if (!isGitDirectory(owner, owner, true)) {
         throw new Error(`external writer lease owner is not a Git directory: ${owner}`)
+      }
       paths.push(join(owner, "yrd-worktree-mutations", "writer.lock"))
     }
     const uniquePaths = [...new Set(paths)].filter((path) => !skipped.has(resolve(path)))
