@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.0 — 2026-10-21
+
+- Add `git-super/remote` helpers for repository identity, URL spelling and clone-directory naming across supported network transports. Hosted push ownership retains its existing namespace checks.
+- Let native Git delegation accept an explicit environment; export repository-environment cleanup while preserving credentials and user Git configuration.
+- Strengthen worktree removal with complete commit-custody checks under removal leases, bounded streams, and protection for surviving alternate-object dependencies. Read canonical legacy archive custody and recognize archive ancestry during push.
+- Keep frozen task publication within requested destinations and preserve main as the first parent of two-sided component merges.
+- Improve status for absent checkouts with retained module repositories, label diff pins already at the target, retain native Git lookup errors, and provide exact repository/retry guidance. Delegate ordinary branch forms under `--repo` and refresh contended-lock holder progress.
+
 ## 0.7.0 — 2026-10-17
 
 - Export `shellQuote` through `git-super/shell-command`, including its published JavaScript and types. It quotes one argument for a POSIX shell; SSH retry commands and pull hook wrappers now reuse that implementation.
