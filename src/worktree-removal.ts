@@ -214,6 +214,10 @@ type RemovalParent = Readonly<{ adminDir: string; name: string; head: string; me
 type ExcludedRemovalCustody = Readonly<{
   notCompared: readonly NotCompared[]
   declaredPaths: readonly string[]
+  /** Stores the caller has already taken custody of; the slot inventory never judges them. */
+  excludedStores: readonly string[]
+  /** Excluded paths with no declaration identity at HEAD and nothing on disk: a store here stays unclaimed. */
+  unclaimedExclusions: readonly string[]
   borrowers: readonly RemovalParent[]
 }>
 
@@ -226,7 +230,9 @@ export async function assertExcludedRemovalCustody(
   excludedSubmodules: readonly string[] = [],
 ): Promise<ExcludedRemovalCustody> {
   validateExcludedSubmodules(excludedSubmodules)
-  if (excludedSubmodules.length === 0) return { notCompared: [], declaredPaths: [], borrowers: [] }
+  if (excludedSubmodules.length === 0) {
+    return { notCompared: [], declaredPaths: [], excludedStores: [], unclaimedExclusions: [], borrowers: [] }
+  }
   const checkout = realpathSync(requested)
   const parents: RemovalParent[] = []
   for (const candidate of [{ adminDir: gitDir, name: "target" }, ...removalBorrowers(commonDir, gitDir)]) {
@@ -240,6 +246,7 @@ export async function assertExcludedRemovalCustody(
   }
   const notCompared: NotCompared[] = []
   const declaredPaths: string[] = []
+  const excludedStores: string[] = []
   for (const path of new Set(excludedSubmodules)) {
     const { state, checkout: disk, unsafeAncestor } = inspectExcludedCheckout(checkout, path)
     const evidence = parents.map((parent) => {
@@ -298,44 +305,18 @@ export async function assertExcludedRemovalCustody(
       message: `excluded checkout is ${state}; not checked out, nothing to preserve in the checkout; Git store custody is reported separately`,
       exclusion,
     })
+    excludedStores.push(store)
     declaredPaths.push(path)
   }
-  const absentPaths = notCompared
-    .filter((entry) => entry.exclusion?.classification === "absent")
-    .map((entry) => entry.path)
-  const modules = join(gitDir, "modules")
-  if (absentPaths.length > 0 && present(modules)) {
-    const target = parents.find((parent) => parent.name === "target")
-    if (target === undefined) throw new Error(`missing target parent identity for ${checkout}`)
-    const includedStores: Array<{ path: string; store: string }> = []
-    for (const declaration of target.metadata.submodules) {
-      validateExcludedSubmodules([declaration.name])
-      const store = await git.text(checkout, [
-        "rev-parse",
-        "--path-format=absolute",
-        "--git-path",
-        `modules/${declaration.name}`,
-      ])
-      if (!isAbsolute(store) || !within(modules, store)) {
-        throw new Error(`included submodule ${declaration.path} has invalid parent-resolved store identity ${store}`)
-      }
-      includedStores.push({ path: declaration.path, store })
-    }
-    const refuse = (store: string): never => {
-      throw new Error(
-        `excluded ${absentPaths.join(", ")}: target-owned store ${store} has no included parent identity; worktree preserved before store inspection; preserve the store outside ${checkout} and ${gitDir} before retrying removal`,
-      )
-    }
-    const moduleState = lstatSync(modules)
-    if (!moduleState.isDirectory() || moduleState.isSymbolicLink()) refuse(modules)
-    for (const entry of borrowerEntries(modules, includedStores, "custody")) {
-      const store = join(entry.parentPath, entry.name)
-      // Only namespace ancestors of known included stores may be descended into.
-      // The existing walker prunes each known store and yields unknown entries before descent.
-      if (!entry.isDirectory() || !includedStores.some((included) => within(store, included.store))) refuse(store)
-    }
+  return {
+    notCompared,
+    declaredPaths,
+    excludedStores,
+    unclaimedExclusions: notCompared
+      .filter((entry) => entry.exclusion?.classification === "absent")
+      .map((entry) => entry.path),
+    borrowers: parents.filter((entry) => entry.name !== "target"),
   }
-  return { notCompared, declaredPaths, borrowers: parents.filter((entry) => entry.name !== "target") }
 }
 
 /**
@@ -351,12 +332,8 @@ export interface RehomeBorrowersOptions {
 }
 
 /** Protected roots are pruned before entry, including symlinks. */
-function* borrowerEntries(
-  root: string,
-  excludedStores: RemovalBorrower["excludedStores"],
-  purpose: "custody" | "dependencies",
-): Generator<Dirent> {
-  const dependencyStore = purpose === "dependencies" && isGitDirectory(root, root, false)
+function* borrowerEntries(root: string, excludedStores: RemovalBorrower["excludedStores"]): Generator<Dirent> {
+  const dependencyStore = isGitDirectory(root, root, false)
   for (const entry of readdirSync(root, { withFileTypes: true })) {
     const path = join(root, entry.name)
     if (excludedStores?.some((excluded) => within(excluded.store, path))) continue
@@ -373,7 +350,7 @@ function* borrowerEntries(
     // already read through (hh 28572). Only `info` can carry a borrower marker, so the walk never
     // enters the others.
     if (basename(root) === "objects" && entry.name !== "info") continue
-    yield* borrowerEntries(path, excludedStores, purpose)
+    yield* borrowerEntries(path, excludedStores)
   }
 }
 
@@ -557,7 +534,7 @@ function rehomeBorrowerCandidates(
     try {
       for (const includedStore of candidate.includedStores ?? [candidateModules]) {
         if (!existsSync(includedStore)) continue
-        for (const entry of borrowerEntries(includedStore, candidate.excludedStores, "dependencies")) {
+        for (const entry of borrowerEntries(includedStore, candidate.excludedStores)) {
           if (entry.isSymbolicLink() && entry.name === "objects") {
             const objects = join(entry.parentPath, entry.name)
             let target: string

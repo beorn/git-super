@@ -16,6 +16,7 @@ import { joinCommitSubmodules, parseCommitSubmoduleConfig, type CommitSubmodule 
 import { pinRef } from "./objects.ts"
 import { shellQuote } from "./shell-command.ts"
 import { resolveSubmoduleOrigin } from "./submodule-origin.ts"
+import { moduleStoreValue } from "./module-store-custody.ts"
 
 const ZERO_OID = "0".repeat(40)
 const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
@@ -707,10 +708,34 @@ function* statusRepository(
       const classifyHoldingNothing = function* (): Traversal<void> {
         const module = yield* moduleRepository(root, path)
         if (module.kind === "repository") {
+          // A surviving repository protects bytes, not existence (30580): when every commit it holds is
+          // held by its remote's default branch or archive refs, read from that remote now, the empty
+          // checkout really does hold nothing. One predicate decides this here and in removal's `modules/`
+          // inventory. A store or remote that cannot be read is still a problem, never "holds nothing".
+          let value: ReturnType<typeof moduleStoreValue>
+          try {
+            value = moduleStoreValue(module.dir)
+          } catch (error) {
+            submoduleProblems.push({
+              kind: "repository-not-consulted",
+              path: nestedPrefix,
+              reason: `${child} holds no files, but its repository exists at ${module.dir} and what it holds is unknown: ${error instanceof Error ? error.message : String(error)}; re-attach it: git -C ${root} submodule update --init ${path}`,
+              gitDir: module.dir,
+            })
+            return
+          }
+          if (value.valueCommits === 0) {
+            uninitializedSubmodules.push(nestedPrefix)
+            return
+          }
           submoduleProblems.push({
             kind: "repository-not-consulted",
             path: nestedPrefix,
-            reason: `${child} holds no files, but its repository exists at ${module.dir}; re-attach it: git -C ${root} submodule update --init ${path}`,
+            reason:
+              `${child} holds no files, but its repository exists at ${module.dir} and holds ${String(value.valueCommits)} commit(s) that neither its remote's default branch nor any archive ref there holds` +
+              `${value.remote === undefined ? " (it has no remote)" : ` (remote ${value.remote}${value.defaultBranch === undefined ? "" : ` ${value.defaultBranch}`})`}` +
+              `${value.head === undefined ? "" : `, HEAD ${value.head}`}` +
+              `; re-attach it: git -C ${root} submodule update --init ${path}`,
             gitDir: module.dir,
           })
           return
