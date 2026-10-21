@@ -16,7 +16,7 @@ import { joinCommitSubmodules, parseCommitSubmoduleConfig, type CommitSubmodule 
 import { pinRef } from "./objects.ts"
 import { shellQuote } from "./shell-command.ts"
 import { resolveSubmoduleOrigin } from "./submodule-origin.ts"
-import { describeModuleStore, moduleStoreCustody } from "./module-store-custody.ts"
+import { moduleStoreValue } from "./module-store-custody.ts"
 
 const ZERO_OID = "0".repeat(40)
 const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
@@ -711,15 +711,19 @@ function* statusRepository(
           // A surviving repository protects bytes, not existence (30580): when every commit it holds is
           // held by a remote-tracking ref too, the empty checkout really does hold nothing. One predicate
           // decides this here and in removal's `modules/` inventory.
-          const custody = moduleStoreCustody(module.dir)
-          if (custody.uniqueCommits === 0) {
+          const value = moduleStoreValue(module.dir)
+          if (value.valueCommits === 0) {
             uninitializedSubmodules.push(nestedPrefix)
             return
           }
           submoduleProblems.push({
             kind: "repository-not-consulted",
             path: nestedPrefix,
-            reason: `${child} holds no files, but its repository exists at ${module.dir}; ${describeModuleStore(module.name, module.dir, custody)}; re-attach it: git -C ${root} submodule update --init ${path}`,
+            reason:
+              `${child} holds no files, but its repository exists at ${module.dir} and holds ${String(value.valueCommits)} commit(s) that neither its remote main nor any archive ref holds` +
+              `${value.remote === undefined ? " (it has no remote)" : ` (remote ${value.remote})`}` +
+              `${value.head === undefined ? "" : `, HEAD ${value.head}`}` +
+              `; re-attach it: git -C ${root} submodule update --init ${path}`,
             gitDir: module.dir,
           })
           return

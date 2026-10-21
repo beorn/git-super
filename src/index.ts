@@ -44,12 +44,12 @@ export {
   type WorktreeHomeOptions,
 } from "./worktree-add.ts"
 export {
-  describeReleasedStores,
-  describeModuleStore,
+  archiveModuleStores,
+  describeModuleStores,
   inspectModuleStores,
-  moduleStoreCustody,
-  moduleStoreUniqueCommits,
+  moduleStoreValue,
+  moduleStoreValueCommits,
+  type ModuleArchiveTarget,
   type ModuleInventory,
   type ModuleStore,
-  type StoreCustody,
 } from "./module-store-custody.ts"
