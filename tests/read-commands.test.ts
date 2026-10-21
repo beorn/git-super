@@ -1009,7 +1009,7 @@ describe("Phase 1 read commands", () => {
 
     expect(code).toBe(2)
     expect(code).not.toBe(1)
-    expect(stderr.output).toMatch(/fatal:|Needed a single revision|could not resolve/i)
+    expect(stderr.output).toContain("Needed a single revision")
   })
 
   test("dispatches through the Silvery command tree and preserves JSON and NUL output parity", async () => {
