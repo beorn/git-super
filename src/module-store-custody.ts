@@ -169,16 +169,22 @@ function missingObjects(gitDir: string, shas: readonly string[]): string[] {
 
 /**
  * The tips the value test subtracts, read from the store's remote now (operator 2026-10-21): the remote's default
- * branch and every `refs/archive/*` it holds. A local remote-tracking ref can be stale or name the wrong default,
- * and a local archive ref is not on the remote at all, so neither decides. Tips whose objects the store lacks are
- * fetched first, because reachability needs them. A remote that cannot be read stops removal, with no fallback
- * to the local copies.
+ * branch, every `refs/archive/*` and every `refs/tags/*` it holds (a published tag is permanent and holds no
+ * worktree work, @cto 2026-10-21). A local remote-tracking ref can be stale or name the wrong default, and a local
+ * archive ref is not on the remote at all, so neither decides. Default-branch and archive tips whose objects the
+ * store lacks are fetched first, because reachability needs them. Tags are never fetched: a tag tip the store
+ * lacks is left out, so the work it would cover still counts as value. A remote that cannot be read stops
+ * removal, with no fallback to the local copies.
  */
 function remoteDurableTips(
   gitDir: string,
   remote: string,
 ): Readonly<{ defaultBranch?: string; tips: string[]; archiveRefs: string[] }> {
-  const listed = storeGit(gitDir, ["ls-remote", "--symref", remote, "HEAD", "refs/archive/*"], REMOTE_READ_TIMEOUT_MS)
+  const listed = storeGit(
+    gitDir,
+    ["ls-remote", "--symref", remote, "HEAD", "refs/archive/*", "refs/tags/*"],
+    REMOTE_READ_TIMEOUT_MS,
+  )
   if (listed.status !== 0) {
     throw new Error(
       `module store ${gitDir} could not be read: its remote ${remote} did not answer ls-remote (${listed.stderr.trim() || `exit ${String(listed.status)}`}), so its value is unknown; worktree preserved`,
@@ -187,6 +193,7 @@ function remoteDurableTips(
   let defaultBranch: string | undefined
   let headTip: string | undefined
   const archive = new Map<string, string>()
+  const tags = new Map<string, string>()
   for (const line of listed.stdout.split("\n")) {
     if (line.trim() === "") continue
     const [, target, symrefName] = /^ref: (\S+)\t(\S+)$/u.exec(line) ?? []
@@ -203,6 +210,12 @@ function remoteDurableTips(
     // The `HEAD` pattern also matches every ref ending in `/HEAD`; only the remote's own HEAD is its default branch.
     if (ref === "HEAD") headTip = sha
     else if (ref.startsWith("refs/archive/")) archive.set(ref, sha)
+    else if (ref.startsWith("refs/tags/")) {
+      // An annotated tag lists its tag object, then its commit under `^{}`; the commit is what counts.
+      const peeled = ref.endsWith("^{}")
+      const name = peeled ? ref.slice(0, -"^{}".length) : ref
+      if (peeled || !tags.has(name)) tags.set(name, sha)
+    }
   }
   // A remote HEAD that is unborn or detached names no default branch, so only its archive refs are subtracted.
   const head =
@@ -235,7 +248,13 @@ function remoteDurableTips(
       )
     }
   }
-  return { ...(defaultBranch === undefined ? {} : { defaultBranch }), tips, archiveRefs: [...archive.keys()] }
+  const tagTips = [...new Set(tags.values())]
+  const absentTags = new Set(missingObjects(gitDir, tagTips))
+  return {
+    ...(defaultBranch === undefined ? {} : { defaultBranch }),
+    tips: [...new Set([...tips, ...tagTips.filter((sha) => !absentTags.has(sha))])],
+    archiveRefs: [...archive.keys()],
+  }
 }
 
 /** A ref that could hold work, and the name its commit is archived under. */
@@ -313,8 +332,8 @@ function count(gitDir: string, wants: readonly string[], exclusions: readonly st
 
 /**
  * The one value predicate removal and #30563's status check share (operator 2026-10-21): the commits a store's
- * own refs hold that are not reachable from its remote's default branch or from any `refs/archive/*` on that
- * remote, both read from the remote now. A store with no remote has nothing proving its bytes exist elsewhere,
+ * own refs hold that are not reachable from its remote's default branch, any `refs/archive/*` or any `refs/tags/*`
+ * on that remote, all read from the remote now. A store with no remote has nothing proving its bytes exist elsewhere,
  * so every commit it holds counts as value.
  */
 export function moduleStoreValue(gitDir: string): Readonly<{
@@ -510,27 +529,27 @@ function archiveModuleStore(store: ModuleStore, target: ModuleArchiveTarget, ear
       `module store ${store.name} holds ${String(store.valueCommits)} commit(s), and it has no remote to archive them to; worktree preserved${earlier.length === 0 ? "" : ` after archiving ${earlier.join(", ")}`}. Add a remote, or save the store with \`git --git-dir ${store.gitDir} bundle create <file> --all\`, before retrying removal`,
     )
   }
-  const archived: string[] = []
   const taken = new Set(store.remoteArchiveRefs)
-  for (const ref of store.refs) {
+  const pushes = store.refs.map((ref) => {
     const named = archiveRefFor(`${store.name}/${ref.label}`, target.actor, target.date)
     // A name the remote already holds keeps another commit (the commits it holds are not value), so this one
     // takes its object's short id instead. An archive is never replaced, and the push needs no force; a name
     // taken in the meantime fails the push and stops the removal.
     const destination = taken.has(named) ? `${named}-${objectId(store.gitDir, ref.source).slice(0, 12)}` : named
-    const pushed = storeGit(
-      store.gitDir,
-      ["push", store.remote, `${ref.source}:${destination}`],
-      ARCHIVE_PUSH_TIMEOUT_MS,
+    return { refspec: `${ref.source}:${destination}`, destination }
+  })
+  // One atomic push per store: every ref lands, or none does and the stop says so.
+  const pushed = storeGit(
+    store.gitDir,
+    ["push", "--atomic", store.remote, ...pushes.map((push) => push.refspec)],
+    ARCHIVE_PUSH_TIMEOUT_MS,
+  )
+  if (pushed.status !== 0) {
+    throw new Error(
+      `module store ${store.name} could not be archived: git push --atomic of ${String(pushes.length)} ref(s) to ${store.remote} failed (${pushed.stderr.trim() || `exit ${String(pushed.status)}`}); worktree preserved after archiving ${earlier.join(", ") || "nothing"}`,
     )
-    if (pushed.status !== 0) {
-      throw new Error(
-        `module store ${store.name} could not be archived: git push ${ref.source} -> ${destination} on ${store.remote} failed (${pushed.stderr.trim() || `exit ${String(pushed.status)}`}); worktree preserved after archiving ${[...earlier, ...archived].join(", ") || "nothing"}`,
-      )
-    }
-    archived.push(destination)
   }
-  return { ...store, archived }
+  return { ...store, archived: pushes.map((push) => push.destination) }
 }
 
 /** One line per store, so a removal never destroys (or archives) a module repository silently. */
@@ -541,7 +560,7 @@ export function describeModuleStores(stores: readonly ModuleStore[]): string[] {
       const where =
         store.remote === undefined
           ? "it holds no commits and has no remote"
-          : `${store.remote} ${store.defaultBranch === undefined ? "" : `${store.defaultBranch} and `}archive refs hold it`
+          : `${store.remote} ${store.defaultBranch === undefined ? "" : `${store.defaultBranch}, `}archive refs and tags hold it`
       return `module store ${store.name} released: ${where}, 0 commits unique${head}`
     }
     // Before the push (an inspection's removal plan) the line must not claim an archive that has not happened.
