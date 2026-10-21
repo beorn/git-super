@@ -343,9 +343,14 @@ async function enrichedInvocation(argv: readonly string[]): Promise<readonly str
   // (28962).
   const statusPath = command === "status" ? statusPathArgument(argv.slice(commandIndex + 1)) : undefined
   const cure = (await namesRepositoryPath(globals, statusPath)) ?? repo
+  // The refusal must name the tree it judged AND a command that runs there. "this
+  // worktree context" told a reader neither which tree was read nor how to retry,
+  // so a clean check that spans submodules was unreachable without guessing --repo
+  // (30539).
+  const context = bare.stdout === "true\n" ? `bare context (${repo})` : `worktree context (${repo})`
   const refuse = (reason: string) =>
     new Error(
-      `git-super: ${command}: ${reason}. Use the explicit git-super --repo ${cure} interface; implicit superproject operation contracts are not yet supported.`,
+      `git-super: ${command}: ${reason}. Use the explicit git-super --repo ${cure} ${command} … interface; implicit superproject operation contracts are not yet supported.`,
     )
   let objects: readonly { argument: string; object: string }[]
   try {
@@ -382,9 +387,7 @@ async function enrichedInvocation(argv: readonly string[]): Promise<readonly str
       throw refuse(`cannot classify argument '${argument}': ${error instanceof Error ? error.message : String(error)}`)
     }
     if (hasGitlinks) {
-      throw refuse(
-        `argument '${argument}' carries gitlinks against this ${bare.stdout === "true\n" ? "bare" : "worktree"} context`,
-      )
+      throw refuse(`argument '${argument}' carries gitlinks against this ${context}`)
     }
   }
   if (tree.stdout.split("\0").some((entry) => entry.startsWith("160000 "))) throw refuse("the index carries gitlinks")
