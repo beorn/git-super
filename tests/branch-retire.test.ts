@@ -86,7 +86,7 @@ describe("branch retire", () => {
    * @consumer /pm-wip-sweep step 5
    * @testonly none
    */
-  test("refuses an unarchived branch, naming the archive ref it expected", async () => {
+  test("refuses a branch with no local archive, naming the ref, the fetch cure, and the archive cure", async () => {
     const fixture = retireFixture("absent")
     const stdout = outputSink()
     const stderr = outputSink()
@@ -99,7 +99,10 @@ describe("branch retire", () => {
 
     expect(code).toBe(2)
     expect(stderr.output).toContain(fixture.archiveRef)
-    expect(stderr.output).toContain("no archive ref")
+    // The local ref is what this verb read, so an archive that lives only on origin must not read as "never archived".
+    expect(stderr.output).toContain("no local ref")
+    expect(stderr.output).toContain(`git fetch origin ${fixture.archiveRef}:${fixture.archiveRef}`)
+    expect(stderr.output).toContain("archive the branch at its tip")
     expect(headOf(fixture.repo, "refs/heads/task/28989")).toBe("refs/heads/task/28989")
     expect(existsSync(join(fixture.repo, ".git"))).toBe(true)
   })

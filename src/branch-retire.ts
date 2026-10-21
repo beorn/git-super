@@ -77,7 +77,7 @@ export async function superBranchRetire(options: SuperBranchRetireOptions): Prom
   const archivedTip = oidOf(repo, archiveRef)
   if (archivedTip === undefined) {
     throw new Error(
-      `branch ${branch}: no archive ref ${archiveRef} holds this commit; archive the branch at its tip ${tip} first, then retire it`,
+      `branch ${branch}: no local ref ${archiveRef} holds this commit; if that archive exists on origin, bring it here with \`git fetch origin ${archiveRef}:${archiveRef}\`; otherwise archive the branch at its tip ${tip} first, then retire it`,
     )
   }
   if (archivedTip !== tip) {
