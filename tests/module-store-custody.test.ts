@@ -280,6 +280,22 @@ describe("slot module store custody", () => {
     expect(await slot.store.inspect(slot.linked)).toEqual(expect.objectContaining({ registered: true }))
   })
 
+  test("an archive push the remote rejects stops removal, naming the store, and the slot stays", async () => {
+    const slot = await linkedSlot(fixtureRoot("module-push-rejected"))
+    localCommit(slot.child)
+    dropAlphaFromHead(slot.linked)
+    const hook = join(slot.fixture.alpha, ".git", "hooks", "pre-receive")
+    writeFileSync(hook, "#!/bin/sh\necho 'archive refused by fixture' >&2\nexit 1\n", { mode: 0o755 })
+    const message = refusal(() =>
+      archiveModuleStores(inspectModuleStores(slot.linked, slot.gitDir).stores, { actor: "dev-test", date: DATE }),
+    )
+    expect(message).toContain("module store packages/alpha could not be archived: git push")
+    expect(message).toContain("worktree preserved after archiving nothing")
+    await expect(slot.store.remove(slot.linked)).rejects.toThrow(/could not be archived/)
+    expect(existsSync(slot.linked)).toBe(true)
+    expect(existsSync(join(slot.modules, "packages/alpha"))).toBe(true)
+  })
+
   test("a stash-only commit is value and is archived as its own entry", async () => {
     const slot = await linkedSlot(fixtureRoot("module-stash"))
     writeFileSync(join(slot.child, "alpha.ts"), "export const alpha = 999\n")
