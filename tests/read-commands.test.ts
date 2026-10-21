@@ -15,7 +15,7 @@ vi.mock("node:fs", async (importOriginal) => {
     readFileSync: (...args: Parameters<typeof actual.readFileSync>) => actual.default.readFileSync(...args),
   }
 })
-import { copyFileSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { flattenCommandNodes, resolveInvocation } from "@silvery/command"
@@ -501,21 +501,196 @@ describe("Phase 1 read commands", () => {
     })
   })
 
-  test("status names a missing nested checkout as a problem instead of claiming it was consulted", () => {
+  test("status classifies a missing nested checkout as holding nothing, never as consulted (30563)", () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-nested-missing-"))
     roots.push(fixtureRoot)
     const fixture = addNestedAlphaSubmodule(createProductFixture(fixtureRoot))
-    rmSync(join(fixture.product, "packages/alpha/apps/maddoc"), { recursive: true, force: true })
+    // A fresh clone has no module repositories: alpha initializes on demand, and its own
+    // nested gitlink never does, so removing that directory loses no repository (30563 R1).
+    const clone = join(fixtureRoot, "clone")
+    git(fixtureRoot, "clone", "-q", fixture.product, clone)
+    git(clone, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "packages/alpha")
+    rmSync(join(clone, "packages/alpha/apps/maddoc"), { recursive: true, force: true })
 
-    const result = superStatus({ repo: fixture.product })
-    expect(result.submoduleProblems).toEqual([
-      {
-        kind: "repository-not-consulted",
-        path: "packages/alpha/apps/maddoc",
-        reason: expect.stringContaining("packages/alpha/apps/maddoc"),
-      },
-    ])
+    const result = superStatus({ repo: clone })
+    expect(result.uninitializedSubmodules).toContain("packages/alpha/apps/maddoc")
+    expect(result.submoduleProblems).toEqual([])
     expect(result.consultedRepositories.map(({ path }) => path)).not.toContain("packages/alpha/apps/maddoc")
+  })
+
+  /**
+   * @failure An uninitialized submodule checkout that holds nothing (directory absent or empty) is reported
+   *          as an unknown submodule state, so removal refuses a slot with no payload to preserve; a populated
+   *          one refuses without naming the owning repository's init command (30563).
+   * @level   l1
+   * @consumer git-super status --json, bearly worktree remove
+   * @testonly none
+   */
+  test("absent and empty checkouts hold nothing while a populated one names its owner's init command", () => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-uninitialized-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    // No module repositories here, which is the state `git clone` leaves: the empty
+    // directories hold nothing at all.
+    const clone = join(root, "clone")
+    git(root, "clone", "-q", fixture.product, clone)
+    const child = join(clone, "packages/alpha")
+
+    rmSync(child, { recursive: true, force: true })
+    const absent = superStatus({ repo: clone })
+    expect(absent.uninitializedSubmodules).toContain("packages/alpha")
+    expect(absent.submoduleProblems).toEqual([])
+
+    mkdirSync(child)
+    const empty = superStatus({ repo: clone })
+    expect(empty.uninitializedSubmodules).toContain("packages/alpha")
+    expect(empty.submoduleProblems).toEqual([])
+
+    writeFileSync(join(child, "authored.txt"), "authored payload\n")
+    const populated = superStatus({ repo: clone })
+    expect(populated.uninitializedSubmodules).not.toContain("packages/alpha")
+    expect(populated.submoduleProblems).toHaveLength(1)
+    expect(populated.submoduleProblems[0]).toMatchObject({ kind: "repository-not-consulted", path: "packages/alpha" })
+    expect(populated.submoduleProblems[0]!.reason).toContain("is not empty")
+    expect(populated.submoduleProblems[0]!.reason).toContain(`git -C ${clone} submodule update --init packages/alpha`)
+    expect(populated.submoduleProblems[0]!.reason).toContain("move its files out of it")
+  })
+
+  test("a checkout that holds no files but keeps its module repository refuses, naming the re-attach (30563 R1)", () => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-module-repo-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const child = join(fixture.product, "packages/alpha")
+    writeFileSync(join(child, "unpushed.txt"), "unpushed work\n")
+    git(child, "add", "-A")
+    git(child, "commit", "-q", "-m", "unpushed commit")
+    const declared = git(fixture.product, "rev-parse", "--git-path", "modules/packages/alpha")
+    const moduleDir = declared.startsWith("/") ? declared : join(fixture.product, declared)
+    expect(existsSync(moduleDir)).toBe(true)
+
+    git(fixture.product, "submodule", "deinit", "-f", "--", "packages/alpha")
+    expect(existsSync(child)).toBe(true)
+    const deinitialized = superStatus({ repo: fixture.product })
+    expect(deinitialized.uninitializedSubmodules).toEqual([])
+    expect(deinitialized.submoduleProblems).toEqual([
+      expect.objectContaining({
+        kind: "repository-not-consulted",
+        path: "packages/alpha",
+        gitDir: moduleDir,
+        reason: expect.stringContaining(`git -C ${fixture.product} submodule update --init packages/alpha`),
+      }),
+    ])
+
+    rmSync(child, { recursive: true, force: true })
+    const deleted = superStatus({ repo: fixture.product })
+    expect(deleted.uninitializedSubmodules).toEqual([])
+    expect(deleted.submoduleProblems).toHaveLength(1)
+    expect(deleted.submoduleProblems[0]!.reason).toContain("its repository exists at")
+    expect(existsSync(moduleDir)).toBe(true)
+  })
+
+  test("a module name and path containing spaces still finds the surviving repository (30563 R2)", () => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-spaced-module-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const spaced = "packages/alpha spaced"
+    const name = "alpha spaced name"
+    // A name that differs from the path: only the .gitmodules parse can reach the module
+    // directory, so the path-default fallback cannot mask a parse regression (30563 R2).
+    git(
+      fixture.product,
+      "-c",
+      "protocol.file.allow=always",
+      "submodule",
+      "add",
+      "-q",
+      "--name",
+      name,
+      fixture.alpha,
+      spaced,
+    )
+    git(fixture.product, "commit", "-q", "-am", "add spaced submodule")
+    const child = join(fixture.product, spaced)
+    writeFileSync(join(child, "unpushed.txt"), "unpushed work\n")
+    git(child, "add", "-A")
+    git(child, "commit", "-q", "-m", "unpushed commit")
+    const declared = git(fixture.product, "rev-parse", "--git-path", `modules/${name}`)
+    const moduleDir = declared.startsWith("/") ? declared : join(fixture.product, declared)
+    expect(existsSync(moduleDir)).toBe(true)
+    expect(git(fixture.product, "config", "-f", ".gitmodules", "--get", `submodule.${name}.path`)).toBe(spaced)
+
+    rmSync(child, { recursive: true, force: true })
+    const status = superStatus({ repo: fixture.product })
+    expect(status.uninitializedSubmodules).not.toContain(spaced)
+    expect(status.submoduleProblems).toEqual([
+      expect.objectContaining({
+        kind: "repository-not-consulted",
+        path: spaced,
+        gitDir: moduleDir,
+        reason: expect.stringContaining("its repository exists at"),
+      }),
+    ])
+    expect(existsSync(moduleDir)).toBe(true)
+  })
+
+  test("an unreadable .gitmodules is a problem, never no declarations (30563 R2)", () => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-malformed-gitmodules-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const child = join(fixture.product, "packages/alpha")
+    const declared = git(fixture.product, "rev-parse", "--git-path", "modules/packages/alpha")
+    const moduleDir = declared.startsWith("/") ? declared : join(fixture.product, declared)
+    expect(existsSync(moduleDir)).toBe(true)
+    // A malformed file exits 128, not 1: the declarations are UNREAD, and the default-name
+    // fallback would otherwise miss a renamed submodule's surviving repository.
+    writeFileSync(
+      join(fixture.product, ".gitmodules"),
+      '[submodule "packages/alpha"]\npath = packages/alpha\nbad line\n',
+    )
+
+    rmSync(child, { recursive: true, force: true })
+    const status = superStatus({ repo: fixture.product })
+    expect(status.uninitializedSubmodules).not.toContain("packages/alpha")
+    expect(status.submoduleProblems).toEqual([
+      expect.objectContaining({
+        kind: "repository-not-consulted",
+        path: "packages/alpha",
+        reason: expect.stringContaining("bad config line"),
+      }),
+    ])
+    expect(existsSync(moduleDir)).toBe(true)
+  })
+
+  test("an undeclared gitlink still checks git's default module name instead of claiming it holds nothing (30563 R2)", () => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-undeclared-gitlink-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const child = join(fixture.product, "packages/alpha")
+    writeFileSync(join(child, "unpushed.txt"), "unpushed work\n")
+    git(child, "add", "-A")
+    git(child, "commit", "-q", "-m", "unpushed commit")
+    const declared = git(fixture.product, "rev-parse", "--git-path", "modules/packages/alpha")
+    const moduleDir = declared.startsWith("/") ? declared : join(fixture.product, declared)
+    expect(existsSync(moduleDir)).toBe(true)
+    // Drop the declaration while the gitlink stays in the index: git's own default module
+    // name for an undeclared gitlink is the path, so the repository is still reachable.
+    rmSync(join(fixture.product, ".gitmodules"))
+    git(fixture.product, "add", "-A")
+    git(fixture.product, "commit", "-q", "-m", "drop gitmodules")
+    expect(existsSync(join(fixture.product, ".gitmodules"))).toBe(false)
+
+    rmSync(child, { recursive: true, force: true })
+    const status = superStatus({ repo: fixture.product })
+    expect(status.uninitializedSubmodules).not.toContain("packages/alpha")
+    expect(status.submoduleProblems).toEqual([
+      expect.objectContaining({
+        kind: "repository-not-consulted",
+        path: "packages/alpha",
+        gitDir: moduleDir,
+        reason: expect.stringContaining("its repository exists at"),
+      }),
+    ])
+    expect(existsSync(moduleDir)).toBe(true)
   })
 
   /**

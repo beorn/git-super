@@ -64,7 +64,11 @@ export type SuperStatusResult = Readonly<{
   records: readonly string[]
   consultedRepositories: readonly ConsultedRepository[]
   notCompared: readonly NotCompared[]
-  /** Existing empty gitlink directories with no repository of their own; these are not dirty records. */
+  /** Gitlinks whose checkout is absent or an empty directory AND whose module repository is gone --
+   * they hold nothing, so they are not dirty records and not a problem. Two other shapes are a
+   * `submoduleProblems` entry naming that repository's own command: a checkout directory that exists
+   * WITH contents, and a checkout with no files whose module repository survives at
+   * `<git-dir>/modules/<name>` (`deinit` and `rm -rf` both keep it). */
   uninitializedSubmodules: readonly string[]
   /** Named uncertainty is observable, but never sufficient evidence for worktree removal. */
   submoduleProblems: readonly Readonly<{

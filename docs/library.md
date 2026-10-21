@@ -43,7 +43,7 @@ Node needs the built npm package and a built Node-compatible `@bearly/flock`. In
 
 ## Options worth knowing
 
-**Inspect before removing.** `inspectRemoval(path, { excludedSubmodules? })`, on the store `createGitWorktreeStore` returns, checks excluded checkouts and stores without taking locks, copying or moving anything. It returns `notCompared`, `consultedRepositories` and `uninitializedSubmodules`. It is a snapshot, not permission: `remove` checks again under its lock. Uninitialized included submodules are reported, not judged.
+**Inspect before removing.** `inspectRemoval(path, { excludedSubmodules? })`, on the store `createGitWorktreeStore` returns, checks excluded checkouts and stores without taking locks, copying or moving anything. It returns `notCompared`, `consultedRepositories` and `uninitializedSubmodules`. It is a snapshot, not permission: `remove` checks again under its lock. An included submodule whose directory is absent or empty AND whose module repository no longer exists holds nothing and does not block removal. A directory that exists with contents, or a checkout whose module repository survives at `<git-dir>/modules/<name>`, is a `submoduleProblems` entry naming its owner's re-attach command, and blocks removal.
 
 **`materializeSubmodulesWithProcess(process, options, processOptions)`:**
 

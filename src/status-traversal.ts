@@ -34,6 +34,49 @@ function* gitText(cwd: string, args: readonly string[], indexFile?: string): Tra
 function* discoverRoot(cwd: string): Traversal<string> {
   return (yield* gitText(cwd, ["rev-parse", "--show-toplevel"])).trim()
 }
+/** The module repository a gitlink's checkout re-attaches to, when it still exists.
+ * `git submodule deinit` leaves the directory empty and `rm -rf` leaves none, but BOTH
+ * keep `<git-dir>/modules/<name>` with its local branches, unpushed commits and stashes:
+ * that checkout does not hold nothing, and removal would delete the repository with the
+ * slot. The name comes from .gitmodules, defaulting to the path itself (git's own default);
+ * a .gitmodules that cannot be read is `unreadable`, never "no declarations". */
+type ModuleLookup =
+  | Readonly<{ kind: "none" }>
+  | Readonly<{ kind: "repository"; dir: string }>
+  | Readonly<{ kind: "unreadable"; reason: string }>
+function* moduleRepository(root: string, path: string): Traversal<ModuleLookup> {
+  // NUL-terminated pairs keep a name or path containing spaces intact; `key\nvalue\0`.
+  const listing = yield* queryGit(root, [
+    "config",
+    "-z",
+    "-f",
+    ".gitmodules",
+    "--get-regexp",
+    "^submodule\\..*\\.path$",
+  ])
+  // `git config` exits 1 for a missing file and for no matching key -- both mean "no declarations".
+  // Any other status (a malformed file exits 128) leaves them UNREAD, which is never "holds
+  // nothing": `git mv` keeps the old name, so a renamed submodule's repository would be missed.
+  if (listing.status !== 0 && listing.status !== 1) {
+    return {
+      kind: "unreadable",
+      reason: `git config -f .gitmodules exited ${listing.status}: ${listing.stderr.trim()}`,
+    }
+  }
+  const declarations = listing.stdout.split("\0").flatMap((entry) => {
+    const newline = entry.indexOf("\n")
+    return newline < 0 ? [] : [{ key: entry.slice(0, newline), value: entry.slice(newline + 1) }]
+  })
+  const declared = declarations.find((candidate) => candidate.value === path)
+  // Undeclared gitlinks still have git's default module name, which is the path itself: check
+  // that name rather than assuming no repository exists. Never an unchecked "holds nothing".
+  const name = declared === undefined ? path : declared.key.replace(/^submodule\./u, "").replace(/\.path$/u, "")
+  const expected = (yield* gitText(root, ["rev-parse", "--git-path", `modules/${name}`])).trim()
+  const absolute = isAbsolute(expected) ? expected : resolve(root, expected)
+  return lstatSync(absolute, { throwIfNoEntry: false }) === undefined
+    ? { kind: "none" }
+    : { kind: "repository", dir: absolute }
+}
 function* readIndexGitlinks(cwd: string, indexFile?: string) {
   return parseIndexEntries(
     yield* gitText(cwd, ["ls-files", "--stage", "-z"], indexFile),
@@ -655,7 +698,37 @@ function* statusRepository(
       })
     }
     try {
-      const childState = lstatSync(child)
+      const childState = lstatSync(child, { throwIfNoEntry: false })
+      // A checkout with no files holds nothing -- unless its module repository survives,
+      // because removal would delete that repository (with its local branches, unpushed
+      // commits and stashes) along with the slot. Recorded as a problem, naming either the
+      // re-attach command that reuses the existing repository instead of cloning, or the
+      // .gitmodules that could not be read (30563).
+      const classifyHoldingNothing = function* (): Traversal<void> {
+        const module = yield* moduleRepository(root, path)
+        if (module.kind === "repository") {
+          submoduleProblems.push({
+            kind: "repository-not-consulted",
+            path: nestedPrefix,
+            reason: `${child} holds no files, but its repository exists at ${module.dir}; re-attach it: git -C ${root} submodule update --init ${path}`,
+            gitDir: module.dir,
+          })
+          return
+        }
+        if (module.kind === "unreadable") {
+          submoduleProblems.push({
+            kind: "repository-not-consulted",
+            path: nestedPrefix,
+            reason: `${child} holds no files, but ${root}/.gitmodules could not be read, so whether its module repository survives is unknown: ${module.reason}; repair .gitmodules before removal`,
+          })
+          return
+        }
+        uninitializedSubmodules.push(nestedPrefix)
+      }
+      if (childState === undefined) {
+        yield* classifyHoldingNothing()
+        continue
+      }
       symbolicCheckout = childState.isSymbolicLink()
       const metadata = join(child, ".git")
       const metadataState = lstatSync(metadata, { throwIfNoEntry: false })
@@ -676,10 +749,11 @@ function* statusRepository(
       if (probe.kind === "absent") {
         if (inspectUninitializedCheckout(child) !== "empty") {
           throw new Error(
-            `uninitialized directory ${child} is not empty and has no repository of its own; preserve its files and initialize the submodule before removal`,
+            `uninitialized directory ${child} is not empty and has no repository of its own; move its files out of it, then run: ` +
+              `git -C ${root} submodule update --init ${path}`,
           )
         }
-        uninitializedSubmodules.push(nestedPrefix)
+        yield* classifyHoldingNothing()
         continue
       }
       const checkoutPin = (yield* gitText(nestedRoot, ["rev-parse", "HEAD"])).trim()

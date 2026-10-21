@@ -103,7 +103,7 @@ Shows tracked, untracked and staged changes in the root and in every checked-out
 `status --json` always includes two arrays:
 
 - `submoduleProblems`: submodules that could not be read, each with `path`, `reason`, and `gitDir` when known. Status can exit 0 with problems listed: the root read worked, but those submodules stay unknown. A non-empty list blocks `worktree remove` even when `records` is empty. Human output names the problems on stderr.
-- `uninitializedSubmodules`: existing empty submodule directories, also printed on stderr as `path: not checked out`. They are not reported as dirty. A non-empty directory that is not checked out is refused with its path, so ignored files in it cannot be lost.
+- `uninitializedSubmodules`: checkouts that hold nothing -- the submodule directory is absent or empty AND no module repository survives at `<git-dir>/modules/<name>` -- also printed on stderr as `path: not checked out`. They are not reported as dirty and do not block removal. Two other shapes are `submoduleProblems` entries whose reason names the owning repository's own command, so nothing is lost: a directory that exists WITH contents (`move its files out of it, then run: git -C <owner> submodule update --init <path>`), and a checkout with no files whose module repository still exists (`deinit` and `rm -rf` both keep it, with local branches, unpushed commits and stashes: `re-attach it: git -C <owner> submodule update --init <path>`). Never `--recursive`.
 
 ## merge-base
 
