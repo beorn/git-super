@@ -355,6 +355,61 @@ describe("slot module store custody", () => {
     expect(await slot.store.inspect(slot.linked)).toEqual(expect.objectContaining({ registered: true }))
   })
 
+  test("prune recovers a destroyed slot, archiving its store's value first, and leaves a live slot (30616)", async () => {
+    const root = fixtureRoot("module-prune")
+    const slot = await linkedSlot(root)
+    const tip = localCommit(slot.child)
+    const live = join(root, "live")
+    await slot.store.add({ kind: "detached", path: live, ref: "HEAD" })
+    // Something other than git-super deleted the checkout, so only its registration still holds its stores.
+    renameSync(slot.linked, `${slot.linked}-moved`)
+    const sink: string[] = []
+    await createLocalGitWorktreeStore({ repo: slot.fixture.product, report: (line) => sink.push(line) }).prune()
+    expect(await slot.store.inspect(slot.linked)).toEqual({ registered: false })
+    expect(existsSync(slot.gitDir)).toBe(false)
+    expect(await slot.store.inspect(live)).toEqual(expect.objectContaining({ registered: true }))
+    const lines = sink.filter((line) => line.startsWith("module store"))
+    expect(lines).toEqual([expect.stringMatching(/^module store packages\/alpha archived: 1 commit\(s\) to /u)])
+    const archiveRef = /refs\/archive\/\S+\/packages\/alpha\/HEAD/u.exec(lines[0] ?? "")?.[0] ?? "no archive ref named"
+    expect(git(slot.fixture.alpha, "rev-parse", archiveRef)).toBe(tip)
+  })
+
+  test("prune keeps and names a destroyed slot it cannot recover, and still recovers the others (30616)", async () => {
+    const root = fixtureRoot("module-prune-unreadable")
+    const slot = await linkedSlot(root)
+    const store = join(slot.modules, "packages/alpha")
+    // Write the store's config file directly: an older git enters its core.worktree even under --git-dir --bare.
+    git(slot.fixture.product, "config", "--file", join(store, "config"), "remote.origin.url", join(root, "gone"))
+    const other = join(root, "other")
+    await slot.store.add({ kind: "detached", path: other, ref: "HEAD" })
+    renameSync(slot.linked, `${slot.linked}-moved`)
+    renameSync(other, `${other}-moved`)
+    const message = await slot.store.prune().then(
+      () => "prune proceeded",
+      (error: unknown) => (error instanceof Error ? error.message : String(error)),
+    )
+    expect(message).toContain(`worktree ${slot.linked}`)
+    expect(message).toContain("did not answer ls-remote")
+    expect(existsSync(store)).toBe(true)
+    expect(await slot.store.inspect(slot.linked)).toEqual(expect.objectContaining({ registered: true }))
+    expect(await slot.store.inspect(other)).toEqual({ registered: false })
+  })
+
+  test("prune keeps a destroyed slot whose detached HEAD no ref holds, and names that HEAD (30616)", async () => {
+    const slot = await linkedSlot(fixtureRoot("module-prune-detached"))
+    // recoverDestroyed archives module stores, never the slot's own HEAD, so this commit has no other copy.
+    git(slot.linked, "commit", "-q", "--allow-empty", "-m", "work only this slot's HEAD holds")
+    const head = git(slot.linked, "rev-parse", "HEAD").trim()
+    renameSync(slot.linked, `${slot.linked}-moved`)
+    const message = await slot.store.prune().then(
+      () => "prune proceeded",
+      (error: unknown) => (error instanceof Error ? error.message : String(error)),
+    )
+    expect(message).toContain(`worktree ${slot.linked}: detached HEAD ${head.slice(0, 12)} held by no ref`)
+    expect(existsSync(slot.gitDir)).toBe(true)
+    expect(await slot.store.inspect(slot.linked)).toEqual(expect.objectContaining({ registered: true }))
+  })
+
   test("an archive push the remote rejects stops removal, naming the store, and the slot stays", async () => {
     const slot = await linkedSlot(fixtureRoot("module-push-rejected"))
     localCommit(slot.child)

@@ -840,8 +840,8 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
   }
   // The operator's value test (2026-10-21): a module repository a removal destroys has its value pushed to its
   // own remote under `refs/archive/...` first, and only then may anything be deleted. A failed push throws
-  // before the caller deletes, so the slot is preserved. `remove` and `recoverDestroyed` go through this; a
-  // raw `prune` does not yet (30616). Each store is reported as soon as it is archived, so a later store's failure
+  // before the caller deletes, so the slot is preserved. `remove` and `recoverDestroyed` go through this, and
+  // `prune` recovers each prunable registration through `recoverDestroyed` (30616). Each store is reported as soon as it is archived, so a later store's failure
   // never hides an archive already made. The actor names the slot: the caller's, else the checkout or registration.
   const archiveModuleStoresBeforeDelete = (stores: readonly ModuleStore[], actor: string) => {
     archiveModuleStores(stores, { actor, date: new Date().toISOString().slice(0, 10) }, (store) => {
@@ -1620,21 +1620,92 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       if (compaction !== undefined) return { compaction }
       return undefined
     },
-    async prune(
-      pruneOptions: Readonly<{
-        expire?: string
-        verbose?: boolean
-        operation?: string
-      }> = {},
-    ): Promise<void> {
-      await mutate(pruneOptions.operation ?? "worktree prune", async () => {
-        return git.run(repo, [
+    /**
+     * Recover every registration git would prune through `recoverDestroyed`, so each one's module stores are
+     * judged and their value archived before the registration goes (30616). A raw `git worktree prune` never
+     * runs: it deletes a registration's `modules/` stores unread. git still decides what is prunable, by a dry
+     * run that honours `expire`; that also names an administration directory with no gitdir file, which
+     * `worktree list` omits. `recoverDestroyed` archives module stores but not the slot's own HEAD, so a detached
+     * HEAD no ref holds keeps its registration. A registration that cannot be recovered keeps its stores and is
+     * named in the throw, after every other one is handled.
+     */
+    async prune(pruneOptions: Readonly<{ expire?: string; operation?: string }> = {}): Promise<void> {
+      const operation = pruneOptions.operation ?? "worktree prune"
+      // git localizes these lines; C keeps them parseable.
+      const listed = await git.run(
+        repo,
+        [
           "worktree",
           "prune",
+          "--dry-run",
+          "--verbose",
           ...(pruneOptions.expire === undefined ? [] : ["--expire", pruneOptions.expire]),
-          ...(pruneOptions.verbose === true ? ["--verbose"] : []),
-        ])
-      })
+        ],
+        false,
+        undefined,
+        { env: { LC_ALL: "C" } },
+      )
+      const candidates: { id: string; reason: string }[] = []
+      const unreadable: string[] = []
+      for (const line of [...listed.stdout.split("\n"), ...listed.stderr.split("\n")]) {
+        if (line.trim() === "") continue
+        const [, id, reason] = /^Removing worktrees\/(.+): (.+)$/u.exec(line.trim()) ?? []
+        if (id === undefined || reason === undefined) unreadable.push(line)
+        else candidates.push({ id, reason })
+      }
+      if (unreadable.length > 0) {
+        throw new Error(
+          `worktree prune: git's dry run printed ${String(unreadable.length)} line(s) that name no prunable registration (${unreadable.map((line) => JSON.stringify(line)).join(", ")}); nothing recovered`,
+        )
+      }
+      const common = realpathSync(await git.text(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"]))
+      const recover = async (adminDir: string): Promise<void> => {
+        let pointer: string
+        try {
+          pointer = (await readFile(join(adminDir, "gitdir"), "utf8")).trim()
+        } catch (cause) {
+          throw new Error(`its gitdir pointer is unreadable (${String(cause)}); its module stores are unjudged`, {
+            cause,
+          })
+        }
+        if (pointer === "") throw new Error("its gitdir pointer is empty; its module stores are unjudged")
+        const path = dirname(resolve(adminDir, pointer))
+        const head = (await readFile(join(adminDir, "HEAD"), "utf8")).trim()
+        if (!head.startsWith("ref: ")) {
+          const unheld = await git.run(repo, [
+            "rev-list",
+            "-n",
+            "1",
+            head,
+            "--not",
+            "--branches",
+            "--remotes",
+            "--tags",
+            "--glob=refs/archive/*",
+          ])
+          if (unheld.stdout.trim() !== "") {
+            throw new Error(
+              `worktree ${path}: detached HEAD ${head.slice(0, 12)} held by no ref (refs/heads, refs/remotes, refs/tags, refs/archive); archive it before pruning`,
+            )
+          }
+        }
+        try {
+          await createGitWorktreeStore(options).recoverDestroyed(path, `${operation}: recover ${path}`)
+        } catch (cause) {
+          throw new Error(`worktree ${path}: ${cause instanceof Error ? cause.message : String(cause)}`, { cause })
+        }
+      }
+      const failures: Error[] = []
+      for (const { id, reason } of candidates) {
+        const adminDir = join(common, "worktrees", id)
+        try {
+          await recover(adminDir)
+        } catch (cause) {
+          const message = cause instanceof Error ? cause.message : String(cause)
+          failures.push(new Error(`registration ${adminDir} kept (${reason}): ${message}`, { cause }))
+        }
+      }
+      if (failures.length > 0) throw new AggregateError(failures, failures.map((error) => error.message).join("; "))
     },
     async inspect(path: string): Promise<WorktreeInspection> {
       return inspectWorktree(git, repo, path)
