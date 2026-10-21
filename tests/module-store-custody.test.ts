@@ -5,7 +5,8 @@
  * work not on the store's remote main and not under an archive ref is value: archive it first, then remove.
  *
  * @failure A slot's module repository holding work nothing durable names is deleted with the slot; a store
- *          that is fully reproducible is destroyed without being named; or a failed archive does not stop it.
+ *          that is fully reproducible is destroyed without being named; value is judged from the store's own
+ *          stale copies instead of its remote; or a failed archive or remote read does not stop it.
  * @level   l1
  * @consumer git-super worktree removal, bearly worktree remove, yrd environment close
  * @testonly none
@@ -63,6 +64,17 @@ function dropAlphaFromHead(linked: string): void {
   git(linked, "submodule", "deinit", "-f", "--", "packages/alpha")
   git(linked, "rm", "-fq", "packages/alpha")
   git(linked, "commit", "-q", "-m", "drop alpha")
+}
+
+/** Land the child's HEAD on its remote's checked-out branch, as merging it upstream does; the store never fetches back. */
+function landOnRemote(remote: string, child: string): void {
+  git(remote, "fetch", "-q", child, "HEAD")
+  git(remote, "merge", "-q", "--ff-only", "FETCH_HEAD")
+}
+
+/** Read a store directly, since its checkout is gone once the slot drops it. */
+function storeGitOutput(cwd: string, store: string, ...args: string[]): string {
+  return git(cwd, "--git-dir", store, "--bare", ...args)
 }
 
 function refusal(run: () => unknown): string {
@@ -126,6 +138,80 @@ describe("slot module store custody", () => {
     expect(git(slot.fixture.alpha, "rev-parse", `refs/archive/${DATE}/dev-test/packages/alpha/HEAD`).trim()).toBe(tip)
   })
 
+  test("work the remote's main took after the store last fetched is released, read from the remote (row 1)", async () => {
+    const slot = await linkedSlot(fixtureRoot("module-remote-ahead"))
+    const store = join(slot.modules, "packages/alpha")
+    const stale = git(slot.child, "rev-parse", "refs/remotes/origin/main")
+    const tip = localCommit(slot.child)
+    landOnRemote(slot.fixture.alpha, slot.child)
+    const beyond = advanceRepository(slot.fixture.alpha, "alpha.ts", "export const alpha = 7\n")
+    dropAlphaFromHead(slot.linked)
+    expect(storeGitOutput(slot.fixture.product, store, "rev-parse", "refs/remotes/origin/main")).toBe(stale)
+    expect(() => storeGitOutput(slot.fixture.product, store, "cat-file", "-e", beyond)).toThrow()
+    const inventory = inspectModuleStores(slot.linked, slot.gitDir)
+    expect(inventory.stores).toEqual([
+      expect.objectContaining({ name: "packages/alpha", valueCommits: 0, defaultBranch: "main" }),
+    ])
+    expect(describeModuleStores(archiveModuleStores(inventory.stores, { actor: "dev-test", date: DATE }))).toEqual([
+      `module store packages/alpha released: origin main and archive refs hold it, 0 commits unique, HEAD ${tip.slice(0, 12)}`,
+    ])
+  })
+
+  test("a remote whose default branch is master is measured against master, not a local main (row 1)", async () => {
+    const slot = await linkedSlot(fixtureRoot("module-remote-master"))
+    const tip = localCommit(slot.child)
+    git(slot.fixture.alpha, "branch", "-m", "main", "master")
+    landOnRemote(slot.fixture.alpha, slot.child)
+    dropAlphaFromHead(slot.linked)
+    const inventory = inspectModuleStores(slot.linked, slot.gitDir)
+    expect(inventory.stores).toEqual([
+      expect.objectContaining({ name: "packages/alpha", valueCommits: 0, defaultBranch: "master" }),
+    ])
+    expect(describeModuleStores(inventory.stores)).toEqual([
+      `module store packages/alpha released: origin master and archive refs hold it, 0 commits unique, HEAD ${tip.slice(0, 12)}`,
+    ])
+  })
+
+  test("a commit only a local archive ref holds is value, because the remote does not hold it (row 1)", async () => {
+    const slot = await linkedSlot(fixtureRoot("module-local-archive"))
+    const tip = localCommit(slot.child)
+    git(slot.child, "update-ref", `refs/archive/${DATE}/someone/kept`, tip)
+    dropAlphaFromHead(slot.linked)
+    const inventory = inspectModuleStores(slot.linked, slot.gitDir)
+    expect(inventory.stores[0]!.valueCommits).toBe(1)
+    const archived = archiveModuleStores(inventory.stores, { actor: "dev-test", date: DATE })
+    expect(archived[0]!.archived).toEqual([`refs/archive/${DATE}/dev-test/packages/alpha/HEAD`])
+    expect(git(slot.fixture.alpha, "rev-parse", `refs/archive/${DATE}/dev-test/packages/alpha/HEAD`)).toBe(tip)
+  })
+
+  test("a commit the remote holds only under refs/archive is released (row 1)", async () => {
+    const slot = await linkedSlot(fixtureRoot("module-remote-archive"))
+    const store = join(slot.modules, "packages/alpha")
+    const tip = localCommit(slot.child)
+    git(slot.child, "push", "-q", "origin", "HEAD:refs/archive/2026-10-01/someone/packages/alpha/HEAD")
+    dropAlphaFromHead(slot.linked)
+    expect(storeGitOutput(slot.fixture.product, store, "for-each-ref", "refs/archive")).toBe("")
+    const inventory = inspectModuleStores(slot.linked, slot.gitDir)
+    expect(inventory.stores).toEqual([expect.objectContaining({ name: "packages/alpha", valueCommits: 0 })])
+    expect(describeModuleStores(inventory.stores)).toEqual([
+      `module store packages/alpha released: origin main and archive refs hold it, 0 commits unique, HEAD ${tip.slice(0, 12)}`,
+    ])
+  })
+
+  test("a remote that cannot be read stops removal, naming the store, with no fallback to local copies (row 1)", async () => {
+    const root = fixtureRoot("module-remote-unreadable")
+    const slot = await linkedSlot(root)
+    const store = join(slot.modules, "packages/alpha")
+    dropAlphaFromHead(slot.linked)
+    storeGitOutput(slot.fixture.product, store, "config", "remote.origin.url", join(root, "gone"))
+    const message = refusal(() => inspectModuleStores(slot.linked, slot.gitDir))
+    expect(message).toContain(`module store ${store} could not be read: its remote origin did not answer ls-remote`)
+    expect(message).toContain("worktree preserved")
+    await expect(slot.store.remove(slot.linked)).rejects.toThrow(/did not answer ls-remote/)
+    expect(existsSync(slot.linked)).toBe(true)
+    expect(existsSync(store)).toBe(true)
+  })
+
   test("a stash-only commit is value and is archived as its own entry", async () => {
     const slot = await linkedSlot(fixtureRoot("module-stash"))
     writeFileSync(join(slot.child, "alpha.ts"), "export const alpha = 999\n")
@@ -152,9 +238,7 @@ describe("slot module store custody", () => {
       actor: "dev-test",
       date: DATE,
     })
-    expect(archived).toEqual([
-      expect.objectContaining({ name: "components/outer", valueCommits: 1 }),
-    ])
+    expect(archived).toEqual([expect.objectContaining({ name: "components/outer", valueCommits: 1 })])
     expect(archived[0]!.archived).toEqual([`refs/archive/${DATE}/dev-test/components/outer/HEAD`])
     expect(git(slot.fixture.alpha, "rev-parse", `refs/archive/${DATE}/dev-test/components/outer/HEAD`).trim()).toBe(tip)
   })
@@ -185,7 +269,9 @@ describe("slot module store custody", () => {
     const inventory = inspectModuleStores(slot.linked, slot.gitDir)
     expect(inventory.stores[0]!.remote).toBeUndefined()
     const message = refusal(() => archiveModuleStores(inventory.stores, { actor: "dev-test", date: DATE }))
-    expect(message).toContain("module store packages/alpha holds 1 commit(s)")
+    // With no remote nothing proves any commit exists elsewhere: the base commit its leftover local
+    // `refs/remotes/origin/main` names counts too, because that copy is not a remote.
+    expect(message).toContain("module store packages/alpha holds 2 commit(s)")
     expect(message).toContain("has no remote to archive them to")
     expect(message).toContain("bundle create")
   })
@@ -213,6 +299,14 @@ describe("slot module store custody", () => {
     const admitted = superStatus({ repo: pushed.product })
     expect(admitted.uninitializedSubmodules).toContain("packages/alpha")
     expect(admitted.submoduleProblems).toEqual([])
+    // The same store with a remote that cannot be read is unknown, never "holds nothing".
+    const pushedStore = join(pushed.product, ".git/modules/packages/alpha")
+    storeGitOutput(pushed.product, pushedStore, "config", "remote.origin.url", join(pushed.alpha, "..", "gone"))
+    const unread = superStatus({ repo: pushed.product })
+    expect(unread.uninitializedSubmodules).not.toContain("packages/alpha")
+    expect(unread.submoduleProblems).toHaveLength(1)
+    expect(unread.submoduleProblems[0]!.reason).toContain("what it holds is unknown")
+    expect(unread.submoduleProblems[0]!.reason).toContain("did not answer ls-remote")
 
     const local = createProductFixture(fixtureRoot("module-status-local"))
     const localChild = join(local.product, "packages/alpha")
@@ -223,7 +317,9 @@ describe("slot module store custody", () => {
     const stopped = superStatus({ repo: local.product })
     expect(stopped.uninitializedSubmodules).toEqual([])
     expect(stopped.submoduleProblems).toHaveLength(1)
-    expect(stopped.submoduleProblems[0]!.reason).toContain("holds 1 commit(s) that neither its remote main")
+    expect(stopped.submoduleProblems[0]!.reason).toContain(
+      "holds 1 commit(s) that neither its remote's default branch nor any archive ref there holds (remote origin main)",
+    )
     expect(stopped.submoduleProblems[0]!.reason).toContain("submodule update --init packages/alpha")
   })
 })
