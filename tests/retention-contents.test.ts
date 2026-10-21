@@ -226,7 +226,11 @@ describe("retention contents scan — gate 4 (#27443(b))", () => {
       },
     )
     expect(result.status).toBe("unknown")
-    expect(result.detail).toContain("logs/HEAD exceeds the 0-line bound")
+    expect(
+      [join(root, ".git", "logs", "HEAD"), join(root, ".git", "logs", "refs", "heads", "main")].map(
+        (path) => `${path} exceeds the 0-line bound`,
+      ),
+    ).toContain(result.detail)
   })
 
   test("a dangling alternate is unknown, never a silent skip", async () => {

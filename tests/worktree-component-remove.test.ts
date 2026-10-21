@@ -402,10 +402,12 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
       const target = join(root, "target")
       git(fixture.product, "worktree", "add", "--detach", target)
       git(target, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
-      const alpha = join(target, "packages/alpha")
+      // Both censuses must be valid independently: borrowing a disappearing
+      // target store is already refused by root alternate validation.
+      const alpha = join(fixture.product, "packages/alpha")
       const alphaObjects = git(alpha, "rev-parse", "--path-format=absolute", "--git-path", "objects")
       const betaObjects = git(
-        join(target, "vendor/beta"),
+        join(fixture.product, "vendor/beta"),
         "rev-parse",
         "--path-format=absolute",
         "--git-path",
