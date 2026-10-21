@@ -2,7 +2,7 @@ import { realpathSync } from "node:fs"
 import { isAbsolute, join, relative, resolve, sep } from "node:path"
 import { runGit } from "./git.ts"
 import { gitSuperResult, type GitSuperResult } from "./result.ts"
-import { createLocalGitWorktreeStore } from "./worktree.ts"
+import { createLocalGitWorktreeStore, type ComponentCustodyRefusal } from "./worktree.ts"
 import type { CompactionResult } from "./retention-compact.ts"
 import type { WorktreeRemovalProof } from "./worktree-removal.ts"
 import type { NotCompared } from "./diff.ts"
@@ -34,6 +34,7 @@ export type SuperWorktreeRemoveOptions = Readonly<{
   report?: (message: string) => void
   excludedSubmodules?: readonly string[]
   noRehome?: boolean
+  componentCustody?: Readonly<{ primaryRoot: string; targetBranch: string }>
   /**
    * 29073: refs the caller preserved the dirty stores to, so the retention gate admits each dirty
    * store only against a named ref that resolves to a commit in that same store. Existence and store
@@ -47,7 +48,8 @@ export type SuperWorktreeRemoveResult = GitSuperResult &
     path: string
     proof?: WorktreeRemovalProof
     notCompared: readonly NotCompared[]
-    reason?: "borrowed"
+    reason?: "borrowed" | "component-custody"
+    custody?: ComponentCustodyRefusal
     borrowers?: readonly string[]
     /** Present when a retained copy was compacted after native --force; failure does not fail the removal. */
     compaction?: CompactionResult
@@ -70,6 +72,7 @@ export async function superWorktreeRemove(options: SuperWorktreeRemoveOptions): 
     const outcome = await store.remove(path, {
       ...(options.excludedSubmodules === undefined ? {} : { excludedSubmodules: options.excludedSubmodules }),
       ...(options.noRehome === undefined ? {} : { noRehome: options.noRehome }),
+      ...(options.componentCustody === undefined ? {} : { componentCustody: options.componentCustody }),
       ...(options.preserved === undefined ? {} : { preserved: options.preserved }),
       retention: {
         root: options.retain,
@@ -79,6 +82,22 @@ export async function superWorktreeRemove(options: SuperWorktreeRemoveOptions): 
         },
       },
     })
+    if (outcome !== undefined && "custodyRefusal" in outcome) {
+      const custody = outcome.custodyRefusal
+      const detail = {
+        code: "component-custody",
+        phase: "custody",
+        message: custody.detail,
+        remedy: "Resolve the named custody condition and retry; the worktree and retained stores were left untouched.",
+      }
+      return {
+        ...gitSuperResult([{ repository: repo, state: "unchanged", refs: [], detail }], detail),
+        path,
+        notCompared: [],
+        reason: "component-custody",
+        custody,
+      }
+    }
     if (outcome !== undefined && "borrowers" in outcome) {
       return {
         ...gitSuperResult([{ repository: repo, state: "unchanged", refs: [] }]),

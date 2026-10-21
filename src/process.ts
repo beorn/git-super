@@ -21,15 +21,16 @@ import { delimiter, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { fullJitter } from "@bearly/pacing"
 import { shellQuote } from "./shell-command.ts"
+import { gitLineStream, type GitLineStream } from "./retention-stream.ts"
 
 export { applyGitObjectContext, cleanGitEnvironment, validateGitObjectContext, type GitObjectContext } from "./git.ts"
 
 export type ProcessOutputSink = Readonly<{ write(value: string | Uint8Array): unknown }>
 
 /** Resolve the native executable separately; selecting this binary must not recurse. */
-export function nativeGitExecutable(): string {
+export function nativeGitExecutable(path = process.env.PATH ?? ""): string {
   let executable: string | undefined
-  for (const directory of process.env.PATH?.split(delimiter) ?? []) {
+  for (const directory of path.split(delimiter)) {
     const candidate = resolve(directory, "git")
     try {
       if (!statSync(candidate).isFile()) continue
@@ -55,6 +56,7 @@ function spawnGit(
   args: readonly string[],
   options: {
     env: NodeJS.ProcessEnv
+    executable?: string
     stdin: "inherit" | "ignore" | "pipe"
     input?: string
     signal?: AbortSignal
@@ -62,7 +64,7 @@ function spawnGit(
   },
 ) {
   options.signal?.throwIfAborted()
-  const child = spawn(nativeGitExecutable(), [...args], {
+  const child = spawn(options.executable ?? nativeGitExecutable(options.env.PATH), [...args], {
     env: options.env,
     stdio: [options.stdin, "pipe", "pipe"],
     ...(options.signal === undefined ? {} : { signal: options.signal }),
@@ -182,6 +184,18 @@ export type GitProcessRequest = Readonly<{
    * {@link APPLY_GROUPS_ENV} names. Nothing of the command survives it.
    */
   backstopMs?: number
+}>
+
+/** Bounded stdout streaming for callers that must reject a partial Git enumeration. */
+export type GitProcessStreamRequest = Readonly<{
+  repo: string
+  args: readonly string[]
+  env?: NodeJS.ProcessEnv
+  signal?: AbortSignal
+  timeoutMs?: number
+  maxBytes?: number
+  maxLines?: number
+  onQueueHighWater?: (depth: number) => void
 }>
 
 export type GitProcessResult = Readonly<{
@@ -463,6 +477,8 @@ function withReadRetry(inner: GitProcess, options: StallRetryOptions, environmen
 /** The one injectable Git process capability used by graph operations. */
 export type GitProcess = Readonly<{
   run(request: GitProcessRequest): Promise<GitProcessResult>
+  /** Optional because some supervised process hosts expose buffered output only. */
+  stream?(request: GitProcessStreamRequest): GitLineStream
 }>
 
 /** The supervised runner capability Git needs; its owner retains process lifetime and teardown. */
@@ -551,15 +567,17 @@ export function createLocalGitProcess(environment?: NodeJS.ProcessEnv, options: 
         request.backstopMs === undefined ? undefined : mkdtempSync(join(tmpdir(), "git-super-apply-groups-"))
       const groupsFile = groupsDir === undefined ? undefined : join(groupsDir, "groups")
       try {
+        const env = applyGitObjectContext(
+          {
+            ...baseEnvironment,
+            ...request.env,
+            ...(groupsFile === undefined ? {} : { [APPLY_GROUPS_ENV]: groupsFile }),
+          },
+          options.objects,
+        )
         child = spawnGit(["-C", request.repo, ...request.args], {
-          env: applyGitObjectContext(
-            {
-              ...baseEnvironment,
-              ...request.env,
-              ...(groupsFile === undefined ? {} : { [APPLY_GROUPS_ENV]: groupsFile }),
-            },
-            options.objects,
-          ),
+          env,
+          executable: nativeGitExecutable(env.PATH),
           stdin: request.stdin === undefined ? "ignore" : "pipe",
           ...(request.stdin === undefined ? {} : { input: request.stdin }),
           ...(request.signal === undefined ? {} : { signal: request.signal }),
@@ -603,5 +621,26 @@ export function createLocalGitProcess(environment?: NodeJS.ProcessEnv, options: 
     }
   }
 
-  return withReadRetry({ run: runOnce }, options, baseEnvironment)
+  const local = withReadRetry({ run: runOnce }, options, baseEnvironment)
+  return {
+    ...local,
+    stream(request) {
+      const env = applyGitObjectContext(
+        {
+          ...baseEnvironment,
+          ...request.env,
+        },
+        options.objects,
+      )
+      return gitLineStream(["-C", request.repo, ...request.args], {
+        executable: nativeGitExecutable(env.PATH),
+        env,
+        ...(request.signal === undefined ? {} : { signal: request.signal }),
+        ...(request.timeoutMs === undefined ? {} : { timeoutMs: request.timeoutMs }),
+        ...(request.maxBytes === undefined ? {} : { maxBytes: request.maxBytes }),
+        ...(request.maxLines === undefined ? {} : { maxLines: request.maxLines }),
+        ...(request.onQueueHighWater === undefined ? {} : { onQueueHighWater: request.onQueueHighWater }),
+      })
+    },
+  }
 }

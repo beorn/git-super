@@ -4,7 +4,7 @@
  * @consumer WIP sweep retiring landed vendor component worktrees; yrd env close delegates to this verb
  * @testonly none
  */
-import { existsSync } from "node:fs"
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { describe, expect, it } from "vitest"
@@ -197,6 +197,402 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
       expect(existsSync(outsider)).toBe(true)
     } finally {
       // raw-delete-allow: the fixture tree this test made under its own mkdtemp root
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it("proves all removal commits in the persistent primary target branch before removing", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-component-custody-"))
+    try {
+      const product = join(root, "product")
+      const target = join(root, "target")
+      createRepository(product, "root.txt", "root\n")
+      git(product, "worktree", "add", "--detach", target)
+
+      const result = await superWorktreeRemove({
+        repo: product,
+        path: target,
+        retain: join(root, "retained"),
+        componentCustody: { primaryRoot: product, targetBranch: "main" },
+      })
+
+      expect(result.state, result.detail?.message ?? JSON.stringify(result)).toBe("updated")
+      expect(result.proof?.componentCustody).toMatchObject({
+        targetBranch: "main",
+        componentCount: 1,
+        effectiveCommitCount: 1,
+        witnessCount: 1,
+      })
+      expect(existsSync(target)).toBe(false)
+    } finally {
+      // raw-delete-allow: this isolated mkdtemp fixture owns every path beneath root
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  /**
+   * @failure A commit created after the first identity census but before leases and the final proof is omitted from
+   * the complete source ledger, allowing removal to proceed on a stale object population.
+   * @level l1 @consumer automatic environment removal through GitSuper
+   * This must be caught at the transaction seam; the Gate 4 inventory unit tests do not exercise census/lease ordering.
+   */
+  it("includes a commit introduced after the initial census in the acquired final proof", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-component-custody-new-commit-"))
+    try {
+      const product = join(root, "product")
+      const target = join(root, "target")
+      createRepository(product, "root.txt", "root\n")
+      git(product, "worktree", "add", "--detach", target)
+      const tree = git(product, "rev-parse", "HEAD^{tree}")
+      const parent = git(product, "rev-parse", "HEAD")
+      let censusLists = 0
+      let introduced: string | undefined
+      const local = createLocalGitProcess()
+      const localStream = local.stream!
+      const store = createGitWorktreeStore({
+        repo: product,
+        gitProcess: {
+          run: local.run,
+          stream: (request) => {
+            const stream = localStream(request)
+            if (
+              introduced !== undefined ||
+              request.args[0] !== "-C" ||
+              request.args[1] !== join(product, ".git") ||
+              !request.args.includes("worktree") ||
+              !request.args.includes("list") ||
+              ++censusLists !== 3
+            )
+              return stream
+            return {
+              ...stream,
+              outcome: stream.outcome.then((outcome) => {
+                introduced = git(product, "commit-tree", tree, "-p", parent, "-m", "introduced before final proof")
+                return outcome
+              }),
+            }
+          },
+        },
+      })
+
+      const outcome = await store.remove(target, {
+        retention: { root: join(root, "retained"), report: () => undefined },
+        componentCustody: { primaryRoot: product, targetBranch: "main" },
+      })
+
+      expect(introduced).toMatch(/^[0-9a-f]{40}$/u)
+      expect(outcome).toMatchObject({ custodyRefusal: { status: "blocked", component: ".", oid: introduced } })
+      expect(existsSync(target)).toBe(true)
+    } finally {
+      // raw-delete-allow: this isolated mkdtemp root owns every path beneath it
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  /**
+   * @failure Final custody relies on a persistent primary store whose writer lease is held, yet removal proceeds.
+   * @level l1 @consumer automatic environment removal through GitSuper
+   * Gate 5 checks graph validity, while the transaction suite must prove the external lease gates that final proof.
+   */
+  it("keeps the target when its external persistent-primary witness lease is held", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-component-custody-held-primary-"))
+    let lease: ReturnType<typeof tryAcquireFlock> | undefined
+    try {
+      const fixture = createProductFixture(root)
+      const target = join(root, "target")
+      git(fixture.product, "worktree", "add", "--detach", target)
+      git(target, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
+      const alpha = join(fixture.product, "packages/alpha")
+      const owner = git(alpha, "rev-parse", "--path-format=absolute", "--git-common-dir")
+      const lock = join(owner, "yrd-worktree-mutations", "writer.lock")
+      await mkdir(join(owner, "yrd-worktree-mutations"), { recursive: true })
+      lease = tryAcquireFlock(lock, { body: "fixture external witness writer" })
+      expect(lease).not.toBeNull()
+
+      const outcome = await createGitWorktreeStore({
+        repo: fixture.product,
+        gitProcess: createLocalGitProcess(),
+      }).remove(target, {
+        retention: { root: join(root, "retained"), report: () => undefined },
+        componentCustody: { primaryRoot: fixture.product, targetBranch: "main" },
+      })
+
+      expect(outcome).toMatchObject({
+        custodyRefusal: {
+          status: "unknown",
+          source: `writer lease owner ${owner}`,
+        },
+      })
+      expect(JSON.stringify(outcome)).toContain(owner)
+      expect(JSON.stringify(outcome)).toContain("writer lease")
+      expect(existsSync(target)).toBe(true)
+      expect(git(fixture.product, "worktree", "list", "--porcelain")).toContain(`worktree ${target}\n`)
+    } finally {
+      lease?.release()
+      // raw-delete-allow: this isolated mkdtemp root owns every path beneath it
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  /**
+   * @failure A newly consulted alternate-store identity is added after the initial census, but proof uses the stale census.
+   * @level l1 @consumer automatic environment removal through GitSuper
+   * Gate tests cover static identities; only the live transaction can assert the two censuses agree before proof.
+   */
+  it("refuses when a consulted component's alternate identity changes between censuses", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-component-custody-reidentity-"))
+    try {
+      const fixture = createProductFixture(root)
+      const target = join(root, "target")
+      git(fixture.product, "worktree", "add", "--detach", target)
+      git(target, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
+      const alpha = join(target, "packages/alpha")
+      const alphaObjects = git(alpha, "rev-parse", "--path-format=absolute", "--git-path", "objects")
+      const betaObjects = git(
+        join(target, "vendor/beta"),
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        "objects",
+      )
+      const rootObjects = git(target, "rev-parse", "--path-format=absolute", "--git-path", "objects")
+      const alternatesFile = join(rootObjects, "info", "alternates")
+      const previousAlternates = existsSync(alternatesFile) ? readFileSync(alternatesFile, "utf8") : ""
+      const existingAlternates = new Set(previousAlternates.split(/\r?\n/u).filter(Boolean))
+      const newAlternate = [alphaObjects, betaObjects].find((candidate) => !existingAlternates.has(candidate))
+      expect(newAlternate).toBeDefined()
+      let rootStoreLists = 0
+      let changed = false
+      const local = createLocalGitProcess()
+      const localStream = local.stream!
+      const store = createGitWorktreeStore({
+        repo: fixture.product,
+        gitProcess: {
+          run: local.run,
+          stream: (request) => {
+            const changesIdentity =
+              !changed &&
+              request.args[0] === "-C" &&
+              request.args[1] === join(fixture.product, ".git") &&
+              request.args.includes("worktree") &&
+              request.args.includes("list") &&
+              ++rootStoreLists === 3
+            if (changesIdentity) {
+              mkdirSync(join(rootObjects, "info"), { recursive: true })
+              const separator = previousAlternates === "" || previousAlternates.endsWith("\n") ? "" : "\n"
+              writeFileSync(alternatesFile, `${previousAlternates}${separator}${newAlternate}\n`)
+              changed = true
+            }
+            const stream = localStream(request)
+            return stream
+          },
+        },
+      })
+
+      const outcome = await store.remove(target, {
+        retention: { root: join(root, "retained"), report: () => undefined },
+        componentCustody: { primaryRoot: fixture.product, targetBranch: "main" },
+      })
+
+      expect(changed).toBe(true)
+      expect(outcome).toMatchObject({
+        custodyRefusal: { status: "unknown", source: "component identity recensus" },
+      })
+      expect(existsSync(target)).toBe(true)
+    } finally {
+      // raw-delete-allow: this isolated mkdtemp root owns every path beneath it
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  /**
+   * @failure A dangling commit supplied only by a persistent component alternate is omitted from complete-commit census and removal succeeds.
+   * @level l1 @consumer automatic environment removal through GitSuper
+   * Gate 4 verifies alternate enumeration and Gate 5 verifies graph coverage separately; this pins their removal-path composition.
+   */
+  it("keeps a target for an alternate-supplied dangling commit", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-component-custody-alternate-dangling-"))
+    try {
+      const fixture = createProductFixture(root)
+      const target = join(root, "target")
+      git(fixture.product, "worktree", "add", "--detach", target)
+      git(target, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
+      const alphaPrimary = join(fixture.product, "packages/alpha")
+      const alphaHead = git(alphaPrimary, "rev-parse", "HEAD")
+      const alphaTree = git(alphaPrimary, "rev-parse", `${alphaHead}^{tree}`)
+      const dangling = git(
+        alphaPrimary,
+        "commit-tree",
+        alphaTree,
+        "-p",
+        alphaHead,
+        "-m",
+        "alternate-only dangling commit",
+      )
+      const alphaObjects = git(alphaPrimary, "rev-parse", "--path-format=absolute", "--git-path", "objects")
+      const rootObjects = git(fixture.product, "rev-parse", "--path-format=absolute", "--git-path", "objects")
+      await mkdir(join(rootObjects, "info"), { recursive: true })
+      await writeFile(join(rootObjects, "info", "alternates"), `${alphaObjects}\n`)
+      // The root policy permits a content-addressed pin for this alternate-supplied base commit.
+      // That isolates the new dangling commit as the sole missing custody item in the root ledger.
+      git(fixture.product, "update-ref", `refs/git-super/pins/${alphaHead}`, alphaHead)
+
+      const outcome = await createGitWorktreeStore({
+        repo: fixture.product,
+        gitProcess: createLocalGitProcess(),
+      }).remove(target, {
+        retention: { root: join(root, "retained"), report: () => undefined },
+        componentCustody: { primaryRoot: fixture.product, targetBranch: "main" },
+      })
+
+      expect(outcome, JSON.stringify(outcome)).toMatchObject({
+        custodyRefusal: { status: "blocked", oid: dangling },
+      })
+      expect(existsSync(target)).toBe(true)
+    } finally {
+      // raw-delete-allow: this isolated mkdtemp root owns every path beneath it
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  /**
+   * @failure The persistent witness graph borrows from an object store inside the worktree removal set, yet is accepted.
+   * @level l1 @consumer automatic environment removal through GitSuper
+   * Gate 5 has a direct unit pin; this confirms the live census passes the true removal boundary to it.
+   */
+  it("refuses a witness graph that borrows from the disappearing component store", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-component-custody-disappearing-source-"))
+    try {
+      const fixture = createProductFixture(root)
+      const target = join(root, "target")
+      git(fixture.product, "worktree", "add", "--detach", target)
+      git(target, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
+      const alphaSource = join(target, "packages/alpha")
+      const alphaObjects = git(alphaSource, "rev-parse", "--path-format=absolute", "--git-path", "objects")
+      const rootObjects = git(fixture.product, "rev-parse", "--path-format=absolute", "--git-path", "objects")
+      await mkdir(join(rootObjects, "info"), { recursive: true })
+      await writeFile(join(rootObjects, "info", "alternates"), `${alphaObjects}\n`)
+
+      const outcome = await createGitWorktreeStore({
+        repo: fixture.product,
+        gitProcess: createLocalGitProcess(),
+      }).remove(target, {
+        retention: { root: join(root, "retained"), report: () => undefined },
+        componentCustody: { primaryRoot: fixture.product, targetBranch: "main" },
+      })
+
+      expect(outcome).toMatchObject({
+        custodyRefusal: {
+          status: "unknown",
+          source: "surviving primary Git graph",
+          detail: expect.stringContaining("inside the removal set"),
+        },
+      })
+      expect(existsSync(target)).toBe(true)
+    } finally {
+      // raw-delete-allow: this isolated mkdtemp root owns every path beneath it
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it("returns a structured custody refusal and preserves the target when the primary lacks the named branch", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-component-custody-refusal-"))
+    try {
+      const product = join(root, "product")
+      const target = join(root, "target")
+      createRepository(product, "root.txt", "root\n")
+      git(product, "worktree", "add", "--detach", target)
+
+      const result = await superWorktreeRemove({
+        repo: product,
+        path: target,
+        retain: join(root, "retained"),
+        componentCustody: { primaryRoot: product, targetBranch: "release" },
+      })
+
+      expect(result.state).toBe("unchanged")
+      expect(result.reason).toBe("component-custody")
+      expect(result.custody).toMatchObject({ status: "blocked", component: "." })
+      expect(existsSync(target)).toBe(true)
+    } finally {
+      // raw-delete-allow: this isolated mkdtemp fixture owns every path beneath root
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it("reports unknown and preserves the target when the selected Git process cannot stream", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-component-custody-no-stream-"))
+    try {
+      const product = join(root, "product")
+      const target = join(root, "target")
+      createRepository(product, "root.txt", "root\n")
+      git(product, "worktree", "add", "--detach", target)
+      const local = createLocalGitProcess()
+      const store = createGitWorktreeStore({ repo: product, gitProcess: { run: local.run } })
+
+      const outcome = await store.remove(target, {
+        retention: { root: join(root, "retained"), report: () => undefined },
+        componentCustody: { primaryRoot: product, targetBranch: "main" },
+      })
+
+      expect(outcome).toMatchObject({ custodyRefusal: { status: "unknown", component: "." } })
+      expect(existsSync(target)).toBe(true)
+    } finally {
+      // raw-delete-allow: this isolated mkdtemp fixture owns every path beneath root
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it("refuses custody when a nested component census query fails", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-component-custody-nested-failure-"))
+    try {
+      const fixture = createProductFixture(root)
+      const target = join(root, "target")
+      git(fixture.product, "worktree", "add", "--detach", target)
+      git(target, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
+      const child = join(target, "packages/alpha")
+      const local = createLocalGitProcess()
+      const failed = async function* (): AsyncGenerator<string> {}
+      const store = createGitWorktreeStore({
+        repo: fixture.product,
+        gitProcess: {
+          run: (request) => local.run(request),
+          stream: (request) => {
+            if (request.args[0] === "-C" && request.args[1] === child && request.args.includes("--show-toplevel")) {
+              return {
+                lines: failed(),
+                outcome: Promise.resolve({
+                  code: 1,
+                  bytes: 0,
+                  lines: 0,
+                  stderr: "fixture nested census failure",
+                  timedOut: false,
+                  capped: false,
+                }),
+              }
+            }
+            return local.stream!(request)
+          },
+        },
+      })
+
+      const outcome = await store.remove(target, {
+        retention: { root: join(root, "retained"), report: () => undefined },
+        componentCustody: { primaryRoot: fixture.product, targetBranch: "main" },
+      })
+
+      expect(outcome).toMatchObject({
+        custodyRefusal: {
+          status: "unknown",
+          component: ".",
+          source: "recursive component census",
+          detail: expect.stringContaining("fixture nested census failure"),
+        },
+      })
+      expect(JSON.stringify(outcome)).toContain("packages/alpha")
+      expect(existsSync(target)).toBe(true)
+    } finally {
+      // raw-delete-allow: this isolated mkdtemp fixture owns every path beneath root
       await rm(root, { recursive: true, force: true })
     }
   })

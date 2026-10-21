@@ -3,6 +3,7 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
+  mkdtempSync,
   readFileSync,
   realpathSync,
   renameSync,
@@ -11,12 +12,13 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs"
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import { spawnSync } from "node:child_process"
 import { setTimeout as delay } from "node:timers/promises"
 import { appendFile, lstat, readFile, writeFile } from "node:fs/promises"
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { fileURLToPath } from "node:url"
+import { tmpdir } from "node:os"
 import { createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS } from "./exclusive.ts"
 import { ARCHIVE_REF_PREFIX } from "./archive-ref.ts"
 import {
@@ -26,13 +28,24 @@ import {
   prepareRemovalBorrowers,
   rehomeBorrowers,
   retainWorktreeModules,
+  type ComponentCustodyProof,
   type WorktreeRemovalProof,
   type WorktreeRetention,
 } from "./worktree-removal.ts"
 export { inspectRemovalStatus } from "./worktree-removal.ts"
 import { compactRetainedModules, type CompactionResult } from "./retention-compact.ts"
-import { cleanGitEnvironment, probeRepository } from "./git.ts"
+import { cleanGitEnvironment, cleanGitRepositoryEnvironment, probeRepository } from "./git.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
+import {
+  scanContents,
+  type ComponentGitSource,
+  type GitRun,
+  type GitRunOptions,
+  type GitRunResult,
+  type GitStreamFactory,
+} from "./retention-contents.ts"
+import { scanCustody, type CustodyTarget, type WitnessIdentity } from "./retention-custody.ts"
+import { alternateEntries, alternatesLineage } from "./alternates.ts"
 import { createProgressReporter } from "./progress.ts"
 import { materializeSubmodulesWithProcess } from "./submodules.ts"
 import type { SuperStatusResult } from "./status.ts"
@@ -41,6 +54,415 @@ import { removalBorrowers } from "./worktree-administration.ts"
 
 export type GitResult = Readonly<{ code: number; stdout: string; stderr: string }>
 export type Git = ReturnType<typeof createGit>
+
+export type ComponentCustodyPolicy = Readonly<{ primaryRoot: string; targetBranch: string }>
+export type ComponentCustodyRefusal = Readonly<{
+  status: "blocked" | "unknown"
+  component: string
+  source: string
+  detail: string
+  oid?: string
+}>
+const COMPONENT_QUERY_MAX_BYTES = 64 * 1024 * 1024
+const COMPONENT_QUERY_MAX_LINES = 1_000_000
+// A hard aggregate stream byte bound keeps a huge object graph from consuming unbounded disk.
+const COMPONENT_STREAM_MAX_BYTES = 512 * 1024 * 1024
+const COMPONENT_STREAM_MAX_LINES = 20_000_000
+
+function incompleteSelectedRun(message: string, timedOut = false): GitRunResult {
+  return { code: 1, stdout: "", stderr: message, ...(timedOut ? { timedOut: true } : {}) }
+}
+
+/** A fail-closed, selected GitProcess adapter for Gate 4/5; every answer is bounded. */
+function selectedCustodyAdapters(
+  gitProcess: GitProcess,
+  repo: string,
+  environment: NodeJS.ProcessEnv,
+  signal: AbortSignal | undefined,
+  deadline: number,
+): Readonly<{ run: GitRun; stream: GitStreamFactory }> {
+  const baseEnv = {
+    ...cleanGitRepositoryEnvironment(environment),
+    GIT_NO_REPLACE_OBJECTS: "1",
+    GIT_NO_LAZY_FETCH: "1",
+  }
+  const remaining = (): number => deadline - Date.now()
+  const stream: GitStreamFactory = (args, streamOptions = {}) => {
+    const left = remaining()
+    if (left <= 0) throw new Error("component custody proof deadline is exhausted")
+    if (gitProcess.stream === undefined) {
+      throw new Error("selected Git process does not support bounded output streaming")
+    }
+    return gitProcess.stream({
+      repo,
+      args,
+      env: { ...baseEnv, ...streamOptions.env, GIT_NO_REPLACE_OBJECTS: "1", GIT_NO_LAZY_FETCH: "1" },
+      ...((streamOptions.signal ?? signal) === undefined ? {} : { signal: streamOptions.signal ?? signal }),
+      timeoutMs: Math.min(streamOptions.timeoutMs ?? Number.POSITIVE_INFINITY, left),
+      maxBytes: Math.min(streamOptions.maxBytes ?? COMPONENT_STREAM_MAX_BYTES, COMPONENT_STREAM_MAX_BYTES),
+      maxLines: Math.min(streamOptions.maxLines ?? COMPONENT_STREAM_MAX_LINES, COMPONENT_STREAM_MAX_LINES),
+      ...(streamOptions.onQueueHighWater === undefined ? {} : { onQueueHighWater: streamOptions.onQueueHighWater }),
+    })
+  }
+  const run: GitRun = async (args, options: GitRunOptions = {}) => {
+    const left = remaining()
+    if (left <= 0) return incompleteSelectedRun("component custody proof deadline is exhausted", true)
+    if (gitProcess.stream === undefined) {
+      return incompleteSelectedRun("selected Git process does not support bounded output streaming")
+    }
+    let bounded
+    try {
+      bounded = stream(args, {
+        ...(options.env === undefined ? {} : { env: options.env }),
+        ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+        maxBytes: COMPONENT_QUERY_MAX_BYTES,
+        maxLines: COMPONENT_QUERY_MAX_LINES,
+      })
+    } catch (error) {
+      return incompleteSelectedRun(
+        `selected bounded Git query could not start: ${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
+    const lines: string[] = []
+    let bytes = 0
+    let outputExceeded = false
+    let streamFailure: string | undefined
+    try {
+      for await (const line of bounded.lines) {
+        bytes += Buffer.byteLength(line, "utf8") + 1
+        if (bytes > COMPONENT_QUERY_MAX_BYTES || lines.length >= COMPONENT_QUERY_MAX_LINES) {
+          outputExceeded = true
+          continue
+        }
+        lines.push(line)
+      }
+    } catch (error) {
+      streamFailure = `selected bounded Git query stream failed: ${String(error)}`
+    }
+    const outcome = await bounded.outcome
+    if (streamFailure !== undefined) return incompleteSelectedRun(streamFailure)
+    if (Date.now() >= deadline) return incompleteSelectedRun("component custody proof deadline is exhausted", true)
+    if (outcome.timedOut || outcome.capped || outputExceeded) {
+      return incompleteSelectedRun(
+        outcome.timedOut
+          ? `selected Git query timed out: ${outcome.stderr}`
+          : `selected Git query exceeded its output cap: ${outcome.stderr}`,
+        outcome.timedOut,
+      )
+    }
+    if (outcome.code === 0 && outcome.stderr !== "") {
+      return incompleteSelectedRun(`selected Git query wrote stderr: ${outcome.stderr}`)
+    }
+    return {
+      code: outcome.code ?? 1,
+      stdout: lines.join("\n"),
+      stderr: outcome.stderr,
+    }
+  }
+  return { run, stream }
+}
+
+type ComponentIdentity = Readonly<{
+  component: string
+  gitDir: string
+  commonDir: string
+  objectDirectory: string
+  workTree: string
+}>
+
+type ComponentCensus = Readonly<{
+  sources: readonly ComponentGitSource[]
+  identities: readonly ComponentIdentity[]
+  witnessStores: readonly string[]
+  witnessStoreByComponent: readonly Readonly<{ component: string; store: string }>[]
+  alternateStores: readonly string[]
+  externalOwners: readonly string[]
+  removal: readonly string[]
+  fingerprint: string
+}>
+
+function custodyIdentityError(message: string): Error {
+  return new Error(`component custody census unknown: ${message}`)
+}
+
+async function buildComponentCensus(
+  input: Readonly<{
+    git: Git
+    adapters: Readonly<{ run: GitRun; stream: GitStreamFactory }>
+    repo: string
+    worktree: string
+    rootGitDir: string
+    excludedSubmodules: readonly string[]
+    policy: ComponentCustodyPolicy
+    deadline: number
+  }>,
+): Promise<ComponentCensus> {
+  const remaining = (): number => {
+    const left = input.deadline - Date.now()
+    if (left <= 0) throw custodyIdentityError("shared proof deadline is exhausted")
+    return left
+  }
+  const query = async (cwd: string, args: readonly string[]): Promise<string> => {
+    const result = await input.adapters.run(["-C", cwd, ...args])
+    if (result.code !== 0)
+      throw custodyIdentityError(`${cwd}: ${result.stderr.trim() || `git ${args.join(" ")} failed`}`)
+    remaining()
+    return result.stdout.trim()
+  }
+  const boundedGit: Pick<Git, "run"> = {
+    run: async (cwd, args, allowFailure = false, _timeoutMs, options) => {
+      const result = await input.adapters.run(["-C", cwd, ...args], {
+        timeoutMs: remaining(),
+        ...(options?.env === undefined ? {} : { env: options.env }),
+      })
+      if (
+        result.timedOut === true ||
+        result.stderr.startsWith("selected ") ||
+        result.stderr.startsWith("component custody proof deadline")
+      ) {
+        throw custodyIdentityError(`${cwd}: ${result.stderr || "selected Git query did not complete"}`)
+      }
+      if (!allowFailure && result.code !== 0) {
+        throw custodyIdentityError(`${cwd}: ${result.stderr.trim() || `git ${args.join(" ")} exited ${result.code}`}`)
+      }
+      return result
+    },
+  }
+  const canonical = (value: string, label: string): string => {
+    try {
+      return realpathSync(value)
+    } catch (error) {
+      throw custodyIdentityError(
+        `${label} ${value} is missing or redirected: ${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
+  }
+  const removal = [canonical(input.worktree, "removal checkout"), canonical(input.rootGitDir, "removal Git directory")]
+  const withinRemoval = (path: string): boolean =>
+    removal.some((root) => {
+      const part = relative(root, path)
+      return part === "" || (part !== ".." && !part.startsWith(`..${sep}`) && !isAbsolute(part))
+    })
+  const branch = await input.adapters.run(["check-ref-format", "--branch", input.policy.targetBranch])
+  if (branch.code !== 0)
+    throw custodyIdentityError(`target branch ${JSON.stringify(input.policy.targetBranch)} is invalid`)
+  const status = await statusWithGit(
+    { repo: input.worktree, excludedSubmodules: input.excludedSubmodules },
+    boundedGit,
+    remaining(),
+  )
+  if (status.uninitializedSubmodules.length > 0 || status.submoduleProblems.length > 0) {
+    throw custodyIdentityError(
+      [
+        ...status.uninitializedSubmodules.map((component) => `${component}: submodule checkout is uninitialized`),
+        ...status.submoduleProblems.map((entry) => `${entry.path}: ${entry.kind}: ${entry.reason}`),
+      ].join("; "),
+    )
+  }
+  const unaccounted = status.notCompared
+  if (unaccounted.length > 0) {
+    throw custodyIdentityError(unaccounted.map((entry) => `${entry.path}: ${entry.message}`).join("; "))
+  }
+  const primaryStatus = await statusWithGit(
+    { repo: input.policy.primaryRoot, excludedSubmodules: input.excludedSubmodules },
+    boundedGit,
+    remaining(),
+  )
+  if (primaryStatus.uninitializedSubmodules.length > 0 || primaryStatus.submoduleProblems.length > 0) {
+    throw custodyIdentityError(
+      `persistent primary: ${[
+        ...primaryStatus.uninitializedSubmodules.map(
+          (component) => `${component}: submodule checkout is uninitialized`,
+        ),
+        ...primaryStatus.submoduleProblems.map((entry) => `${entry.path}: ${entry.kind}: ${entry.reason}`),
+      ].join("; ")}`,
+    )
+  }
+  const primaryUnaccounted = primaryStatus.notCompared
+  if (primaryUnaccounted.length > 0) {
+    throw custodyIdentityError(
+      `persistent primary: ${primaryUnaccounted.map((entry) => `${entry.path}: ${entry.message}`).join("; ")}`,
+    )
+  }
+  const primaryRepositories = new Map<string, string>([
+    [".", canonical(input.policy.primaryRoot, "persistent primary root")],
+  ])
+  for (const entry of primaryStatus.consultedRepositories) {
+    if (entry.path !== ".")
+      primaryRepositories.set(entry.path, canonical(entry.root, `primary component ${entry.path}`))
+  }
+  const repositories = [
+    { component: ".", root: canonical(input.worktree, "removal checkout") },
+    ...status.consultedRepositories
+      .filter((entry) => entry.path !== ".")
+      .map((entry) => ({ component: entry.path, root: canonical(entry.root, `component ${entry.path}`) })),
+  ]
+  const identities: ComponentIdentity[] = []
+  const sources: ComponentGitSource[] = []
+  const objectOwners = new Map<string, string>()
+  const witnessStores = new Set<string>()
+  const witnessStoreByComponent: { component: string; store: string }[] = []
+  const externalOwners = new Set<string>()
+  const registerObjectOwner = (objectDirectory: string, commonDir: string, component: string): void => {
+    const prior = objectOwners.get(objectDirectory)
+    if (prior !== undefined && prior !== commonDir) {
+      throw custodyIdentityError(
+        `${component}: object directory ${objectDirectory} has ambiguous Git owners ${prior} and ${commonDir}`,
+      )
+    }
+    objectOwners.set(objectDirectory, commonDir)
+  }
+  for (const repository of repositories) {
+    remaining()
+    const workTree = canonical(
+      await query(repository.root, ["rev-parse", "--show-toplevel"]),
+      `${repository.component} worktree`,
+    )
+    if (workTree !== repository.root) {
+      throw custodyIdentityError(`${repository.component}: declared root ${repository.root} resolves to ${workTree}`)
+    }
+    const gitDir = canonical(
+      await query(workTree, ["rev-parse", "--absolute-git-dir"]),
+      `${repository.component} gitdir`,
+    )
+    const commonDir = canonical(
+      await query(workTree, ["rev-parse", "--path-format=absolute", "--git-common-dir"]),
+      `${repository.component} common-dir`,
+    )
+    const objectDirectory = canonical(
+      await query(workTree, ["rev-parse", "--path-format=absolute", "--git-path", "objects"]),
+      `${repository.component} object directory`,
+    )
+    if (!statSync(objectDirectory).isDirectory()) {
+      throw custodyIdentityError(`${repository.component}: Git object directory ${objectDirectory} is not a directory`)
+    }
+    registerObjectOwner(objectDirectory, commonDir, repository.component)
+    if (!withinRemoval(commonDir)) externalOwners.add(commonDir)
+    const source: ComponentGitSource = { component: repository.component, gitDir, workTree }
+    sources.push(source)
+    identities.push({ ...source, commonDir, objectDirectory })
+
+    const registrations = parseRegisteredWorktrees(await query(commonDir, ["worktree", "list", "--porcelain", "-z"]))
+    if (registrations.length === 0)
+      throw custodyIdentityError(`${repository.component}: ${commonDir} has no native worktree registration`)
+    if (
+      !registrations.some((entry) => {
+        const registeredPath = canonical(entry.path, `${repository.component} source registration`)
+        return (
+          registeredPath === workTree ||
+          (repository.component !== "." && gitDir === commonDir && registeredPath === commonDir)
+        )
+      })
+    ) {
+      throw custodyIdentityError(
+        `${repository.component}: source ${workTree} has no exact native registration in ${commonDir}`,
+      )
+    }
+    const selectedPrimary = primaryRepositories.get(repository.component)
+    if (selectedPrimary === undefined)
+      throw custodyIdentityError(`${repository.component}: primary registration is missing`)
+    const primaryPath = resolve(selectedPrimary)
+    if (withinRemoval(primaryPath)) {
+      throw custodyIdentityError(`${repository.component}: primary ${primaryPath} is in the removal set`)
+    }
+    const primaryGitDir = canonical(
+      await query(primaryPath, ["rev-parse", "--absolute-git-dir"]),
+      `${repository.component} primary gitdir`,
+    )
+    const primaryCommon = canonical(
+      await query(primaryPath, ["rev-parse", "--path-format=absolute", "--git-common-dir"]),
+      `${repository.component} primary common-dir`,
+    )
+    const primaryObjects = canonical(
+      await query(primaryPath, ["rev-parse", "--path-format=absolute", "--git-path", "objects"]),
+      `${repository.component} primary object directory`,
+    )
+    if (!statSync(primaryObjects).isDirectory()) {
+      throw custodyIdentityError(
+        `${repository.component}: persistent primary object directory ${primaryObjects} is not a directory`,
+      )
+    }
+    const primaryRegistrations = parseRegisteredWorktrees(
+      await query(primaryCommon, ["worktree", "list", "--porcelain", "-z"]),
+    )
+    const canonicalPrimaryRegistrations = primaryRegistrations.map((entry) =>
+      canonical(entry.path, `${repository.component} primary registration`),
+    )
+    const primaryRegistrationIdentity =
+      repository.component !== "." && primaryGitDir === primaryCommon ? primaryCommon : primaryPath
+    if (canonicalPrimaryRegistrations[0] !== primaryRegistrationIdentity) {
+      throw custodyIdentityError(
+        `${repository.component}: persistent primary ${primaryPath} is not the first native registration in ${primaryCommon}`,
+      )
+    }
+    if (repository.component === "." && (primaryCommon !== commonDir || primaryObjects !== objectDirectory)) {
+      throw custodyIdentityError(
+        `root persistent primary ${primaryPath} has Git identity ${primaryCommon}/${primaryObjects}, expected source root identity ${commonDir}/${objectDirectory}`,
+      )
+    }
+    registerObjectOwner(primaryObjects, primaryCommon, `${repository.component} primary ${primaryGitDir}`)
+    witnessStores.add(primaryObjects)
+    witnessStoreByComponent.push({ component: repository.component, store: primaryObjects })
+    if (!withinRemoval(primaryCommon)) externalOwners.add(primaryCommon)
+  }
+  const alternateStores = new Set<string>()
+  const queue = [...new Set([...identities.map((entry) => entry.objectDirectory), ...witnessStores])]
+  for (let index = 0; index < queue.length; index += 1) {
+    remaining()
+    const store = queue[index]
+    if (store === undefined) continue
+    const alternateFile = join(store, "info", "alternates")
+    if (!existsSync(alternateFile)) continue
+    const metadata = lstatSync(alternateFile)
+    if (!metadata.isFile() || realpathSync(alternateFile) !== alternateFile) {
+      throw custodyIdentityError(`alternate declaration ${alternateFile} is redirected or not a file`)
+    }
+    for (const target of alternateEntries(readFileSync(alternateFile, "utf8"), store)) {
+      if (!existsSync(target) || !statSync(target).isDirectory()) {
+        throw custodyIdentityError(`${store}: alternate object store ${target} is missing or not a directory`)
+      }
+      const canonicalTarget = realpathSync(target)
+      const owner = objectOwners.get(canonicalTarget)
+      if (owner === undefined) {
+        throw custodyIdentityError(`${store}: alternate ${canonicalTarget} has no exact consulted Git owner`)
+      }
+      if (!alternateStores.has(canonicalTarget)) {
+        alternateStores.add(canonicalTarget)
+        queue.push(canonicalTarget)
+      }
+      if (!withinRemoval(owner)) externalOwners.add(owner)
+    }
+  }
+  // The shared traversal is also the canonical cycle/dedup check used by retention.
+  await alternatesLineage([...identities.map((entry) => entry.objectDirectory), ...witnessStores], "")
+  const fingerprintValue = JSON.stringify({
+    sources: identities.map(({ component, gitDir, commonDir, objectDirectory, workTree }) => ({
+      component,
+      gitDir,
+      commonDir,
+      objectDirectory,
+      workTree,
+    })),
+    witnesses: [...witnessStores].sort(),
+    witnessStoreByComponent: [...witnessStoreByComponent].sort((left, right) =>
+      left.component.localeCompare(right.component),
+    ),
+    alternates: [...alternateStores].sort(),
+    externalOwners: [...externalOwners].sort(),
+  })
+  return {
+    sources,
+    identities,
+    witnessStores: [...witnessStores].sort(),
+    witnessStoreByComponent: [...witnessStoreByComponent].sort((left, right) =>
+      left.component.localeCompare(right.component),
+    ),
+    alternateStores: [...alternateStores].sort(),
+    externalOwners: [...externalOwners].sort(),
+    removal,
+    fingerprint: createHash("sha256").update(fingerprintValue).digest("hex"),
+  }
+}
 
 export type GitWorktreeStoreOptions = Readonly<{
   repo: string
@@ -646,16 +1068,27 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         excludedSubmodules?: readonly string[]
         noRehome?: boolean
         preserved?: readonly string[]
+        componentCustody?: ComponentCustodyPolicy
       }> = {},
-    ): Promise<void | Readonly<{ borrowers: readonly string[] }> | Readonly<{ compaction: CompactionResult }>> {
+    ): Promise<
+      | void
+      | Readonly<{ borrowers: readonly string[] }>
+      | Readonly<{ compaction: CompactionResult }>
+      | Readonly<{ custodyRefusal: ComponentCustodyRefusal }>
+    > {
       await assertRemovalRoot(path)
+      if (removeOptions.componentCustody !== undefined && removeOptions.retention === undefined) {
+        throw new Error("component custody requires the existing retention proof on worktree removal")
+      }
       // The selected checkout can be the removal target. Its registry outlives it.
       const removalRepo = await git.text(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"])
       let stagingPath: string | undefined
       let borrowed: Readonly<{ borrowers: readonly string[] }> | undefined
       let removalProof: WorktreeRemovalProof | undefined
+      let componentCustodyProof: ComponentCustodyProof | undefined
       let compaction: CompactionResult | undefined
       let children: Awaited<ReturnType<typeof captureLinkedChildren>> = []
+      let custodyRefusal: ComponentCustodyRefusal | undefined
       await mutate(removeOptions.operation ?? `worktree remove ${path}`, async () => {
         if (removeOptions.retention !== undefined && removeOptions.unlock === true) {
           throw new Error(`retained worktree removal cannot unlock ${path}; resolve its holder first`)
@@ -673,9 +1106,236 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
           )
         }
         if (rehome === undefined) throw new Error(`worktree ${path} has no prepared borrower custody`)
-        const writerLeases = acquireRemovalWriterLeases(gitDir)
+        const proofDeadline = Date.now() + timeouts.cleanup
+        const adapters =
+          removeOptions.componentCustody === undefined
+            ? undefined
+            : selectedCustodyAdapters(
+                options.gitProcess,
+                repo,
+                options.env ?? process.env,
+                options.signal,
+                proofDeadline,
+              )
+        let initialCensus: ComponentCensus | undefined
+        if (removeOptions.componentCustody !== undefined && adapters !== undefined) {
+          try {
+            initialCensus = await buildComponentCensus({
+              git,
+              adapters,
+              repo,
+              worktree: path,
+              rootGitDir: gitDir,
+              excludedSubmodules: removeOptions.excludedSubmodules ?? [],
+              policy: removeOptions.componentCustody,
+              deadline: proofDeadline,
+            })
+          } catch (error) {
+            custodyRefusal = {
+              status: "unknown",
+              component: ".",
+              source: "recursive component census",
+              detail: error instanceof Error ? error.message : String(error),
+            }
+            return
+          }
+        }
+        const mutationDirectory = await mutationLock()
+        let writerLeases: ReturnType<typeof acquireRemovalWriterLeases>
+        try {
+          writerLeases = acquireRemovalWriterLeases(gitDir, undefined, {
+            ...(initialCensus === undefined ? {} : { additionalGitDirs: initialCensus.externalOwners }),
+            skip: [join(mutationDirectory, "writer.lock")],
+          })
+        } catch (error) {
+          if (removeOptions.componentCustody !== undefined) {
+            const detail = error instanceof Error ? error.message : String(error)
+            const queriedOwner = initialCensus?.externalOwners.find((owner) =>
+              detail.includes(join(owner, "yrd-worktree-mutations", "writer.lock")),
+            )
+            custodyRefusal = {
+              status: "unknown",
+              component: ".",
+              source: queriedOwner === undefined ? "removal writer lease" : `writer lease owner ${queriedOwner}`,
+              detail,
+            }
+            return
+          }
+          throw error
+        }
         const resolvedPath = resolve(path)
         try {
+          if (removeOptions.componentCustody !== undefined && adapters !== undefined && initialCensus !== undefined) {
+            let sidecarDir: string | undefined
+            try {
+              const confirmedCensus = await buildComponentCensus({
+                git,
+                adapters,
+                repo,
+                worktree: path,
+                rootGitDir: gitDir,
+                excludedSubmodules: removeOptions.excludedSubmodules ?? [],
+                policy: removeOptions.componentCustody,
+                deadline: proofDeadline,
+              })
+              if (confirmedCensus.fingerprint !== initialCensus.fingerprint) {
+                custodyRefusal = {
+                  status: "unknown",
+                  component: ".",
+                  source: "component identity recensus",
+                  detail:
+                    "component population, Git-store identities, alternates, primary witnesses, or lease owners changed after acquiring writer leases",
+                }
+              } else {
+                const proofSidecarDir = mkdtempSync(join(tmpdir(), "git-super-component-custody-"))
+                sidecarDir = proofSidecarDir
+                const sidecarReal = realpathSync(proofSidecarDir)
+                if (
+                  [
+                    ...initialCensus.removal,
+                    ...initialCensus.identities.flatMap((entry) => [
+                      entry.gitDir,
+                      entry.commonDir,
+                      entry.objectDirectory,
+                    ]),
+                    ...initialCensus.witnessStores,
+                    ...initialCensus.alternateStores,
+                    ...initialCensus.externalOwners,
+                    realpathSync(removeOptions.componentCustody.primaryRoot),
+                  ].some((root) => {
+                    const part = relative(root, sidecarReal)
+                    return part === "" || (part !== ".." && !part.startsWith(`..${sep}`) && !isAbsolute(part))
+                  })
+                ) {
+                  throw new Error(
+                    `temporary proof sidecar ${sidecarReal} is inside a source, witness, or removal store`,
+                  )
+                }
+                const contents = await scanContents(path, {}, initialCensus.removal, {
+                  sidecarDir: proofSidecarDir,
+                  sources: initialCensus.sources,
+                  sourceMode: "complete-commit",
+                  run: adapters.run,
+                  stream: adapters.stream,
+                  deadline: proofDeadline,
+                })
+                if (contents.status !== "pass") {
+                  const first = contents.components.find((entry) => entry.missingRoots > 0)
+                  custodyRefusal = {
+                    status: contents.status,
+                    component: first?.component ?? ".",
+                    source: contents.status === "blocked" ? "root-reference integrity" : "effective commit inventory",
+                    detail: contents.detail,
+                    ...(first?.missingRootsSample[0] === undefined ? {} : { oid: first.missingRootsSample[0] }),
+                  }
+                } else {
+                  const witnesses: WitnessIdentity[] = []
+                  const witnessKeys = new Set<string>()
+                  let witnessCount = 0
+                  let custodyFailure: ComponentCustodyRefusal | undefined
+                  for (const component of contents.components) {
+                    const store = initialCensus.witnessStoreByComponent.find(
+                      (entry) => entry.component === component.component,
+                    )?.store
+                    if (store === undefined) {
+                      custodyFailure = {
+                        status: "unknown",
+                        component: component.component,
+                        source: "persistent primary object store",
+                        detail: `no exact primary witness store was resolved for component ${component.component}`,
+                      }
+                      break
+                    }
+                    const custody = await scanCustody(path, [component], [store], initialCensus.removal, {
+                      sidecarDir: proofSidecarDir,
+                      run: adapters.run,
+                      stream: adapters.stream,
+                      deadline: proofDeadline,
+                      witnessPolicy: { targetBranch: removeOptions.componentCustody.targetBranch },
+                    })
+                    if (custody.status !== "pass") {
+                      const first: CustodyTarget | undefined = custody.missing[0]
+                      custodyFailure = {
+                        status: custody.status,
+                        component: first?.component ?? component.component,
+                        source: first?.source ?? "surviving primary Git graph",
+                        detail: custody.detail,
+                        ...(first === undefined ? {} : { oid: first.oid }),
+                      }
+                      break
+                    }
+                    witnessCount += custody.witnessCount
+                    for (const witness of custody.witnesses) {
+                      const key = `${witness.store}\0${witness.ref}\0${witness.tip}`
+                      if (witnessKeys.has(key)) continue
+                      witnessKeys.add(key)
+                      witnesses.push(witness)
+                    }
+                  }
+                  if (custodyFailure !== undefined) {
+                    custodyRefusal = custodyFailure
+                  } else {
+                    const sourceSummary = initialCensus.identities.map(
+                      ({ component, gitDir: sourceGitDir, commonDir, objectDirectory }) => ({
+                        component,
+                        gitDir: sourceGitDir,
+                        commonDir,
+                        objectDirectory,
+                      }),
+                    )
+                    const atRiskDigest = contents.components
+                      .map(
+                        (entry) =>
+                          `${entry.component}\t${entry.gitDir ?? ""}\t${entry.atRisk}\t${entry.atRiskSidecar.sha256}`,
+                      )
+                      .join("\n")
+                    const digest = createHash("sha256")
+                      .update(
+                        JSON.stringify({
+                          targetBranch: removeOptions.componentCustody.targetBranch,
+                          sources: sourceSummary,
+                          atRiskDigest,
+                          witnesses,
+                          witnessCount,
+                        }),
+                      )
+                      .digest("hex")
+                    componentCustodyProof = {
+                      targetBranch: removeOptions.componentCustody.targetBranch,
+                      sources: sourceSummary,
+                      witnesses,
+                      componentCount: contents.components.length,
+                      effectiveCommitCount: contents.components.reduce((count, entry) => count + entry.atRisk, 0),
+                      witnessCount,
+                      digest,
+                      elapsedMs: Date.now() + timeouts.cleanup - proofDeadline,
+                    }
+                  }
+                }
+              }
+            } catch (error) {
+              custodyRefusal = {
+                status: "unknown",
+                component: ".",
+                source: "component custody proof",
+                detail: error instanceof Error ? error.message : String(error),
+              }
+            } finally {
+              if (sidecarDir !== undefined) {
+                try {
+                  rmSync(sidecarDir, { recursive: true })
+                } catch (error) {
+                  custodyRefusal = {
+                    status: "unknown",
+                    component: ".",
+                    source: "proof sidecar cleanup",
+                    detail: `${custodyRefusal?.detail ? `${custodyRefusal.detail}; ` : ""}could not remove invocation sidecar ${sidecarDir}: ${error instanceof Error ? error.message : String(error)}`,
+                  }
+                }
+              }
+            }
+            if (custodyRefusal !== undefined) return
+          }
           if (removeOptions.noRehome === true) {
             const borrowers = rehome.inspect()
             if (borrowers.length > 0) {
@@ -699,6 +1359,8 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
               undefined,
               undefined,
               removeOptions.preserved,
+              undefined,
+              componentCustodyProof,
             )
           } else {
             if (removeOptions.unlock === true) await unlockWorktree(git, repo, path)
@@ -838,6 +1500,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
           }
         }
       }
+      if (custodyRefusal !== undefined) return { custodyRefusal }
       if (borrowed !== undefined) return borrowed
       const failures: Error[] = []
       for (const child of children) {
@@ -1107,10 +1770,9 @@ async function inspectWorktree(git: Git, repo: string, path: string): Promise<Wo
   return { registered: true, ...fields }
 }
 
-async function listWorktrees(git: Git, repo: string): Promise<RegisteredWorktree[]> {
-  const listed = await git.run(repo, ["worktree", "list", "--porcelain", "-z"])
+function parseRegisteredWorktrees(output: string): RegisteredWorktree[] {
   const rows: RegisteredWorktree[] = []
-  for (const record of listed.stdout.split("\0\0")) {
+  for (const record of output.split("\0\0")) {
     if (record === "") continue
     const fields = record.split("\0").filter((field) => field !== "")
     const worktree = fields.find((field) => field.startsWith("worktree "))
@@ -1129,6 +1791,11 @@ async function listWorktrees(git: Git, repo: string): Promise<RegisteredWorktree
     })
   }
   return rows
+}
+
+async function listWorktrees(git: Git, repo: string): Promise<RegisteredWorktree[]> {
+  const listed = await git.run(repo, ["worktree", "list", "--porcelain", "-z"])
+  return parseRegisteredWorktrees(listed.stdout)
 }
 
 export type GitWorktreeStore = Awaited<ReturnType<typeof createGitWorktreeStore>>

@@ -168,6 +168,18 @@ export type WorktreeRemovalProof = Readonly<{
   writerLocks: readonly WriterLockProof[]
   createdWriterLocks: readonly WriterLockProof[]
   notCompared: readonly NotCompared[]
+  componentCustody?: ComponentCustodyProof
+}>
+
+export type ComponentCustodyProof = Readonly<{
+  targetBranch: string
+  sources: readonly Readonly<{ component: string; gitDir: string; commonDir: string; objectDirectory: string }>[]
+  witnesses: readonly Readonly<{ store: string; ref: string; tip: string; graphDigest: string }>[]
+  componentCount: number
+  effectiveCommitCount: number
+  witnessCount: number
+  digest: string
+  elapsedMs: number
 }>
 
 export type WriterLockProof = Readonly<{ path: string; body: string; lease: "free" }>
@@ -809,7 +821,11 @@ function isWriterLeasePath(path: string, root: string, rootIsGitDir: boolean): b
 }
 
 /** Take every in-custody Git directory's writer lease before retention; callers hold them through native removal. */
-export function acquireRemovalWriterLeases(gitDir: string, onAcquired?: (path: string) => void): RemovalWriterLeases {
+export function acquireRemovalWriterLeases(
+  gitDir: string,
+  onAcquired?: (path: string) => void,
+  options: Readonly<{ additionalGitDirs?: readonly string[]; skip?: readonly string[] }> = {},
+): RemovalWriterLeases {
   const handles: FlockHandle[] = []
   const proof: WriterLockProof[] = []
   const created: WriterLockProof[] = []
@@ -834,23 +850,34 @@ export function acquireRemovalWriterLeases(gitDir: string, onAcquired?: (path: s
     if (failures.length > 0) throw new AggregateError(failures, `could not release writer leases under ${gitDir}`)
   }
   try {
-    const entries = readdirSync(gitDir, { recursive: true, withFileTypes: true })
+    const removalRoot = realpathSync(gitDir)
+    const externalRoots = [...new Set((options.additionalGitDirs ?? []).map((root) => realpathSync(root)))]
+      .filter((root) => root !== removalRoot)
+      .sort()
+    const skipped = new Set((options.skip ?? []).map((path) => resolve(path)))
+    const entries = readdirSync(removalRoot, { recursive: true, withFileTypes: true })
     for (const entry of entries) {
       if (!entry.name.endsWith(".lock")) continue
       const path = join(entry.parentPath, entry.name)
-      if (!entry.isFile() || !isWriterLeasePath(path, gitDir, true)) {
+      if (!entry.isFile() || !isWriterLeasePath(path, removalRoot, true)) {
         throw new Error(`Git lock ${path} prevents worktree removal; resolve its holder (${describeLockBarrier(path)})`)
       }
     }
-    const directories = [
-      gitDir,
+    const removalDirectories = [
+      removalRoot,
       ...entries.filter((entry) => entry.isDirectory()).map((entry) => join(entry.parentPath, entry.name)),
     ]
-    const paths = directories
-      .filter((directory) => isGitDirectory(directory, gitDir, true))
+    const paths = removalDirectories
+      .filter((directory) => isGitDirectory(directory, removalRoot, true))
       .map((directory) => join(directory, "yrd-worktree-mutations", "writer.lock"))
-    const existing = paths.filter((path) => present(path)).sort()
-    const absent = paths.filter((path) => !present(path)).sort()
+    for (const owner of externalRoots) {
+      if (!isGitDirectory(owner, owner, true))
+        throw new Error(`external writer lease owner is not a Git directory: ${owner}`)
+      paths.push(join(owner, "yrd-worktree-mutations", "writer.lock"))
+    }
+    const uniquePaths = [...new Set(paths)].filter((path) => !skipped.has(resolve(path)))
+    const existing = uniquePaths.filter((path) => present(path)).sort()
+    const absent = uniquePaths.filter((path) => !present(path)).sort()
     // Refuse held existing leases before creating any missing path. Missing paths are then
     // acquired too, so a writer that starts during retention cannot create and take one.
     for (const path of [...existing, ...absent]) {
@@ -1110,6 +1137,7 @@ export async function retainWorktreeModules(
   retirePrivate?: () => void,
   preserved: readonly string[] = [],
   destroyed?: Readonly<{ gitDir: string; common: string; head: string }>,
+  componentCustody?: ComponentCustodyProof,
 ): Promise<WorktreeRemovalProof> {
   const path = destroyed === undefined ? realpathSync(requested) : resolve(requested)
   if (privateProjection === undefined && destroyed === undefined) {
@@ -1153,6 +1181,7 @@ export async function retainWorktreeModules(
     retirePrivate,
     preserved,
     destroyedHead: destroyed?.head,
+    componentCustody,
   })
 }
 
@@ -1174,6 +1203,7 @@ async function retainResolvedWorktreeModules(context: {
   retirePrivate: (() => void) | undefined
   preserved: readonly string[]
   destroyedHead: string | undefined
+  componentCustody: ComponentCustodyProof | undefined
 }): Promise<WorktreeRemovalProof> {
   const {
     git,
@@ -1192,6 +1222,7 @@ async function retainResolvedWorktreeModules(context: {
     retirePrivate,
     preserved,
     destroyedHead,
+    componentCustody,
   } = context
   const modules = join(gitDir, "modules")
   const custody = { common, checkout: path, gitDir, modules }
@@ -1398,6 +1429,7 @@ async function retainResolvedWorktreeModules(context: {
     writerLocks,
     createdWriterLocks,
     notCompared,
+    ...(componentCustody === undefined ? {} : { componentCustody }),
   }
   writeFileSync(
     proof.manifest,

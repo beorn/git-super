@@ -2,6 +2,7 @@ import { afterEach, describe, expect, onTestFailed, test, vi } from "vitest"
 import { createLogger } from "loggily"
 import {
   existsSync,
+  chmodSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -27,6 +28,36 @@ afterEach(() => {
 })
 
 describe("GitProcess", () => {
+  // @failure: a complete-proof stream silently falls back to a separately scrubbed/default Git executable or environment.
+  // @level l2; @consumer selected GitSuper cleanup custody proof; existing buffered-runner tests cannot observe stream context.
+  test("local bounded streams use the selected executable and preserve its Git environment", async () => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-selected-stream-"))
+    roots.push(root)
+    const executable = join(root, "git")
+    writeFileSync(
+      executable,
+      `#!/bin/sh\nprintf '%s|%s|%s|%s\\n' "$CUSTODY_STREAM_MARKER" "\${GIT_CONFIG_NOSYSTEM-absent}" "\${GIT_OPTIONAL_LOCKS-absent}" "\${GIT_TERMINAL_PROMPT-absent}"\n`,
+    )
+    chmodSync(executable, 0o755)
+    vi.stubEnv("PATH", `${root}${delimiter}${process.env.PATH ?? ""}`)
+    try {
+      const selectedEnvironment: NodeJS.ProcessEnv = { ...process.env, CUSTODY_STREAM_MARKER: "selected-environment" }
+      delete selectedEnvironment.GIT_CONFIG_NOSYSTEM
+      delete selectedEnvironment.GIT_OPTIONAL_LOCKS
+      delete selectedEnvironment.GIT_TERMINAL_PROMPT
+      const selected = createLocalGitProcess(selectedEnvironment)
+      expect(selected.stream).toBeTypeOf("function")
+      const stream = selected.stream?.({ repo: root, args: ["version"], maxLines: 4 })
+      if (stream === undefined) throw new Error("local Git process did not expose its bounded stream")
+      const lines: string[] = []
+      for await (const line of stream.lines) lines.push(line)
+      await expect(stream.outcome).resolves.toMatchObject({ code: 0, timedOut: false, capped: false })
+      expect(lines).toEqual(["selected-environment|absent|absent|absent"])
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  })
+
   // @failure: invalid host-selected stores are accepted and reach a native Git spawn.
   // @level l1; @consumer callers declaring a closed public object context; @testonly none
   // Existing graph tests scrub ambient routing but do not validate explicit stores.

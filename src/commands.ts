@@ -13,6 +13,7 @@ import { superPull, type SuperPullOptions } from "./pull.ts"
 import { superPush, type SuperPushOptions } from "./push.ts"
 import type { GitSuperResult } from "./result.ts"
 import { shellQuote } from "./shell-command.ts"
+import { isAbsolute } from "node:path"
 import { superStatus, type SuperStatusOptions, type SuperStatusResult } from "./status.ts"
 import {
   superSubmodulePrepare,
@@ -431,10 +432,24 @@ const worktreeRemove = commandNode<CommandContext, WorktreeRemoveParams, GitSupe
     if (input.noRehome !== undefined && typeof input.noRehome !== "boolean") {
       throw new Error("worktree remove noRehome must be a boolean")
     }
+    let componentCustody: Readonly<{ primaryRoot: string; targetBranch: string }> | undefined
+    if (input.componentCustody !== undefined) {
+      const custody = record(input.componentCustody)
+      const unknown = Object.keys(custody).filter((key) => key !== "primaryRoot" && key !== "targetBranch")
+      if (unknown.length > 0) throw new Error(`componentCustody has unknown property ${unknown[0]}`)
+      if (typeof custody.primaryRoot !== "string" || !isAbsolute(custody.primaryRoot)) {
+        throw new Error("componentCustody.primaryRoot must be an absolute path")
+      }
+      if (typeof custody.targetBranch !== "string" || custody.targetBranch === "") {
+        throw new Error("componentCustody.targetBranch must be a non-empty branch name")
+      }
+      componentCustody = { primaryRoot: custody.primaryRoot, targetBranch: custody.targetBranch }
+    }
     return {
       path: input.path,
       retain: input.retain,
       ...(input.noRehome === true ? { noRehome: true } : {}),
+      ...(componentCustody === undefined ? {} : { componentCustody }),
       ...(input.excludedSubmodules === undefined
         ? {}
         : {

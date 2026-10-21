@@ -774,6 +774,7 @@ async function runInvocation(
     .command("remove")
     .description(commands.worktree.remove.description ?? commands.worktree.remove.title)
     .requiredOption("--retain <directory>", "durable directory outside the worktree and its Git directory")
+    .option("--component-custody <json>", "prove every component commit has durable custody in the named primary store")
     .option("--no-rehome", "keep a lender with borrowers instead of changing their object stores")
     .option(
       "--exclude-submodule <path>",
@@ -795,19 +796,24 @@ async function runInvocation(
         excludeSubmodule?: string[]
         preserved?: string[]
         rehome: boolean
+        componentCustody?: string
       }
-      captured = {
+      const invocation: Extract<CapturedInvocation, { node: typeof commands.worktree.remove }> = {
         node: commands.worktree.remove,
         params: {
           path,
           retain: options.retain,
           ...(options.rehome === false ? { noRehome: true } : {}),
+          ...(options.componentCustody === undefined
+            ? {}
+            : { componentCustody: JSON.parse(options.componentCustody) as WorktreeRemoveParams["componentCustody"] }),
           ...(options.excludeSubmodule?.length ? { excludedSubmodules: options.excludeSubmodule } : {}),
           ...(options.preserved?.length ? { preserved: options.preserved } : {}),
         },
         json: globals.json === true,
         nul: false,
       }
+      captured = invocation
     })
 
   const retention = worktree
