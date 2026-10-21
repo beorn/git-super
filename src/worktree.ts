@@ -51,6 +51,7 @@ import { materializeSubmodulesWithProcess } from "./submodules.ts"
 import type { SuperStatusResult } from "./status.ts"
 import { statusWithGit } from "./status-traversal.ts"
 import { removalBorrowers } from "./worktree-administration.ts"
+import { inspectModuleStores, type ModuleStore } from "./module-store-custody.ts"
 
 export type GitResult = Readonly<{ code: number; stdout: string; stderr: string }>
 export type Git = ReturnType<typeof createGit>
@@ -826,7 +827,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       )
     }
   }
-  const prepareRemoval = async (path: string, excludedSubmodules?: readonly string[]) => {
+  const prepareRemoval = async (path: string, excludedSubmodules?: readonly string[], retained = false) => {
     await assertRemovalRoot(path)
     const gitDir = realpathSync(await git.text(path, ["rev-parse", "--absolute-git-dir"]))
     const common = realpathSync(await git.text(path, ["rev-parse", "--path-format=absolute", "--git-common-dir"]))
@@ -839,13 +840,20 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       excludedSubmodules,
     )
     if (custody.notCompared.some((entry) => entry.reason !== "excluded")) {
-      return { gitDir, rehome: undefined, notCompared: custody.notCompared }
+      return { gitDir, rehome: undefined, notCompared: custody.notCompared, released: [] }
     }
+    // Every destructive removal walks the slot's own `modules/` inventory, whether or not any submodule is
+    // excluded: a store no HEAD declaration names is destroyed with the slot, and only a reproducible one is
+    // released. A retained removal copies the whole store population first, so nothing is destroyed by it.
+    const released = retained
+      ? []
+      : inspectModuleStores(path, gitDir, custody.excludedStores, custody.unclaimedExclusions).released
     const rehome = await prepareRemovalBorrowers(git, path, common, gitDir, custody, excludedSubmodules)
     return {
       gitDir,
       rehome,
       notCompared: [...custody.notCompared, ...rehome.notCompared],
+      released,
     }
   }
   // Reuse removal's consulted population: native children can belong to independent
@@ -1118,7 +1126,11 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         if (removeOptions.retention !== undefined && removeOptions.unlock === true) {
           throw new Error(`retained worktree removal cannot unlock ${path}; resolve its holder first`)
         }
-        const { gitDir, rehome, notCompared } = await prepareRemoval(path, removeOptions.excludedSubmodules)
+        const { gitDir, rehome, notCompared } = await prepareRemoval(
+          path,
+          removeOptions.excludedSubmodules,
+          removeOptions.retention !== undefined,
+        )
         if (notCompared.some((entry) => entry.reason !== "excluded")) {
           throw Object.assign(
             new Error(
@@ -1645,7 +1657,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       inspectOptions: Readonly<{ excludedSubmodules?: readonly string[] }> = {},
     ): Promise<
       Pick<SuperStatusResult, "records" | "notCompared" | "consultedRepositories" | "uninitializedSubmodules"> &
-        Readonly<{ borrowers: readonly string[] }>
+        Readonly<{ borrowers: readonly string[]; released: readonly ModuleStore[] }>
     > {
       const prepared = await prepareRemoval(path, inspectOptions.excludedSubmodules)
       const status = await inspectRemovalStatusWithGit(git, path, inspectOptions.excludedSubmodules)
@@ -1659,6 +1671,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       }
       return {
         borrowers: prepared.rehome === undefined ? [] : prepared.rehome.inspect(),
+        released: prepared.released,
         records: status.records,
         notCompared: [...prepared.notCompared, ...status.notCompared],
         consultedRepositories: status.consultedRepositories,

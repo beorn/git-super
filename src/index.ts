@@ -43,3 +43,13 @@ export {
   POOL_ROOT_CONFIG_KEY,
   type WorktreeHomeOptions,
 } from "./worktree-add.ts"
+export {
+  describeReleasedStores,
+  describeModuleStore,
+  inspectModuleStores,
+  moduleStoreCustody,
+  moduleStoreUniqueCommits,
+  type ModuleInventory,
+  type ModuleStore,
+  type StoreCustody,
+} from "./module-store-custody.ts"
