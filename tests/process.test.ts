@@ -28,6 +28,38 @@ afterEach(() => {
 })
 
 describe("GitProcess", () => {
+  // @failure: interactive clone inherits a different repository or loses the caller's Git auth/config environment.
+  // @level l1; @consumer Git URL clone; buffered runner coverage cannot exercise native delegation and output sinks.
+  test("native delegation accepts a repository-clean environment and routes both streams to diagnostics", async () => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-delegate-env-"))
+    roots.push(root)
+    const executable = join(root, "git")
+    writeFileSync(
+      executable,
+      `#!/bin/sh\nprintf '%s|%s|%s|%s\\n' "\${GIT_DIR-absent}" "$GIT_SSH_COMMAND" "$GIT_CONFIG_VALUE_0" "$HOME"\nprintf 'progress\\n' >&2\n`,
+    )
+    chmodSync(executable, 0o755)
+    const env = processPort.cleanGitRepositoryEnvironment({
+      ...process.env,
+      PATH: root,
+      HOME: root,
+      GIT_DIR: "/wrong/repository",
+      GIT_SSH_COMMAND: "ssh -i caller-key",
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "credential.helper",
+      GIT_CONFIG_VALUE_0: "caller-helper",
+    })
+    const output: string[] = []
+    const diagnostics = { write: (value: string | Uint8Array) => output.push(Buffer.from(value).toString()) }
+    expect(
+      await processPort.delegateNativeGit(["clone", "--", "git@host:repo", "repo"], diagnostics, diagnostics, false, {
+        env,
+      }),
+    ).toBe(0)
+    expect(output.join("")).toContain(`absent|ssh -i caller-key|caller-helper|${root}\n`)
+    expect(output.join("")).toContain("progress\n")
+  })
+
   // @failure: a complete-proof stream silently falls back to a separately scrubbed/default Git executable or environment.
   // @level l2; @consumer selected GitSuper cleanup custody proof; existing buffered-runner tests cannot observe stream context.
   test("local bounded streams use the selected executable and preserve its Git environment", async () => {

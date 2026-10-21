@@ -1,6 +1,7 @@
 import { readCommitSubmodules } from "./commit-graph.ts"
 import type { GitProcess } from "./process.ts"
 import type { ExpectedDestination } from "./result.ts"
+import { parseGitRemote } from "./remote.ts"
 
 export const PUSH_INTENT_TRAILER = "Git-Super-Push"
 
@@ -45,34 +46,9 @@ function invalid(reason: string): never {
 export function hostedRemoteIdentity(
   remote: string,
 ): Readonly<{ host: string; namespace: string; repository: string }> {
-  let host: string
-  let path: string
-  if (/^[^/:]+@[^/:]+:/u.test(remote)) {
-    const split = remote.indexOf(":")
-    host = remote.slice(remote.indexOf("@") + 1, split).toLowerCase()
-    path = remote.slice(split + 1)
-  } else {
-    let url: URL
-    try {
-      url = new URL(remote)
-    } catch {
-      return invalid(`remote ${remote} has no hosted identity; local paths and file URLs cannot establish ownership`)
-    }
-    if (!["https:", "http:", "ssh:", "git:"].includes(url.protocol) || url.hostname === "") {
-      return invalid(`remote ${remote} has no hosted identity; local paths and file URLs cannot establish ownership`)
-    }
-    if (
-      url.password !== "" ||
-      (["http:", "https:"].includes(url.protocol) && url.username !== "") ||
-      url.search !== "" ||
-      url.hash !== ""
-    ) {
-      return invalid("remote URLs must not contain credentials, a query or a fragment")
-    }
-    host = url.host.toLowerCase()
-    path = url.pathname.replace(/^\//u, "")
-  }
-  path = path.replace(/\.git$/u, "")
+  const parsed = parseGitRemote(remote, invalid)
+  const host = parsed.host
+  const path = parsed.path.replace(/\.git$/u, "")
   const parts = path.split("/")
   if (parts.length < 2 || parts.some((part) => part === "" || part === "." || part === "..")) {
     return invalid(`remote ${remote} does not name a hosted namespace and repository`)

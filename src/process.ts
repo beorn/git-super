@@ -23,7 +23,13 @@ import { fullJitter } from "@bearly/pacing"
 import { shellQuote } from "./shell-command.ts"
 import { gitLineStream, type GitLineStream } from "./retention-stream.ts"
 
-export { applyGitObjectContext, cleanGitEnvironment, validateGitObjectContext, type GitObjectContext } from "./git.ts"
+export {
+  applyGitObjectContext,
+  cleanGitEnvironment,
+  cleanGitRepositoryEnvironment,
+  validateGitObjectContext,
+  type GitObjectContext,
+} from "./git.ts"
 
 export type ProcessOutputSink = Readonly<{ write(value: string | Uint8Array): unknown }>
 
@@ -138,7 +144,9 @@ export async function delegateNativeGit(
   stdout: ProcessOutputSink,
   stderr: ProcessOutputSink,
   replaceProcess: boolean,
+  options: Readonly<{ env?: NodeJS.ProcessEnv }> = {},
 ): Promise<number> {
+  const env = options.env ?? process.env
   if (typeof Bun === "undefined") {
     throw new Error("git-super: native delegation is a Bun CLI operation; Bun CLI requires Bun >=1.3.14")
   }
@@ -146,11 +154,11 @@ export async function delegateNativeGit(
     if (process.execve === undefined) {
       throw new Error(`git-super: Bun ${Bun.version} lacks process.execve; use Bun >=1.3.14 for native Git delegation`)
     }
-    const executable = nativeGitExecutable()
-    process.execve(executable, [executable, ...args], process.env)
+    const executable = nativeGitExecutable(env.PATH)
+    process.execve(executable, [executable, ...args], env)
   }
   // In-process CLI consumers retain their process and supply the output sinks.
-  const child = spawnGit(args, { env: process.env, stdin: "inherit" })
+  const child = spawnGit(args, { env, stdin: "inherit" })
   const forward = async (stream: Readable, sink: ProcessOutputSink) => {
     for await (const bytes of stream as AsyncIterable<unknown>) sink.write(nativeOutputBytes(bytes))
   }
