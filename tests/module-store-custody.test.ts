@@ -152,6 +152,9 @@ describe("slot module store custody", () => {
     expect(inventory.stores).toEqual([
       expect.objectContaining({ name: "packages/alpha", valueCommits: 0, defaultBranch: "main" }),
     ])
+    // The read fetched the missing tip's objects only; the store's own tracking ref is left as it was.
+    expect(storeGitOutput(slot.fixture.product, store, "cat-file", "-t", beyond)).toBe("commit")
+    expect(storeGitOutput(slot.fixture.product, store, "rev-parse", "refs/remotes/origin/main")).toBe(stale)
     expect(describeModuleStores(archiveModuleStores(inventory.stores, { actor: "dev-test", date: DATE }))).toEqual([
       `module store packages/alpha released: origin main and archive refs hold it, 0 commits unique, HEAD ${tip.slice(0, 12)}`,
     ])
@@ -294,6 +297,24 @@ describe("slot module store custody", () => {
     await expect(slot.store.remove(slot.linked)).rejects.toThrow(/could not be archived/)
     expect(existsSync(slot.linked)).toBe(true)
     expect(existsSync(join(slot.modules, "packages/alpha"))).toBe(true)
+  })
+
+  test("a GIT_COMMON_DIR or GIT_OBJECT_DIRECTORY a git hook exports never redirects the value read", async () => {
+    const slot = await linkedSlot(fixtureRoot("module-hook-environment"))
+    const tip = localCommit(slot.child)
+    dropAlphaFromHead(slot.linked)
+    const outer = join(slot.fixture.product, ".git")
+    vi.stubEnv("GIT_COMMON_DIR", outer)
+    vi.stubEnv("GIT_OBJECT_DIRECTORY", join(outer, "objects"))
+    let stores: ReturnType<typeof inspectModuleStores>["stores"]
+    try {
+      stores = inspectModuleStores(slot.linked, slot.gitDir).stores
+    } finally {
+      vi.unstubAllEnvs()
+    }
+    expect(stores).toEqual([
+      expect.objectContaining({ name: "packages/alpha", valueCommits: 1, head: tip.slice(0, 12) }),
+    ])
   })
 
   test("a stash-only commit is value and is archived as its own entry", async () => {

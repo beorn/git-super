@@ -1,7 +1,7 @@
 import { existsSync, lstatSync, readdirSync, type Dirent } from "node:fs"
 import { isAbsolute, join, relative, sep } from "node:path"
-import { spawnSync } from "node:child_process"
 import { archiveRefFor } from "./archive-ref.ts"
+import { tryGit, withGitTimeout } from "./git.ts"
 
 /**
  * A module repository under a slot's own `<git-dir>/modules/`, which removal destroys with the slot, and the
@@ -40,25 +40,45 @@ const REMOTE_READ_TIMEOUT_MS = 120_000
 const ARCHIVE_PUSH_TIMEOUT_MS = 120_000
 
 /**
+ * Every git call here goes through the package's one runner, `tryGit`, which strips an inherited `GIT_DIR`,
+ * `GIT_COMMON_DIR` or `GIT_OBJECT_DIRECTORY` (a git hook exports them) that would otherwise point a store read at
+ * another repository's refs and objects. A call that cannot run, or does not finish inside its bound, names what
+ * could not be read; it is never an empty answer (fail closed).
+ */
+function readGit(
+  cwd: string,
+  args: readonly string[],
+  what: string,
+  timeout = STORE_TIMEOUT_MS,
+  input?: string,
+): Capture {
+  try {
+    const result = withGitTimeout(timeout, () => tryGit(cwd, args, undefined, input))
+    return { status: result.exitCode, stdout: result.stdout, stderr: result.stderr }
+  } catch (error) {
+    throw new Error(
+      `${what} could not be read: ${error instanceof Error ? error.message : String(error)}; worktree preserved`,
+      {
+        cause: error,
+      },
+    )
+  }
+}
+
+/**
  * A store's `core.worktree` points at a checkout that removal may already have emptied or deleted. `--bare`
  * does not reach git's own subprocesses: `pack-objects` under a push and `unpack-objects` under a fetch re-read
  * `core.worktree` and die on `cannot chdir`. So the work tree is the store itself, an existing directory these
- * commands never write to, and the inherited `GIT_WORK_TREE` carries that to every subprocess. A store that does
- * not answer inside the bound is unreadable, never empty (fail closed).
+ * commands never write to, and git hands that to every subprocess.
  */
 function storeGit(gitDir: string, args: readonly string[], timeout = STORE_TIMEOUT_MS, input?: string): Capture {
-  const result = spawnSync("git", ["--git-dir", gitDir, "--work-tree", gitDir, ...args], {
-    encoding: "utf8",
+  return readGit(
+    gitDir,
+    ["--git-dir", gitDir, "--work-tree", gitDir, ...args],
+    `module store ${gitDir}`,
     timeout,
-    ...(input === undefined ? {} : { input }),
-  })
-  if (result.error !== undefined) {
-    throw new Error(
-      `module store ${gitDir} could not be read (git ${args[0] ?? ""}: ${result.error.message}); worktree preserved`,
-      { cause: result.error },
-    )
-  }
-  return { status: result.status ?? -1, stdout: result.stdout ?? "", stderr: result.stderr ?? "" }
+    input,
+  )
 }
 
 function within(parent: string, candidate: string): boolean {
@@ -172,6 +192,8 @@ function remoteDurableTips(gitDir: string, remote: string): Readonly<{ defaultBr
   const missing = new Set(missingObjects(gitDir, tips))
   if (missing.size > 0) {
     const wanted = named.filter(([, sha]) => missing.has(sha)).map(([ref]) => ref)
+    // An empty `--refmap` keeps this read from rewriting the store's own remote-tracking refs: only objects land.
+    // A tip the remote rewrote meanwhile stays absent, and the count below then fails loudly on it.
     const fetched = storeGit(
       gitDir,
       [
@@ -181,6 +203,7 @@ function remoteDurableTips(gitDir: string, remote: string): Readonly<{ defaultBr
         "--no-recurse-submodules",
         "--no-write-fetch-head",
         "--no-auto-maintenance",
+        "--refmap=",
         remote,
         ...wanted,
       ],
@@ -191,24 +214,24 @@ function remoteDurableTips(gitDir: string, remote: string): Readonly<{ defaultBr
         `module store ${gitDir} could not be read: fetching ${wanted.join(", ")} from ${remote} failed (${fetched.stderr.trim() || `exit ${String(fetched.status)}`}), so its value is unknown; worktree preserved`,
       )
     }
-    const absent = missingObjects(gitDir, [...missing])
-    if (absent.length > 0) {
-      throw new Error(
-        `module store ${gitDir}: ${remote} moved while it was read (${absent.join(", ")} still absent after fetch); worktree preserved, retry removal`,
-      )
-    }
   }
   return { ...(defaultBranch === undefined ? {} : { defaultBranch }), tips }
 }
 
-/** The store's own refs that could hold work: HEAD, every branch, every tag, and every stash entry. */
-function localRefs(gitDir: string): string[] {
+/** A ref that could hold work, and the name its commit is archived under. */
+type LocalRef = Readonly<{ source: string; label: string }>
+
+/**
+ * The store's own refs that could hold work: HEAD, every branch, every tag, and every stash entry. A stash
+ * entry has no ref name of its own, so its commit is archived under its position.
+ */
+function localRefs(gitDir: string): LocalRef[] {
   const refs = refsMatching(gitDir, ["refs/heads", "refs/tags"])
   const head = storeGit(gitDir, ["rev-parse", "--verify", "--quiet", "HEAD"])
   const headTip = head.status === 0 ? head.stdout.trim() : ""
   // Stash entries are commits reachable only through refs/stash's reflog, so its tip alone is not enough.
   const hasStash = storeGit(gitDir, ["reflog", "exists", "refs/stash"])
-  const stash: string[] = []
+  const stash: LocalRef[] = []
   if (hasStash.status === 0) {
     const entries = storeGit(gitDir, ["reflog", "show", "--format=%H", "refs/stash"])
     if (entries.status !== 0) {
@@ -220,17 +243,16 @@ function localRefs(gitDir: string): string[] {
       .split("\n")
       .filter((line) => line.trim() !== "")
       .entries()) {
-      stash.push(`${sha.trim()}|stash/${String(index + 1)}`)
+      stash.push({ source: sha.trim(), label: `stash/${String(index + 1)}` })
     }
   } else if (hasStash.status !== 1) {
     throw new Error(
       `module store ${gitDir} has an unreadable stash ref (${hasStash.stderr.trim()}); worktree preserved`,
     )
   }
-  // `source|archive-name`; a stash has no ref name of its own, so its commit is pushed under a numbered name.
   return [
-    ...(headTip === "" ? [] : [`${headTip}|HEAD`]),
-    ...refs.map((ref) => `${ref}|${ref.replace(/^refs\/(heads|tags)\//u, "$1/")}`),
+    ...(headTip === "" ? [] : [{ source: headTip, label: "HEAD" }]),
+    ...refs.map((ref) => ({ source: ref, label: ref.replace(/^refs\/(heads|tags)\//u, "$1/") })),
     ...stash,
   ]
 }
@@ -285,60 +307,45 @@ export function moduleStoreValue(gitDir: string): Readonly<{
   const durable = remote === undefined ? { tips: [] } : remoteDurableTips(gitDir, remote)
   const exclusions = durable.tips
   const local = localRefs(gitDir)
-  const chart = local.map((entry) => {
-    const [source, label] = entry.split("|")
-    if (source === undefined || label === undefined) throw new Error(`module store ${gitDir}: malformed ref entry`)
-    return { source, label, value: count(gitDir, [source], exclusions) }
-  })
   const valueCommits = count(
     gitDir,
-    local.map((entry) => entry.split("|")[0] ?? ""),
+    local.map((ref) => ref.source),
     exclusions,
   )
-  const head = storeGit(gitDir, ["rev-parse", "--verify", "--quiet", "HEAD"])
-  const headShort = head.status === 0 && head.stdout.trim() !== "" ? head.stdout.trim().slice(0, 12) : undefined
+  const headShort = local.find((ref) => ref.label === "HEAD")?.source.slice(0, 12)
   return {
     valueCommits,
-    refs: chart.filter((entry) => entry.value > 0).map((entry) => ({ source: entry.source, label: entry.label })),
+    refs: local.filter((ref) => count(gitDir, [ref.source], exclusions) > 0),
     ...(remote === undefined ? {} : { remote }),
     ...(durable.defaultBranch === undefined ? {} : { defaultBranch: durable.defaultBranch }),
     ...(headShort === undefined ? {} : { head: headShort }),
   }
 }
 
-/** The one predicate #30563's surviving-repository check uses: a store holds nothing of value at 0. */
-export function moduleStoreValueCommits(gitDir: string): number {
-  return moduleStoreValue(gitDir).valueCommits
-}
-
 /** The module names a slot's own HEAD declares, read from the committed `.gitmodules` rather than a working file. */
 function headModuleNames(checkout: string): string[] {
-  const blob = spawnSync("git", ["-C", checkout, "cat-file", "-e", "HEAD:.gitmodules"], {
-    encoding: "utf8",
-    timeout: STORE_TIMEOUT_MS,
-  })
+  const declarations = `HEAD:.gitmodules in ${checkout}`
+  const blob = readGit(checkout, ["cat-file", "-e", "HEAD:.gitmodules"], declarations)
   // 128 is git's answer for a commit that carries no `.gitmodules` at all: no declarations, not unreadable.
+  if (blob.status === 128) return []
   if (blob.status !== 0) {
-    if (blob.status === 128 && blob.error === undefined) return []
     throw new Error(
-      `HEAD:.gitmodules in ${checkout} could not be read, so the slot's own stores are unknown: ${(blob.error?.message ?? blob.stderr ?? "").trim()}; worktree preserved`,
-      { cause: blob.error },
+      `${declarations} could not be read, so the slot's own stores are unknown: ${blob.stderr}; worktree preserved`,
     )
   }
-  const listing = spawnSync(
-    "git",
-    ["-C", checkout, "config", "-z", "--blob", "HEAD:.gitmodules", "--get-regexp", "^submodule\\..*\\.path$"],
-    { encoding: "utf8", timeout: STORE_TIMEOUT_MS },
+  const listing = readGit(
+    checkout,
+    ["config", "-z", "--blob", "HEAD:.gitmodules", "--get-regexp", "^submodule\\..*\\.path$"],
+    declarations,
   )
   // Exit 1 means the commit declares no submodule paths; any other failure leaves the declarations unread.
   if (listing.status !== 0 && listing.status !== 1) {
     throw new Error(
-      `HEAD:.gitmodules in ${checkout} could not be parsed, so the slot's own stores are unknown: ${(listing.error?.message ?? listing.stderr ?? "").trim()}; worktree preserved`,
-      { cause: listing.error },
+      `${declarations} could not be parsed, so the slot's own stores are unknown: ${listing.stderr}; worktree preserved`,
     )
   }
   const names: string[] = []
-  for (const record of (listing.stdout ?? "").split("\0")) {
+  for (const record of listing.stdout.split("\0")) {
     const newline = record.indexOf("\n")
     if (newline < 0) continue
     const name = record
@@ -354,18 +361,12 @@ function headModuleNames(checkout: string): string[] {
 function referencedModuleStores(checkout: string): string[] {
   const stores: string[] = []
   for (const name of headModuleNames(checkout)) {
-    const resolved = spawnSync(
-      "git",
-      ["-C", checkout, "rev-parse", "--path-format=absolute", "--git-path", `modules/${name}`],
-      { encoding: "utf8", timeout: STORE_TIMEOUT_MS },
-    )
+    const what = `module store for declared submodule ${name} in ${checkout}`
+    const resolved = readGit(checkout, ["rev-parse", "--path-format=absolute", "--git-path", `modules/${name}`], what)
     if (resolved.status !== 0) {
-      throw new Error(
-        `module store for declared submodule ${name} could not be resolved in ${checkout}: ${(resolved.error?.message ?? resolved.stderr ?? "").trim()}; worktree preserved`,
-        { cause: resolved.error },
-      )
+      throw new Error(`${what} could not be resolved: ${resolved.stderr}; worktree preserved`)
     }
-    const store = (resolved.stdout ?? "").trim()
+    const store = resolved.stdout.trim()
     if (store === "" || !isAbsolute(store)) {
       throw new Error(
         `module store for declared submodule ${name} resolved to ${JSON.stringify(store)} in ${checkout}; worktree preserved`,

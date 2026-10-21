@@ -49,7 +49,6 @@ export {
   inspectDestroyedModuleStores,
   inspectModuleStores,
   moduleStoreValue,
-  moduleStoreValueCommits,
   type ModuleArchiveTarget,
   type ModuleInventory,
   type ModuleStore,
