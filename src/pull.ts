@@ -424,6 +424,19 @@ async function resolvePullTarget(
   }
 }
 
+/** The full ref names git's ref_rev_parse_rules derive from a short name; a full `refs/` name names only itself. */
+function remoteRefCandidates(remoteRef: string): readonly string[] {
+  if (remoteRef.startsWith("refs/")) return [remoteRef]
+  return [
+    remoteRef,
+    `refs/${remoteRef}`,
+    `refs/tags/${remoteRef}`,
+    `refs/heads/${remoteRef}`,
+    `refs/remotes/${remoteRef}`,
+    `refs/remotes/${remoteRef}/HEAD`,
+  ]
+}
+
 async function observeRemoteTarget(
   git: GitProcess,
   root: string,
@@ -432,12 +445,17 @@ async function observeRemoteTarget(
   phase: string,
 ): Promise<string> {
   const observed = await required(git, root, ["ls-remote", "--exit-code", repository, remoteRef], phase)
+  // ls-remote tail-matches a pattern, so "main" also returns refs/archive/.../heads/main (#30615). Keep only the refs
+  // git's own short-name rules can name; two of those that disagree is still an ambiguity, and still refused.
+  const named = new Set(remoteRefCandidates(remoteRef))
   const objectIds = [
     ...new Set(
       observed
         .split(/\r?\n/u)
         .filter((line) => line !== "")
-        .map((line) => line.split(/\s/u, 1)[0])
+        .map((line) => line.split(/\s+/u))
+        .filter(([, name]) => name !== undefined && named.has(name))
+        .map(([oid]) => oid)
         .filter((oid): oid is string => oid !== undefined && OBJECT_ID.test(oid)),
     ),
   ]
