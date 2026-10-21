@@ -760,6 +760,48 @@ describe("git super pull --ff-only", () => {
     expect(before).not.toBe(target)
   })
 
+  // @failure ls-remote tail-matches a short name, so an archive ref ending in /heads/main beside the real branch read
+  //          as two objects for "main" and the shared-main pull refused ambiguous-remote-target 11 times (#30615).
+  test("a short branch name resolves by git's ref rules, not every ref ending in that name (#30615)", async () => {
+    const fixture = mkdtempSync(join(tmpdir(), "git-super-pull-archive-main-"))
+    roots.push(fixture)
+    const upstream = join(fixture, "upstream")
+    const checkout = join(fixture, "checkout")
+    const archived = createRepository(upstream, "README.md", "one\n")
+    git(fixture, "clone", "-q", upstream, checkout)
+    const target = advanceRepository(upstream, "README.md", "two\n")
+    git(upstream, "update-ref", "refs/archive/2026-10-21/chief/bundle/new/heads/main", archived)
+    const stdout = outputSink()
+    const stderr = outputSink()
+
+    const exitCode = await runCli(["--repo", checkout, "pull", "--ff-only", "origin", "main", "--json"], stdout, stderr)
+
+    expect(stderr.output).toBe("")
+    expect(exitCode).toBe(0)
+    expect(git(checkout, "rev-parse", "HEAD")).toBe(target)
+    expect(JSON.parse(stdout.output)).toMatchObject({ state: "updated", partial: false })
+  })
+
+  test("a short name that git itself could read two ways still refuses (#30615)", async () => {
+    const fixture = mkdtempSync(join(tmpdir(), "git-super-pull-tag-branch-"))
+    roots.push(fixture)
+    const upstream = join(fixture, "upstream")
+    const checkout = join(fixture, "checkout")
+    const tagged = createRepository(upstream, "README.md", "one\n")
+    git(fixture, "clone", "-q", upstream, checkout)
+    advanceRepository(upstream, "README.md", "two\n")
+    git(upstream, "tag", "main", tagged)
+    const before = git(checkout, "rev-parse", "HEAD")
+    const stdout = outputSink()
+    const stderr = outputSink()
+
+    const exitCode = await runCli(["--repo", checkout, "pull", "--ff-only", "origin", "main", "--json"], stdout, stderr)
+
+    expect(exitCode).toBe(2)
+    expect(stdout.output).toContain("ambiguous-remote-target")
+    expect(git(checkout, "rev-parse", "HEAD")).toBe(before)
+  })
+
   test("peels an annotated tag target to its commit without FETCH_HEAD", async () => {
     const fixture = mkdtempSync(join(tmpdir(), "git-super-pull-annotated-tag-"))
     roots.push(fixture)
