@@ -259,7 +259,8 @@ describe("slot module store custody", () => {
     expect(written).toEqual([
       expect.stringMatching(
         new RegExp(
-          `^module store packages/alpha archived: 1 commit\\(s\\) to refs/archive/\\d{4}-\\d{2}-\\d{2}/git-super/packages/alpha/HEAD, HEAD ${tip.slice(0, 12)}\\n$`,
+          // With no archiveActor the slot's own checkout name is the actor, never a library name.
+          `^module store packages/alpha archived: 1 commit\\(s\\) to refs/archive/\\d{4}-\\d{2}-\\d{2}/slot/packages/alpha/HEAD, HEAD ${tip.slice(0, 12)}\\n$`,
           "u",
         ),
       ),
@@ -291,8 +292,9 @@ describe("slot module store custody", () => {
     expect(await slot.store.inspect(slot.linked)).toEqual({ registered: false })
     expect(existsSync(slot.gitDir)).toBe(false)
     const lines = sink.filter((line) => line.startsWith("module store"))
+    // The registration id names the actor, since no checkout is left to name it.
     expect(lines).toEqual([
-      expect.stringMatching(/^module store packages\/alpha archived: 1 commit\(s\) to refs\/archive\//u),
+      expect.stringMatching(/^module store packages\/alpha archived: 1 commit\(s\) to refs\/archive\/[\d-]+\/slot\//u),
     ])
     const archiveRef = /refs\/archive\/\S+\/packages\/alpha\/HEAD/u.exec(lines[0] ?? "")?.[0] ?? "no archive ref named"
     expect(git(slot.fixture.alpha, "rev-parse", archiveRef)).toBe(tip)
@@ -323,6 +325,35 @@ describe("slot module store custody", () => {
     await expect(slot.store.remove(slot.linked)).rejects.toThrow(/could not be archived/)
     expect(existsSync(slot.linked)).toBe(true)
     expect(existsSync(join(slot.modules, "packages/alpha"))).toBe(true)
+  })
+
+  test("a later store's rejected push still reports, and names, the archive an earlier store made", async () => {
+    const root = fixtureRoot("module-push-second-rejected")
+    const slot = await linkedSlot(root)
+    localCommit(slot.child)
+    dropAlphaFromHead(slot.linked)
+    // A second undeclared store whose own remote refuses every push.
+    const refusing = join(root, "refusing-remote")
+    cpSync(slot.fixture.alpha, refusing, { recursive: true })
+    writeFileSync(join(refusing, ".git", "hooks", "pre-receive"), "#!/bin/sh\necho 'refused' >&2\nexit 1\n", {
+      mode: 0o755,
+    })
+    const zeta = join(slot.modules, "packages/zeta")
+    cpSync(join(slot.modules, "packages/alpha"), zeta, { recursive: true })
+    storeGitOutput(slot.fixture.product, zeta, "config", "remote.origin.url", refusing)
+    const sink: string[] = []
+    const removal = createLocalGitWorktreeStore({
+      repo: slot.fixture.product,
+      report: (line) => sink.push(line),
+    }).remove(slot.linked)
+    await expect(removal).rejects.toThrow(
+      /module store packages\/zeta could not be archived: [\s\S]*worktree preserved after archiving refs\/archive\/[\d-]+\/slot\/packages\/alpha\/HEAD$/u,
+    )
+    expect(sink.filter((line) => line.startsWith("module store"))).toEqual([
+      expect.stringMatching(/^module store packages\/alpha archived: 1 commit\(s\) to refs\/archive\/[\d-]+\/slot\//u),
+    ])
+    expect(existsSync(slot.linked)).toBe(true)
+    expect(existsSync(zeta)).toBe(true)
   })
 
   test("a GIT_COMMON_DIR or GIT_OBJECT_DIRECTORY a git hook exports never redirects the value read", async () => {

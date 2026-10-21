@@ -94,7 +94,10 @@ function isStore(path: string): boolean {
 
 function readEntries(path: string): Dirent[] {
   try {
-    return readdirSync(path, { withFileTypes: true })
+    // Name order, so stores are archived and reported in the same order on every filesystem.
+    return readdirSync(path, { withFileTypes: true }).sort((left, right) =>
+      left.name < right.name ? -1 : left.name > right.name ? 1 : 0,
+    )
   } catch (error) {
     throw new Error(
       `module directory ${path} could not be read, so the slot's stores are unknown: ${error instanceof Error ? error.message : String(error)}; worktree preserved`,
@@ -334,7 +337,7 @@ export function moduleStoreValue(gitDir: string): Readonly<{
   const headShort = local.find((ref) => ref.label === "HEAD")?.source.slice(0, 12)
   return {
     valueCommits,
-    refs: local.filter((ref) => count(gitDir, [ref.source], exclusions) > 0),
+    refs: valueCommits === 0 ? [] : local.filter((ref) => count(gitDir, [ref.source], exclusions) > 0),
     remoteArchiveRefs: durable.archiveRefs,
     ...(remote === undefined ? {} : { remote }),
     ...(durable.defaultBranch === undefined ? {} : { defaultBranch: durable.defaultBranch }),
@@ -481,40 +484,53 @@ function judgeStores(
  * with value and no remote, and an unreadable store all stop the removal and name the store: this is an error,
  * never a gate, and no store is deleted on a partial archive. A store with nothing to archive is left for
  * removal to discard, and its report says why that is safe.
+ *
+ * Stores go one at a time: `onStore` hears each as soon as it is done, and a stop names every archive already
+ * made, so no archive is ever unannounced.
  */
 export function archiveModuleStores(
   stores: readonly ModuleStore[],
   target: ModuleArchiveTarget,
+  onStore: (store: ModuleStore) => void = () => {},
 ): readonly ModuleStore[] {
-  return stores.map((store) => {
-    if (store.valueCommits === 0) return store
-    if (store.remote === undefined) {
+  const done: ModuleStore[] = []
+  const madeBefore = () => done.flatMap((store) => store.archived)
+  for (const store of stores) {
+    const result = archiveModuleStore(store, target, madeBefore())
+    done.push(result)
+    onStore(result)
+  }
+  return done
+}
+
+function archiveModuleStore(store: ModuleStore, target: ModuleArchiveTarget, earlier: readonly string[]): ModuleStore {
+  if (store.valueCommits === 0) return store
+  if (store.remote === undefined) {
+    throw new Error(
+      `module store ${store.name} holds ${String(store.valueCommits)} commit(s), and it has no remote to archive them to; worktree preserved${earlier.length === 0 ? "" : ` after archiving ${earlier.join(", ")}`}. Add a remote, or save the store with \`git --git-dir ${store.gitDir} bundle create <file> --all\`, before retrying removal`,
+    )
+  }
+  const archived: string[] = []
+  const taken = new Set(store.remoteArchiveRefs)
+  for (const ref of store.refs) {
+    const named = archiveRefFor(`${store.name}/${ref.label}`, target.actor, target.date)
+    // A name the remote already holds keeps another commit (the commits it holds are not value), so this one
+    // takes its object's short id instead. An archive is never replaced, and the push needs no force; a name
+    // taken in the meantime fails the push and stops the removal.
+    const destination = taken.has(named) ? `${named}-${objectId(store.gitDir, ref.source).slice(0, 12)}` : named
+    const pushed = storeGit(
+      store.gitDir,
+      ["push", store.remote, `${ref.source}:${destination}`],
+      ARCHIVE_PUSH_TIMEOUT_MS,
+    )
+    if (pushed.status !== 0) {
       throw new Error(
-        `module store ${store.name} holds ${String(store.valueCommits)} commit(s), and it has no remote to archive them to; worktree preserved. Add a remote, or save the store with \`git --git-dir ${store.gitDir} bundle create <file> --all\`, before retrying removal`,
+        `module store ${store.name} could not be archived: git push ${ref.source} -> ${destination} on ${store.remote} failed (${pushed.stderr.trim() || `exit ${String(pushed.status)}`}); worktree preserved after archiving ${[...earlier, ...archived].join(", ") || "nothing"}`,
       )
     }
-    const archived: string[] = []
-    const taken = new Set(store.remoteArchiveRefs)
-    for (const ref of store.refs) {
-      const named = archiveRefFor(`${store.name}/${ref.label}`, target.actor, target.date)
-      // A name the remote already holds keeps another commit (the commits it holds are not value), so this one
-      // takes its object's short id instead. An archive is never replaced, and the push needs no force; a name
-      // taken in the meantime fails the push and stops the removal.
-      const destination = taken.has(named) ? `${named}-${objectId(store.gitDir, ref.source).slice(0, 12)}` : named
-      const pushed = storeGit(
-        store.gitDir,
-        ["push", store.remote, `${ref.source}:${destination}`],
-        ARCHIVE_PUSH_TIMEOUT_MS,
-      )
-      if (pushed.status !== 0) {
-        throw new Error(
-          `module store ${store.name} could not be archived: git push ${ref.source} -> ${destination} on ${store.remote} failed (${pushed.stderr.trim() || `exit ${String(pushed.status)}`}); worktree preserved after archiving ${archived.length === 0 ? "nothing" : archived.join(", ")}`,
-        )
-      }
-      archived.push(destination)
-    }
-    return { ...store, archived }
-  })
+    archived.push(destination)
+  }
+  return { ...store, archived }
 }
 
 /** One line per store, so a removal never destroys (or archives) a module repository silently. */
