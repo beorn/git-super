@@ -54,6 +54,7 @@ import { removalBorrowers } from "./worktree-administration.ts"
 import {
   archiveModuleStores,
   describeModuleStores,
+  inspectDestroyedModuleStores,
   inspectModuleStores,
   type ModuleStore,
 } from "./module-store-custody.ts"
@@ -507,7 +508,12 @@ export type GitWorktreeStoreOptions = Readonly<{
   env?: NodeJS.ProcessEnv
   signal?: AbortSignal
   timeouts?: Partial<GitWorktreeTimeouts>
-  /** Reports writer-lock contention without writing to stderr from the library. */
+  /**
+   * Reports writer-lock contention, and the module stores a removal archives or releases, without writing to
+   * stderr from the library. One exception (30580): with no sink, a module-store ARCHIVE line goes to stderr,
+   * because it is how a human finds work moved to `refs/archive/...`. A value-less release is ordinary
+   * deletion and reaches only a caller that passes this sink.
+   */
   report?: (line: string) => void
 }>
 
@@ -832,6 +838,17 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       )
     }
   }
+  // The operator's value test (2026-10-21): a module repository a removal destroys has its value pushed to its
+  // own remote under `refs/archive/...` first, and only then may anything be deleted. A failed push throws
+  // before the caller deletes, so the slot is preserved. `remove` and `recoverDestroyed` go through this; a
+  // raw `prune` does not yet (30616).
+  const archiveModuleStoresBeforeDelete = (stores: readonly ModuleStore[], actor = "git-super") => {
+    for (const store of archiveModuleStores(stores, { actor, date: new Date().toISOString().slice(0, 10) })) {
+      const line = `${describeModuleStores([store]).join("")}\n`
+      if (options.report !== undefined) options.report(line)
+      else if (store.valueCommits > 0) process.stderr.write(line)
+    }
+  }
   const prepareRemoval = async (path: string, excludedSubmodules?: readonly string[], retained = false) => {
     await assertRemovalRoot(path)
     const gitDir = realpathSync(await git.text(path, ["rev-parse", "--absolute-git-dir"]))
@@ -1150,17 +1167,8 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
           )
         }
         if (rehome === undefined) throw new Error(`worktree ${path} has no prepared borrower custody`)
-        // The operator's value test (2026-10-21): a module repository removal destroys has its value pushed to
-        // its own remote under `refs/archive/...` first, and only then may anything be deleted. A failed push
-        // stops here as an error; nothing below this line has run yet, so the slot is preserved.
-        for (const line of describeModuleStores(
-          archiveModuleStores(stores, {
-            actor: removeOptions.archiveActor ?? "git-super",
-            date: new Date().toISOString().slice(0, 10),
-          }),
-        )) {
-          options.report?.(`${line}\n`)
-        }
+        // Nothing below this line has run yet, so a failed archive preserves the slot.
+        archiveModuleStoresBeforeDelete(stores, removeOptions.archiveActor)
         const proofDeadline = Date.now() + timeouts.cleanup
         const adapters =
           removeOptions.componentCustody === undefined
@@ -1738,6 +1746,9 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         let releasedHold: { head: string; pointer: string; body: Uint8Array } | undefined
         try {
           if (retention === undefined) {
+            // With the checkout already gone nothing consults this registration's stores, so every one is judged
+            // by the value test and archived before its administration directory is deleted (30580).
+            archiveModuleStoresBeforeDelete(inspectDestroyedModuleStores(directory).stores)
             rehomeBorrowers(common, directory, join(directory, "modules"))
           } else {
             const identity = await inspectWorktree(git, repo, path)

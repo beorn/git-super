@@ -40,12 +40,14 @@ const REMOTE_READ_TIMEOUT_MS = 120_000
 const ARCHIVE_PUSH_TIMEOUT_MS = 120_000
 
 /**
- * A store's `core.worktree` points at a checkout that removal may already have emptied or deleted, so every
- * read is `--bare` against the store itself. A store that does not answer inside the bound is unreadable,
- * never empty (fail closed).
+ * A store's `core.worktree` points at a checkout that removal may already have emptied or deleted. `--bare`
+ * does not reach git's own subprocesses: `pack-objects` under a push and `unpack-objects` under a fetch re-read
+ * `core.worktree` and die on `cannot chdir`. So the work tree is the store itself, an existing directory these
+ * commands never write to, and the inherited `GIT_WORK_TREE` carries that to every subprocess. A store that does
+ * not answer inside the bound is unreadable, never empty (fail closed).
  */
 function storeGit(gitDir: string, args: readonly string[], timeout = STORE_TIMEOUT_MS, input?: string): Capture {
-  const result = spawnSync("git", ["--git-dir", gitDir, "--bare", ...args], {
+  const result = spawnSync("git", ["--git-dir", gitDir, "--work-tree", gitDir, ...args], {
     encoding: "utf8",
     timeout,
     ...(input === undefined ? {} : { input }),
@@ -393,15 +395,37 @@ export function inspectModuleStores(
   excludedStores: readonly string[] = [],
   unclaimedExclusions: readonly string[] = [],
 ): ModuleInventory {
+  const modules = modulesDirectory(gitDir)
+  if (modules === undefined) return { stores: [] }
+  return judgeStores(modules, [...referencedModuleStores(checkout), ...excludedStores], unclaimedExclusions)
+}
+
+/**
+ * The inventory of a registration whose checkout is already gone (`recoverDestroyed` without retention): no
+ * checkout is left to consult any store, so every store under `modules/` is judged, declared or not.
+ */
+export function inspectDestroyedModuleStores(gitDir: string): ModuleInventory {
+  const modules = modulesDirectory(gitDir)
+  return modules === undefined ? { stores: [] } : judgeStores(modules, [], [])
+}
+
+function modulesDirectory(gitDir: string): string | undefined {
   const modules = join(gitDir, "modules")
   const state = lstatSync(modules, { throwIfNoEntry: false })
-  if (state === undefined) return { stores: [] }
+  if (state === undefined) return undefined
   if (!state.isDirectory() || state.isSymbolicLink()) {
     throw new Error(
       `worktree module directory ${modules} is not a directory; worktree preserved before store inspection`,
     )
   }
-  const skipped = [...referencedModuleStores(checkout), ...excludedStores]
+  return modules
+}
+
+function judgeStores(
+  modules: string,
+  skipped: readonly string[],
+  unclaimedExclusions: readonly string[],
+): ModuleInventory {
   const stores: ModuleStore[] = []
   for (const entry of moduleEntries(modules)) {
     if (skipped.some((store) => within(entry.path, store))) continue

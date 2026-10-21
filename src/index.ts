@@ -46,6 +46,7 @@ export {
 export {
   archiveModuleStores,
   describeModuleStores,
+  inspectDestroyedModuleStores,
   inspectModuleStores,
   moduleStoreValue,
   moduleStoreValueCommits,
