@@ -1228,7 +1228,13 @@ describe("explicit recursive push mechanics", () => {
     expect(refused).toMatchObject({
       state: "failed",
       partial: false,
-      detail: { code: "non-fast-forward-refused", phase: "verify-fast-forward" },
+      detail: {
+        code: "non-fast-forward-refused",
+        phase: "verify-fast-forward",
+        remedy: expect.stringContaining(
+          "git super push is fast-forward-only on refs/heads/* even when --force-with-lease is passed",
+        ),
+      },
     })
     expect(git(remote, "rev-parse", "refs/heads/main")).toBe(competing)
 
