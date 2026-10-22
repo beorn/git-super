@@ -1450,6 +1450,15 @@ describe("Phase 1 read commands", () => {
     }
   })
 
+  test("merge-base --is-ancestor with an abbreviated unknown SHA suggests resolving the full 40-char OID (#30712)", () => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-short-sha-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    expect(() => superIsAncestor({ repo: fixture.product, ancestor: "deadbeef1234", descendant: "HEAD" })).toThrow(
+      /if deadbeef1234 is an abbreviated submodule SHA, resolve its full 40-char commit OID/u,
+    )
+  })
+
   test("runCli forwards local-main options to commands.merge (25626)", async () => {
     let capturedInput: unknown
     const originalRun = commands.merge.run

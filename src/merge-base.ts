@@ -180,7 +180,13 @@ export function superIsAncestor(options: SuperIsAncestorOptions): SuperIsAncesto
     const probe = presentAtRoot
       ? ""
       : `\nroot read: git -C ${root} cat-file -e ${ancestor}^{commit} exited ${rootProbe.exitCode}${rootProbe.stderr ? `: ${rootProbe.stderr}` : ""}`
-    throw new Error(`git super: no consulted repository owns commit ${spelled}${orphaned}${absent}${probe}`)
+    const shortShaHint =
+      spelled.length < 40 && /^[0-9a-f]{4,39}$/iu.test(spelled)
+        ? ` (if ${spelled} is an abbreviated submodule SHA, resolve its full 40-char commit OID with 'git -C <submodule> rev-parse ${spelled}' or compare inside the owning repository)`
+        : ""
+    throw new Error(
+      `git super: no consulted repository owns commit ${spelled}${shortShaHint}${orphaned}${absent}${probe}`,
+    )
   }
   if (owners.length > 1) {
     // Named, never silently preferred. Picking one here is how the wrong

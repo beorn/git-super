@@ -631,7 +631,8 @@ async function verifyFastForwardUpdate(git: GitProcess, update: PlannedUpdate): 
     `Refusing to rewrite ${update.remote} ${update.destination} from ${update.expectedDestination.oid} to ${update.source}.`,
     {
       objectIds: [update.expectedDestination.oid, update.source],
-      remedy: "Publish a descendant commit, or make the caller explicitly authorize a non-fast-forward update.",
+      remedy:
+        "git super push only fast-forwards refs/heads/*; --force-with-lease pins the expected old commit but never authorizes a rewrite. Publish a descendant commit instead.",
     },
   )
 }
