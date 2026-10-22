@@ -26,6 +26,7 @@ import { statusWithGit } from "./status-traversal.ts"
 import { readCommitSubmodules, readPrivateSubmodules, type SelectedCommitSubmodules } from "./commit-graph.ts"
 import type { PrivateGitProjection } from "./private-git-projection.ts"
 import { alternatesLineage } from "./alternates.ts"
+import { storeRemote } from "./module-store-custody.ts"
 import { validateExcludedSubmodules, withGitTimeout } from "./git.ts"
 import type { GitProcess } from "./process.ts"
 import type { ConsultedRepository, NotCompared } from "./diff.ts"
@@ -680,22 +681,55 @@ function storeOwningRecord(record: string, consulted: readonly ConsultedReposito
  * bypass and never a rewrite. Existence and store are verified here; byte equality between the ref
  * and the dirt is the caller's (yrd's) claim, because this gate builds no snapshot tree of a dirty
  * store. A ref in the wrong store, or a missing ref, admits nothing.
+ *
+ * A COMPONENT store is also admitted with no ref when it is proven on its target (30715, @cto ruling D
+ * 2026-10-22, amending 29073): its records are then only the parent's gitlink move, which the parent's
+ * own ref holds, and its commit is already on its remote's default branch.
  */
 async function admitDirtyStore(
   git: Git,
   store: string,
   records: readonly string[],
   preserved: readonly string[],
+  component: boolean,
 ): Promise<void> {
   if (records.length === 0) return
   for (const ref of preserved) {
     const resolved = await git.optionalText(store, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`])
     if (resolved !== undefined && resolved !== "") return
   }
+  const offTarget = component ? await componentOffTarget(git, store) : undefined
+  if (component && offTarget === undefined) return
   throw new Error(
-    `worktree ${store} is dirty: ${records.join("; ")}; preserve its changes before removal, or admit them with ` +
-      `--preserved <ref> naming a ref that resolves to a commit in this store`,
+    `worktree ${store} is dirty: ${records.join("; ")}; ` +
+      (offTarget === undefined ? "" : `it is not proven on its target: ${offTarget}; `) +
+      `preserve its changes before removal, or admit them with --preserved <ref> naming a ref that resolves to a ` +
+      `commit in this store`,
   )
+}
+
+/**
+ * Why a component store is NOT proven on its target, or undefined when it is: its own index and worktree are
+ * clean against HEAD, and HEAD is an ancestor of its remote's default-branch remote-tracking ref. A stale
+ * tracking ref fails closed; the cure is to fetch the component.
+ */
+async function componentOffTarget(git: Git, store: string): Promise<string | undefined> {
+  const own = await git.run(store, ["--no-optional-locks", "status", "--porcelain", "--untracked-files=all"])
+  if (own.stdout.trim() !== "") return "its own index or worktree has changes"
+  const remote = storeRemote(await git.text(store, ["rev-parse", "--absolute-git-dir"]))
+  if (remote === undefined) return "it has no remote"
+  const defaultRef = `refs/remotes/${remote}/HEAD`
+  const tracking = await git.run(store, ["symbolic-ref", "--quiet", defaultRef], true)
+  if (tracking.code !== 0) {
+    return `${defaultRef} names no default branch${tracking.stderr.trim() === "" ? "" : ` (${tracking.stderr.trim()})`}`
+  }
+  const target = tracking.stdout.trim()
+  const head = await git.text(store, ["rev-parse", "--verify", "HEAD^{commit}"])
+  const ancestry = await git.run(store, ["merge-base", "--is-ancestor", head, target], true)
+  if (ancestry.code === 0) return undefined
+  if (ancestry.code === 1)
+    return `its HEAD ${head} is not an ancestor of ${target} (fetch the component if that ref is stale)`
+  throw new Error(`worktree ${store}: cannot prove HEAD ${head} on ${target}: ${ancestry.stderr.trim()}`)
 }
 
 /** The existing status walker owns repository discovery; every native status is exact, including gitlink changes. */
@@ -710,16 +744,22 @@ async function cleanSnapshot(
   // 29073: attribute every dirty record to the consulted store that owns it (the deepest consulted
   // prefix that contains it), then admit that store's dirt only with a preserved ref that resolves
   // to a commit in THAT store. The root's own records are admitted against the root store, each
-  // component's against its own; a ref in the wrong store, or a missing ref, admits nothing.
-  const dirtyByStore = new Map<string, { store: string; records: string[] }>()
+  // component's against its own; a ref in the wrong store, or a missing ref, admits nothing. A component
+  // store with no ref is admitted only by its on-target proof (30715).
+  const dirtyByStore = new Map<string, { store: string; component: boolean; records: string[] }>()
   for (const record of status.records) {
-    const store = storeOwningRecord(record, status.consultedRepositories)?.root ?? path
-    const group = dirtyByStore.get(store) ?? { store, records: [] }
+    const owner = storeOwningRecord(record, status.consultedRepositories)
+    const store = owner?.root ?? path
+    const group = dirtyByStore.get(store) ?? {
+      store,
+      component: owner !== undefined && owner.path !== ".",
+      records: [],
+    }
     group.records.push(record)
     dirtyByStore.set(store, group)
   }
   for (const group of dirtyByStore.values()) {
-    await admitDirtyStore(git, group.store, group.records, preserved)
+    await admitDirtyStore(git, group.store, group.records, preserved, group.component)
   }
   const snapshot: { path: string; head: string }[] = []
   for (const entry of status.consultedRepositories) {

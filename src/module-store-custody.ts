@@ -297,8 +297,11 @@ function localRefs(gitDir: string): LocalRef[] {
   ]
 }
 
-/** The remote an archive may be pushed to: `origin` when configured, otherwise the one configured remote. */
-function storeRemote(gitDir: string): string | undefined {
+/**
+ * The remote an archive may be pushed to: `origin` when configured, otherwise the one configured remote. Removal
+ * reads the same remote for its on-target proof of a component store (30715).
+ */
+export function storeRemote(gitDir: string): string | undefined {
   const remotes = storeGit(gitDir, ["config", "--get-regexp", "^remote\\..*\\.url$"])
   // Exit 1 is git's answer for "no remote configured"; any other failure leaves the configuration unread.
   if (remotes.status === 1) return undefined
