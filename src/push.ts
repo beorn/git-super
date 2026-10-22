@@ -632,7 +632,7 @@ async function verifyFastForwardUpdate(git: GitProcess, update: PlannedUpdate): 
     {
       objectIds: [update.expectedDestination.oid, update.source],
       remedy:
-        "git super push is fast-forward-only on refs/heads/* even when --force-with-lease is passed (allowNonFastForward is a library-only RefUpdate field); publish a descendant commit, or retire/replace a queued branch via 'yrd drop <branch> --tip <sha> --reason <text>'.",
+        "git super push only fast-forwards refs/heads/*; --force-with-lease pins the expected old commit but never authorizes a rewrite. Publish a descendant commit instead.",
     },
   )
 }

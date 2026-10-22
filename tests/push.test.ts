@@ -1231,9 +1231,8 @@ describe("explicit recursive push mechanics", () => {
       detail: {
         code: "non-fast-forward-refused",
         phase: "verify-fast-forward",
-        remedy: expect.stringContaining(
-          "git super push is fast-forward-only on refs/heads/* even when --force-with-lease is passed",
-        ),
+        remedy:
+          "git super push only fast-forwards refs/heads/*; --force-with-lease pins the expected old commit but never authorizes a rewrite. Publish a descendant commit instead.",
       },
     })
     expect(git(remote, "rev-parse", "refs/heads/main")).toBe(competing)
