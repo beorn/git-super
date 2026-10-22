@@ -202,6 +202,24 @@ describe("git-super worktree remove admits a clean component store proven on its
     }
   })
 
+  it("refuses the same staged gitlink move with no root ref, naming the root store and the gitlink line", async () => {
+    const { root, fixture, linked, alpha, retain } = await linkedWithSubmodules()
+    try {
+      const next = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
+      git(alpha, "fetch", "-q", "origin")
+      stageComponentMove(linked, alpha, next)
+
+      const result = await superWorktreeRemove({ repo: fixture.product, path: linked, retain, preserved: [] })
+
+      expect(result.state).toBe("failed")
+      expect(result.detail?.message ?? "").toContain(`worktree ${linked} is dirty: M  packages/alpha`)
+      expect(existsSync(linked)).toBe(true)
+    } finally {
+      // raw-delete-allow: the fixture tree this test made under its own mkdtemp root
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it("refuses a staged gitlink move to a local component commit that is not on its origin main", async () => {
     const { root, fixture, linked, alpha, retain } = await linkedWithSubmodules()
     try {

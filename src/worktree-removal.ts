@@ -664,11 +664,14 @@ function knownRemovalStatus(path: string, status: SuperStatusResult): SuperStatu
 
 /** The consulted store that owns a status record: the deepest consulted prefix that contains it (29073). */
 function storeOwningRecord(record: string, consulted: readonly ConsultedRepository[]): ConsultedRepository | undefined {
-  const recordPath = record.slice(3)
+  return storeOwningPath(record.slice(3), consulted)
+}
+
+function storeOwningPath(path: string, consulted: readonly ConsultedRepository[]): ConsultedRepository | undefined {
   let owner = consulted.find((candidate) => candidate.path === ".")
   for (const candidate of consulted) {
     if (candidate.path === ".") continue
-    if (recordPath !== candidate.path && !recordPath.startsWith(`${candidate.path}/`)) continue
+    if (path !== candidate.path && !path.startsWith(`${candidate.path}/`)) continue
     if (owner === undefined || candidate.path.length > owner.path.length) owner = candidate
   }
   return owner
@@ -748,16 +751,36 @@ async function cleanSnapshot(
   // component's against its own; a ref in the wrong store, or a missing ref, admits nothing. A component
   // store with no ref is admitted only by its on-target proof (30715).
   const dirtyByStore = new Map<string, { store: string; component: boolean; records: string[] }>()
-  for (const record of status.records) {
-    const owner = storeOwningRecord(record, status.consultedRepositories)
+  const own = (owner: ConsultedRepository | undefined, record: string): void => {
     const store = owner?.root ?? path
     const group = dirtyByStore.get(store) ?? {
       store,
       component: owner !== undefined && owner.path !== ".",
       records: [],
     }
-    group.records.push(record)
+    if (!group.records.includes(record)) group.records.push(record)
     dirtyByStore.set(store, group)
+  }
+  for (const record of status.records) own(storeOwningRecord(record, status.consultedRepositories), record)
+  // 30715 (@cto 2026-10-22): a component's gitlink move is its PARENT's own work. The walker can expand it into
+  // the component's records only, or into none (a move to an identical tree), so the parent's native status of
+  // every component path is read here, owned by the parent store, and needs a preserved ref in that store.
+  for (const component of status.consultedRepositories) {
+    if (component.path === ".") continue
+    const parent = storeOwningPath(
+      component.path,
+      status.consultedRepositories.filter((candidate) => candidate !== component),
+    )
+    const parentPath = parent === undefined || parent.path === "." ? "" : `${parent.path}/`
+    const moved = await git.run(parent?.root ?? path, [
+      "--no-optional-locks",
+      "status",
+      "--porcelain",
+      "--ignore-submodules=dirty",
+      "--",
+      component.path.slice(parentPath.length),
+    ])
+    for (const line of moved.stdout.split("\n")) if (line !== "") own(parent, line)
   }
   for (const group of dirtyByStore.values()) {
     await admitDirtyStore(git, group.store, group.records, preserved, group.component)
