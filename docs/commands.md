@@ -279,17 +279,6 @@ Prepare covers one level. For the next level, run it again with the returned `gi
 
 When merge finds missing nested stores, it stops before changing the root and reports `nested-store-missing`. The report names each missing store at the first missing level, with paths and exact commits, and prints the `submodule prepare` and fetch commands to run. Run them and retry; a deeper missing level shows up in the next round. If the parent's remote cannot be confirmed, the error says so instead of guessing commands.
 
-## branch retire
-
-```bash
-git super --repo /work/product branch retire <branch> --tip <commit> --actor <name>
-git super --repo /work/product branch retire <branch> --tip <commit> --archive <ref> --dry-run
-```
-
-Deletes `refs/heads/<branch>` only while an archive ref reads back the branch's exact tip. It refuses a branch that is unarchived, checked out, missing, or has a different tip; a branch that moved past `--tip` is kept.
-
-The archive ref defaults to `refs/archive/<date>/<actor>/<branch>`; `--date` defaults to today (UTC). `--actor` is required when `--archive` is not given. `--dry-run` lists what would be retired. `git super --repo <path> branch <other>` runs plain `git branch`.
-
 ## observe
 
 ```bash

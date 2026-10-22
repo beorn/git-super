@@ -5,7 +5,7 @@ import { afterEach, describe, expect, test } from "vitest"
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import * as archive from "../src/archive-ref.ts"
-import { runCli } from "../src/cli.ts"
+import { createLocalGitWorktreeStore } from "../src/worktree.ts"
 import { canonicalTmpdir, createRepository, git } from "./fixture.ts"
 
 const roots: string[] = []
@@ -23,15 +23,6 @@ function repositoryWithArchiveRefs(refs: readonly string[]): { repo: string; bas
   return { repo, base }
 }
 
-function outputSink(): { output: string; write(value: string): void } {
-  return {
-    output: "",
-    write(value) {
-      this.output += value
-    },
-  }
-}
-
 describe("archive custody names", () => {
   /**
    * @failure A store carrying one legacy archive name made readArchiveRows throw for the WHOLE store,
@@ -39,7 +30,7 @@ describe("archive custody names", () => {
    *          shapes measured in the estate: a dated ref whose actor carries @, an undated actor/branch,
    *          a bundles custody ref, and a preserve custody ref.
    * @level l1 (a real Git repo holding all four archive shapes)
-   * @consumer every yrd drop and git super branch retire in a store with legacy custody
+   * @consumer every yrd drop and branch retirement in a store with legacy custody
    * @testonly none
    */
   test("reads legacy custody shapes instead of refusing the whole store", () => {
@@ -84,8 +75,8 @@ describe("archive custody names", () => {
    * @failure Chief's GO on 30263: the fix is only real if a branch retirement still runs beside an
    *          unrelated legacy ref. The read must not refuse the store, and the retire must delete the
    *          branch while keeping the archive and the legacy evidence.
-   * @level l1 (a real git super branch retire over a repo holding an unrelated legacy ref)
-   * @consumer every seat retiring a branch in a store that carries legacy custody
+   * @level l1 (a real store removeBranch + findArchiveRefFor over a repo holding an unrelated legacy ref)
+   * @consumer every caller retiring a branch in a store that carries legacy custody
    * @testonly none
    */
   test("retires a branch beside an unrelated legacy ref", async () => {
@@ -98,16 +89,14 @@ describe("archive custody names", () => {
     const archiveRef = "refs/archive/2026-10-19/dev-brain/task/30263"
     git(repo, "update-ref", archiveRef, tip)
     git(repo, "checkout", "-q", "main")
-    const stdout = outputSink()
-    const stderr = outputSink()
 
-    const code = await runCli(
-      ["--repo", repo, "branch", "retire", "task/30263", "--tip", tip, "--archive", archiveRef],
-      stdout,
-      stderr,
-    )
+    expect(archive.findArchiveRefFor(repo, "task/30263", tip)).toBe(archiveRef)
+    await createLocalGitWorktreeStore({ repo }).removeBranch({
+      branch: "task/30263",
+      tip,
+      verify: { ref: archiveRef, oid: tip },
+    })
 
-    expect(code, stderr.output).toBe(0)
     expect(git(repo, "for-each-ref", "--format=%(refname)", "refs/heads/task/30263")).toBe("")
     expect(git(repo, "rev-parse", "--verify", archiveRef)).toBe(tip)
     // The unrelated legacy evidence is untouched.

@@ -4,7 +4,6 @@ export * from "./gitlink-carrier.ts"
 export * from "./pull.ts"
 export * from "./push.ts"
 export * from "./result.ts"
-export { superBranchRetire, type SuperBranchRetireOptions, type SuperBranchRetireResult } from "./branch-retire.ts"
 export { readReflogEntries, type ReflogEntry } from "./retention-contents.ts"
 export { verifyRetainedCopy, type RetainedCopyProof } from "./retention-compact.ts"
 export {

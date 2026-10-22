@@ -22,24 +22,24 @@ Node needs the built npm package and a built Node-compatible `@bearly/flock`. In
 
 ## Entry points
 
-| Import                                                      | Provides                                                                                                                                                   |
-| ----------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `git-super`                                                 | process, gitlink, pull, push and result APIs, branch retirement, retention checks, private Git projections, `superSubmodulePrepare`, worktree home helpers |
-| `git-super/status`                                          | recursive repository inventory and status (`superStatus`)                                                                                                  |
-| `git-super/worktree`                                        | worktree mechanics: add, lock, unlock, inspect, exact removal, recovery                                                                                    |
-| `git-super/submodules`                                      | recursive submodule checkout (`materializeSubmodulesWithProcess`)                                                                                          |
-| `git-super/gitlink`                                         | exact index commit writes (`writeGitlink`)                                                                                                                 |
-| `git-super/commit-graph`                                    | submodule entries recorded in an exact commit                                                                                                              |
-| `git-super/objects`                                         | exact commit presence checks and fetches                                                                                                                   |
-| `git-super/submodule-origin`                                | resolving `.gitmodules` URLs: absolute, URL, scp-like, relative                                                                                            |
-| `git-super/process`                                         | the injectable Git process                                                                                                                                 |
-| `git-super/pull`, `git-super/push`, `git-super/push-intent` | pull, push, and the recorded push plan                                                                                                                     |
-| `git-super/result`                                          | the shared result types                                                                                                                                    |
-| `git-super/composition`                                     | every path a side changed, deletions included                                                                                                              |
-| `git-super/local-main`                                      | local-only check of a submodule's main branch                                                                                                              |
-| `git-super/archive-ref`                                     | archive refs and exact-name branch retirement                                                                                                              |
-| `git-super/shell-command`                                   | `shellQuote`: quote one POSIX shell argument                                                                                                               |
-| `git-super/exclusive`, `git-super/gitlink-carrier`          | the mutation lock, and carrier commits for submodule commits                                                                                               |
+| Import                                                      | Provides                                                                                                                                |
+| ----------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `git-super`                                                 | process, gitlink, pull, push and result APIs, retention checks, private Git projections, `superSubmodulePrepare`, worktree home helpers |
+| `git-super/status`                                          | recursive repository inventory and status (`superStatus`)                                                                               |
+| `git-super/worktree`                                        | worktree mechanics: add, lock, unlock, inspect, exact removal, recovery                                                                 |
+| `git-super/submodules`                                      | recursive submodule checkout (`materializeSubmodulesWithProcess`)                                                                       |
+| `git-super/gitlink`                                         | exact index commit writes (`writeGitlink`)                                                                                              |
+| `git-super/commit-graph`                                    | submodule entries recorded in an exact commit                                                                                           |
+| `git-super/objects`                                         | exact commit presence checks and fetches                                                                                                |
+| `git-super/submodule-origin`                                | resolving `.gitmodules` URLs: absolute, URL, scp-like, relative                                                                         |
+| `git-super/process`                                         | the injectable Git process                                                                                                              |
+| `git-super/pull`, `git-super/push`, `git-super/push-intent` | pull, push, and the recorded push plan                                                                                                  |
+| `git-super/result`                                          | the shared result types                                                                                                                 |
+| `git-super/composition`                                     | every path a side changed, deletions included                                                                                           |
+| `git-super/local-main`                                      | local-only check of a submodule's main branch                                                                                           |
+| `git-super/archive-ref`                                     | archive refs and exact-name branch retirement                                                                                           |
+| `git-super/shell-command`                                   | `shellQuote`: quote one POSIX shell argument                                                                                            |
+| `git-super/exclusive`, `git-super/gitlink-carrier`          | the mutation lock, and carrier commits for submodule commits                                                                            |
 
 ## Options worth knowing
 

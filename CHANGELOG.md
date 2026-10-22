@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Breaking change: remove `git super branch retire` and the root `superBranchRetire` (`SuperBranchRetireOptions`, `SuperBranchRetireResult`) export from `git-super`; `--repo <path> branch …` is no longer special-cased and fails with `unknown command 'branch'` while `git super -C <path> branch …` continues to delegate to native Git.
+
 ## 0.8.0 — 2026-10-21
 
 - Add `git-super/remote` helpers for repository identity, URL spelling and clone-directory naming across supported network transports. Hosted push ownership retains its existing namespace checks.
