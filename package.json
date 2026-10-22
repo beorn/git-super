@@ -175,6 +175,7 @@
       "src/worktree.ts",
       "src/archive-ref.ts"
     ],
+    "fixedExtension": false,
     "format": "esm",
     "target": "es2022"
   },
