@@ -198,7 +198,9 @@ describe("createGitWorktreeStore", () => {
       expect(findArchiveRefFor(repo, branch, tip)).toBe(archiveRef)
       const linked = join(root, "linked")
       await store.add({ kind: "branch", path: linked, branch })
-      await expect(store.removeBranch({ branch, tip, verify: { ref: archiveRef, oid: tip } })).rejects.toThrow(/checked out/u)
+      await expect(store.removeBranch({ branch, tip, verify: { ref: archiveRef, oid: tip } })).rejects.toThrow(
+        /checked out/u,
+      )
       expect(git(linked, ["symbolic-ref", "HEAD"]).trim()).toBe(`refs/heads/${branch}`)
       git(linked, ["checkout", "--detach", "-q"])
 
@@ -208,7 +210,9 @@ describe("createGitWorktreeStore", () => {
         const path = join(admin, state)
         await mkdir(dirname(path), { recursive: true })
         await writeFile(path, state === "BISECT_START" ? branch : `refs/heads/${branch}`)
-        await expect(store.removeBranch({ branch, tip, verify: { ref: archiveRef, oid: tip } })).rejects.toThrow(/rebase|bisect/u)
+        await expect(store.removeBranch({ branch, tip, verify: { ref: archiveRef, oid: tip } })).rejects.toThrow(
+          /rebase|bisect/u,
+        )
         expect(git(repo, ["rev-parse", `refs/heads/${branch}`]).trim()).toBe(tip)
         await rename(path, `${path}.finished`)
       }
@@ -220,7 +224,9 @@ describe("createGitWorktreeStore", () => {
       expect(git(repo, ["rev-parse", `refs/heads/${branch}`]).trim()).toBe(newer)
 
       // A mismatched archive is not custody, even when the expected branch tip is current.
-      await expect(store.removeBranch({ branch, tip: newer, verify: { ref: archiveRef, oid: newer } })).rejects.toThrow()
+      await expect(
+        store.removeBranch({ branch, tip: newer, verify: { ref: archiveRef, oid: newer } }),
+      ).rejects.toThrow()
       expect(git(repo, ["rev-parse", `refs/heads/${branch}`]).trim()).toBe(newer)
       git(repo, ["update-ref", `refs/heads/${branch}`, tip])
 

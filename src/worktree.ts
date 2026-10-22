@@ -1736,7 +1736,9 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         await git.run(repo, ["check-ref-format", "--branch", branch])
         if (verify !== undefined) {
           if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(verify.oid)) {
-            throw new Error(`branch ${branch}: verify ${verify.ref} needs a full oid, got ${JSON.stringify(verify.oid)}`)
+            throw new Error(
+              `branch ${branch}: verify ${verify.ref} needs a full oid, got ${JSON.stringify(verify.oid)}`,
+            )
           }
           await git.run(repo, ["check-ref-format", verify.ref])
         }
