@@ -1,6 +1,6 @@
 {
   "name": "git-super",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Git commands that treat superprojects and submodule interiors as one product",
   "license": "MIT",
   "repository": "github:beorn/git-super",

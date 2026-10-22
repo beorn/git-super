@@ -1,8 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.9.0 — 2026-10-22
 
 - Breaking change: remove `git super branch retire` and the root `superBranchRetire` (`SuperBranchRetireOptions`, `SuperBranchRetireResult`) export from `git-super`; `--repo <path> branch …` is no longer special-cased and fails with `unknown command 'branch'` while `git super -C <path> branch …` continues to delegate to native Git.
+- Add `describeModuleStores`, which names every module store a worktree removal archives or releases. Removal now archives a slot's module stores one at a time before removing the slot: it never replaces an archive, reads each store's value from its remote, releases a store only when every commit is on a remote, and counts remote tags as durable. A remote that rejects the archive push stops the removal and keeps the slot.
+- `prune` recovers each prunable worktree registration instead of running a raw `git worktree prune`. The parent store owns a component's gitlink move, and a clean component store proven on its target is admitted without a preserved ref.
+- `pull` reads only the exact remote ref, never a tail match.
 
 ## 0.8.0 — 2026-10-21
 
