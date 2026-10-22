@@ -727,8 +727,9 @@ async function componentOffTarget(git: Git, store: string): Promise<string | und
   const head = await git.text(store, ["rev-parse", "--verify", "HEAD^{commit}"])
   const ancestry = await git.run(store, ["merge-base", "--is-ancestor", head, target], true)
   if (ancestry.code === 0) return undefined
-  if (ancestry.code === 1)
+  if (ancestry.code === 1) {
     return `its HEAD ${head} is not an ancestor of ${target} (fetch the component if that ref is stale)`
+  }
   throw new Error(`worktree ${store}: cannot prove HEAD ${head} on ${target}: ${ancestry.stderr.trim()}`)
 }
 
