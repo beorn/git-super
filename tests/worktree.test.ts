@@ -190,7 +190,7 @@ describe("createGitWorktreeStore", () => {
       // Another branch at the same tip is not this branch's retirement custody.
       git(repo, ["update-ref", `${archiveRef}-other`, tip])
       expect(findArchiveRefFor(repo, branch, tip)).toBeUndefined()
-      await expect(store.removeArchivedBranch({ branch, tip, archiveRef })).rejects.toThrow()
+      await expect(store.removeBranch({ branch, tip, verify: { ref: archiveRef, oid: tip } })).rejects.toThrow()
       expect(git(repo, ["rev-parse", `refs/heads/${branch}`]).trim()).toBe(tip)
 
       git(repo, ["update-ref", archiveRef, tip])
@@ -198,7 +198,7 @@ describe("createGitWorktreeStore", () => {
       expect(findArchiveRefFor(repo, branch, tip)).toBe(archiveRef)
       const linked = join(root, "linked")
       await store.add({ kind: "branch", path: linked, branch })
-      await expect(store.removeArchivedBranch({ branch, tip, archiveRef })).rejects.toThrow(/checked out/u)
+      await expect(store.removeBranch({ branch, tip, verify: { ref: archiveRef, oid: tip } })).rejects.toThrow(/checked out/u)
       expect(git(linked, ["symbolic-ref", "HEAD"]).trim()).toBe(`refs/heads/${branch}`)
       git(linked, ["checkout", "--detach", "-q"])
 
@@ -208,7 +208,7 @@ describe("createGitWorktreeStore", () => {
         const path = join(admin, state)
         await mkdir(dirname(path), { recursive: true })
         await writeFile(path, state === "BISECT_START" ? branch : `refs/heads/${branch}`)
-        await expect(store.removeArchivedBranch({ branch, tip, archiveRef })).rejects.toThrow(/rebase|bisect/u)
+        await expect(store.removeBranch({ branch, tip, verify: { ref: archiveRef, oid: tip } })).rejects.toThrow(/rebase|bisect/u)
         expect(git(repo, ["rev-parse", `refs/heads/${branch}`]).trim()).toBe(tip)
         await rename(path, `${path}.finished`)
       }
@@ -216,11 +216,11 @@ describe("createGitWorktreeStore", () => {
       git(repo, ["commit", "--allow-empty", "-qm", "newer tip"])
       const newer = git(repo, ["rev-parse", "HEAD"]).trim()
       git(repo, ["update-ref", `refs/heads/${branch}`, newer])
-      await expect(store.removeArchivedBranch({ branch, tip, archiveRef })).rejects.toThrow()
+      await expect(store.removeBranch({ branch, tip, verify: { ref: archiveRef, oid: tip } })).rejects.toThrow()
       expect(git(repo, ["rev-parse", `refs/heads/${branch}`]).trim()).toBe(newer)
 
       // A mismatched archive is not custody, even when the expected branch tip is current.
-      await expect(store.removeArchivedBranch({ branch, tip: newer, archiveRef })).rejects.toThrow()
+      await expect(store.removeBranch({ branch, tip: newer, verify: { ref: archiveRef, oid: newer } })).rejects.toThrow()
       expect(git(repo, ["rev-parse", `refs/heads/${branch}`]).trim()).toBe(newer)
       git(repo, ["update-ref", `refs/heads/${branch}`, tip])
 
@@ -238,10 +238,10 @@ describe("createGitWorktreeStore", () => {
       })
       try {
         await expect(
-          contended.removeArchivedBranch({
+          contended.removeBranch({
             branch,
             tip,
-            archiveRef,
+            verify: { ref: archiveRef, oid: tip },
             beforeRemove: async () => {
               const probe = tryAcquireFlock(join(lockDir, "writer.lock"))
               checkedUnderLock = probe === null
@@ -255,7 +255,7 @@ describe("createGitWorktreeStore", () => {
       }
       expect(checkedUnderLock).toBe(true)
       expect(git(repo, ["rev-parse", `refs/heads/${branch}`]).trim()).toBe(tip)
-      await store.removeArchivedBranch({ branch, tip, archiveRef })
+      await store.removeBranch({ branch, tip, verify: { ref: archiveRef, oid: tip } })
       expect(git(repo, ["for-each-ref", "--format=%(refname)", `refs/heads/${branch}`]).trim()).toBe("")
       expect(git(repo, ["rev-parse", archiveRef]).trim()).toBe(tip)
       expect(git(linked, ["rev-parse", "HEAD"]).trim()).toBe(tip)
@@ -263,6 +263,49 @@ describe("createGitWorktreeStore", () => {
       const malformedArchive = "refs/archive/unreadable-custody"
       git(repo, ["update-ref", malformedArchive, tip])
       expect(() => findArchiveRefFor(repo, branch, tip)).toThrow(malformedArchive)
+    } finally {
+      // raw-delete-allow: root is this test's fresh mkdtemp fixture, never a caller-supplied worktree.
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  /**
+   * @failure Dropping a branch needs a shadow archive ref, or the archive-free removal skips the checkout,
+   * operation, moved-tip or caller-hold protection the archived removal keeps.
+   * @level l1
+   * @consumer Yrd drop and local drop, which write no archive ref (30683)
+   */
+  it("removes an unchecked-out branch at its exact tip and writes no archive ref", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-branch-removal-"))
+    try {
+      const repo = join(root, "repo")
+      createRepository(repo, "root.txt", "root\n")
+      const store = createLocalGitWorktreeStore({ repo })
+      const tip = git(repo, ["rev-parse", "HEAD"]).trim()
+      const branch = "task/drop"
+      git(repo, ["branch", branch])
+      const linked = join(root, "linked")
+      await store.add({ kind: "branch", path: linked, branch })
+      await expect(store.removeBranch({ branch, tip })).rejects.toThrow(/checked out/u)
+      git(linked, ["checkout", "--detach", "-q"])
+      const bisect = join(git(linked, ["rev-parse", "--absolute-git-dir"]).trim(), "BISECT_START")
+      await writeFile(bisect, branch)
+      await expect(store.removeBranch({ branch, tip })).rejects.toThrow(/bisect/u)
+      await rename(bisect, `${bisect}.finished`)
+
+      git(repo, ["commit", "--allow-empty", "-qm", "newer tip"])
+      const newer = git(repo, ["rev-parse", "HEAD"]).trim()
+      git(repo, ["update-ref", `refs/heads/${branch}`, newer])
+      await expect(store.removeBranch({ branch, tip })).rejects.toThrow()
+      const hold = async () => {
+        throw new Error("caller hold")
+      }
+      await expect(store.removeBranch({ branch, tip: newer, beforeRemove: hold })).rejects.toThrow("caller hold")
+      expect(git(repo, ["rev-parse", `refs/heads/${branch}`]).trim()).toBe(newer)
+
+      await store.removeBranch({ branch, tip: newer })
+      expect(git(repo, ["for-each-ref", "--format=%(refname)", `refs/heads/${branch}`]).trim()).toBe("")
+      expect(git(repo, ["for-each-ref", "--format=%(refname)", "refs/archive/"]).trim()).toBe("")
     } finally {
       // raw-delete-allow: root is this test's fresh mkdtemp fixture, never a caller-supplied worktree.
       await rm(root, { recursive: true, force: true })

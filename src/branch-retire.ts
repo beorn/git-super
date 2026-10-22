@@ -109,7 +109,7 @@ export async function superBranchRetire(options: SuperBranchRetireOptions): Prom
       dryRun: true,
     }
   }
-  await store.removeArchivedBranch({ branch, tip, archiveRef })
+  await store.removeBranch({ branch, tip, verify: { ref: archiveRef, oid: tip } })
   return {
     ...gitSuperResult([{ repository: repo, state: "updated", refs: [] }]),
     branch,

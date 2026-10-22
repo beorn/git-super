@@ -20,7 +20,6 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { fileURLToPath } from "node:url"
 import { tmpdir } from "node:os"
 import { createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS } from "./exclusive.ts"
-import { ARCHIVE_REF_PREFIX } from "./archive-ref.ts"
 import {
   acquireRemovalWriterLeases,
   assertExcludedRemovalCustody,
@@ -1715,34 +1714,43 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       return listWorktrees(git, repo)
     },
     /**
-     * Remove a local name only while its exact commit remains archived. The existing worktree writer lock
-     * excludes a concurrent store.add; the ref transaction also refuses a moved branch or archive.
+     * Remove a local name only at its exact tip; it writes no ref (30683). The existing worktree writer lock
+     * excludes a concurrent store.add; the ref transaction refuses a moved branch, and an optional verify line
+     * refuses unless that ref still holds that oid in the same transaction.
      * Callers own eligibility, attribution and journal policy. This never removes a worktree or remote ref.
      * beforeRemove rechecks caller authority under the acquired lock; throwing preserves the branch.
      */
-    async removeArchivedBranch(
-      input: Readonly<{ branch: string; tip: string; archiveRef: string; beforeRemove?: () => Promise<void> }>,
+    async removeBranch(
+      input: Readonly<{
+        branch: string
+        tip: string
+        verify?: Readonly<{ ref: string; oid: string }>
+        beforeRemove?: () => Promise<void>
+      }>,
     ): Promise<void> {
       await mutate(`retire branch ${input.branch}`, async () => {
-        const { branch, tip, archiveRef } = input
+        const { branch, tip, verify } = input
         if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(tip)) {
           throw new Error(`branch ${branch}: expected a full SHA1 or SHA256 tip, got ${JSON.stringify(tip)}`)
         }
         await git.run(repo, ["check-ref-format", "--branch", branch])
-        await git.run(repo, ["check-ref-format", archiveRef])
-        if (!archiveRef.startsWith(`${ARCHIVE_REF_PREFIX}/`)) {
-          throw new Error(`branch ${branch}: custody ref ${archiveRef} is outside ${ARCHIVE_REF_PREFIX}/`)
+        if (verify !== undefined) {
+          if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(verify.oid)) {
+            throw new Error(`branch ${branch}: verify ${verify.ref} needs a full oid, got ${JSON.stringify(verify.oid)}`)
+          }
+          await git.run(repo, ["check-ref-format", verify.ref])
         }
         const ref = `refs/heads/${branch}`
         await input.beforeRemove?.()
         const held = await branchHolder(branch)
         if (held !== undefined) throw new Error(held)
+        const verifyLine = verify === undefined ? "" : `verify ${verify.ref} ${verify.oid}\n`
         await git.run(
           repo,
           ["-c", "core.fsync=loose-object,reference", "-c", "core.fsyncMethod=fsync", "update-ref", "--stdin"],
           false,
           timeouts.operation,
-          { stdin: `start\nverify ${archiveRef} ${tip}\ndelete ${ref} ${tip}\nprepare\ncommit\n` },
+          { stdin: `start\n${verifyLine}delete ${ref} ${tip}\nprepare\ncommit\n` },
         )
       })
     },
