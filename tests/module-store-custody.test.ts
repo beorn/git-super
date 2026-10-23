@@ -534,7 +534,11 @@ describe("slot module store custody", () => {
     // `refs/remotes/origin/main` names counts too, because that copy is not a remote.
     expect(message).toContain("module store packages/alpha holds 2 commit(s)")
     expect(message).toContain("has no remote to archive them to")
-    expect(message).toContain("bundle create")
+    expect(message).toContain("worktree preserved")
+    expect(message).toContain("land or deliberately drop the work")
+    expect(message).toContain("configure a remote")
+    expect(existsSync(slot.linked)).toBe(true)
+    expect(existsSync(store)).toBe(true)
   })
 
   test("a caller-proved excluded store is never judged, and an unclaimed exclusion still stops removal", async () => {

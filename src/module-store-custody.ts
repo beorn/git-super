@@ -529,7 +529,7 @@ function archiveModuleStore(store: ModuleStore, target: ModuleArchiveTarget, ear
   if (store.valueCommits === 0) return store
   if (store.remote === undefined) {
     throw new Error(
-      `module store ${store.name} holds ${String(store.valueCommits)} commit(s), and it has no remote to archive them to; worktree preserved${earlier.length === 0 ? "" : ` after archiving ${earlier.join(", ")}`}. Add a remote, or save the store with \`git --git-dir ${store.gitDir} bundle create <file> --all\`, before retrying removal`,
+      `module store ${store.name} holds ${String(store.valueCommits)} commit(s), and it has no remote to archive them to; worktree preserved${earlier.length === 0 ? "" : ` after archiving ${earlier.join(", ")}`}. Review and land or deliberately drop the work, or configure a remote, before retrying removal`,
     )
   }
   const taken = new Set(store.remoteArchiveRefs)
