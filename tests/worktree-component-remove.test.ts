@@ -636,9 +636,9 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
                 }
                 const stream = gitLineStream(["--version"], {
                   stdout: oversized(),
-                  timeoutMs: request.timeoutMs,
-                  maxBytes: request.maxBytes,
-                  maxLines: request.maxLines,
+                  ...(request.timeoutMs === undefined ? {} : { timeoutMs: request.timeoutMs }),
+                  ...(request.maxBytes === undefined ? {} : { maxBytes: request.maxBytes }),
+                  ...(request.maxLines === undefined ? {} : { maxLines: request.maxLines }),
                 })
                 return {
                   lines: stream.lines,
