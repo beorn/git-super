@@ -93,6 +93,8 @@ export type NotCompared = Readonly<{
   reason: "absent" | "removed" | "excluded" | "unreadable" | "inconsistent"
   message: string
   objectIds?: readonly string[]
+  /** Frozen descriptor URL resolved by the comparison owner, for exact missing-object repair. */
+  remote?: string
   remedy?: string
   exclusion?: Readonly<{
     classification: "declared" | "absent" | "unclassified"

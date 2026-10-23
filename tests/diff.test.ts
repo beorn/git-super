@@ -435,12 +435,50 @@ describe("superDiff --stat / --patch", () => {
   })
 
   /**
-   * @failure The first missing sibling pin aborts comparison, hiding other missing pins and readable root data (#27058 AC2/AC4).
+   * @failure Repairing a missing parent commit still omits an unfetched nested component (#30800 AC1).
+   * @level l1
+   * @consumer git super diff and landing replay with nested components
+   * @testonly none
+   */
+  test("repairs a missing parent and the nested commit it exposes without moving either checkout", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-nested-unfetched-"))
+    roots.push(fixtureRoot)
+    const fixture = addNestedAlphaSubmodule(createProductFixture(fixtureRoot))
+    const alphaCheckout = join(fixture.product, "packages/alpha")
+    const leafCheckout = join(alphaCheckout, "apps/maddoc")
+    const oldAlpha = git(alphaCheckout, "rev-parse", "HEAD")
+    const oldLeaf = git(leafCheckout, "rev-parse", "HEAD")
+    const leaf = advanceRepository(fixture.leaf, "leaf.ts", "export const leaf = 2\n")
+    git(fixture.alpha, "update-index", "--cacheinfo", `160000,${leaf},apps/maddoc`)
+    git(fixture.alpha, "commit", "-qm", "record unfetched nested commit")
+    const alpha = git(fixture.alpha, "rev-parse", "HEAD")
+    git(fixture.product, "update-index", "--cacheinfo", `160000,${alpha},packages/alpha`)
+    git(fixture.product, "commit", "-qm", "record unfetched parent commit")
+    const head = git(fixture.product, "rev-parse", "HEAD")
+    const stdout = outputSink()
+    const stderr = outputSink()
+    expect(
+      await runCli(
+        ["--repo", fixture.product, "--json", "diff", `${fixture.productWithNestedBase}..${head}`],
+        stdout,
+        stderr,
+      ),
+      stderr.output,
+    ).toBe(0)
+    const result = JSON.parse(stdout.output) as SuperDiffResult
+    expect(result.paths).toEqual(["packages/alpha/apps/maddoc/leaf.ts"])
+    expect(result.notCompared).toEqual([])
+    expect(git(alphaCheckout, "rev-parse", "HEAD")).toBe(oldAlpha)
+    expect(git(leafCheckout, "rev-parse", "HEAD")).toBe(oldLeaf)
+  })
+
+  /**
+   * @failure Unfetched sibling pins either hide changed component paths or stop the first comparison until a hand fetch (#30800 AC1).
    * @level l1
    * @consumer git super diff CLI and affected-tests
    * @testonly none
    */
-  test("reports every unreadable sibling pin and readable root data before CLI refusal", async () => {
+  test("reports unfetched sibling pins and repairs them before returning the CLI comparison", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-diff-stat-missing-"))
     roots.push(fixtureRoot)
     const fixture = createProductFixture(fixtureRoot)
@@ -456,6 +494,23 @@ describe("superDiff --stat / --patch", () => {
     git(fixture.product, "commit", "-q", "-m", "bump two pins without fetching and change root")
     const head = git(fixture.product, "rev-parse", "HEAD")
 
+    const missing = superDiff({ repo: fixture.product, refs: [`${fixture.productBase}..${head}`] })
+    expect(missing.paths).toEqual(["root.ts"])
+    expect(missing.notCompared).toEqual([
+      expect.objectContaining({ path: "packages/alpha", reason: "unreadable", objectIds: [alphaHead] }),
+      expect.objectContaining({ path: "vendor/beta", reason: "unreadable", objectIds: [betaHead] }),
+    ])
+    for (const [index, checkout, origin, pin] of [
+      [0, alphaCheckout, fixture.alpha, alphaHead],
+      [1, betaCheckout, fixture.beta, betaHead],
+    ] as const) {
+      const remedy = missing.notCompared[index]?.remedy
+      expect(remedy).toContain(checkout)
+      expect(remedy).toContain(origin)
+      expect(remedy).toContain("fetch")
+      expect(remedy).toContain(`${pin}:refs/git-super/pins/${pin}`)
+    }
+
     const stdout = outputSink()
     const stderr = outputSink()
     const code = await runCli(
@@ -464,29 +519,17 @@ describe("superDiff --stat / --patch", () => {
       stderr,
     )
 
-    expect(code).toBe(2)
-    expect(stdout.output).toContain("root.ts")
+    expect(code, stderr.output).toBe(0)
     const result = JSON.parse(stdout.output) as {
       paths: string[]
       consultedRepositories: { path: string }[]
       notCompared: { path: string; reason: string; objectIds: string[]; remedy: string }[]
     }
-    expect(result.paths).toEqual(["root.ts"])
-    expect(result.consultedRepositories.map(({ path }) => path)).toEqual(["."])
-    expect(result.notCompared).toEqual([
-      expect.objectContaining({ path: "packages/alpha", reason: "unreadable", objectIds: [alphaHead] }),
-      expect.objectContaining({ path: "vendor/beta", reason: "unreadable", objectIds: [betaHead] }),
-    ])
-    for (const [index, checkout, origin, pin] of [
-      [0, alphaCheckout, fixture.alpha, alphaHead],
-      [1, betaCheckout, fixture.beta, betaHead],
-    ] as const) {
-      const remedy = result.notCompared[index]?.remedy
-      expect(remedy).toContain(checkout)
-      expect(remedy).toContain(origin)
-      expect(remedy).toContain("fetch")
-      expect(remedy).toContain(`${pin}:refs/git-super/pins/${pin}`)
-    }
+    expect(result.paths).toEqual(["packages/alpha/alpha.ts", "root.ts", "vendor/beta/beta.ts"])
+    expect(result.consultedRepositories.map(({ path }) => path)).toEqual([".", "packages/alpha", "vendor/beta"])
+    expect(result.notCompared).toEqual([])
+    expect(git(alphaCheckout, "rev-parse", "HEAD")).toBe(fixture.alphaBase)
+    expect(git(betaCheckout, "rev-parse", "HEAD")).toBe(fixture.betaBase)
   })
 
   test("CLI --json --stat carries the same per-repository split, and plain --json without either flag is unchanged", async () => {
@@ -1083,7 +1126,7 @@ describe("superDiff --component-base (29363: published component changes are not
     },
   )
 
-  test("a published pin the component checkout cannot read refuses with exit 2 and a remedy naming that pin", async () => {
+  test("fetches an unfetched published base pin before comparing the authored changes", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-diff-component-base-unreadable-"))
     roots.push(fixtureRoot)
     const fixture = createPublishedComponentFixture(fixtureRoot)
@@ -1107,17 +1150,14 @@ describe("superDiff --component-base (29363: published component changes are not
         stdout,
         stderr,
       ),
-    ).toBe(2)
+    ).toBe(0)
     expect(stderr.output).toContain(publishedBeta2)
-    expect(stderr.output).toContain(`${publishedBeta2}:refs/`)
     const result = superDiff({
       repo: fixture.product,
       refs: [`${fixture.productBase}..${head}`],
       componentBase: "origin/main",
     })
-    expect(result.notCompared).toMatchObject([
-      { path: "vendor/beta", reason: "unreadable", objectIds: [publishedBeta2] },
-    ])
+    expect(result.notCompared).toEqual([])
     expect(result.paths).toEqual(["authored.ts"])
   })
 

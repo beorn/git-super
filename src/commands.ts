@@ -13,7 +13,9 @@ import { superPull, type SuperPullOptions } from "./pull.ts"
 import { superPush, type SuperPushOptions } from "./push.ts"
 import type { GitSuperResult } from "./result.ts"
 import { shellQuote } from "./shell-command.ts"
-import { isAbsolute } from "node:path"
+import { isAbsolute, join } from "node:path"
+import { repositoryRoot } from "./git.ts"
+import { ensureCommitObject } from "./objects.ts"
 import { superStatus, type SuperStatusOptions, type SuperStatusResult } from "./status.ts"
 import {
   superSubmodulePrepare,
@@ -82,7 +84,30 @@ const diff = commandNode<CommandContext, DiffParams, SuperDiffResult>({
       ...(typeof input.componentBase === "string" ? { componentBase: input.componentBase } : {}),
     }
   }),
-  run: (context, input) => superDiff({ repo: context.repo, ...input }),
+  run: async (context, input) => {
+    const root = repositoryRoot(context.repo)
+    const options = { repo: root, ...input }
+    const attempted = new Set<string>()
+    let result = superDiff(options)
+    for (;;) {
+      let fetched = false
+      for (const observation of result.notCompared) {
+        if (observation.reason !== "unreadable" || observation.remote === undefined) continue
+        const repository = join(root, observation.path)
+        for (const commit of observation.objectIds ?? []) {
+          const key = `${repository}\0${commit}`
+          if (attempted.has(key)) continue
+          attempted.add(key)
+          context.report?.(`Fetching missing commit ${commit} for ${observation.path}\n`)
+          await ensureCommitObject({ repository, remote: observation.remote, commit })
+          fetched = true
+        }
+      }
+      if (!fetched) return result
+      // Reading a repaired parent can expose a previously unreadable nested component.
+      result = superDiff(options)
+    }
+  },
 })
 
 const status = commandNode<CommandContext, StatusParams, SuperStatusResult>({

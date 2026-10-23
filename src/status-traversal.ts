@@ -447,6 +447,7 @@ export function* diffTraversal(options: RecursiveNameStatusOptions): Traversal<R
         path: nestedPrefix,
         reason: "unreadable",
         objectIds: unreadable.map(({ pin }) => pin),
+        ...(url === undefined ? {} : { remote: url }),
         message: `cannot read component objects in ${nestedRoot}: ${unreadable.map(({ pin, result }) => `${pin} (${result.stderr || `git cat-file exited ${result.status}`})`).join("; ")}`,
         remedy,
       })
