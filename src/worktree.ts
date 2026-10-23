@@ -153,7 +153,7 @@ function selectedCustodyAdapters(
       return incompleteSelectedRun(
         outcome.timedOut
           ? `selected Git query timed out: ${outcome.stderr}`
-          : `selected Git query exceeded its output cap: ${outcome.stderr}`,
+          : `selected Git query exceeded its output cap: repository=${JSON.stringify(repo)} argv=${JSON.stringify(["git", "-C", repo, ...args])}: ${outcome.stderr}`,
         outcome.timedOut,
       )
     }

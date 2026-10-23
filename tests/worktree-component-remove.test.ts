@@ -11,6 +11,7 @@ import { describe, expect, it } from "vitest"
 import { tryAcquireFlock } from "@bearly/flock"
 import { createGitWorktreeStore } from "../src/worktree.ts"
 import { createLocalGitProcess } from "../src/process.ts"
+import { gitLineStream, MAX_LINE_LENGTH, type GitStreamOutcome } from "../src/retention-stream.ts"
 import { superWorktreeRemove } from "../src/worktree-remove.ts"
 import { addNestedAlphaSubmodule, canonicalTmpdir, createProductFixture, createRepository, git } from "./fixture.ts"
 
@@ -608,22 +609,45 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
     }
   })
 
-  it("refuses custody when a nested component census query fails", async () => {
+  // The cap case must cross the real stream reader, then preserve both custody evidence and checkout ownership.
+  it.each(["failed", "capped"] as const)("refuses custody when a nested component census query is %s", async (mode) => {
     const root = await mkdtemp(join(canonicalTmpdir(), "git-super-component-custody-nested-failure-"))
     try {
       const fixture = createProductFixture(root)
-      const target = join(root, "target")
+      const target = join(root, "target with spaces")
       git(fixture.product, "worktree", "add", "--detach", target)
       git(target, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
       const child = join(target, "packages/alpha")
+      const checkoutBytes = readFileSync(join(child, "alpha.ts"))
+      const rootRegistration = git(fixture.product, "worktree", "list", "--porcelain")
+      const childRegistration = git(child, "worktree", "list", "--porcelain")
       const local = createLocalGitProcess()
       const failed = async function* (): AsyncGenerator<string> {}
+      let cappedOutcome: GitStreamOutcome | undefined
       const store = createGitWorktreeStore({
         repo: fixture.product,
         gitProcess: {
           run: (request) => local.run(request),
           stream: (request) => {
             if (request.args[0] === "-C" && request.args[1] === child && request.args.includes("--show-toplevel")) {
+              if (mode === "capped") {
+                const oversized = async function* (): AsyncGenerator<Buffer> {
+                  yield Buffer.from("x".repeat(MAX_LINE_LENGTH) + "\0")
+                }
+                const stream = gitLineStream(["--version"], {
+                  stdout: oversized(),
+                  timeoutMs: request.timeoutMs,
+                  maxBytes: request.maxBytes,
+                  maxLines: request.maxLines,
+                })
+                return {
+                  lines: stream.lines,
+                  outcome: stream.outcome.then((outcome) => {
+                    cappedOutcome = outcome
+                    return { ...outcome, stderr: `${outcome.stderr}fixture nested census failure` }
+                  }),
+                }
+              }
               return {
                 lines: failed(),
                 outcome: Promise.resolve({
@@ -656,6 +680,21 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
       })
       expect(JSON.stringify(outcome)).toContain("packages/alpha")
       expect(existsSync(target)).toBe(true)
+      expect(readFileSync(join(child, "alpha.ts"))).toEqual(checkoutBytes)
+      expect(git(fixture.product, "worktree", "list", "--porcelain")).toBe(rootRegistration)
+      expect(git(child, "worktree", "list", "--porcelain")).toBe(childRegistration)
+      if (mode === "capped") {
+        expect(cappedOutcome).toMatchObject({ capped: true, timedOut: false, bytes: MAX_LINE_LENGTH + 1, lines: 0 })
+        if (outcome === undefined || !("custodyRefusal" in outcome)) throw new Error("expected a custody refusal")
+        const detail = outcome.custodyRefusal.detail
+        expect.soft(detail).toContain(`repository=${JSON.stringify(fixture.product)}`)
+        expect
+          .soft(detail)
+          .toContain(
+            `argv=${JSON.stringify(["git", "-C", fixture.product, "-C", child, "rev-parse", "--show-toplevel"])}`,
+          )
+        expect(detail).toContain("selected Git query exceeded its output cap")
+      }
     } finally {
       // raw-delete-allow: this isolated mkdtemp fixture owns every path beneath root
       await rm(root, { recursive: true, force: true })
