@@ -304,9 +304,9 @@ export function scanEstate(
   return {
     status: survivorIntoRemoval.length === 0 ? "pass" : "blocked",
     detail:
-      survivorIntoRemoval.length === 0
+      firstSurvivor === undefined
         ? `${objectDirs.size} object dir(s), ${alternatesFiles} alternates file(s), ${borrowers.length} reverse link(s)`
-        : `${survivorIntoRemoval.length} survivor borrower(s) into the removal set, e.g. ${firstSurvivor!.borrower} -> ${firstSurvivor!.target}`,
+        : `${survivorIntoRemoval.length} survivor borrower(s) into the removal set, e.g. ${firstSurvivor.borrower} -> ${firstSurvivor.target}`,
     roots,
     objectDirs: [...objectDirs].sort(),
     alternatesFiles,
