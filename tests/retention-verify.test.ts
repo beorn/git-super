@@ -15,6 +15,7 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -23,7 +24,7 @@ import {
 import { spawnSync } from "node:child_process"
 import { createHash, randomUUID } from "node:crypto"
 import { tmpdir } from "node:os"
-import { dirname, isAbsolute, join, relative } from "node:path"
+import { basename, dirname, isAbsolute, join, relative } from "node:path"
 import { tryAcquireFlock } from "@bearly/flock"
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest"
 import { runCli } from "../src/cli.ts"
@@ -378,6 +379,14 @@ describe("retention verify gates 1-6", () => {
       const stderr = outputSink()
       expect(await runCli(args, outputSink(), stderr)).not.toBe(0)
       expect(stderr.output).toContain("--namespace")
+      const empty = await auditRetainedEntry({
+        ...base,
+        artifactDir,
+        common: join(fixtureRoot as string, "product", ".git"),
+        namespaceRoots: [],
+      })
+      expect(empty.detail?.code).toBe("incomplete")
+      expect(empty.detail?.message).toContain("No complete managed namespace")
       expect(readRetentionAudits(base.entry, manifestPath, GATE_ORDER)).toEqual([])
       expect(readFileSync(manifestPath)).toEqual(original)
     } finally {
@@ -507,6 +516,12 @@ describe("retention verify gates 1-6", () => {
     expect(missingHistory.verdict).toBe("unknown")
     expect(missingHistory.gates[0]?.status).toBe("unknown")
     writeFileSync(originalPath, original)
+    const missingTool = writeRecord({
+      ...record,
+      provenance: { ...record.provenance, tool: { name: "git-super" } },
+    })
+    expect(() => readRetentionAudits(base.entry, originalPath, GATE_ORDER)).toThrowError("required tool version")
+    rmSync(missingTool)
     const invalid = writeRecord({
       ...record,
       checks: record.checks.map((check, index) => (index === 0 ? { ...check, outcome: ["pass"] } : check)),
@@ -518,7 +533,7 @@ describe("retention verify gates 1-6", () => {
     expect(readFileSync(originalPath)).toEqual(original)
   })
 
-  it("native legacy audit preserves the original and creates a distinct immutable record each run", async () => {
+  it("native legacy audit records provenance and retires through its generated immutable evidence", async () => {
     const artifactDir = mkdtempSync(join("/var/tmp", "git-super-legacy-audit-"))
     const createdLeasePaths: string[] = []
     try {
@@ -529,6 +544,11 @@ describe("retention verify gates 1-6", () => {
       for (const field of ["repositories", "writerLocks", "createdWriterLocks", "notCompared"]) delete legacy[field]
       writeFileSync(manifestPath, `${JSON.stringify(legacy, null, 2)}\n`)
       const original = readFileSync(manifestPath)
+      const common = join(fixtureRoot as string, "product", ".git")
+      const expectedHead = git(common, ["rev-parse", "HEAD"])
+      const expectedTool = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
+        version: string
+      }
       const args = retirementArgs(artifactDir).map((argument) => (argument === "retire" ? "audit" : argument))
       for (let run = 0; run < 2; run += 1) {
         const stdout = outputSink()
@@ -548,7 +568,50 @@ describe("retention verify gates 1-6", () => {
           })
           expect(record["schema"]).toBe("git-super/retention-audit/1")
         }
+        const estate = scanEstate([fixtureRoot as string], [base.entry])
+        const nativeRecords = readRetentionAudits(base.entry, manifestPath, GATE_ORDER)
+        for (const { record } of nativeRecords) {
+          expect(record.provenance).toMatchObject({
+            tool: { name: "git-super", version: expectedTool.version },
+            common: { path: common, head: expectedHead },
+            estate: {
+              namespaceRoots: [fixtureRoot as string],
+              scanDigest: retentionEstateDigest(estate),
+              counts: {
+                objectDirs: estate.objectDirs.length,
+                alternatesFiles: estate.alternatesFiles,
+                borrowers: estate.borrowers.length,
+                registries: estate.registries.length,
+                survivorIntoRemoval: estate.survivorIntoRemoval.length,
+              },
+            },
+          })
+          expect(Number.isFinite(Date.parse(record.provenance.observedAt))).toBe(true)
+          expect(record.checks.map(({ outcome }) => outcome)).toEqual(GATE_ORDER.map(() => "pass"))
+        }
       }
+      // The producer's record must be usable by the real actuator, without a fixture-written receipt.
+      const records = readRetentionAudits(base.entry, manifestPath, GATE_ORDER)
+      const selected = matchRetentionAudit(
+        records,
+        original,
+        scanEstate([fixtureRoot as string], [base.entry]),
+      ).selected
+      if (selected === undefined) throw new Error("native audit did not produce matching evidence")
+      const auditBytes = readFileSync(selected.binding.path)
+      const stdout = outputSink()
+      const stderr = outputSink()
+      expect(await runCli(retirementArgs(artifactDir), stdout, stderr), stderr.output || stdout.output).toBe(0)
+      expect(existsSync(base.entry)).toBe(false)
+      const certificate = JSON.parse(
+        readFileSync(join(artifactDir, "held", "retirement-certificate.json"), "utf8"),
+      ) as { audit: { path: string; sha256: string } }
+      expect(isAbsolute(certificate.audit.path)).toBe(false)
+      expect(certificate.audit.sha256).toBe(selected.binding.sha256)
+      expect(readFileSync(join(artifactDir, "held", "metadata", certificate.audit.path))).toEqual(auditBytes)
+      expect(readFileSync(join(artifactDir, "held", "metadata", "retention-evidence", "manifest.json"))).toEqual(
+        original,
+      )
     } finally {
       rmSync(artifactDir, { recursive: true, force: true })
       for (const path of createdLeasePaths) rmSync(path, { recursive: true, force: true })
@@ -556,13 +619,35 @@ describe("retention verify gates 1-6", () => {
   })
 
   // Root-only containment misses aliases below an otherwise external artifact directory.
-  it.each(["metadata-directory", "metadata-file", "sidecars", "certificate"])(
+  it.each(["metadata-directory", "metadata-file", "sidecars", "certificate", "original-evidence", "audit-evidence"])(
     "preserves custody before writing through a %s artifact alias",
     async (kind) => {
       const artifactDir = mkdtempSync(join("/var/tmp", "git-super-descendant-artifact-"))
       try {
         let alias = join(artifactDir, kind === "sidecars" ? "sidecars" : "metadata")
         let target = base.entry
+        if (kind === "original-evidence" || kind === "audit-evidence") {
+          const modern = await verifyRetainedEntry({
+            ...base,
+            clock: eligible(),
+            namespaceRoots: [fixtureRoot as string],
+            artifactDir: join(artifactDir, "control"),
+          })
+          expect(modern.verdict).toBe("candidate")
+          const manifestPath = join(base.entry, "manifest.json")
+          const legacy = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, unknown>
+          for (const field of ["repositories", "writerLocks", "createdWriterLocks", "notCompared"]) delete legacy[field]
+          const original = Buffer.from(`${JSON.stringify(legacy, null, 2)}\n`)
+          writeFileSync(manifestPath, original)
+          const audit = writeAuditRecordFixture(fixtureAuditRecord(modern, original))
+          target = manifestPath
+          alias = join(
+            artifactDir,
+            "metadata",
+            "retention-evidence",
+            kind === "original-evidence" ? "manifest.json" : basename(audit),
+          )
+        }
         if (kind === "metadata-file") {
           const copy = join(base.entry, "modules")
           const key = (readdirSync(copy, { recursive: true }) as string[]).find(
@@ -659,7 +744,7 @@ describe("retention verify gates 1-6", () => {
     }
   })
 
-  it.each(["held", "manifest", "census", "pointer-cleanup"])(
+  it.each(["held", "manifest", "census", "pointer-cleanup", "audit-bytes", "audit-identity"])(
     "reports the real %s boundary event",
     async (event) => {
       const artifactDir = mkdtempSync(join("/var/tmp", "git-super-retire-boundary-"))
@@ -669,8 +754,24 @@ describe("retention verify gates 1-6", () => {
       const census = join(fixtureRoot as string, "boundary-survivor")
       const registry = join(fixtureRoot as string, "dependency", ".git", "git-super-retained-borrowers")
       const pointer = join(registry, "pointer.json")
+      let auditPath: string | undefined
       try {
         await prepareRetirementFixture(artifactDir, createdLeasePaths)
+        if (event === "audit-bytes" || event === "audit-identity") {
+          const manifestPath = join(base.entry, "manifest.json")
+          const legacy = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, unknown>
+          for (const field of ["repositories", "writerLocks", "createdWriterLocks", "notCompared"]) delete legacy[field]
+          writeFileSync(manifestPath, `${JSON.stringify(legacy, null, 2)}\n`)
+          const result = await auditRetainedEntry({
+            ...base,
+            artifactDir: join(artifactDir, "audit"),
+            common: join(fixtureRoot as string, "product", ".git"),
+            namespaceRoots: [fixtureRoot as string],
+          })
+          expect(result.detail?.code).toBe("audit-pass")
+          auditPath = readRetentionAudits(base.entry, manifestPath, GATE_ORDER)[0]?.binding.path
+          if (auditPath === undefined) throw new Error("native audit fixture produced no record")
+        }
         if (event === "pointer-cleanup") {
           expect(process.getuid?.(), "native permission fault requires an unprivileged actor").not.toBe(0)
           expect(existsSync(registry)).toBe(false)
@@ -715,6 +816,16 @@ describe("retention verify gates 1-6", () => {
           git(census, ["commit", "-q", "-m", "independent survivor"])
         } else if (event === "pointer-cleanup") {
           chmodSync(registry, 0o555)
+        } else if (auditPath !== undefined) {
+          const bytes = readFileSync(auditPath)
+          if (event === "audit-bytes") writeFileSync(auditPath, Buffer.concat([bytes, Buffer.from("\n")]))
+          else {
+            const previous = lstatSync(auditPath)
+            const replacement = join(artifactDir, "replacement-audit.json")
+            writeFileSync(replacement, bytes)
+            renameSync(replacement, auditPath)
+            expect(lstatSync(auditPath).ino).not.toBe(previous.ino)
+          }
         }
         const preserved = readFileSync(manifestPath)
         if (event !== "held") blocker?.release()
