@@ -34,16 +34,24 @@ import {
 } from "./worktree-removal.ts"
 
 /** The emitting tool's own name and version, read loudly (an unreadable package.json is fatal). */
-const RETENTION_TOOL = (() => {
-  const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
-    name?: unknown
-    version?: unknown
+const RETENTION_PACKAGE = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
+  name?: unknown
+  version?: unknown
+}
+const RETENTION_TOOL = {
+  name: typeof RETENTION_PACKAGE.name === "string" ? RETENTION_PACKAGE.name : "git-super",
+  version: typeof RETENTION_PACKAGE.version === "string" ? RETENTION_PACKAGE.version : "unknown",
+}
+
+/** The audit requires actual package provenance; the shared codec validates its required version. */
+export function retentionAuditTool(): Readonly<{ name: string; version: string }> {
+  if (typeof RETENTION_PACKAGE.name !== "string" || typeof RETENTION_PACKAGE.version !== "string") {
+    throw new Error(
+      `required retention tool name/version is absent from ${new URL("../package.json", import.meta.url).pathname}`,
+    )
   }
-  return {
-    name: typeof pkg.name === "string" ? pkg.name : "git-super",
-    version: typeof pkg.version === "string" ? pkg.version : "unknown",
-  }
-})()
+  return { name: RETENTION_PACKAGE.name, version: RETENTION_PACKAGE.version }
+}
 
 /**
  * Read-only verification of one retained GitSuper entry (a direct child of a declared

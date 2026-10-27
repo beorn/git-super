@@ -56,6 +56,82 @@ function requireRecord(valid: boolean, subject: string): asserts valid {
   if (!valid) throw new Error(`${subject} is invalid in the native retention audit`)
 }
 
+/** The one schema validator, shared by the native producer and file reader. */
+export function validateRetentionAudit(
+  parsed: unknown,
+  path: string,
+  manifestPath: string,
+  gateOrder: readonly RetentionGateId[],
+): RetentionAuditRecord {
+  const value = recordObject(parsed, path)
+  requireRecord(value["schema"] === RETENTION_AUDIT_SCHEMA, `${path} schema`)
+  requireRecord(
+    typeof value["runId"] === "string" &&
+      /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(value["runId"]),
+    `${path} runId`,
+  )
+  const original = recordObject(value["original"], `${path} original`)
+  requireRecord(original["path"] === manifestPath, `${path} original manifest path`)
+  requireRecord(typeof original["sha256"] === "string" && SHA256.test(original["sha256"]), `${path} original digest`)
+  requireRecord(
+    Number.isSafeInteger(original["byteLength"]) && Number(original["byteLength"]) >= 0,
+    `${path} original byte length`,
+  )
+  const provenance = recordObject(value["provenance"], `${path} provenance`)
+  requireRecord(
+    typeof provenance["observedAt"] === "string" && Number.isFinite(Date.parse(provenance["observedAt"])),
+    `${path} observation clock`,
+  )
+  const tool = recordObject(provenance["tool"], `${path} tool`)
+  requireRecord(typeof tool["name"] === "string" && tool["name"].trim() !== "", `${path} tool name`)
+  requireRecord(
+    typeof tool["version"] === "string" &&
+      /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(tool["version"]),
+    `${path} required tool version`,
+  )
+  const common = recordObject(provenance["common"], `${path} common`)
+  requireRecord(typeof common["path"] === "string" && isAbsolute(common["path"]), `${path} common path`)
+  requireRecord(
+    typeof common["head"] === "string" && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(common["head"]),
+    `${path} common HEAD`,
+  )
+  const estate = recordObject(provenance["estate"], `${path} estate`)
+  const roots = estate["namespaceRoots"]
+  requireRecord(
+    Array.isArray(roots) &&
+      roots.length > 0 &&
+      roots.every((root: unknown) => typeof root === "string" && root.trim() !== ""),
+    `${path} namespace declaration`,
+  )
+  requireRecord(typeof estate["scanDigest"] === "string" && SHA256.test(estate["scanDigest"]), `${path} estate digest`)
+  const counts = recordObject(estate["counts"], `${path} counts`)
+  for (const field of ["objectDirs", "alternatesFiles", "borrowers", "registries", "survivorIntoRemoval"]) {
+    requireRecord(Number.isSafeInteger(counts[field]) && Number(counts[field]) >= 0, `${path} ${field} count`)
+  }
+  const checks = value["checks"]
+  requireRecord(Array.isArray(checks) && checks.length === gateOrder.length, `${path} complete check set`)
+  for (const [index, check] of checks.entries()) {
+    const row = recordObject(check, `${path} check ${index + 1}`)
+    requireRecord(row["gate"] === gateOrder[index], `${path} check order`)
+    const outcome = row["outcome"]
+    requireRecord(
+      typeof outcome === "string" && ["pass", "blocked", "unknown"].includes(outcome),
+      `${path} check outcome`,
+    )
+    requireRecord(
+      typeof row["reason"] === "string" && row["reason"].startsWith(`${String(row["outcome"])}: `),
+      `${path} check reason`,
+    )
+    const basis = row["basis"]
+    requireRecord(
+      typeof basis === "string" && ["recorded", "observed", "unavailable"].includes(basis),
+      `${path} check basis`,
+    )
+    requireRecord(!("status" in row), `${path} obsolete persisted binary status`)
+  }
+  return value as unknown as RetentionAuditRecord
+}
+
 /** Validate native records, including well-formed stale ones; never trust a stored check as authority. */
 export function readRetentionAudits(
   entry: string,
@@ -78,78 +154,10 @@ export function readRetentionAudits(
     } catch (error) {
       throw new Error(`cannot decode native retention audit ${path}: ${String(error)}`, { cause: error })
     }
-    const value = recordObject(parsed, path)
-    requireRecord(value["schema"] === RETENTION_AUDIT_SCHEMA, `${path} schema`)
-    requireRecord(
-      typeof value["runId"] === "string" &&
-        /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(value["runId"]),
-      `${path} runId`,
-    )
-    const original = recordObject(value["original"], `${path} original`)
-    requireRecord(original["path"] === manifestPath, `${path} original manifest path`)
-    requireRecord(typeof original["sha256"] === "string" && SHA256.test(original["sha256"]), `${path} original digest`)
-    requireRecord(
-      Number.isSafeInteger(original["byteLength"]) && Number(original["byteLength"]) >= 0,
-      `${path} original byte length`,
-    )
-    const provenance = recordObject(value["provenance"], `${path} provenance`)
-    requireRecord(
-      typeof provenance["observedAt"] === "string" && Number.isFinite(Date.parse(provenance["observedAt"])),
-      `${path} observation clock`,
-    )
-    const tool = recordObject(provenance["tool"], `${path} tool`)
-    requireRecord(typeof tool["name"] === "string" && tool["name"].trim() !== "", `${path} tool name`)
-    requireRecord(
-      typeof tool["version"] === "string" &&
-        /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(tool["version"]),
-      `${path} required tool version`,
-    )
-    const common = recordObject(provenance["common"], `${path} common`)
-    requireRecord(typeof common["path"] === "string" && isAbsolute(common["path"]), `${path} common path`)
-    requireRecord(
-      typeof common["head"] === "string" && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(common["head"]),
-      `${path} common HEAD`,
-    )
-    const estate = recordObject(provenance["estate"], `${path} estate`)
-    const roots = estate["namespaceRoots"]
-    requireRecord(
-      Array.isArray(roots) &&
-        roots.length > 0 &&
-        roots.every((root: unknown) => typeof root === "string" && root.trim() !== ""),
-      `${path} namespace declaration`,
-    )
-    requireRecord(
-      typeof estate["scanDigest"] === "string" && SHA256.test(estate["scanDigest"]),
-      `${path} estate digest`,
-    )
-    const counts = recordObject(estate["counts"], `${path} counts`)
-    for (const field of ["objectDirs", "alternatesFiles", "borrowers", "registries", "survivorIntoRemoval"]) {
-      requireRecord(Number.isSafeInteger(counts[field]) && Number(counts[field]) >= 0, `${path} ${field} count`)
-    }
-    const checks = value["checks"]
-    requireRecord(Array.isArray(checks) && checks.length === gateOrder.length, `${path} complete check set`)
-    for (const [index, check] of checks.entries()) {
-      const row = recordObject(check, `${path} check ${index + 1}`)
-      requireRecord(row["gate"] === gateOrder[index], `${path} check order`)
-      const outcome = row["outcome"]
-      requireRecord(
-        typeof outcome === "string" && ["pass", "blocked", "unknown"].includes(outcome),
-        `${path} check outcome`,
-      )
-      requireRecord(
-        typeof row["reason"] === "string" && row["reason"].startsWith(`${String(row["outcome"])}: `),
-        `${path} check reason`,
-      )
-      const basis = row["basis"]
-      requireRecord(
-        typeof basis === "string" && ["recorded", "observed", "unavailable"].includes(basis),
-        `${path} check basis`,
-      )
-      requireRecord(!("status" in row), `${path} obsolete persisted binary status`)
-    }
+    const record = validateRetentionAudit(parsed, path, manifestPath, gateOrder)
     records.push({
       binding: { path, sha256, devIno: `${stat.dev}:${stat.ino}` },
-      record: value as unknown as RetentionAuditRecord,
+      record,
     })
   }
   return records

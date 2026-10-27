@@ -48,6 +48,7 @@ import {
   verifyRetainedEntry,
 } from "../src/retention-verify.ts"
 import { canonicalProspectivePath, type ManifestEntry } from "../src/worktree-removal.ts"
+import { auditRetainedEntry } from "../src/retention-remove.ts"
 
 /** The shared, real-writer fixture and the pristine snapshot used to restore it in place. */
 let fixtureRoot: string | undefined
@@ -261,6 +262,66 @@ function writeAuditRecordFixture(value: unknown): string {
 }
 
 describe("retention verify gates 1-6", () => {
+  it.each(["unexpired", "missing-history"])("audit records distinct blocked/unknown outcomes for %s", async (kind) => {
+    const artifactDir = mkdtempSync(join("/var/tmp", "git-super-audit-outcome-"))
+    const createdLeasePaths: string[] = []
+    try {
+      await prepareRetirementFixture(artifactDir, createdLeasePaths)
+      const manifestPath = join(base.entry, "manifest.json")
+      const value = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, unknown>
+      if (kind === "unexpired") value["retainUntil"] = new Date(Date.now() + 86_400_000).toISOString()
+      else delete value["head"]
+      writeFileSync(manifestPath, `${JSON.stringify(value, null, 2)}\n`)
+      const original = readFileSync(manifestPath)
+      const stdout = outputSink()
+      const stderr = outputSink()
+      const args = retirementArgs(artifactDir)
+        .filter((argument) => argument !== "--json")
+        .map((argument) => (argument === "retire" ? "audit" : argument))
+      expect(await runCli(args, stdout, stderr), stderr.output).toBe(1)
+      const records = readRetentionAudits(base.entry, manifestPath, GATE_ORDER)
+      expect(records).toHaveLength(1)
+      expect(records[0]?.record.checks[0]?.outcome).toBe(kind === "unexpired" ? "blocked" : "unknown")
+      expect(stdout.output).toContain(kind === "unexpired" ? "1 blocked, 5 unknown" : "0 blocked, 6 unknown")
+      for (const check of records[0]?.record.checks ?? []) {
+        expect(check.reason).toMatch(/^(pass|blocked|unknown): /)
+        expect(check).not.toHaveProperty("status")
+      }
+      expect(readFileSync(manifestPath)).toEqual(original)
+    } finally {
+      rmSync(artifactDir, { recursive: true, force: true })
+      for (const path of createdLeasePaths) rmSync(path, { recursive: true, force: true })
+    }
+  })
+
+  it("audit publishes no record for a bounded incomplete estate or missing namespace", async () => {
+    const artifactDir = mkdtempSync(join("/var/tmp", "git-super-audit-incomplete-"))
+    try {
+      const manifestPath = join(base.entry, "manifest.json")
+      const original = readFileSync(manifestPath)
+      let tick = 0
+      const result = await auditRetainedEntry({
+        ...base,
+        artifactDir,
+        common: join(fixtureRoot as string, "product", ".git"),
+        namespaceRoots: [fixtureRoot as string],
+        bounds: { estate: { maxAlternatesFiles: 60_000, scanMs: 0 } },
+        monotonic: () => tick++,
+      })
+      expect(result.detail?.code).toBe("audit-failed")
+      expect(result.detail?.message).toContain("estate unavailable")
+      const args = retirementArgs(artifactDir).map((argument) => (argument === "retire" ? "audit" : argument))
+      args.splice(args.indexOf("--namespace"), 2)
+      const stderr = outputSink()
+      expect(await runCli(args, outputSink(), stderr)).not.toBe(0)
+      expect(stderr.output).toContain("--namespace")
+      expect(readRetentionAudits(base.entry, manifestPath, GATE_ORDER)).toEqual([])
+      expect(readFileSync(manifestPath)).toEqual(original)
+    } finally {
+      rmSync(artifactDir, { recursive: true, force: true })
+    }
+  })
+
   it("native legacy retirement preserves original and selected audit bytes in the checked external bundle", async () => {
     const artifactDir = mkdtempSync(join("/var/tmp", "git-super-legacy-preserve-"))
     const createdLeasePaths: string[] = []
