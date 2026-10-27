@@ -262,6 +262,69 @@ function writeAuditRecordFixture(value: unknown): string {
 }
 
 describe("retention verify gates 1-6", () => {
+  it.each(["held-common", "held-original-shift", "missing-common-head"])(
+    "audit preserves E and publishes no record for %s",
+    async (kind) => {
+      const artifactDir = mkdtempSync(join("/var/tmp", "git-super-audit-held-"))
+      const createdLeasePaths: string[] = []
+      let lease: ReturnType<typeof tryAcquireFlock> | undefined
+      try {
+        await prepareRetirementFixture(artifactDir, createdLeasePaths)
+        const manifestPath = join(base.entry, "manifest.json")
+        const original = readFileSync(manifestPath)
+        const common = join(fixtureRoot as string, "product", ".git")
+        const commonPath = join(common, "yrd-worktree-mutations", "writer.lock")
+        let selectedCommon = common
+        if (kind === "held-common") {
+          lease = tryAcquireFlock(commonPath)
+          expect(lease?.held).toBe(true)
+        } else if (kind === "missing-common-head") {
+          selectedCommon = join(fixtureRoot as string, "unborn-common")
+          mkdirSync(selectedCommon)
+          createdLeasePaths.push(selectedCommon)
+          git(selectedCommon, ["init", "-q", "--bare"])
+          const seed = tryAcquireFlock(join(selectedCommon, "yrd-worktree-mutations", "writer.lock"))
+          expect(seed?.held).toBe(true)
+          seed?.release()
+        }
+        let shifted = false
+        let tick = 0
+        const monotonic = () => {
+          if (kind === "held-original-shift" && !shifted) {
+            const probe = tryAcquireFlock(commonPath, { create: false, createParent: false, noFollow: true })
+            if (probe === null) {
+              writeFileSync(manifestPath, Buffer.concat([original, Buffer.from("\n")]))
+              shifted = true
+            } else probe.release()
+          }
+          return tick++
+        }
+        const result = await auditRetainedEntry({
+          ...base,
+          artifactDir,
+          common: selectedCommon,
+          namespaceRoots: [fixtureRoot as string],
+          monotonic,
+        })
+        expect(result.state).not.toBe("updated")
+        expect(readRetentionAudits(base.entry, manifestPath, GATE_ORDER)).toEqual([])
+        expect(lstatSync(base.entry).isDirectory()).toBe(true)
+        if (kind === "held-original-shift") {
+          expect(shifted).toBe(true)
+          expect(result.detail?.message).toContain("observations differ")
+          expect(readFileSync(manifestPath)).toEqual(Buffer.concat([original, Buffer.from("\n")]))
+        } else {
+          expect(readFileSync(manifestPath)).toEqual(original)
+          expect(result.detail?.code).toBe(kind === "held-common" ? "lease-held" : "audit-failed")
+        }
+      } finally {
+        lease?.release()
+        rmSync(artifactDir, { recursive: true, force: true })
+        for (const path of createdLeasePaths) rmSync(path, { recursive: true, force: true })
+      }
+    },
+  )
+
   it.each(["unexpired", "missing-history"])("audit records distinct blocked/unknown outcomes for %s", async (kind) => {
     const artifactDir = mkdtempSync(join("/var/tmp", "git-super-audit-outcome-"))
     const createdLeasePaths: string[] = []
