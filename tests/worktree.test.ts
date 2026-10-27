@@ -4,7 +4,7 @@
  * @consumer Yrd worktree and deployment stores
  * @reach fs-walk <fixture-only: worktree stores and retention checks read isolated mkdtemp Git repositories>
  */
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs"
 import { mkdir, mkdtemp, readFile, readlink, rename, rm, symlink, utimes, writeFile } from "node:fs/promises"
 import { spawnSync } from "node:child_process"
 import { tmpdir } from "node:os"
@@ -1304,6 +1304,523 @@ describe("createGitWorktreeStore", () => {
       }
     },
   )
+
+  // Retained regular-file alternates are absent from the symlink and live-rehome lifecycles.
+  // @failure Removing a lender strands a retained alternates-only copy, directly or transitively (#26497).
+  // @level l1
+  // @consumer worktree remove retained-copy custody
+  it.each(["direct", "transitive", "symlink-transitive"] as const)(
+    "protects a newly registered retained alternates closure; shape=%s",
+    async (shape) => {
+      const root = await mkdtemp(join(canonicalTmpdir(), "git-super-retained-alternates-"))
+      try {
+        const fixture = createProductFixture(root)
+        const store = createLocalGitWorktreeStore({ repo: fixture.product })
+        const owner = await addAlphaWorktree(store, root, "owner")
+        const intermediate = shape === "direct" ? undefined : await addAlphaWorktree(store, root, "intermediate")
+        const borrower = await addAlphaWorktree(store, root, "borrower")
+        const unrelated = await addAlphaWorktree(store, root, "unrelated")
+        if (intermediate) await writeFile(join(intermediate.objects, "info/alternates"), owner.objects + "\n")
+        if (shape === "symlink-transitive") await linkObjects(borrower.moduleDir, intermediate!.objects)
+        else await writeFile(join(borrower.objects, "info/alternates"), (intermediate?.objects ?? owner.objects) + "\n")
+        const proofs: WorktreeRemovalProof[] = []
+        const retention = { root: join(root, "retained"), report: (proof: WorktreeRemovalProof) => proofs.push(proof) }
+        await store.remove(borrower.linked, { retention })
+        const proof = proofs[0]!
+        const stored = JSON.parse(await readFile(proof.manifest, "utf8")) as Record<string, unknown>
+        const oldEntry = join(root, "old", dirname(proof.manifest).split("/").at(-1)!)
+        await writeFile(
+          proof.manifest,
+          JSON.stringify({
+            ...stored,
+            retained: join(oldEntry, "modules"),
+            manifest: join(oldEntry, "manifest.json"),
+          }) + "\n",
+        )
+        const relocatedProof = await readFile(proof.manifest)
+        const common = git(fixture.product, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim()
+        const registry = join(common, "git-super-retained-borrowers")
+        expect(existsSync(registry)).toBe(true)
+        const pointers = readdirSync(registry).filter((name) => name.endsWith(".json"))
+        expect(pointers).toHaveLength(1)
+        const pointer = join(registry, pointers[0]!)
+        await store.remove(unrelated.linked, { retention })
+        expect(existsSync(pointer)).toBe(true)
+        await expect(store.remove(owner.linked, { retention })).rejects.toThrow(proof.retained!)
+        expect(existsSync(owner.linked)).toBe(true)
+        expect(existsSync(owner.objects)).toBe(true)
+        expect(await readFile(proof.manifest)).toEqual(relocatedProof)
+      } finally {
+        await rm(root, { recursive: true, force: true })
+      }
+    },
+  )
+
+  // @failure The last closure crosses the enrollment deadline but its plan still authorizes pointer writes.
+  // @level l1
+  // @consumer retention enroll five-minute no-partial-plan boundary
+  // Entry-count bounds and checks before each child miss time spent inside the final metadata read.
+  it("refuses apply when the final empty alternates read crosses the inspection deadline", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-enroll-last-deadline-"))
+    try {
+      const fixture = createProductFixture(root)
+      const store = createLocalGitWorktreeStore({ repo: fixture.product })
+      const owner = await addAlphaWorktree(store, root, "owner")
+      const borrower = await addAlphaWorktree(store, root, "borrower")
+      const alternate = join(owner.objects, "info/alternates")
+      await writeFile(alternate, "")
+      await linkObjects(borrower.moduleDir, owner.objects)
+      const retainedRoot = join(root, "retained")
+      await store.remove(borrower.linked, { retention: { root: retainedRoot, report: () => {} } })
+      const common = git(fixture.product, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim()
+      const registry = join(common, "git-super-retained-borrowers")
+      for (const name of readdirSync(registry)) await rm(join(registry, name))
+      const writer = join(common, "yrd-worktree-mutations/writer.lock")
+      const writerBytes = await readFile(writer)
+      let now = Date.now()
+      const clock = vi.spyOn(Date, "now").mockImplementation(() => now)
+      const realRead = vi.mocked(readFileSync).getMockImplementation()!
+      vi.mocked(readFileSync).mockImplementation((...args: Parameters<typeof readFileSync>) => {
+        const bytes = realRead(...args)
+        if (String(args[0]) === alternate) now += 5 * 60_000 + 1
+        return bytes
+      })
+      let stdout = "",
+        stderr = ""
+      try {
+        const code = await runCli(
+          [
+            "--repo",
+            fixture.product,
+            "--json",
+            "worktree",
+            "retention",
+            "enroll",
+            "--root",
+            retainedRoot,
+            "--common",
+            common,
+            "--apply",
+          ],
+          {
+            write: (text) => {
+              stdout += String(text)
+            },
+          },
+          {
+            write: (text) => {
+              stderr += String(text)
+            },
+          },
+        )
+        expect(code, stderr).toBe(1)
+        const report = JSON.parse(stdout) as { boundHit: boolean; enrolled: number; inspected: number }
+        expect(report.boundHit).toBe(true)
+        expect(report.enrolled).toBe(0)
+        expect(readdirSync(registry)).toEqual([])
+        expect(await readFile(writer)).toEqual(writerBytes)
+      } finally {
+        clock.mockRestore()
+        vi.mocked(readFileSync).mockImplementation(realRead)
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it("reports a non-ENOENT manifest read failure and refuses the whole apply before writes", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-enroll-manifest-io-"))
+    try {
+      const fixture = createProductFixture(root)
+      const retainedRoot = join(root, "retained")
+      await mkdir(retainedRoot)
+      const store = createLocalGitWorktreeStore({ repo: fixture.product })
+      const owner = await addAlphaWorktree(store, root, "owner")
+      const borrower = await addAlphaWorktree(store, root, "borrower")
+      await writeFile(join(borrower.objects, "info/alternates"), owner.objects + "\n")
+      const proofs: WorktreeRemovalProof[] = []
+      await store.remove(borrower.linked, {
+        retention: { root: retainedRoot, report: (proof) => proofs.push(proof) },
+      })
+      const proof = proofs[0]!
+      const common = git(fixture.product, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim()
+      const manifestPath = proof.manifest
+      const writerDir = join(common, "yrd-worktree-mutations")
+      const writerBefore = readdirSync(writerDir)
+        .sort()
+        .map((name) => [name, readFileSync(join(writerDir, name))])
+      const registry = join(common, "git-super-retained-borrowers")
+      const registryBefore = registrySnapshot(registry)
+      const realRead = vi.mocked(readFileSync).getMockImplementation()!
+      vi.mocked(readFileSync).mockImplementation((...args: Parameters<typeof readFileSync>) => {
+        if (String(args[0]) === manifestPath) {
+          throw Object.assign(new Error("fixture device read failure"), { code: "EIO" })
+        }
+        return realRead(...args)
+      })
+      const stdout = {
+        text: "",
+        write(text: string) {
+          this.text += text
+        },
+      }
+      const stderr = {
+        text: "",
+        write(text: string) {
+          this.text += text
+        },
+      }
+      try {
+        const code = await runCli(
+          [
+            "--repo",
+            fixture.product,
+            "--json",
+            "worktree",
+            "retention",
+            "enroll",
+            "--root",
+            retainedRoot,
+            "--common",
+            common,
+            "--apply",
+          ],
+          { write: stdout.write.bind(stdout) },
+          { write: stderr.write.bind(stderr) },
+        )
+        expect(code).toBe(1)
+        const report = JSON.parse(stdout.text) as { complete: boolean; enrolled: number; errors: string[] }
+        expect(report.complete).toBe(false)
+        expect(report.enrolled).toBe(0)
+        expect(report.errors.join("\n")).toContain("(EIO): fixture device read failure")
+        expect(registrySnapshot(registry)).toEqual(registryBefore)
+        expect(
+          readdirSync(writerDir)
+            .sort()
+            .map((name) => [name, readFileSync(join(writerDir, name))]),
+        ).toEqual(writerBefore)
+      } finally {
+        vi.mocked(readFileSync).mockImplementation(realRead)
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  // @failure A retained dependency declared through common/worktrees is discarded when its realpath is durable (#26497).
+  // @level l1
+  // @consumer worktree remove retained-copy custody
+  // The existing alternate closure table covers only declarations whose canonical paths also identify the lender.
+  it.each(["alias-only", "durable-then-alias", "objects-link-alias", "relative-objects-link"] as const)(
+    "keeps retained custody for a volatile alias path; declaration=%s",
+    async (shape) => {
+      const root = await mkdtemp(join(canonicalTmpdir(), "git-super-retained-alternate-alias-"))
+      try {
+        const fixture = createProductFixture(root)
+        const store = createLocalGitWorktreeStore({ repo: fixture.product })
+        const owner = await addAlphaWorktree(store, root, "owner")
+        const borrower = await addAlphaWorktree(store, root, "borrower")
+        const commonPath = git(fixture.product, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim()
+        const durable = join(commonPath, "modules/packages/alpha/objects")
+        await rm(owner.objects, { recursive: true, force: true })
+        await symlink(durable, owner.objects, "dir")
+        const volatileAlias = owner.objects
+        const canonical = realpathSync(volatileAlias)
+        expect(canonical).toBe(durable)
+        let objectsAliasTopology: { declaration: string; canonical: string; proofTarget: string } | undefined
+        if (shape === "objects-link-alias" || shape === "relative-objects-link") {
+          await linkObjects(borrower.moduleDir, volatileAlias, shape === "relative-objects-link")
+        } else {
+          const lines = shape === "alias-only" ? [volatileAlias] : [canonical, volatileAlias]
+          await writeFile(join(borrower.objects, "info/alternates"), lines.join("\n") + "\n")
+        }
+        const proofs: WorktreeRemovalProof[] = []
+        const retention = { root: join(root, "retained"), report: (proof: WorktreeRemovalProof) => proofs.push(proof) }
+        await store.remove(borrower.linked, { retention })
+        expect(proofs).toHaveLength(1)
+        if (shape === "objects-link-alias" || shape === "relative-objects-link") {
+          const retainedObjects = join(proofs[0]!.retained!, "packages/alpha/objects")
+          const manifestBytes = await readFile(proofs[0]!.manifest)
+          const stored = JSON.parse(manifestBytes.toString()) as {
+            externalObjectStores: readonly { path: string; target: string }[]
+          }
+          const proofTarget = stored.externalObjectStores.find((row) => row.path === "packages/alpha/objects")?.target
+          expect(proofTarget).toBe(durable)
+          await rm(retainedObjects, { recursive: true, force: true })
+          const declaration =
+            shape === "relative-objects-link" ? relative(dirname(retainedObjects), volatileAlias) : volatileAlias
+          await symlink(declaration, retainedObjects, "dir")
+          objectsAliasTopology = {
+            declaration: await readlink(retainedObjects),
+            canonical: realpathSync(retainedObjects),
+            proofTarget: proofTarget!,
+          }
+          expect(objectsAliasTopology).toEqual({ declaration, canonical: durable, proofTarget: durable })
+          expect(await readFile(proofs[0]!.manifest)).toEqual(manifestBytes)
+        }
+        const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true)
+        try {
+          if (objectsAliasTopology !== undefined) {
+            const removalError = await store.remove(owner.linked, { retention }).then(
+              () => null,
+              (error: unknown) => error,
+            )
+            if (removalError === null) {
+              throw new Error(
+                `owner removal succeeded despite volatile objects-link alias: ${JSON.stringify(objectsAliasTopology)}`,
+              )
+            }
+            expect(removalError).toBeInstanceOf(Error)
+            expect((removalError as Error).message).toContain(proofs[0]!.retained!)
+          } else {
+            await expect(store.remove(owner.linked, { retention })).rejects.toThrow(proofs[0]!.retained!)
+          }
+        } finally {
+          stderr.mockRestore()
+        }
+        expect(existsSync(owner.linked)).toBe(true)
+        expect(existsSync(canonical)).toBe(true)
+        const common = git(fixture.product, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim()
+        expect(
+          readdirSync(join(common, "git-super-retained-borrowers")).filter((name) => name.endsWith(".json")),
+        ).toHaveLength(1)
+      } finally {
+        await rm(root, { recursive: true, force: true })
+      }
+    },
+  )
+
+  // @failure Unprovable retained alternate custody deletes a lender, or unrelated dangling history blocks it (#26497).
+  // @level l1
+  // @consumer worktree remove retained-copy custody
+  // Existing symlink tests cannot witness the regular-file closure and pointer-drop union.
+  it("preserves unprovable retained alternate custody and releases only the independent union", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-retained-alternate-proof-"))
+    try {
+      const fixture = createProductFixture(root)
+      const store = createLocalGitWorktreeStore({ repo: fixture.product })
+      const owner = await addAlphaWorktree(store, root, "owner")
+      const borrower = await addAlphaWorktree(store, root, "borrower")
+      const unrelated = await addAlphaWorktree(store, root, "unrelated")
+      await writeFile(join(borrower.objects, "info/alternates"), owner.objects + "\n")
+      const proofs: WorktreeRemovalProof[] = []
+      const retention = { root: join(root, "retained"), report: (proof: WorktreeRemovalProof) => proofs.push(proof) }
+      await store.remove(borrower.linked, { retention })
+      const proof = proofs[0]!
+      const alternate = join(proof.retained!, "packages/alpha/objects/info/alternates")
+      const manifestBytes = await readFile(proof.manifest)
+      const alternateBytes = await readFile(alternate)
+      const legacyProof = JSON.parse(manifestBytes.toString()) as Record<string, unknown>
+      delete legacyProof.entries
+      delete legacyProof.externalObjectStores
+      await writeFile(proof.manifest, JSON.stringify(legacyProof) + "\n")
+      const legacyBytes = await readFile(proof.manifest)
+      const commonForLegacy = git(fixture.product, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim()
+      const pointerRoot = join(commonForLegacy, "git-super-retained-borrowers")
+      const pointerPath = join(
+        pointerRoot,
+        readdirSync(pointerRoot).find((name) => name.endsWith(".json"))!,
+      )
+      const pointerBytes = await readFile(pointerPath)
+      await writeFile(alternate, join(commonForLegacy, "modules/packages/alpha/objects") + "\n")
+      // Unknown legacy proof fields plus a currently independent graph must preserve custody while unrelated cleanup proceeds.
+      const legacyCleanupStderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true)
+      try {
+        await store.remove(unrelated.linked, { retention })
+      } finally {
+        legacyCleanupStderr.mockRestore()
+      }
+      expect(existsSync(pointerPath)).toBe(true)
+      expect(await readFile(pointerPath)).toEqual(pointerBytes)
+      expect(await readFile(proof.manifest)).toEqual(legacyBytes)
+      await writeFile(proof.manifest, manifestBytes)
+      await writeFile(alternate, alternateBytes)
+      await rm(proof.manifest)
+      await expect(store.remove(owner.linked, { retention })).rejects.toThrow(proof.retained!)
+      expect(existsSync(owner.objects)).toBe(true)
+      await writeFile(
+        proof.manifest,
+        JSON.stringify({
+          ...(JSON.parse(manifestBytes.toString()) as Record<string, unknown>),
+          externalObjectStores: [{ path: "packages/alpha/objects", target: 42 }],
+        }),
+      )
+      await expect(store.remove(owner.linked, { retention })).rejects.toThrow("invalid retained objects dependency")
+      expect(existsSync(owner.objects)).toBe(true)
+      await writeFile(proof.manifest, manifestBytes)
+      const originalProof = JSON.parse(manifestBytes.toString()) as Record<string, unknown>
+      await writeFile(alternate, join(commonForLegacy, "modules/packages/alpha/objects") + "\n")
+      const retainedChildren = readdirSync(retention.root).sort()
+      for (const partial of [{ externalObjectStores: [] }, { entries: {} }]) {
+        const asymmetric = { ...originalProof, ...partial }
+        if (!("entries" in partial)) delete asymmetric.entries
+        if (!("externalObjectStores" in partial)) delete asymmetric.externalObjectStores
+        await writeFile(proof.manifest, JSON.stringify(asymmetric) + "\n")
+        await expect(store.remove(owner.linked, { retention })).rejects.toThrow("invalid retained dependency manifest")
+        expect(existsSync(owner.objects)).toBe(true)
+        expect(await readFile(pointerPath)).toEqual(pointerBytes)
+        expect(readdirSync(retention.root).sort()).toEqual(retainedChildren)
+      }
+      await writeFile(proof.manifest, manifestBytes)
+      await writeFile(alternate, alternateBytes)
+      const realRead = vi.mocked(readFileSync).getMockImplementation()!
+      vi.mocked(readFileSync).mockImplementation((...args: Parameters<typeof readFileSync>) => {
+        if (String(args[0]) === alternate) {
+          throw Object.assign(new Error("fixture unreadable alternates"), { code: "EACCES" })
+        }
+        return realRead(...args)
+      })
+      try {
+        await expect(store.remove(owner.linked, { retention })).rejects.toThrow("alternates")
+        expect(existsSync(owner.objects)).toBe(true)
+      } finally {
+        vi.mocked(readFileSync).mockImplementation(realRead)
+      }
+      const unknown = join(root, "unknown/objects")
+      await mkdir(join(unknown, "info"), { recursive: true })
+      await writeFile(alternate, unknown + "\n")
+      await expect(store.remove(owner.linked, { retention })).rejects.toThrow("unknown")
+      expect(existsSync(owner.objects)).toBe(true)
+      const dangling = join(root, "gone/objects")
+      await writeFile(alternate, dangling + "\n" + owner.objects + "\n")
+      const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true)
+      try {
+        await expect(store.remove(owner.linked, { retention })).rejects.toThrow(proof.retained!)
+        expect(existsSync(owner.objects)).toBe(true)
+        const common = git(fixture.product, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim()
+        await writeFile(alternate, dangling + "\n" + join(common, "modules/packages/alpha/objects") + "\n")
+        stderr.mockClear()
+        await store.remove(owner.linked, { retention })
+        expect(existsSync(owner.linked)).toBe(false)
+        const diagnostics = stderr.mock.calls.map(([line]) => String(line)).filter((line) => line.includes("dangling"))
+        expect(diagnostics).toHaveLength(1)
+        expect(diagnostics[0]).toContain(dangling)
+        expect(
+          readdirSync(join(common, "git-super-retained-borrowers")).filter((name) => name.endsWith(".json")),
+        ).toEqual([])
+      } finally {
+        stderr.mockRestore()
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  // @failure An empty or durable-only alternates file spuriously registers a fresh copy as a linked borrower (#26497).
+  // @level l1
+  // @consumer worktree remove retention registration
+  // The linked and refusal cases cannot prove that independent copies publish no borrower pointer.
+  it.each(["empty", "durable-only"] as const)("does not register a fresh %s alternate copy", async (shape) => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-retained-independent-copy-"))
+    try {
+      const fixture = createProductFixture(root)
+      const store = createLocalGitWorktreeStore({ repo: fixture.product })
+      const source = await addAlphaWorktree(store, root, "source")
+      const common = git(fixture.product, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim()
+      const declaration = shape === "empty" ? "" : join(common, "modules/packages/alpha/objects") + "\n"
+      await writeFile(join(source.objects, "info/alternates"), declaration)
+      const proofs: WorktreeRemovalProof[] = []
+      await store.remove(source.linked, {
+        retention: { root: join(root, "retained"), report: (proof) => proofs.push(proof) },
+      })
+      expect(existsSync(source.linked)).toBe(false)
+      expect(proofs).toHaveLength(1)
+      expect(await readFile(join(proofs[0]!.retained!, "packages/alpha/objects/info/alternates"), "utf8")).toBe(
+        declaration,
+      )
+      expect(registrySnapshot(join(common, "git-super-retained-borrowers"))).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  // @failure Fresh retention registers a dependency that native deletion destroys in the same command (#26497).
+  // @level l1
+  // @consumer worktree remove retention transaction
+  // The fresh retained copy's own alternate can resolve into the deletion set before any pointer exists.
+  it.each(["self-path", "volatile-alias"] as const)(
+    "refuses a fresh retained copy borrowing from its own deletion set; path=%s",
+    async (shape) => {
+      const root = await mkdtemp(join(canonicalTmpdir(), "git-super-retained-self-borrow-"))
+      try {
+        const fixture = createProductFixture(root)
+        const store = createLocalGitWorktreeStore({ repo: fixture.product })
+        const source = await addAlphaWorktree(store, root, "source")
+        const liveBorrower = await addAlphaWorktree(store, root, "live-borrower")
+        const retainedRoot = join(root, "retained")
+        let declared = source.objects
+        if (shape === "volatile-alias") {
+          const commonPath = git(fixture.product, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim()
+          const durable = join(commonPath, "modules/packages/alpha/objects")
+          await rm(source.objects, { recursive: true, force: true })
+          await symlink(durable, source.objects, "dir")
+          declared = source.objects
+          expect(realpathSync(declared)).toBe(durable)
+        }
+        const alternate = join(source.objects, "info/alternates")
+        await writeFile(alternate, declared + "\n")
+        const alternateBefore = await readFile(alternate)
+        const liveBorrowerAlternate = join(liveBorrower.objects, "info/alternates")
+        await writeFile(liveBorrowerAlternate, declared + "\n")
+        const liveBorrowerAlternateBefore = await readFile(liveBorrowerAlternate)
+        await mkdir(retainedRoot, { recursive: true })
+        const retainedRootBefore = readdirSync(retainedRoot).sort()
+        const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true)
+        try {
+          await expect(
+            store.remove(source.linked, { retention: { root: retainedRoot, report: () => {} } }),
+          ).rejects.toThrow("retained")
+        } finally {
+          stderr.mockRestore()
+        }
+        expect(existsSync(source.linked)).toBe(true)
+        expect(existsSync(source.objects)).toBe(true)
+        expect(await readFile(alternate)).toEqual(alternateBefore)
+        expect(existsSync(liveBorrower.linked)).toBe(true)
+        expect(await readFile(liveBorrowerAlternate)).toEqual(liveBorrowerAlternateBefore)
+        expect(readdirSync(retainedRoot).sort()).toEqual(retainedRootBefore)
+        const common = git(fixture.product, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim()
+        expect(registrySnapshot(join(common, "git-super-retained-borrowers"))).toEqual([])
+      } finally {
+        await rm(root, { recursive: true, force: true })
+      }
+    },
+  )
+
+  // @failure Retention reports/crashes before publishing the pointer that protects the copied alternate borrower (#26497).
+  // @level l1
+  // @consumer worktree remove retention crash boundary
+  // Successful removal tests do not exercise interruption between pointer publication and native deletion.
+  it("publishes retained alternate registration before a reporting crash and native deletion", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-retained-alternate-crash-"))
+    try {
+      const fixture = createProductFixture(root)
+      const store = createLocalGitWorktreeStore({ repo: fixture.product })
+      const owner = await addAlphaWorktree(store, root, "owner")
+      const borrower = await addAlphaWorktree(store, root, "borrower")
+      await writeFile(join(borrower.objects, "info/alternates"), owner.objects + "\n")
+      let retained: string | null = null
+      await expect(
+        store.remove(borrower.linked, {
+          retention: {
+            root: join(root, "retained"),
+            report: (proof) => {
+              retained = proof.retained
+              throw new Error("fixture report crash")
+            },
+          },
+        }),
+      ).rejects.toThrow("fixture report crash")
+      expect(existsSync(borrower.linked)).toBe(true)
+      expect(retained).not.toBeNull()
+      await expect(
+        store.remove(owner.linked, { retention: { root: join(root, "retained"), report: () => {} } }),
+      ).rejects.toThrow(retained!)
+      expect(existsSync(owner.objects)).toBe(true)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
 
   /**
    * @failure A store owner is removed while a retained copy still points at it, or a stale dependency never releases it (26270).

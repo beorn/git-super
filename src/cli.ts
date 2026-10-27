@@ -1,3 +1,5 @@
+import type { RetentionEnrollReport } from "./worktree-removal.ts"
+import type { RetentionEnrollParams } from "./commands.ts"
 import type { CommandNode } from "@silvery/command"
 import { constants as osConstants } from "node:os"
 import {
@@ -46,6 +48,7 @@ export type OutputSink = ProcessOutputSink &
   }>
 
 type CapturedInvocation =
+  | CapturedEnrollment
   | Readonly<{ node: typeof commands.diff; params: DiffParams; json: boolean; nul: boolean }>
   | Readonly<{ node: typeof commands.status; params: StatusParams; json: boolean; nul: boolean }>
   | Readonly<{ node: (typeof commands)["merge-base"]; params: MergeBaseParams; json: boolean; nul: boolean }>
@@ -74,6 +77,13 @@ type CapturedInvocation =
       json: boolean
       nul: boolean
     }>
+
+type CapturedEnrollment = Readonly<{
+  node: typeof commands.worktree.retention.enroll
+  params: RetentionEnrollParams
+  json: boolean
+  nul: boolean
+}>
 
 function stableValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(stableValue)
@@ -111,6 +121,7 @@ async function commandResult(
   | SuperMergeResult
   | SuperSubmodulePrepareResult
   | RetentionVerifyResult
+  | RetentionEnrollReport
   | CompactRetainedRootReport
   | PrivateStoreCandidateResult
   | GitSuperResult
@@ -126,6 +137,7 @@ async function commandResult(
       | SuperMergeResult
       | SuperSubmodulePrepareResult
       | RetentionVerifyResult
+      | RetentionEnrollReport
       | PrivateStoreCandidateResult
       | GitSuperResult
     >,
@@ -735,14 +747,17 @@ async function runInvocation(
 
   const retention = worktree
     .command("retention")
-    .description("Read-only verification of retained GitSuper entries; its result is never removal authority")
+    .description(
+      "Inspect retained GitSuper entries, compact metadata, or explicitly enroll borrower pointers; no removal authority",
+    )
     .allowExcessArguments()
     .action((_options, command) => {
       const subcommand = command.args[0]
       usage =
         (subcommand === undefined
-          ? "git-super: worktree retention needs a subcommand\n"
-          : `git-super: unknown worktree retention subcommand '${subcommand}'\n`) + command.helpInformation()
+          ? "git-super: worktree retention needs verify, compact, or enroll\n"
+          : `git-super: unknown worktree retention subcommand '${subcommand}'; choose verify, compact, or enroll\n`) +
+        command.helpInformation()
     })
   retention
     .command("verify")
@@ -775,6 +790,25 @@ async function runInvocation(
           ...(namespaces === undefined || namespaces.length === 0 ? {} : { namespaceRoots: namespaces }),
           ...(options.artifactDir === undefined ? {} : { artifactDir: options.artifactDir }),
         },
+        json: globals.json === true,
+        nul: false,
+      }
+    })
+
+  retention
+    .command("enroll")
+    .description(
+      "Plan retained linked-store borrowers; --apply writes existing registry pointers under the common lease",
+    )
+    .requiredOption("--root <directory>", "declared retained root whose immediate entries are inspected")
+    .requiredOption("--common <directory>", "Git common directory whose borrowers are registered")
+    .option("--apply", "recompute under the common writer lease and register the exact proposed pointers")
+    .action((_options, command) => {
+      const globals = command.optsWithGlobals() as { json?: boolean }
+      const options = command.opts() as { root: string; common: string; apply?: boolean }
+      captured = {
+        node: commands.worktree.retention.enroll,
+        params: { root: options.root, common: options.common, ...(options.apply === true ? { apply: true } : {}) },
         json: globals.json === true,
         nul: false,
       }
@@ -966,6 +1000,7 @@ async function runInvocation(
     | SuperMergeResult
     | SuperSubmodulePrepareResult
     | RetentionVerifyResult
+    | RetentionEnrollReport
     | CompactRetainedRootReport
     | PrivateStoreCandidateResult
     | GitSuperResult
@@ -1030,6 +1065,7 @@ async function runInvocation(
     return status.submoduleProblems.length > 0 ? 2 : status.records.length > 0 ? 1 : 0
   }
   // A stopped compaction is a judgment too: a run that refused at a child must not read as success.
+  if (captured.node === commands.worktree.retention.enroll) return (result as RetentionEnrollReport).complete ? 0 : 1
   if (captured.node === commands.worktree.retention.compact) {
     const report = result as CompactRetainedRootReport
     // A refusal before any write is reported by class and the run continues, but it is never
@@ -1210,6 +1246,21 @@ async function writeResult(
     for (const gate of verify.gates) {
       stdout.write(`${gate.status} ${gate.gate}: ${gate.message}\n`)
     }
+  } else if (captured.node === nodes.worktree.retention.enroll) {
+    const report = result as RetentionEnrollReport
+    stdout.write(`${report.apply ? "apply" : "dry-run"} enroll ${report.root} common ${report.common}\n`)
+    stdout.write(
+      `children ${report.children}, inspected ${report.inspected}, proposed ${report.proposed.length}, enrolled ${report.enrolled}, observations ${report.observations.length}, complete ${report.complete}\n`,
+    )
+    for (const row of report.entries) {
+      stdout.write(
+        `${row.classification} ${row.entry}${row.registration === undefined ? "" : " -> " + row.registration}${row.reason === null ? "" : ": " + row.reason}\n`,
+      )
+    }
+    for (const observation of report.observations) {
+      stdout.write(`${observation.kind} ${observation.path} -> ${observation.target}: ${observation.reason}\n`)
+    }
+    for (const error of report.errors) stderr.write(error + "\n")
   } else if (captured.node === nodes.worktree.retention.compact) {
     const report = result as CompactRetainedRootReport
     stdout.write(`${report.dryRun ? "dry-run" : "compact"} ${report.root}\n`)

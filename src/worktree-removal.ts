@@ -17,6 +17,7 @@ import {
   writeFileSync,
   type Dirent,
 } from "node:fs"
+import { createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS } from "./exclusive.ts"
 import { tryAcquireFlock, type FlockHandle } from "@bearly/flock"
 import { fileLockHolders, formatLockHolders } from "@bearly/flock/holders"
 import { spawnSync } from "node:child_process"
@@ -25,7 +26,7 @@ import { classifyExcludedPath, inspectExcludedCheckout, superStatus, type SuperS
 import { statusWithGit } from "./status-traversal.ts"
 import { readCommitSubmodules, readPrivateSubmodules, type SelectedCommitSubmodules } from "./commit-graph.ts"
 import type { PrivateGitProjection } from "./private-git-projection.ts"
-import { alternatesLineage } from "./alternates.ts"
+import { alternatesLineage, alternatesLineageSync } from "./alternates.ts"
 import { storeRemote } from "./module-store-custody.ts"
 import { validateExcludedSubmodules, withGitTimeout } from "./git.ts"
 import type { GitProcess } from "./process.ts"
@@ -1031,7 +1032,13 @@ export type StoreManifest = Readonly<{
   files: Readonly<Record<string, string>>
   externalObjectStores: readonly ExternalObjectStore[]
 }>
-export type StoreCustody = Readonly<{ common: string; checkout: string; gitDir: string; modules: string }>
+export type StoreCustody = Readonly<{
+  common: string
+  checkout: string
+  gitDir?: string
+  modules: string
+  removalRoots?: readonly string[]
+}>
 
 function isGitDirectory(owner: string, root: string, rootIsGitDir: boolean): boolean {
   if (!within(root, owner)) return false
@@ -1164,6 +1171,10 @@ export function metadataFileDigest(path: string): string {
 }
 
 export function manifest(root: string, custody: StoreCustody, hashFiles = true, workingTree = false): StoreManifest {
+  const removalRoots = custody.removalRoots ?? [
+    custody.checkout,
+    ...(custody.gitDir === undefined ? [] : [custody.gitDir]),
+  ]
   const entries: Record<string, ManifestEntry> = {}
   const files: Record<string, string> = {}
   const externalObjectStores: ExternalObjectStore[] = []
@@ -1171,11 +1182,11 @@ export function manifest(root: string, custody: StoreCustody, hashFiles = true, 
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
       const path = join(directory, entry.name)
       const key = relative(root, path)
-      const metadata = within(custody.gitDir, path)
+      const metadata = custody.gitDir !== undefined && within(custody.gitDir, path)
       if (
         (!workingTree || metadata) &&
         entry.name.endsWith(".lock") &&
-        !isWriterLeasePath(path, workingTree ? custody.gitDir : root, workingTree || root === custody.gitDir)
+        !isWriterLeasePath(path, workingTree ? (custody.gitDir ?? root) : root, workingTree || root === custody.gitDir)
       ) {
         throw new Error(`Git lock ${path} prevents worktree removal; resolve its holder (${describeLockBarrier(path)})`)
       }
@@ -1204,9 +1215,9 @@ export function manifest(root: string, custody: StoreCustody, hashFiles = true, 
             cause: error,
           })
         }
-        if (!within(custody.common, target) || within(custody.checkout, target) || within(custody.gitDir, target)) {
+        if (!within(custody.common, target) || removalRoots.some((boundary) => within(boundary, target))) {
           throw new Error(
-            `Git objects link ${path} targets ${target} outside common-store custody or inside removal paths ${custody.checkout} or ${custody.gitDir}; preserve its objects before removal`,
+            `Git objects link ${path} targets ${target} outside common-store custody or inside removal paths ${removalRoots.join(" or ")}; preserve its objects before removal`,
           )
         }
         entries[key] = { kind: "objects-link", declaration, target }
@@ -1260,6 +1271,154 @@ function registerRetainedBorrower(common: string, retained: string, manifestPath
   }
 }
 
+/** Inspect actual retained metadata using the existing borrower walk and the one alternates traversal. */
+function retainedAlternatesDependency(
+  retained: string,
+  common: string,
+  lenderGitDir: string | undefined,
+  externalObjectStores: readonly ExternalObjectStore[],
+  deadline?: number,
+  canonicalCopiedLinks = false,
+  registrationCommon?: string,
+  onDangling?: (store: string, target: string, rawLine: string) => void,
+): boolean | string {
+  const copy = realpathSync(retained)
+  const lenders = lenderGitDir === undefined ? [] : [...new Set([resolve(lenderGitDir), realpathSync(lenderGitDir)])]
+  const canonicalCommon = realpathSync(common)
+  const linkedStores = join(canonicalCommon, "worktrees")
+  const primaryStores = join(canonicalCommon, "modules")
+  let linkedDependency = false
+  let custodyRefusal: Error | undefined
+  const refuse = (message: string): never => {
+    custodyRefusal = new Error(message)
+    throw custodyRefusal
+  }
+  const classify = (declaredPath: string, canonicalPath: string, edge: string): void => {
+    if (deadline !== undefined && Date.now() >= deadline) {
+      throw new Error(`retained closure ${retained} exceeded enrollment deadline`)
+    }
+    for (const target of new Set([declaredPath, canonicalPath])) {
+      if (lenders.some((lender) => within(lender, target))) {
+        refuse(
+          `retained copy ${retained} borrows from removal store through ${edge} (declared ${declaredPath}, canonical ${canonicalPath}); worktree preserved`,
+        )
+      }
+      if (within(linkedStores, target)) linkedDependency = true
+      else if (
+        !within(primaryStores, target) &&
+        !within(copy, target) &&
+        !(registrationCommon === canonicalCommon && within(join(canonicalCommon, "objects"), target))
+      ) {
+        refuse(
+          `retained copy ${retained} has unknown removal custody through ${edge} (declared ${declaredPath}, canonical ${canonicalPath}); worktree preserved`,
+        )
+      }
+    }
+  }
+  const seeds = new Set<string>()
+  const dangling: string[] = []
+  try {
+    for (const dependency of externalObjectStores) {
+      const link = join(retained, dependency.path)
+      const declaredPath = resolve(dirname(link), readlinkSync(link))
+      const canonicalPath = realpathSync(link)
+      classify(canonicalCopiedLinks ? canonicalPath : declaredPath, canonicalPath, link)
+      seeds.add(canonicalPath)
+    }
+    // This existing local metadata walk does not expose external intermediate symlink hops.
+    for (const entry of borrowerEntries(retained, undefined)) {
+      if (deadline !== undefined && Date.now() >= deadline) {
+        throw new Error(`retained closure ${retained} exceeded enrollment deadline`)
+      }
+      if (entry.name === "objects" && entry.isDirectory()) seeds.add(realpathSync(join(entry.parentPath, entry.name)))
+    }
+    alternatesLineageSync([...seeds], join(copy, "objects"), undefined, {
+      strictReads: true,
+      onDeclaration: (store, declaredPath, canonicalPath) => {
+        classify(declaredPath, canonicalPath, join(store, "info/alternates"))
+      },
+      onEdge: () => {},
+      onDangling: (store, target, rawLine) => {
+        onDangling?.(store, target, rawLine)
+        dangling.push(
+          join(store, "info/alternates") + " -> " + target + " (declaration " + JSON.stringify(rawLine) + ")",
+        )
+      },
+    })
+  } catch (error) {
+    if (custodyRefusal !== undefined && error === custodyRefusal) return custodyRefusal.message
+    throw error
+  } finally {
+    if (dangling.length > 0 && onDangling === undefined) {
+      process.stderr.write(
+        "retained borrower " + retained + " has dangling alternates declarations: " + dangling.join("; ") + "\n",
+      )
+    }
+  }
+  return linkedDependency
+}
+
+function validateRetainedObjectsDeclarations(proof: Record<string, unknown>, retained: string): boolean | string {
+  if (
+    !Object.hasOwn(proof, "entries") &&
+    !Object.hasOwn(proof, "externalObjectStores") &&
+    proof.files !== null &&
+    typeof proof.files === "object" &&
+    !Array.isArray(proof.files)
+  ) {
+    return true
+  }
+  if (
+    !Object.hasOwn(proof, "entries") ||
+    proof.entries === null ||
+    typeof proof.entries !== "object" ||
+    Array.isArray(proof.entries)
+  ) {
+    return "invalid retained dependency manifest"
+  }
+  const dependencies = proof.externalObjectStores
+  if (!Object.hasOwn(proof, "externalObjectStores") || !Array.isArray(dependencies)) {
+    return "invalid retained dependency manifest"
+  }
+  for (const dependency of dependencies as Array<{ path?: unknown; target?: unknown }>) {
+    if (
+      dependency === null ||
+      typeof dependency !== "object" ||
+      typeof dependency.path !== "string" ||
+      typeof dependency.target !== "string" ||
+      !isAbsolute(dependency.target)
+    ) {
+      return "invalid retained objects dependency"
+    }
+    const link = resolve(retained, dependency.path)
+    if (!within(retained, link) || basename(link) !== "objects") {
+      return `invalid retained objects path ${link}`
+    }
+  }
+  return false
+}
+
+function readRetainedPointer(path: string): { retained: string; manifest: string } {
+  if (!lstatSync(path).isFile() || realpathSync(path) !== resolve(path)) {
+    throw new Error(`retained pointer ${path} is not a plain regular file`)
+  }
+  const record: unknown = JSON.parse(readFileSync(path, "utf8"))
+  if (record === null || typeof record !== "object" || Array.isArray(record)) {
+    throw new Error(`invalid retained borrower pointer ${path}`)
+  }
+  const pointer = record as Record<string, unknown>
+  if (
+    Object.keys(pointer).length !== 2 ||
+    typeof pointer.retained !== "string" ||
+    !isAbsolute(pointer.retained) ||
+    typeof pointer.manifest !== "string" ||
+    !isAbsolute(pointer.manifest)
+  ) {
+    throw new Error(`invalid retained borrower pointer ${path}`)
+  }
+  return { retained: pointer.retained, manifest: pointer.manifest }
+}
+
 /** Retained copies are borrowers too: verify their actual links before allowing an owner store to disappear. */
 function guardRetainedBorrowers(common: string, lenderGitDir: string, policy: "inspect" | "rehome" = "rehome"): void {
   const registry = join(common, "git-super-retained-borrowers")
@@ -1271,6 +1430,7 @@ function guardRetainedBorrowers(common: string, lenderGitDir: string, policy: "i
     .filter((name) => name.endsWith(".json"))
     .sort()
   if (registrations.length === 0) return
+  const identities = new Map<string, string>()
   const pointer = join(lenderGitDir, "gitdir")
   let checkout: string
   try {
@@ -1289,15 +1449,7 @@ function guardRetainedBorrowers(common: string, lenderGitDir: string, policy: "i
     const registration = join(registry, name)
     let retained = registration
     try {
-      const record = JSON.parse(readFileSync(registration, "utf8")) as { retained?: unknown; manifest?: unknown }
-      if (
-        typeof record.retained !== "string" ||
-        !isAbsolute(record.retained) ||
-        typeof record.manifest !== "string" ||
-        !isAbsolute(record.manifest)
-      ) {
-        throw new Error("invalid retained borrower pointer")
-      }
+      const record = readRetainedPointer(registration)
       retained = record.retained
       if (!present(retained)) {
         if (policy === "inspect") continue
@@ -1306,45 +1458,57 @@ function guardRetainedBorrowers(common: string, lenderGitDir: string, policy: "i
         continue
       }
       if (!lstatSync(retained).isDirectory()) throw new Error("retained copy is not an owned directory")
-      const proof = JSON.parse(readFileSync(record.manifest, "utf8")) as {
-        retained?: unknown
-        externalObjectStores?: unknown
+      const entry = dirname(record.manifest)
+      const runtime = rebuildRetainedCopyProof(entry, dirname(entry), identities)
+      if (typeof runtime === "string") throw new Error(runtime)
+      if (runtime.retained !== retained || runtime.manifest !== record.manifest) {
+        throw new Error("retained pointer does not name its actual copy and local manifest")
       }
-      if (proof.retained !== retained || !Array.isArray(proof.externalObjectStores)) {
-        throw new Error("invalid retained dependency manifest")
-      }
-      for (const dependency of proof.externalObjectStores as Array<{ path?: unknown; target?: unknown }>) {
-        if (
-          typeof dependency.path !== "string" ||
-          typeof dependency.target !== "string" ||
-          !isAbsolute(dependency.target)
-        ) {
-          throw new Error("invalid retained objects dependency")
-        }
-        const link = resolve(retained, dependency.path)
-        if (!within(retained, link) || basename(link) !== "objects") {
-          throw new Error(`invalid retained objects path ${link}`)
-        }
-      }
+      const proof = runtime.stored
+      const legacy = validateRetainedObjectsDeclarations(proof, retained)
+      if (typeof legacy === "string") throw new Error(legacy)
       // The manifest declaration cannot hide an actual link or authorise deletion of its current target.
       const actual = manifest(retained, { common, checkout, gitDir: lenderGitDir, modules: retained }, false)
-      const linkedStores = join(realpathSync(common), "worktrees")
-      const primaryStores = join(realpathSync(common), "modules")
-      let linkedDependency = false
-      for (const dependency of actual.externalObjectStores) {
-        if (within(linkedStores, dependency.target)) {
-          linkedDependency = true
-        } else if (!within(primaryStores, dependency.target)) {
-          throw new Error(
-            `retained objects link ${join(retained, dependency.path)} targets ${dependency.target} with unknown removal custody in ${common}; preserve and resolve it before removal`,
+      const dangling: string[] = []
+      let observed = false
+      let linkedDependency: boolean
+      try {
+        // This pointer's canonical registration common is the guard's own common, so common/objects is durable.
+        const dependency = retainedAlternatesDependency(
+          retained,
+          common,
+          lenderGitDir,
+          actual.externalObjectStores,
+          undefined,
+          false,
+          realpathSync(dirname(dirname(registration))),
+          (store, target, rawLine) =>
+            dangling.push(
+              join(store, "info/alternates") + " -> " + target + " (declaration " + JSON.stringify(rawLine) + ")",
+            ),
+        )
+        if (typeof dependency === "string") throw new Error(dependency)
+        linkedDependency = dependency
+        observed = true
+      } finally {
+        // Successful preflight leaves reporting to the existing rehome pass; a refusal reports now.
+        if (dangling.length > 0 && (policy === "rehome" || !observed)) {
+          process.stderr.write(
+            "retained borrower " + retained + " has dangling alternates declarations: " + dangling.join("; ") + "\n",
           )
         }
+      }
+      if (legacy && !linkedDependency) {
+        process.stderr.write(
+          `retained borrower ${retained} legacy-retained; actual graph independent; integrity UNKNOWN\n`,
+        )
+        continue
       }
       if (!linkedDependency) {
         if (policy === "inspect") continue
         unlinkSync(registration)
         process.stderr.write(
-          `retained borrower ${retained} has no objects links into removable linked stores; dropped registry entry ${registration}\n`,
+          `retained borrower ${retained} has no objects links or alternates into removable linked stores; dropped registry entry ${registration}\n`,
         )
       }
     } catch (error) {
@@ -1462,6 +1626,8 @@ async function retainResolvedWorktreeModules(context: {
   } = context
   const modules = join(gitDir, "modules")
   const custody = { common, checkout: path, gitDir, modules }
+  // Use the existing nonmutating guard before retention creates a copy or rehomes borrowers.
+  guardRetainedBorrowers(common, gitDir, "inspect")
   // Diagnose metadata links before Git discovery can hide their source and target in an object lookup failure.
   manifest(gitDir, custody, false, false)
   if (privateProjection !== undefined) {
@@ -1511,6 +1677,20 @@ async function retainResolvedWorktreeModules(context: {
       )
     }
   }
+  // A fresh copy preserves alternates bytes but canonicalizes objects links. Refuse its
+  // self-borrow before creating a retained directory or rehoming any live borrower.
+  const linkedDependency =
+    privateProjection === undefined && existsSync(modules)
+      ? retainedAlternatesDependency(
+          modules,
+          common,
+          gitDir,
+          manifest(modules, custody, false).externalObjectStores,
+          undefined,
+          true,
+        )
+      : false
+  if (typeof linkedDependency === "string") throw new Error(linkedDependency)
   mkdirSync(canonical, { recursive: true })
   onRetainedPath?.(canonical)
   const retainedRoot = mkdtempSync(join(canonical, `${basename(gitDir)}-`))
@@ -1672,7 +1852,7 @@ async function retainResolvedWorktreeModules(context: {
     `${JSON.stringify({ ...proof, files: retainedManifest.files, entries: retainedManifest.entries, externalObjectStores: retainedManifest.externalObjectStores }, null, 2)}\n`,
     { flag: "wx" },
   )
-  if (retained !== null && retainedManifest.externalObjectStores.length > 0) {
+  if (retained !== null && (retainedManifest.externalObjectStores.length > 0 || linkedDependency)) {
     registerRetainedBorrower(common, retained, proof.manifest)
   }
   if (retained !== null && privateProjection !== undefined) {
@@ -1687,4 +1867,420 @@ async function retainResolvedWorktreeModules(context: {
     retirePrivate()
   }
   return proof
+}
+
+/**
+ * The stored proof's location fields. Compaction never invents one: a value that is not a string is a
+ * MISSING recorded fact about this child, so the child is reported and skipped rather than rebuilt
+ * with a guessed path that would then feed the manifest walk's custody arithmetic (CTO F1).
+ */
+export function readProofLocation(stored: Record<string, unknown>):
+  | { readonly ok: true; readonly path: string; readonly modules: string; readonly retained: string }
+  | {
+      readonly ok: false
+      readonly missing: readonly string[]
+    } {
+  const missing = ["path", "modules", "retained"].filter((field) => typeof stored[field] !== "string")
+  if (missing.length > 0) return { ok: false, missing }
+  return {
+    ok: true,
+    path: stored.path as string,
+    modules: stored.modules as string,
+    retained: stored.retained as string,
+  }
+}
+
+/**
+ * Read a child's stored proof. Absence or invalid proof bytes are reported reasons; unexpected
+ * filesystem errors throw with their path and errno rather than pretending to establish custody.
+ */
+export function readStoredManifest(
+  entry: string,
+): { readonly ok: true; readonly manifest: Record<string, unknown> } | { readonly ok: false; readonly reason: string } {
+  const path = join(entry, "manifest.json")
+  let parsed: unknown
+  try {
+    if (!lstatSync(path).isFile() || realpathSync(path) !== resolve(path)) {
+      return { ok: false, reason: `${path} is not a regular nonredirected file` }
+    }
+    parsed = JSON.parse(readFileSync(path, "utf8"))
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code !== undefined && code !== "ENOENT") {
+      throw new Error(
+        `cannot read retained manifest ${path} (${code}): ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
+      )
+    }
+    if (code === undefined && !(error instanceof SyntaxError)) throw error
+    return {
+      ok: false,
+      reason:
+        (error as NodeJS.ErrnoException).code === "ENOENT"
+          ? `${path} is absent`
+          : `${path} is unreadable JSON or metadata: ${error instanceof Error ? error.message : String(error)}`,
+    }
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { ok: false, reason: `${path} is not a JSON object` }
+  }
+  return { ok: true, manifest: parsed as Record<string, unknown> }
+}
+
+/**
+ * Rebuild the proof compaction reads from the child's own location. The stored `retained`/`manifest`
+ * point at the root the proof was written under, which for older stock no longer exists; `path` and
+ * `modules` feed only the manifest walk's custody string math and are taken as recorded, never
+ * regenerated from a walk. Returns the refusing step's name when the stored proof cannot be matched
+ * to this child, or does not record the location fields at all.
+ */
+export function rebuildRetainedCopyProof(
+  entry: string,
+  root = dirname(entry),
+  identities?: Map<string, string>,
+):
+  | {
+      path: string
+      modules: string
+      retained: string
+      manifest: string
+      stored: Record<string, unknown>
+      recordedEntry: string
+    }
+  | string {
+  try {
+    const canonicalRoot = realpathSync(root)
+    if (canonicalRoot !== resolve(root) || !lstatSync(root).isDirectory()) {
+      return "foreign-proof: declared root is redirected or not a directory: " + root
+    }
+    const actual = resolve(entry)
+    if (dirname(actual) !== canonicalRoot || !lstatSync(actual).isDirectory() || realpathSync(actual) !== actual) {
+      return "foreign-proof: entry is not a plain immediate child: " + entry
+    }
+    const read = readStoredManifest(actual)
+    if (!read.ok) return "no-manifest: " + read.reason
+    const stored = read.manifest
+    const location = readProofLocation(stored)
+    if (!location.ok) return "incomplete-proof: missing " + location.missing.join(", ")
+    const recordedManifest = stored.manifest
+    const recordedRetained = location.retained
+    if (
+      typeof recordedManifest !== "string" ||
+      !isAbsolute(recordedManifest) ||
+      resolve(recordedManifest) !== recordedManifest ||
+      !isAbsolute(recordedRetained) ||
+      resolve(recordedRetained) !== recordedRetained ||
+      basename(recordedManifest) !== "manifest.json" ||
+      !within(dirname(recordedManifest), recordedRetained) ||
+      recordedRetained === dirname(recordedManifest) ||
+      basename(dirname(recordedManifest)) !== basename(actual)
+    ) {
+      return (
+        "foreign-proof: incoherent recorded manifest/retained pair " +
+        String(recordedManifest) +
+        " and " +
+        recordedRetained +
+        " for " +
+        actual
+      )
+    }
+    const manifestPath = join(actual, "manifest.json")
+    if (realpathSync(manifestPath) !== manifestPath || !lstatSync(manifestPath).isFile()) {
+      return "foreign-proof: redirected manifest: " + manifestPath
+    }
+    const recordedEntry = dirname(recordedManifest)
+    const retained = resolve(actual, relative(recordedEntry, recordedRetained))
+    if (!lstatSync(retained).isDirectory() || realpathSync(retained) !== retained) {
+      return "missing-copy: retained directory is absent or redirected: " + retained
+    }
+    const prior = identities?.get(recordedEntry)
+    if (prior !== undefined && prior !== actual) {
+      return "foreign-proof: two candidates for recorded entry " + recordedEntry + ": " + prior + " and " + actual
+    }
+    identities?.set(recordedEntry, actual)
+    return { path: location.path, modules: location.modules, retained, manifest: manifestPath, stored, recordedEntry }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      const code = (error as NodeJS.ErrnoException).code ?? "ERROR"
+      throw new Error(
+        `cannot inspect retained child ${entry} (${code}): ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
+      )
+    }
+    return (
+      "foreign-proof: cannot resolve actual retained child " +
+      entry +
+      ": " +
+      (error instanceof Error ? error.message : String(error))
+    )
+  }
+}
+
+export type RetentionEnrollOptions = Readonly<{
+  root: string
+  common: string
+  apply?: boolean
+  report?: (message: string) => void
+}>
+export type RetentionEnrollEntry = {
+  entry: string
+  classification: "would-enroll" | "enrolled" | "already-enrolled" | "not-needed" | "not-enrolled"
+  reason: string | null
+  retained?: string
+  manifest?: string
+  registration?: string
+}
+export type RetentionEnrollReport = {
+  root: string
+  common: string
+  apply: boolean
+  complete: boolean
+  boundHit: boolean
+  children: number
+  inspected: number
+  entries: RetentionEnrollEntry[]
+  proposed: Array<{ retained: string; manifest: string; registration: string }>
+  enrolled: number
+  errors: string[]
+  observations: Array<{
+    kind: "dangling-alternate" | "gone-pointer"
+    entry: string
+    path: string
+    target: string
+    rawLine?: string
+    excluded: true
+    reason: string
+  }>
+}
+
+/** Dry-run plans only; apply recomputes under the same common writer lease as native removal. */
+export async function enrollRetainedBorrowers(options: RetentionEnrollOptions): Promise<RetentionEnrollReport> {
+  const physicalDirectory = (path: string): string => {
+    const absolute = resolve(path)
+    if (!lstatSync(absolute).isDirectory() || realpathSync(absolute) !== absolute) {
+      throw new Error(`retention enrollment requires a canonical plain directory: ${path}`)
+    }
+    return absolute
+  }
+  const root = physicalDirectory(options.root)
+  const common = physicalDirectory(options.common)
+  if (!isGitDirectory(common, common, false)) {
+    throw new Error(`retention enrollment common ${common} is not a Git common directory`)
+  }
+  const deadline = Date.now() + 5 * 60_000
+  const plan = (): RetentionEnrollReport => {
+    const names = readdirSync(root).sort()
+    const result: RetentionEnrollReport = {
+      root,
+      common,
+      apply: options.apply === true,
+      complete: true,
+      boundHit: names.length > 10_000,
+      children: names.length,
+      inspected: 0,
+      entries: [],
+      proposed: [],
+      enrolled: 0,
+      errors: [],
+      observations: [],
+    }
+    if (result.boundHit) {
+      result.complete = false
+      result.errors.push(
+        `retention enrollment ${root} has ${names.length} children, exceeding the 10000-entry bound; nothing applied`,
+      )
+      return result
+    }
+    const identities = new Map<string, string>()
+    const registry = join(common, "git-super-retained-borrowers")
+    if (present(registry)) {
+      if (!lstatSync(registry).isDirectory() || realpathSync(registry) !== registry) {
+        throw new Error(`retained borrower registry ${registry} is not a plain directory`)
+      }
+      const registrations = readdirSync(registry)
+        .filter((name) => name.endsWith(".json"))
+        .sort()
+      if (registrations.length > 10_000) {
+        result.boundHit = true
+        result.complete = false
+        result.errors.push(`retained registry ${registry} exceeds the 10000-entry bound; nothing applied`)
+        return result
+      }
+      for (const name of registrations) {
+        if (Date.now() >= deadline) {
+          result.boundHit = true
+          result.complete = false
+          result.errors.push(`retained registry ${registry} exceeded the five-minute bound; nothing applied`)
+          return result
+        }
+        const path = join(registry, name)
+        try {
+          const pointer = readRetainedPointer(path)
+          if (!present(pointer.retained)) {
+            result.observations.push({
+              kind: "gone-pointer",
+              entry: dirname(pointer.manifest),
+              path,
+              target: pointer.retained,
+              excluded: true,
+              reason:
+                "registered retained copy is absent; excluded from competing physical identities; guard owns dropping pointer",
+            })
+            continue
+          }
+          const pointerEntry = dirname(pointer.manifest)
+          const runtime = rebuildRetainedCopyProof(pointerEntry, dirname(pointerEntry), identities)
+          if (typeof runtime === "string") throw new Error(runtime)
+          if (runtime.retained !== pointer.retained || runtime.manifest !== pointer.manifest) {
+            throw new Error("pointer does not name its actual local proof")
+          }
+        } catch (error) {
+          result.errors.push(`${path}: ${error instanceof Error ? error.message : String(error)}`)
+        }
+      }
+    }
+    for (const name of names) {
+      if (Date.now() >= deadline) {
+        result.boundHit = true
+        result.errors.push(`retention enrollment ${root} exceeded its five-minute bound; nothing applied`)
+        break
+      }
+      const entry = join(root, name)
+      const row: RetentionEnrollEntry = { entry, classification: "not-enrolled", reason: null }
+      result.entries.push(row)
+      result.inspected++
+      try {
+        const runtime = rebuildRetainedCopyProof(entry, root, identities)
+        if (typeof runtime === "string") {
+          row.reason = runtime
+          continue
+        }
+        const legacy = validateRetainedObjectsDeclarations(runtime.stored, runtime.retained)
+        if (typeof legacy === "string") {
+          row.reason = legacy
+          continue
+        }
+        const actual = manifest(
+          runtime.retained,
+          {
+            common,
+            checkout: runtime.path,
+            modules: runtime.retained,
+            removalRoots: [runtime.path, runtime.modules],
+          },
+          false,
+        )
+        Object.assign(row, { retained: runtime.retained, manifest: runtime.manifest })
+        const registration = join(registry, createHash("sha256").update(runtime.manifest).digest("hex") + ".json")
+        row.registration = registration
+        const existing = present(registration) ? readRetainedPointer(registration) : undefined
+        if (
+          existing !== undefined &&
+          (existing.retained !== runtime.retained || existing.manifest !== runtime.manifest)
+        ) {
+          throw new Error(`retained pointer ${registration} does not match the exact proposed pointer`)
+        }
+        const linkedDependency = retainedAlternatesDependency(
+          runtime.retained,
+          common,
+          undefined,
+          actual.externalObjectStores,
+          deadline,
+          false,
+          existing === undefined ? undefined : realpathSync(dirname(dirname(registration))),
+          (store, target, rawLine) =>
+            result.observations.push({
+              kind: "dangling-alternate",
+              entry,
+              path: join(store, "info", "alternates"),
+              target,
+              rawLine,
+              excluded: true,
+              reason: "alternate target is absent; this declaration branch ends; integrity UNKNOWN",
+            }),
+        )
+        if (typeof linkedDependency === "string") {
+          row.reason = linkedDependency
+          delete row.registration
+          continue
+        }
+        if (present(registration)) {
+          row.classification = "already-enrolled"
+          if (legacy) {
+            row.reason = linkedDependency
+              ? "legacy-unrecorded; actual graph linked; integrity UNKNOWN"
+              : "legacy-retained; actual graph independent; integrity UNKNOWN"
+          } else if (!linkedDependency) {
+            row.classification = "not-needed"
+            delete row.registration
+          }
+        } else if (!linkedDependency) {
+          if (legacy) {
+            row.reason = "legacy-unrecorded; actual graph independent; integrity UNKNOWN; owner disposition required"
+          } else row.classification = "not-needed"
+          delete row.registration
+        } else {
+          if (legacy) row.reason = "legacy-unrecorded; actual graph linked; integrity UNKNOWN"
+          row.classification = "would-enroll"
+          result.proposed.push({ retained: runtime.retained, manifest: runtime.manifest, registration })
+        }
+      } catch (error) {
+        row.reason = error instanceof Error ? error.message : String(error)
+        result.errors.push(`${entry}: ${row.reason}`)
+      }
+    }
+    if (Date.now() >= deadline) {
+      result.boundHit = true
+      result.errors.push(`retention enrollment ${root} exceeded its five-minute bound; nothing applied`)
+    }
+    result.complete =
+      !result.boundHit &&
+      result.errors.length === 0 &&
+      result.entries.every((row) => row.classification !== "not-enrolled")
+    return result
+  }
+  const initial = plan()
+  if (options.apply !== true || initial.boundHit || initial.errors.length > 0) return initial
+  const remaining = deadline - Date.now()
+  if (remaining <= 0) {
+    initial.boundHit = true
+    initial.complete = false
+    initial.errors.push(`retention enrollment ${root} deadline expired before writer acquisition; nothing applied`)
+    return initial
+  }
+  // worktree.ts mutationLock uses this exact common/yrd-worktree-mutations directory; createExclusive adds writer.lock.
+  return createExclusive(join(common, "yrd-worktree-mutations"), {
+    timeoutMs: Math.min(DEFAULT_MUTATION_LOCK_WAIT_MS, remaining),
+    onContended: (holder) => options.report?.(`retention enrollment waiting for common writer lock held by ${holder}`),
+  }).run(
+    async () => {
+      const current = plan()
+      if (current.boundHit || current.errors.length > 0) return Promise.resolve(current)
+      if (Date.now() >= deadline) {
+        current.boundHit = true
+        current.complete = false
+        current.errors.push(
+          `retention enrollment ${root} exceeded its deadline before pointer publication; nothing applied`,
+        )
+        return current
+      }
+      // The deadline bounds inspection and lease wait. An admitted, capped plan publishes to completion.
+      for (const pointer of current.proposed) {
+        const row = current.entries.find((row) => row.registration === pointer.registration)
+        if (row === undefined) throw new Error(`retention enrollment lost planned entry ${pointer.registration}`)
+        try {
+          registerRetainedBorrower(common, pointer.retained, pointer.manifest)
+          row.classification = "enrolled"
+          current.enrolled++
+        } catch (error) {
+          row.classification = "not-enrolled"
+          row.reason = error instanceof Error ? error.message : String(error)
+          current.complete = false
+          break
+        }
+      }
+      return Promise.resolve(current)
+    },
+    { holder: "git-super worktree retention enroll" },
+  )
 }
