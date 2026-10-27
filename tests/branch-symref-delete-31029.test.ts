@@ -1,22 +1,17 @@
 /**
- * #31029 — dropping a local branch must never delete the ref a symbolic ref points at.
- *
- * `removeBranch` (src/worktree.ts:1723-1758) deletes with
- *   `update-ref --stdin` + `delete refs/heads/<branch> <tip>` and no `option no-deref`.
- * `update-ref` dereferences a symbolic ref by default, so when `refs/heads/<branch>` is a
- * symref the delete lands on its TARGET — measured on git 2.4x: deleting
- * `refs/heads/task/sym -> refs/heads/main` removes `refs/heads/main`, exits 0, and leaves the
- * symref dangling. Yrd reaches this through `retireLocalBranch`
- * (vendor/yrd packages/yrd-queue-core/src/local-branch-retirement.ts:272); a symref branch in a
- * return-worktree repository therefore retires `main` itself.
- *
- * These tests are the red half of the pair; product source is untouched by this file.
+ * @failure Local branch retirement follows an alias and deletes another branch, including main (#31029).
+ * @level l1
+ * @consumer Yrd retireLocalBranch and explicit local branch cleanup
+ * @testonly none
+ * retire-when: subsumed by a broader ref-transaction property suite or symbolic branch refs cannot enter the store.
+ * Existing direct-branch tests do not cover symbolic-ref dereferencing or a false successful removal.
  */
 import { spawnSync } from "node:child_process"
 import { mkdtemp, rm } from "node:fs/promises"
 import { join } from "node:path"
 import { describe, expect, it } from "vitest"
-import { createLocalGitWorktreeStore } from "../src/worktree.ts"
+import { createGitWorktreeStore, createLocalGitWorktreeStore } from "../src/worktree.ts"
+import { createLocalGitProcess } from "../src/process.ts"
 import { canonicalTmpdir, createRepository, NO_BACKGROUND_MAINTENANCE } from "./fixture.ts"
 
 function git(repo: string, args: readonly string[]): string {
@@ -34,33 +29,62 @@ function refState(repo: string, ref: string): { present: boolean; oid: string; s
 }
 
 describe("#31029 branch removal must not follow a symbolic ref", () => {
-  it("keeps refs/heads/main when the named branch is a symref to it", async () => {
-    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-symref-35029-"))
-    try {
-      const repo = join(root, "repo")
-      const tip = createRepository(repo, "root.txt", "root\n")
-      const store = createLocalGitWorktreeStore({ repo })
-      const branch = "task/sym"
-      git(repo, ["symbolic-ref", `refs/heads/${branch}`, "refs/heads/main"])
-      expect(git(repo, ["symbolic-ref", `refs/heads/${branch}`]).trim()).toBe("refs/heads/main")
-
-      let removalError: unknown = null
+  it.each(["already symbolic", "rebound before transaction"] as const)(
+    "keeps refs/heads/main when the named branch is %s",
+    async (mode) => {
+      const root = await mkdtemp(join(canonicalTmpdir(), "git-super-symref-35029-"))
       try {
-        await store.removeBranch({ branch, tip })
-      } catch (error) {
-        removalError = error
-      }
+        const repo = join(root, "repo")
+        const tip = createRepository(repo, "root.txt", "root\n")
+        const branch = "task/sym"
+        const native = createLocalGitProcess()
+        let rebound = false
+        const store = createGitWorktreeStore({
+          repo,
+          gitProcess: {
+            run: (request) => {
+              if (
+                mode === "rebound before transaction" &&
+                request.args.includes("update-ref") &&
+                request.stdin?.includes(`delete refs/heads/${branch} `)
+              ) {
+                git(repo, ["symbolic-ref", `refs/heads/${branch}`, "refs/heads/main"])
+                rebound = true
+              }
+              return native.run(request)
+            },
+          },
+        })
+        git(repo, ["tag", "retained", tip])
+        if (mode === "already symbolic") git(repo, ["symbolic-ref", `refs/heads/${branch}`, "refs/heads/main"])
+        else git(repo, ["branch", branch, tip])
 
-      const main = refState(repo, "refs/heads/main")
-      expect(main.present, `refs/heads/main must survive removing symref ${branch}: ${main.stderr}`).toBe(true)
-      expect(main.oid).toBe(tip)
-      if (removalError !== null) {
-        expect(String(removalError)).not.toMatch(/refs\/heads\/main[^]*\b(?:removed|deleted)\b/iu)
+        let removalError: unknown = null
+        try {
+          await store.removeBranch({ branch, tip, verify: { ref: "refs/tags/retained", oid: tip } })
+        } catch (error) {
+          removalError = error
+        }
+
+        const main = refState(repo, "refs/heads/main")
+        expect(main.present, `refs/heads/main must survive removing symref ${branch}: ${main.stderr}`).toBe(true)
+        expect(main.oid).toBe(tip)
+        expect(rebound).toBe(mode === "rebound before transaction")
+        expect(refState(repo, "refs/tags/retained").oid).toBe(tip)
+        if (mode === "already symbolic") {
+          expect(removalError).toBeInstanceOf(Error)
+          expect(String(removalError)).toMatch(/task\/sym.*symbolic/iu)
+          expect(git(repo, ["symbolic-ref", `refs/heads/${branch}`]).trim()).toBe("refs/heads/main")
+        } else {
+          // Chief fa34f6ee: the native transaction may remove the literal alias introduced after inspection.
+          expect(removalError).toBeNull()
+          expect(refState(repo, `refs/heads/${branch}`).present).toBe(false)
+        }
+      } finally {
+        await rm(root, { recursive: true, force: true })
       }
-    } finally {
-      await rm(root, { recursive: true, force: true })
-    }
-  })
+    },
+  )
 
   it("keeps the target when the symref names a branch other than main", async () => {
     const root = await mkdtemp(join(canonicalTmpdir(), "git-super-symref-other-35029-"))
@@ -69,13 +93,22 @@ describe("#31029 branch removal must not follow a symbolic ref", () => {
       const tip = createRepository(repo, "root.txt", "root\n")
       const store = createLocalGitWorktreeStore({ repo })
       git(repo, ["branch", "release/keep"])
+      git(repo, ["tag", "retained", tip])
       git(repo, ["symbolic-ref", "refs/heads/task/sym", "refs/heads/release/keep"])
 
-      await store.removeBranch({ branch: "task/sym", tip }).catch(() => undefined)
+      let removalError: unknown = null
+      try {
+        await store.removeBranch({ branch: "task/sym", tip, verify: { ref: "refs/tags/retained", oid: tip } })
+      } catch (error) {
+        removalError = error
+      }
 
       const kept = refState(repo, "refs/heads/release/keep")
       expect(kept.present, `refs/heads/release/keep must survive removing its symref: ${kept.stderr}`).toBe(true)
       expect(kept.oid).toBe(tip)
+      expect(refState(repo, "refs/tags/retained").oid).toBe(tip)
+      expect(removalError).toBeInstanceOf(Error)
+      expect(String(removalError)).toMatch(/task\/sym.*symbolic/iu)
     } finally {
       await rm(root, { recursive: true, force: true })
     }

@@ -1746,13 +1746,21 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         await input.beforeRemove?.()
         const held = await branchHolder(branch)
         if (held !== undefined) throw new Error(held)
+        const symbolic = await git.run(repo, ["symbolic-ref", "--quiet", "--no-recurse", ref], true)
+        if (symbolic.code === 0) {
+          throw new Error(`branch ${branch}: symbolic reference to ${symbolic.stdout.trim()}; refusing branch removal`)
+        }
+        if (symbolic.code !== 1) {
+          throw new Error(`branch ${branch}: symbolic reference inspection failed: ${symbolic.stderr.trim()}`)
+        }
         const verifyLine = verify === undefined ? "" : `verify ${verify.ref} ${verify.oid}\n`
         await git.run(
           repo,
           ["-c", "core.fsync=loose-object,reference", "-c", "core.fsyncMethod=fsync", "update-ref", "--stdin"],
           false,
           timeouts.operation,
-          { stdin: `start\n${verifyLine}delete ${ref} ${tip}\nprepare\ncommit\n` },
+          // no-deref is per-command: keep verify unchanged and fence a ref rebound after the symbolic check.
+          { stdin: `start\n${verifyLine}option no-deref\ndelete ${ref} ${tip}\nprepare\ncommit\n` },
         )
       })
     },
