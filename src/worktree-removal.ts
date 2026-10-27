@@ -685,20 +685,20 @@ function componentSelectionOnRemote(
   if (porcelain.code !== 0) {
     return {
       onRemote: false,
-      reason: `${path}: cannot read checkout status in ${store} (git exit ${porcelain.code}); inspect the checkout before removal`,
+      reason: `${path}: cannot read checkout status in ${store} (git exit ${porcelain.code}: ${porcelain.stderr}); inspect the checkout before removal`,
     }
   }
   if (porcelain.stdout.trim() !== "") {
     return {
       onRemote: false,
-      reason: `${path}: checkout ${store} has uncommitted changes; commit or preserve them before removal`,
+      reason: `${path}: checkout ${store} has uncommitted or untracked files; commit or preserve them before removal`,
     }
   }
   const gitDir = gitText(store, ["rev-parse", "--absolute-git-dir"])
   if (gitDir.code !== 0) {
     return {
       onRemote: false,
-      reason: `${path}: cannot read the Git directory of ${store} (git exit ${gitDir.code}); inspect the component store before removal`,
+      reason: `${path}: cannot read the Git directory of ${store} (git exit ${gitDir.code}: ${gitDir.stderr}); inspect the component store before removal`,
     }
   }
   const remote = storeRemote(gitDir.stdout.trim())
@@ -712,18 +712,26 @@ function componentSelectionOnRemote(
   if (tracking.code !== 0) {
     return {
       onRemote: false,
-      reason: `${path}: component remote ${remote} has no readable refs/remotes/${remote}/HEAD in ${store}; set its remote default branch before removal`,
+      reason: `${path}: component remote ${remote} has no readable refs/remotes/${remote}/HEAD in ${store} (git exit ${tracking.code}: ${tracking.stderr}); set its remote default branch before removal`,
     }
   }
   const target = tracking.stdout.trim()
+  const targetCommit = gitText(store, ["rev-parse", "--verify", `${target}^{commit}`])
+  if (targetCommit.code !== 0) {
+    return {
+      onRemote: false,
+      reason: `${path}: cannot read remote target ${target} in ${store} (git exit ${targetCommit.code}: ${targetCommit.stderr}); fetch its component remote ${remote} before removal`,
+    }
+  }
+  const targetOid = targetCommit.stdout.trim()
   const head = gitText(store, ["rev-parse", "--verify", "HEAD^{commit}"])
   if (head.code !== 0) {
     return {
       onRemote: false,
-      reason: `${path}: cannot read HEAD in ${store} (git exit ${head.code}); inspect the component HEAD before removal`,
+      reason: `${path}: cannot read HEAD in ${store} (git exit ${head.code}: ${head.stderr}); inspect the component HEAD before removal`,
     }
   }
-  const headAncestry = ancestorOf(store, head.stdout.trim(), target)
+  const headAncestry = ancestorOf(store, head.stdout.trim(), targetOid)
   if (headAncestry.code !== 0 && headAncestry.code !== 1) {
     return {
       onRemote: false,
@@ -741,16 +749,16 @@ function componentSelectionOnRemote(
   if (indexPin.code !== 0) {
     return {
       onRemote: false,
-      reason: `${path}: cannot read the index gitlink in ${parent} (git exit ${indexPin.code}); inspect the parent index before removal`,
+      reason: `${path}: cannot read the index gitlink in ${parent} (git exit ${indexPin.code}: ${indexPin.stderr}); inspect the parent index before removal`,
     }
   }
   if (headPin.code !== 0) {
     return {
       onRemote: false,
-      reason: `${path}: cannot read the HEAD gitlink in ${parent} (git exit ${headPin.code}); inspect the parent HEAD before removal`,
+      reason: `${path}: cannot read the HEAD gitlink in ${parent} (git exit ${headPin.code}: ${headPin.stderr}); inspect the parent HEAD before removal`,
     }
   }
-  const indexAncestry = ancestorOf(store, indexPin.stdout.trim(), target)
+  const indexAncestry = ancestorOf(store, indexPin.stdout.trim(), targetOid)
   if (indexAncestry.code !== 0 && indexAncestry.code !== 1) {
     return {
       onRemote: false,
@@ -763,7 +771,7 @@ function componentSelectionOnRemote(
       reason: `${path}: index gitlink ${indexPin.stdout.trim()} is not on ${target}; push it to the component remote ${remote} before removal`,
     }
   }
-  const pinAncestry = ancestorOf(store, headPin.stdout.trim(), target)
+  const pinAncestry = ancestorOf(store, headPin.stdout.trim(), targetOid)
   if (pinAncestry.code !== 0 && pinAncestry.code !== 1) {
     return {
       onRemote: false,
@@ -776,19 +784,11 @@ function componentSelectionOnRemote(
       reason: `${path}: HEAD gitlink ${headPin.stdout.trim()} is not on ${target}; push it to the component remote ${remote} before removal`,
     }
   }
-  const targetCommit = gitText(store, ["rev-parse", "--verify", `${target}^{commit}`])
-  if (targetCommit.code !== 0) {
-    return {
-      onRemote: false,
-      reason: `${path}: cannot read remote target ${target} in ${store} (git exit ${targetCommit.code}); fetch its component remote ${remote} before removal`,
-    }
-  }
-  const targetOid = targetCommit.stdout.trim()
   const refs = gitText(store, ["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads", "refs/tags"])
   if (refs.code !== 0) {
     return {
       onRemote: false,
-      reason: `${path}: cannot read local heads and tags in ${store} (git exit ${refs.code}); inspect the component refs before removal`,
+      reason: `${path}: cannot read local heads and tags in ${store} (git exit ${refs.code}: ${refs.stderr}); inspect the component refs before removal`,
     }
   }
   for (const line of refs.stdout.split("\n")) {

@@ -71,6 +71,29 @@ describe("status --removal verdict", () => {
     expect(result).not.toHaveProperty("offRemote")
   })
 
+  test("a missing component remote target keeps dirt and names the fetch cure", async () => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-removal-missing-target-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const checkout = join(fixture.product, "packages/alpha")
+    const next = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
+    git(checkout, "fetch", "-q", "origin")
+    git(checkout, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    git(checkout, "checkout", "-q", "--detach", next)
+    git(fixture.product, "add", "packages/alpha")
+    git(checkout, "update-ref", "-d", "refs/remotes/origin/main")
+    const { code, result, text } = await removal(fixture.product)
+    expect(code).toBe(1)
+    expect(result.records).toEqual(["M  packages/alpha/alpha.ts"])
+    expect(result.offRemote).toHaveLength(1)
+    expect(result.offRemote?.[0]?.record).toBe(result.records[0])
+    const reason = result.offRemote?.[0]?.reason
+    expect(reason).toContain("cannot read remote target refs/remotes/origin/main")
+    expect(reason).toContain("fatal:")
+    expect(reason).toContain("fetch its component remote origin before removal")
+    expect(text.trim()).toBe(reason)
+  })
+
   test("an archive tag off the component remote keeps dirt and names its cure", async () => {
     const root = mkdtempSync(join(canonicalTmpdir(), "git-super-removal-archive-tag-"))
     roots.push(root)
@@ -131,7 +154,7 @@ describe("status --removal verdict", () => {
     expect(code).toBe(1)
     expect(result.records.some((record) => record.includes("scratch.txt"))).toBe(true)
     expect(result.offRemote?.[0]?.record).toBe(result.records[0])
-    expect(result.offRemote?.[0]?.reason).toContain("uncommitted changes")
+    expect(result.offRemote?.[0]?.reason).toContain("uncommitted or untracked files")
     expect(result.offRemote).toHaveLength(2)
     expect(text.trim()).toBe(result.offRemote?.[0]?.reason)
   })
