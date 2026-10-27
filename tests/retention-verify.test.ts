@@ -209,6 +209,43 @@ function retirementArgs(artifactDir: string): string[] {
 }
 
 describe("retention verify gates 1-6", () => {
+  it("native legacy audit preserves the original and creates a distinct immutable record each run", async () => {
+    const artifactDir = mkdtempSync(join("/var/tmp", "git-super-legacy-audit-"))
+    const createdLeasePaths: string[] = []
+    try {
+      await prepareRetirementFixture(artifactDir, createdLeasePaths)
+      const manifestPath = join(base.entry, "manifest.json")
+      const legacy = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, unknown>
+      // These are strict modern parser metadata, not inputs to the six safety evaluators.
+      for (const field of ["repositories", "writerLocks", "createdWriterLocks", "notCompared"]) delete legacy[field]
+      writeFileSync(manifestPath, `${JSON.stringify(legacy, null, 2)}\n`)
+      const original = readFileSync(manifestPath)
+      const args = retirementArgs(artifactDir).map((argument) => (argument === "retire" ? "audit" : argument))
+      for (let run = 0; run < 2; run += 1) {
+        const stdout = outputSink()
+        const stderr = outputSink()
+        expect(await runCli(args, stdout, stderr), stderr.output || stdout.output).toBe(0)
+        expect(readFileSync(manifestPath)).toEqual(original)
+        const records = readdirSync(base.entry).filter((name) => /^retention-audit-[a-f0-9]{64}\.json$/.test(name))
+        expect(records).toHaveLength(run + 1)
+        for (const name of records) {
+          const bytes = readFileSync(join(base.entry, name))
+          expect(name).toBe(`retention-audit-${createHash("sha256").update(bytes).digest("hex")}.json`)
+          const record = JSON.parse(bytes.toString("utf8")) as Record<string, unknown>
+          expect(record["original"]).toEqual({
+            path: manifestPath,
+            sha256: createHash("sha256").update(original).digest("hex"),
+            byteLength: original.length,
+          })
+          expect(record["schema"]).toBe("git-super/retention-audit/1")
+        }
+      }
+    } finally {
+      rmSync(artifactDir, { recursive: true, force: true })
+      for (const path of createdLeasePaths) rmSync(path, { recursive: true, force: true })
+    }
+  })
+
   // Root-only containment misses aliases below an otherwise external artifact directory.
   it.each(["metadata-directory", "metadata-file", "sidecars", "certificate"])(
     "preserves custody before writing through a %s artifact alias",

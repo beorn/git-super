@@ -3,6 +3,7 @@ import { lstatSync, readFileSync, readdirSync, realpathSync, rmSync } from "node
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { acquireFlockWithTimeout, type FlockHandle } from "@bearly/flock"
 import { DEFAULT_MUTATION_LOCK_WAIT_MS } from "./exclusive.ts"
+import { canonicalEstateScan } from "./retention-estate.ts"
 import { gitSuperResult, type GitResultDetail, type GitSuperRepositoryResult, type GitSuperResult } from "./result.ts"
 import { verifyRetainedEntry, type RetentionVerifyOptions, type RetentionVerifyResult } from "./retention-verify.ts"
 import { acquireRemovalWriterLeases, readRetainedPointer, removeRetainedPointer } from "./worktree-removal.ts"
@@ -44,6 +45,7 @@ function proofFacts(proof: RetentionVerifyResult): { facts: string; path: string
   if (proof.certificate === undefined || proof.artifactDir === undefined) {
     throw new Error(`candidate ${proof.entry} has no certificate or artifact directory`)
   }
+  if (proof.estate === undefined) throw new Error(`candidate ${proof.entry} has no estate census`)
   const bytes = readFileSync(proof.certificate.path)
   const artifactDir = proof.artifactDir
   if (createHash("sha256").update(bytes).digest("hex") !== proof.certificate.digest) {
@@ -65,6 +67,10 @@ function proofFacts(proof: RetentionVerifyResult): { facts: string; path: string
     const entries: [string, unknown][] = []
     for (const [key, item] of Object.entries(value).sort(([a], [b]) => a.localeCompare(b))) {
       if (depth === 0 && (key === "clock" || key === "elapsedMs")) continue
+      if (depth === 0 && key === "estate" && item !== null && typeof item === "object" && !Array.isArray(item)) {
+        entries.push([key, canonicalEstateScan(item)])
+        continue
+      }
       entries.push([
         key,
         artifactPaths.has(key) && typeof item === "string" && within(artifactDir, item)
@@ -74,7 +80,10 @@ function proofFacts(proof: RetentionVerifyResult): { facts: string; path: string
     }
     return Object.fromEntries(entries)
   }
-  return { facts: JSON.stringify(stable(certificate, 0)), path: proof.certificate.path }
+  return {
+    facts: JSON.stringify({ certificate: stable(certificate, 0), estate: canonicalEstateScan(proof.estate) }),
+    path: proof.certificate.path,
+  }
 }
 
 function pointers(proof: RetentionVerifyResult): ReturnType<typeof readRetainedPointer>[] {

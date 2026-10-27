@@ -27,6 +27,11 @@ export interface EstateBorrower {
   readonly target: string
 }
 
+function compareEstateEdges(left: EstateBorrower, right: EstateBorrower): number {
+  if (left.borrower !== right.borrower) return left.borrower < right.borrower ? -1 : 1
+  return left.target < right.target ? -1 : left.target > right.target ? 1 : 0
+}
+
 export interface EstateScan {
   readonly status: "pass" | "blocked" | "unknown"
   readonly detail: string
@@ -37,6 +42,45 @@ export interface EstateScan {
   readonly registries: readonly string[]
   /** Survivors outside R that borrow into an object directory inside R. */
   readonly survivorIntoRemoval: readonly EstateBorrower[]
+}
+
+/** Complete estate identity: only the named top-level sets are unordered; no fields or duplicates are omitted. */
+export function canonicalEstateScan(scan: object): string {
+  const sets = new Set(["roots", "objectDirs", "registries", "borrowers", "survivorIntoRemoval"])
+  const compare = (left: string, right: string): number => (left < right ? -1 : left > right ? 1 : 0)
+  const edgePart = (value: unknown, field: string): string => {
+    if (value !== null && typeof value === "object") {
+      const part: unknown = Reflect.get(value, field)
+      if (typeof part === "string") return part
+    }
+    return JSON.stringify(value)
+  }
+  const stable = (value: unknown, depth: number, key: string): unknown => {
+    if (Array.isArray(value)) {
+      const items = value.map((item) => stable(item, depth + 1, ""))
+      if (depth !== 1 || !sets.has(key)) return items
+      return items.sort((left, right) => {
+        if (key === "borrowers" || key === "survivorIntoRemoval") {
+          const pair = compareEstateEdges(
+            { borrower: edgePart(left, "borrower"), target: edgePart(left, "target") },
+            { borrower: edgePart(right, "borrower"), target: edgePart(right, "target") },
+          )
+          if (pair !== 0) return pair
+        }
+        return compare(
+          typeof left === "string" ? left : JSON.stringify(left),
+          typeof right === "string" ? right : JSON.stringify(right),
+        )
+      })
+    }
+    if (value === null || typeof value !== "object") return value
+    return Object.fromEntries(
+      Object.entries(value)
+        .sort(([left], [right]) => compare(left, right))
+        .map(([field, item]) => [field, stable(item, depth + 1, field)]),
+    )
+  }
+  return JSON.stringify(stable(scan, 0, ""))
 }
 
 function within(parent: string, path: string): boolean {
@@ -252,12 +296,17 @@ export function scanEstate(
       removalRoots.some((root) => within(root, edge.target)) &&
       !removalRoots.some((root) => within(root, edge.borrower)),
   )
+  // The example must not make otherwise identical complete censuses depend on filesystem walk order.
+  const firstSurvivor = survivorIntoRemoval.reduce<EstateBorrower | undefined>(
+    (first, edge) => (first === undefined || compareEstateEdges(edge, first) < 0 ? edge : first),
+    undefined,
+  )
   return {
     status: survivorIntoRemoval.length === 0 ? "pass" : "blocked",
     detail:
       survivorIntoRemoval.length === 0
         ? `${objectDirs.size} object dir(s), ${alternatesFiles} alternates file(s), ${borrowers.length} reverse link(s)`
-        : `${survivorIntoRemoval.length} survivor borrower(s) into the removal set, e.g. ${survivorIntoRemoval[0]!.borrower} -> ${survivorIntoRemoval[0]!.target}`,
+        : `${survivorIntoRemoval.length} survivor borrower(s) into the removal set, e.g. ${firstSurvivor!.borrower} -> ${firstSurvivor!.target}`,
     roots,
     objectDirs: [...objectDirs].sort(),
     alternatesFiles,
