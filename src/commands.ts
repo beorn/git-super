@@ -423,12 +423,15 @@ const retentionEnroll = commandNode<CommandContext, RetentionEnrollParams, Reten
     "Plan actual retained dependencies read-only; explicit apply registers linked borrowers under the existing common writer lease without rewriting proofs.",
   params: params((value) => {
     const input = record(value)
-    if (typeof input.root !== "string" || input.root.trim() === "")
+    if (typeof input.root !== "string" || input.root.trim() === "") {
       throw new Error("worktree retention enroll requires --root <declared retained root>")
-    if (typeof input.common !== "string" || input.common.trim() === "")
+    }
+    if (typeof input.common !== "string" || input.common.trim() === "") {
       throw new Error("worktree retention enroll requires --common <Git common directory>")
-    if (input.apply !== undefined && typeof input.apply !== "boolean")
+    }
+    if (input.apply !== undefined && typeof input.apply !== "boolean") {
       throw new Error("worktree retention enroll apply must be a boolean")
+    }
     return { root: input.root, common: input.common, ...(input.apply === true ? { apply: true } : {}) }
   }),
   run: (context, input) =>

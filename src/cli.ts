@@ -1250,10 +1250,11 @@ async function writeResult(
     stdout.write(
       `children ${report.children}, inspected ${report.inspected}, proposed ${report.proposed.length}, enrolled ${report.enrolled}, complete ${report.complete}\n`,
     )
-    for (const row of report.entries)
+    for (const row of report.entries) {
       stdout.write(
         `${row.classification} ${row.entry}${row.registration === undefined ? "" : " -> " + row.registration}${row.reason === null ? "" : ": " + row.reason}\n`,
       )
+    }
     for (const error of report.errors) stderr.write(error + "\n")
   } else if (captured.node === nodes.worktree.retention.compact) {
     const report = result as CompactRetainedRootReport

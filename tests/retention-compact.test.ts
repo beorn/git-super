@@ -1042,8 +1042,9 @@ describe("retention enrollment", () => {
     const root = join(scratch, "retained")
     mkdirSync(root)
     const { entry } = buildRetainedEntry(root, "child")
-    if (shape === "incoherent-pair")
+    if (shape === "incoherent-pair") {
       writeStoredProof(entry, { ...storedProof(entry), manifest: join(scratch, "foreign/child/manifest.json") })
+    }
     if (shape === "relative-record") writeStoredProof(entry, { ...storedProof(entry), retained: "child/modules" })
     if (shape === "redirected-manifest") {
       const bytes = readFileSync(join(entry, "manifest.json"))
