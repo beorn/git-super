@@ -1611,7 +1611,8 @@ async function retainResolvedWorktreeModules(context: {
   if (
     retained !== null &&
     (retainedManifest.externalObjectStores.length > 0 ||
-      Object.keys(retainedManifest.entries).some((key) => key.endsWith("objects/info/alternates")))
+      (privateProjection === undefined &&
+        Object.keys(retainedManifest.entries).some((key) => key.endsWith("objects/info/alternates"))))
   ) {
     registerRetainedBorrower(common, retained, proof.manifest)
   }
