@@ -32,7 +32,7 @@ describe("#31029 branch removal must not follow a symbolic ref", () => {
   it.each(["already symbolic", "rebound before transaction"] as const)(
     "keeps refs/heads/main when the named branch is %s",
     async (mode) => {
-      const root = await mkdtemp(join(canonicalTmpdir(), "git-super-symref-35029-"))
+      const root = await mkdtemp(join(canonicalTmpdir(), "git-super-symref-31029-"))
       try {
         const repo = join(root, "repo")
         const tip = createRepository(repo, "root.txt", "root\n")
@@ -74,6 +74,7 @@ describe("#31029 branch removal must not follow a symbolic ref", () => {
         if (mode === "already symbolic") {
           expect(removalError).toBeInstanceOf(Error)
           expect(String(removalError)).toMatch(/task\/sym.*symbolic/iu)
+          expect(String(removalError)).toContain("git symbolic-ref --delete refs/heads/task/sym")
           expect(git(repo, ["symbolic-ref", `refs/heads/${branch}`]).trim()).toBe("refs/heads/main")
         } else {
           // Chief fa34f6ee: the native transaction may remove the literal alias introduced after inspection.
@@ -87,7 +88,7 @@ describe("#31029 branch removal must not follow a symbolic ref", () => {
   )
 
   it("keeps the target when the symref names a branch other than main", async () => {
-    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-symref-other-35029-"))
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-symref-other-31029-"))
     try {
       const repo = join(root, "repo")
       const tip = createRepository(repo, "root.txt", "root\n")
@@ -115,7 +116,7 @@ describe("#31029 branch removal must not follow a symbolic ref", () => {
   })
 
   it("control: a plain branch is still deleted and main is untouched", async () => {
-    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-plain-35029-"))
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-plain-31029-"))
     try {
       const repo = join(root, "repo")
       const tip = createRepository(repo, "root.txt", "root\n")

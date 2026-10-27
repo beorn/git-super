@@ -1714,8 +1714,8 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       return listWorktrees(git, repo)
     },
     /**
-     * Remove a local name only at its exact tip; it writes no ref (30683). The existing worktree writer lock
-     * excludes a concurrent store.add; the ref transaction refuses a moved branch, and an optional verify line
+     * Remove only the literal local ref at its exact tip; pre-existing symbolic aliases are refused.
+     * The existing worktree writer lock excludes a concurrent store.add; the ref transaction refuses a moved branch, and an optional verify line
      * refuses unless that ref still holds that oid in the same transaction.
      * Callers own eligibility, attribution and journal policy. This never removes a worktree or remote ref.
      * beforeRemove rechecks caller authority under the acquired lock; throwing preserves the branch.
@@ -1748,10 +1748,14 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         if (held !== undefined) throw new Error(held)
         const symbolic = await git.run(repo, ["symbolic-ref", "--quiet", "--no-recurse", ref], true)
         if (symbolic.code === 0) {
-          throw new Error(`branch ${branch}: symbolic reference to ${symbolic.stdout.trim()}; refusing branch removal`)
+          throw new Error(
+            `branch ${branch}: symbolic reference to ${symbolic.stdout.trim()}; refusing branch removal; it is an alias, not a branch: run git symbolic-ref --delete ${ref} to remove only the alias`,
+          )
         }
         if (symbolic.code !== 1) {
-          throw new Error(`branch ${branch}: symbolic reference inspection failed: ${symbolic.stderr.trim()}`)
+          throw new Error(
+            `branch ${branch}: symbolic reference inspection failed (exit ${symbolic.code}): ${symbolic.stderr.trim()}`,
+          )
         }
         const verifyLine = verify === undefined ? "" : `verify ${verify.ref} ${verify.oid}\n`
         await git.run(
