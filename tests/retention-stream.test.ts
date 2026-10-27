@@ -96,9 +96,10 @@ describe("retention stream primitives (#27443(b))", () => {
     const child = spawnSync(process.execPath, ["-e", script], { encoding: "utf8", timeout: 30_000 })
     expect(child.status, child.stderr).toBe(0)
     const observation = JSON.parse(child.stdout)
-    expect(observation.bytes).toBe("foreign bytes")
-    expect(observation.identity).toBe(true)
-    expect([null, "EEXIST"]).toContain(observation.error)
+    expect([
+      { bytes: "foreign bytes", identity: true, error: null },
+      { bytes: "foreign bytes", identity: true, error: "EEXIST" },
+    ]).toContainEqual(observation)
   })
 
   test("streamed publication replaces a dangling final-name symlink without writing its target", async () => {
