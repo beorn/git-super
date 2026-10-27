@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Resolve artifact-directory aliases before retention proof writes; report the canonical external path and preserve typed ancestor errors.
+- Resolve artifact-directory and destination aliases before retention proof writes; publish certificates through the existing streamed sidecar family's atomic rename, preserving retained custody and typed ancestor errors.
 
 - Add explicit retained-entry retirement with existing-only writer leases, held proof comparison, exact pointer cleanup and partial-state receipts.
 

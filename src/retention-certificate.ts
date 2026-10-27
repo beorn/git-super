@@ -4,8 +4,9 @@
  * certificate is never a delete capability, and GitSuper writes nothing under `E`.
  */
 import { createHash } from "node:crypto"
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs"
 import { join, relative, sep } from "node:path"
+import { publishArtifact } from "./retention-stream.ts"
 
 export const RETENTION_CERTIFICATE_SCHEMA = "git-super/retention-certificate/1"
 
@@ -47,8 +48,8 @@ export function emitCertificate(certificate: unknown, artifactDir: string): Cert
     const bytes = `${JSON.stringify(certificate, null, 2)}\n`
     const digest = createHash("sha256").update(bytes).digest("hex")
     const path = join(artifactDir, `retirement-certificate-${digest.slice(0, 16)}.json`)
-    writeFileSync(path, bytes)
-    writeFileSync(join(artifactDir, "retirement-certificate.json"), bytes)
+    publishArtifact(path, bytes)
+    publishArtifact(join(artifactDir, "retirement-certificate.json"), bytes)
     return { status: "pass", detail: `certificate ${path} (sha256 ${digest})`, path, digest }
   } catch (error) {
     return {

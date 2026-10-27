@@ -20,11 +20,13 @@ import {
   writeFileSync,
 } from "node:fs"
 import { spawnSync } from "node:child_process"
+import { createHash } from "node:crypto"
 import { tmpdir } from "node:os"
-import { dirname, join } from "node:path"
+import { dirname, join, relative } from "node:path"
 import { tryAcquireFlock } from "@bearly/flock"
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest"
 import { runCli } from "../src/cli.ts"
+import { digestDirectory, emitCertificate } from "../src/retention-certificate.ts"
 import { alternateEntries } from "../src/alternates.ts"
 import type { GitSuperResult } from "../src/result.ts"
 import { scanContents, type ComponentContents } from "../src/retention-contents.ts"
@@ -206,6 +208,64 @@ function retirementArgs(artifactDir: string): string[] {
 }
 
 describe("retention verify gates 1-6", () => {
+  // Root-only containment misses aliases below an otherwise external artifact directory.
+  it.each(["metadata-directory", "metadata-file", "sidecars", "certificate"])(
+    "preserves custody before writing through a %s artifact alias",
+    async (kind) => {
+      const artifactDir = mkdtempSync(join("/var/tmp", "git-super-descendant-artifact-"))
+      try {
+        let alias = join(artifactDir, kind === "sidecars" ? "sidecars" : "metadata")
+        let target = base.entry
+        if (kind === "metadata-file") {
+          const copy = join(base.entry, "modules")
+          const key = (readdirSync(copy, { recursive: true }) as string[]).find(
+            (path) => path.endsWith("/config") && !path.split("/").includes("objects"),
+          )
+          if (key === undefined) throw new Error("native retained fixture has no non-object config")
+          alias = join(artifactDir, "metadata", relative(copy, join(copy, key)))
+          target = join(base.entry, "manifest.json")
+        } else if (kind === "certificate") {
+          alias = join(artifactDir, "retirement-certificate.json")
+          target = join(base.entry, "manifest.json")
+        }
+        mkdirSync(dirname(alias), { recursive: true })
+        symlinkSync(target, alias)
+        const before = digestDirectory(base.entry)
+        const proof = await verifyRetainedEntry({
+          entry: base.entry,
+          root: base.root,
+          artifactDir,
+          namespaceRoots: [fixtureRoot as string],
+          clock: eligible(),
+        })
+        expect(digestDirectory(base.entry)).toBe(before)
+        expect(proof.gates.find((gate) => gate.gate === "copy-manifest")).toMatchObject({ status: "blocked" })
+        expect(proof.verdict).toBe("blocked")
+      } finally {
+        rmSync(artifactDir, { recursive: true, force: true })
+      }
+    },
+  )
+
+  it("publishes the computed certificate name without following its existing symlink", () => {
+    const artifactDir = mkdtempSync(join("/var/tmp", "git-super-certificate-publication-"))
+    try {
+      const certificate = { entry: base.entry, verdict: "candidate" }
+      const bytes = `${JSON.stringify(certificate, null, 2)}\n`
+      const digest = createHash("sha256").update(bytes).digest("hex")
+      const path = join(artifactDir, `retirement-certificate-${digest.slice(0, 16)}.json`)
+      const target = join(base.entry, "manifest.json")
+      const before = readFileSync(target)
+      symlinkSync(target, path)
+      expect(emitCertificate(certificate, artifactDir).status).toBe("pass")
+      expect(readFileSync(target)).toEqual(before)
+      expect(readFileSync(path, "utf8")).toBe(bytes)
+      expect(emitCertificate(certificate, artifactDir).status).toBe("pass")
+    } finally {
+      rmSync(artifactDir, { recursive: true, force: true })
+    }
+  })
+
   it.each(["missing", "inaccessible", "loop"])("preserves the typed %s prospective-ancestor failure", (failure) => {
     const root = mkdtempSync(join("/var/tmp", "git-super-prospective-path-"))
     const parent = join(root, "ancestor")

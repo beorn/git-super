@@ -9,7 +9,7 @@
  */
 import { spawnSync } from "node:child_process"
 import { createHash } from "node:crypto"
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, test } from "vitest"
@@ -55,6 +55,19 @@ function sha256(bytes: Buffer): string {
 }
 
 describe("retention stream primitives (#27443(b))", () => {
+  test("streamed publication replaces a dangling final-name symlink without writing its target", async () => {
+    const dir = tmp("git-super-stream-")
+    const bytes = Buffer.from("a\n")
+    const final = join(dir, `${sha256(bytes)}.txt`)
+    const target = join(dir, "untouched-target")
+    symlinkSync(target, final)
+    const writer = new SidecarWriter(dir)
+    writer.add("a")
+    const result = await writer.finish()
+    expect(readFileSync(result.path)).toEqual(bytes)
+    expect(existsSync(target)).toBe(false)
+  })
+
   test("a selected executable receives exactly its supplied environment", async () => {
     const stream = gitLineStream(["-e", "process.stdout.write(process.env.ONLY ?? 'missing')"], {
       executable: process.execPath,

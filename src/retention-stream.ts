@@ -26,7 +26,7 @@ import {
   writeFileSync,
   writeSync,
 } from "node:fs"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 import { StringDecoder } from "node:string_decoder"
 
 /** A durable, content-addressed sidecar: `<dir>/<sha256>.<suffix>`. */
@@ -57,6 +57,35 @@ function tempName(dir: string, prefix: string): string {
   return join(dir, `.${prefix}-${process.pid}-${tempCounter}`)
 }
 
+/** Publish whole bytes or an already-streamed sibling by replacing the final name, never following it. */
+export function publishArtifact(path: string, contents: string | { temporaryPath: string }): void {
+  const temporary = typeof contents === "string" ? tempName(dirname(path), "artifact") : contents.temporaryPath
+  let owned = false
+  try {
+    if (typeof contents === "string") {
+      const fd = openSync(temporary, "wx")
+      owned = true
+      try {
+        writeFileSync(fd, contents)
+      } finally {
+        closeSync(fd)
+      }
+    }
+    renameSync(temporary, path)
+  } catch (error) {
+    if (owned) {
+      try {
+        unlinkSync(temporary)
+      } catch (cleanup) {
+        if ((cleanup as NodeJS.ErrnoException).code !== "ENOENT") {
+          throw new AggregateError([error, cleanup], `artifact publication failed and could not remove ${temporary}`)
+        }
+      }
+    }
+    throw error
+  }
+}
+
 /**
  * Streams lines to a temporary file, hashing as it goes, then renames to `<sha256>.<suffix>`.
  * `add` is synchronous so a synchronous merge loop can feed it; `finish` reads the temp back and
@@ -80,7 +109,7 @@ export class SidecarWriter {
     this.tempPath = tempName(dir, "sidecar")
     try {
       mkdirSync(dir, { recursive: true })
-      this.fd = openSync(this.tempPath, "w")
+      this.fd = openSync(this.tempPath, "wx")
     } catch (error) {
       throw new SidecarError(
         `cannot create sidecar in ${dir}: ${error instanceof Error ? error.message : String(error)}`,
@@ -122,7 +151,7 @@ export class SidecarWriter {
         `sidecar read-back mismatch in ${this.tempPath}: expected ${sha256}, saw ${readback.sha256}`,
       )
     }
-    renameSync(this.tempPath, final)
+    publishArtifact(final, { temporaryPath: this.tempPath })
     return { path: final, sha256, bytes: this.bytes, count: this.count }
   }
 

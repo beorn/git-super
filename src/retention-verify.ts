@@ -429,6 +429,7 @@ export async function verifyRetainedEntry(options: RetentionVerifyOptions): Prom
 
   // ---- Gate 2: full copy-to-manifest comparison + non-object metadata sidecar -----------
   let metadataBundleDigest: string | undefined
+  let sidecarDir: string | undefined
   try {
     const expectedTop = proof.retained === null ? ["manifest.json"] : ["manifest.json", "modules"]
     const actualTop = readdirSync(entryReal).sort()
@@ -569,7 +570,46 @@ export async function verifyRetainedEntry(options: RetentionVerifyOptions): Prom
         return finish()
       }
       result.artifactDir = artifactDir
-      const bundle = join(artifactDir, "metadata")
+      const bundle = canonicalProspectivePath(join(artifactDir, "metadata"))
+      sidecarDir = canonicalProspectivePath(join(artifactDir, "sidecars"))
+      const nonObject = Object.keys(expectedEntries)
+        .filter((key) => !key.split("/").includes("objects"))
+        .sort()
+      const metadataFiles = nonObject.flatMap((key) => {
+        const want = actual.entries[key]
+        return want?.kind === "file"
+          ? [
+              {
+                source: join(expectedCopyRoot, key),
+                target: canonicalProspectivePath(join(bundle, key)),
+                sha256: want.sha256,
+              },
+            ]
+          : []
+      })
+      // Preflight the exact write set before creating even the artifact directory.
+      // Metadata writes below iterate this same list; sidecars keep this canonical directory.
+      const destinations = [
+        bundle,
+        sidecarDir,
+        canonicalProspectivePath(join(artifactDir, "retirement-certificate.json")),
+        ...metadataFiles.map((file) => file.target),
+      ]
+      for (const destination of destinations) {
+        if (inside(entryReal, destination) || inside(result.root, destination)) {
+          push(
+            refusal(
+              "copy-manifest",
+              `pass artifact destination ${destination} is inside the retention custody ${result.root}`,
+              {
+                path: destination,
+                remedy: "Choose artifact destinations outside the declared retention root and entry.",
+              },
+            ),
+          )
+          return finish()
+        }
+      }
       try {
         mkdirSync(artifactDir, { recursive: true })
         mkdirSync(bundle, { recursive: true })
@@ -586,13 +626,7 @@ export async function verifyRetainedEntry(options: RetentionVerifyOptions): Prom
         )
         return finish()
       }
-      const nonObject = Object.keys(expectedEntries)
-        .filter((key) => !key.split("/").includes("objects"))
-        .sort()
-      const bytes = nonObject.reduce(
-        (total, key) => total + (actual.entries[key]?.kind === "file" ? statSync(join(expectedCopyRoot, key)).size : 0),
-        0,
-      )
+      const bytes = metadataFiles.reduce((total, file) => total + statSync(file.source).size, 0)
       // Contract: at most 256 MiB of non-object metadata per entry in the initial pass. Over the
       // bound is `unknown` naming the observed bytes and the cap, never a truncated bundle.
       const metadataBounds = options.bounds?.metadata ?? DEFAULT_NON_OBJECT_METADATA_BOUNDS
@@ -620,16 +654,12 @@ export async function verifyRetainedEntry(options: RetentionVerifyOptions): Prom
         )
         return finish()
       }
-      for (const key of nonObject) {
-        const want = actual.entries[key]
-        if (want?.kind !== "file") continue
-        const source = join(expectedCopyRoot, key)
-        const target = join(bundle, key)
+      for (const { source, target, sha256 } of metadataFiles) {
         mkdirSync(dirname(target), { recursive: true })
         copyFileSync(source, target)
-        if (createHash("sha256").update(readFileSync(target)).digest("hex") !== want.sha256) {
+        if (createHash("sha256").update(readFileSync(target)).digest("hex") !== sha256) {
           push(
-            refusal("copy-manifest", `metadata bundle ${target} read-back does not match manifest ${want.sha256}`, {
+            refusal("copy-manifest", `metadata bundle ${target} read-back does not match manifest ${sha256}`, {
               path: target,
               remedy: "Preserve the entry and investigate the pass directory; the sidecar is not byte-exact.",
             }),
@@ -714,7 +744,7 @@ export async function verifyRetainedEntry(options: RetentionVerifyOptions): Prom
   // ---- Gate 4: candidate Git contents ---------------------------------------------------
   // Gate 2 has already proved the artifact directory writable, external and non-temporary; the
   // content-addressed sidecars live beside its metadata bundle, never under E or R.
-  if (result.artifactDir === undefined) {
+  if (result.artifactDir === undefined || sidecarDir === undefined) {
     push(
       incomplete("candidate-contents", "no artifact directory is available for the content-addressed sidecars", {
         remedy: "Supply an external, caller-owned --artifact-dir outside the retention custody.",
@@ -722,7 +752,6 @@ export async function verifyRetainedEntry(options: RetentionVerifyOptions): Prom
     )
     return finish()
   }
-  const sidecarDir = join(result.artifactDir, "sidecars")
   const contents: ContentsScan = await scanContents(expectedCopyRoot, proof.entries, [entryReal], {
     sidecarDir,
     ...(options.gitRun === undefined ? {} : { run: options.gitRun }),
