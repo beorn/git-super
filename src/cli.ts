@@ -1104,7 +1104,8 @@ async function writeResult(
     }
   }
   if (captured.node === nodes.status) {
-    for (const { reason } of (result as SuperStatusResult).offRemote ?? []) stderr.write(`${reason}\n`)
+    const reasons = new Set((result as SuperStatusResult).offRemote?.map(({ reason }) => reason))
+    for (const reason of reasons) stderr.write(`${reason}\n`)
     for (const problem of (result as SuperStatusResult).submoduleProblems) {
       stderr.write(
         `${problem.path}: ${problem.reason}${problem.gitDir === undefined ? "" : `; Git directory ${problem.gitDir}`}\n`,

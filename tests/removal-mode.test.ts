@@ -126,11 +126,14 @@ describe("status --removal verdict", () => {
     git(checkout, "fetch", "-q", "origin")
     git(checkout, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
     writeFileSync(join(checkout, "scratch.txt"), "local\n")
-    const { code, result } = await removal(fixture.product)
+    writeFileSync(join(checkout, "other-scratch.txt"), "local\n")
+    const { code, result, text } = await removal(fixture.product)
     expect(code).toBe(1)
     expect(result.records.some((record) => record.includes("scratch.txt"))).toBe(true)
     expect(result.offRemote?.[0]?.record).toBe(result.records[0])
     expect(result.offRemote?.[0]?.reason).toContain("uncommitted changes")
+    expect(result.offRemote).toHaveLength(2)
+    expect(text.trim()).toBe(result.offRemote?.[0]?.reason)
   })
 
   test("a local branch that is not on the remote stays dirt", async () => {

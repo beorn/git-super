@@ -840,8 +840,9 @@ export function admitOnRemoteSelections(status: SuperStatusResult): SuperStatusR
     records.push(record)
   }
   const { offRemote: previousOffRemote, ...unchanged } = status
-  if (onRemote.length === (status.onRemote ?? []).length && offRemote.length === 0 && previousOffRemote === undefined)
+  if (onRemote.length === (status.onRemote ?? []).length && offRemote.length === 0 && previousOffRemote === undefined) {
     return status
+  }
   return {
     ...unchanged,
     records,
