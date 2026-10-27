@@ -9,7 +9,16 @@
  */
 import { spawnSync } from "node:child_process"
 import { createHash } from "node:crypto"
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
+import {
+  existsSync,
+  lstatSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, test } from "vitest"
@@ -55,6 +64,44 @@ function sha256(bytes: Buffer): string {
 }
 
 describe("retention stream primitives (#27443(b))", () => {
+  test.each(["run", "merge", "labeled"])("a %s spill collision preserves the existing file", (kind) => {
+    const dir = tmp("git-super-spill-")
+    // A fresh process makes the existing spill names reproducible without a production test hook.
+    // If naming changes, successful output is fine; preserving unrelated bytes is the contract.
+    const script = `
+      import { lstatSync, readFileSync, writeFileSync } from "node:fs";
+      import { join } from "node:path";
+      const { externalSortToSidecar, mergeSortedFilesToSidecar, mergeLabeledFiles, oidKey } =
+        await import(${JSON.stringify(new URL("../src/retention-stream.ts", import.meta.url).href)});
+      const dir = ${JSON.stringify(dir)}, kind = ${JSON.stringify(kind)};
+      const collision = join(dir, "." + kind + "-" + process.pid + "-" + (kind === "merge" ? 2 : 1));
+      writeFileSync(collision, "foreign bytes");
+      const before = lstatSync(collision);
+      const inputs = ["a", "b", "c"].map(value => {
+        const path = join(dir, value); writeFileSync(path, value + "\\n"); return path;
+      });
+      let error = null;
+      try {
+        if (kind === "run") await externalSortToSidecar(["b", "a"], { dir });
+        else if (kind === "merge") await mergeSortedFilesToSidecar(inputs,
+          { dir, maxFanIn: 2, keyOf: oidKey, pick: group => group[0] });
+        else await mergeLabeledFiles(inputs.map((path, i) => ({ path, label: String(i) })), { dir, maxFanIn: 2 });
+      } catch (caught) { error = caught.code ?? String(caught); }
+      let bytes = null, identity = false;
+      try { bytes = readFileSync(collision, "utf8"); const after = lstatSync(collision);
+        identity = after.dev === before.dev && after.ino === before.ino;
+      } catch (caught) { if (caught.code !== "ENOENT") throw caught; }
+      process.stdout.write(JSON.stringify({ bytes, identity, error }));
+    `
+    const child = spawnSync(process.execPath, ["-e", script], { encoding: "utf8", timeout: 30_000 })
+    expect(child.status, child.stderr).toBe(0)
+    const observation = JSON.parse(child.stdout)
+    expect([
+      { bytes: "foreign bytes", identity: true, error: null },
+      { bytes: "foreign bytes", identity: true, error: "EEXIST" },
+    ]).toContainEqual(observation)
+  })
+
   test("streamed publication replaces a dangling final-name symlink without writing its target", async () => {
     const dir = tmp("git-super-stream-")
     const bytes = Buffer.from("a\n")
@@ -65,7 +112,7 @@ describe("retention stream primitives (#27443(b))", () => {
     writer.add("a")
     const result = await writer.finish()
     expect(readFileSync(result.path)).toEqual(bytes)
-    expect(existsSync(target)).toBe(false)
+    expect(() => lstatSync(target)).toThrowError(expect.objectContaining({ code: "ENOENT" }))
   })
 
   test("a selected executable receives exactly its supplied environment", async () => {

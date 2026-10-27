@@ -657,7 +657,7 @@ function sortLines(lines: string[]): string[] {
 function writeRun(dir: string, lines: string[]): string {
   sortLines(lines)
   const path = tempName(dir, "run")
-  writeFileSync(path, lines.map((line) => `${line}\n`).join(""))
+  writeFileSync(path, lines.map((line) => `${line}\n`).join(""), { flag: "wx" })
   return path
 }
 
@@ -770,7 +770,7 @@ async function reduceMergeGroup(group: readonly string[], options: MergeFilesOpt
   // Stream the merged group to its file: a merge of already-sorted inputs IS sorted, so the output
   // needs no in-memory array or re-sort, and a merge level larger than the fan-in stays bounded.
   const path = tempName(options.dir, "merge")
-  const fd = openSync(path, "w")
+  const fd = openSync(path, "wx")
   try {
     await mergeSorted(
       group.map((input) => ({ label: input, lines: readLines(input), keyOf: options.keyOf })),
@@ -810,22 +810,17 @@ function pickFirst(groups: readonly Readonly<{ label: string; lines: readonly st
 
 async function writeMergePick(
   entries: readonly Readonly<{ path: string; lines: () => AsyncIterable<string> }>[],
-  path: string,
+  fd: number,
   deadlineOptions: SharedDeadlineOptions,
 ): Promise<void> {
-  const fd = openSync(path, "w")
-  try {
-    await mergeSorted(
-      entries.map((entry) => ({ label: entry.path, lines: entry.lines(), keyOf: oidKey })),
-      (_key, groups) => {
-        const picked = pickFirst(groups)
-        if (picked !== undefined) writeSync(fd, Buffer.from(`${picked}\n`, "utf8"))
-      },
-      deadlineOptions,
-    )
-  } finally {
-    closeSync(fd)
-  }
+  await mergeSorted(
+    entries.map((entry) => ({ label: entry.path, lines: entry.lines(), keyOf: oidKey })),
+    (_key, groups) => {
+      const picked = pickFirst(groups)
+      if (picked !== undefined) writeSync(fd, Buffer.from(`${picked}\n`, "utf8"))
+    },
+    deadlineOptions,
+  )
 }
 
 /**
@@ -853,8 +848,13 @@ export async function mergeLabeledFiles(
       for (let index = 0; index < level.length; index += fanIn) {
         const group = level.slice(index, index + fanIn)
         const path = tempName(dir, "labeled")
+        const fd = openSync(path, "wx")
         temps.push(path)
-        await writeMergePick(group, path, options)
+        try {
+          await writeMergePick(group, fd, options)
+        } finally {
+          closeSync(fd)
+        }
         next.push({ path, lines: () => readLines(path) })
       }
       level = next
