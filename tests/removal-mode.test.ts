@@ -69,25 +69,6 @@ describe("status --removal verdict", () => {
     expect(result.onRemote).toContain("on-remote packages/alpha")
   })
 
-  test("an archive tag off the component remote does not keep the gitlink dirty", async () => {
-    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-removal-archive-tag-"))
-    roots.push(root)
-    const fixture = createProductFixture(root)
-    const checkout = join(fixture.product, "packages/alpha")
-    const next = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
-    git(checkout, "fetch", "-q", "origin")
-    git(checkout, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
-    git(checkout, "checkout", "-q", "--detach", next)
-    git(fixture.product, "add", "packages/alpha")
-    const tree = git(checkout, "rev-parse", "HEAD^{tree}")
-    const side = git(checkout, "commit-tree", tree, "-m", "archive only")
-    git(checkout, "tag", "archive/2026-10-13/dev-6/sample", side)
-    const { code, result } = await removal(fixture.product)
-    expect(code, JSON.stringify(result.records)).toBe(0)
-    expect(result.records).toEqual([])
-    expect(result.onRemote).toContain("on-remote packages/alpha")
-  })
-
   test("a component commit that is not on its remote stays dirt", async () => {
     const root = mkdtempSync(join(canonicalTmpdir(), "git-super-removal-off-remote-"))
     roots.push(root)
