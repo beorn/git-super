@@ -17,6 +17,7 @@ import { isAbsolute, join } from "node:path"
 import { repositoryRoot } from "./git.ts"
 import { ensureCommitObject } from "./objects.ts"
 import { superStatus, type SuperStatusOptions, type SuperStatusResult } from "./status.ts"
+import { enrollRetainedBorrowers, type RetentionEnrollReport } from "./worktree-removal.ts"
 import { admitOnRemoteSelections } from "./worktree-removal.ts"
 import {
   superSubmodulePrepare,
@@ -45,6 +46,7 @@ export type SubmodulePrepareParams = Omit<SuperSubmodulePrepareOptions, "repo" |
 export type WorktreeRemoveParams = Omit<SuperWorktreeRemoveOptions, "repo" | "report">
 export type WorktreeAddParams = Omit<SuperWorktreeAddOptions, "repo" | "env" | "log" | "report">
 export type RetentionVerifyParams = Omit<RetentionVerifyOptions, "clock">
+export type RetentionEnrollParams = Readonly<{ root: string; common: string; apply?: boolean }>
 export type RetentionCompactParams = Readonly<{ root: string; dryRun?: boolean; limit?: number }>
 export type PrivateStoreVerifyParams = Omit<PrivateStoreCandidateOptions, "git">
 export type PrivateStoreVerifyNode = CommandNode<CommandContext, PrivateStoreVerifyParams, PrivateStoreCandidateResult>
@@ -415,6 +417,24 @@ const retentionVerify = commandNode<CommandContext, RetentionVerifyParams, Reten
   run: (_context, input) => verifyRetainedEntry(input),
 })
 
+const retentionEnroll = commandNode<CommandContext, RetentionEnrollParams, RetentionEnrollReport>({
+  title: "Enroll retained borrowers in their common registry",
+  description:
+    "Plan actual retained dependencies read-only; explicit apply registers linked borrowers under the existing common writer lease without rewriting proofs.",
+  params: params((value) => {
+    const input = record(value)
+    if (typeof input.root !== "string" || input.root.trim() === "")
+      throw new Error("worktree retention enroll requires --root <declared retained root>")
+    if (typeof input.common !== "string" || input.common.trim() === "")
+      throw new Error("worktree retention enroll requires --common <Git common directory>")
+    if (input.apply !== undefined && typeof input.apply !== "boolean")
+      throw new Error("worktree retention enroll apply must be a boolean")
+    return { root: input.root, common: input.common, ...(input.apply === true ? { apply: true } : {}) }
+  }),
+  run: (context, input) =>
+    enrollRetainedBorrowers({ ...input, ...(context.report === undefined ? {} : { report: context.report }) }),
+})
+
 const retentionCompact = commandNode<CommandContext, RetentionCompactParams, CompactRetainedRootReport>({
   title: "Compact existing retained GitSuper entries",
   description:
@@ -529,6 +549,7 @@ export type GitSuperCommands = Readonly<{
     retention: Readonly<{
       verify: CommandNode<CommandContext, RetentionVerifyParams, RetentionVerifyResult>
       compact: CommandNode<CommandContext, RetentionCompactParams, CompactRetainedRootReport>
+      enroll: CommandNode<CommandContext, RetentionEnrollParams, RetentionEnrollReport>
     }>
     "private-store": Readonly<{
       verify: PrivateStoreVerifyNode
@@ -548,7 +569,7 @@ export const commands = defineCommandNodes({
   worktree: {
     add: worktreeAdd,
     remove: worktreeRemove,
-    retention: { verify: retentionVerify, compact: retentionCompact },
+    retention: { verify: retentionVerify, compact: retentionCompact, enroll: retentionEnroll },
     "private-store": { verify: privateStoreVerify },
   },
 }) satisfies CommandNodeTree<CommandContext> as GitSuperCommands

@@ -1327,6 +1327,17 @@ describe("createGitWorktreeStore", () => {
         const retention = { root: join(root, "retained"), report: (proof: WorktreeRemovalProof) => proofs.push(proof) }
         await store.remove(borrower.linked, { retention })
         const proof = proofs[0]!
+        const stored = JSON.parse(await readFile(proof.manifest, "utf8")) as Record<string, unknown>
+        const oldEntry = join(root, "old", dirname(proof.manifest).split("/").at(-1)!)
+        await writeFile(
+          proof.manifest,
+          JSON.stringify({
+            ...stored,
+            retained: join(oldEntry, "modules"),
+            manifest: join(oldEntry, "manifest.json"),
+          }) + "\n",
+        )
+        const relocatedProof = await readFile(proof.manifest)
         const common = git(fixture.product, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim()
         const registry = join(common, "git-super-retained-borrowers")
         expect(existsSync(registry)).toBe(true)
@@ -1338,11 +1349,84 @@ describe("createGitWorktreeStore", () => {
         await expect(store.remove(owner.linked, { retention })).rejects.toThrow(proof.retained!)
         expect(existsSync(owner.linked)).toBe(true)
         expect(existsSync(owner.objects)).toBe(true)
+        expect(await readFile(proof.manifest)).toEqual(relocatedProof)
       } finally {
         await rm(root, { recursive: true, force: true })
       }
     },
   )
+
+  // @failure The last closure crosses the enrollment deadline but its plan still authorizes pointer writes.
+  // @level l1
+  // @consumer retention enroll five-minute no-partial-plan boundary
+  // Entry-count bounds and checks before each child miss time spent inside the final metadata read.
+  it("refuses apply when the final empty alternates read crosses the inspection deadline", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-enroll-last-deadline-"))
+    try {
+      const fixture = createProductFixture(root)
+      const store = createLocalGitWorktreeStore({ repo: fixture.product })
+      const owner = await addAlphaWorktree(store, root, "owner")
+      const borrower = await addAlphaWorktree(store, root, "borrower")
+      const alternate = join(owner.objects, "info/alternates")
+      await writeFile(alternate, "")
+      await linkObjects(borrower.moduleDir, owner.objects)
+      const retainedRoot = join(root, "retained")
+      await store.remove(borrower.linked, { retention: { root: retainedRoot, report: () => {} } })
+      const common = git(fixture.product, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim()
+      const registry = join(common, "git-super-retained-borrowers")
+      for (const name of readdirSync(registry)) await rm(join(registry, name))
+      const writer = join(common, "yrd-worktree-mutations/writer.lock")
+      const writerBytes = await readFile(writer)
+      let now = Date.now()
+      const clock = vi.spyOn(Date, "now").mockImplementation(() => now)
+      const realRead = vi.mocked(readFileSync).getMockImplementation()!
+      vi.mocked(readFileSync).mockImplementation((...args: Parameters<typeof readFileSync>) => {
+        const bytes = realRead(...args)
+        if (String(args[0]) === alternate) now += 5 * 60_000 + 1
+        return bytes
+      })
+      let stdout = "",
+        stderr = ""
+      try {
+        const code = await runCli(
+          [
+            "--repo",
+            fixture.product,
+            "--json",
+            "worktree",
+            "retention",
+            "enroll",
+            "--root",
+            retainedRoot,
+            "--common",
+            common,
+            "--apply",
+          ],
+          {
+            write: (text) => {
+              stdout += String(text)
+            },
+          },
+          {
+            write: (text) => {
+              stderr += String(text)
+            },
+          },
+        )
+        expect(code, stderr).toBe(1)
+        const report = JSON.parse(stdout) as { boundHit: boolean; enrolled: number; inspected: number }
+        expect(report.boundHit).toBe(true)
+        expect(report.enrolled).toBe(0)
+        expect(readdirSync(registry)).toEqual([])
+        expect(await readFile(writer)).toEqual(writerBytes)
+      } finally {
+        clock.mockRestore()
+        vi.mocked(readFileSync).mockImplementation(realRead)
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
 
   // @failure Unprovable retained alternate custody deletes a lender, or unrelated dangling history blocks it (#26497).
   // @level l1
@@ -1364,6 +1448,15 @@ describe("createGitWorktreeStore", () => {
       const manifestBytes = await readFile(proof.manifest)
       await rm(proof.manifest)
       await expect(store.remove(owner.linked, { retention })).rejects.toThrow(proof.retained!)
+      expect(existsSync(owner.objects)).toBe(true)
+      await writeFile(
+        proof.manifest,
+        JSON.stringify({
+          ...JSON.parse(manifestBytes.toString()),
+          externalObjectStores: [{ path: "packages/alpha/objects", target: 42 }],
+        }),
+      )
+      await expect(store.remove(owner.linked, { retention })).rejects.toThrow("invalid retained objects dependency")
       expect(existsSync(owner.objects)).toBe(true)
       await writeFile(proof.manifest, manifestBytes)
       const realRead = vi.mocked(readFileSync).getMockImplementation()!

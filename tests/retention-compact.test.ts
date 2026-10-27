@@ -29,9 +29,15 @@ import {
 } from "../src/retention-compact.ts"
 import { createLocalGitWorktreeStore } from "../src/worktree.ts"
 import { verifyRetainedEntry } from "../src/retention-verify.ts"
-import { manifest, type WorktreeRemovalProof } from "../src/worktree-removal.ts"
+import {
+  rebuildRetainedCopyProof,
+  type RetentionEnrollReport,
+  manifest,
+  type WorktreeRemovalProof,
+} from "../src/worktree-removal.ts"
 import { canonicalTmpdir, createRepository, git as gitCwd } from "./fixture.ts"
 import { runCli } from "../src/cli.ts"
+import { acquireExclusive } from "../src/exclusive.ts"
 
 const environment: NodeJS.ProcessEnv = {
   ...process.env,
@@ -946,5 +952,214 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
     expect(result.processed).toEqual([healthy.entry])
     expect(existsSync(join(healthy.gitDir, "logs/refs/remotes"))).toBe(false)
     expect(existsSync(join(damaged.gitDir, "logs/refs/remotes"))).toBe(true)
+  })
+})
+
+// @failure Historical alternates-only copies cannot be enrolled safely without rewriting their relocated proofs.
+// @level l1
+// @consumer worktree retention enroll CLI and retained lender guard
+// Compact's mutating relocation tests cannot prove enrollment dry-run, pointer selection, or idempotence.
+describe("retention enrollment", () => {
+  it("plans relocated linked copies without writes and applies exact pointers idempotently", async () => {
+    const scratch = mkdtempSync(join(canonicalTmpdir(), "git-super-enroll-"))
+    roots.push(scratch)
+    const repo = join(scratch, "repo")
+    createRepository(repo, "file.ts", "export const n = 1\n")
+    const common = join(repo, ".git")
+    const root = join(scratch, "retained")
+    mkdirSync(root)
+    const linked = buildRetainedEntry(root, "linked")
+    buildRetainedEntry(root, "durable")
+    const lender = join(common, "worktrees/lender/modules/dep/objects")
+    mkdirSync(join(lender, "info"), { recursive: true })
+    writeFileSync(join(linked.gitDir, "objects/info/alternates"), lender + "\n")
+    const original = {
+      ...storedProof(linked.entry),
+      retained: join(scratch, "old/linked/modules"),
+      manifest: join(scratch, "old/linked/manifest.json"),
+    }
+    writeStoredProof(linked.entry, original)
+    const bytes = readFileSync(join(linked.entry, "manifest.json"))
+    const before = treeDigest(scratch)
+    const stdout = outputSink(),
+      stderr = outputSink()
+    const args = ["--repo", repo, "--json", "worktree", "retention", "enroll", "--root", root, "--common", common]
+    expect(await runCli(args, stdout, stderr), stderr.output).toBe(0)
+    const plan = JSON.parse(stdout.output) as RetentionEnrollReport
+    expect(plan.proposed).toEqual([
+      expect.objectContaining({
+        retained: join(linked.entry, "modules"),
+        manifest: join(linked.entry, "manifest.json"),
+      }),
+    ])
+    expect(treeDigest(scratch)).toBe(before)
+    expect(existsSync(join(common, "yrd-worktree-mutations"))).toBe(false)
+    const applied = outputSink()
+    const held = await acquireExclusive(join(common, "yrd-worktree-mutations"))
+    const applying = runCli([...args, "--apply"], applied, stderr)
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      expect(existsSync(join(common, "git-super-retained-borrowers"))).toBe(false)
+      const durable = join(common, "modules/durable/objects")
+      mkdirSync(join(durable, "info"), { recursive: true })
+      writeFileSync(join(linked.gitDir, "objects/info/alternates"), durable + "\n")
+    } finally {
+      held.release()
+    }
+    expect(await applying, stderr.output).toBe(0)
+    expect(JSON.parse(applied.output).enrolled).toBe(0)
+    expect(JSON.parse(applied.output).proposed).toEqual([])
+    writeFileSync(join(linked.gitDir, "objects/info/alternates"), lender + "\n")
+    const recomputed = outputSink()
+    expect(await runCli([...args, "--apply"], recomputed, stderr), stderr.output).toBe(0)
+    expect(JSON.parse(recomputed.output).enrolled).toBe(1)
+    expect(readFileSync(join(linked.entry, "manifest.json"))).toEqual(bytes)
+    const registry = join(common, "git-super-retained-borrowers")
+    const names = readdirSync(registry)
+    expect(names).toHaveLength(1)
+    const pointer = join(registry, names[0]!)
+    const pointerBytes = readFileSync(pointer)
+    const repeat = outputSink()
+    expect(await runCli([...args, "--apply"], repeat, stderr), stderr.output).toBe(0)
+    expect(JSON.parse(repeat.output).enrolled).toBe(0)
+    expect(
+      JSON.parse(repeat.output).entries.some(
+        (row: { classification: string }) => row.classification === "already-enrolled",
+      ),
+    ).toBe(true)
+    expect(readFileSync(pointer)).toEqual(pointerBytes)
+  })
+  // Identity failures are a reader contract; successful compaction cannot witness preservation on refusal.
+  it.each([
+    "incoherent-pair",
+    "relative-record",
+    "redirected-manifest",
+    "redirected-modules",
+    "missing-child",
+  ] as const)("refuses %s without guessing a runtime proof", (shape) => {
+    const scratch = mkdtempSync(join(canonicalTmpdir(), "git-super-enroll-identity-"))
+    roots.push(scratch)
+    const root = join(scratch, "retained")
+    mkdirSync(root)
+    const { entry } = buildRetainedEntry(root, "child")
+    if (shape === "incoherent-pair")
+      writeStoredProof(entry, { ...storedProof(entry), manifest: join(scratch, "foreign/child/manifest.json") })
+    if (shape === "relative-record") writeStoredProof(entry, { ...storedProof(entry), retained: "child/modules" })
+    if (shape === "redirected-manifest") {
+      const bytes = readFileSync(join(entry, "manifest.json"))
+      rmSync(join(entry, "manifest.json"))
+      writeFileSync(join(scratch, "proof"), bytes)
+      symlinkSync(join(scratch, "proof"), join(entry, "manifest.json"))
+    }
+    if (shape === "redirected-modules") {
+      const moved = join(scratch, "moved-modules")
+      cpSync(join(entry, "modules"), moved, { recursive: true })
+      rmSync(join(entry, "modules"), { recursive: true })
+      symlinkSync(moved, join(entry, "modules"), "dir")
+    }
+    if (shape === "missing-child") rmSync(entry, { recursive: true })
+    const result = rebuildRetainedCopyProof(entry, root)
+    expect(typeof result).toBe("string")
+    expect(result).toMatch(/foreign-proof|no-manifest|missing-copy/)
+  })
+
+  it("refuses two actual candidates for one recorded entry across declared roots", async () => {
+    const scratch = mkdtempSync(join(canonicalTmpdir(), "git-super-enroll-duplicate-"))
+    roots.push(scratch)
+    const repo = join(scratch, "repo")
+    createRepository(repo, "file.ts", "x\n")
+    const common = join(repo, ".git"),
+      root = join(scratch, "one"),
+      otherRoot = join(scratch, "two")
+    mkdirSync(root)
+    mkdirSync(otherRoot)
+    const copy = buildRetainedEntry(root, "child")
+    const lender = join(common, "worktrees/lender/modules/dep/objects")
+    mkdirSync(join(lender, "info"), { recursive: true })
+    writeFileSync(join(copy.gitDir, "objects/info/alternates"), lender + "\n")
+    writeStoredProof(copy.entry, {
+      ...storedProof(copy.entry),
+      manifest: join(scratch, "old/child/manifest.json"),
+      retained: join(scratch, "old/child/modules"),
+    })
+    cpSync(copy.entry, join(otherRoot, "child"), { recursive: true })
+    const args = [
+      "--repo",
+      repo,
+      "--json",
+      "worktree",
+      "retention",
+      "enroll",
+      "--root",
+      root,
+      "--common",
+      common,
+      "--apply",
+    ]
+    const stderr = outputSink()
+    expect(await runCli(args, outputSink(), stderr), stderr.output).toBe(0)
+    const stdout = outputSink()
+    expect(
+      await runCli(
+        args.map((arg) => (arg === root ? otherRoot : arg)),
+        stdout,
+        stderr,
+      ),
+    ).toBe(1)
+    const report = JSON.parse(stdout.output) as RetentionEnrollReport
+    expect(report.enrolled).toBe(0)
+    expect(report.entries[0]?.reason).toContain("two candidates for recorded entry")
+    expect(readdirSync(join(common, "git-super-retained-borrowers"))).toHaveLength(1)
+  })
+
+  it("reports missing manifests and invalid roots/common, and never applies a bounded partial plan", async () => {
+    const scratch = mkdtempSync(join(canonicalTmpdir(), "git-super-enroll-bounds-"))
+    roots.push(scratch)
+    const repo = join(scratch, "repo")
+    createRepository(repo, "file.ts", "x\n")
+    const common = join(repo, ".git"),
+      root = join(scratch, "retained")
+    mkdirSync(root)
+    mkdirSync(join(root, "missing-proof"))
+    const args = ["--repo", repo, "--json", "worktree", "retention", "enroll", "--root", root, "--common", common]
+    const stdout = outputSink(),
+      stderr = outputSink()
+    expect(await runCli(args, stdout, stderr)).toBe(1)
+    expect((JSON.parse(stdout.output) as RetentionEnrollReport).entries[0]?.reason).toContain("no-manifest")
+    expect(existsSync(join(common, "yrd-worktree-mutations"))).toBe(false)
+    expect(
+      await runCli(
+        args.map((arg) => (arg === root ? join(scratch, "absent") : arg)),
+        outputSink(),
+        outputSink(),
+      ),
+    ).not.toBe(0)
+    expect(
+      await runCli(
+        args.map((arg) => (arg === common ? root : arg)),
+        outputSink(),
+        outputSink(),
+      ),
+    ).not.toBe(0)
+    const malformed = buildRetainedEntry(root, "malformed-proof")
+    writeStoredProof(malformed.entry, {
+      ...storedProof(malformed.entry),
+      externalObjectStores: [{ path: "dep/objects", target: 42 }],
+    })
+    const malformedOutput = outputSink()
+    expect(await runCli(args, malformedOutput, outputSink())).toBe(1)
+    expect(
+      (JSON.parse(malformedOutput.output) as RetentionEnrollReport).entries.find((row) => row.entry === malformed.entry)
+        ?.reason,
+    ).toContain("invalid retained objects dependency")
+    expect(existsSync(join(common, "git-super-retained-borrowers"))).toBe(false)
+    for (let i = 0; i < 10000; i++) mkdirSync(join(root, "entry-" + i))
+    const bounded = outputSink()
+    expect(await runCli([...args, "--apply"], bounded, outputSink())).toBe(1)
+    const report = JSON.parse(bounded.output) as RetentionEnrollReport
+    expect(report.boundHit).toBe(true)
+    expect(report.inspected).toBe(0)
+    expect(report.enrolled).toBe(0)
+    expect(existsSync(join(common, "yrd-worktree-mutations"))).toBe(false)
   })
 })
