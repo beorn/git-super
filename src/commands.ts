@@ -17,6 +17,7 @@ import { isAbsolute, join } from "node:path"
 import { repositoryRoot } from "./git.ts"
 import { ensureCommitObject } from "./objects.ts"
 import { superStatus, type SuperStatusOptions, type SuperStatusResult } from "./status.ts"
+import { admitOnRemoteSelections } from "./worktree-removal.ts"
 import {
   superSubmodulePrepare,
   type SuperSubmodulePrepareOptions,
@@ -130,8 +131,9 @@ const status = commandNode<CommandContext, StatusParams, SuperStatusResult>({
     }
   }),
   run: (context, input) => {
-    const { removal: _removal, ...statusOptions } = input
-    return superStatus({ repo: context.repo, ...statusOptions })
+    const { removal, ...statusOptions } = input
+    const status = superStatus({ repo: context.repo, ...statusOptions })
+    return removal === true ? admitOnRemoteSelections(status) : status
   },
 })
 

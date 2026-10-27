@@ -202,7 +202,24 @@ describe("git-super worktree remove admits a clean component store proven on its
     }
   })
 
-  it("refuses the same staged gitlink move with no root ref, naming the root store and the gitlink line", async () => {
+  it("removes an absolute linked worktree when the staged gitlink is on the component remote and no ref is preserved", async () => {
+    const { root, fixture, linked, alpha, retain } = await linkedWithSubmodules()
+    try {
+      const next = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
+      git(alpha, "fetch", "-q", "origin")
+      git(alpha, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+      stageComponentMove(linked, alpha, next)
+      const result = await superWorktreeRemove({ repo: fixture.product, path: linked, retain, preserved: [] })
+      expect(result.state, result.detail?.message ?? "").toBe("updated")
+      expect(linked.startsWith("/")).toBe(true)
+      expect(existsSync(linked)).toBe(false)
+    } finally {
+      // raw-delete-allow: the fixture tree this test made under its own mkdtemp root
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it("admits the same staged gitlink move with no root ref when the pin is on the component remote", async () => {
     const { root, fixture, linked, alpha, retain } = await linkedWithSubmodules()
     try {
       const next = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
@@ -211,9 +228,8 @@ describe("git-super worktree remove admits a clean component store proven on its
 
       const result = await superWorktreeRemove({ repo: fixture.product, path: linked, retain, preserved: [] })
 
-      expect(result.state).toBe("failed")
-      expect(result.detail?.message ?? "").toContain(`worktree ${linked} is dirty: M  packages/alpha`)
-      expect(existsSync(linked)).toBe(true)
+      expect(result.state, result.detail?.message ?? "").toBe("updated")
+      expect(existsSync(linked)).toBe(false)
     } finally {
       // raw-delete-allow: the fixture tree this test made under its own mkdtemp root
       await rm(root, { recursive: true, force: true })

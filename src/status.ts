@@ -62,6 +62,8 @@ export function classifyExcludedPath(
 
 export type SuperStatusResult = Readonly<{
   records: readonly string[]
+  /** Gitlink selections whose index pin, checkout, and module-store refs are on the component's remote default branch. Not dirt. Present only after a removal census. */
+  onRemote?: readonly string[]
   consultedRepositories: readonly ConsultedRepository[]
   notCompared: readonly NotCompared[]
   /** Gitlinks whose checkout is absent or an empty directory AND whose module repository is gone --

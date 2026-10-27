@@ -17,7 +17,7 @@ import { runCli } from "../src/cli.ts"
 import { repositoryRoot, withGitTimeout } from "../src/git.ts"
 import type { SuperStatusResult } from "../src/status.ts"
 import { inspectRemovalStatus } from "../src/worktree-removal.ts"
-import { canonicalTmpdir, createProductFixture, git } from "./fixture.ts"
+import { advanceRepository, canonicalTmpdir, createProductFixture, git } from "./fixture.ts"
 
 const roots: string[] = []
 
@@ -51,6 +51,69 @@ describe("status --removal verdict", () => {
     expect(code).toBe(0)
     expect(result.records).toEqual([])
     expect(result.submoduleProblems).toEqual([])
+  })
+
+  test("a gitlink already on the component remote is on-remote, not dirt", async () => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-removal-on-remote-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const checkout = join(fixture.product, "packages/alpha")
+    const next = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
+    git(checkout, "fetch", "-q", "origin")
+    git(checkout, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    git(checkout, "checkout", "-q", "--detach", next)
+    git(fixture.product, "add", "packages/alpha")
+    const { code, result } = await removal(fixture.product)
+    expect(code, JSON.stringify(result.records)).toBe(0)
+    expect(result.records).toEqual([])
+    expect(result.onRemote).toContain("on-remote packages/alpha")
+  })
+
+  test("a component commit that is not on its remote stays dirt", async () => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-removal-off-remote-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const checkout = join(fixture.product, "packages/alpha")
+    git(checkout, "fetch", "-q", "origin")
+    git(checkout, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    writeFileSync(join(checkout, "alpha.ts"), "export const alpha = 9\n")
+    git(checkout, "commit", "-q", "-am", "local only")
+    git(fixture.product, "add", "packages/alpha")
+    const { code, result } = await removal(fixture.product)
+    expect(code).toBe(1)
+    expect(result.records.some((record) => record.includes("packages/alpha"))).toBe(true)
+  })
+
+  test("an untracked file in the component stays dirt", async () => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-removal-untracked-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const checkout = join(fixture.product, "packages/alpha")
+    git(checkout, "fetch", "-q", "origin")
+    git(checkout, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    writeFileSync(join(checkout, "scratch.txt"), "local\n")
+    const { code, result } = await removal(fixture.product)
+    expect(code).toBe(1)
+    expect(result.records.some((record) => record.includes("scratch.txt"))).toBe(true)
+  })
+
+  test("a local branch that is not on the remote stays dirt", async () => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-removal-local-branch-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const checkout = join(fixture.product, "packages/alpha")
+    const next = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
+    git(checkout, "fetch", "-q", "origin")
+    git(checkout, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    git(checkout, "checkout", "-q", "--detach", next)
+    git(fixture.product, "add", "packages/alpha")
+    git(checkout, "checkout", "-q", "-b", "local-only")
+    writeFileSync(join(checkout, "alpha.ts"), "export const alpha = 8\n")
+    git(checkout, "commit", "-q", "-am", "not pushed")
+    git(checkout, "checkout", "-q", "--detach", next)
+    const { code, result } = await removal(fixture.product)
+    expect(code).toBe(1)
+    expect(result.records.some((record) => record.includes("packages/alpha"))).toBe(true)
   })
 
   test("root dirt exits 1 and names the record as JSON", async () => {

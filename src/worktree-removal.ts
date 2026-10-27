@@ -659,7 +659,69 @@ function knownRemovalStatus(path: string, status: SuperStatusResult): SuperStatu
       `worktree ${path} has unknown submodule state: ${status.submoduleProblems.map((problem) => `${problem.path}: ${problem.reason}${problem.gitDir === undefined ? "" : ` (gitdir ${problem.gitDir})`}`).join("; ")}; preserve and resolve it before removal`,
     )
   }
-  return status
+  return admitOnRemoteSelections(status)
+}
+
+function gitText(repo: string, args: string[]): { code: number; stdout: string } {
+  const result = spawnSync("git", ["-C", repo, ...args], { encoding: "utf8" })
+  return { code: result.status ?? 1, stdout: result.stdout ?? "" }
+}
+
+function ancestorOf(repo: string, ancestor: string, descendant: string): boolean {
+  return gitText(repo, ["merge-base", "--is-ancestor", ancestor, descendant]).code === 0
+}
+
+/** A component checkout whose pins and local refs are on its remote default branch (31031). */
+function componentSelectionOnRemote(parent: string, path: string, store: string): boolean {
+  const porcelain = gitText(store, ["--no-optional-locks", "status", "--porcelain", "--untracked-files=all"])
+  if (porcelain.code !== 0 || porcelain.stdout.trim() !== "") return false
+  const gitDir = gitText(store, ["rev-parse", "--absolute-git-dir"])
+  if (gitDir.code !== 0) return false
+  const remote = storeRemote(gitDir.stdout.trim())
+  if (remote === undefined) return false
+  const tracking = gitText(store, ["symbolic-ref", "--quiet", `refs/remotes/${remote}/HEAD`])
+  if (tracking.code !== 0) return false
+  const target = tracking.stdout.trim()
+  const head = gitText(store, ["rev-parse", "--verify", "HEAD^{commit}"])
+  if (head.code !== 0 || !ancestorOf(store, head.stdout.trim(), target)) return false
+  const indexPin = gitText(parent, ["rev-parse", "--verify", `:${path}`])
+  const headPin = gitText(parent, ["rev-parse", "--verify", `HEAD:${path}`])
+  if (indexPin.code !== 0 || headPin.code !== 0) return false
+  if (!ancestorOf(store, indexPin.stdout.trim(), target) || !ancestorOf(store, headPin.stdout.trim(), target)) {
+    return false
+  }
+  const refs = gitText(store, ["for-each-ref", "--format=%(objectname)", "refs/heads", "refs/tags"])
+  if (refs.code !== 0) return false
+  for (const oid of refs.stdout.split("\n")) {
+    if (oid !== "" && !ancestorOf(store, oid, target)) return false
+  }
+  return true
+}
+
+/** Drop gitlink records that are on the component remote. They are class `on-remote`, not dirt (31031). */
+export function admitOnRemoteSelections(status: SuperStatusResult): SuperStatusResult {
+  const onRemote = [...(status.onRemote ?? [])]
+  const records: string[] = []
+  for (const record of status.records) {
+    const path = record.slice(3)
+    const component = status.consultedRepositories
+      .filter((entry) => entry.path !== "." && (path === entry.path || path.startsWith(`${entry.path}/`)))
+      .sort((left, right) => right.path.length - left.path.length)[0]
+    const parent = status.consultedRepositories.find((entry) => entry.path === ".")
+    if (
+      component !== undefined &&
+      component.path !== "." &&
+      parent !== undefined &&
+      componentSelectionOnRemote(parent.root, component.path, component.root)
+    ) {
+      const label = `on-remote ${component.path}`
+      if (!onRemote.includes(label)) onRemote.push(label)
+      continue
+    }
+    records.push(record)
+  }
+  if (onRemote.length === (status.onRemote ?? []).length) return status
+  return { ...status, records, onRemote }
 }
 
 /** The consulted store that owns a status record: the deepest consulted prefix that contains it (29073). */
@@ -780,7 +842,12 @@ async function cleanSnapshot(
       "--",
       component.path.slice(parentPath.length),
     ])
-    for (const line of moved.stdout.split("\n")) if (line !== "") own(parent, line)
+    for (const line of moved.stdout.split("\n")) {
+      if (line === "") continue
+      const parentRoot = parent?.root ?? path
+      if (componentSelectionOnRemote(parentRoot, component.path, component.root)) continue
+      own(parent, line)
+    }
   }
   for (const group of dirtyByStore.values()) {
     await admitDirtyStore(git, group.store, group.records, preserved, group.component)
