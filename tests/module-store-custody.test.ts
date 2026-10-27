@@ -325,6 +325,26 @@ describe("slot module store custody", () => {
     ])
   })
 
+  test("prune preserves a destroyed slot whose module store still holds value", async () => {
+    const slot = await linkedSlot(fixtureRoot("module-prune-value"))
+    const tip = localCommit(slot.child)
+    dropAlphaFromHead(slot.linked)
+    git(slot.linked, "branch", "held-for-prune")
+    const store = join(slot.modules, "packages/alpha")
+    // Keep the root fixture's HEAD on its normal branch so prune reaches module-store custody.
+    renameSync(slot.linked, `${slot.linked}-moved`)
+    const message = await slot.store.prune().then(
+      () => "prune proceeded",
+      (error: unknown) => (error instanceof Error ? error.message : String(error)),
+    )
+    expect(message).toContain(`worktree ${slot.linked}`)
+    expect(message).toContain("holds 1 commit(s) outside compared refs")
+    expect(existsSync(store)).toBe(true)
+    expect(storeGitOutput(slot.fixture.product, store, "rev-parse", "HEAD")).toBe(tip)
+    expect(await slot.store.inspect(slot.linked)).toEqual(expect.objectContaining({ registered: true }))
+    expect(git(slot.fixture.alpha, "for-each-ref", "refs/archive")).toBe("")
+  })
+
   test("prune keeps and names a destroyed slot it cannot recover, and still recovers the others (30616)", async () => {
     const root = fixtureRoot("module-prune-unreadable")
     const slot = await linkedSlot(root)
