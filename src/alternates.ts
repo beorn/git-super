@@ -10,7 +10,7 @@ export function alternateEntries(
   content: string,
   objects: string,
   physical = true,
-  observe?: (entry: string, rawLine: string) => void,
+  observe?: (entry: string, rawLine: string, declaredPath: string) => void,
 ): string[] {
   return content
     .split(/\r?\n/u)
@@ -19,7 +19,7 @@ export function alternateEntries(
     .map(({ line, rawLine }) => {
       const pathname = isAbsolute(line) ? resolve(line) : resolve(objects, line)
       const entry = physical ? canonical(pathname) : pathname
-      observe?.(entry, rawLine)
+      observe?.(entry, rawLine, pathname)
       return entry
     })
 }
@@ -36,6 +36,7 @@ export function alternatesLineageSync(
   policy?: Readonly<{ allowedObjects: ReadonlySet<string> }>,
   observation?: Readonly<{
     strictReads: true
+    onDeclaration?: (store: string, declaredPath: string, canonicalPath: string, rawLine: string) => void
     onEdge: (store: string, target: string) => void
     onDangling: (store: string, target: string, rawLine: string) => void
   }>,
@@ -80,15 +81,15 @@ export function alternatesLineageSync(
       // silent-fallback-allow: a store with no alternates file borrows nothing; it ends its branch of the lineage
       return
     }
-    const declarations: Array<{ entry: string; rawLine: string }> = []
-    alternateEntries(content, store, policy === undefined, (entry, rawLine) => {
-      declarations.push({ entry, rawLine })
+    const declarations: Array<{ entry: string; rawLine: string; declaredPath: string }> = []
+    alternateEntries(content, store, policy === undefined, (entry, rawLine, declaredPath) => {
+      declarations.push({ entry, rawLine, declaredPath })
     })
-    for (const { entry, rawLine } of declarations) {
+    for (const { entry, rawLine, declaredPath } of declarations) {
       if (policy !== undefined && !policy.allowedObjects.has(entry)) {
         throw new Error(`unapproved alternate object store: ${entry}`)
       }
-      if (seen.has(entry)) continue
+      if (seen.has(entry) && observation?.onDeclaration === undefined) continue
       if (policy === undefined && observation?.strictReads) {
         try {
           if (!statSync(entry).isDirectory()) throw new Error(`alternate object store is not a directory: ${entry}`)
@@ -101,6 +102,8 @@ export function alternatesLineageSync(
           continue
         }
       } else if (policy === undefined && !existsSync(entry)) continue
+      observation?.onDeclaration?.(store, declaredPath, entry, rawLine)
+      if (seen.has(entry)) continue
       seen.add(entry)
       observation?.onEdge(store, entry)
       visit(entry)

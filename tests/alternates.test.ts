@@ -78,16 +78,23 @@ it("keeps default fallback separate from strict reads and reports canonical edge
   roots.push(root)
   const source = join(root, "source/objects")
   const target = join(root, "target/objects")
+  const alias = join(root, "alias/objects")
   const missing = join(root, "missing/objects")
   for (const store of [source, target]) mkdirSync(join(store, "info"), { recursive: true })
+  mkdirSync(join(root, "alias"), { recursive: true })
+  symlinkSync(target, alias, "dir")
   const declared = "  " + missing + "  "
-  writeFileSync(join(source, "info/alternates"), target + "\n" + target + "\n" + declared + "\n" + missing + "\n")
+  writeFileSync(join(source, "info/alternates"), target + "\n" + alias + "\n" + declared + "\n" + missing + "\n")
   const edges: string[][] = []
+  const declarations: string[][] = []
   const dangling: string[][] = []
   const observation = {
     strictReads: true as const,
     onEdge: (store: string, entry: string) => {
       edges.push([store, entry])
+    },
+    onDeclaration: (store: string, declaredPath: string, canonicalPath: string, rawLine: string) => {
+      declarations.push([store, declaredPath, canonicalPath, rawLine])
     },
     onDangling: (store: string, entry: string, raw: string) => {
       dangling.push([store, entry, raw])
@@ -95,6 +102,10 @@ it("keeps default fallback separate from strict reads and reports canonical edge
   }
   expect(alternatesLineageSync([source], "", undefined, observation)).toEqual([target])
   expect(edges).toEqual([[source, target]])
+  expect(declarations).toEqual([
+    [source, target, target, target],
+    [source, alias, target, alias],
+  ])
   expect(dangling).toEqual([[source, missing, declared]])
   mkdirSync(join(target, "info/alternates"))
   expect(await alternatesLineage([source], "")).toEqual([target])

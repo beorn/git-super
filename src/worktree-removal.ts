@@ -1143,45 +1143,52 @@ function retainedAlternatesDependency(
   deadline?: number,
 ): boolean {
   const copy = realpathSync(retained)
-  const lender = lenderGitDir === undefined ? undefined : realpathSync(lenderGitDir)
+  const lenders = lenderGitDir === undefined ? [] : [...new Set([resolve(lenderGitDir), realpathSync(lenderGitDir)])]
   const canonicalCommon = realpathSync(common)
   const linkedStores = join(canonicalCommon, "worktrees")
   const primaryStores = join(canonicalCommon, "modules")
-  const seeds = new Set(externalObjectStores.map((dependency) => dependency.target))
+  let linkedDependency = false
+  const classify = (declaredPath: string, canonicalPath: string, edge: string): void => {
+    if (deadline !== undefined && Date.now() >= deadline) {
+      throw new Error(`retained closure ${retained} exceeded enrollment deadline`)
+    }
+    for (const target of new Set([declaredPath, canonicalPath])) {
+      if (lenders.some((lender) => within(lender, target))) {
+        throw new Error(
+          `retained copy ${retained} borrows from removal store through ${edge} (declared ${declaredPath}, canonical ${canonicalPath}); worktree preserved`,
+        )
+      }
+      if (within(linkedStores, target)) linkedDependency = true
+      else if (!within(primaryStores, target) && !within(copy, target)) {
+        throw new Error(
+          `retained copy ${retained} has unknown removal custody through ${edge} (declared ${declaredPath}, canonical ${canonicalPath}); worktree preserved`,
+        )
+      }
+    }
+  }
+  const seeds = new Set<string>()
+  for (const dependency of externalObjectStores) {
+    const link = join(retained, dependency.path)
+    const declaredPath = resolve(dirname(link), readlinkSync(link))
+    const canonicalPath = realpathSync(link)
+    classify(declaredPath, canonicalPath, link)
+    seeds.add(canonicalPath)
+  }
+  // This existing local metadata walk does not expose external intermediate symlink hops.
   for (const entry of borrowerEntries(retained, undefined)) {
     if (deadline !== undefined && Date.now() >= deadline) {
       throw new Error(`retained closure ${retained} exceeded enrollment deadline`)
     }
     if (entry.name === "objects" && entry.isDirectory()) seeds.add(realpathSync(join(entry.parentPath, entry.name)))
   }
-  let linkedDependency = false
   const dangling: string[] = []
   try {
     alternatesLineageSync([...seeds], join(copy, "objects"), undefined, {
       strictReads: true,
-      onEdge: (store, target) => {
-        if (deadline !== undefined && Date.now() >= deadline) {
-          throw new Error(`retained closure ${retained} exceeded enrollment deadline`)
-        }
-        const edge = join(store, "info/alternates") + " -> " + target
-        if (lender !== undefined && within(lender, target)) {
-          throw new Error(
-            "retained copy " +
-              retained +
-              " borrows from removal store " +
-              lender +
-              " through " +
-              edge +
-              "; worktree preserved",
-          )
-        }
-        if (within(linkedStores, target)) linkedDependency = true
-        else if (!within(primaryStores, target) && !within(copy, target)) {
-          throw new Error(
-            "retained copy " + retained + " has unknown removal custody through " + edge + "; worktree preserved",
-          )
-        }
+      onDeclaration: (store, declaredPath, canonicalPath) => {
+        classify(declaredPath, canonicalPath, join(store, "info/alternates"))
       },
+      onEdge: () => {},
       onDangling: (store, target, rawLine) => {
         dangling.push(
           join(store, "info/alternates") + " -> " + target + " (declaration " + JSON.stringify(rawLine) + ")",
@@ -1198,7 +1205,23 @@ function retainedAlternatesDependency(
   return linkedDependency
 }
 
-function validateRetainedObjectsDeclarations(dependencies: unknown, retained: string): void {
+function validateRetainedObjectsDeclarations(proof: Record<string, unknown>, retained: string): boolean {
+  if (
+    !Object.hasOwn(proof, "entries") &&
+    !Object.hasOwn(proof, "externalObjectStores") &&
+    proof.files !== null &&
+    typeof proof.files === "object" &&
+    !Array.isArray(proof.files)
+  ) {
+    return true
+  }
+  if (
+    Object.hasOwn(proof, "entries") &&
+    (proof.entries === null || typeof proof.entries !== "object" || Array.isArray(proof.entries))
+  ) {
+    throw new Error("invalid retained dependency manifest")
+  }
+  const dependencies = proof.externalObjectStores
   if (!Array.isArray(dependencies)) {
     throw new Error("invalid retained dependency manifest")
   }
@@ -1215,6 +1238,7 @@ function validateRetainedObjectsDeclarations(dependencies: unknown, retained: st
       throw new Error(`invalid retained objects path ${link}`)
     }
   }
+  return false
 }
 
 /** Retained copies are borrowers too: verify their actual links before allowing an owner store to disappear. */
@@ -1270,23 +1294,16 @@ function guardRetainedBorrowers(common: string, lenderGitDir: string, policy: "i
         throw new Error("retained pointer does not name its actual copy and local manifest")
       }
       const proof = runtime.stored
-      validateRetainedObjectsDeclarations(proof.externalObjectStores, retained)
+      const legacy = validateRetainedObjectsDeclarations(proof, retained)
       // The manifest declaration cannot hide an actual link or authorise deletion of its current target.
       const actual = manifest(retained, { common, checkout, gitDir: lenderGitDir, modules: retained }, false)
-      const linkedStores = join(realpathSync(common), "worktrees")
-      const primaryStores = join(realpathSync(common), "modules")
-      let linkedDependency = false
-      for (const dependency of actual.externalObjectStores) {
-        if (within(linkedStores, dependency.target)) {
-          linkedDependency = true
-        } else if (!within(primaryStores, dependency.target)) {
-          throw new Error(
-            `retained objects link ${join(retained, dependency.path)} targets ${dependency.target} with unknown removal custody in ${common}; preserve and resolve it before removal`,
-          )
-        }
+      const linkedDependency = retainedAlternatesDependency(retained, common, lenderGitDir, actual.externalObjectStores)
+      if (legacy && !linkedDependency) {
+        process.stderr.write(
+          `retained borrower ${retained} legacy-retained; actual graph independent; integrity UNKNOWN\n`,
+        )
+        continue
       }
-      linkedDependency =
-        retainedAlternatesDependency(retained, common, lenderGitDir, actual.externalObjectStores) || linkedDependency
       if (!linkedDependency) {
         if (policy === "inspect") continue
         unlinkSync(registration)
@@ -1898,7 +1915,7 @@ export async function enrollRetainedBorrowers(options: RetentionEnrollOptions): 
       try {
         const runtime = rebuildRetainedCopyProof(entry, root, identities)
         if (typeof runtime === "string") throw new Error(runtime)
-        validateRetainedObjectsDeclarations(runtime.stored.externalObjectStores, runtime.retained)
+        const legacy = validateRetainedObjectsDeclarations(runtime.stored, runtime.retained)
         const actual = manifest(
           runtime.retained,
           {
@@ -1909,25 +1926,14 @@ export async function enrollRetainedBorrowers(options: RetentionEnrollOptions): 
           },
           false,
         )
-        const linked = join(common, "worktrees"),
-          durable = join(common, "modules")
-        let linkedDependency = false
-        for (const dependency of actual.externalObjectStores) {
-          if (within(linked, dependency.target)) linkedDependency = true
-          else if (!within(durable, dependency.target) && !within(runtime.retained, dependency.target)) {
-            throw new Error(
-              `retained objects link ${join(runtime.retained, dependency.path)} targets unknown custody ${dependency.target}`,
-            )
-          }
-        }
-        linkedDependency =
-          retainedAlternatesDependency(runtime.retained, common, undefined, actual.externalObjectStores, deadline) ||
-          linkedDependency
+        const linkedDependency = retainedAlternatesDependency(
+          runtime.retained,
+          common,
+          undefined,
+          actual.externalObjectStores,
+          deadline,
+        )
         Object.assign(row, { retained: runtime.retained, manifest: runtime.manifest })
-        if (!linkedDependency) {
-          row.classification = "not-needed"
-          continue
-        }
         const registration = join(registry, createHash("sha256").update(runtime.manifest).digest("hex") + ".json")
         row.registration = registration
         if (present(registration)) {
@@ -1943,7 +1949,21 @@ export async function enrollRetainedBorrowers(options: RetentionEnrollOptions): 
             throw new Error(`retained pointer ${registration} does not match the exact proposed pointer`)
           }
           row.classification = "already-enrolled"
+          if (legacy) {
+            row.reason = linkedDependency
+              ? "legacy-unrecorded; actual graph linked; integrity UNKNOWN"
+              : "legacy-retained; actual graph independent; integrity UNKNOWN"
+          } else if (!linkedDependency) {
+            row.classification = "not-needed"
+            delete row.registration
+          }
+        } else if (!linkedDependency) {
+          if (legacy) {
+            row.reason = "legacy-unrecorded; actual graph independent; integrity UNKNOWN; owner disposition required"
+          } else row.classification = "not-needed"
+          delete row.registration
         } else {
+          if (legacy) row.reason = "legacy-unrecorded; actual graph linked; integrity UNKNOWN"
           row.classification = "would-enroll"
           result.proposed.push({ retained: runtime.retained, manifest: runtime.manifest, registration })
         }

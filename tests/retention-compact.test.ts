@@ -1112,6 +1112,67 @@ describe("retention enrollment", () => {
     expect(readdirSync(join(common, "git-super-retained-borrowers"))).toHaveLength(1)
   })
 
+  // @failure Enrollment mistakes legacy absent dependency identities for invalid/no-dependency proof (#26497).
+  // @level l1
+  // @consumer retention enrollment CLI and retained borrower custody report
+  // Existing coverage only checks legacy compaction skips; it cannot prove enrollment inspects actual custody without rewriting proof bytes.
+  it("labels legacy custody from the actual graph and retains an existing no-link registration", async () => {
+    const scratch = mkdtempSync(join(canonicalTmpdir(), "git-super-enroll-legacy-"))
+    roots.push(scratch)
+    const repo = join(scratch, "repo")
+    createRepository(repo, "file.ts", "export const n = 1\n")
+    const common = join(repo, ".git")
+    const root = join(scratch, "retained")
+    mkdirSync(root)
+    const linked = buildRetainedEntry(root, "legacy-linked")
+    const independent = buildRetainedEntry(root, "legacy-independent")
+    const linkedProof = storedProof(linked.entry)
+    delete linkedProof.entries
+    delete linkedProof.externalObjectStores
+    writeStoredProof(linked.entry, linkedProof)
+    const independentProof = storedProof(independent.entry)
+    delete independentProof.entries
+    delete independentProof.externalObjectStores
+    writeStoredProof(independent.entry, independentProof)
+    const lender = join(common, "worktrees/lender/modules/dep/objects")
+    mkdirSync(join(lender, "info"), { recursive: true })
+    writeFileSync(join(linked.gitDir, "objects/info/alternates"), lender + "\n")
+    const registry = join(common, "git-super-retained-borrowers")
+    mkdirSync(registry)
+    const independentManifest = join(independent.entry, "manifest.json")
+    const registration = join(registry, `${digest(independentManifest)}.json`)
+    writeFileSync(
+      registration,
+      JSON.stringify({ retained: join(independent.entry, "modules"), manifest: independentManifest }) + "\n",
+    )
+    const before = [
+      readFileSync(join(linked.entry, "manifest.json")),
+      readFileSync(join(independent.entry, "manifest.json")),
+    ]
+    const args = ["--repo", repo, "--json", "worktree", "retention", "enroll", "--root", root, "--common", common]
+    const stdout = outputSink()
+    const exitCode = await runCli(args, stdout, outputSink())
+    expect([0, 1]).toContain(exitCode)
+    const report = JSON.parse(stdout.output) as {
+      entries: Array<{ entry: string; classification: string; reason: string | null }>
+    }
+    const linkedRow = report.entries.find((row) => row.entry === linked.entry)!
+    const independentRow = report.entries.find((row) => row.entry === independent.entry)!
+    expect({
+      linked: { classification: linkedRow.classification, reason: linkedRow.reason },
+      registeredIndependent: { reason: independentRow.reason },
+    }).toEqual({
+      linked: { classification: "would-enroll", reason: expect.stringContaining("legacy-unrecorded") },
+      registeredIndependent: {
+        reason: expect.stringMatching(/legacy-retained.*actual.*(independent|no linked|not linked)/i),
+      },
+    })
+    expect(existsSync(registration)).toBe(true)
+    expect(readFileSync(join(linked.entry, "manifest.json"))).toEqual(before[0])
+    expect(readFileSync(join(independent.entry, "manifest.json"))).toEqual(before[1])
+    expect(exitCode).toBe(0)
+  })
+
   it("reports missing manifests and invalid roots/common, and never applies a bounded partial plan", async () => {
     const scratch = mkdtempSync(join(canonicalTmpdir(), "git-super-enroll-bounds-"))
     roots.push(scratch)
