@@ -2,7 +2,7 @@
  * Removal destroys a slot's own `<git-dir>/modules/` tree. A module repository no gitlink in the slot's HEAD
  * names — a submodule dropped in a later commit, or an undeclared gitlink whose store uses another name — was
  * destroyed with its local branches, unpushed commits and stashes. The operator's value test (2026-10-21) says
- * work not on the store's remote main and not under an archive ref is value: archive it first, then remove.
+ * work outside the compared remote refs is value; ADR0018 requires keeping it without a new archive.
  *
  * @failure A slot's module repository holding work nothing durable names is deleted with the slot; a store
  *          that is fully reproducible is destroyed without being named; value is judged from the store's own
@@ -285,30 +285,60 @@ describe("slot module store custody", () => {
     expect(existsSync(store)).toBe(true)
   })
 
-  test("with no report sink an archive line goes to stderr and a release prints nothing; a sink gets both", async () => {
-    const archivedSlot = await linkedSlot(fixtureRoot("module-stderr-archive"))
-    const tip = localCommit(archivedSlot.child)
-    dropAlphaFromHead(archivedSlot.linked)
+  test.each(["remove", "recoverDestroyed"] as const)(
+    "%s preserves a value-holding store without writing an archive and names the value call",
+    async (operation) => {
+      const slot = await linkedSlot(fixtureRoot(`module-value-${operation}`))
+      const tip = localCommit(slot.child)
+      const moduleStore = join(slot.modules, "packages/alpha")
+      if (operation === "remove") {
+        dropAlphaFromHead(slot.linked)
+      } else {
+        advanceRepository(slot.fixture.alpha, "alpha.ts", "export const alpha = 8\n")
+        renameSync(slot.linked, `${slot.linked}-moved`)
+      }
+      const archivesBefore = git(
+        slot.fixture.alpha,
+        "for-each-ref",
+        "--format=%(refname) %(objectname)",
+        "refs/archive/",
+      )
+      let failure: unknown
+      try {
+        // The report channel is unrelated to this contract; keep fixture output inside the test.
+        await createLocalGitWorktreeStore({ repo: slot.fixture.product, report: () => {} })[operation](slot.linked)
+      } catch (error) {
+        failure = error
+      }
+      // Read the real effects before asserting: the old path writes an archive and destroys this store.
+      expect({
+        archives: git(slot.fixture.alpha, "for-each-ref", "--format=%(refname) %(objectname)", "refs/archive/"),
+        storePresent: existsSync(moduleStore),
+        registered: (await slot.store.inspect(slot.linked)).registered,
+      }).toEqual({ archives: archivesBefore, storePresent: true, registered: true })
+      expect(storeGitOutput(slot.fixture.product, moduleStore, "rev-parse", "HEAD")).toBe(tip)
+      expect(failure).toBeInstanceOf(Error)
+      const message = (failure as Error).message
+      expect(message).toContain("packages/alpha")
+      expect(message).toContain("worktree preserved")
+      expect(message).toContain("land")
+      expect(message).toContain("real branch")
+      expect(message).toContain("record")
+    },
+  )
+
+  test("with no report sink a no-value release prints nothing; a sink names the released store", async () => {
     const releasedSlot = await linkedSlot(fixtureRoot("module-stderr-release"))
     dropAlphaFromHead(releasedSlot.linked)
     const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true)
     let written: string[]
     try {
-      await archivedSlot.store.remove(archivedSlot.linked)
       await releasedSlot.store.remove(releasedSlot.linked)
       written = stderr.mock.calls.map(([chunk]) => String(chunk)).filter((line) => line.startsWith("module store"))
     } finally {
       stderr.mockRestore()
     }
-    expect(written).toEqual([
-      expect.stringMatching(
-        new RegExp(
-          // With no archiveActor the slot's own checkout name is the actor, never a library name.
-          `^module store packages/alpha archived: 1 commit\\(s\\) to refs/archive/\\d{4}-\\d{2}-\\d{2}/slot/packages/alpha/HEAD, HEAD ${tip.slice(0, 12)}\\n$`,
-          "u",
-        ),
-      ),
-    ])
+    expect(written).toEqual([])
     const sunk = await linkedSlot(fixtureRoot("module-sink-release"))
     const sunkTip = git(sunk.child, "rev-parse", "HEAD")
     dropAlphaFromHead(sunk.linked)
@@ -319,29 +349,6 @@ describe("slot module store custody", () => {
     expect(sink.filter((line) => line.startsWith("module store"))).toEqual([
       `module store packages/alpha released: origin main, archive refs and tags hold it, 0 commits unique, HEAD ${sunkTip.slice(0, 12)}\n`,
     ])
-  })
-
-  test("recovering a destroyed slot archives every store's value, declared or not, before its registration goes", async () => {
-    const slot = await linkedSlot(fixtureRoot("module-destroyed"))
-    // packages/alpha is still declared at HEAD, but no checkout is left to consult its store.
-    const tip = localCommit(slot.child)
-    // The remote's main moves on, so the value read must fetch into a store whose checkout path is gone.
-    advanceRepository(slot.fixture.alpha, "alpha.ts", "export const alpha = 8\n")
-    renameSync(slot.linked, `${slot.linked}-moved`)
-    const sink: string[] = []
-    await createLocalGitWorktreeStore({
-      repo: slot.fixture.product,
-      report: (line) => sink.push(line),
-    }).recoverDestroyed(slot.linked)
-    expect(await slot.store.inspect(slot.linked)).toEqual({ registered: false })
-    expect(existsSync(slot.gitDir)).toBe(false)
-    const lines = sink.filter((line) => line.startsWith("module store"))
-    // The registration id names the actor, since no checkout is left to name it.
-    expect(lines).toEqual([
-      expect.stringMatching(/^module store packages\/alpha archived: 1 commit\(s\) to refs\/archive\/[\d-]+\/slot\//u),
-    ])
-    const archiveRef = /refs\/archive\/\S+\/packages\/alpha\/HEAD/u.exec(lines[0] ?? "")?.[0] ?? "no archive ref named"
-    expect(git(slot.fixture.alpha, "rev-parse", archiveRef)).toBe(tip)
   })
 
   test("recovering a destroyed slot whose store's remote cannot be read keeps the registration", async () => {
