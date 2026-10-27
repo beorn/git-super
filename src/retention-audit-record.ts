@@ -34,7 +34,7 @@ export type RetentionAuditRecord = Readonly<{
   }>[]
 }>
 
-export type RetentionAuditBinding = Readonly<{ path: string; sha256: string; devIno: string }>
+export type RetentionAuditBinding = Readonly<{ path: string; sha256: string; devIno: string; metadataPath?: string }>
 export type ReadRetentionAudit = Readonly<{ binding: RetentionAuditBinding; record: RetentionAuditRecord }>
 
 const SHA256 = /^[a-f0-9]{64}$/
@@ -174,8 +174,9 @@ export function matchRetentionAudit(
           : candidate.record.provenance.estate.scanDigest !== scanDigest
             ? "complete estate digest changed"
             : undefined
-    if (reason === undefined)
-      selected ??= candidate // readRetentionAudits orders full digest filenames.
+    if (reason === undefined) {
+      selected ??= candidate
+    } // readRetentionAudits orders full digest filenames.
     else stale.push({ path: candidate.binding.path, reason })
   }
   return { ...(selected === undefined ? {} : { selected }), stale }

@@ -661,6 +661,46 @@ async function evaluateRetainedEntry(
             ]
           : []
       })
+      if (legacy && result.audit !== undefined) {
+        const audit = result.audit
+        const originalDigest = metadataFileDigest(manifestPath)
+        if (originalDigest !== result.manifestSha256) {
+          throw new Error(`original manifest ${manifestPath} changed before its external preservation`)
+        }
+        const originalRelative = "retention-evidence/manifest.json"
+        const auditRelative = `retention-evidence/${basename(audit.path)}`
+        const preservation = [
+          {
+            source: manifestPath,
+            target: canonicalProspectivePath(join(bundle, originalRelative)),
+            sha256: originalDigest,
+          },
+          { source: audit.path, target: canonicalProspectivePath(join(bundle, auditRelative)), sha256: audit.sha256 },
+        ]
+        const occupied = new Set(metadataFiles.map((file) => file.target))
+        for (const file of preservation) {
+          if (occupied.has(file.target)) {
+            throw new Error(
+              `legacy evidence ${file.source} would overwrite metadata at ${file.target}; entry preserved`,
+            )
+          }
+          occupied.add(file.target)
+          metadataFiles.push(file)
+        }
+        const originalIdentity = lstatSync(manifestPath)
+        result.wrapperRecords = [
+          ...audits.map(({ binding }) =>
+            binding.path === audit.path ? { ...binding, metadataPath: auditRelative } : binding,
+          ),
+          {
+            path: manifestPath,
+            sha256: originalDigest,
+            devIno: `${originalIdentity.dev}:${originalIdentity.ino}`,
+            metadataPath: originalRelative,
+          },
+        ]
+        result.audit = { path: auditRelative, sha256: audit.sha256 }
+      }
       // Preflight the exact write set before creating even the artifact directory.
       // Metadata writes below iterate this same list; sidecars keep this canonical directory.
       const destinations = [
