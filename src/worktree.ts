@@ -46,6 +46,7 @@ import {
 import { scanCustody, type CustodyTarget, type WitnessIdentity } from "./retention-custody.ts"
 import { alternateEntries, alternatesLineage } from "./alternates.ts"
 import { createProgressReporter } from "./progress.ts"
+import { shellQuote } from "./shell-command.ts"
 import { materializeSubmodulesWithProcess } from "./submodules.ts"
 import type { SuperStatusResult } from "./status.ts"
 import { statusWithGit } from "./status-traversal.ts"
@@ -1714,9 +1715,9 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       return listWorktrees(git, repo)
     },
     /**
-     * Remove a local name only at its exact tip; it writes no ref (30683). The existing worktree writer lock
-     * excludes a concurrent store.add; the ref transaction refuses a moved branch, and an optional verify line
-     * refuses unless that ref still holds that oid in the same transaction.
+     * Remove only the literal local ref at its exact tip; pre-existing symbolic aliases are refused.
+     * The existing worktree writer lock excludes a concurrent store.add; the ref transaction refuses a moved branch.
+     * An optional verify line refuses unless that ref still holds that oid in the same transaction.
      * Callers own eligibility, attribution and journal policy. This never removes a worktree or remote ref.
      * beforeRemove rechecks caller authority under the acquired lock; throwing preserves the branch.
      */
@@ -1746,13 +1747,25 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         await input.beforeRemove?.()
         const held = await branchHolder(branch)
         if (held !== undefined) throw new Error(held)
+        const symbolic = await git.run(repo, ["symbolic-ref", "--quiet", "--no-recurse", ref], true)
+        if (symbolic.code === 0) {
+          throw new Error(
+            `branch ${branch}: symbolic reference to ${symbolic.stdout.trim()}; refusing branch removal; it is an alias, not a branch: run git symbolic-ref --delete ${shellQuote(ref)} to remove only the alias`,
+          )
+        }
+        if (symbolic.code !== 1) {
+          throw new Error(
+            `branch ${branch}: symbolic reference inspection failed (exit ${symbolic.code}): ${symbolic.stderr.trim()}`,
+          )
+        }
         const verifyLine = verify === undefined ? "" : `verify ${verify.ref} ${verify.oid}\n`
         await git.run(
           repo,
           ["-c", "core.fsync=loose-object,reference", "-c", "core.fsyncMethod=fsync", "update-ref", "--stdin"],
           false,
           timeouts.operation,
-          { stdin: `start\n${verifyLine}delete ${ref} ${tip}\nprepare\ncommit\n` },
+          // no-deref is per-command: keep verify unchanged and fence a ref rebound after the symbolic check.
+          { stdin: `start\n${verifyLine}option no-deref\ndelete ${ref} ${tip}\nprepare\ncommit\n` },
         )
       })
     },
