@@ -1,12 +1,34 @@
-import { createHash } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import { lstatSync, readFileSync, readdirSync, realpathSync, rmSync } from "node:fs"
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
+import { tmpdir } from "node:os"
 import { acquireFlockWithTimeout, type FlockHandle } from "@bearly/flock"
 import { DEFAULT_MUTATION_LOCK_WAIT_MS } from "./exclusive.ts"
-import { canonicalEstateScan } from "./retention-estate.ts"
+import { canonicalEstateScan, scanEstate, type EstateScan } from "./retention-estate.ts"
+import { runGit } from "./git.ts"
+import { publishArtifact } from "./retention-stream.ts"
+import {
+  readRetentionAudits,
+  retentionEstateDigest,
+  validateRetentionAudit,
+  RETENTION_AUDIT_SCHEMA,
+  type RetentionAuditRecord,
+} from "./retention-audit-record.ts"
 import { gitSuperResult, type GitResultDetail, type GitSuperRepositoryResult, type GitSuperResult } from "./result.ts"
-import { verifyRetainedEntry, type RetentionVerifyOptions, type RetentionVerifyResult } from "./retention-verify.ts"
-import { acquireRemovalWriterLeases, readRetainedPointer, removeRetainedPointer } from "./worktree-removal.ts"
+import {
+  verifyRetainedEntry,
+  inspectRetainedEntryForAudit,
+  retentionAuditTool,
+  GATE_ORDER,
+  type RetentionVerifyOptions,
+  type RetentionVerifyResult,
+} from "./retention-verify.ts"
+import {
+  acquireRemovalWriterLeases,
+  readRetainedPointer,
+  removeRetainedPointer,
+  canonicalProspectivePath,
+} from "./worktree-removal.ts"
 
 export type RetentionRetireOptions = RetentionVerifyOptions &
   Readonly<{
@@ -97,8 +119,52 @@ function pointers(proof: RetentionVerifyResult): ReturnType<typeof readRetainedP
   )
 }
 
+/** Raw original identity and complete current census remain required even when historical checks are unknown. */
+function auditSnapshot(
+  entry: string,
+  root: string,
+  proof: RetentionVerifyResult,
+  estate: EstateScan,
+): { original: Buffer; facts: string } {
+  const manifestPath = join(entry, "manifest.json")
+  const manifest = lstatSync(manifestPath)
+  if (!manifest.isFile() || manifest.isSymbolicLink() || realpathSync(manifestPath) !== manifestPath) {
+    throw new Error(`audit original ${manifestPath} is not a regular nonredirected file`)
+  }
+  const original = readFileSync(manifestPath)
+  const sha256 = createHash("sha256").update(original).digest("hex")
+  if (proof.manifestSha256 !== undefined && proof.manifestSha256 !== sha256) {
+    throw new Error(`audit original ${manifestPath} changed during evaluation`)
+  }
+  const entryIdentity = lstatSync(entry)
+  const rootIdentity = lstatSync(root)
+  return {
+    original,
+    facts: JSON.stringify({
+      entry: `${entryIdentity.dev}:${entryIdentity.ino}`,
+      root: `${rootIdentity.dev}:${rootIdentity.ino}`,
+      original: { sha256, byteLength: original.length, devIno: `${manifest.dev}:${manifest.ino}` },
+      estate: retentionEstateDigest(estate),
+      wrappers: readRetentionAudits(entry, manifestPath, GATE_ORDER).map((record) => record.binding),
+      outcomes: proof.gates.map(({ gate, status }) => ({ gate, status })),
+    }),
+  }
+}
+
 /** The only retained-entry actuator; a standalone preliminary proof remains no capability. */
 export async function retireRetainedEntry(options: RetentionRetireOptions): Promise<GitSuperResult> {
+  return runRetentionOperation(options, "retire")
+}
+
+/** Audit shares the held retention operation and returns before its deletion boundary. */
+export async function auditRetainedEntry(options: RetentionRetireOptions): Promise<GitSuperResult> {
+  return runRetentionOperation({ ...options, clock: options.clock ?? new Date() }, "audit")
+}
+
+async function runRetentionOperation(
+  options: RetentionRetireOptions,
+  mode: "retire" | "audit",
+): Promise<GitSuperResult> {
   let entry = resolve(options.entry)
   let root = resolve(options.root)
   let commonLease: FlockHandle | undefined
@@ -106,6 +172,8 @@ export async function retireRetainedEntry(options: RetentionRetireOptions): Prom
   let crossed = false
   let phase = "identity"
   let proof: RetentionVerifyResult | undefined
+  let auditPath: string | undefined
+  let auditPublished = false
   const rows: GitSuperRepositoryResult[] = []
   const row = (repository: string, state: GitSuperRepositoryResult["state"], detail: GitResultDetail): void => {
     rows.push({ repository, state, detail, refs: [] })
@@ -153,10 +221,37 @@ export async function retireRetainedEntry(options: RetentionRetireOptions): Prom
       }
       assertEntry()
       if (options.namespaceRoots.length === 0) return kept("incomplete", "No complete managed namespace was declared.")
+      if (mode === "audit") {
+        if (!options.artifactDir.trim() || options.namespaceRoots.some((path) => !path.trim())) {
+          throw new Error("retention audit requires explicit nonempty artifact and namespace declarations")
+        }
+        const artifact = canonicalProspectivePath(options.artifactDir)
+        if (
+          within(root, artifact) ||
+          within(entry, artifact) ||
+          (options.allowTemporaryArtifactDir !== true && within(canonicalProspectivePath(tmpdir()), artifact))
+        ) {
+          throw new Error(
+            `audit artifact ${artifact} must be external to ${root} and outside the OS temporary directory`,
+          )
+        }
+      }
       phase = "preliminary-proof"
-      proof = await verifyRetainedEntry({ ...options, entry, root, artifactDir: join(options.artifactDir, "pre") })
-      if (proof.verdict !== "candidate") return kept(keepReason(proof), proof.reasons.join("; "))
-      const before = proofFacts(proof)
+      const preOptions = { ...options, entry, root, artifactDir: join(options.artifactDir, "pre") }
+      const preliminaryEstate =
+        mode === "audit"
+          ? scanEstate(options.namespaceRoots, [entry], options.bounds?.estate, options.monotonic)
+          : undefined
+      if (preliminaryEstate?.status === "unknown")
+        throw new Error(`audit estate unavailable: ${preliminaryEstate.detail}`)
+      proof =
+        preliminaryEstate === undefined
+          ? await verifyRetainedEntry(preOptions)
+          : await inspectRetainedEntryForAudit(preOptions, preliminaryEstate)
+      if (mode === "retire" && proof.verdict !== "candidate") return kept(keepReason(proof), proof.reasons.join("; "))
+      const before = proof.verdict === "candidate" ? proofFacts(proof) : undefined
+      const auditBefore =
+        preliminaryEstate === undefined ? undefined : auditSnapshot(entry, root, proof, preliminaryEstate)
       const registrations = pointers(proof)
       if (proof.estate === undefined) throw new Error(`candidate ${entry} has no estate census`)
       phase = "owner-identity"
@@ -192,14 +287,100 @@ export async function retireRetainedEntry(options: RetentionRetireOptions): Prom
         skip: [commonPath],
       })
       phase = "held-proof"
-      const held = await verifyRetainedEntry({
+      const heldOptions = {
         ...options,
         entry,
         root,
         artifactDir: join(options.artifactDir, "held"),
-      })
+      }
+      const heldEstate =
+        mode === "audit"
+          ? scanEstate(options.namespaceRoots, [entry], options.bounds?.estate, options.monotonic)
+          : undefined
+      if (heldEstate?.status === "unknown") throw new Error(`held audit estate unavailable: ${heldEstate.detail}`)
+      const commonHead = mode === "audit" ? runGit(common, ["rev-parse", "--verify", "HEAD"]).trim() : undefined
+      const held =
+        heldEstate === undefined
+          ? await verifyRetainedEntry(heldOptions)
+          : await inspectRetainedEntryForAudit(heldOptions, heldEstate)
       const after = held.verdict === "candidate" ? proofFacts(held) : undefined
+      if (mode === "audit") {
+        if (heldEstate === undefined || auditBefore === undefined || commonHead === undefined)
+          throw new Error("held audit provenance is incomplete")
+        const current = auditSnapshot(entry, root, held, heldEstate)
+        if (
+          auditBefore.facts !== current.facts ||
+          (before !== undefined && (after === undefined || before.facts !== after.facts)) ||
+          JSON.stringify(registrations) !== JSON.stringify(pointers(held))
+        ) {
+          throw new Error(`audit preliminary and held observations differ for ${entry}; no record published`)
+        }
+        assertEntry()
+        const record: RetentionAuditRecord = {
+          schema: RETENTION_AUDIT_SCHEMA,
+          runId: randomUUID(),
+          original: {
+            path: join(entry, "manifest.json"),
+            sha256: createHash("sha256").update(current.original).digest("hex"),
+            byteLength: current.original.length,
+          },
+          provenance: {
+            observedAt: held.clock,
+            tool: retentionAuditTool(),
+            common: { path: common, head: commonHead },
+            estate: {
+              namespaceRoots: options.namespaceRoots,
+              scanDigest: retentionEstateDigest(heldEstate),
+              counts: {
+                objectDirs: heldEstate.objectDirs.length,
+                alternatesFiles: heldEstate.alternatesFiles,
+                borrowers: heldEstate.borrowers.length,
+                registries: heldEstate.registries.length,
+                survivorIntoRemoval: heldEstate.survivorIntoRemoval.length,
+              },
+            },
+          },
+          checks: held.gates.map((gate) => ({
+            gate: gate.gate,
+            outcome: gate.status,
+            reason: `${gate.status}: ${gate.message}`,
+            basis:
+              gate.status === "unknown"
+                ? "unavailable"
+                : gate.gate === "identity-eligibility" || gate.gate === "copy-manifest"
+                  ? "recorded"
+                  : "observed",
+          })),
+        }
+        const bytes = `${JSON.stringify(record, null, 2)}\n`
+        auditPath = join(entry, `retention-audit-${createHash("sha256").update(bytes).digest("hex")}.json`)
+        validateRetentionAudit(record, auditPath, join(entry, "manifest.json"), GATE_ORDER)
+        phase = "publish-audit"
+        publishArtifact(auditPath, bytes, { replace: false })
+        auditPublished = true
+        if (held.staleAudits !== undefined) {
+          for (const stale of held.staleAudits) {
+            row(stale.path, "unchanged", {
+              code: "audit-stale",
+              phase,
+              message: `Stale audit ${stale.path}: ${stale.reason}; preserved.`,
+            })
+          }
+        }
+        const blocked = record.checks.filter((check) => check.outcome === "blocked").length
+        const unknown = record.checks.filter((check) => check.outcome === "unknown").length
+        const detail: GitResultDetail = {
+          code: blocked + unknown === 0 ? "audit-pass" : "audit-incomplete",
+          phase,
+          message: `Audit ${auditPath}: ${blocked} blocked, ${unknown} unknown; original unchanged, entry preserved.`,
+          evidence: auditPath,
+          paths: [entry, auditPath],
+        }
+        row(entry, "updated", detail)
+        return gitSuperResult(rows, detail)
+      }
       if (
+        before === undefined ||
         after === undefined ||
         before.facts !== after.facts ||
         JSON.stringify(registrations) !== JSON.stringify(pointers(held))
@@ -254,7 +435,25 @@ export async function retireRetainedEntry(options: RetentionRetireOptions): Prom
     })()
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
-    if (!crossed) {
+    if (mode === "audit") {
+      let recordState = "not attempted"
+      if (auditPath !== undefined) {
+        try {
+          recordState = lstatSync(auditPath).isFile() ? "present" : "present with changed shape"
+        } catch (observation) {
+          recordState =
+            (observation as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : `unknown (${String(observation)})`
+        }
+      }
+      const detail: GitResultDetail = {
+        code: "audit-failed",
+        phase,
+        message: `${message}; audit record ${auditPath ?? "not planned"}: ${recordState}; entry preserved, no retry.`,
+        paths: auditPath === undefined ? [entry] : [entry, auditPath],
+      }
+      row(entry, "failed", detail)
+      result = { ...gitSuperResult(rows, detail), partial: auditPublished || recordState.startsWith("present") }
+    } else if (!crossed) {
       const code: KeepReason =
         (error as NodeJS.ErrnoException).code === "ENOENT" && phase.includes("lease")
           ? "lease-missing"
@@ -289,7 +488,7 @@ export async function retireRetainedEntry(options: RetentionRetireOptions): Prom
     } catch (error) {
       const detail = { code: "lease-release-failed", phase: "release", message: String(error), paths: [entry] }
       row(entry, "failed", detail)
-      result = { ...gitSuperResult(rows, detail), partial: crossed }
+      result = { ...gitSuperResult(rows, detail), partial: crossed || auditPublished }
     }
   }
   return result
