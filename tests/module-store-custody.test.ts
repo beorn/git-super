@@ -67,9 +67,9 @@ function landOnRemote(remote: string, child: string): void {
   git(remote, "merge", "-q", "--ff-only", "FETCH_HEAD")
 }
 
-/** Read a store directly, since its checkout is gone once the slot drops it. */
+/** Read a surviving store even on Git versions that follow core.worktree under --bare. */
 function storeGitOutput(cwd: string, store: string, ...args: string[]): string {
-  return git(cwd, "--git-dir", store, "--bare", ...args)
+  return git(cwd, "--git-dir", store, "--work-tree", store, ...args)
 }
 
 function refusal(run: () => unknown): string {
