@@ -7,6 +7,7 @@
  */
 import {
   cpSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -156,6 +157,64 @@ async function sidecarRows(path: string): Promise<string[]> {
 }
 
 describe("retention verify gates 1-6", () => {
+  /**
+   * @failure A verified native-writer entry has no governed retirement actuator.
+   * @level l2
+   * @consumer worktree retention retire (#31146)
+   * A standalone candidate certificate remains insufficient to remove it.
+   */
+  it("retires an eligible native-writer entry through the explicit CLI and retains external proof", async () => {
+    const artifactDir = mkdtempSync(join("/var/tmp", "git-super-retire-proof-"))
+    try {
+      const manifestPath = join(base.entry, "manifest.json")
+      const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, unknown>
+      // The CLI uses the real clock; only this isolated fixture's floor moves.
+      manifest["retainUntil"] = new Date(Date.now() - 1000).toISOString()
+      writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)
+      const pre = await verifyRetainedEntry({
+        entry: base.entry,
+        root: base.root,
+        namespaceRoots: [fixtureRoot as string],
+        artifactDir: join(artifactDir, "control"),
+      })
+      expect(pre.verdict).toBe("candidate")
+      const output = outputSink()
+      const diagnostic = outputSink()
+      const code = await runCli(
+        [
+          "--repo",
+          join(fixtureRoot as string, "product"),
+          "--json",
+          "worktree",
+          "retention",
+          "retire",
+          base.entry,
+          "--root",
+          base.root,
+          "--common",
+          join(fixtureRoot as string, "product", ".git"),
+          "--namespace",
+          fixtureRoot as string,
+          "--artifact-dir",
+          join(artifactDir, "retire"),
+        ],
+        output,
+        diagnostic,
+      )
+      expect(code, diagnostic.output).toBe(0)
+      const result = JSON.parse(output.output) as {
+        state: string
+        partial: boolean
+        detail: { evidence: string }
+      }
+      expect(result).toMatchObject({ state: "updated", partial: false })
+      expect(existsSync(base.entry)).toBe(false)
+      expect(existsSync(result.detail.evidence)).toBe(true)
+    } finally {
+      rmSync(artifactDir, { recursive: true, force: true })
+    }
+  })
+
   it("reaches candidate only through gate 6 and never claims removal authority", async () => {
     const result = await verifyRetainedEntry({
       entry: base.entry,
