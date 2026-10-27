@@ -554,7 +554,6 @@ export async function verifyRetainedEntry(options: RetentionVerifyOptions): Prom
         temporaryRoots.add(realpathSync(tmpdir()))
       } catch {
         // silent-fallback-allow: the raw tmpdir() is already in the set, so an unresolvable symlink target only means the real path adds no second root
-        // delete-fallback-allow: temporaryRoots — a failed realpath only omits the resolved temp root; this set decides the temporary-path refusal, never a delete.
       }
       if (options.allowTemporaryArtifactDir !== true && [...temporaryRoots].some((root) => inside(root, artifactDir))) {
         push(
