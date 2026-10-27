@@ -217,6 +217,16 @@ function operationError(
   })
 }
 
+/**
+ * The repository a failure names as the one that refused, when the error carries it (31074). A failed row's
+ * `repository` is the one home of "who refused"; an error without one stays the root's, as before.
+ */
+function failedRepository(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null || !("repository" in error)) return undefined
+  const repository = (error as { repository: unknown }).repository
+  return typeof repository === "string" ? repository : undefined
+}
+
 function resultError(error: unknown, phase: string): GitResultDetail {
   if (typeof error === "object" && error !== null && "resultDetail" in error) {
     return (error as { resultDetail: GitResultDetail }).resultDetail
@@ -717,7 +727,9 @@ async function refuseIgnoredIncomingCollisions(
   const message = `Ignored operator bytes collide with incoming tracked paths: ${collisions
     .map(({ ignoredPath, incomingPath }) => `${ignoredPath} <- ${incomingPath}`)
     .join(", ")}.`
+  // 31074: the paths and objectIds are this repository's, so the failed row names it, not the root.
   throw Object.assign(new Error(message), {
+    repository,
     resultDetail: detail("ignored-path-collision", "preflight-tree-transition", message, {
       paths,
       objectIds: [current, target],
@@ -1015,7 +1027,10 @@ export async function superPull(options: SuperPullOptions): Promise<PullResult> 
     const notCompared = excludedObservations(excludedCheckouts)
     for (const observation of notCompared) warn(`${observation.path}: ${observation.message}\n`)
     return {
-      ...gitSuperResult([{ repository: resolve(options.repo), state: "failed", detail: failure, refs: [] }], failure),
+      ...gitSuperResult(
+        [{ repository: failedRepository(error) ?? resolve(options.repo), state: "failed", detail: failure, refs: [] }],
+        failure,
+      ),
       notCompared,
     }
   }
@@ -1121,12 +1136,13 @@ export async function superPull(options: SuperPullOptions): Promise<PullResult> 
     const failure = resultError(error, "apply")
     const root = plan.repositories[0]
     if (root === undefined) throw new Error("git-super: pull plan contained no root repository")
+    const refusing = failedRepository(error)
+    const failedAt = plan.repositories.find((repository) => repository.repository === refusing) ?? root
     return {
       ...gitSuperResult(
-        [
-          repositoryResult(root, "failed", failure),
-          ...plan.repositories.slice(1).map((repository) => repositoryResult(repository, "not-run", failure)),
-        ],
+        plan.repositories.map((repository) =>
+          repositoryResult(repository, repository === failedAt ? "failed" : "not-run", failure),
+        ),
         failure,
       ),
       notCompared: plan.notCompared,

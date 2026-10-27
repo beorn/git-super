@@ -1179,7 +1179,110 @@ describe("git super pull --ff-only", () => {
       state: "failed",
       partial: false,
       detail: { code: "ignored-path-collision", phase: "preflight-tree-transition" },
+      // 31074: a root collision still names the root as the repository that refused.
+      repositories: [{ repository: git(checkout, "rev-parse", "--show-toplevel"), state: "failed", refs: [] }],
     })
+  })
+
+  /**
+   * A product whose vendor/beta first ignores `ignored.txt`, is cloned with that pin, and is then advanced to a beta
+   * commit that tracks the formerly ignored path — so the incoming tracked path collides inside the CHILD (31074).
+   */
+  function childCollisionFixture(root: string) {
+    vi.stubEnv("GIT_CONFIG_COUNT", "1")
+    vi.stubEnv("GIT_CONFIG_KEY_0", "protocol.file.allow")
+    vi.stubEnv("GIT_CONFIG_VALUE_0", "always")
+    onTestFinished(() => {
+      vi.unstubAllEnvs()
+    })
+    const fixture = createProductFixture(root)
+    const pinBeta = (commit: string, subject: string): string => {
+      const productBeta = join(fixture.product, "vendor/beta")
+      git(productBeta, "fetch", "-q", "origin")
+      git(productBeta, "checkout", "-q", commit)
+      git(fixture.product, "add", "vendor/beta")
+      git(fixture.product, "commit", "-q", "-m", subject)
+      return git(fixture.product, "rev-parse", "HEAD")
+    }
+    const betaCurrent = advanceRepository(fixture.beta, ".gitignore", "ignored.txt\n")
+    const productBefore = pinBeta(betaCurrent, "beta ignores ignored.txt")
+    const checkout = join(root, "checkout")
+    git(root, "clone", "-q", "--recurse-submodules", fixture.product, checkout)
+    writeFileSync(join(fixture.beta, "ignored.txt"), "remote bytes\n")
+    git(fixture.beta, "add", "-f", "ignored.txt")
+    git(fixture.beta, "commit", "-q", "-m", "track formerly ignored file")
+    const betaTarget = git(fixture.beta, "rev-parse", "HEAD")
+    pinBeta(betaTarget, "pin beta tracking ignored.txt")
+    const top = git(checkout, "rev-parse", "--show-toplevel")
+    return { checkout, top, child: join(top, "vendor/beta"), betaCurrent, betaTarget, productBefore }
+  }
+
+  /**
+   * @failure An ignored-path collision inside a component names only the root as the repository that refused, so
+   * every reader resolves the child-relative paths from nowhere; the shared-main updater stalled Yrd on it (31068, 31074).
+   * @level l2
+   * @consumer git super pull --json readers: the shared-main updater and author environments
+   */
+  test("a collision inside a child names the child as the repository that refused (31074)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-pull-child-ignored-"))
+    roots.push(root)
+    const f = childCollisionFixture(root)
+    writeFileSync(join(f.child, "ignored.txt"), "operator bytes\n")
+
+    const result = await superPull({ repo: f.checkout, repository: "origin", refspecs: ["main"], ffOnly: true })
+
+    expect(result).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: {
+        code: "ignored-path-collision",
+        phase: "preflight-tree-transition",
+        paths: ["ignored.txt"],
+        objectIds: [f.betaCurrent, f.betaTarget],
+      },
+      repositories: [{ repository: f.child, state: "failed", refs: [] }],
+    })
+    expect(result.repositories).toHaveLength(1)
+    expect(git(f.checkout, "rev-parse", "HEAD")).toBe(f.productBefore)
+    expect(readFileSync(join(f.child, "ignored.txt"), "utf8")).toBe("operator bytes\n")
+  })
+
+  /**
+   * @failure Ignored bytes that appear between the plan and the apply are refused at apply-preflight, and that
+   * refusal also marked the root as the repository that failed (31074).
+   * @level l2
+   * @consumer git super pull --json readers: the shared-main updater and author environments
+   */
+  test("a child collision found at apply-preflight marks the child failed and the rest not-run (31074)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-pull-child-ignored-apply-"))
+    roots.push(root)
+    const f = childCollisionFixture(root)
+
+    const result = await superPull({
+      repo: f.checkout,
+      repository: "origin",
+      refspecs: ["main"],
+      ffOnly: true,
+      // The plan proved the transition clean; the operator's bytes land before the apply re-proves it.
+      report: (message) => {
+        if (message.startsWith("git-super pull: apply-preflight ")) {
+          writeFileSync(join(f.child, "ignored.txt"), "operator bytes\n")
+        }
+      },
+    })
+
+    expect(result).toMatchObject({
+      state: "failed",
+      partial: false,
+      detail: { code: "ignored-path-collision", objectIds: [f.betaCurrent, f.betaTarget] },
+    })
+    expect(Object.fromEntries(result.repositories.map(({ repository, state }) => [repository, state]))).toEqual({
+      [f.top]: "not-run",
+      [join(f.top, "packages/alpha")]: "not-run",
+      [f.child]: "failed",
+    })
+    expect(git(f.checkout, "rev-parse", "HEAD")).toBe(f.productBefore)
+    expect(readFileSync(join(f.child, "ignored.txt"), "utf8")).toBe("operator bytes\n")
   })
 
   test("refuses divergent root history without merging or rebasing", async () => {
