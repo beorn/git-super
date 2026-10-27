@@ -203,14 +203,16 @@ function operationError(
   phase: string,
   args: readonly string[],
   result: GitProcessResult,
-): Error & Readonly<{ resultDetail: GitResultDetail }> {
+): Error & Readonly<{ repository: string; resultDetail: GitResultDetail }> {
   const summary = result.timedOut
     ? `git ${args.join(" ")} timed out in ${repository}`
     : result.stalled
       ? `git ${args.join(" ")} stalled in ${repository}`
       : `git ${args.join(" ")} failed in ${repository} (exit ${result.code})`
   const message = `${summary}${result.stderr ? `\n${result.stderr}` : ""}${result.failure === undefined ? "" : `\n${result.failure}`}`
+  // 31077: the repository the command ran in is the one that failed, so a superPull catch names it in the row.
   return Object.assign(new Error(message), {
+    repository,
     resultDetail: detail(result.timedOut ? "git-timeout" : "git-failed", phase, message, {
       remedy: "Resolve the reported Git condition, then rerun the same git super pull command.",
     }),
@@ -1028,7 +1030,8 @@ export async function superPull(options: SuperPullOptions): Promise<PullResult> 
     for (const observation of notCompared) warn(`${observation.path}: ${observation.message}\n`)
     return {
       ...gitSuperResult(
-        [{ repository: failedRepository(error) ?? resolve(options.repo), state: "failed", detail: failure, refs: [] }],
+        // A planning failure can carry options.repo itself (required() before the root is known), which may be relative.
+        [{ repository: resolve(failedRepository(error) ?? options.repo), state: "failed", detail: failure, refs: [] }],
         failure,
       ),
       notCompared,
@@ -1137,7 +1140,15 @@ export async function superPull(options: SuperPullOptions): Promise<PullResult> 
     const root = plan.repositories[0]
     if (root === undefined) throw new Error("git-super: pull plan contained no root repository")
     const refusing = failedRepository(error)
-    const failedAt = plan.repositories.find((repository) => repository.repository === refusing) ?? root
+    const matched = plan.repositories.find((repository) => repository.repository === refusing)
+    // 31077: a carried repository outside the plan (a realpath difference would do it) keeps the root's row, said aloud.
+    if (refusing !== undefined && matched === undefined) {
+      warn(
+        `git-super pull: the failure names ${refusing}, which matches no repository in this pull's plan; ` +
+          `its row is reported against the root ${root.repository}\n`,
+      )
+    }
+    const failedAt = matched ?? root
     return {
       ...gitSuperResult(
         plan.repositories.map((repository) =>

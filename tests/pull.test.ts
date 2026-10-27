@@ -1188,13 +1188,17 @@ describe("git super pull --ff-only", () => {
    * A product whose vendor/beta first ignores `ignored.txt`, is cloned with that pin, and is then advanced to a beta
    * commit that tracks the formerly ignored path — so the incoming tracked path collides inside the CHILD (31074).
    */
-  function childCollisionFixture(root: string) {
+  function allowFileProtocol(): void {
     vi.stubEnv("GIT_CONFIG_COUNT", "1")
     vi.stubEnv("GIT_CONFIG_KEY_0", "protocol.file.allow")
     vi.stubEnv("GIT_CONFIG_VALUE_0", "always")
     onTestFinished(() => {
       vi.unstubAllEnvs()
     })
+  }
+
+  function childCollisionFixture(root: string) {
+    allowFileProtocol()
     const fixture = createProductFixture(root)
     const pinBeta = (commit: string, subject: string): string => {
       const productBeta = join(fixture.product, "vendor/beta")
@@ -1283,6 +1287,129 @@ describe("git super pull --ff-only", () => {
     })
     expect(git(f.checkout, "rev-parse", "HEAD")).toBe(f.productBefore)
     expect(readFileSync(join(f.child, "ignored.txt"), "utf8")).toBe("operator bytes\n")
+  })
+
+  /**
+   * One site per command a child's planning proof runs through operationError: the failure is injected into that
+   * command in vendor/beta only, every other command runs for real (31077).
+   */
+  const childFailureSites = [
+    {
+      site: "merge-base --is-ancestor of a detached local HEAD",
+      phase: "prove-submodule-ancestry",
+      detached: true,
+      fails: (args: readonly string[]) => args[0] === "merge-base" && args[1] === "--is-ancestor",
+    },
+    {
+      site: "read-tree of the transition",
+      phase: "preflight-tree-transition",
+      detached: false,
+      fails: (args: readonly string[]) => args.includes("read-tree"),
+    },
+    {
+      site: "diff of the incoming paths",
+      phase: "preflight-ignored-paths",
+      detached: false,
+      fails: (args: readonly string[]) => args[0] === "diff" && args.includes("--name-only"),
+    },
+    {
+      site: "ls-files of the ignored paths",
+      phase: "preflight-ignored-paths",
+      detached: false,
+      fails: (args: readonly string[]) => args[0] === "ls-files" && args.includes("--ignored"),
+    },
+  ] as const
+
+  /**
+   * @failure A git failure inside a component raised through operationError names only the root as the repository
+   * that failed, so a reader looks for the failure in the wrong checkout (31077, the general case of 31074).
+   * @level l2
+   * @consumer git super pull --json readers: the shared-main updater and author environments
+   */
+  test.each(childFailureSites)(
+    "a git failure in a child at $site names the child as the repository that failed (31077)",
+    async ({ phase, detached, fails }) => {
+      const root = mkdtempSync(join(tmpdir(), "git-super-pull-child-failure-"))
+      roots.push(root)
+      allowFileProtocol()
+      const fixture = createProductFixture(root)
+      const checkout = join(root, "checkout")
+      git(root, "clone", "-q", "--recurse-submodules", fixture.product, checkout)
+      const before = git(checkout, "rev-parse", "HEAD")
+      bumpProductSubmodules(fixture)
+      const child = join(git(checkout, "rev-parse", "--show-toplevel"), "vendor/beta")
+      if (detached) git(child, "commit", "-q", "--allow-empty", "-m", "local detached work")
+      const local = createLocalGitProcess()
+      const failing: GitProcess = {
+        async run(request) {
+          if (request.repo === child && fails(request.args)) {
+            return { code: 128, stdout: "", stderr: "fatal: injected child failure" }
+          }
+          return local.run(request)
+        },
+      }
+
+      const result = await superPull({
+        repo: checkout,
+        repository: "origin",
+        refspecs: ["main"],
+        ffOnly: true,
+        git: failing,
+      })
+
+      expect(result).toMatchObject({
+        state: "failed",
+        partial: false,
+        detail: { code: "git-failed", phase },
+        repositories: [{ repository: child, state: "failed", refs: [] }],
+      })
+      expect(result.repositories).toHaveLength(1)
+      expect(git(checkout, "rev-parse", "HEAD")).toBe(before)
+    },
+  )
+
+  /**
+   * @failure The apply catch silently re-named the root when a failure carried a repository that is not in the
+   * pull's plan (a realpath difference would do it), hiding the mismatch (31077, @dev/brain on 31074).
+   * @level l2
+   * @consumer git super pull --json readers and the operator reading its warnings
+   */
+  test("a carried repository that matches no repository in the plan is said, and the root keeps the row (31077)", async () => {
+    const fixture = mkdtempSync(join(tmpdir(), "git-super-pull-unmatched-repository-"))
+    roots.push(fixture)
+    const upstream = join(fixture, "upstream")
+    const checkout = join(fixture, "checkout")
+    const before = createRepository(upstream, "README.md", "one\n")
+    git(fixture, "clone", "-q", upstream, checkout)
+    advanceRepository(upstream, "README.md", "two\n")
+    const elsewhere = join(fixture, "not-in-the-plan")
+    // The exclusive seam runs the apply; this one fails it with a repository the plan never named.
+    const exclusive: Exclusive = {
+      async run() {
+        throw Object.assign(new Error("injected apply failure"), {
+          repository: elsewhere,
+          resultDetail: { code: "git-failed", phase: "apply-root", message: "injected apply failure" },
+        })
+      },
+    }
+    const warnings = outputSink()
+
+    const result = await superPull({
+      repo: checkout,
+      repository: "origin",
+      refspecs: ["main"],
+      ffOnly: true,
+      exclusive,
+      warn: (message) => warnings.write(message),
+    })
+
+    expect(result).toMatchObject({
+      state: "failed",
+      detail: { code: "git-failed", phase: "apply-root" },
+      repositories: [{ repository: git(checkout, "rev-parse", "--show-toplevel"), state: "failed" }],
+    })
+    expect(warnings.output).toContain(`${elsewhere}, which matches no repository in this pull's plan`)
+    expect(git(checkout, "rev-parse", "HEAD")).toBe(before)
   })
 
   test("refuses divergent root history without merging or rebasing", async () => {
