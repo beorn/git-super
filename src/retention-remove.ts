@@ -242,8 +242,9 @@ async function runRetentionOperation(
         mode === "audit"
           ? scanEstate(options.namespaceRoots, [entry], options.bounds?.estate, options.monotonic)
           : undefined
-      if (preliminaryEstate?.status === "unknown")
+      if (preliminaryEstate?.status === "unknown") {
         throw new Error(`audit estate unavailable: ${preliminaryEstate.detail}`)
+      }
       proof =
         preliminaryEstate === undefined
           ? await verifyRetainedEntry(preOptions)
@@ -305,8 +306,9 @@ async function runRetentionOperation(
           : await inspectRetainedEntryForAudit(heldOptions, heldEstate)
       const after = held.verdict === "candidate" ? proofFacts(held) : undefined
       if (mode === "audit") {
-        if (heldEstate === undefined || auditBefore === undefined || commonHead === undefined)
+        if (heldEstate === undefined || auditBefore === undefined || commonHead === undefined) {
           throw new Error("held audit provenance is incomplete")
+        }
         const current = auditSnapshot(entry, root, held, heldEstate)
         if (
           auditBefore.facts !== current.facts ||
