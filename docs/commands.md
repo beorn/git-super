@@ -244,6 +244,8 @@ Other options:
 
 `worktree retention verify <entry> --root <dir>` checks an existing copy without changing it. `worktree private-store verify <store>` checks a private submodule store.
 
+Artifact-directory aliases resolve before any proof write. An alias into retained custody is rejected; an external alias reports and writes to its canonical directory. Unresolvable or inaccessible ancestors report incomplete proof with the offending path.
+
 `worktree retention compact --root <dir>` compacts existing copies and rewrites their proofs. Pass `--dry-run` to report the proposed compaction without writes.
 
 ```bash

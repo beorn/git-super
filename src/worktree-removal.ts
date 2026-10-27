@@ -1263,6 +1263,24 @@ function present(path: string): boolean {
   }
 }
 
+/** Resolve the existing ancestor before a prospective directory creates any bytes. */
+export function canonicalProspectivePath(path: string): string {
+  const requested = resolve(path)
+  let ancestor = requested
+  while (true) {
+    try {
+      lstatSync(ancestor)
+      break
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+      const next = dirname(ancestor)
+      if (next === ancestor) throw error
+      ancestor = next
+    }
+  }
+  return resolve(realpathSync(ancestor), relative(ancestor, requested))
+}
+
 /** A pointer per manifest avoids shared aggregate updates; publication occurs under the common writer lock. */
 function registerRetainedBorrower(common: string, retained: string, manifestPath: string): void {
   const registry = join(common, "git-super-retained-borrowers")
@@ -1687,13 +1705,7 @@ async function retainResolvedWorktreeModules(context: {
   const requestedRoot = resolve(retention.root)
   // Resolve existing ancestors before creating anything, so a symlink cannot put
   // the only retained copy back inside either native deletion path.
-  let ancestor = requestedRoot
-  while (!existsSync(ancestor)) {
-    const next = resolve(ancestor, "..")
-    if (next === ancestor) throw new Error(`retention directory ${requestedRoot} has no existing parent`)
-    ancestor = next
-  }
-  const canonical = resolve(realpathSync(ancestor), relative(ancestor, requestedRoot))
+  const canonical = canonicalProspectivePath(requestedRoot)
   if (within(path, canonical) || within(gitDir, canonical)) {
     throw new Error(
       `retention directory ${canonical} is inside worktree removal paths ${path} or ${gitDir}; choose an external durable directory`,

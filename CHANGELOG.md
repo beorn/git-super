@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Resolve artifact-directory aliases before retention proof writes; report the canonical external path and preserve typed ancestor errors.
+
 - Add explicit retained-entry retirement with existing-only writer leases, held proof comparison, exact pointer cleanup and partial-state receipts.
 
 ## 0.9.0 — 2026-10-22

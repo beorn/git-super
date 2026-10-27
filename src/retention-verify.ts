@@ -23,7 +23,13 @@ import {
 import { scanCustody, type CustodyBounds, type WitnessIdentity } from "./retention-custody.ts"
 import { scanEstate, type EstateScan, type EstateScanBounds } from "./retention-estate.ts"
 import { RETENTION_STREAM_RSS_BOUND_BYTES } from "./retention-stream.ts"
-import { manifest, metadataFileDigest, type ManifestEntry, type StoreCustody } from "./worktree-removal.ts"
+import {
+  canonicalProspectivePath,
+  manifest,
+  metadataFileDigest,
+  type ManifestEntry,
+  type StoreCustody,
+} from "./worktree-removal.ts"
 
 /** The emitting tool's own name and version, read loudly (an unreadable package.json is fatal). */
 const RETENTION_TOOL = (() => {
@@ -516,7 +522,22 @@ export async function verifyRetainedEntry(options: RetentionVerifyOptions): Prom
         )
         return finish()
       }
-      const artifactDir = resolve(options.artifactDir)
+      let artifactDir: string
+      try {
+        artifactDir = canonicalProspectivePath(options.artifactDir)
+      } catch (error) {
+        push(
+          incomplete(
+            "copy-manifest",
+            `pass artifact ${options.artifactDir} cannot resolve its existing ancestor: ${error instanceof Error ? error.message : String(error)}`,
+            {
+              path: options.artifactDir,
+              remedy: "Supply an external artifact path with an accessible, resolvable ancestor.",
+            },
+          ),
+        )
+        return finish()
+      }
       if (inside(entryReal, artifactDir) || inside(result.root, artifactDir)) {
         push(
           refusal("copy-manifest", `pass artifact ${artifactDir} is inside the retention custody ${result.root}`, {

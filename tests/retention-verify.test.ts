@@ -36,7 +36,7 @@ import {
   retentionRemovalBoundary,
   verifyRetainedEntry,
 } from "../src/retention-verify.ts"
-import type { ManifestEntry } from "../src/worktree-removal.ts"
+import { canonicalProspectivePath, type ManifestEntry } from "../src/worktree-removal.ts"
 
 /** The shared, real-writer fixture and the pristine snapshot used to restore it in place. */
 let fixtureRoot: string | undefined
@@ -206,6 +206,52 @@ function retirementArgs(artifactDir: string): string[] {
 }
 
 describe("retention verify gates 1-6", () => {
+  it.each(["missing", "inaccessible", "loop"])("preserves the typed %s prospective-ancestor failure", (failure) => {
+    const root = mkdtempSync(join("/var/tmp", "git-super-prospective-path-"))
+    const parent = join(root, "ancestor")
+    mkdirSync(parent)
+    let requested = join(parent, "future")
+    try {
+      if (failure === "inaccessible") {
+        expect(process.getuid?.(), "native permission fault requires an unprivileged actor").not.toBe(0)
+        chmodSync(parent, 0o000)
+      } else {
+        requested = join(root, "alias")
+        symlinkSync(failure === "loop" ? requested : join(root, "missing-target"), requested)
+      }
+      expect(() => canonicalProspectivePath(requested)).toThrowError(
+        expect.objectContaining({
+          code: failure === "missing" ? "ENOENT" : failure === "inaccessible" ? "EACCES" : "ELOOP",
+        }),
+      )
+    } finally {
+      chmodSync(parent, 0o700)
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it("writes an external alias's proof at its canonical durable directory", async () => {
+    const root = mkdtempSync(join("/var/tmp", "git-super-external-artifact-"))
+    const target = join(root, "canonical")
+    mkdirSync(target)
+    const alias = join(root, "alias")
+    symlinkSync(target, alias)
+    try {
+      const result = await verifyRetainedEntry({
+        entry: base.entry,
+        root: base.root,
+        namespaceRoots: [fixtureRoot as string],
+        artifactDir: join(alias, "future", "pass"),
+        clock: eligible(),
+      })
+      expect(result.verdict).toBe("candidate")
+      expect(result.artifactDir).toBe(join(target, "future", "pass"))
+      expect(result.certificate?.path.startsWith(`${target}/future/pass/`)).toBe(true)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
   it.each(["held", "manifest", "census", "pointer-cleanup"])(
     "reports the real %s boundary event",
     async (event) => {
@@ -471,17 +517,25 @@ describe("retention verify gates 1-6", () => {
     expect(retentionRemovalBoundary(result).authorized).toBe(false)
   })
 
-  it("refuses a pass directory inside the retention custody", async () => {
-    const result = await verifyRetainedEntry({
-      entry: base.entry,
-      root: base.root,
-      artifactDir: join(base.root, "inside"),
-      clock: eligible(),
-    })
-    expect(result.verdict).toBe("blocked")
-    expect(result.gates[1]).toMatchObject({ gate: "copy-manifest", status: "blocked" })
-    expect(result.gates[1]?.message).toContain("inside the retention custody")
-  })
+  it.each(["direct", "symlink"])(
+    "refuses a %s pass directory inside the retention custody before writing",
+    async (kind) => {
+      const aliasRoot = mkdtempSync(join("/var/tmp", "git-super-artifact-alias-"))
+      const alias = join(aliasRoot, "artifact-alias")
+      if (kind === "symlink") symlinkSync(base.entry, alias)
+      const inside = kind === "direct" ? join(base.root, "inside") : join(base.entry, "inside")
+      const artifactDir = kind === "direct" ? inside : join(alias, "inside")
+      try {
+        const result = await verifyRetainedEntry({ entry: base.entry, root: base.root, artifactDir, clock: eligible() })
+        expect(existsSync(inside)).toBe(false)
+        expect(result.verdict).toBe("blocked")
+        expect(result.gates[1]).toMatchObject({ gate: "copy-manifest", status: "blocked" })
+        expect(result.gates[1]?.message).toContain("inside the retention custody")
+      } finally {
+        rmSync(aliasRoot, { recursive: true, force: true })
+      }
+    },
+  )
 
   it("refuses eligibility at the retention floor (now == retainUntil)", async () => {
     const result = await verifyRetainedEntry({
