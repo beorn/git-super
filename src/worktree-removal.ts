@@ -662,45 +662,165 @@ function knownRemovalStatus(path: string, status: SuperStatusResult): SuperStatu
   return admitOnRemoteSelections(status)
 }
 
-function gitText(repo: string, args: string[]): { code: number; stdout: string } {
+function gitText(repo: string, args: string[]): { code: number; stdout: string; stderr: string } {
   const result = spawnSync("git", ["-C", repo, ...args], { encoding: "utf8" })
-  return { code: result.status ?? 1, stdout: result.stdout ?? "" }
+  return {
+    code: result.status ?? -1,
+    stdout: result.stdout ?? "",
+    stderr: (result.error?.message ?? result.stderr ?? "").trim().replaceAll("\n", "; "),
+  }
 }
 
-function ancestorOf(repo: string, ancestor: string, descendant: string): boolean {
-  return gitText(repo, ["merge-base", "--is-ancestor", ancestor, descendant]).code === 0
+function ancestorOf(repo: string, ancestor: string, descendant: string) {
+  return gitText(repo, ["merge-base", "--is-ancestor", ancestor, descendant])
 }
 
 /** A component checkout whose pins and local refs are on its remote default branch (31031). */
-function componentSelectionOnRemote(parent: string, path: string, store: string): boolean {
+function componentSelectionOnRemote(
+  parent: string,
+  path: string,
+  store: string,
+): { onRemote: true } | { onRemote: false; reason: string } {
   const porcelain = gitText(store, ["--no-optional-locks", "status", "--porcelain", "--untracked-files=all"])
-  if (porcelain.code !== 0 || porcelain.stdout.trim() !== "") return false
+  if (porcelain.code !== 0) {
+    return {
+      onRemote: false,
+      reason: `${path}: cannot read checkout status in ${store} (git exit ${porcelain.code}); inspect the checkout before removal`,
+    }
+  }
+  if (porcelain.stdout.trim() !== "") {
+    return {
+      onRemote: false,
+      reason: `${path}: checkout ${store} has uncommitted changes; commit or preserve them before removal`,
+    }
+  }
   const gitDir = gitText(store, ["rev-parse", "--absolute-git-dir"])
-  if (gitDir.code !== 0) return false
+  if (gitDir.code !== 0) {
+    return {
+      onRemote: false,
+      reason: `${path}: cannot read the Git directory of ${store} (git exit ${gitDir.code}); inspect the component store before removal`,
+    }
+  }
   const remote = storeRemote(gitDir.stdout.trim())
-  if (remote === undefined) return false
+  if (remote === undefined) {
+    return {
+      onRemote: false,
+      reason: `${path}: component store ${store} has no remote; configure its component remote before removal`,
+    }
+  }
   const tracking = gitText(store, ["symbolic-ref", "--quiet", `refs/remotes/${remote}/HEAD`])
-  if (tracking.code !== 0) return false
+  if (tracking.code !== 0) {
+    return {
+      onRemote: false,
+      reason: `${path}: component remote ${remote} has no readable refs/remotes/${remote}/HEAD in ${store}; set its remote default branch before removal`,
+    }
+  }
   const target = tracking.stdout.trim()
   const head = gitText(store, ["rev-parse", "--verify", "HEAD^{commit}"])
-  if (head.code !== 0 || !ancestorOf(store, head.stdout.trim(), target)) return false
+  if (head.code !== 0) {
+    return {
+      onRemote: false,
+      reason: `${path}: cannot read HEAD in ${store} (git exit ${head.code}); inspect the component HEAD before removal`,
+    }
+  }
+  const headAncestry = ancestorOf(store, head.stdout.trim(), target)
+  if (headAncestry.code !== 0 && headAncestry.code !== 1) {
+    return {
+      onRemote: false,
+      reason: `${path}: cannot compare HEAD ${head.stdout.trim()} against ${target} in ${store} (git exit ${headAncestry.code}: ${headAncestry.stderr}); inspect the component objects before removal`,
+    }
+  }
+  if (headAncestry.code === 1) {
+    return {
+      onRemote: false,
+      reason: `${path}: HEAD ${head.stdout.trim()} is not on ${target}; push it to the component remote ${remote} before removal`,
+    }
+  }
   const indexPin = gitText(parent, ["rev-parse", "--verify", `:${path}`])
   const headPin = gitText(parent, ["rev-parse", "--verify", `HEAD:${path}`])
-  if (indexPin.code !== 0 || headPin.code !== 0) return false
-  if (!ancestorOf(store, indexPin.stdout.trim(), target) || !ancestorOf(store, headPin.stdout.trim(), target)) {
-    return false
+  if (indexPin.code !== 0) {
+    return {
+      onRemote: false,
+      reason: `${path}: cannot read the index gitlink in ${parent} (git exit ${indexPin.code}); inspect the parent index before removal`,
+    }
   }
-  const refs = gitText(store, ["for-each-ref", "--format=%(objectname)", "refs/heads", "refs/tags"])
-  if (refs.code !== 0) return false
-  for (const oid of refs.stdout.split("\n")) {
-    if (oid !== "" && !ancestorOf(store, oid, target)) return false
+  if (headPin.code !== 0) {
+    return {
+      onRemote: false,
+      reason: `${path}: cannot read the HEAD gitlink in ${parent} (git exit ${headPin.code}); inspect the parent HEAD before removal`,
+    }
   }
-  return true
+  const indexAncestry = ancestorOf(store, indexPin.stdout.trim(), target)
+  if (indexAncestry.code !== 0 && indexAncestry.code !== 1) {
+    return {
+      onRemote: false,
+      reason: `${path}: cannot compare index gitlink ${indexPin.stdout.trim()} against ${target} in ${store} (git exit ${indexAncestry.code}: ${indexAncestry.stderr}); inspect the component objects before removal`,
+    }
+  }
+  if (indexAncestry.code === 1) {
+    return {
+      onRemote: false,
+      reason: `${path}: index gitlink ${indexPin.stdout.trim()} is not on ${target}; push it to the component remote ${remote} before removal`,
+    }
+  }
+  const pinAncestry = ancestorOf(store, headPin.stdout.trim(), target)
+  if (pinAncestry.code !== 0 && pinAncestry.code !== 1) {
+    return {
+      onRemote: false,
+      reason: `${path}: cannot compare HEAD gitlink ${headPin.stdout.trim()} against ${target} in ${store} (git exit ${pinAncestry.code}: ${pinAncestry.stderr}); inspect the component objects before removal`,
+    }
+  }
+  if (pinAncestry.code === 1) {
+    return {
+      onRemote: false,
+      reason: `${path}: HEAD gitlink ${headPin.stdout.trim()} is not on ${target}; push it to the component remote ${remote} before removal`,
+    }
+  }
+  const targetCommit = gitText(store, ["rev-parse", "--verify", `${target}^{commit}`])
+  if (targetCommit.code !== 0) {
+    return {
+      onRemote: false,
+      reason: `${path}: cannot read remote target ${target} in ${store} (git exit ${targetCommit.code}); fetch its component remote ${remote} before removal`,
+    }
+  }
+  const targetOid = targetCommit.stdout.trim()
+  const refs = gitText(store, ["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads", "refs/tags"])
+  if (refs.code !== 0) {
+    return {
+      onRemote: false,
+      reason: `${path}: cannot read local heads and tags in ${store} (git exit ${refs.code}); inspect the component refs before removal`,
+    }
+  }
+  for (const line of refs.stdout.split("\n")) {
+    if (line === "") continue
+    const [ref, oid] = line.split(" ")
+    if (ref === undefined || oid === undefined || oid === "") {
+      return {
+        onRemote: false,
+        reason: `${path}: local ref listing in ${store} is unreadable (${JSON.stringify(line)}); inspect the component refs before removal`,
+      }
+    }
+    const ancestry = ancestorOf(store, oid, targetOid)
+    if (ancestry.code !== 0 && ancestry.code !== 1) {
+      return {
+        onRemote: false,
+        reason: `${path}: cannot compare local ref ${ref} at ${oid} against ${target} (${targetOid}) in ${store} (git exit ${ancestry.code}: ${ancestry.stderr}); inspect the component objects before removal`,
+      }
+    }
+    if (ancestry.code === 1) {
+      return {
+        onRemote: false,
+        reason: `${path}: local ref ${ref} at ${oid} is not on ${target} (${targetOid}); push it to the component remote ${remote}, or delete it by a recorded value call (finish or delete; no archive refs)`,
+      }
+    }
+  }
+  return { onRemote: true }
 }
 
 /** Drop gitlink records that are on the component remote. They are class `on-remote`, not dirt (31031). */
 export function admitOnRemoteSelections(status: SuperStatusResult): SuperStatusResult {
   const onRemote = [...(status.onRemote ?? [])]
+  const offRemote: { record: string; reason: string }[] = []
   const records: string[] = []
   for (const record of status.records) {
     const path = record.slice(3)
@@ -708,20 +828,26 @@ export function admitOnRemoteSelections(status: SuperStatusResult): SuperStatusR
       .filter((entry) => entry.path !== "." && (path === entry.path || path.startsWith(`${entry.path}/`)))
       .sort((left, right) => right.path.length - left.path.length)[0]
     const parent = status.consultedRepositories.find((entry) => entry.path === ".")
-    if (
-      component !== undefined &&
-      component.path !== "." &&
-      parent !== undefined &&
-      componentSelectionOnRemote(parent.root, component.path, component.root)
-    ) {
-      const label = `on-remote ${component.path}`
-      if (!onRemote.includes(label)) onRemote.push(label)
-      continue
+    if (component !== undefined && component.path !== "." && parent !== undefined) {
+      const selection = componentSelectionOnRemote(parent.root, component.path, component.root)
+      if (selection.onRemote) {
+        const label = `on-remote ${component.path}`
+        if (!onRemote.includes(label)) onRemote.push(label)
+        continue
+      }
+      offRemote.push({ record, reason: selection.reason })
     }
     records.push(record)
   }
-  if (onRemote.length === (status.onRemote ?? []).length) return status
-  return { ...status, records, onRemote }
+  const { offRemote: previousOffRemote, ...unchanged } = status
+  if (onRemote.length === (status.onRemote ?? []).length && offRemote.length === 0 && previousOffRemote === undefined)
+    return status
+  return {
+    ...unchanged,
+    records,
+    ...(onRemote.length > 0 ? { onRemote } : {}),
+    ...(offRemote.length > 0 ? { offRemote } : {}),
+  }
 }
 
 /** The consulted store that owns a status record: the deepest consulted prefix that contains it (29073). */
@@ -845,7 +971,7 @@ async function cleanSnapshot(
     for (const line of moved.stdout.split("\n")) {
       if (line === "") continue
       const parentRoot = parent?.root ?? path
-      if (componentSelectionOnRemote(parentRoot, component.path, component.root)) continue
+      if (componentSelectionOnRemote(parentRoot, component.path, component.root).onRemote) continue
       own(parent, line)
     }
   }
