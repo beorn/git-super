@@ -690,9 +690,14 @@ function componentSelectionOnRemote(parent: string, path: string, store: string)
   if (!ancestorOf(store, indexPin.stdout.trim(), target) || !ancestorOf(store, headPin.stdout.trim(), target)) {
     return false
   }
-  const refs = gitText(store, ["for-each-ref", "--format=%(objectname)", "refs/heads", "refs/tags"])
+  const refs = gitText(store, ["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads", "refs/tags"])
   if (refs.code !== 0) return false
-  for (const oid of refs.stdout.split("\n")) {
+  for (const line of refs.stdout.split("\n")) {
+    if (line === "") continue
+    const space = line.indexOf(" ")
+    const ref = space === -1 ? line : line.slice(0, space)
+    const oid = space === -1 ? "" : line.slice(space + 1)
+    if (ref.startsWith("refs/tags/archive/") || ref.startsWith("refs/archive/")) continue
     if (oid !== "" && !ancestorOf(store, oid, target)) return false
   }
   return true
