@@ -9,6 +9,7 @@ import {
   chmodSync,
   cpSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -377,7 +378,7 @@ describe("retention verify gates 1-6", () => {
         const result = JSON.parse(body) as GitSuperResult
         if (event === "pointer-cleanup") {
           expect(result).toMatchObject({ state: "failed", partial: true, detail: { code: "retirement-partial" } })
-          expect(existsSync(base.entry)).toBe(false)
+          expect(() => lstatSync(base.entry)).toThrowError(expect.objectContaining({ code: "ENOENT" }))
           expect(existsSync(pointer)).toBe(true)
           expect(result.repositories).toContainEqual(
             expect.objectContaining({ repository: base.entry, state: "updated" }),
@@ -542,7 +543,7 @@ describe("retention verify gates 1-6", () => {
         detail: { evidence: string }
       }
       expect(result).toMatchObject({ state: "updated", partial: false })
-      expect(existsSync(base.entry)).toBe(false)
+      expect(() => lstatSync(base.entry)).toThrowError(expect.objectContaining({ code: "ENOENT" }))
       expect(existsSync(result.detail.evidence)).toBe(true)
     } finally {
       for (const path of createdLeasePaths.reverse()) rmSync(path, { recursive: true, force: false })
@@ -587,7 +588,7 @@ describe("retention verify gates 1-6", () => {
       const artifactDir = kind === "direct" ? inside : join(alias, "inside")
       try {
         const result = await verifyRetainedEntry({ entry: base.entry, root: base.root, artifactDir, clock: eligible() })
-        expect(existsSync(inside)).toBe(false)
+        expect(() => lstatSync(inside)).toThrowError(expect.objectContaining({ code: "ENOENT" }))
         expect(result.verdict).toBe("blocked")
         expect(result.gates[1]).toMatchObject({ gate: "copy-manifest", status: "blocked" })
         expect(result.gates[1]?.message).toContain("inside the retention custody")
@@ -1071,7 +1072,8 @@ describe("native retirement alongside supported materialization", () => {
       expect([0, 1], `${await stderr}\n${body}`).toContain(code)
       const result = JSON.parse(body) as GitSuperResult
       expect(result.partial).toBe(false)
-      expect(existsSync(base.entry)).toBe(code === 1)
+      if (code === 1) expect(lstatSync(base.entry).isDirectory()).toBe(true)
+      else expect(() => lstatSync(base.entry)).toThrowError(expect.objectContaining({ code: "ENOENT" }))
       const objects = realpathSync(
         git(join(checkout, "vendor/dep"), ["rev-parse", "--path-format=absolute", "--git-path", "objects"]),
       )

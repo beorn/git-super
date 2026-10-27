@@ -4,6 +4,8 @@
 
 - Resolve artifact-directory and destination aliases before retention proof writes; publish certificates through the existing streamed sidecar family's atomic rename, preserving retained custody and typed ancestor errors.
 
+- Live `worktree remove --retain` propagates inaccessible (`EACCES`), looping (`ELOOP`) and dangling (`ENOENT`) ancestor errors instead of walking past them. Intermediate sort and merge spills use exclusive creation and preserve pre-existing paths on collisions.
+
 - Add explicit retained-entry retirement with existing-only writer leases, held proof comparison, exact pointer cleanup and partial-state receipts.
 
 ## 0.9.0 — 2026-10-22

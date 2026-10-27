@@ -96,7 +96,7 @@ describe("existing-only removal writer leases", () => {
       const leases = acquireRemovalWriterLeases(gitDir, undefined, { existingOnly: true })
       leases.release()
     }).toThrowError(expect.objectContaining({ code: "ENOENT", path }))
-    expect(existsSync(path)).toBe(false)
+    expect(() => lstatSync(path)).toThrowError(expect.objectContaining({ code: "ENOENT" }))
     expect(existsSync(parent)).toBe(missing === "file")
   })
 

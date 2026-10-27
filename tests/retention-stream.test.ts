@@ -9,7 +9,16 @@
  */
 import { spawnSync } from "node:child_process"
 import { createHash } from "node:crypto"
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
+import {
+  existsSync,
+  lstatSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, test } from "vitest"
@@ -102,7 +111,7 @@ describe("retention stream primitives (#27443(b))", () => {
     writer.add("a")
     const result = await writer.finish()
     expect(readFileSync(result.path)).toEqual(bytes)
-    expect(existsSync(target)).toBe(false)
+    expect(() => lstatSync(target)).toThrowError(expect.objectContaining({ code: "ENOENT" }))
   })
 
   test("a selected executable receives exactly its supplied environment", async () => {
