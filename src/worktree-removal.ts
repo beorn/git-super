@@ -1074,6 +1074,9 @@ export function acquireRemovalWriterLeases(
   }> = {},
 ): RemovalWriterLeases {
   const handles: FlockHandle[] = []
+  const existingOnly = options.existingOnly === true
+  // A retained modules root is a collection, not an implicit Git directory.
+  const rootIsGitDir = !existingOnly
   const proof: WriterLockProof[] = []
   const created: WriterLockProof[] = []
   const createdPaths: string[] = []
@@ -1106,7 +1109,7 @@ export function acquireRemovalWriterLeases(
     for (const entry of entries) {
       if (!entry.name.endsWith(".lock")) continue
       const path = join(entry.parentPath, entry.name)
-      if (!entry.isFile() || !isWriterLeasePath(path, removalRoot, true)) {
+      if (!entry.isFile() || !isWriterLeasePath(path, removalRoot, rootIsGitDir)) {
         throw new Error(`Git lock ${path} prevents worktree removal; resolve its holder (${describeLockBarrier(path)})`)
       }
     }
@@ -1115,10 +1118,10 @@ export function acquireRemovalWriterLeases(
       ...entries.filter((entry) => entry.isDirectory()).map((entry) => join(entry.parentPath, entry.name)),
     ]
     const paths = removalDirectories
-      .filter((directory) => isGitDirectory(directory, removalRoot, true))
+      .filter((directory) => isGitDirectory(directory, removalRoot, rootIsGitDir))
       .map((directory) => join(directory, "yrd-worktree-mutations", "writer.lock"))
     for (const owner of externalRoots) {
-      if (!isGitDirectory(owner, owner, true)) {
+      if (!isGitDirectory(owner, owner, !existingOnly)) {
         throw new Error(`external writer lease owner is not a Git directory: ${owner}`)
       }
       paths.push(join(owner, "yrd-worktree-mutations", "writer.lock"))
@@ -1128,7 +1131,6 @@ export function acquireRemovalWriterLeases(
     const absent = uniquePaths.filter((path) => !present(path)).sort()
     // Live retention takes existing leases before creating absent ones. Retirement only
     // opens existing paths, in stable order; a missing path stays a native ENOENT.
-    const existingOnly = options.existingOnly === true
     const orderedPaths = existingOnly ? uniquePaths.sort() : [...existing, ...absent]
     for (const path of orderedPaths) {
       const before = present(path) ? lstatSync(path) : null
