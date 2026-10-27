@@ -1250,12 +1250,15 @@ async function writeResult(
     const report = result as RetentionEnrollReport
     stdout.write(`${report.apply ? "apply" : "dry-run"} enroll ${report.root} common ${report.common}\n`)
     stdout.write(
-      `children ${report.children}, inspected ${report.inspected}, proposed ${report.proposed.length}, enrolled ${report.enrolled}, complete ${report.complete}\n`,
+      `children ${report.children}, inspected ${report.inspected}, proposed ${report.proposed.length}, enrolled ${report.enrolled}, observations ${report.observations.length}, complete ${report.complete}\n`,
     )
     for (const row of report.entries) {
       stdout.write(
         `${row.classification} ${row.entry}${row.registration === undefined ? "" : " -> " + row.registration}${row.reason === null ? "" : ": " + row.reason}\n`,
       )
+    }
+    for (const observation of report.observations) {
+      stdout.write(`${observation.kind} ${observation.path} -> ${observation.target}: ${observation.reason}\n`)
     }
     for (const error of report.errors) stderr.write(error + "\n")
   } else if (captured.node === nodes.worktree.retention.compact) {

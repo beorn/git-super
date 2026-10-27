@@ -1648,6 +1648,21 @@ describe("createGitWorktreeStore", () => {
       await expect(store.remove(owner.linked, { retention })).rejects.toThrow("invalid retained objects dependency")
       expect(existsSync(owner.objects)).toBe(true)
       await writeFile(proof.manifest, manifestBytes)
+      const originalProof = JSON.parse(manifestBytes.toString()) as Record<string, unknown>
+      await writeFile(alternate, join(commonForLegacy, "modules/packages/alpha/objects") + "\n")
+      const retainedChildren = readdirSync(retention.root).sort()
+      for (const partial of [{ externalObjectStores: [] }, { entries: {} }]) {
+        const asymmetric = { ...originalProof, ...partial }
+        if (!("entries" in partial)) delete asymmetric.entries
+        if (!("externalObjectStores" in partial)) delete asymmetric.externalObjectStores
+        await writeFile(proof.manifest, JSON.stringify(asymmetric) + "\n")
+        await expect(store.remove(owner.linked, { retention })).rejects.toThrow("invalid retained dependency manifest")
+        expect(existsSync(owner.objects)).toBe(true)
+        expect(await readFile(pointerPath)).toEqual(pointerBytes)
+        expect(readdirSync(retention.root).sort()).toEqual(retainedChildren)
+      }
+      await writeFile(proof.manifest, manifestBytes)
+      await writeFile(alternate, alternateBytes)
       const realRead = vi.mocked(readFileSync).getMockImplementation()!
       vi.mocked(readFileSync).mockImplementation((...args: Parameters<typeof readFileSync>) => {
         if (String(args[0]) === alternate) {
@@ -1691,10 +1706,38 @@ describe("createGitWorktreeStore", () => {
     }
   })
 
+  // @failure An empty or durable-only alternates file spuriously registers a fresh copy as a linked borrower (#26497).
+  // @level l1
+  // @consumer worktree remove retention registration
+  // The linked and refusal cases cannot prove that independent copies publish no borrower pointer.
+  it.each(["empty", "durable-only"] as const)("does not register a fresh %s alternate copy", async (shape) => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-retained-independent-copy-"))
+    try {
+      const fixture = createProductFixture(root)
+      const store = createLocalGitWorktreeStore({ repo: fixture.product })
+      const source = await addAlphaWorktree(store, root, "source")
+      const common = git(fixture.product, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim()
+      const declaration = shape === "empty" ? "" : join(common, "modules/packages/alpha/objects") + "\n"
+      await writeFile(join(source.objects, "info/alternates"), declaration)
+      const proofs: WorktreeRemovalProof[] = []
+      await store.remove(source.linked, {
+        retention: { root: join(root, "retained"), report: (proof) => proofs.push(proof) },
+      })
+      expect(existsSync(source.linked)).toBe(false)
+      expect(proofs).toHaveLength(1)
+      expect(await readFile(join(proofs[0]!.retained!, "packages/alpha/objects/info/alternates"), "utf8")).toBe(
+        declaration,
+      )
+      expect(registrySnapshot(join(common, "git-super-retained-borrowers"))).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   // @failure Fresh retention registers a dependency that native deletion destroys in the same command (#26497).
   // @level l1
   // @consumer worktree remove retention transaction
-  // Historical borrower guards cannot observe the newly copied self-borrower before its pointer exists.
+  // The fresh retained copy's own alternate can resolve into the deletion set before any pointer exists.
   it.each(["self-path", "volatile-alias"] as const)(
     "refuses a fresh retained copy borrowing from its own deletion set; path=%s",
     async (shape) => {
@@ -1720,6 +1763,8 @@ describe("createGitWorktreeStore", () => {
         const liveBorrowerAlternate = join(liveBorrower.objects, "info/alternates")
         await writeFile(liveBorrowerAlternate, declared + "\n")
         const liveBorrowerAlternateBefore = await readFile(liveBorrowerAlternate)
+        await mkdir(retainedRoot, { recursive: true })
+        const retainedRootBefore = readdirSync(retainedRoot).sort()
         const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true)
         try {
           await expect(
@@ -1733,7 +1778,7 @@ describe("createGitWorktreeStore", () => {
         expect(await readFile(alternate)).toEqual(alternateBefore)
         expect(existsSync(liveBorrower.linked)).toBe(true)
         expect(await readFile(liveBorrowerAlternate)).toEqual(liveBorrowerAlternateBefore)
-        expect(existsSync(retainedRoot) ? readdirSync(retainedRoot) : []).toEqual([])
+        expect(readdirSync(retainedRoot).sort()).toEqual(retainedRootBefore)
         const common = git(fixture.product, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim()
         expect(registrySnapshot(join(common, "git-super-retained-borrowers"))).toEqual([])
       } finally {

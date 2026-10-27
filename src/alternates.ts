@@ -76,7 +76,11 @@ export function alternatesLineageSync(
       content = readFileSync(file, "utf8")
     } catch (error) {
       if (policy !== undefined || observation?.strictReads) {
-        throw new Error(`cannot inspect alternates file: ${file}`, { cause: error })
+        const code = (error as NodeJS.ErrnoException).code
+        throw new Error(
+          `cannot inspect alternates file: ${file}${code === undefined ? "" : ` (${code})`}: ${error instanceof Error ? error.message : String(error)}`,
+          { cause: error },
+        )
       }
       // silent-fallback-allow: a store with no alternates file borrows nothing; it ends its branch of the lineage
       return

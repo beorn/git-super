@@ -1361,7 +1361,7 @@ describe("retention enrollment", () => {
     const args = ["--repo", repo, "--json", "worktree", "retention", "enroll", "--root", root, "--common", common]
     const stdout = outputSink()
     const exitCode = await runCli(args, stdout, outputSink())
-    expect([0, 1]).toContain(exitCode)
+    expect(exitCode).toBe(0)
     const report = JSON.parse(stdout.output) as {
       entries: Array<{ entry: string; classification: string; reason: string | null }>
     }
@@ -1380,7 +1380,6 @@ describe("retention enrollment", () => {
     expect(readFileSync(registration)).toEqual(registrationBefore)
     expect(readFileSync(join(linked.entry, "manifest.json"))).toEqual(before[0])
     expect(readFileSync(join(independent.entry, "manifest.json"))).toEqual(before[1])
-    expect(exitCode).toBe(0)
 
     const applied = outputSink()
     expect(await runCli([...args, "--apply"], applied, outputSink())).toBe(0)
@@ -1447,6 +1446,40 @@ describe("retention enrollment", () => {
     ).toHaveLength(1)
   })
 
+  it.each([
+    ["entries missing with empty external stores", { externalObjectStores: [] }],
+    ["external stores missing with empty entries", { entries: {} }],
+  ])("refuses an incomplete modern dependency proof during enrollment: %s", async (_label, partial) => {
+    const scratch = mkdtempSync(join(canonicalTmpdir(), "git-super-enroll-asymmetric-proof-"))
+    roots.push(scratch)
+    const repo = join(scratch, "repo")
+    createRepository(repo, "file.ts", "x\n")
+    const common = join(repo, ".git")
+    const root = join(scratch, "retained")
+    mkdirSync(root)
+    const entry = buildRetainedEntry(root, "modern")
+    const proof = { ...storedProof(entry.entry), ...partial }
+    if (!("entries" in partial)) delete (proof as Record<string, unknown>).entries
+    if (!("externalObjectStores" in partial)) delete (proof as Record<string, unknown>).externalObjectStores
+    writeStoredProof(entry.entry, proof)
+    const stdout = outputSink()
+    expect(
+      await runCli(
+        ["--repo", repo, "--json", "worktree", "retention", "enroll", "--root", root, "--common", common, "--apply"],
+        stdout,
+        outputSink(),
+      ),
+    ).toBe(1)
+    const report = JSON.parse(stdout.output) as RetentionEnrollReport
+    expect(report.complete).toBe(false)
+    expect(report.entries[0]).toEqual(
+      expect.objectContaining({
+        classification: "not-enrolled",
+        reason: expect.stringContaining("invalid retained dependency manifest"),
+      }),
+    )
+  })
+
   it("reports missing manifests and invalid roots/common, and never applies a bounded partial plan", async () => {
     const scratch = mkdtempSync(join(canonicalTmpdir(), "git-super-enroll-bounds-"))
     roots.push(scratch)
@@ -1489,14 +1522,48 @@ describe("retention enrollment", () => {
     ).toContain("invalid retained objects dependency")
     expect(existsSync(join(common, "git-super-retained-borrowers"))).toBe(false)
     const childrenBeforeBound = readdirSync(root).length
-    for (let i = 0; i < 10001; i++) mkdirSync(join(root, "entry-" + i))
+    for (let i = 0; i < 10001 - childrenBeforeBound; i++) mkdirSync(join(root, "entry-" + i))
     const bounded = outputSink()
     expect(await runCli([...args, "--apply"], bounded, outputSink())).toBe(1)
     const report = JSON.parse(bounded.output) as RetentionEnrollReport
     expect(report.boundHit).toBe(true)
-    expect(report.children).toBe(childrenBeforeBound + 10001)
+    expect(report.children).toBe(10001)
     expect(report.inspected).toBe(0)
     expect(report.enrolled).toBe(0)
     expect(existsSync(join(common, "yrd-worktree-mutations"))).toBe(false)
+  })
+
+  it("accepts 10,000 inspected children and refuses 10,001 before inspection", async () => {
+    const scratch = mkdtempSync(join(canonicalTmpdir(), "git-super-enroll-exact-bound-"))
+    roots.push(scratch)
+    const repo = join(scratch, "repo")
+    createRepository(repo, "file.ts", "x\n")
+    const common = join(repo, ".git")
+    const root = join(scratch, "retained")
+    mkdirSync(root)
+    for (let i = 0; i < 10000; i++) mkdirSync(join(root, `entry-${i}`))
+    const stdout = outputSink()
+    expect(
+      await runCli(
+        ["--repo", repo, "--json", "worktree", "retention", "enroll", "--root", root, "--common", common],
+        stdout,
+        outputSink(),
+      ),
+    ).toBe(1)
+    expect(JSON.parse(stdout.output) as RetentionEnrollReport).toEqual(
+      expect.objectContaining({ children: 10000, inspected: 10000, boundHit: false, complete: false }),
+    )
+    mkdirSync(join(root, "entry-10000"))
+    const over = outputSink()
+    expect(
+      await runCli(
+        ["--repo", repo, "--json", "worktree", "retention", "enroll", "--root", root, "--common", common, "--apply"],
+        over,
+        outputSink(),
+      ),
+    ).toBe(1)
+    expect(JSON.parse(over.output) as RetentionEnrollReport).toEqual(
+      expect.objectContaining({ children: 10001, inspected: 0, boundHit: true, enrolled: 0 }),
+    )
   })
 })

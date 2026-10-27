@@ -1369,13 +1369,15 @@ function validateRetainedObjectsDeclarations(proof: Record<string, unknown>, ret
     return true
   }
   if (
-    Object.hasOwn(proof, "entries") &&
-    (proof.entries === null || typeof proof.entries !== "object" || Array.isArray(proof.entries))
+    !Object.hasOwn(proof, "entries") ||
+    proof.entries === null ||
+    typeof proof.entries !== "object" ||
+    Array.isArray(proof.entries)
   ) {
     return "invalid retained dependency manifest"
   }
   const dependencies = proof.externalObjectStores
-  if (!Array.isArray(dependencies)) {
+  if (!Object.hasOwn(proof, "externalObjectStores") || !Array.isArray(dependencies)) {
     return "invalid retained dependency manifest"
   }
   for (const dependency of dependencies as Array<{ path?: unknown; target?: unknown }>) {
@@ -1471,6 +1473,7 @@ function guardRetainedBorrowers(common: string, lenderGitDir: string, policy: "i
       let observed = false
       let linkedDependency: boolean
       try {
+        // This pointer's canonical registration common is the guard's own common, so common/objects is durable.
         const dependency = retainedAlternatesDependency(
           retained,
           common,

@@ -15,7 +15,16 @@ vi.mock("node:fs", async (importOriginal) => {
     readFileSync: (...args: Parameters<typeof actual.readFileSync>) => actual.default.readFileSync(...args),
   }
 })
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { flattenCommandNodes, resolveInvocation } from "@silvery/command"
@@ -26,6 +35,7 @@ import { superStatus, type SuperStatusResult } from "../src/status.ts"
 import { statusWithGit } from "../src/status-traversal.ts"
 import { createGit } from "../src/worktree.ts"
 import { createLocalGitProcess } from "../src/process.ts"
+import type { RetentionEnrollReport } from "../src/worktree-removal.ts"
 import {
   addNestedAlphaSubmodule,
   advanceRepository,
@@ -51,7 +61,161 @@ function outputSink(): { output: string; write(value: string): void } {
   }
 }
 
+async function retainedCliFixture(): Promise<{
+  repo: string
+  common: string
+  root: string
+  entry: string
+  alternates: string
+}> {
+  const scratch = mkdtempSync(join(canonicalTmpdir(), "git-super-enroll-output-"))
+  roots.push(scratch)
+  const fixture = createProductFixture(scratch)
+  const checkout = join(scratch, "checkout")
+  const root = join(scratch, "retained")
+  const stderr = outputSink()
+  expect(
+    await runCli(["--repo", fixture.product, "worktree", "add", checkout, "HEAD"], outputSink(), stderr),
+    stderr.output,
+  ).toBe(0)
+  expect(
+    await runCli(["--repo", fixture.product, "worktree", "remove", checkout, "--retain", root], outputSink(), stderr),
+    stderr.output,
+  ).toBe(0)
+  const children = readdirSync(root)
+  expect(children).toHaveLength(1)
+  const entry = join(root, children[0]!)
+  return {
+    repo: fixture.product,
+    common: join(fixture.product, ".git"),
+    root,
+    entry,
+    alternates: join(entry, "modules/packages/alpha/objects/info/alternates"),
+  }
+}
+
 describe("Phase 1 read commands", () => {
+  /**
+   * @failure Enrollment hides excluded dangling declarations and gone registrations from human output (#26497).
+   * @level l1
+   * @consumer worktree retention enroll CLI operators
+   * @testonly none
+   * JSON graph coverage cannot detect an observation dropped by the human renderer.
+   */
+  test("retention enrollment exposes dangling and gone observations in JSON and human output", async () => {
+    const fixture = await retainedCliFixture()
+    const missing = join(fixture.repo, "missing-objects")
+    writeFileSync(fixture.alternates, missing + "\n")
+    const registry = join(fixture.common, "git-super-retained-borrowers")
+    mkdirSync(registry, { recursive: true })
+    const pointer = join(registry, "gone.json")
+    const absentEntry = join(fixture.repo, "absent-copy")
+    const absentModules = join(absentEntry, "modules")
+    writeFileSync(pointer, JSON.stringify({ retained: absentModules, manifest: join(absentEntry, "manifest.json") }))
+    const args = [
+      "--repo",
+      fixture.repo,
+      "worktree",
+      "retention",
+      "enroll",
+      "--root",
+      fixture.root,
+      "--common",
+      fixture.common,
+    ]
+    const json = outputSink()
+    expect(await runCli([...args, "--json"], json, outputSink())).toBe(0)
+    const report = JSON.parse(json.output) as RetentionEnrollReport
+    const danglingReason = "alternate target is absent; this declaration branch ends; integrity UNKNOWN"
+    const goneReason =
+      "registered retained copy is absent; excluded from competing physical identities; guard owns dropping pointer"
+    expect(report.observations).toEqual([
+      {
+        kind: "gone-pointer",
+        entry: absentEntry,
+        path: pointer,
+        target: absentModules,
+        excluded: true,
+        reason: goneReason,
+      },
+      {
+        kind: "dangling-alternate",
+        entry: fixture.entry,
+        path: fixture.alternates,
+        target: missing,
+        rawLine: missing,
+        excluded: true,
+        reason: danglingReason,
+      },
+    ])
+    const human = outputSink()
+    expect(await runCli(args, human, outputSink())).toBe(0)
+    expect(human.output).toContain("observations 2")
+    expect(human.output).toContain(`gone-pointer ${pointer} -> ${absentModules}: ${goneReason}`)
+    expect(human.output).toContain(`dangling-alternate ${fixture.alternates} -> ${missing}: ${danglingReason}`)
+    expect(existsSync(pointer)).toBe(true)
+  })
+
+  /**
+   * @failure Enrollment's strict alternates reader erases the errno and original I/O reason from JSON (#26497).
+   * @level l1
+   * @consumer worktree retention enroll CLI diagnostics
+   * @testonly none
+   * Manifest-read failures do not exercise the strict alternates wrapper and JSON serialization seam.
+   */
+  test("retention enrollment preserves alternates EIO path, code and message", async () => {
+    const fixture = await retainedCliFixture()
+    writeFileSync(fixture.alternates, "")
+    const registry = join(fixture.common, "git-super-retained-borrowers")
+    expect(existsSync(registry)).toBe(false)
+    const mutationDirectory = join(fixture.common, "yrd-worktree-mutations")
+    const mutationEntries = readdirSync(mutationDirectory).sort()
+    const writerLock = join(mutationDirectory, "writer.lock")
+    const writerBefore = fileSystem.readFileSync(writerLock)
+    const originalRead = fileSystem.readFileSync
+    const read = vi.spyOn(fileSystem, "readFileSync").mockImplementation((path, options) => {
+      if (String(path) === fixture.alternates) throw Object.assign(new Error("device read failure"), { code: "EIO" })
+      return originalRead(path, options)
+    })
+    try {
+      const stdout = outputSink()
+      expect(
+        await runCli(
+          [
+            "--repo",
+            fixture.repo,
+            "--json",
+            "worktree",
+            "retention",
+            "enroll",
+            "--root",
+            fixture.root,
+            "--common",
+            fixture.common,
+            "--apply",
+          ],
+          stdout,
+          outputSink(),
+        ),
+      ).toBe(1)
+      const report = JSON.parse(stdout.output) as RetentionEnrollReport
+      expect(report.complete).toBe(false)
+      expect(report.enrolled).toBe(0)
+      expect(report.proposed).toEqual([])
+      expect(report.errors).toEqual([
+        expect.stringContaining(`cannot inspect alternates file: ${fixture.alternates} (EIO): device read failure`),
+      ])
+      expect(report.entries[0]?.reason).toContain(
+        `cannot inspect alternates file: ${fixture.alternates} (EIO): device read failure`,
+      )
+      expect(existsSync(registry)).toBe(false)
+      expect(readdirSync(mutationDirectory).sort()).toEqual(mutationEntries)
+      expect(fileSystem.readFileSync(writerLock)).toEqual(writerBefore)
+    } finally {
+      read.mockRestore()
+    }
+  })
+
   /**
    * @failure Status or ancestry enters an explicitly excluded Git store (#27058 AC3).
    * @level l1
