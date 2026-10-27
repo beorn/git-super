@@ -15,6 +15,7 @@ import {
   type PrivateStoreVerifyParams,
   type RetentionCompactParams,
   type RetentionVerifyParams,
+  type RetentionRetireParams,
   type StatusParams,
   type SubmodulePrepareParams,
   type WorktreeAddParams,
@@ -49,6 +50,12 @@ export type OutputSink = ProcessOutputSink &
 
 type CapturedInvocation =
   | CapturedEnrollment
+  | Readonly<{
+      node: typeof commands.worktree.retention.retire
+      params: RetentionRetireParams
+      json: boolean
+      nul: boolean
+    }>
   | Readonly<{ node: typeof commands.diff; params: DiffParams; json: boolean; nul: boolean }>
   | Readonly<{ node: typeof commands.status; params: StatusParams; json: boolean; nul: boolean }>
   | Readonly<{ node: (typeof commands)["merge-base"]; params: MergeBaseParams; json: boolean; nul: boolean }>
@@ -747,16 +754,14 @@ async function runInvocation(
 
   const retention = worktree
     .command("retention")
-    .description(
-      "Inspect retained GitSuper entries, compact metadata, or explicitly enroll borrower pointers; no removal authority",
-    )
+    .description("Verify, compact, enroll borrowers, or explicitly retire one retained entry under existing leases")
     .allowExcessArguments()
     .action((_options, command) => {
       const subcommand = command.args[0]
       usage =
         (subcommand === undefined
-          ? "git-super: worktree retention needs verify, compact, or enroll\n"
-          : `git-super: unknown worktree retention subcommand '${subcommand}'; choose verify, compact, or enroll\n`) +
+          ? "git-super: worktree retention needs verify, compact, enroll, or retire\n"
+          : `git-super: unknown worktree retention subcommand '${subcommand}'; choose verify, compact, enroll, or retire\n`) +
         command.helpInformation()
     })
   retention
@@ -789,6 +794,36 @@ async function runInvocation(
           root: options.root,
           ...(namespaces === undefined || namespaces.length === 0 ? {} : { namespaceRoots: namespaces }),
           ...(options.artifactDir === undefined ? {} : { artifactDir: options.artifactDir }),
+        },
+        json: globals.json === true,
+        nul: false,
+      }
+    })
+
+  retention
+    .command("retire")
+    .description("Retire one eligible retained entry after held-lease revalidation; never unlock a lender")
+    .argument("<entry>", "the retained entry to retire")
+    .requiredOption("--root <directory>", "declared retained-modules root")
+    .requiredOption("--common <directory>", "Git common directory for the existing mutation lease")
+    .requiredOption(
+      "--namespace <path>",
+      "complete managed namespace; repeat for every root",
+      (value: string, previous: string[]) => [...previous, value],
+      [],
+    )
+    .requiredOption("--artifact-dir <directory>", "external durable directory for preliminary and held proofs")
+    .action((entry, _options, command) => {
+      const globals = command.optsWithGlobals() as { json?: boolean }
+      const options = command.opts() as { root: string; common: string; namespace: string[]; artifactDir: string }
+      captured = {
+        node: commands.worktree.retention.retire,
+        params: {
+          entry,
+          root: options.root,
+          common: options.common,
+          namespaceRoots: options.namespace,
+          artifactDir: options.artifactDir,
         },
         json: globals.json === true,
         nul: false,
@@ -1108,6 +1143,10 @@ async function runInvocation(
       )
     }
     return operation.state === "updated" || operation.state === "unchanged" ? 0 : 2
+  }
+  if (captured.node === commands.worktree.retention.retire) {
+    const operation = result as GitSuperResult
+    return operation.state === "updated" ? 0 : operation.state === "unchanged" ? 1 : 2
   }
   if (captured.node === commands.worktree.retention.verify) {
     const verify = result as RetentionVerifyResult

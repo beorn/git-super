@@ -20,7 +20,8 @@ import {
 } from "node:fs"
 import { spawnSync } from "node:child_process"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
+import { tryAcquireFlock } from "@bearly/flock"
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest"
 import { runCli } from "../src/cli.ts"
 import { scanContents, type ComponentContents } from "../src/retention-contents.ts"
@@ -157,6 +158,55 @@ async function sidecarRows(path: string): Promise<string[]> {
 }
 
 describe("retention verify gates 1-6", () => {
+  it.each(["unexpired", "legacy-unrecorded", "incomplete", "lease-missing"])(
+    "keeps a %s entry through the native retire CLI without changing its manifest",
+    async (reason) => {
+      const artifactDir = mkdtempSync(join("/var/tmp", "git-super-retire-keep-"))
+      try {
+        const path = join(base.entry, "manifest.json")
+        const manifest = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>
+        if (reason !== "unexpired") manifest["retainUntil"] = new Date(Date.now() - 1000).toISOString()
+        if (reason === "legacy-unrecorded") delete manifest["entries"]
+        writeFileSync(path, `${JSON.stringify(manifest, null, 2)}\n`)
+        if (reason === "incomplete") writeFileSync(firstFile(join(base.entry, "modules")), "changed fixture bytes")
+        const before = readFileSync(path)
+        const output = outputSink()
+        const diagnostic = outputSink()
+        const code = await runCli(
+          [
+            "--repo",
+            join(fixtureRoot as string, "product"),
+            "--json",
+            "worktree",
+            "retention",
+            "retire",
+            base.entry,
+            "--root",
+            base.root,
+            "--common",
+            join(fixtureRoot as string, "product", ".git"),
+            "--namespace",
+            fixtureRoot as string,
+            "--artifact-dir",
+            artifactDir,
+          ],
+          output,
+          diagnostic,
+        )
+        expect(code, `${diagnostic.output}\n${output.output}`).toBe(1)
+        expect(JSON.parse(output.output)).toMatchObject({
+          state: "unchanged",
+          partial: false,
+          detail: { code: reason },
+        })
+        expect(existsSync(base.entry)).toBe(true)
+        expect(readFileSync(path)).toEqual(before)
+      } finally {
+        rmSync(artifactDir, { recursive: true, force: true })
+      }
+    },
+  )
+
   /**
    * @failure A verified native-writer entry has no governed retirement actuator.
    * @level l2
@@ -165,6 +215,7 @@ describe("retention verify gates 1-6", () => {
    */
   it("retires an eligible native-writer entry through the explicit CLI and retains external proof", async () => {
     const artifactDir = mkdtempSync(join("/var/tmp", "git-super-retire-proof-"))
+    const createdLeasePaths: string[] = []
     try {
       const manifestPath = join(base.entry, "manifest.json")
       const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, unknown>
@@ -178,6 +229,19 @@ describe("retention verify gates 1-6", () => {
         artifactDir: join(artifactDir, "control"),
       })
       expect(pre.verdict).toBe("candidate")
+      if (pre.estate === undefined) throw new Error("candidate fixture has no estate census")
+      // Only this isolated fixture's external owners are provisioned. Certified E
+      // stays untouched; a missing in-copy lease must still keep the entry.
+      for (const objects of pre.estate.objectDirs) {
+        if (!objects.startsWith(`${fixtureRoot}/`)) throw new Error(`fixture escaped its namespace: ${objects}`)
+        if (objects.startsWith(`${base.entry}/`)) continue
+        const parent = join(dirname(objects), "yrd-worktree-mutations")
+        const path = join(parent, "writer.lock")
+        if (existsSync(path)) continue
+        createdLeasePaths.push(existsSync(parent) ? path : parent)
+        using lease = tryAcquireFlock(path)
+        expect(lease?.held).toBe(true)
+      }
       const output = outputSink()
       const diagnostic = outputSink()
       const code = await runCli(
@@ -201,7 +265,7 @@ describe("retention verify gates 1-6", () => {
         output,
         diagnostic,
       )
-      expect(code, diagnostic.output).toBe(0)
+      expect(code, `${diagnostic.output}\n${output.output}`).toBe(0)
       const result = JSON.parse(output.output) as {
         state: string
         partial: boolean
@@ -211,6 +275,7 @@ describe("retention verify gates 1-6", () => {
       expect(existsSync(base.entry)).toBe(false)
       expect(existsSync(result.detail.evidence)).toBe(true)
     } finally {
+      for (const path of createdLeasePaths.reverse()) rmSync(path, { recursive: true, force: false })
       rmSync(artifactDir, { recursive: true, force: true })
     }
   })

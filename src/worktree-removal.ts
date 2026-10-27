@@ -1410,11 +1410,18 @@ function validateRetainedObjectsDeclarations(proof: Record<string, unknown>, ret
   return false
 }
 
-function readRetainedPointer(path: string): { retained: string; manifest: string } {
+export function readRetainedPointer(path: string): {
+  path: string
+  retained: string
+  manifest: string
+  bytes: string
+  identity: string
+} {
   if (!lstatSync(path).isFile() || realpathSync(path) !== resolve(path)) {
     throw new Error(`retained pointer ${path} is not a plain regular file`)
   }
-  const record: unknown = JSON.parse(readFileSync(path, "utf8"))
+  const bytes = readFileSync(path, "utf8")
+  const record: unknown = JSON.parse(bytes)
   if (record === null || typeof record !== "object" || Array.isArray(record)) {
     throw new Error(`invalid retained borrower pointer ${path}`)
   }
@@ -1428,7 +1435,17 @@ function readRetainedPointer(path: string): { retained: string; manifest: string
   ) {
     throw new Error(`invalid retained borrower pointer ${path}`)
   }
-  return { retained: pointer.retained, manifest: pointer.manifest }
+  const stat = lstatSync(path)
+  return { path, retained: pointer.retained, manifest: pointer.manifest, bytes, identity: `${stat.dev}:${stat.ino}` }
+}
+
+/** Remove only the same pointer read under its owner's existing mutation lease. */
+export function removeRetainedPointer(expected: ReturnType<typeof readRetainedPointer>): void {
+  const actual = readRetainedPointer(expected.path)
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    throw new Error(`retained pointer ${expected.path} changed identity or bytes; preserved`)
+  }
+  unlinkSync(expected.path)
 }
 
 /** Retained copies are borrowers too: verify their actual links before allowing an owner store to disappear. */
@@ -1465,7 +1482,7 @@ function guardRetainedBorrowers(common: string, lenderGitDir: string, policy: "i
       retained = record.retained
       if (!present(retained)) {
         if (policy === "inspect") continue
-        unlinkSync(registration)
+        removeRetainedPointer(record)
         process.stderr.write(`retained borrower ${retained} is gone; dropped registry entry ${registration}\n`)
         continue
       }
@@ -1518,7 +1535,7 @@ function guardRetainedBorrowers(common: string, lenderGitDir: string, policy: "i
       }
       if (!linkedDependency) {
         if (policy === "inspect") continue
-        unlinkSync(registration)
+        removeRetainedPointer(record)
         process.stderr.write(
           `retained borrower ${retained} has no objects links or alternates into removable linked stores; dropped registry entry ${registration}\n`,
         )

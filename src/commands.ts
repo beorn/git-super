@@ -30,6 +30,7 @@ import {
   type PrivateStoreCandidateResult,
 } from "./private-store-candidate.ts"
 import { verifyRetainedEntry, type RetentionVerifyOptions, type RetentionVerifyResult } from "./retention-verify.ts"
+import { retireRetainedEntry, type RetentionRetireOptions } from "./retention-remove.ts"
 import { compactRetainedRoot, type CompactRetainedRootReport } from "./retention-compact.ts"
 import { superWorktreeRemove, type SuperWorktreeRemoveOptions } from "./worktree-remove.ts"
 
@@ -45,6 +46,7 @@ export type SubmodulePrepareParams = Omit<SuperSubmodulePrepareOptions, "repo" |
 export type WorktreeRemoveParams = Omit<SuperWorktreeRemoveOptions, "repo" | "report">
 export type WorktreeAddParams = Omit<SuperWorktreeAddOptions, "repo" | "env" | "log" | "report">
 export type RetentionVerifyParams = Omit<RetentionVerifyOptions, "clock">
+export type RetentionRetireParams = Omit<RetentionRetireOptions, "clock">
 export type RetentionEnrollParams = Readonly<{ root: string; common: string; apply?: boolean }>
 export type RetentionCompactParams = Readonly<{ root: string; dryRun?: boolean; limit?: number }>
 export type PrivateStoreVerifyParams = Omit<PrivateStoreCandidateOptions, "git">
@@ -379,41 +381,64 @@ const worktreeAdd = commandNode<CommandContext, WorktreeAddParams, GitSuperResul
     }),
 })
 
+const retentionVerifySchema = params<RetentionVerifyParams>((value) => {
+  const input = record(value)
+  if (typeof input.entry !== "string" || input.entry.trim() === "") {
+    throw new Error("worktree retention verify requires an entry path")
+  }
+  if (typeof input.root !== "string" || input.root.trim() === "") {
+    throw new Error("worktree retention verify requires --root <declared retained-modules root>")
+  }
+  if (
+    input.namespaceRoots !== undefined &&
+    (!Array.isArray(input.namespaceRoots) || input.namespaceRoots.some((entry) => typeof entry !== "string"))
+  ) {
+    throw new Error("namespaceRoots must be strings")
+  }
+  if (input.artifactDir !== undefined && typeof input.artifactDir !== "string") {
+    throw new Error("artifactDir must be a string")
+  }
+  if (input.allowTemporaryArtifactDir !== undefined && typeof input.allowTemporaryArtifactDir !== "boolean") {
+    throw new Error("allowTemporaryArtifactDir must be a boolean")
+  }
+  return {
+    entry: input.entry,
+    root: input.root,
+    ...(input.namespaceRoots === undefined ? {} : { namespaceRoots: input.namespaceRoots as string[] }),
+    ...(input.artifactDir === undefined ? {} : { artifactDir: input.artifactDir as string }),
+    ...(input.allowTemporaryArtifactDir === undefined
+      ? {}
+      : { allowTemporaryArtifactDir: input.allowTemporaryArtifactDir as boolean }),
+  }
+})
+
 const retentionVerify = commandNode<CommandContext, RetentionVerifyParams, RetentionVerifyResult>({
   title: "Verify one retained GitSuper entry read-only",
   description:
     "Read a retained entry and its manifest, prove identity, eligibility and the full copy-to-manifest comparison, and refuse or report incomplete rather than authorizing removal.",
-  params: params((value) => {
-    const input = record(value)
-    if (typeof input.entry !== "string" || input.entry.trim() === "") {
-      throw new Error("worktree retention verify requires an entry path")
-    }
-    if (typeof input.root !== "string" || input.root.trim() === "") {
-      throw new Error("worktree retention verify requires --root <declared retained-modules root>")
-    }
-    if (
-      input.namespaceRoots !== undefined &&
-      (!Array.isArray(input.namespaceRoots) || input.namespaceRoots.some((entry) => typeof entry !== "string"))
-    ) {
-      throw new Error("namespaceRoots must be strings")
-    }
-    if (input.artifactDir !== undefined && typeof input.artifactDir !== "string") {
-      throw new Error("artifactDir must be a string")
-    }
-    if (input.allowTemporaryArtifactDir !== undefined && typeof input.allowTemporaryArtifactDir !== "boolean") {
-      throw new Error("allowTemporaryArtifactDir must be a boolean")
-    }
-    return {
-      entry: input.entry,
-      root: input.root,
-      ...(input.namespaceRoots === undefined ? {} : { namespaceRoots: input.namespaceRoots as string[] }),
-      ...(input.artifactDir === undefined ? {} : { artifactDir: input.artifactDir as string }),
-      ...(input.allowTemporaryArtifactDir === undefined
-        ? {}
-        : { allowTemporaryArtifactDir: input.allowTemporaryArtifactDir as boolean }),
-    }
-  }),
+  params: retentionVerifySchema,
   run: (_context, input) => verifyRetainedEntry(input),
+})
+
+const retentionRetire = commandNode<CommandContext, RetentionRetireParams, GitSuperResult>({
+  title: "Retire one verified retained entry under existing writer leases",
+  description:
+    "Revalidate preliminary proof while holding existing leases, remove only this entry, and retire its exact registry pointers; never unlock a lender.",
+  params: params((value) => {
+    const input = retentionVerifySchema.parse(value)
+    const extra = record(value)
+    if (typeof extra.common !== "string" || extra.common.trim() === "") {
+      throw new Error("retention retire requires --common <Git common directory>")
+    }
+    if (input.artifactDir === undefined || input.artifactDir.trim() === "") {
+      throw new Error("retention retire requires --artifact-dir <external directory>")
+    }
+    if (input.namespaceRoots === undefined || input.namespaceRoots.length === 0) {
+      throw new Error("retention retire requires a complete --namespace <path> declaration")
+    }
+    return { ...input, common: extra.common, artifactDir: input.artifactDir, namespaceRoots: input.namespaceRoots }
+  }),
+  run: (_context, input) => retireRetainedEntry(input),
 })
 
 const retentionEnroll = commandNode<CommandContext, RetentionEnrollParams, RetentionEnrollReport>({
@@ -550,6 +575,7 @@ export type GitSuperCommands = Readonly<{
     remove: CommandNode<CommandContext, WorktreeRemoveParams, GitSuperResult>
     retention: Readonly<{
       verify: CommandNode<CommandContext, RetentionVerifyParams, RetentionVerifyResult>
+      retire: CommandNode<CommandContext, RetentionRetireParams, GitSuperResult>
       compact: CommandNode<CommandContext, RetentionCompactParams, CompactRetainedRootReport>
       enroll: CommandNode<CommandContext, RetentionEnrollParams, RetentionEnrollReport>
     }>
@@ -571,7 +597,7 @@ export const commands = defineCommandNodes({
   worktree: {
     add: worktreeAdd,
     remove: worktreeRemove,
-    retention: { verify: retentionVerify, compact: retentionCompact, enroll: retentionEnroll },
+    retention: { verify: retentionVerify, retire: retentionRetire, compact: retentionCompact, enroll: retentionEnroll },
     "private-store": { verify: privateStoreVerify },
   },
 }) satisfies CommandNodeTree<CommandContext> as GitSuperCommands
