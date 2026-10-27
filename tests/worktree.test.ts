@@ -1452,7 +1452,7 @@ describe("createGitWorktreeStore", () => {
       await writeFile(
         proof.manifest,
         JSON.stringify({
-          ...JSON.parse(manifestBytes.toString()),
+          ...(JSON.parse(manifestBytes.toString()) as Record<string, unknown>),
           externalObjectStores: [{ path: "packages/alpha/objects", target: 42 }],
         }),
       )

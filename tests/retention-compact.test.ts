@@ -1007,12 +1007,14 @@ describe("retention enrollment", () => {
       held.release()
     }
     expect(await applying, stderr.output).toBe(0)
-    expect(JSON.parse(applied.output).enrolled).toBe(0)
-    expect(JSON.parse(applied.output).proposed).toEqual([])
+    const appliedReport = JSON.parse(applied.output) as RetentionEnrollReport
+    expect(appliedReport.enrolled).toBe(0)
+    expect(appliedReport.proposed).toEqual([])
     writeFileSync(join(linked.gitDir, "objects/info/alternates"), lender + "\n")
     const recomputed = outputSink()
     expect(await runCli([...args, "--apply"], recomputed, stderr), stderr.output).toBe(0)
-    expect(JSON.parse(recomputed.output).enrolled).toBe(1)
+    const recomputedReport = JSON.parse(recomputed.output) as RetentionEnrollReport
+    expect(recomputedReport.enrolled).toBe(1)
     expect(readFileSync(join(linked.entry, "manifest.json"))).toEqual(bytes)
     const registry = join(common, "git-super-retained-borrowers")
     const names = readdirSync(registry)
@@ -1021,12 +1023,9 @@ describe("retention enrollment", () => {
     const pointerBytes = readFileSync(pointer)
     const repeat = outputSink()
     expect(await runCli([...args, "--apply"], repeat, stderr), stderr.output).toBe(0)
-    expect(JSON.parse(repeat.output).enrolled).toBe(0)
-    expect(
-      JSON.parse(repeat.output).entries.some(
-        (row: { classification: string }) => row.classification === "already-enrolled",
-      ),
-    ).toBe(true)
+    const repeatedReport = JSON.parse(repeat.output) as RetentionEnrollReport
+    expect(repeatedReport.enrolled).toBe(0)
+    expect(repeatedReport.entries.some((row) => row.classification === "already-enrolled")).toBe(true)
     expect(readFileSync(pointer)).toEqual(pointerBytes)
   })
   // Identity failures are a reader contract; successful compaction cannot witness preservation on refusal.
