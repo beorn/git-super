@@ -67,8 +67,9 @@ function proofFacts(proof: RetentionVerifyResult): { facts: string; path: string
     const entries: [string, unknown][] = []
     for (const [key, item] of Object.entries(value).sort(([a], [b]) => a.localeCompare(b))) {
       if (depth === 0 && (key === "clock" || key === "elapsedMs")) continue
-      if (depth === 0 && key === "estate" && item !== null && typeof item === "object" && !Array.isArray(item)) {
-        entries.push([key, canonicalEstateScan(item)])
+      const estate: unknown = item
+      if (depth === 0 && key === "estate" && estate !== null && typeof estate === "object" && !Array.isArray(estate)) {
+        entries.push([key, canonicalEstateScan(estate)])
         continue
       }
       entries.push([
