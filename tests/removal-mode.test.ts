@@ -51,6 +51,7 @@ describe("status --removal verdict", () => {
     expect(code).toBe(0)
     expect(result.records).toEqual([])
     expect(result.submoduleProblems).toEqual([])
+    expect(result).not.toHaveProperty("offRemote")
   })
 
   test("a gitlink already on the component remote is on-remote, not dirt", async () => {
@@ -67,6 +68,58 @@ describe("status --removal verdict", () => {
     expect(code, JSON.stringify(result.records)).toBe(0)
     expect(result.records).toEqual([])
     expect(result.onRemote).toContain("on-remote packages/alpha")
+    expect(result).not.toHaveProperty("offRemote")
+  })
+
+  test("a missing component remote target keeps dirt and names the fetch cure", async () => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-removal-missing-target-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const checkout = join(fixture.product, "packages/alpha")
+    const next = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
+    git(checkout, "fetch", "-q", "origin")
+    git(checkout, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    git(checkout, "checkout", "-q", "--detach", next)
+    git(fixture.product, "add", "packages/alpha")
+    git(checkout, "update-ref", "-d", "refs/remotes/origin/main")
+    const { code, result, text } = await removal(fixture.product)
+    expect(code).toBe(1)
+    expect(result.records).toEqual(["M  packages/alpha/alpha.ts"])
+    expect(result.offRemote).toHaveLength(1)
+    expect(result.offRemote?.[0]?.record).toBe(result.records[0])
+    const reason = result.offRemote?.[0]?.reason
+    expect(reason).toContain("cannot read remote target refs/remotes/origin/main")
+    expect(reason).toContain("fatal:")
+    expect(reason).toContain("fetch its component remote origin before removal")
+    expect(text.trim()).toBe(reason)
+  })
+
+  test("an archive tag off the component remote keeps dirt and names its cure", async () => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-removal-archive-tag-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const checkout = join(fixture.product, "packages/alpha")
+    const next = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
+    git(checkout, "fetch", "-q", "origin")
+    git(checkout, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    git(checkout, "checkout", "-q", "--detach", next)
+    git(fixture.product, "add", "packages/alpha")
+    const tree = git(checkout, "rev-parse", "HEAD^{tree}")
+    const side = git(checkout, "commit-tree", tree, "-m", "archive only")
+    const ref = "refs/tags/archive/2026-10-13/dev-6/sample"
+    git(checkout, "update-ref", ref, side)
+    const { code, result } = await removal(fixture.product)
+    expect(code).toBe(1)
+    expect(result.records).toEqual(["M  packages/alpha/alpha.ts"])
+    expect(result.offRemote).toHaveLength(1)
+    expect(result.offRemote?.[0]?.record).toBe("M  packages/alpha/alpha.ts")
+    const reason = result.offRemote?.[0]?.reason
+    expect(reason).toContain(ref)
+    expect(reason).toContain(side)
+    expect(reason).toContain(`refs/remotes/origin/main (${next})`)
+    expect(reason).toContain("push it to the component remote origin")
+    expect(reason).toContain("delete it by a recorded value call")
+    expect(reason).not.toContain("\n")
   })
 
   test("a component commit that is not on its remote stays dirt", async () => {
@@ -78,10 +131,14 @@ describe("status --removal verdict", () => {
     git(checkout, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
     writeFileSync(join(checkout, "alpha.ts"), "export const alpha = 9\n")
     git(checkout, "commit", "-q", "-am", "local only")
+    const local = git(checkout, "rev-parse", "HEAD")
     git(fixture.product, "add", "packages/alpha")
     const { code, result } = await removal(fixture.product)
     expect(code).toBe(1)
     expect(result.records.some((record) => record.includes("packages/alpha"))).toBe(true)
+    expect(result.offRemote?.[0]?.record).toBe(result.records[0])
+    expect(result.offRemote?.[0]?.reason).toContain(`HEAD ${local}`)
+    expect(result.offRemote?.[0]?.reason).toContain("refs/remotes/origin/main")
   })
 
   test("an untracked file in the component stays dirt", async () => {
@@ -92,9 +149,14 @@ describe("status --removal verdict", () => {
     git(checkout, "fetch", "-q", "origin")
     git(checkout, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
     writeFileSync(join(checkout, "scratch.txt"), "local\n")
-    const { code, result } = await removal(fixture.product)
+    writeFileSync(join(checkout, "other-scratch.txt"), "local\n")
+    const { code, result, text } = await removal(fixture.product)
     expect(code).toBe(1)
     expect(result.records.some((record) => record.includes("scratch.txt"))).toBe(true)
+    expect(result.offRemote?.[0]?.record).toBe(result.records[0])
+    expect(result.offRemote?.[0]?.reason).toContain("uncommitted or untracked files")
+    expect(result.offRemote).toHaveLength(2)
+    expect(text.trim()).toBe(result.offRemote?.[0]?.reason)
   })
 
   test("a local branch that is not on the remote stays dirt", async () => {

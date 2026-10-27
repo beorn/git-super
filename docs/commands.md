@@ -99,6 +99,7 @@ Shows tracked, untracked and staged changes in the root and in every checked-out
 
 - `--index-file <absolute path>` is for Git hooks: it reads the index Git is about to commit. It applies to the root repository only; submodules use their own indexes. A relative or missing path is refused. JSON names the file in the root entry of `consultedRepositories`.
 - `--removal` returns a removal verdict: exit 0 clean, 1 dirty (records as JSON), 2 a submodule's state is unknown.
+- A retained component record has an optional `offRemote` explanation: `{record, reason}` uses the unchanged porcelain record and names its first blocker and cure. Human output prints the same reason on stderr.
 
 `status --json` always includes two arrays:
 
