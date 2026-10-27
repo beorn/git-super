@@ -9,7 +9,7 @@
     {
       "name": "@bearly/flock",
       "repository": "beorn/bearly",
-      "commit": "aa472ea64d456144a4a041ded4541fadbdc56879",
+      "commit": "66ae83e6bece1f3720609fd34d05bcded8a8e6a5",
       "directory": "packages/flock",
       "pack": true
     }
