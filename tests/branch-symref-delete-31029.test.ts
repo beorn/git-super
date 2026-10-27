@@ -29,63 +29,69 @@ function refState(repo: string, ref: string): { present: boolean; oid: string; s
 }
 
 describe("#31029 branch removal must not follow a symbolic ref", () => {
-  it.each(["already symbolic", "rebound before transaction"] as const)(
-    "keeps refs/heads/main when the named branch is %s",
-    async (mode) => {
-      const root = await mkdtemp(join(canonicalTmpdir(), "git-super-symref-31029-"))
-      try {
-        const repo = join(root, "repo")
-        const tip = createRepository(repo, "root.txt", "root\n")
-        const branch = "task/sym"
-        const native = createLocalGitProcess()
-        let rebound = false
-        const store = createGitWorktreeStore({
-          repo,
-          gitProcess: {
-            run: (request) => {
-              if (
-                mode === "rebound before transaction" &&
-                request.args.includes("update-ref") &&
-                request.stdin?.includes(`delete refs/heads/${branch} `)
-              ) {
-                git(repo, ["symbolic-ref", `refs/heads/${branch}`, "refs/heads/main"])
-                rebound = true
-              }
-              return native.run(request)
-            },
+  it.each([
+    ["already symbolic", "task/sym"],
+    ["rebound before transaction", "task/sym"],
+    ["already symbolic", "task/sym;false"],
+  ] as const)("keeps refs/heads/main when the named branch is %s (%s)", async (mode, branch) => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-symref-31029-"))
+    try {
+      const repo = join(root, "repo")
+      const tip = createRepository(repo, "root.txt", "root\n")
+      const native = createLocalGitProcess()
+      let rebound = false
+      const store = createGitWorktreeStore({
+        repo,
+        gitProcess: {
+          run: (request) => {
+            if (
+              mode === "rebound before transaction" &&
+              request.args.includes("update-ref") &&
+              request.stdin?.includes(`delete refs/heads/${branch} `)
+            ) {
+              git(repo, ["symbolic-ref", `refs/heads/${branch}`, "refs/heads/main"])
+              rebound = true
+            }
+            return native.run(request)
           },
-        })
-        git(repo, ["tag", "retained", tip])
-        if (mode === "already symbolic") git(repo, ["symbolic-ref", `refs/heads/${branch}`, "refs/heads/main"])
-        else git(repo, ["branch", branch, tip])
+        },
+      })
+      git(repo, ["tag", "retained", tip])
+      if (mode === "already symbolic") git(repo, ["symbolic-ref", `refs/heads/${branch}`, "refs/heads/main"])
+      else git(repo, ["branch", branch, tip])
 
-        let removalError: unknown = null
-        try {
-          await store.removeBranch({ branch, tip, verify: { ref: "refs/tags/retained", oid: tip } })
-        } catch (error) {
-          removalError = error
-        }
-
-        const main = refState(repo, "refs/heads/main")
-        expect(main.present, `refs/heads/main must survive removing symref ${branch}: ${main.stderr}`).toBe(true)
-        expect(main.oid).toBe(tip)
-        expect(rebound).toBe(mode === "rebound before transaction")
-        expect(refState(repo, "refs/tags/retained").oid).toBe(tip)
-        if (mode === "already symbolic") {
-          expect(removalError).toBeInstanceOf(Error)
-          expect(String(removalError)).toMatch(/task\/sym.*symbolic/iu)
-          expect(String(removalError)).toContain("git symbolic-ref --delete refs/heads/task/sym")
-          expect(git(repo, ["symbolic-ref", `refs/heads/${branch}`]).trim()).toBe("refs/heads/main")
-        } else {
-          // Chief fa34f6ee: the native transaction may remove the literal alias introduced after inspection.
-          expect(removalError).toBeNull()
-          expect(refState(repo, `refs/heads/${branch}`).present).toBe(false)
-        }
-      } finally {
-        await rm(root, { recursive: true, force: true })
+      let removalError: unknown = null
+      try {
+        await store.removeBranch({ branch, tip, verify: { ref: "refs/tags/retained", oid: tip } })
+      } catch (error) {
+        removalError = error
       }
-    },
-  )
+
+      const main = refState(repo, "refs/heads/main")
+      expect(main.present, `refs/heads/main must survive removing symref ${branch}: ${main.stderr}`).toBe(true)
+      expect(main.oid).toBe(tip)
+      expect(rebound).toBe(mode === "rebound before transaction")
+      expect(refState(repo, "refs/tags/retained").oid).toBe(tip)
+      if (mode === "already symbolic") {
+        expect(removalError).toBeInstanceOf(Error)
+        expect(String(removalError)).toMatch(/task\/sym.*symbolic/iu)
+        expect(String(removalError)).toContain(`git symbolic-ref --delete 'refs/heads/${branch}'`)
+        expect(git(repo, ["symbolic-ref", `refs/heads/${branch}`]).trim()).toBe("refs/heads/main")
+        const command = /run (git symbolic-ref --delete .+) to remove only the alias$/u.exec(String(removalError))?.[1]
+        if (command === undefined) throw new Error("symbolic refusal names no alias-removal command")
+        const copied = spawnSync("sh", ["-c", command], { cwd: repo, encoding: "utf8" })
+        expect(copied.status, copied.stderr).toBe(0)
+        expect(refState(repo, `refs/heads/${branch}`).present).toBe(false)
+        expect(refState(repo, "refs/heads/main").oid).toBe(tip)
+      } else {
+        // Chief fa34f6ee: the native transaction may remove the literal alias introduced after inspection.
+        expect(removalError).toBeNull()
+        expect(refState(repo, `refs/heads/${branch}`).present).toBe(false)
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
 
   it("keeps the target when the symref names a branch other than main", async () => {
     const root = await mkdtemp(join(canonicalTmpdir(), "git-super-symref-other-31029-"))
