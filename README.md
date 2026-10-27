@@ -59,7 +59,7 @@ Lower-level commands, each run as `git super <command>`:
 
 - **`gitlink write <path> <commit>`**: set the commit the index records for one submodule, without touching its checkout.
 - **`submodule prepare <commit> --remote <remote>`**: create submodule Git directories without checking anything out.
-- **`worktree retention verify|compact`**: check or shrink the backups that `worktree remove` made.
+- **`worktree retention verify|compact|enroll`**: check or shrink retained copies, or register their dependencies. [Retention options](docs/commands.md#retention-commands).
 - **`observe --protocol=1`**: for merge queues: reads a saved root state as JSON on stdin and reports submodule branch commits that state does not explain. See [docs/commands.md](docs/commands.md#observe).
 
 `git super <command> --help` lists every flag.

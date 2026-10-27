@@ -10,9 +10,16 @@ import {
   writeFileSync,
 } from "node:fs"
 import { spawnSync } from "node:child_process"
-import { basename, dirname, join, sep } from "node:path"
+import { dirname, join, sep } from "node:path"
 import { cleanGitRepositoryEnvironment } from "./git.ts"
-import { manifest, metadataFileDigest, type WorktreeRemovalProof } from "./worktree-removal.ts"
+import {
+  manifest,
+  metadataFileDigest,
+  readStoredManifest,
+  readProofLocation,
+  rebuildRetainedCopyProof,
+  type WorktreeRemovalProof,
+} from "./worktree-removal.ts"
 
 /**
  * Post-close compaction of one retained-modules child (#27443 C1).
@@ -509,7 +516,8 @@ export function compactRetainedRoot(root: string, options: CompactRetainedRootOp
   }
   // A refusal before any write is a reported CLASS, not a stop: the child is left exactly as it is,
   // the run carries on, and the report still names it and its step.
-  const refusal = (entry: string, step: string): void => relabel(entry, "refused", step, null)
+  const refusal = (entry: string, step: string, detail: string | null = null): void =>
+    relabel(entry, "refused", step, detail)
   // A failure after the copy began to change stops the run. Its child is PARTIAL, so it gets its own
   // label and is never counted with the refusals (CTO 2026-10-12, on @dev/review2's finding): an
   // operator reading `refused` must be able to believe the entry is untouched.
@@ -521,10 +529,12 @@ export function compactRetainedRoot(root: string, options: CompactRetainedRootOp
       "may be partial: the failing step can write; run `retention verify` on it before trusting it",
     )
   for (const entry of selected) {
-    const rebuilt = rebuildRetainedCopyProof(entry)
+    const rebuilt = rebuildRetainedCopyProof(entry, root)
     if (typeof rebuilt === "string") {
-      if (PRE_MUTATION_REFUSALS.has(rebuilt)) {
-        refusal(entry, rebuilt)
+      const colon = rebuilt.indexOf(":")
+      const step = colon < 0 ? rebuilt : rebuilt.slice(0, colon)
+      if (PRE_MUTATION_REFUSALS.has(step)) {
+        refusal(entry, step, rebuilt)
         continue
       }
       failed = { entry, step: rebuilt }
@@ -607,76 +617,4 @@ function classifyRetainedEntry(entry: string): {
     }
   }
   return { entry, classification: "eligible", recordedFiles, detail: null }
-}
-
-/**
- * The stored proof's location fields. Compaction never invents one: a value that is not a string is a
- * MISSING recorded fact about this child, so the child is reported and skipped rather than rebuilt
- * with a guessed path that would then feed the manifest walk's custody arithmetic (CTO F1).
- */
-function readProofLocation(stored: Record<string, unknown>):
-  | { readonly ok: true; readonly path: string; readonly modules: string; readonly retained: string }
-  | {
-      readonly ok: false
-      readonly missing: readonly string[]
-    } {
-  const missing = ["path", "modules", "retained"].filter((field) => typeof stored[field] !== "string")
-  if (missing.length > 0) return { ok: false, missing }
-  return {
-    ok: true,
-    path: stored.path as string,
-    modules: stored.modules as string,
-    retained: stored.retained as string,
-  }
-}
-
-/**
- * Read a child's stored proof. A failure is a REPORTED reason, never a silent null: a manifest that
- * is absent, unreadable, or not a JSON object is what makes a child `no-manifest`, and the report
- * carries which way it failed.
- */
-function readStoredManifest(
-  entry: string,
-): { readonly ok: true; readonly manifest: Record<string, unknown> } | { readonly ok: false; readonly reason: string } {
-  const path = join(entry, "manifest.json")
-  if (!existsSync(path)) return { ok: false, reason: `${path} is absent` }
-  if (!lstatSync(path).isFile()) return { ok: false, reason: `${path} is not a regular file` }
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(readFileSync(path, "utf8"))
-  } catch (error) {
-    return {
-      ok: false,
-      reason: `${path} is unreadable JSON: ${error instanceof Error ? error.message : String(error)}`,
-    }
-  }
-  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-    return { ok: false, reason: `${path} is not a JSON object` }
-  }
-  return { ok: true, manifest: parsed as Record<string, unknown> }
-}
-
-/**
- * Rebuild the proof compaction reads from the child's own location. The stored `retained`/`manifest`
- * point at the root the proof was written under, which for older stock no longer exists; `path` and
- * `modules` feed only the manifest walk's custody string math and are taken as recorded, never
- * regenerated from a walk. Returns the refusing step's name when the stored proof cannot be matched
- * to this child, or does not record the location fields at all.
- */
-function rebuildRetainedCopyProof(entry: string): RetainedCopyProof | string {
-  const read = readStoredManifest(entry)
-  if (!read.ok) return "no-manifest"
-  const stored = read.manifest
-  const location = readProofLocation(stored)
-  if (!location.ok) return "incomplete-proof"
-  const recordedRetained = location.retained
-  if (basename(recordedRetained) !== "modules" || basename(dirname(recordedRetained)) !== basename(entry)) {
-    return "foreign-proof"
-  }
-  return {
-    path: location.path,
-    modules: location.modules,
-    retained: join(entry, "modules"),
-    manifest: join(entry, "manifest.json"),
-  }
 }

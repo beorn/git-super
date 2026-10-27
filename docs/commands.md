@@ -240,7 +240,23 @@ Other options:
 - `--no-rehome` keeps a store that other stores borrow from, instead of moving their objects.
 - `--preserved <ref>` lets a dirty store be removed only if `<ref>` resolves to a commit in that store.
 
-`worktree retention verify <entry> --root <dir>` and `worktree retention compact --root <dir>` check and compact existing copies. `worktree private-store verify <store>` checks a private submodule store. Both are read-only checks, and their results do not authorize removal.
+### Retention commands
+
+`worktree retention verify <entry> --root <dir>` checks an existing copy without changing it. `worktree private-store verify <store>` checks a private submodule store.
+
+`worktree retention compact --root <dir>` compacts existing copies and rewrites their proofs. Pass `--dry-run` to report the proposed compaction without writes.
+
+```bash
+git super --repo /work/product --json worktree retention enroll --root /backups/retained --common /work/product/.git
+```
+
+`worktree retention enroll` requires both `--root <directory>` and `--common <directory>`. By default it reports a dry-run plan without writes.
+
+`--apply` recomputes the plan under the common writer lock, then writes borrower registration pointers under `<common>/git-super-retained-borrowers`. It leaves copies and manifests unchanged.
+
+JSON includes each entry's classification and the proposed pointers. JSON and human output report excluded dangling alternate targets and gone copies, with their paths, targets and reasons.
+
+Enrollment exits 0 when the report is complete and 1 when incomplete, including refused entries, inspection errors or bounds reached. Enrollment, verification and compaction results do not authorize removal.
 
 ## gitlink write
 
