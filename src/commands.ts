@@ -17,8 +17,7 @@ import { isAbsolute, join } from "node:path"
 import { repositoryRoot } from "./git.ts"
 import { ensureCommitObject } from "./objects.ts"
 import { superStatus, type SuperStatusOptions, type SuperStatusResult } from "./status.ts"
-import { enrollRetainedBorrowers, type RetentionEnrollReport } from "./worktree-removal.ts"
-import { admitOnRemoteSelections } from "./worktree-removal.ts"
+import { admitOnRemoteSelections, enrollRetainedBorrowers, type RetentionEnrollReport } from "./worktree-removal.ts"
 import {
   superSubmodulePrepare,
   type SuperSubmodulePrepareOptions,

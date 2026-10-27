@@ -1428,11 +1428,90 @@ describe("createGitWorktreeStore", () => {
     }
   })
 
+  it("reports a non-ENOENT manifest read failure and refuses the whole apply before writes", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-enroll-manifest-io-"))
+    try {
+      const fixture = createProductFixture(root)
+      const retainedRoot = join(root, "retained")
+      await mkdir(retainedRoot)
+      const store = createLocalGitWorktreeStore({ repo: fixture.product })
+      const owner = await addAlphaWorktree(store, root, "owner")
+      const borrower = await addAlphaWorktree(store, root, "borrower")
+      await writeFile(join(borrower.objects, "info/alternates"), owner.objects + "\n")
+      const proofs: WorktreeRemovalProof[] = []
+      await store.remove(borrower.linked, {
+        retention: { root: retainedRoot, report: (proof) => proofs.push(proof) },
+      })
+      const proof = proofs[0]!
+      const common = git(fixture.product, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim()
+      const manifestPath = proof.manifest
+      const writerDir = join(common, "yrd-worktree-mutations")
+      const writerBefore = readdirSync(writerDir)
+        .sort()
+        .map((name) => [name, readFileSync(join(writerDir, name))])
+      const registry = join(common, "git-super-retained-borrowers")
+      const registryBefore = registrySnapshot(registry)
+      const realRead = vi.mocked(readFileSync).getMockImplementation()!
+      vi.mocked(readFileSync).mockImplementation((...args: Parameters<typeof readFileSync>) => {
+        if (String(args[0]) === manifestPath) {
+          throw Object.assign(new Error("fixture device read failure"), { code: "EIO" })
+        }
+        return realRead(...args)
+      })
+      const stdout = {
+        text: "",
+        write(text: string) {
+          this.text += text
+        },
+      }
+      const stderr = {
+        text: "",
+        write(text: string) {
+          this.text += text
+        },
+      }
+      try {
+        const code = await runCli(
+          [
+            "--repo",
+            fixture.product,
+            "--json",
+            "worktree",
+            "retention",
+            "enroll",
+            "--root",
+            retainedRoot,
+            "--common",
+            common,
+            "--apply",
+          ],
+          { write: stdout.write.bind(stdout) },
+          { write: stderr.write.bind(stderr) },
+        )
+        expect(code).toBe(1)
+        const report = JSON.parse(stdout.text) as { complete: boolean; enrolled: number; errors: string[] }
+        expect(report.complete).toBe(false)
+        expect(report.enrolled).toBe(0)
+        expect(report.errors.join("\n")).toContain("(EIO): fixture device read failure")
+        expect(registrySnapshot(registry)).toEqual(registryBefore)
+        expect(
+          readdirSync(writerDir)
+            .sort()
+            .map((name) => [name, readFileSync(join(writerDir, name))]),
+        ).toEqual(writerBefore)
+      } finally {
+        vi.mocked(readFileSync).mockImplementation(realRead)
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   // @failure A retained dependency declared through common/worktrees is discarded when its realpath is durable (#26497).
   // @level l1
   // @consumer worktree remove retained-copy custody
   // The existing alternate closure table covers only declarations whose canonical paths also identify the lender.
-  it.each(["alias-only", "durable-then-alias", "objects-link-alias"] as const)(
+  it.each(["alias-only", "durable-then-alias", "objects-link-alias", "relative-objects-link"] as const)(
     "keeps retained custody for a volatile alias path; declaration=%s",
     async (shape) => {
       const root = await mkdtemp(join(canonicalTmpdir(), "git-super-retained-alternate-alias-"))
@@ -1449,8 +1528,8 @@ describe("createGitWorktreeStore", () => {
         const canonical = realpathSync(volatileAlias)
         expect(canonical).toBe(durable)
         let objectsAliasTopology: { declaration: string; canonical: string; proofTarget: string } | undefined
-        if (shape === "objects-link-alias") {
-          await linkObjects(borrower.moduleDir, volatileAlias)
+        if (shape === "objects-link-alias" || shape === "relative-objects-link") {
+          await linkObjects(borrower.moduleDir, volatileAlias, shape === "relative-objects-link")
         } else {
           const lines = shape === "alias-only" ? [volatileAlias] : [canonical, volatileAlias]
           await writeFile(join(borrower.objects, "info/alternates"), lines.join("\n") + "\n")
@@ -1459,7 +1538,7 @@ describe("createGitWorktreeStore", () => {
         const retention = { root: join(root, "retained"), report: (proof: WorktreeRemovalProof) => proofs.push(proof) }
         await store.remove(borrower.linked, { retention })
         expect(proofs).toHaveLength(1)
-        if (shape === "objects-link-alias") {
+        if (shape === "objects-link-alias" || shape === "relative-objects-link") {
           const retainedObjects = join(proofs[0]!.retained!, "packages/alpha/objects")
           const manifestBytes = await readFile(proofs[0]!.manifest)
           const stored = JSON.parse(manifestBytes.toString()) as {
@@ -1468,13 +1547,15 @@ describe("createGitWorktreeStore", () => {
           const proofTarget = stored.externalObjectStores.find((row) => row.path === "packages/alpha/objects")?.target
           expect(proofTarget).toBe(durable)
           await rm(retainedObjects, { recursive: true, force: true })
-          await symlink(volatileAlias, retainedObjects, "dir")
+          const declaration =
+            shape === "relative-objects-link" ? relative(dirname(retainedObjects), volatileAlias) : volatileAlias
+          await symlink(declaration, retainedObjects, "dir")
           objectsAliasTopology = {
             declaration: await readlink(retainedObjects),
             canonical: realpathSync(retainedObjects),
             proofTarget: proofTarget!,
           }
-          expect(objectsAliasTopology).toEqual({ declaration: volatileAlias, canonical: durable, proofTarget: durable })
+          expect(objectsAliasTopology).toEqual({ declaration, canonical: durable, proofTarget: durable })
           expect(await readFile(proofs[0]!.manifest)).toEqual(manifestBytes)
         }
         const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true)
@@ -1622,6 +1703,8 @@ describe("createGitWorktreeStore", () => {
         const fixture = createProductFixture(root)
         const store = createLocalGitWorktreeStore({ repo: fixture.product })
         const source = await addAlphaWorktree(store, root, "source")
+        const liveBorrower = await addAlphaWorktree(store, root, "live-borrower")
+        const retainedRoot = join(root, "retained")
         let declared = source.objects
         if (shape === "volatile-alias") {
           const commonPath = git(fixture.product, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim()
@@ -1631,17 +1714,28 @@ describe("createGitWorktreeStore", () => {
           declared = source.objects
           expect(realpathSync(declared)).toBe(durable)
         }
-        await writeFile(join(source.objects, "info/alternates"), declared + "\n")
+        const alternate = join(source.objects, "info/alternates")
+        await writeFile(alternate, declared + "\n")
+        const alternateBefore = await readFile(alternate)
+        const liveBorrowerAlternate = join(liveBorrower.objects, "info/alternates")
+        await writeFile(liveBorrowerAlternate, declared + "\n")
+        const liveBorrowerAlternateBefore = await readFile(liveBorrowerAlternate)
         const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true)
         try {
           await expect(
-            store.remove(source.linked, { retention: { root: join(root, "retained"), report: () => {} } }),
+            store.remove(source.linked, { retention: { root: retainedRoot, report: () => {} } }),
           ).rejects.toThrow("retained")
         } finally {
           stderr.mockRestore()
         }
         expect(existsSync(source.linked)).toBe(true)
         expect(existsSync(source.objects)).toBe(true)
+        expect(await readFile(alternate)).toEqual(alternateBefore)
+        expect(existsSync(liveBorrower.linked)).toBe(true)
+        expect(await readFile(liveBorrowerAlternate)).toEqual(liveBorrowerAlternateBefore)
+        expect(existsSync(retainedRoot) ? readdirSync(retainedRoot) : []).toEqual([])
+        const common = git(fixture.product, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim()
+        expect(registrySnapshot(join(common, "git-super-retained-borrowers"))).toEqual([])
       } finally {
         await rm(root, { recursive: true, force: true })
       }

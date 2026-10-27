@@ -7,6 +7,7 @@
  */
 import { spawn, spawnSync } from "node:child_process"
 import { once } from "node:events"
+import { createHash } from "node:crypto"
 import {
   chmodSync,
   existsSync,
@@ -20,7 +21,7 @@ import {
   writeFileSync,
 } from "node:fs"
 import { mkdtemp, rm } from "node:fs/promises"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 import { afterEach, expect, it, vi } from "vitest"
 import * as GitSuper from "../src/index.ts"
 import { createExclusive } from "../src/exclusive.ts"
@@ -301,13 +302,14 @@ it.each(["unknown-store", "unknown-hook"] as const)(
 // CTO343fc3e2/0a13f6da: host-selected linked environments borrow declared public stores transitively.
 // Existing primary-source fixtures have no public alternates and therefore miss real Yrd source closure.
 it.each([
-  [false, false, false],
-  [true, false, false],
-  [false, true, false],
-  [false, false, true],
+  [false, false, false, false],
+  [true, false, false, false],
+  [false, true, false, false],
+  [false, false, true, false],
+  [false, false, true, true],
 ])(
-  "projects a public linked source with its declared child object-store lenders; nested=%s; authored=%s; remove donor=%s",
-  async (nested, authored, removeDonor) => {
+  "projects a public linked source with its declared child object-store lenders; nested=%s; authored=%s; remove donor=%s; independent=%s",
+  async (nested, authored, removeDonor, independent) => {
     const root = await mkdtemp(join(canonicalTmpdir(), "git-super-linked-source-closure-"))
     roots.push(root)
     const fixture = nested ? addNestedAlphaSubmodule(createProductFixture(root)) : createProductFixture(root)
@@ -380,25 +382,131 @@ it.each([
       for (const dependency of proof.externalObjectStores) {
         expect(dependency.target === donorGit || dependency.target.startsWith(`${donorGit}/`)).toBe(false)
       }
+      // AC3: actual alternates, beyond the recorded symlinks, decide donor custody.
+      // The earlier journey checked only externalObjectStores and missed this live edge.
+      const borrowedPairs = ["packages/alpha", "vendor/beta"].map((modulePath) => ({
+        alternate: join(proof.retained, "modules", modulePath, "objects/info/alternates"),
+        lender: join(donorGit, "modules", modulePath, "objects"),
+      }))
+      const copiedStores = [
+        proof.retained,
+        join(proof.retained, "modules/packages/alpha"),
+        join(proof.retained, "modules/vendor/beta"),
+      ]
+      const copiedHeads = copiedStores.map((storePath) =>
+        git(fixture.product, "--git-dir", storePath, "rev-parse", "HEAD"),
+      )
+      if (independent) {
+        // Legal independent counterpart: each private store borrows only the durable public store.
+        for (const [storePath, durable] of [
+          [proof.retained, join(fixture.product, ".git/objects")],
+          [join(proof.retained, "modules/packages/alpha"), durableObjects],
+          [join(proof.retained, "modules/vendor/beta"), privateObjects],
+        ] as const) {
+          const alternate = join(storePath, "objects/info/alternates")
+          if (existsSync(alternate)) writeFileSync(alternate, `${durable}\n`)
+        }
+        for (const [index, storePath] of copiedStores.entries()) {
+          expect(git(fixture.product, "--git-dir", storePath, "rev-parse", "HEAD")).toBe(copiedHeads[index])
+          git(
+            fixture.product,
+            "--git-dir",
+            storePath,
+            "--work-tree",
+            dirname(proof.retained),
+            "fsck",
+            "--connectivity-only",
+            "--no-dangling",
+          )
+        }
+      } else {
+        for (const pair of borrowedPairs) {
+          expect(readFileSync(pair.alternate, "utf8").trim().split("\n")).toContain(pair.lender)
+        }
+      }
+      const manifestBefore = readFileSync(retained.manifest)
+      const alternatesBefore = borrowedPairs.map((pair) => readFileSync(pair.alternate))
+      const pointerName = createHash("sha256").update(retained.manifest).digest("hex") + ".json"
+      const registries = [
+        ...new Set([
+          join(fixture.product, ".git"),
+          ...projected.projection.mounts.filter((mount) => mount.mode === "ro").map((mount) => dirname(mount.source)),
+        ]),
+      ].map((common) => join(common, "git-super-retained-borrowers"))
+      const registryBefore = registries.map((registry) => ({
+        registry,
+        files: readdirSync(registry)
+          .sort()
+          .map((name) => ({ name, bytes: readFileSync(join(registry, name)) })),
+      }))
+      expect(registryBefore.some((row) => row.files.some((file) => file.name === pointerName))).toBe(true)
       expect(statSync(join(proof.retained, "yrd-worktree-mutations/writer.lock")).size).toBe(0)
       const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true)
       try {
-        await store.remove(source, {
-          retention: {
-            root: join(root, "retained-donor"),
-            report: (removed) => expect(existsSync(removed.manifest)).toBe(true),
-          },
-          excludedSubmodules,
-        })
+        const removal = () =>
+          store.remove(source, {
+            retention: {
+              root: join(root, "retained-donor"),
+              report: (removed) => expect(existsSync(removed.manifest)).toBe(true),
+            },
+            excludedSubmodules,
+          })
+        if (!independent) {
+          let refusal: unknown
+          try {
+            await removal()
+          } catch (error) {
+            refusal = error
+          }
+          expect(refusal).toBeInstanceOf(Error)
+          expect(
+            borrowedPairs.some((pair) =>
+              String(refusal).includes(
+                `borrows from removal store through ${pair.alternate} (declared ${pair.lender}, canonical ${pair.lender}); worktree preserved`,
+              ),
+            ),
+            String(refusal),
+          ).toBe(true)
+          expect(existsSync(source)).toBe(true)
+          expect(existsSync(proof.retained)).toBe(true)
+          expect(readFileSync(retained.manifest)).toEqual(manifestBefore)
+          expect(borrowedPairs.map((pair) => readFileSync(pair.alternate))).toEqual(alternatesBefore)
+          expect(
+            registryBefore.map(({ registry }) => ({
+              registry,
+              files: readdirSync(registry)
+                .sort()
+                .map((name) => ({ name, bytes: readFileSync(join(registry, name)) })),
+            })),
+          ).toEqual(registryBefore)
+          const donorRoot = join(root, "retained-donor")
+          expect(existsSync(donorRoot) ? readdirSync(donorRoot) : []).toEqual([])
+          return
+        }
+        await removal()
         expect(stderr.mock.calls.map(([line]) => String(line)).join("")).toContain(
-          `retained borrower ${proof.retained} has no objects links into removable linked stores; dropped registry entry `,
+          `retained borrower ${proof.retained} has no objects links or alternates into removable linked stores; dropped registry entry `,
         )
+        expect(existsSync(join(fixture.product, ".git/git-super-retained-borrowers", pointerName))).toBe(false)
       } finally {
         stderr.mockRestore()
       }
       expect(existsSync(source)).toBe(false)
       expect(existsSync(proof.retained)).toBe(true)
       git(fixture.product, "--git-dir", proof.retained, "cat-file", "-e", `${base}^{commit}`)
+      for (const [index, storePath] of copiedStores.entries()) {
+        expect(git(fixture.product, "--git-dir", storePath, "rev-parse", "HEAD")).toBe(copiedHeads[index])
+        git(
+          fixture.product,
+          "--git-dir",
+          storePath,
+          "--work-tree",
+          dirname(proof.retained),
+          "fsck",
+          "--connectivity-only",
+          "--no-dangling",
+        )
+      }
       return
     }
     const alternates = join(sourceGit, "objects/info/alternates")

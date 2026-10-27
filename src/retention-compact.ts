@@ -516,7 +516,8 @@ export function compactRetainedRoot(root: string, options: CompactRetainedRootOp
   }
   // A refusal before any write is a reported CLASS, not a stop: the child is left exactly as it is,
   // the run carries on, and the report still names it and its step.
-  const refusal = (entry: string, step: string): void => relabel(entry, "refused", step, null)
+  const refusal = (entry: string, step: string, detail: string | null = null): void =>
+    relabel(entry, "refused", step, detail)
   // A failure after the copy began to change stops the run. Its child is PARTIAL, so it gets its own
   // label and is never counted with the refusals (CTO 2026-10-12, on @dev/review2's finding): an
   // operator reading `refused` must be able to believe the entry is untouched.
@@ -533,7 +534,7 @@ export function compactRetainedRoot(root: string, options: CompactRetainedRootOp
       const colon = rebuilt.indexOf(":")
       const step = colon < 0 ? rebuilt : rebuilt.slice(0, colon)
       if (PRE_MUTATION_REFUSALS.has(step)) {
-        refusal(entry, step)
+        refusal(entry, step, rebuilt)
         continue
       }
       failed = { entry, step: rebuilt }

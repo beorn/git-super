@@ -19,7 +19,7 @@ import {
   writeFileSync,
 } from "node:fs"
 import { spawnSync } from "node:child_process"
-import { join, sep } from "node:path"
+import { join, relative, sep } from "node:path"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import {
   compactRetainedModules,
@@ -880,6 +880,22 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
     )
   })
 
+  it("refuses a symlinked retained root before reading or compacting children", () => {
+    const scratch = mkdtempSync(join(canonicalTmpdir(), "git-super-c3-root-alias-"))
+    roots.push(scratch)
+    const retainedRoot = join(scratch, "retained-modules")
+    mkdirSync(retainedRoot, { recursive: true })
+    const child = buildRetainedEntry(retainedRoot, "a-entry")
+    const beforeProof = readFileSync(join(child.entry, "manifest.json"))
+    const beforeTree = treeDigest(child.entry)
+    const alias = join(scratch, "retained-alias")
+    symlinkSync(retainedRoot, alias, "dir")
+
+    expect(() => compactRetainedRoot(alias)).toThrow(/root .*absent or not a directory/u)
+    expect(readFileSync(join(child.entry, "manifest.json"))).toEqual(beforeProof)
+    expect(treeDigest(child.entry)).toBe(beforeTree)
+  })
+
   it("compacts over the CLI and reports JSON counts", async () => {
     const scratch = mkdtempSync(join(canonicalTmpdir(), "git-super-c3-cli-"))
     roots.push(scratch)
@@ -960,6 +976,141 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
 // @consumer worktree retention enroll CLI and retained lender guard
 // Compact's mutating relocation tests cannot prove enrollment dry-run, pointer selection, or idempotence.
 describe("retention enrollment", () => {
+  // @failure Enrollment stops midway after the scan-and-lease deadline expires during publication (#26497, CTO b6d9b2b1).
+  // @level l1
+  // @consumer retention enrollment CLI and retained borrower custody guard
+  // Existing deadline coverage only checks before publication; this pins that a bounded admitted list publishes as one complete batch.
+  it("finishes all borrower pointer publications when the deadline passes after the first pointer", async () => {
+    const scratch = mkdtempSync(join(canonicalTmpdir(), "git-super-enroll-deadline-"))
+    roots.push(scratch)
+    const repo = join(scratch, "repo")
+    createRepository(repo, "file.ts", "export const n = 1\n")
+    const common = join(repo, ".git")
+    const root = join(scratch, "retained")
+    mkdirSync(root)
+    const first = buildRetainedEntry(root, "a-linked")
+    const second = buildRetainedEntry(root, "b-linked")
+    const lender = join(common, "worktrees/lender/modules/dep/objects")
+    mkdirSync(join(lender, "info"), { recursive: true })
+    writeFileSync(join(first.gitDir, "objects/info/alternates"), lender + "\n")
+    writeFileSync(join(second.gitDir, "objects/info/alternates"), lender + "\n")
+    const manifests = [
+      readFileSync(join(first.entry, "manifest.json")),
+      readFileSync(join(second.entry, "manifest.json")),
+    ]
+    const registry = join(common, "git-super-retained-borrowers")
+    const start = 1_000_000
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => {
+      const published = existsSync(registry) && readdirSync(registry).some((name) => name.endsWith(".json"))
+      return published ? start + 5 * 60_000 + 1 : start
+    })
+    const stdout = outputSink()
+    const stderr = outputSink()
+    const args = ["--repo", repo, "--json", "worktree", "retention", "enroll", "--root", root, "--common", common]
+    try {
+      await runCli([...args, "--apply"], stdout, stderr)
+    } finally {
+      clock.mockRestore()
+    }
+    const report = JSON.parse(stdout.output) as RetentionEnrollReport
+    expect(readFileSync(join(first.entry, "manifest.json"))).toEqual(manifests[0])
+    expect(readFileSync(join(second.entry, "manifest.json"))).toEqual(manifests[1])
+    const jsonPointers = existsSync(registry) ? readdirSync(registry).filter((name) => name.endsWith(".json")) : []
+    expect({
+      boundHit: report.boundHit,
+      complete: report.complete,
+      enrolled: report.enrolled,
+      jsonPointerCount: jsonPointers.length,
+    }).toEqual({
+      boundHit: false,
+      complete: true,
+      enrolled: 2,
+      jsonPointerCount: 2,
+    })
+  })
+
+  it("publishes nothing when the lease-bound replan reaches the deadline before its first pointer", async () => {
+    const scratch = mkdtempSync(join(canonicalTmpdir(), "git-super-enroll-prepublish-deadline-"))
+    roots.push(scratch)
+    const repo = join(scratch, "repo")
+    createRepository(repo, "file.ts", "export const n = 1\n")
+    const common = join(repo, ".git")
+    const root = join(scratch, "retained")
+    mkdirSync(root)
+    const child = buildRetainedEntry(root, "child")
+    const lender = join(common, "worktrees/lender/modules/dep/objects")
+    mkdirSync(join(lender, "info"), { recursive: true })
+    writeFileSync(join(child.gitDir, "objects/info/alternates"), lender + "\n")
+    const registry = join(common, "git-super-retained-borrowers")
+    const lock = join(common, "yrd-worktree-mutations/writer.lock")
+    const now = 1_000_000
+    const args = [
+      "--repo",
+      repo,
+      "--json",
+      "worktree",
+      "retention",
+      "enroll",
+      "--root",
+      root,
+      "--common",
+      common,
+      "--apply",
+    ]
+    let dryRunDateCalls = 0
+    const calibrationClock = vi.spyOn(Date, "now").mockImplementation(() => {
+      dryRunDateCalls++
+      return now
+    })
+    const dryRun = outputSink()
+    try {
+      expect(await runCli(args.slice(0, -1), dryRun, outputSink())).toBe(0)
+    } finally {
+      calibrationClock.mockRestore()
+    }
+    const dryReport = JSON.parse(dryRun.output) as RetentionEnrollReport
+    expect(dryReport.proposed).toHaveLength(1)
+    // The dry-run measures one deadline-start call plus exactly one plan over this fixed fixture.
+    // During apply, the same bounded plan runs under the real enrollment lease. Expire only on the
+    // next clock call after those planned reads, which is the prepublication admission check.
+    const planDateCalls = dryRunDateCalls - 1
+    expect(planDateCalls).toBeGreaterThan(1)
+    let leaseClockReads = 0
+    let expiredUnderEnrollmentLease = false
+    const deadlineClock = vi.spyOn(Date, "now").mockImplementation(() => {
+      let holder: unknown
+      if (existsSync(lock)) {
+        const lockBytes = readFileSync(lock, "utf8")
+        // The lock file is created before its JSON body is published; only that exact empty stage
+        // has no holder. Malformed contents and read failures must remain visible to the test.
+        if (lockBytes !== "") holder = (JSON.parse(lockBytes) as { holder?: unknown }).holder
+      }
+      if (holder === "git-super worktree retention enroll") {
+        leaseClockReads++
+        if (leaseClockReads === planDateCalls + 1) {
+          expiredUnderEnrollmentLease = true
+          return now + 5 * 60_000 + 1
+        }
+      }
+      return now
+    })
+    const stdout = outputSink()
+    const stderr = outputSink()
+    try {
+      expect(await runCli(args, stdout, stderr)).toBe(1)
+      const report = JSON.parse(stdout.output) as RetentionEnrollReport
+      expect(expiredUnderEnrollmentLease).toBe(true)
+      expect(leaseClockReads).toBe(planDateCalls + 1)
+      expect(report.boundHit).toBe(true)
+      expect(report.complete).toBe(false)
+      expect(report.enrolled).toBe(0)
+      expect(report.errors.join("\n")).toContain("exceeded its deadline before pointer publication; nothing applied")
+      expect(existsSync(registry)).toBe(false)
+    } finally {
+      deadlineClock.mockRestore()
+    }
+  })
+
   it("plans relocated linked copies without writes and applies exact pointers idempotently", async () => {
     const scratch = mkdtempSync(join(canonicalTmpdir(), "git-super-enroll-"))
     roots.push(scratch)
@@ -998,7 +1149,9 @@ describe("retention enrollment", () => {
     const held = await acquireExclusive(join(common, "yrd-worktree-mutations"))
     const applying = runCli([...args, "--apply"], applied, stderr)
     try {
-      await new Promise((resolve) => setTimeout(resolve, 100))
+      await vi.waitFor(() => expect(stderr.output).toContain("waiting for common writer lock held by"), {
+        timeout: 1_000,
+      })
       expect(existsSync(join(common, "git-super-retained-borrowers"))).toBe(false)
       const durable = join(common, "modules/durable/objects")
       mkdirSync(join(durable, "info"), { recursive: true })
@@ -1027,6 +1180,54 @@ describe("retention enrollment", () => {
     expect(repeatedReport.enrolled).toBe(0)
     expect(repeatedReport.entries.some((row) => row.classification === "already-enrolled")).toBe(true)
     expect(readFileSync(pointer)).toEqual(pointerBytes)
+  })
+
+  it("uses recorded path and modules as exact removal roots without requiring gitDir", async () => {
+    const scratch = mkdtempSync(join(canonicalTmpdir(), "git-super-enroll-recorded-roots-"))
+    roots.push(scratch)
+    const repo = join(scratch, "repo")
+    createRepository(repo, "file.ts", "export const n = 1\n")
+    const common = join(repo, ".git")
+    const root = join(scratch, "retained")
+    mkdirSync(root)
+    const child = buildRetainedEntry(root, "child")
+    const originalCheckout = join(common, "worktrees", "owner")
+    const originalModules = join(originalCheckout, "modules")
+    const siblingLender = join(common, "worktrees", "owner-sibling", "modules", "dep", "objects")
+    expect(relative(originalCheckout, siblingLender)).toMatch(/^\.\./u)
+    mkdirSync(join(siblingLender, "info"), { recursive: true })
+    writeFileSync(join(child.gitDir, "objects/info/alternates"), siblingLender + "\n")
+    const proof = storedProof(child.entry)
+    proof.path = originalCheckout
+    proof.modules = originalModules
+    delete proof.gitDir
+    expect(proof).not.toHaveProperty("gitDir")
+    expect(proof.path).toBe(originalCheckout)
+    expect(proof.modules).toBe(originalModules)
+    writeStoredProof(child.entry, proof)
+
+    const args = [
+      "--repo",
+      repo,
+      "--json",
+      "worktree",
+      "retention",
+      "enroll",
+      "--root",
+      root,
+      "--common",
+      common,
+      "--apply",
+    ]
+    const stdout = outputSink()
+    const stderr = outputSink()
+    expect(await runCli(args, stdout, stderr), stderr.output).toBe(0)
+    const report = JSON.parse(stdout.output) as RetentionEnrollReport
+    expect(report.entries[0]).toEqual(expect.objectContaining({ classification: "enrolled" }))
+    expect(report.enrolled).toBe(1)
+    expect(readFileSync(join(child.entry, "manifest.json"))).toEqual(Buffer.from(`${JSON.stringify(proof, null, 2)}\n`))
+    const pointerFiles = readdirSync(join(common, "git-super-retained-borrowers"))
+    expect(pointerFiles).toHaveLength(1)
   })
   // Identity failures are a reader contract; successful compaction cannot witness preservation on refusal.
   it.each([
@@ -1060,7 +1261,14 @@ describe("retention enrollment", () => {
     if (shape === "missing-child") rmSync(entry, { recursive: true })
     const result = rebuildRetainedCopyProof(entry, root)
     expect(typeof result).toBe("string")
-    expect(result).toMatch(/foreign-proof|no-manifest|missing-copy/)
+    const expected = {
+      "incoherent-pair": "foreign-proof: incoherent recorded manifest/retained pair",
+      "relative-record": "foreign-proof: incoherent recorded manifest/retained pair",
+      "redirected-manifest": "no-manifest:",
+      "redirected-modules": "missing-copy: retained directory is absent or redirected:",
+      "missing-child": "foreign-proof: cannot resolve actual retained child",
+    }[shape]
+    expect(result).toContain(expected)
   })
 
   it("refuses two actual candidates for one recorded entry across declared roots", async () => {
@@ -1149,6 +1357,7 @@ describe("retention enrollment", () => {
       readFileSync(join(linked.entry, "manifest.json")),
       readFileSync(join(independent.entry, "manifest.json")),
     ]
+    const registrationBefore = readFileSync(registration)
     const args = ["--repo", repo, "--json", "worktree", "retention", "enroll", "--root", root, "--common", common]
     const stdout = outputSink()
     const exitCode = await runCli(args, stdout, outputSink())
@@ -1168,9 +1377,74 @@ describe("retention enrollment", () => {
       },
     })
     expect(existsSync(registration)).toBe(true)
+    expect(readFileSync(registration)).toEqual(registrationBefore)
     expect(readFileSync(join(linked.entry, "manifest.json"))).toEqual(before[0])
     expect(readFileSync(join(independent.entry, "manifest.json"))).toEqual(before[1])
     expect(exitCode).toBe(0)
+
+    const applied = outputSink()
+    expect(await runCli([...args, "--apply"], applied, outputSink())).toBe(0)
+    const appliedReport = JSON.parse(applied.output) as RetentionEnrollReport
+    expect(appliedReport.enrolled).toBe(1)
+    expect(appliedReport.entries.find((row) => row.entry === linked.entry)?.classification).toBe("enrolled")
+    expect(readFileSync(registration)).toEqual(registrationBefore)
+    expect(readFileSync(join(linked.entry, "manifest.json"))).toEqual(before[0])
+    expect(readFileSync(join(independent.entry, "manifest.json"))).toEqual(before[1])
+    expect(readdirSync(registry).filter((name) => name.endsWith(".json"))).toHaveLength(2)
+  })
+
+  it("applies a valid legacy proposal while refusing an invalid modern leg", async () => {
+    const scratch = mkdtempSync(join(canonicalTmpdir(), "git-super-enroll-modern-refusal-"))
+    roots.push(scratch)
+    const repo = join(scratch, "repo")
+    createRepository(repo, "file.ts", "export const n = 1\n")
+    const common = join(repo, ".git")
+    const root = join(scratch, "retained")
+    mkdirSync(root)
+    const modern = buildRetainedEntry(root, "a-modern")
+    const legacy = buildRetainedEntry(root, "b-legacy")
+    writeStoredProof(modern.entry, {
+      ...storedProof(modern.entry),
+      externalObjectStores: [{ path: "dep/objects", target: 7 }],
+    })
+    const legacyProof = storedProof(legacy.entry)
+    delete legacyProof.entries
+    delete legacyProof.externalObjectStores
+    writeStoredProof(legacy.entry, legacyProof)
+    const lender = join(common, "worktrees/lender/modules/dep/objects")
+    mkdirSync(join(lender, "info"), { recursive: true })
+    writeFileSync(join(legacy.gitDir, "objects/info/alternates"), lender + "\n")
+
+    const stdout = outputSink()
+    const stderr = outputSink()
+    const args = [
+      "--repo",
+      repo,
+      "--json",
+      "worktree",
+      "retention",
+      "enroll",
+      "--root",
+      root,
+      "--common",
+      common,
+      "--apply",
+    ]
+    const exitCode = await runCli(args, stdout, stderr)
+    expect(exitCode).toBe(1)
+    const report = JSON.parse(stdout.output) as RetentionEnrollReport
+    expect(report.complete).toBe(false)
+    expect(report.enrolled).toBe(1)
+    expect(report.entries.find((row) => row.entry === modern.entry)).toEqual(
+      expect.objectContaining({
+        classification: "not-enrolled",
+        reason: expect.stringContaining("invalid retained objects dependency"),
+      }),
+    )
+    expect(report.entries.find((row) => row.entry === legacy.entry)?.classification).toBe("enrolled")
+    expect(
+      readdirSync(join(common, "git-super-retained-borrowers")).filter((name) => name.endsWith(".json")),
+    ).toHaveLength(1)
   })
 
   it("reports missing manifests and invalid roots/common, and never applies a bounded partial plan", async () => {
@@ -1214,11 +1488,13 @@ describe("retention enrollment", () => {
         ?.reason,
     ).toContain("invalid retained objects dependency")
     expect(existsSync(join(common, "git-super-retained-borrowers"))).toBe(false)
-    for (let i = 0; i < 10000; i++) mkdirSync(join(root, "entry-" + i))
+    const childrenBeforeBound = readdirSync(root).length
+    for (let i = 0; i < 10001; i++) mkdirSync(join(root, "entry-" + i))
     const bounded = outputSink()
     expect(await runCli([...args, "--apply"], bounded, outputSink())).toBe(1)
     const report = JSON.parse(bounded.output) as RetentionEnrollReport
     expect(report.boundHit).toBe(true)
+    expect(report.children).toBe(childrenBeforeBound + 10001)
     expect(report.inspected).toBe(0)
     expect(report.enrolled).toBe(0)
     expect(existsSync(join(common, "yrd-worktree-mutations"))).toBe(false)
