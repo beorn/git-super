@@ -16,7 +16,7 @@ import { createHash, randomUUID } from "node:crypto"
 import { spawnSync } from "node:child_process"
 import { setTimeout as delay } from "node:timers/promises"
 import { appendFile, lstat, readFile, writeFile } from "node:fs/promises"
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { fileURLToPath } from "node:url"
 import { tmpdir } from "node:os"
 import { createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS } from "./exclusive.ts"
@@ -52,7 +52,6 @@ import type { SuperStatusResult } from "./status.ts"
 import { statusWithGit } from "./status-traversal.ts"
 import { removalBorrowers } from "./worktree-administration.ts"
 import {
-  archiveModuleStores,
   describeModuleStores,
   inspectDestroyedModuleStores,
   inspectModuleStores,
@@ -838,17 +837,20 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       )
     }
   }
-  // The operator's value test (2026-10-21): a module repository a removal destroys has its value pushed to its
-  // own remote under `refs/archive/...` first, and only then may anything be deleted. A failed push throws
-  // before the caller deletes, so the slot is preserved. `remove` and `recoverDestroyed` go through this, and
-  // `prune` recovers each prunable registration through `recoverDestroyed` (30616). Each store is reported as soon as it is archived, so a later store's failure
-  // never hides an archive already made. The actor names the slot: the caller's, else the checkout or registration.
-  const archiveModuleStoresBeforeDelete = (stores: readonly ModuleStore[], actor: string) => {
-    archiveModuleStores(stores, { actor, date: new Date().toISOString().slice(0, 10) }, (store) => {
+  // The existing value population is checked before custody rehome or destruction. A positive count keeps
+  // the whole store for its owner's value call; ADR 0018 forbids the old automatic archive-then-delete cure.
+  // Both removal and destroyed recovery use this boundary; prune delegates to destroyed recovery.
+  const preserveModuleStoreValueBeforeDelete = (stores: readonly ModuleStore[]) => {
+    const value = stores.find((store) => store.valueCommits > 0)
+    if (value !== undefined) {
+      throw new Error(
+        `${describeModuleStores([value]).join("")}; worktree preserved. Owner value call: land, keep one real branch, or recorded delete.`,
+      )
+    }
+    for (const store of stores) {
       const line = `${describeModuleStores([store]).join("")}\n`
       if (options.report !== undefined) options.report(line)
-      else if (store.valueCommits > 0) process.stderr.write(line)
-    })
+    }
   }
   const prepareRemoval = async (path: string, excludedSubmodules?: readonly string[], retained = false) => {
     await assertRemovalRoot(path)
@@ -866,8 +868,8 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       return { gitDir, rehome: undefined, notCompared: custody.notCompared, stores: [] }
     }
     // Every destructive removal walks the slot's own `modules/` inventory, whether or not any submodule is
-    // excluded: a store no HEAD declaration names is destroyed with the slot, so its value must be archived
-    // first. A retained removal copies the whole store population, so nothing is destroyed by it.
+    // excluded: a store no HEAD declaration names is destroyed with the slot, so positive value preserves it.
+    // A retained removal copies the whole store population, so nothing is destroyed by it.
     const stores = retained
       ? []
       : inspectModuleStores(path, gitDir, custody.excludedStores, custody.unclaimedExclusions).stores
@@ -1124,8 +1126,6 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         excludedSubmodules?: readonly string[]
         noRehome?: boolean
         preserved?: readonly string[]
-        /** Names the `refs/archive/<date>/<actor>/...` segment when a module store's value is archived. */
-        archiveActor?: string
         componentCustody?: ComponentCustodyPolicy
       }> = {},
     ): Promise<
@@ -1168,8 +1168,8 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
           )
         }
         if (rehome === undefined) throw new Error(`worktree ${path} has no prepared borrower custody`)
-        // Nothing below this line has run yet, so a failed archive preserves the slot.
-        archiveModuleStoresBeforeDelete(stores, removeOptions.archiveActor ?? basename(path))
+        // No custody rehome or destruction has run; a value-holding store stays in place.
+        preserveModuleStoreValueBeforeDelete(stores)
         const proofDeadline = Date.now() + timeouts.cleanup
         const adapters =
           removeOptions.componentCustody === undefined
@@ -1799,9 +1799,9 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         uninitializedSubmodules: status.uninitializedSubmodules,
       }
     },
-    /** Retention records the destroyed checkout's own HEAD in its proof but does not archive it. The current
-     * pool/candidate callers use disposable compositions whose inputs queue change records retain; a caller
-     * passing a seat environment must first hold that HEAD with an archive ref. */
+    /** Retention records the destroyed checkout's own HEAD in its proof. Pool/candidate inputs are retained
+     * by queue change records; a caller passing a seat environment must first hold its HEAD on its real
+     * branch or in its owning tool's durable custody. Recovery never creates an archive ref. */
     async recoverDestroyed(
       path: string,
       operation = `recover destroyed worktree ${path}`,
@@ -1841,9 +1841,8 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         let releasedHold: { head: string; pointer: string; body: Uint8Array } | undefined
         try {
           if (retention === undefined) {
-            // With the checkout already gone nothing consults this registration's stores, so every one is judged
-            // by the value test and archived before its administration directory is deleted (30580).
-            archiveModuleStoresBeforeDelete(inspectDestroyedModuleStores(directory).stores, basename(directory))
+            // Keep the same value inspection; unresolved value preserves the registration and all its stores.
+            preserveModuleStoreValueBeforeDelete(inspectDestroyedModuleStores(directory).stores)
             rehomeBorrowers(common, directory, join(directory, "modules"))
           } else {
             const identity = await inspectWorktree(git, repo, path)

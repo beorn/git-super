@@ -220,6 +220,12 @@ Removes one registered, clean, unlocked linked worktree. Steps:
 
 Copies are never deleted automatically. Keep them at least until the proof's `retainUntil` date. Use a durable directory.
 
+Library removal or destroyed-worktree recovery without retained-copy custody preserves a module store when the existing inspection finds commits outside its compared remote default, existing archive refs and available tags.
+
+The error names the store, count and owner value call: land, keep one real branch, or recorded delete. This path creates no archive refs; existing remote archive refs still count in the comparison.
+
+The comparison does not prove absence of every other durable anchor. Explicit retained-copy removal follows its existing proof instead.
+
 If unregistering a nested checkout fails, the command exits nonzero and names the state: the root is removed, and the nested registration is kept, already removed, or unreadable. Surviving paths are untouched. Library callers can retry with `store.recoverDestroyed(path)` from the surviving submodule repository.
 
 Object links and borrowers:

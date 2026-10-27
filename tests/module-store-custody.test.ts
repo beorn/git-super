@@ -15,12 +15,7 @@
 import { cpSync, existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { afterEach, describe, expect, test, vi } from "vitest"
-import {
-  archiveModuleStores,
-  describeModuleStores,
-  inspectModuleStores,
-  moduleStoreValue,
-} from "../src/module-store-custody.ts"
+import { describeModuleStores, inspectModuleStores, moduleStoreValue } from "../src/module-store-custody.ts"
 import { superStatus } from "../src/status.ts"
 import { createLocalGitWorktreeStore } from "../src/worktree.ts"
 import { advanceRepository, canonicalTmpdir, createProductFixture, git } from "./fixture.ts"
@@ -87,7 +82,7 @@ function refusal(run: () => unknown): string {
 }
 
 describe("slot module store custody", () => {
-  test("an unreferenced store holding local work is archived on its remote before removal", async () => {
+  test("an unreferenced store holding local work is measured", async () => {
     const slot = await linkedSlot(fixtureRoot("module-archive"))
     const tip = localCommit(slot.child)
     dropAlphaFromHead(slot.linked)
@@ -95,18 +90,9 @@ describe("slot module store custody", () => {
     expect(inventory.stores).toEqual([
       expect.objectContaining({ name: "packages/alpha", valueCommits: 1, remote: "origin", head: tip.slice(0, 12) }),
     ])
-    // The plan line an inspection prints before any push never claims the archive has happened.
     expect(describeModuleStores(inventory.stores)).toEqual([
-      `module store packages/alpha holds 1 commit(s) to archive, HEAD ${tip.slice(0, 12)}`,
+      `module store packages/alpha at ${join(slot.modules, "packages/alpha")} holds 1 commit(s) outside compared refs (origin default main, existing archive refs and available tags), HEAD ${tip.slice(0, 12)}`,
     ])
-    const archived = archiveModuleStores(inventory.stores, { actor: "dev-test", date: DATE })
-    expect(archived[0]!.archived).toEqual([`refs/archive/${DATE}/dev-test/packages/alpha/HEAD`])
-    expect(git(slot.fixture.alpha, "rev-parse", `refs/archive/${DATE}/dev-test/packages/alpha/HEAD`).trim()).toBe(tip)
-    expect(describeModuleStores(archived)).toEqual([
-      `module store packages/alpha archived: 1 commit(s) to refs/archive/${DATE}/dev-test/packages/alpha/HEAD, HEAD ${tip.slice(0, 12)}`,
-    ])
-    await slot.store.remove(slot.linked)
-    expect(existsSync(slot.linked)).toBe(false)
   })
 
   test("a store whose work is all on its remote main is released and named", async () => {
@@ -117,10 +103,8 @@ describe("slot module store custody", () => {
     expect(inventory.stores).toEqual([
       expect.objectContaining({ name: "packages/alpha", valueCommits: 0, remote: "origin" }),
     ])
-    const archived = archiveModuleStores(inventory.stores, { actor: "dev-test", date: DATE })
-    expect(archived[0]!.archived).toEqual([])
-    expect(describeModuleStores(archived)).toEqual([
-      `module store packages/alpha released: origin main, archive refs and tags hold it, 0 commits unique, HEAD ${tip.slice(0, 12)}`,
+    expect(describeModuleStores(inventory.stores)).toEqual([
+      `module store packages/alpha released: origin default main, existing archive refs and available tags, 0 commits outside compared refs, HEAD ${tip.slice(0, 12)}`,
     ])
     await slot.store.remove(slot.linked)
     expect(existsSync(slot.linked)).toBe(false)
@@ -134,12 +118,13 @@ describe("slot module store custody", () => {
     dropAlphaFromHead(slot.linked)
     const value = moduleStoreValue(join(slot.modules, "packages/alpha"))
     expect(value.valueCommits).toBe(1)
-    const archived = archiveModuleStores(inspectModuleStores(slot.linked, slot.gitDir).stores, {
-      actor: "dev-test",
-      date: DATE,
-    })
-    expect(archived[0]!.archived).toEqual([`refs/archive/${DATE}/dev-test/packages/alpha/HEAD`])
-    expect(git(slot.fixture.alpha, "rev-parse", `refs/archive/${DATE}/dev-test/packages/alpha/HEAD`).trim()).toBe(tip)
+    const inventory = inspectModuleStores(slot.linked, slot.gitDir)
+    expect(inventory.stores).toEqual([
+      expect.objectContaining({
+        valueCommits: 1,
+        refs: expect.arrayContaining([expect.objectContaining({ source: tip })]),
+      }),
+    ])
   })
 
   test("work the remote's main took after the store last fetched is released, read from the remote (row 1)", async () => {
@@ -159,8 +144,8 @@ describe("slot module store custody", () => {
     // The read fetched the missing tip's objects only; the store's own tracking ref is left as it was.
     expect(storeGitOutput(slot.fixture.product, store, "cat-file", "-t", beyond)).toBe("commit")
     expect(storeGitOutput(slot.fixture.product, store, "rev-parse", "refs/remotes/origin/main")).toBe(stale)
-    expect(describeModuleStores(archiveModuleStores(inventory.stores, { actor: "dev-test", date: DATE }))).toEqual([
-      `module store packages/alpha released: origin main, archive refs and tags hold it, 0 commits unique, HEAD ${tip.slice(0, 12)}`,
+    expect(describeModuleStores(inventory.stores)).toEqual([
+      `module store packages/alpha released: origin default main, existing archive refs and available tags, 0 commits outside compared refs, HEAD ${tip.slice(0, 12)}`,
     ])
   })
 
@@ -175,7 +160,7 @@ describe("slot module store custody", () => {
       expect.objectContaining({ name: "packages/alpha", valueCommits: 0, defaultBranch: "master" }),
     ])
     expect(describeModuleStores(inventory.stores)).toEqual([
-      `module store packages/alpha released: origin master, archive refs and tags hold it, 0 commits unique, HEAD ${tip.slice(0, 12)}`,
+      `module store packages/alpha released: origin default master, existing archive refs and available tags, 0 commits outside compared refs, HEAD ${tip.slice(0, 12)}`,
     ])
   })
 
@@ -188,29 +173,12 @@ describe("slot module store custody", () => {
     dropAlphaFromHead(slot.linked)
     const inventory = inspectModuleStores(slot.linked, slot.gitDir)
     expect(inventory.stores[0]!.valueCommits).toBe(1)
-    const archived = archiveModuleStores(inventory.stores, { actor: "dev-test", date: DATE })
-    const kept = `refs/archive/${DATE}/dev-test/packages/alpha/archive/${DATE}/someone/kept`
-    expect(archived[0]!.archived).toEqual([kept])
-    expect(git(slot.fixture.alpha, "rev-parse", kept).trim()).toBe(tip)
-  })
-
-  test("a second archive the same day never replaces the first; the new one takes its short id (row 1)", async () => {
-    const slot = await linkedSlot(fixtureRoot("module-archive-twice"))
-    const earlier = `refs/archive/${DATE}/dev-test/packages/alpha/HEAD`
-    const first = localCommit(slot.child)
-    git(slot.child, "push", "-q", "origin", `HEAD:${earlier}`)
-    writeFileSync(join(slot.child, "second.txt"), "more bytes that exist only here\n")
-    git(slot.child, "add", "-A")
-    git(slot.child, "commit", "-q", "-m", "second local work")
-    const second = git(slot.child, "rev-parse", "HEAD").trim()
-    dropAlphaFromHead(slot.linked)
-    const archived = archiveModuleStores(inspectModuleStores(slot.linked, slot.gitDir).stores, {
-      actor: "dev-test",
-      date: DATE,
-    })
-    expect(archived[0]!.archived).toEqual([`${earlier}-${second.slice(0, 12)}`])
-    expect(git(slot.fixture.alpha, "rev-parse", earlier).trim()).toBe(first)
-    expect(git(slot.fixture.alpha, "rev-parse", `${earlier}-${second.slice(0, 12)}`).trim()).toBe(second)
+    expect(inventory.stores[0]).toEqual(
+      expect.objectContaining({
+        valueCommits: 1,
+        refs: [{ source: `refs/archive/${DATE}/someone/kept`, label: `archive/${DATE}/someone/kept` }],
+      }),
+    )
   })
 
   test("a commit the remote holds only under refs/archive is released (row 1)", async () => {
@@ -223,11 +191,11 @@ describe("slot module store custody", () => {
     const inventory = inspectModuleStores(slot.linked, slot.gitDir)
     expect(inventory.stores).toEqual([expect.objectContaining({ name: "packages/alpha", valueCommits: 0 })])
     expect(describeModuleStores(inventory.stores)).toEqual([
-      `module store packages/alpha released: origin main, archive refs and tags hold it, 0 commits unique, HEAD ${tip.slice(0, 12)}`,
+      `module store packages/alpha released: origin default main, existing archive refs and available tags, 0 commits outside compared refs, HEAD ${tip.slice(0, 12)}`,
     ])
   })
 
-  test("a local tag the remote holds is released, and a local-only tag is archived (row 1)", async () => {
+  test("a local tag the remote holds is excluded, and a local-only tag is value (row 1)", async () => {
     const slot = await linkedSlot(fixtureRoot("module-tags"))
     // An annotated tag the remote holds: ls-remote lists its tag object, and its commit under `^{}`.
     localCommit(slot.child)
@@ -236,7 +204,6 @@ describe("slot module store custody", () => {
     writeFileSync(join(slot.child, "preserved.txt"), "bytes only a local tag holds\n")
     git(slot.child, "add", "-A")
     git(slot.child, "commit", "-q", "-m", "preserved work")
-    const preserved = git(slot.child, "rev-parse", "HEAD").trim()
     git(slot.child, "tag", "preserve/kept")
     git(slot.child, "checkout", "-q", "--detach", "HEAD~1")
     dropAlphaFromHead(slot.linked)
@@ -247,28 +214,6 @@ describe("slot module store custody", () => {
         refs: [{ source: "refs/tags/preserve/kept", label: "tags/preserve/kept" }],
       }),
     )
-    const kept = `refs/archive/${DATE}/dev-test/packages/alpha/tags/preserve/kept`
-    expect(archiveModuleStores(inventory.stores, { actor: "dev-test", date: DATE })[0]!.archived).toEqual([kept])
-    expect(git(slot.fixture.alpha, "rev-parse", kept).trim()).toBe(preserved)
-  })
-
-  test("a store's archive lands whole or not at all: one rejected ref keeps every other ref off the remote", async () => {
-    const slot = await linkedSlot(fixtureRoot("module-push-atomic"))
-    localCommit(slot.child)
-    git(slot.child, "branch", "side")
-    dropAlphaFromHead(slot.linked)
-    // An update hook judges each ref alone, so without an atomic push the HEAD archive would land by itself.
-    writeFileSync(
-      join(slot.fixture.alpha, ".git", "hooks", "update"),
-      "#!/bin/sh\ncase \"$1\" in */heads/side) echo 'side refused' >&2; exit 1;; esac\n",
-      { mode: 0o755 },
-    )
-    const stores = inspectModuleStores(slot.linked, slot.gitDir).stores
-    expect(stores[0]!.refs.map((ref) => ref.label)).toEqual(["HEAD", "heads/side"])
-    expect(refusal(() => archiveModuleStores(stores, { actor: "dev-test", date: DATE }))).toContain(
-      "worktree preserved after archiving nothing",
-    )
-    expect(git(slot.fixture.alpha, "for-each-ref", "refs/archive")).toBe("")
   })
 
   test("a remote that cannot be read stops removal, naming the store, with no fallback to local copies (row 1)", async () => {
@@ -347,7 +292,7 @@ describe("slot module store custody", () => {
       sunk.linked,
     )
     expect(sink.filter((line) => line.startsWith("module store"))).toEqual([
-      `module store packages/alpha released: origin main, archive refs and tags hold it, 0 commits unique, HEAD ${sunkTip.slice(0, 12)}\n`,
+      `module store packages/alpha released: origin default main, existing archive refs and available tags, 0 commits outside compared refs, HEAD ${sunkTip.slice(0, 12)}\n`,
     ])
   })
 
@@ -362,10 +307,10 @@ describe("slot module store custody", () => {
     expect(await slot.store.inspect(slot.linked)).toEqual(expect.objectContaining({ registered: true }))
   })
 
-  test("prune recovers a destroyed slot, archiving its store's value first, and leaves a live slot (30616)", async () => {
+  test("prune recovers a destroyed no-value slot and leaves a live slot (30616)", async () => {
     const root = fixtureRoot("module-prune")
     const slot = await linkedSlot(root)
-    const tip = localCommit(slot.child)
+    const tip = git(slot.child, "rev-parse", "HEAD").trim()
     const live = join(root, "live")
     await slot.store.add({ kind: "detached", path: live, ref: "HEAD" })
     // Something other than git-super deleted the checkout, so only its registration still holds its stores.
@@ -375,10 +320,9 @@ describe("slot module store custody", () => {
     expect(await slot.store.inspect(slot.linked)).toEqual({ registered: false })
     expect(existsSync(slot.gitDir)).toBe(false)
     expect(await slot.store.inspect(live)).toEqual(expect.objectContaining({ registered: true }))
-    const lines = sink.filter((line) => line.startsWith("module store"))
-    expect(lines).toEqual([expect.stringMatching(/^module store packages\/alpha archived: 1 commit\(s\) to /u)])
-    const archiveRef = /refs\/archive\/\S+\/packages\/alpha\/HEAD/u.exec(lines[0] ?? "")?.[0] ?? "no archive ref named"
-    expect(git(slot.fixture.alpha, "rev-parse", archiveRef)).toBe(tip)
+    expect(sink.filter((line) => line.startsWith("module store"))).toEqual([
+      `module store packages/alpha released: origin default main, existing archive refs and available tags, 0 commits outside compared refs, HEAD ${tip.slice(0, 12)}\n`,
+    ])
   })
 
   test("prune keeps and names a destroyed slot it cannot recover, and still recovers the others (30616)", async () => {
@@ -417,51 +361,6 @@ describe("slot module store custody", () => {
     expect(await slot.store.inspect(slot.linked)).toEqual(expect.objectContaining({ registered: true }))
   })
 
-  test("an archive push the remote rejects stops removal, naming the store, and the slot stays", async () => {
-    const slot = await linkedSlot(fixtureRoot("module-push-rejected"))
-    localCommit(slot.child)
-    dropAlphaFromHead(slot.linked)
-    const hook = join(slot.fixture.alpha, ".git", "hooks", "pre-receive")
-    writeFileSync(hook, "#!/bin/sh\necho 'archive refused by fixture' >&2\nexit 1\n", { mode: 0o755 })
-    const message = refusal(() =>
-      archiveModuleStores(inspectModuleStores(slot.linked, slot.gitDir).stores, { actor: "dev-test", date: DATE }),
-    )
-    expect(message).toContain("module store packages/alpha could not be archived: git push")
-    expect(message).toContain("worktree preserved after archiving nothing")
-    await expect(slot.store.remove(slot.linked)).rejects.toThrow(/could not be archived/)
-    expect(existsSync(slot.linked)).toBe(true)
-    expect(existsSync(join(slot.modules, "packages/alpha"))).toBe(true)
-  })
-
-  test("a later store's rejected push still reports, and names, the archive an earlier store made", async () => {
-    const root = fixtureRoot("module-push-second-rejected")
-    const slot = await linkedSlot(root)
-    localCommit(slot.child)
-    dropAlphaFromHead(slot.linked)
-    // A second undeclared store whose own remote refuses every push.
-    const refusing = join(root, "refusing-remote")
-    cpSync(slot.fixture.alpha, refusing, { recursive: true })
-    writeFileSync(join(refusing, ".git", "hooks", "pre-receive"), "#!/bin/sh\necho 'refused' >&2\nexit 1\n", {
-      mode: 0o755,
-    })
-    const zeta = join(slot.modules, "packages/zeta")
-    cpSync(join(slot.modules, "packages/alpha"), zeta, { recursive: true })
-    storeGitOutput(slot.fixture.product, zeta, "config", "remote.origin.url", refusing)
-    const sink: string[] = []
-    const removal = createLocalGitWorktreeStore({
-      repo: slot.fixture.product,
-      report: (line) => sink.push(line),
-    }).remove(slot.linked)
-    await expect(removal).rejects.toThrow(
-      /module store packages\/zeta could not be archived: [\s\S]*worktree preserved after archiving refs\/archive\/[\d-]+\/slot\/packages\/alpha\/HEAD$/u,
-    )
-    expect(sink.filter((line) => line.startsWith("module store"))).toEqual([
-      expect.stringMatching(/^module store packages\/alpha archived: 1 commit\(s\) to refs\/archive\/[\d-]+\/slot\//u),
-    ])
-    expect(existsSync(slot.linked)).toBe(true)
-    expect(existsSync(zeta)).toBe(true)
-  })
-
   test("a GIT_COMMON_DIR or GIT_OBJECT_DIRECTORY a git hook exports never redirects the value read", async () => {
     const slot = await linkedSlot(fixtureRoot("module-hook-environment"))
     const tip = localCommit(slot.child)
@@ -480,7 +379,7 @@ describe("slot module store custody", () => {
     ])
   })
 
-  test("a stash-only commit is value and is archived as its own entry", async () => {
+  test("a stash-only commit is value and is attributed to its reflog entry", async () => {
     const slot = await linkedSlot(fixtureRoot("module-stash"))
     writeFileSync(join(slot.child, "alpha.ts"), "export const alpha = 999\n")
     git(slot.child, "stash", "push", "-q", "-m", "only in the stash")
@@ -489,26 +388,22 @@ describe("slot module store custody", () => {
     const inventory = inspectModuleStores(slot.linked, slot.gitDir)
     expect(inventory.stores[0]!.valueCommits).toBeGreaterThan(0)
     expect(inventory.stores[0]!.refs).toContainEqual({ source: stashTip, label: "stash/1" })
-    const archived = archiveModuleStores(inventory.stores, { actor: "dev-test", date: DATE })
-    expect(archived[0]!.archived).toContain(`refs/archive/${DATE}/dev-test/packages/alpha/stash/1`)
-    expect(git(slot.fixture.alpha, "rev-parse", `refs/archive/${DATE}/dev-test/packages/alpha/stash/1`).trim()).toBe(
-      stashTip,
-    )
   })
 
-  test("an undeclared store under another name is archived under that name", async () => {
+  test("an undeclared store under another name is measured under that name", async () => {
     const slot = await linkedSlot(fixtureRoot("module-undeclared"))
     const tip = localCommit(slot.child)
     dropAlphaFromHead(slot.linked)
     mkdirSync(join(slot.modules, "components"), { recursive: true })
     renameSync(join(slot.modules, "packages/alpha"), join(slot.modules, "components/outer"))
-    const archived = archiveModuleStores(inspectModuleStores(slot.linked, slot.gitDir).stores, {
-      actor: "dev-test",
-      date: DATE,
-    })
-    expect(archived).toEqual([expect.objectContaining({ name: "components/outer", valueCommits: 1 })])
-    expect(archived[0]!.archived).toEqual([`refs/archive/${DATE}/dev-test/components/outer/HEAD`])
-    expect(git(slot.fixture.alpha, "rev-parse", `refs/archive/${DATE}/dev-test/components/outer/HEAD`).trim()).toBe(tip)
+    const inventory = inspectModuleStores(slot.linked, slot.gitDir)
+    expect(inventory.stores).toEqual([
+      expect.objectContaining({
+        name: "components/outer",
+        valueCommits: 1,
+        refs: expect.arrayContaining([expect.objectContaining({ source: tip })]),
+      }),
+    ])
   })
 
   test("a fully mapped slot passes the inventory and still removes", async () => {
@@ -536,14 +431,15 @@ describe("slot module store custody", () => {
     git(slot.fixture.product, "--git-dir", store, "config", "--remove-section", "remote.origin")
     const inventory = inspectModuleStores(slot.linked, slot.gitDir)
     expect(inventory.stores[0]!.remote).toBeUndefined()
-    const message = refusal(() => archiveModuleStores(inventory.stores, { actor: "dev-test", date: DATE }))
+    const message = await slot.store.remove(slot.linked).then(
+      () => "removal proceeded",
+      (error: unknown) => (error instanceof Error ? error.message : String(error)),
+    )
     // With no remote nothing proves any commit exists elsewhere: the base commit its leftover local
     // `refs/remotes/origin/main` names counts too, because that copy is not a remote.
-    expect(message).toContain("module store packages/alpha holds 2 commit(s)")
-    expect(message).toContain("has no remote to archive them to")
-    expect(message).toContain("worktree preserved")
-    expect(message).toContain("land or deliberately drop the work")
-    expect(message).toContain("configure a remote")
+    expect(message).toContain(`module store packages/alpha at ${store} holds 2 commit(s) outside compared refs`)
+    expect(message).toContain("(no remote refs (store has no remote))")
+    expect(message).toContain("; worktree preserved. Owner value call: land, keep one real branch, or recorded delete.")
     expect(existsSync(slot.linked)).toBe(true)
     expect(existsSync(store)).toBe(true)
   })
