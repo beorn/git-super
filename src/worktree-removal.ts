@@ -25,7 +25,7 @@ import { classifyExcludedPath, inspectExcludedCheckout, superStatus, type SuperS
 import { statusWithGit } from "./status-traversal.ts"
 import { readCommitSubmodules, readPrivateSubmodules, type SelectedCommitSubmodules } from "./commit-graph.ts"
 import type { PrivateGitProjection } from "./private-git-projection.ts"
-import { alternatesLineage } from "./alternates.ts"
+import { alternatesLineage, alternatesLineageSync } from "./alternates.ts"
 import { storeRemote } from "./module-store-custody.ts"
 import { validateExcludedSubmodules, withGitTimeout } from "./git.ts"
 import type { GitProcess } from "./process.ts"
@@ -1133,6 +1133,63 @@ function registerRetainedBorrower(common: string, retained: string, manifestPath
   }
 }
 
+/** Inspect actual retained metadata using the existing borrower walk and the one alternates traversal. */
+function retainedAlternatesDependency(
+  retained: string,
+  common: string,
+  lenderGitDir: string,
+  externalObjectStores: readonly ExternalObjectStore[],
+): boolean {
+  const copy = realpathSync(retained)
+  const lender = realpathSync(lenderGitDir)
+  const canonicalCommon = realpathSync(common)
+  const linkedStores = join(canonicalCommon, "worktrees")
+  const primaryStores = join(canonicalCommon, "modules")
+  const seeds = new Set(externalObjectStores.map((dependency) => dependency.target))
+  for (const entry of borrowerEntries(retained, undefined)) {
+    if (entry.name === "objects" && entry.isDirectory()) seeds.add(realpathSync(join(entry.parentPath, entry.name)))
+  }
+  let linkedDependency = false
+  const dangling: string[] = []
+  try {
+    alternatesLineageSync([...seeds], join(copy, "objects"), undefined, {
+      strictReads: true,
+      onEdge: (store, target) => {
+        const edge = join(store, "info/alternates") + " -> " + target
+        if (within(lender, target)) {
+          throw new Error(
+            "retained copy " +
+              retained +
+              " borrows from removal store " +
+              lender +
+              " through " +
+              edge +
+              "; worktree preserved",
+          )
+        }
+        if (within(linkedStores, target)) linkedDependency = true
+        else if (!within(primaryStores, target) && !within(copy, target)) {
+          throw new Error(
+            "retained copy " + retained + " has unknown removal custody through " + edge + "; worktree preserved",
+          )
+        }
+      },
+      onDangling: (store, target, rawLine) => {
+        dangling.push(
+          join(store, "info/alternates") + " -> " + target + " (declaration " + JSON.stringify(rawLine) + ")",
+        )
+      },
+    })
+  } finally {
+    if (dangling.length > 0) {
+      process.stderr.write(
+        "retained borrower " + retained + " has dangling alternates declarations: " + dangling.join("; ") + "\n",
+      )
+    }
+  }
+  return linkedDependency
+}
+
 /** Retained copies are borrowers too: verify their actual links before allowing an owner store to disappear. */
 function guardRetainedBorrowers(common: string, lenderGitDir: string, policy: "inspect" | "rehome" = "rehome"): void {
   const registry = join(common, "git-super-retained-borrowers")
@@ -1213,11 +1270,13 @@ function guardRetainedBorrowers(common: string, lenderGitDir: string, policy: "i
           )
         }
       }
+      linkedDependency =
+        retainedAlternatesDependency(retained, common, lenderGitDir, actual.externalObjectStores) || linkedDependency
       if (!linkedDependency) {
         if (policy === "inspect") continue
         unlinkSync(registration)
         process.stderr.write(
-          `retained borrower ${retained} has no objects links into removable linked stores; dropped registry entry ${registration}\n`,
+          `retained borrower ${retained} has no objects links or alternates into removable linked stores; dropped registry entry ${registration}\n`,
         )
       }
     } catch (error) {
@@ -1545,7 +1604,15 @@ async function retainResolvedWorktreeModules(context: {
     `${JSON.stringify({ ...proof, files: retainedManifest.files, entries: retainedManifest.entries, externalObjectStores: retainedManifest.externalObjectStores }, null, 2)}\n`,
     { flag: "wx" },
   )
-  if (retained !== null && retainedManifest.externalObjectStores.length > 0) {
+  if (retained !== null && privateProjection === undefined) {
+    // A newly copied borrower must not outlive a lender destroyed by this same transaction.
+    retainedAlternatesDependency(retained, common, gitDir, retainedManifest.externalObjectStores)
+  }
+  if (
+    retained !== null &&
+    (retainedManifest.externalObjectStores.length > 0 ||
+      Object.keys(retainedManifest.entries).some((key) => key.endsWith("objects/info/alternates")))
+  ) {
     registerRetainedBorrower(common, retained, proof.manifest)
   }
   if (retained !== null && privateProjection !== undefined) {

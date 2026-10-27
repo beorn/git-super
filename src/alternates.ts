@@ -1,5 +1,4 @@
-import { existsSync, lstatSync, realpathSync, statSync } from "node:fs"
-import { readFile } from "node:fs/promises"
+import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from "node:fs"
 import { isAbsolute, join, resolve } from "node:path"
 
 function canonical(pathname: string): string {
@@ -7,14 +6,21 @@ function canonical(pathname: string): string {
 }
 
 /** The canonical object directories an alternates file names, relative lines resolved against its own store. */
-export function alternateEntries(content: string, objects: string, physical = true): string[] {
+export function alternateEntries(
+  content: string,
+  objects: string,
+  physical = true,
+  observe?: (entry: string, rawLine: string) => void,
+): string[] {
   return content
     .split(/\r?\n/u)
-    .map((line) => line.trim())
-    .filter((entry) => entry !== "" && (!physical || !entry.startsWith("#")))
-    .map((entry) => {
-      const pathname = isAbsolute(entry) ? resolve(entry) : resolve(objects, entry)
-      return physical ? canonical(pathname) : pathname
+    .map((rawLine) => ({ rawLine, line: rawLine.trim() }))
+    .filter(({ line }) => line !== "" && (!physical || !line.startsWith("#")))
+    .map(({ line, rawLine }) => {
+      const pathname = isAbsolute(line) ? resolve(line) : resolve(objects, line)
+      const entry = physical ? canonical(pathname) : pathname
+      observe?.(entry, rawLine)
+      return entry
     })
 }
 
@@ -24,16 +30,22 @@ export function alternateEntries(content: string, objects: string, physical = tr
  * borrow already registered. A directory that no longer exists (its worktree was recycled) ends that branch: git
  * skips it too.
  */
-export async function alternatesLineage(
+export function alternatesLineageSync(
   stores: readonly string[],
   own: string,
   policy?: Readonly<{ allowedObjects: ReadonlySet<string> }>,
-): Promise<string[]> {
+  observation?: Readonly<{
+    strictReads: true
+    onEdge: (store: string, target: string) => void
+    onDangling: (store: string, target: string, rawLine: string) => void
+  }>,
+): string[] {
   // Seeded with the own store only: a listed ancestor must still be placed ahead of the store that borrows from it,
   // or a file an earlier release wrote ancestor-last reads as complete and is never healed (review2 f11cfb14).
   const seen = new Set([own])
   const lineage: string[] = []
-  const visit = async (store: string): Promise<void> => {
+  const missing = new Set<string>()
+  const visit = (store: string): void => {
     if (policy !== undefined) {
       // Check authority before resolving or opening a path named by an alternates file.
       if (!policy.allowedObjects.has(store)) throw new Error(`unapproved alternate object store: ${store}`)
@@ -48,7 +60,7 @@ export async function alternatesLineage(
     const file = join(store, "info", "alternates")
     let content: string
     try {
-      if (policy !== undefined) {
+      if (policy !== undefined || observation?.strictReads) {
         const info = lstatSync(join(store, "info"), { throwIfNoEntry: false })
         // silent-fallback-allow: a genuinely absent info directory cannot contain an alternates file
         if (info === undefined) return
@@ -60,25 +72,50 @@ export async function alternatesLineage(
           throw new Error(`redirected or non-file alternates file: ${file}`)
         }
       }
-      content = await readFile(file, "utf8")
+      content = readFileSync(file, "utf8")
     } catch (error) {
-      if (policy !== undefined) {
+      if (policy !== undefined || observation?.strictReads) {
         throw new Error(`cannot inspect alternates file: ${file}`, { cause: error })
       }
       // silent-fallback-allow: a store with no alternates file borrows nothing; it ends its branch of the lineage
       return
     }
-    for (const entry of alternateEntries(content, store, policy === undefined)) {
+    const declarations: Array<{ entry: string; rawLine: string }> = []
+    alternateEntries(content, store, policy === undefined, (entry, rawLine) => {
+      declarations.push({ entry, rawLine })
+    })
+    for (const { entry, rawLine } of declarations) {
       if (policy !== undefined && !policy.allowedObjects.has(entry)) {
         throw new Error(`unapproved alternate object store: ${entry}`)
       }
       if (seen.has(entry)) continue
-      if (policy === undefined && !existsSync(entry)) continue
+      if (policy === undefined && observation?.strictReads) {
+        try {
+          if (!statSync(entry).isDirectory()) throw new Error(`alternate object store is not a directory: ${entry}`)
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+          if (!missing.has(entry)) {
+            missing.add(entry)
+            observation.onDangling(store, entry, rawLine)
+          }
+          continue
+        }
+      } else if (policy === undefined && !existsSync(entry)) continue
       seen.add(entry)
-      await visit(entry)
+      observation?.onEdge(store, entry)
+      visit(entry)
       lineage.push(entry)
     }
   }
-  for (const store of stores) await visit(store)
+  for (const store of stores) visit(store)
   return lineage
+}
+
+/** Preserve asynchronous callers, including rejected promises for every synchronous traversal refusal. */
+export async function alternatesLineage(
+  stores: readonly string[],
+  own: string,
+  policy?: Readonly<{ allowedObjects: ReadonlySet<string> }>,
+): Promise<string[]> {
+  return Promise.resolve(alternatesLineageSync(stores, own, policy))
 }

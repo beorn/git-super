@@ -8,7 +8,7 @@
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { afterEach, expect, it } from "vitest"
-import { alternatesLineage } from "../src/alternates.ts"
+import { alternatesLineage, alternatesLineageSync } from "../src/alternates.ts"
 import { canonicalTmpdir } from "./fixture.ts"
 
 const roots: string[] = []
@@ -65,3 +65,44 @@ it.each(["dangling file", "redirected file", "redirected info"] as const)(
     await expect(alternatesLineage([store], join(root, "own"), policy)).rejects.toThrow("alternates")
   },
 )
+
+/**
+ * @failure Strict retained reads silently skip bad metadata, duplicate edge notifications, or lose dangling declarations;
+ * legacy callers lose their permissive unreadable-branch behavior during sync-core reuse.
+ * @level l1
+ * @consumer retained removal guard and existing asynchronous alternates callers
+ * @testonly none
+ */
+it("keeps default fallback separate from strict reads and reports canonical edges and raw dangling lines once", async () => {
+  const root = mkdtempSync(join(canonicalTmpdir(), "git-super-alternates-modes-"))
+  roots.push(root)
+  const source = join(root, "source/objects")
+  const target = join(root, "target/objects")
+  const missing = join(root, "missing/objects")
+  for (const store of [source, target]) mkdirSync(join(store, "info"), { recursive: true })
+  const declared = "  " + missing + "  "
+  writeFileSync(join(source, "info/alternates"), target + "\n" + target + "\n" + declared + "\n" + missing + "\n")
+  const edges: string[][] = []
+  const dangling: string[][] = []
+  const observation = {
+    strictReads: true as const,
+    onEdge: (store: string, entry: string) => {
+      edges.push([store, entry])
+    },
+    onDangling: (store: string, entry: string, raw: string) => {
+      dangling.push([store, entry, raw])
+    },
+  }
+  expect(alternatesLineageSync([source], "", undefined, observation)).toEqual([target])
+  expect(edges).toEqual([[source, target]])
+  expect(dangling).toEqual([[source, missing, declared]])
+  mkdirSync(join(target, "info/alternates"))
+  expect(await alternatesLineage([source], "")).toEqual([target])
+  expect(() => alternatesLineageSync([source], "", undefined, observation)).toThrow(
+    "cannot inspect alternates file: " + join(target, "info/alternates"),
+  )
+  // The async compatibility wrapper must convert core validation throws to rejected promises.
+  const rejected = alternatesLineage([source], "", { allowedObjects: new Set([source]) })
+  expect(rejected).toBeInstanceOf(Promise)
+  await expect(rejected).rejects.toThrow("unapproved alternate object store: " + target)
+})
