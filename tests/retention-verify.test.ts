@@ -23,7 +23,7 @@ import {
 import { spawnSync } from "node:child_process"
 import { createHash, randomUUID } from "node:crypto"
 import { tmpdir } from "node:os"
-import { dirname, join, relative } from "node:path"
+import { dirname, isAbsolute, join, relative } from "node:path"
 import { tryAcquireFlock } from "@bearly/flock"
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest"
 import { runCli } from "../src/cli.ts"
@@ -43,6 +43,7 @@ import { readLines, SidecarWriter } from "../src/retention-stream.ts"
 import {
   DEFAULT_NON_OBJECT_METADATA_BOUNDS,
   GATE_ORDER,
+  type RetentionVerifyResult,
   retentionRemovalBoundary,
   verifyRetainedEntry,
 } from "../src/retention-verify.ts"
@@ -215,7 +216,112 @@ function retirementArgs(artifactDir: string): string[] {
   ]
 }
 
+/** A native-schema record fixture; stored pass claims never replace the verifier's actual checks. */
+function fixtureAuditRecord(proof: RetentionVerifyResult, original: Buffer): RetentionAuditRecord {
+  if (proof.estate === undefined) throw new Error("fixture has no complete estate")
+  const common = join(fixtureRoot as string, "product", ".git")
+  return {
+    schema: "git-super/retention-audit/1",
+    runId: randomUUID(),
+    original: {
+      path: join(base.entry, "manifest.json"),
+      sha256: createHash("sha256").update(original).digest("hex"),
+      byteLength: original.length,
+    },
+    provenance: {
+      observedAt: proof.clock,
+      tool: { name: "git-super", version: "1.0.0" },
+      common: { path: common, head: git(common, ["rev-parse", "HEAD"]) },
+      estate: {
+        namespaceRoots: [fixtureRoot as string],
+        scanDigest: retentionEstateDigest(proof.estate),
+        counts: {
+          objectDirs: proof.estate.objectDirs.length,
+          alternatesFiles: proof.estate.alternatesFiles,
+          borrowers: proof.estate.borrowers.length,
+          registries: proof.estate.registries.length,
+          survivorIntoRemoval: proof.estate.survivorIntoRemoval.length,
+        },
+      },
+    },
+    checks: proof.gates.map((gate) => ({
+      gate: gate.gate,
+      outcome: gate.status,
+      reason: `${gate.status}: ${gate.message}`,
+      basis: "observed",
+    })),
+  }
+}
+
+function writeAuditRecordFixture(value: unknown): string {
+  const bytes = `${JSON.stringify(value, null, 2)}\n`
+  const path = join(base.entry, `retention-audit-${createHash("sha256").update(bytes).digest("hex")}.json`)
+  writeFileSync(path, bytes, { flag: "wx" })
+  return path
+}
+
 describe("retention verify gates 1-6", () => {
+  it("native legacy retirement preserves original and selected audit bytes in the checked external bundle", async () => {
+    const artifactDir = mkdtempSync(join("/var/tmp", "git-super-legacy-preserve-"))
+    const createdLeasePaths: string[] = []
+    try {
+      await prepareRetirementFixture(artifactDir, createdLeasePaths)
+      const modern = await verifyRetainedEntry({
+        ...base,
+        namespaceRoots: [fixtureRoot as string],
+        artifactDir: join(artifactDir, "fixture"),
+      })
+      expect(modern.verdict).toBe("candidate")
+      const originalPath = join(base.entry, "manifest.json")
+      const legacy = JSON.parse(readFileSync(originalPath, "utf8")) as Record<string, unknown>
+      for (const field of ["repositories", "writerLocks", "createdWriterLocks", "notCompared"]) delete legacy[field]
+      const original = Buffer.from(`${JSON.stringify(legacy, null, 2)}\n`)
+      writeFileSync(originalPath, original)
+      const auditPath = writeAuditRecordFixture(fixtureAuditRecord(modern, original))
+      const auditBytes = readFileSync(auditPath)
+      // The old bundle's observed size fits exactly; preserving the two new evidence files must exceed it.
+      const oldBundle = join(artifactDir, "fixture", "metadata")
+      const oldBytes = (readdirSync(oldBundle, { recursive: true }) as string[]).reduce((sum, path) => {
+        const stat = lstatSync(join(oldBundle, path))
+        return sum + (stat.isFile() ? stat.size : 0)
+      }, 0)
+      const bounded = await verifyRetainedEntry({
+        ...base,
+        namespaceRoots: [fixtureRoot as string],
+        artifactDir: join(artifactDir, "budget"),
+        bounds: { metadata: { maxBytes: oldBytes } },
+      })
+      expect(bounded.verdict).toBe("unknown")
+      expect(bounded.gates.find((gate) => gate.gate === "copy-manifest")?.message).toContain("byte bound")
+      expect(readFileSync(originalPath)).toEqual(original)
+      expect(readFileSync(auditPath)).toEqual(auditBytes)
+      const stdout = outputSink()
+      const stderr = outputSink()
+      expect(await runCli(retirementArgs(artifactDir), stdout, stderr), stderr.output || stdout.output).toBe(0)
+      expect(() => lstatSync(base.entry)).toThrowError(expect.objectContaining({ code: "ENOENT" }))
+      const certificate = JSON.parse(
+        readFileSync(join(artifactDir, "held", "retirement-certificate.json"), "utf8"),
+      ) as {
+        audit: { path: string; sha256: string }
+        wrapperRecords: readonly { path: string; sha256: string; metadataPath?: string }[]
+      }
+      expect(isAbsolute(certificate.audit.path)).toBe(false)
+      const bundle = join(artifactDir, "held", "metadata")
+      expect(readFileSync(join(bundle, certificate.audit.path))).toEqual(auditBytes)
+      expect(certificate.audit.sha256).toBe(createHash("sha256").update(auditBytes).digest("hex"))
+      const originalBinding = certificate.wrapperRecords.find((record) => record.path === originalPath)
+      expect(originalBinding).toMatchObject({
+        sha256: createHash("sha256").update(original).digest("hex"),
+        metadataPath: "retention-evidence/manifest.json",
+      })
+      if (originalBinding?.metadataPath === undefined) throw new Error("certificate lost original metadata reference")
+      expect(readFileSync(join(bundle, originalBinding.metadataPath))).toEqual(original)
+    } finally {
+      rmSync(artifactDir, { recursive: true, force: true })
+      for (const path of createdLeasePaths) rmSync(path, { recursive: true, force: true })
+    }
+  })
+
   it("immutable audit validation and two-key matching preserve the original bytes", async () => {
     const proof = await verifyRetainedEntry({
       ...base,
@@ -228,43 +334,8 @@ describe("retention verify gates 1-6", () => {
     const originalPath = join(base.entry, "manifest.json")
     const original = readFileSync(originalPath)
     const common = join(fixtureRoot as string, "product", ".git")
-    const record: RetentionAuditRecord = {
-      schema: "git-super/retention-audit/1",
-      runId: randomUUID(),
-      original: {
-        path: originalPath,
-        sha256: createHash("sha256").update(original).digest("hex"),
-        byteLength: original.length,
-      },
-      provenance: {
-        observedAt: eligible().toISOString(),
-        tool: { name: "git-super", version: "1.0.0" },
-        common: { path: common, head: git(common, ["rev-parse", "HEAD"]) },
-        estate: {
-          namespaceRoots: [fixtureRoot as string],
-          scanDigest: retentionEstateDigest(proof.estate),
-          counts: {
-            objectDirs: proof.estate.objectDirs.length,
-            alternatesFiles: proof.estate.alternatesFiles,
-            borrowers: proof.estate.borrowers.length,
-            registries: proof.estate.registries.length,
-            survivorIntoRemoval: proof.estate.survivorIntoRemoval.length,
-          },
-        },
-      },
-      checks: proof.gates.map((gate) => ({
-        gate: gate.gate,
-        outcome: gate.status,
-        reason: `${gate.status}: ${gate.message}`,
-        basis: "observed",
-      })),
-    }
-    const writeRecord = (value: unknown): string => {
-      const bytes = `${JSON.stringify(value, null, 2)}\n`
-      const path = join(base.entry, `retention-audit-${createHash("sha256").update(bytes).digest("hex")}.json`)
-      writeFileSync(path, bytes)
-      return path
-    }
+    const record = fixtureAuditRecord(proof, original)
+    const writeRecord = writeAuditRecordFixture
     const first = writeRecord(record)
     const second = writeRecord({
       ...record,
