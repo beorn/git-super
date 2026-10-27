@@ -21,7 +21,7 @@ import {
   writeFileSync,
 } from "node:fs"
 import { spawnSync } from "node:child_process"
-import { createHash } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import { tmpdir } from "node:os"
 import { dirname, join, relative } from "node:path"
 import { tryAcquireFlock } from "@bearly/flock"
@@ -33,9 +33,16 @@ import type { GitSuperResult } from "../src/result.ts"
 import { scanContents, type ComponentContents } from "../src/retention-contents.ts"
 import { scanCustody } from "../src/retention-custody.ts"
 import { scanEstate } from "../src/retention-estate.ts"
+import {
+  readRetentionAudits,
+  matchRetentionAudit,
+  retentionEstateDigest,
+  type RetentionAuditRecord,
+} from "../src/retention-audit-record.ts"
 import { readLines, SidecarWriter } from "../src/retention-stream.ts"
 import {
   DEFAULT_NON_OBJECT_METADATA_BOUNDS,
+  GATE_ORDER,
   retentionRemovalBoundary,
   verifyRetainedEntry,
 } from "../src/retention-verify.ts"
@@ -209,6 +216,113 @@ function retirementArgs(artifactDir: string): string[] {
 }
 
 describe("retention verify gates 1-6", () => {
+  it("immutable audit validation and two-key matching preserve the original bytes", async () => {
+    const proof = await verifyRetainedEntry({
+      ...base,
+      clock: eligible(),
+      namespaceRoots: [fixtureRoot as string],
+      allowTemporaryArtifactDir: true,
+    })
+    expect(proof.verdict).toBe("candidate")
+    if (proof.estate === undefined) throw new Error("fixture has no complete estate")
+    const originalPath = join(base.entry, "manifest.json")
+    const original = readFileSync(originalPath)
+    const common = join(fixtureRoot as string, "product", ".git")
+    const record: RetentionAuditRecord = {
+      schema: "git-super/retention-audit/1",
+      runId: randomUUID(),
+      original: {
+        path: originalPath,
+        sha256: createHash("sha256").update(original).digest("hex"),
+        byteLength: original.length,
+      },
+      provenance: {
+        observedAt: eligible().toISOString(),
+        tool: { name: "git-super", version: "1.0.0" },
+        common: { path: common, head: git(common, ["rev-parse", "HEAD"]) },
+        estate: {
+          namespaceRoots: [fixtureRoot as string],
+          scanDigest: retentionEstateDigest(proof.estate),
+          counts: {
+            objectDirs: proof.estate.objectDirs.length,
+            alternatesFiles: proof.estate.alternatesFiles,
+            borrowers: proof.estate.borrowers.length,
+            registries: proof.estate.registries.length,
+            survivorIntoRemoval: proof.estate.survivorIntoRemoval.length,
+          },
+        },
+      },
+      checks: proof.gates.map((gate) => ({
+        gate: gate.gate,
+        outcome: gate.status,
+        reason: `${gate.status}: ${gate.message}`,
+        basis: "observed",
+      })),
+    }
+    const writeRecord = (value: unknown): string => {
+      const bytes = `${JSON.stringify(value, null, 2)}\n`
+      const path = join(base.entry, `retention-audit-${createHash("sha256").update(bytes).digest("hex")}.json`)
+      writeFileSync(path, bytes)
+      return path
+    }
+    const first = writeRecord(record)
+    const second = writeRecord({
+      ...record,
+      runId: randomUUID(),
+      provenance: { ...record.provenance, common: { path: common, head: "1".repeat(40) } },
+    })
+    const records = readRetentionAudits(base.entry, originalPath, GATE_ORDER)
+    const matched = matchRetentionAudit(records, original, proof.estate)
+    expect(matched.selected?.binding.path).toBe([first, second].sort()[0])
+    expect(matched.stale).toEqual([])
+    expect(matchRetentionAudit(records, Buffer.from("changed original"), proof.estate).selected).toBeUndefined()
+    const changedEstate = matchRetentionAudit(records, original, {
+      ...proof.estate,
+      detail: "different bounded outcome",
+    })
+    expect(changedEstate.selected).toBeUndefined()
+    expect(changedEstate.stale).toHaveLength(2)
+    const legacy = JSON.parse(original.toString("utf8")) as Record<string, unknown>
+    for (const field of ["repositories", "writerLocks", "createdWriterLocks", "notCompared"]) delete legacy[field]
+    const checkLegacy = async (): Promise<Awaited<ReturnType<typeof verifyRetainedEntry>>> => {
+      const bytes = Buffer.from(`${JSON.stringify(legacy, null, 2)}\n`)
+      writeFileSync(originalPath, bytes)
+      writeRecord({
+        ...record,
+        original: {
+          path: originalPath,
+          sha256: createHash("sha256").update(bytes).digest("hex"),
+          byteLength: bytes.length,
+        },
+      })
+      const checked = await verifyRetainedEntry({
+        ...base,
+        clock: eligible(),
+        namespaceRoots: [fixtureRoot as string],
+        allowTemporaryArtifactDir: true,
+      })
+      expect(readFileSync(originalPath)).toEqual(bytes)
+      return checked
+    }
+    const checkedLegacy = await checkLegacy()
+    expect(checkedLegacy.verdict, checkedLegacy.reasons.join("; ")).toBe("candidate")
+    expect(checkedLegacy.gates.map((gate) => gate.status)).toEqual(["pass", "pass", "pass", "pass", "pass", "pass"])
+    delete legacy["head"]
+    const missingHistory = await checkLegacy()
+    expect(missingHistory.verdict).toBe("unknown")
+    expect(missingHistory.gates[0]?.status).toBe("unknown")
+    writeFileSync(originalPath, original)
+    const invalid = writeRecord({
+      ...record,
+      checks: record.checks.map((check, index) => (index === 0 ? { ...check, outcome: ["pass"] } : check)),
+    })
+    expect(() => readRetentionAudits(base.entry, originalPath, GATE_ORDER)).toThrowError("check outcome")
+    rmSync(invalid)
+    writeFileSync(first, "tampered")
+    expect(() => readRetentionAudits(base.entry, originalPath, GATE_ORDER)).toThrowError("byte digest")
+    expect(readFileSync(originalPath)).toEqual(original)
+  })
+
   it("native legacy audit preserves the original and creates a distinct immutable record each run", async () => {
     const artifactDir = mkdtempSync(join("/var/tmp", "git-super-legacy-audit-"))
     const createdLeasePaths: string[] = []
