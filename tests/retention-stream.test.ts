@@ -67,6 +67,21 @@ function sha256(bytes: Buffer): string {
 }
 
 describe("retention stream primitives (#27443(b))", () => {
+  test("create-only publication preserves a dangling final symlink and leaves its target absent", () => {
+    const dir = tmp("git-super-create-only-link-")
+    const final = join(dir, "final")
+    const target = join(dir, "absent-target")
+    symlinkSync(target, final)
+    const identity = lstatSync(final).ino
+    expect(() => publishArtifact(final, "new bytes", { replace: false })).toThrowError(
+      expect.objectContaining({ code: "EEXIST" }),
+    )
+    expect(lstatSync(final).isSymbolicLink()).toBe(true)
+    expect(lstatSync(final).ino).toBe(identity)
+    expect(() => lstatSync(target)).toThrowError(expect.objectContaining({ code: "ENOENT" }))
+    expect(readdirSync(dir)).toEqual(["final"])
+  })
+
   test.each(["whole", "streamed"])("create-only %s publication preserves an existing final file", (kind) => {
     const dir = tmp("git-super-create-only-")
     const final = join(dir, "final")
