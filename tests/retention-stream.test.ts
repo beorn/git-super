@@ -10,8 +10,10 @@
 import { spawnSync } from "node:child_process"
 import { createHash } from "node:crypto"
 import {
+  chmodSync,
   existsSync,
   lstatSync,
+  mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
@@ -30,6 +32,7 @@ import {
   mergeSorted,
   mergeSortedFilesToSidecar,
   oidKey,
+  publishArtifact,
   readLines,
   RETENTION_STREAM_QUEUE_LINES,
   RETENTION_STREAM_RSS_BOUND_BYTES,
@@ -64,6 +67,47 @@ function sha256(bytes: Buffer): string {
 }
 
 describe("retention stream primitives (#27443(b))", () => {
+  test.each(["whole", "streamed"])("create-only %s publication preserves an existing final file", (kind) => {
+    const dir = tmp("git-super-create-only-")
+    const final = join(dir, "final")
+    const contents = (bytes: string, name: string) => {
+      if (kind === "whole") return bytes
+      const temporaryPath = join(dir, name)
+      writeFileSync(temporaryPath, bytes)
+      return { temporaryPath }
+    }
+    publishArtifact(final, contents("original", "first"), { replace: false })
+    const original = lstatSync(final)
+    expect(() => publishArtifact(final, contents("replacement", "second"), { replace: false })).toThrowError(
+      expect.objectContaining({ code: "EEXIST" }),
+    )
+    expect(readFileSync(final, "utf8")).toBe("original")
+    expect(lstatSync(final).ino).toBe(original.ino)
+    expect(readdirSync(dir)).toEqual(["final"])
+  })
+
+  test("create-only cleanup failure names the published artifact and owned temporary", () => {
+    const dir = tmp("git-super-publish-cleanup-")
+    const sourceDir = join(dir, "source")
+    mkdirSync(sourceDir)
+    const temporaryPath = join(sourceDir, "owned")
+    const final = join(dir, "final")
+    writeFileSync(temporaryPath, "published bytes")
+    expect(process.getuid?.(), "native permission fault requires an unprivileged actor").not.toBe(0)
+    // link only needs write access at the destination; unlink needs it at the source.
+    chmodSync(sourceDir, 0o500)
+    try {
+      expect(() => publishArtifact(final, { temporaryPath }, { replace: false })).toThrowError(
+        `artifact ${final} published but could not remove owned temporary ${temporaryPath}`,
+      )
+      expect(readFileSync(final, "utf8")).toBe("published bytes")
+      expect(readFileSync(temporaryPath, "utf8")).toBe("published bytes")
+      expect(lstatSync(final).ino).toBe(lstatSync(temporaryPath).ino)
+    } finally {
+      chmodSync(sourceDir, 0o700)
+    }
+  })
+
   test.each(["run", "merge", "labeled"])("a %s spill collision preserves the existing file", (kind) => {
     const dir = tmp("git-super-spill-")
     // A fresh process makes the existing spill names reproducible without a production test hook.
