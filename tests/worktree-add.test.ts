@@ -6,6 +6,7 @@
  */
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -62,6 +63,51 @@ function initRepository(root: string, file: string, content: string): string {
   git(root, ["commit", "-q", "-m", `add ${file}`])
   return git(root, ["rev-parse", "HEAD"])
 }
+
+describe("existing-only removal writer leases", () => {
+  // #31146: certified retained metadata must not gain lock files or new bodies.
+  // These use native flock and real Git metadata, never a FlockIo lifecycle fake.
+  it.each(["file", "parent"])("preserves an absent lease %s as a typed missing-path error", (missing) => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-existing-lease-"))
+    roots.push(root)
+    initRepository(root, "keep", "retained")
+    const gitDir = join(root, ".git")
+    const parent = join(gitDir, "yrd-worktree-mutations")
+    const path = join(parent, "writer.lock")
+    if (missing === "file") mkdirSync(parent)
+    expect(() => {
+      const leases = acquireRemovalWriterLeases(gitDir, undefined, { existingOnly: true })
+      leases.release()
+    }).toThrowError(expect.objectContaining({ code: "ENOENT", path }))
+    expect(existsSync(path)).toBe(false)
+    expect(existsSync(parent)).toBe(missing === "file")
+  })
+
+  it("holds an existing native lease without changing its bytes or inode, then releases it", () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-existing-lease-"))
+    roots.push(root)
+    initRepository(root, "keep", "retained")
+    const gitDir = join(root, ".git")
+    const path = join(gitDir, "yrd-worktree-mutations", "writer.lock")
+    const original = tryAcquireFlock(path, { body: "retained owner\n" })
+    expect(original).not.toBeNull()
+    original?.release()
+    const before = lstatSync(path)
+    const leases = acquireRemovalWriterLeases(gitDir, undefined, { existingOnly: true })
+    try {
+      expect(leases.created).toEqual([])
+      expect(leases.proof).toContainEqual({ path, body: "retained owner\n", lease: "free" })
+      expect(tryAcquireFlock(path, { create: false, noFollow: true })).toBeNull()
+      expect(readFileSync(path, "utf8")).toBe("retained owner\n")
+      expect(lstatSync(path).ino).toBe(before.ino)
+      expect(lstatSync(path).dev).toBe(before.dev)
+    } finally {
+      leases.release()
+    }
+    using successor = tryAcquireFlock(path, { create: false, noFollow: true })
+    expect(successor?.held).toBe(true)
+  })
+})
 
 type SuperFixture = Readonly<{ dependency: string; product: string; pin: string; product_head: string }>
 

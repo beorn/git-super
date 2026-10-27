@@ -1062,11 +1062,16 @@ function isWriterLeasePath(path: string, root: string, rootIsGitDir: boolean): b
   )
 }
 
-/** Take every in-custody Git directory's writer lease before retention; callers hold them through native removal. */
+/** Take every in-custody Git directory's writer lease; callers hold them through native removal. */
 export function acquireRemovalWriterLeases(
   gitDir: string,
   onAcquired?: (path: string) => void,
-  options: Readonly<{ additionalGitDirs?: readonly string[]; skip?: readonly string[] }> = {},
+  options: Readonly<{
+    additionalGitDirs?: readonly string[]
+    skip?: readonly string[]
+    /** Retained metadata is certified: never create a lease file or its parent. */
+    existingOnly?: boolean
+  }> = {},
 ): RemovalWriterLeases {
   const handles: FlockHandle[] = []
   const proof: WriterLockProof[] = []
@@ -1121,11 +1126,16 @@ export function acquireRemovalWriterLeases(
     const uniquePaths = [...new Set(paths)].filter((path) => !skipped.has(resolve(path)))
     const existing = uniquePaths.filter((path) => present(path)).sort()
     const absent = uniquePaths.filter((path) => !present(path)).sort()
-    // Refuse held existing leases before creating any missing path. Missing paths are then
-    // acquired too, so a writer that starts during retention cannot create and take one.
-    for (const path of [...existing, ...absent]) {
+    // Live retention takes existing leases before creating absent ones. Retirement only
+    // opens existing paths, in stable order; a missing path stays a native ENOENT.
+    const existingOnly = options.existingOnly === true
+    const orderedPaths = existingOnly ? uniquePaths.sort() : [...existing, ...absent]
+    for (const path of orderedPaths) {
       const before = present(path) ? lstatSync(path) : null
-      const handle = tryAcquireFlock(path)
+      const handle = tryAcquireFlock(
+        path,
+        existingOnly ? { create: false, createParent: false, noFollow: true } : undefined,
+      )
       if (handle === null) {
         const note = readFileSync(path, "utf8")
         const holder =
