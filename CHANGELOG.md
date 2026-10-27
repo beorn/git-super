@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Add explicit retained-entry retirement with existing-only writer leases, held proof comparison, exact pointer cleanup and partial-state receipts.
+
 ## 0.9.0 — 2026-10-22
 
 - Breaking change: remove `git super branch retire` and the root `superBranchRetire` (`SuperBranchRetireOptions`, `SuperBranchRetireResult`) export from `git-super`; `--repo <path> branch …` is no longer special-cased and fails with `unknown command 'branch'` while `git super -C <path> branch …` continues to delegate to native Git.

@@ -150,8 +150,10 @@ export async function retireRetainedEntry(options: RetentionRetireOptions): Prom
       const registrations = pointers(proof)
       if (proof.estate === undefined) throw new Error(`candidate ${entry} has no estate census`)
       phase = "owner-identity"
-      const observedObjects = [...proof.estate.objectDirs,
-        ...proof.estate.borrowers.filter(edge => basename(edge.borrower) === "objects").map(edge => edge.borrower)]
+      const observedObjects = [
+        ...proof.estate.objectDirs,
+        ...proof.estate.borrowers.filter((edge) => basename(edge.borrower) === "objects").map((edge) => edge.borrower),
+      ]
       const objectOwners: string[] = []
       for (const objects of observedObjects) {
         if (within(entry, objects)) continue
@@ -161,9 +163,9 @@ export async function retireRetainedEntry(options: RetentionRetireOptions): Prom
         }
         objectOwners.push(owner)
       }
-      const owners = [
-        ...new Set([...objectOwners, ...proof.estate.registries.map(dirname), common]),
-      ].filter((owner) => !within(entry, owner))
+      const owners = [...new Set([...objectOwners, ...proof.estate.registries.map(dirname), common])].filter(
+        (owner) => !within(entry, owner),
+      )
       phase = "common-lease"
       const commonPath = join(common, "yrd-worktree-mutations", "writer.lock")
       const acquired = acquireFlockWithTimeout(commonPath, DEFAULT_MUTATION_LOCK_WAIT_MS, {
@@ -215,7 +217,17 @@ export async function retireRetainedEntry(options: RetentionRetireOptions): Prom
       phase = "retire-pointers"
       for (const pointer of registrations) {
         if (pointer.retained !== join(entry, "modules") || pointer.manifest !== join(entry, "manifest.json")) continue
-        removeRetainedPointer(pointer)
+        try {
+          removeRetainedPointer(pointer)
+        } catch (error) {
+          row(pointer.path, "failed", {
+            code: "pointer-cleanup-failed",
+            phase,
+            message: String(error),
+            paths: [pointer.path],
+          })
+          throw error
+        }
         row(pointer.path, "updated", {
           code: "pointer-retired",
           phase,
@@ -238,7 +250,7 @@ export async function retireRetainedEntry(options: RetentionRetireOptions): Prom
           ? "lease-missing"
           : phase.includes("lease") && message.includes(" is held")
             ? "lease-held"
-              : phase.includes("lease") || phase === "identity" || phase === "owner-identity"
+            : phase.includes("lease") || phase === "identity" || phase === "owner-identity"
               ? "identity-unknown"
               : "incomplete"
       result = kept(code, `${phase}: ${message}; entry preserved.`)
@@ -257,7 +269,7 @@ export async function retireRetainedEntry(options: RetentionRetireOptions): Prom
         message: `${message}; actual entry state: ${state}; no retry performed.`,
         paths: [entry],
       }
-      row(phase === "retire-pointers" ? join(entry, "manifest.json") : entry, "failed", detail)
+      if (!rows.some((item) => item.state === "failed")) row(entry, "failed", detail)
       result = { ...gitSuperResult(rows, detail), partial: true }
     }
   }

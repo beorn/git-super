@@ -6,6 +6,7 @@
  * @testonly none
  */
 import {
+  chmodSync,
   cpSync,
   existsSync,
   mkdirSync,
@@ -22,8 +23,10 @@ import { spawnSync } from "node:child_process"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { tryAcquireFlock } from "@bearly/flock"
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest"
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest"
 import { runCli } from "../src/cli.ts"
+import { alternateEntries } from "../src/alternates.ts"
+import type { GitSuperResult } from "../src/result.ts"
 import { scanContents, type ComponentContents } from "../src/retention-contents.ts"
 import { scanCustody } from "../src/retention-custody.ts"
 import { scanEstate } from "../src/retention-estate.ts"
@@ -157,7 +160,168 @@ async function sidecarRows(path: string): Promise<string[]> {
   return rows
 }
 
+async function prepareRetirementFixture(artifactDir: string, createdLeasePaths: string[]): Promise<void> {
+  const path = join(base.entry, "manifest.json")
+  const manifest = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>
+  manifest["retainUntil"] = new Date(Date.now() - 1000).toISOString()
+  writeFileSync(path, `${JSON.stringify(manifest, null, 2)}\n`)
+  const pre = await verifyRetainedEntry({
+    entry: base.entry,
+    root: base.root,
+    namespaceRoots: [fixtureRoot as string],
+    artifactDir: join(artifactDir, "control"),
+  })
+  expect(pre.verdict).toBe("candidate")
+  if (pre.estate === undefined) throw new Error("candidate fixture has no estate census")
+  for (const objects of pre.estate.objectDirs) {
+    if (!objects.startsWith(`${fixtureRoot}/`)) throw new Error(`fixture escaped its namespace: ${objects}`)
+    if (objects.startsWith(`${base.entry}/`)) continue
+    const parent = join(dirname(objects), "yrd-worktree-mutations")
+    const lockPath = join(parent, "writer.lock")
+    if (existsSync(lockPath)) continue
+    createdLeasePaths.push(existsSync(parent) ? lockPath : parent)
+    using lease = tryAcquireFlock(lockPath)
+    expect(lease?.held).toBe(true)
+  }
+}
+
+function retirementArgs(artifactDir: string): string[] {
+  return [
+    "--repo",
+    join(fixtureRoot as string, "product"),
+    "--json",
+    "worktree",
+    "retention",
+    "retire",
+    base.entry,
+    "--root",
+    base.root,
+    "--common",
+    join(fixtureRoot as string, "product", ".git"),
+    "--namespace",
+    fixtureRoot as string,
+    "--artifact-dir",
+    artifactDir,
+  ]
+}
+
 describe("retention verify gates 1-6", () => {
+  it.each(["held", "manifest", "census", "pointer-cleanup"])(
+    "reports the real %s boundary event",
+    async (event) => {
+      const artifactDir = mkdtempSync(join("/var/tmp", "git-super-retire-boundary-"))
+      const createdLeasePaths: string[] = []
+      let child: ReturnType<typeof Bun.spawn> | undefined
+      let blocker: ReturnType<typeof tryAcquireFlock> = null
+      const census = join(fixtureRoot as string, "boundary-survivor")
+      const registry = join(fixtureRoot as string, "dependency", ".git", "git-super-retained-borrowers")
+      const pointer = join(registry, "pointer.json")
+      try {
+        await prepareRetirementFixture(artifactDir, createdLeasePaths)
+        if (event === "pointer-cleanup") {
+          expect(process.getuid?.(), "native permission fault requires an unprivileged actor").not.toBe(0)
+          expect(existsSync(registry)).toBe(false)
+          mkdirSync(registry)
+          writeFileSync(
+            pointer,
+            `${JSON.stringify({ retained: join(base.entry, "modules"), manifest: join(base.entry, "manifest.json") })}\n`,
+          )
+        }
+        const common = join(fixtureRoot as string, "product", ".git", "yrd-worktree-mutations", "writer.lock")
+        const lockPath =
+          event === "held"
+            ? join(fixtureRoot as string, "dependency", ".git", "yrd-worktree-mutations", "writer.lock")
+            : common
+        blocker = tryAcquireFlock(lockPath, { create: false, noFollow: true })
+        expect(blocker?.held).toBe(true)
+        const running = Bun.spawn(
+          [
+            process.execPath,
+            join(import.meta.dirname, "../bin/git-super"),
+            ...retirementArgs(join(artifactDir, "operation")),
+          ],
+          { cwd: process.cwd(), env: environment, stdout: "pipe", stderr: "pipe" },
+        )
+        child = running
+        const stdout = new Response(running.stdout).text()
+        const stderr = new Response(running.stderr).text()
+        await vi.waitFor(
+          () => expect(existsSync(join(artifactDir, "operation", "pre", "retirement-certificate.json"))).toBe(true),
+          { timeout: 30_000, interval: 20 },
+        )
+        const manifestPath = join(base.entry, "manifest.json")
+        if (event === "manifest") {
+          const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, unknown>
+          manifest["retainUntil"] = new Date(Date.now() - 500).toISOString()
+          writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)
+        } else if (event === "census") {
+          mkdirSync(census)
+          git(census, ["init", "-q", "-b", "main"])
+          writeFileSync(join(census, "survivor"), "independent survivor\n")
+          git(census, ["add", "survivor"])
+          git(census, ["commit", "-q", "-m", "independent survivor"])
+        } else if (event === "pointer-cleanup") {
+          chmodSync(registry, 0o555)
+        }
+        const preserved = readFileSync(manifestPath)
+        if (event !== "held") blocker?.release()
+        const code = await child.exited
+        const body = await stdout
+        expect(code, `${await stderr}\n${body}`).toBe(event === "pointer-cleanup" ? 2 : 1)
+        const result = JSON.parse(body) as GitSuperResult
+        if (event === "pointer-cleanup") {
+          expect(result).toMatchObject({ state: "failed", partial: true, detail: { code: "retirement-partial" } })
+          expect(existsSync(base.entry)).toBe(false)
+          expect(existsSync(pointer)).toBe(true)
+          expect(result.repositories).toContainEqual(
+            expect.objectContaining({ repository: base.entry, state: "updated" }),
+          )
+          expect(result.repositories).toContainEqual(expect.objectContaining({ repository: pointer, state: "failed" }))
+        } else {
+          expect(result).toMatchObject({
+            state: "unchanged",
+            partial: false,
+            detail: { code: event === "held" ? "lease-held" : "census-shifted" },
+          })
+          expect(existsSync(base.entry)).toBe(true)
+          expect(readFileSync(manifestPath)).toEqual(preserved)
+        }
+        if (event === "manifest" || event === "census") {
+          const readCertificate = (
+            pass: string,
+          ): { verdict: string; manifestSha256: string; estate: { objectDirs: string[] } } =>
+            JSON.parse(readFileSync(join(artifactDir, "operation", pass, "retirement-certificate.json"), "utf8")) as {
+              verdict: string
+              manifestSha256: string
+              estate: { objectDirs: string[] }
+            }
+          const pre = readCertificate("pre")
+          const held = readCertificate("held")
+          expect(held.verdict).toBe("candidate")
+          if (event === "manifest") expect(held.manifestSha256).not.toBe(pre.manifestSha256)
+          else {
+            expect(pre.estate.objectDirs).not.toContain(join(census, ".git", "objects"))
+            expect(held.estate.objectDirs).toContain(join(census, ".git", "objects"))
+          }
+        }
+      } finally {
+        blocker?.release()
+        if (child !== undefined && child.exitCode === null) {
+          child.kill()
+          await child.exited
+        }
+        if (event === "pointer-cleanup" && existsSync(registry)) {
+          chmodSync(registry, 0o700)
+          rmSync(registry, { recursive: true, force: false })
+        }
+        for (const path of createdLeasePaths.reverse()) rmSync(path, { recursive: true, force: false })
+        rmSync(census, { recursive: true, force: true })
+        rmSync(artifactDir, { recursive: true, force: true })
+      }
+    },
+    60_000,
+  )
+
   it.each(["unexpired", "legacy-unrecorded", "incomplete", "lease-missing"])(
     "keeps a %s entry through the native retire CLI without changing its manifest",
     async (reason) => {
@@ -753,4 +917,64 @@ describe("retention verify fix-forward #27443(b) gaps", () => {
     expect(result.verdict).toBe("unknown")
     expect(result.gates[1]).toMatchObject({ gate: "copy-manifest", status: "unknown" })
   })
+})
+
+describe("native retirement alongside supported materialization", () => {
+  it("keeps the materializer's actual object target at the durable primary while retirement runs", async () => {
+    const artifactDir = mkdtempSync(join("/var/tmp", "git-super-retire-materializer-"))
+    const createdLeasePaths: string[] = []
+    let child: ReturnType<typeof Bun.spawn> | undefined
+    let blocker: ReturnType<typeof tryAcquireFlock> = null
+    try {
+      await prepareRetirementFixture(artifactDir, createdLeasePaths)
+      const product = join(fixtureRoot as string, "product")
+      const checkout = join(fixtureRoot as string, "materialized-survivor")
+      blocker = tryAcquireFlock(join(product, ".git", "yrd-worktree-mutations", "writer.lock"), { create: false })
+      expect(blocker?.held).toBe(true)
+      const running = Bun.spawn(
+        [
+          process.execPath,
+          join(import.meta.dirname, "../bin/git-super"),
+          ...retirementArgs(join(artifactDir, "operation")),
+        ],
+        { cwd: process.cwd(), env: environment, stdout: "pipe", stderr: "pipe" },
+      )
+      child = running
+      const stdout = new Response(running.stdout).text()
+      const stderr = new Response(running.stderr).text()
+      await vi.waitFor(
+        () => expect(existsSync(join(artifactDir, "operation", "pre", "retirement-certificate.json"))).toBe(true),
+        { timeout: 30_000, interval: 20 },
+      )
+      blocker?.release()
+      const diagnostic = outputSink()
+      expect(
+        await runCli(["--repo", product, "worktree", "add", checkout, "HEAD"], outputSink(), diagnostic),
+        diagnostic.output,
+      ).toBe(0)
+      const code = await running.exited
+      const body = await stdout
+      expect([0, 1], `${await stderr}\n${body}`).toContain(code)
+      const result = JSON.parse(body) as GitSuperResult
+      expect(result.partial).toBe(false)
+      expect(existsSync(base.entry)).toBe(code === 1)
+      const objects = realpathSync(
+        git(join(checkout, "vendor/dep"), ["rev-parse", "--path-format=absolute", "--git-path", "objects"]),
+      )
+      expect(alternateEntries(readFileSync(join(objects, "info", "alternates"), "utf8"), objects)).toContain(
+        realpathSync(join(product, ".git", "modules", "vendor", "dep", "objects")),
+      )
+      expect(objects.startsWith(`${base.entry}/`)).toBe(false)
+      expect(scanEstate([fixtureRoot as string], [base.entry]).survivorIntoRemoval).toEqual([])
+      git(join(checkout, "vendor/dep"), ["fsck", "--full"])
+    } finally {
+      blocker?.release()
+      if (child !== undefined && child.exitCode === null) {
+        child.kill()
+        await child.exited
+      }
+      for (const path of createdLeasePaths.reverse()) rmSync(path, { recursive: true, force: false })
+      rmSync(artifactDir, { recursive: true, force: true })
+    }
+  }, 90_000)
 })

@@ -258,6 +258,18 @@ JSON includes each entry's classification and the proposed pointers. JSON and hu
 
 Enrollment exits 0 when the report is complete and 1 when incomplete, including refused entries, inspection errors or bounds reached. Enrollment, verification and compaction results do not authorize removal.
 
+```bash
+git super --repo /work/product --json worktree retention retire /backups/retained/entry \
+  --root /backups/retained --common /work/product/.git \
+  --namespace /work --namespace /backups/retained --artifact-dir /work/audit/entry
+```
+
+`retire` requires one canonical direct-child entry, its retained root, the Git common directory, every managed namespace root, and an external durable artifact directory. Existing manifests, positive surviving custody, and existing common/owner lease files are required. Missing or held leases keep the entry; this action creates no lease paths and rewrites no certified entry bytes.
+
+The action emits preliminary and held proofs, compares their identity, manifest, contents, custody and estate facts while holding the existing leases, then removes only the selected entry and its exact unchanged registry pointers. Supported writers must use the existing leases; other writers require quiescence. It never unlocks a lender. Legacy or incomplete records stay kept until native evidence can establish their missing facts.
+
+JSON is the existing `GitSuperResult`: proof paths are in `detail.paths`, with the held certificate in `detail.evidence`. A kept row names `legacy-unrecorded`, `incomplete`, `unexpired`, `borrower`, `identity-unknown`, `custody-unknown`, `lease-missing`, `lease-held`, or `census-shifted`. Exit 0 means retired; 1 means kept; 2 means failure or uncertain/partial state. A failure after deletion reports the entry's actual state and any failed pointer path with `partial:true`; no deletion retry or rollback is attempted.
+
 ## gitlink write
 
 ```bash
