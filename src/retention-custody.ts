@@ -91,6 +91,8 @@ export interface CustodyScanOptions {
   readonly deadline?: number
   /** When present, only this target branch and exact-suffix primary pin refs are durable witnesses. */
   readonly witnessPolicy?: Readonly<{ targetBranch: string }>
+  /** Records a named span of this scan. The removal caller folds these into its phase log. */
+  readonly onPhase?: (name: string, ms: number) => void
 }
 
 const HEX40 = /^[0-9a-f]{40}$/u
@@ -270,9 +272,12 @@ async function indexWitnessStores(
   sidecarDir: string,
   witnessPolicy?: Readonly<{ targetBranch: string }>,
   deadline?: number,
+  onPhase?: (name: string, ms: number) => void,
 ): Promise<{ records: DurableRefRecord[]; formats: Map<string, string> }> {
   const records: DurableRefRecord[] = []
   const formats = new Map<string, string>()
+  let witnessFsckMs = 0
+  let refGraphMs = 0
   for (const store of stores) {
     const gitDir = dirname(store)
     const format = await objectFormat(gitDir, run)
@@ -293,7 +298,9 @@ async function indexWitnessStores(
     const closureResult = alternateClosure(store, removal)
     if (closureResult.status !== "ok") throw new UnknownError(closureResult.detail)
     // A hung `fsck` is killed at the declared deadline and reported unknown, never blocking.
+    const fsckStarted = clock()
     const fsck = await run([`--git-dir=${gitDir}`, "fsck", "--full", "--no-progress"], { timeoutMs: bounds.fsckMs })
+    witnessFsckMs += clock() - fsckStarted
     refuseSuccessfulStderr(fsck, `fsck --full in witness store ${gitDir}`)
     if (fsck.code !== 0) {
       throw new UnknownError(`fsck --full failed in witness store ${gitDir}: ${fsck.stderr.trim()}`)
@@ -328,6 +335,7 @@ async function indexWitnessStores(
     }
     durable.sort((left, right) => (left.ref < right.ref ? -1 : left.ref > right.ref ? 1 : 0))
     const selected = witnessPolicy === undefined ? durable : await independentPolicyRefs(durable, gitDir, run)
+    const refStarted = clock()
     for (const entry of selected) {
       const started = clock()
       const lineStream = stream([`--git-dir=${gitDir}`, "rev-list", "--objects", entry.tip], {
@@ -346,7 +354,10 @@ async function indexWitnessStores(
       if (deadline !== undefined && clock() >= deadline) throw new UnknownError("shared proof deadline is exhausted")
       records.push({ store, ref: entry.ref, tip: entry.tip, format: format.format, sidecar })
     }
+    refGraphMs += clock() - refStarted
   }
+  onPhase?.("witnessFsck", witnessFsckMs)
+  onPhase?.("refGraph", refGraphMs)
   return { records, formats }
 }
 
@@ -362,6 +373,7 @@ async function runCustody(
   sidecarDir: string,
   witnessPolicy?: Readonly<{ targetBranch: string }>,
   deadline?: number,
+  onPhase?: (name: string, ms: number) => void,
 ): Promise<CustodyScan> {
   const stores = [...new Set(witnessStores.map((store) => realpathSync(store)))]
     .filter((store) => !removal.some((root) => within(root, store)))
@@ -410,6 +422,7 @@ async function runCustody(
     sidecarDir,
     witnessPolicy,
     deadline,
+    onPhase,
   )
   const width = String(Math.max(1, records.length)).length
   const index = await mergeLabeledFiles(
@@ -536,6 +549,7 @@ export async function scanCustody(
       options.sidecarDir,
       options.witnessPolicy,
       options.deadline,
+      options.onPhase,
     )
   } catch (error) {
     return {
