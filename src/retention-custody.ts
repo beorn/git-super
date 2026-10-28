@@ -183,15 +183,32 @@ async function objectFormat(
   return { status: "ok", format }
 }
 
-/** Validates a `rev-list --objects` stream, yielding the bare OID of every reachable object. */
-async function* reachableOidLines(stream: GitLineStream, gitDir: string, tip: string): AsyncGenerator<string> {
+/** Drain bounded output before classifying it: a partial row cannot hide a native failure. */
+async function* reachableOidLines(
+  stream: GitLineStream,
+  gitDir: string,
+  tip: string,
+  bounds: CustodyBounds,
+): AsyncGenerator<string> {
+  let malformed: UnknownError | undefined
   for await (const line of stream.lines) {
+    if (malformed !== undefined) continue
     const oid = line.split(" ")[0]
     if (oid === undefined || !HEX40.test(oid)) {
-      throw new UnknownError(`malformed rev-list row for ${tip} in ${gitDir}: ${line.slice(0, 120)}`)
+      malformed = new UnknownError(`malformed rev-list row for ${tip} in ${gitDir}: ${line.slice(0, 120)}`)
+      continue
     }
     yield oid
   }
+  // Await only after draining: the producer can otherwise be paused at its queue bound.
+  const outcome = await stream.outcome
+  assertStreamComplete(outcome, {
+    timedOut: `rev-list ${tip} in ${gitDir} exceeded the ${bounds.reachableMs} ms bound`,
+    capped: `reachable OIDs exceeded the ${bounds.maxReachableOids} cap in ${gitDir}`,
+    failed: `rev-list ${tip} failed in witness store ${gitDir}: ${outcome.stderr.trim()}`,
+    warned: `rev-list ${tip} in ${gitDir} exited 0 with stderr: ${outcome.stderr.trim()}`,
+  })
+  if (malformed !== undefined) throw malformed
 }
 
 interface DurableRefRecord {
@@ -317,18 +334,11 @@ async function indexWitnessStores(
         timeoutMs: bounds.reachableMs,
         maxLines: bounds.maxReachableOids,
       })
-      const sidecar = await externalSortToSidecar(reachableOidLines(lineStream, gitDir, entry.tip), {
+      const sidecar = await externalSortToSidecar(reachableOidLines(lineStream, gitDir, entry.tip, bounds), {
         dir: sidecarDir,
         runLines: DEFAULT_SORT_RUN_LINES,
         deadline,
         clock,
-      })
-      const outcome = await lineStream.outcome
-      assertStreamComplete(outcome, {
-        timedOut: `rev-list ${entry.tip} in ${gitDir} exceeded the ${bounds.reachableMs} ms bound`,
-        capped: `reachable OIDs exceeded the ${bounds.maxReachableOids} cap in ${gitDir}`,
-        failed: `rev-list ${entry.tip} failed in witness store ${gitDir}: ${outcome.stderr.trim()}`,
-        warned: `rev-list ${entry.tip} in ${gitDir} exited 0 with stderr: ${outcome.stderr.trim()}`,
       })
       if (clock() - started > bounds.reachableMs) {
         throw new UnknownError(`rev-list ${entry.tip} in ${gitDir} exceeded the ${bounds.reachableMs} ms bound`)

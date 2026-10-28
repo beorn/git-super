@@ -68,7 +68,7 @@ describe("GitProcess", () => {
     const executable = join(root, "git")
     writeFileSync(
       executable,
-      `#!/bin/sh\nprintf '%s|%s|%s|%s\\n' "$CUSTODY_STREAM_MARKER" "\${GIT_CONFIG_NOSYSTEM-absent}" "\${GIT_OPTIONAL_LOCKS-absent}" "\${GIT_TERMINAL_PROMPT-absent}"\n`,
+      `#!/bin/sh\nprintf '%s|%s|%s|%s\\0second\\0' "$CUSTODY_STREAM_MARKER" "\${GIT_CONFIG_NOSYSTEM-absent}" "\${GIT_OPTIONAL_LOCKS-absent}" "\${GIT_TERMINAL_PROMPT-absent}"\n`,
     )
     chmodSync(executable, 0o755)
     vi.stubEnv("CUSTODY_STREAM_MARKER", "ambient-environment")
@@ -83,12 +83,12 @@ describe("GitProcess", () => {
       delete selectedEnvironment.GIT_TERMINAL_PROMPT
       const selected = createLocalGitProcess(selectedEnvironment)
       expect(selected.stream).toBeTypeOf("function")
-      const stream = selected.stream?.({ repo: root, args: ["version"], maxLines: 4 })
+      const stream = selected.stream?.({ repo: root, args: ["version"], maxLines: 4, framing: "nul" })
       if (stream === undefined) throw new Error("local Git process did not expose its bounded stream")
       const lines: string[] = []
       for await (const line of stream.lines) lines.push(line)
       await expect(stream.outcome).resolves.toMatchObject({ code: 0, timedOut: false, capped: false })
-      expect(lines).toEqual(["selected-environment|absent|absent|absent"])
+      expect(lines).toEqual(["selected-environment|absent|absent|absent\0", "second\0"])
     } finally {
       vi.unstubAllEnvs()
     }
@@ -439,7 +439,7 @@ process.exitCode = 19
     // EAGAIN before the child begins reading. Bound backpressure handling so
     // the assertion measures producer validation, not a truncated fixture.
     const deadline = Date.now() + 2_000
-    for (let offset = 0; offset < greeting.length;) {
+    for (let offset = 0; offset < greeting.length; ) {
       try {
         const count = await new Promise<number>((resolve, reject) => {
           write(fd, greeting, offset, greeting.length - offset, null, (error, count) => {

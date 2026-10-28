@@ -314,6 +314,7 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
       const tree = git(alphaSource, "rev-parse", "HEAD^{tree}")
       const parent = git(alphaSource, "rev-parse", "HEAD")
       let introduced: string | undefined
+      const nulFraming: { args: readonly string[]; framing: string | undefined }[] = []
       const local = createLocalGitProcess()
       const localStream = local.stream!
       const store = createGitWorktreeStore({
@@ -321,6 +322,17 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
         gitProcess: {
           run: local.run,
           stream: (request) => {
+            // AC: the selected custody query adapter must carry NUL framing through to
+            // native Git; isolated reader tests cannot catch a lost request option.
+            const beforePaths = request.args.slice(
+              0,
+              request.args.indexOf("--") === -1 ? undefined : request.args.indexOf("--"),
+            )
+            if (
+              request.env?.GIT_NO_LAZY_FETCH === "1" &&
+              (beforePaths.includes("-z") || beforePaths.includes("--null"))
+            )
+              nulFraming.push({ args: request.args, framing: request.framing })
             if (introduced === undefined && request.args.includes("--batch-all-objects")) {
               introduced = git(alphaSource, "commit-tree", tree, "-p", parent, "-m", "introduced before final proof")
             }
@@ -335,6 +347,8 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
         componentCustody: { primaryRoot: product, targetBranch: "main" },
       })
 
+      expect(nulFraming.length).toBeGreaterThan(0)
+      expect(nulFraming.filter((request) => request.framing !== "nul")).toEqual([])
       expect(introduced).toMatch(/^[0-9a-f]{40}$/u)
       expect(outcome).toMatchObject({
         custodyRefusal: { status: "blocked", component: "packages/alpha", oid: introduced },

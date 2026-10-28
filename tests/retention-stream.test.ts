@@ -28,6 +28,7 @@ import {
   assertStreamComplete,
   externalSortToSidecar,
   gitLineStream,
+  MAX_LINE_LENGTH,
   mergeLabeledFiles,
   mergeSorted,
   mergeSortedFilesToSidecar,
@@ -192,6 +193,52 @@ describe("retention stream primitives (#27443(b))", () => {
     const outcome = await stream.outcome
     expect(outcome.lines).toBe(2)
     expect(outcome.capped).toBe(true)
+  })
+
+  // AC: NUL queries preserve exact records, empty fields and LF filenames above the old
+  // single-line cap. Existing LF-only tests never exercise native -z framing or its queue.
+  test("NUL framing preserves a large record sequence and exact delimiters within bounded backpressure", async () => {
+    const bytes = Buffer.from(
+      "file\nname\0\0" + ("100644 " + "a".repeat(40) + " 0\t" + "path".repeat(20) + "\0\0").repeat(38_100) + "tail",
+    )
+    let highWater = 0
+    const stream = gitLineStream(["--version"], {
+      framing: "nul",
+      maxBytes: 64 * 1024 * 1024,
+      maxLines: 1_000_000,
+      onQueueHighWater: (depth) => {
+        highWater = Math.max(highWater, depth)
+      },
+      stdout: (async function* () {
+        for (let offset = 0; offset < bytes.length; offset += 65_537) yield bytes.subarray(offset, offset + 65_537)
+      })(),
+    })
+    const records = await collect(stream.lines)
+    expect(sha256(Buffer.from(records.join("")))).toBe(sha256(bytes))
+    expect(records).toHaveLength(76_203)
+    expect(records[1]).toBe("\0")
+    expect(records.at(-1)).toBe("tail")
+    expect(highWater).toBeLessThanOrEqual(RETENTION_STREAM_QUEUE_LINES)
+    expect(await stream.outcome).toMatchObject({ code: 0, bytes: bytes.length, lines: records.length, capped: false })
+  })
+
+  // AC: framing cannot raise byte, record-count or individual-record bounds. Existing
+  // cap tests cover LF only and miss completed oversized records delivered in one chunk.
+  test.each([
+    { label: "bytes", output: "a\0b\0", options: { maxBytes: 3 }, count: 0 },
+    { label: "record count including empty", output: "a\0\0b\0", options: { maxLines: 2 }, count: 2 },
+    { label: "terminated record", output: "x".repeat(MAX_LINE_LENGTH + 1) + "\0", options: {}, count: 0 },
+    { label: "unterminated record", output: "x".repeat(MAX_LINE_LENGTH + 1), options: {}, count: 0 },
+  ])("NUL framing preserves the $label cap", async ({ output, options, count }) => {
+    const stream = gitLineStream(["--version"], {
+      framing: "nul",
+      ...options,
+      stdout: (async function* () {
+        yield Buffer.from(output)
+      })(),
+    })
+    expect(await collect(stream.lines)).toHaveLength(count)
+    expect(await stream.outcome).toMatchObject({ capped: true, lines: count })
   })
 
   test("externalSortToSidecar sorts, deduplicates, and names the file by its own bytes", async () => {

@@ -14,7 +14,7 @@ import { join } from "node:path"
 import { afterEach, describe, expect, test } from "vitest"
 import { defaultGitRun, defaultGitStream, type ComponentContents, type GitRun } from "../src/retention-contents.ts"
 import { scanCustody, type CustodyScan } from "../src/retention-custody.ts"
-import { readLines, SidecarWriter } from "../src/retention-stream.ts"
+import { gitLineStream, RETENTION_STREAM_QUEUE_LINES, readLines, SidecarWriter } from "../src/retention-stream.ts"
 
 const cleanup: string[] = []
 afterEach(() => {
@@ -80,6 +80,80 @@ async function sidecarText(scan: CustodyScan, which: "witness" | "missing"): Pro
 }
 
 describe("retention custody scan — gate 5 (#27443(b))", () => {
+  // AC: a killed/capped/failed/warning stream outranks its malformed partial row,
+  // while a complete malformed stream stays malformed. Existing fixtures only emit valid OIDs.
+  test.each([
+    { fault: "timeout", code: 1, timedOut: true, capped: false, stderr: "", detail: "ms bound" },
+    { fault: "cap", code: 1, timedOut: false, capped: true, stderr: "", detail: "OIDs exceeded" },
+    {
+      fault: "exit",
+      code: 1,
+      timedOut: false,
+      capped: false,
+      stderr: "failed child",
+      detail: "failed in witness store",
+    },
+    {
+      fault: "warning",
+      code: 0,
+      timedOut: false,
+      capped: false,
+      stderr: "ignored alternate",
+      detail: "exited 0 with stderr",
+    },
+    {
+      fault: "complete malformed",
+      code: 0,
+      timedOut: false,
+      capped: false,
+      stderr: "",
+      detail: "malformed rev-list row",
+    },
+  ])("drains before classifying a $fault rev-list", async ({ detail, fault: _fault, ...outcome }) => {
+    const store = repoWithCommit("git-super-custody-fault-")
+    const sidecarDir = tmp("git-super-custody-fault-sidecars-")
+    let drained = false
+    const scan = await scanCustody(store.root, [], [join(store.root, ".git", "objects")], [], {
+      sidecarDir,
+      stream: () => ({
+        lines: (async function* () {
+          yield "partial"
+          yield store.head
+          drained = true
+        })(),
+        outcome: Promise.resolve({ ...outcome, bytes: 48, lines: 2 }),
+      }),
+    })
+    expect(scan.status).toBe("unknown")
+    expect(scan.detail).toContain(detail)
+    expect(drained).toBe(true)
+  })
+
+  // AC: drain the real bounded producer before awaiting its outcome. The simple outcome
+  // table cannot detect a producer blocked at the 2048-record queue before its read failure.
+  test("drains a backpressured malformed rev-list and reports its native read failure", async () => {
+    const store = repoWithCommit("git-super-custody-backpressure-")
+    const sidecarDir = tmp("git-super-custody-backpressure-sidecars-")
+    let highWater = 0
+    const scan = await scanCustody(store.root, [], [join(store.root, ".git", "objects")], [], {
+      sidecarDir,
+      stream: () =>
+        gitLineStream(["--version"], {
+          onQueueHighWater: (depth) => {
+            highWater = Math.max(highWater, depth)
+          },
+          stdout: (async function* () {
+            yield Buffer.from("partial\n" + `${store.head}\n`.repeat(RETENTION_STREAM_QUEUE_LINES + 10))
+            throw new Error("injected stdout read failure after queue")
+          })(),
+        }),
+    })
+    expect(scan.status).toBe("unknown")
+    expect(scan.detail).toContain("failed in witness store")
+    expect(scan.detail).toContain("stdout read failed")
+    expect(highWater).toBe(RETENTION_STREAM_QUEUE_LINES)
+  })
+
   test("a named survivor ref whose closure includes the OID witnesses it", async () => {
     const store = repoWithCommit("git-super-custody-")
     const sidecarDir = tmp("git-super-custody-sidecars-")

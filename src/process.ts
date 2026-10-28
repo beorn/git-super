@@ -203,6 +203,8 @@ export type GitProcessStreamRequest = Readonly<{
   timeoutMs?: number
   maxBytes?: number
   maxLines?: number
+  /** LF by default; NUL records retain delimiters for exact query reconstruction. */
+  framing?: "lf" | "nul"
   onQueueHighWater?: (depth: number) => void
 }>
 
@@ -647,6 +649,7 @@ export function createLocalGitProcess(environment?: NodeJS.ProcessEnv, options: 
         ...(request.timeoutMs === undefined ? {} : { timeoutMs: request.timeoutMs }),
         ...(request.maxBytes === undefined ? {} : { maxBytes: request.maxBytes }),
         ...(request.maxLines === undefined ? {} : { maxLines: request.maxLines }),
+        ...(request.framing === undefined ? {} : { framing: request.framing }),
         ...(request.onQueueHighWater === undefined ? {} : { onQueueHighWater: request.onQueueHighWater }),
       })
     },

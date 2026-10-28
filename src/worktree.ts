@@ -108,6 +108,7 @@ function selectedCustodyAdapters(
       timeoutMs: Math.min(streamOptions.timeoutMs ?? Number.POSITIVE_INFINITY, left),
       maxBytes: Math.min(streamOptions.maxBytes ?? COMPONENT_STREAM_MAX_BYTES, COMPONENT_STREAM_MAX_BYTES),
       maxLines: Math.min(streamOptions.maxLines ?? COMPONENT_STREAM_MAX_LINES, COMPONENT_STREAM_MAX_LINES),
+      ...(streamOptions.framing === undefined ? {} : { framing: streamOptions.framing }),
       ...(streamOptions.onQueueHighWater === undefined ? {} : { onQueueHighWater: streamOptions.onQueueHighWater }),
     })
   }
@@ -117,9 +118,21 @@ function selectedCustodyAdapters(
     if (gitProcess.stream === undefined) {
       return incompleteSelectedRun("selected Git process does not support bounded output streaming")
     }
+    // Only existing NUL-producing query verbs opt in. Stop at the path separator:
+    // a filename named -z or --null must never select a different protocol.
+    let commandIndex = 0
+    while (args[commandIndex]?.startsWith("-")) {
+      commandIndex += ["-C", "-c", "--git-dir", "--work-tree"].includes(args[commandIndex]!) ? 2 : 1
+    }
+    const pathSeparator = args.indexOf("--", commandIndex)
+    const queryOptions = args.slice(commandIndex + 1, pathSeparator === -1 ? undefined : pathSeparator)
+    const nul =
+      ["ls-files", "ls-tree", "config", "worktree", "status", "diff"].includes(args[commandIndex] ?? "") &&
+      queryOptions.some((arg) => arg === "-z" || arg === "--null")
     let bounded
     try {
       bounded = stream(args, {
+        ...(nul ? { framing: "nul" } : {}),
         ...(options.env === undefined ? {} : { env: options.env }),
         ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
         maxBytes: COMPONENT_QUERY_MAX_BYTES,
@@ -136,7 +149,7 @@ function selectedCustodyAdapters(
     let streamFailure: string | undefined
     try {
       for await (const line of bounded.lines) {
-        bytes += Buffer.byteLength(line, "utf8") + 1
+        bytes += Buffer.byteLength(line, "utf8") + (nul ? 0 : 1)
         if (bytes > COMPONENT_QUERY_MAX_BYTES || lines.length >= COMPONENT_QUERY_MAX_LINES) {
           outputExceeded = true
           continue
@@ -162,7 +175,7 @@ function selectedCustodyAdapters(
     }
     return {
       code: outcome.code ?? 1,
-      stdout: lines.join("\n"),
+      stdout: lines.join(nul ? "" : "\n"),
       stderr: outcome.stderr,
     }
   }

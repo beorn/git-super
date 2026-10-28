@@ -296,6 +296,12 @@ export interface GitStreamOptions {
   readonly timeoutMs?: number
   /** Hard byte cap; the child is killed when stdout exceeds it and reported `capped`. */
   readonly maxBytes?: number
+  /**
+   * LF (default) yields nonempty lines without delimiters. NUL yields every record,
+   * retaining its NUL terminator, including empty records; join("") reconstructs stdout.
+   * An unterminated final record is yielded as-is. The same byte/record/queue bounds apply.
+   */
+  readonly framing?: "lf" | "nul"
   /** Hard line cap; the child is killed when stdout exceeds it and reported `capped`. */
   readonly maxLines?: number
   /**
@@ -481,6 +487,7 @@ export function gitLineStream(args: readonly string[], options: GitStreamOptions
   void (async (): Promise<void> => {
     const decoder = new StringDecoder("utf8")
     let remainder = ""
+    const separator = options.framing === "nul" ? "\0" : "\n"
     try {
       const source = options.stdout ?? (child.stdout as AsyncIterable<Buffer>)
       for await (const chunk of source) {
@@ -491,22 +498,27 @@ export function gitLineStream(args: readonly string[], options: GitStreamOptions
           break
         }
         remainder += decoder.write(chunk)
-        let index = remainder.indexOf("\n")
+        let index = remainder.indexOf(separator)
         while (index !== -1) {
           const line = remainder.slice(0, index)
           remainder = remainder.slice(index + 1)
-          if (line !== "") {
+          if (line.length > MAX_LINE_LENGTH) {
+            capped = true
+            kill()
+            break
+          }
+          if (line !== "" || options.framing === "nul") {
             if (options.maxLines !== undefined && lines >= options.maxLines) {
               capped = true
               kill()
               break
             }
             lines += 1
-            push(line)
+            push(options.framing === "nul" ? `${line}\0` : line)
             if (capped) break
             if (pending.length >= QUEUE_LINES) await waitForCapacity()
           }
-          index = remainder.indexOf("\n")
+          index = remainder.indexOf(separator)
         }
         if (capped) break
         if (remainder.length > MAX_LINE_LENGTH) {
@@ -519,6 +531,11 @@ export function gitLineStream(args: readonly string[], options: GitStreamOptions
       if (!capped) {
         const tail = remainder + decoder.end()
         if (tail !== "") {
+          if (tail.length > MAX_LINE_LENGTH) {
+            capped = true
+            kill()
+            return
+          }
           if (options.maxLines !== undefined && lines >= options.maxLines) {
             capped = true
             kill()
