@@ -439,7 +439,7 @@ process.exitCode = 19
     // EAGAIN before the child begins reading. Bound backpressure handling so
     // the assertion measures producer validation, not a truncated fixture.
     const deadline = Date.now() + 2_000
-    for (let offset = 0; offset < greeting.length; ) {
+    for (let offset = 0; offset < greeting.length;) {
       try {
         const count = await new Promise<number>((resolve, reject) => {
           write(fd, greeting, offset, greeting.length - offset, null, (error, count) => {
