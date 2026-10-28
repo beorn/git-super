@@ -180,7 +180,7 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     writeFileSync(blobPath, "only this blob pin keeps me\n")
     const blob = git(store.root, ["hash-object", "-w", blobPath])
     git(store.root, ["update-ref", `refs/git-super/pins/${blob}`, blob])
-    git(store.root, ["tag", "-a", "annotated", "-m", "annotation"])
+    git(store.root, ["tag", "-a", "annotated", "-m", "annotation", store.head])
     const tag = git(store.root, ["rev-parse", "refs/tags/annotated"])
     git(store.root, ["update-ref", `refs/git-super/pins/${tag}`, tag])
     const component = await componentOf([main, side, blob, tag, "f".repeat(40)], sidecarDir)
@@ -195,8 +195,11 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     expect(scan.witnessCount).toBe(4)
     expect(scan.missing).toEqual(control.missing)
     expect(scan.missingCount).toBe(1)
+    expect(scan.witnesses).toHaveLength(4)
     expect(scan.witnesses).toEqual(
       expect.arrayContaining([
+        expect.objectContaining({ tip: main }),
+        expect.objectContaining({ tip: side }),
         expect.objectContaining({ ref: `refs/git-super/pins/${blob}`, tip: blob }),
         expect.objectContaining({ ref: `refs/git-super/pins/${tag}`, tip: tag }),
       ]),
