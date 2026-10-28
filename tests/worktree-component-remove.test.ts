@@ -263,7 +263,7 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
       expect(result.state, result.detail?.message ?? JSON.stringify(result)).toBe("updated")
       const line = errors.find((entry) => entry.includes("git-super removal phases"))
       expect(line, errors.join("\n")).toBeDefined()
-      const phases = JSON.parse(line!.slice(line!.indexOf("{"))).phases as Record<string, number>
+      const phases = (JSON.parse(line!.slice(line!.indexOf("{"))) as { phases: Record<string, number> }).phases
       expect(phases).toHaveProperty("witnessFsck")
       expect(phases).toHaveProperty("refGraph")
     } finally {
