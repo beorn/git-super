@@ -18,7 +18,7 @@ import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { spawn } from "node:child_process"
 import { runCli } from "../src/cli.ts"
-import { acquireExclusive, createExclusive, type Exclusive } from "../src/exclusive.ts"
+import { acquireExclusive, createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS, type Exclusive } from "../src/exclusive.ts"
 import {
   adaptProcessGit,
   createLocalGitProcess,
@@ -975,6 +975,47 @@ describe("git super pull --ff-only", () => {
     expect(lines.findIndex((line) => line.includes("lock-wait held by"))).toBeLessThan(
       lines.findIndex((line) => line.includes("lock-acquired")),
     )
+  })
+
+  test("a fast-forward pull still waits after 30 seconds when the writer lock is held", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-pull-lock-past-30s-"))
+    roots.push(fixtureRoot)
+    const upstream = join(fixtureRoot, "upstream")
+    const checkout = join(fixtureRoot, "checkout")
+    createRepository(upstream, "README.md", "one\n")
+    git(fixtureRoot, "clone", "-q", upstream, checkout)
+    advanceRepository(upstream, "README.md", "two\n")
+    const common = git(checkout, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    const holder = await acquireExclusive(join(common, "yrd-worktree-mutations"), { timeoutMs: 0 }, "worktree remove")
+    const lines: string[] = []
+    let settled = false
+    const pulled = superPull({
+      repo: checkout,
+      repository: "origin",
+      refspecs: ["main"],
+      ffOnly: true,
+      report: (message) => lines.push(message),
+    }).finally(() => {
+      settled = true
+    })
+    try {
+      const deadline = Date.now() + 5_000
+      while (!lines.some((line) => line.includes("lock-wait held by")) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10))
+      }
+      expect(lines.some((line) => line.includes("lock-wait held by"))).toBe(true)
+      vi.useFakeTimers({ toFake: ["Date"] })
+      vi.setSystemTime(Date.now() + 31_000)
+      // ≥ 4 polls at pollIntervalMs 10; raise this wait with the default.
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      expect(settled).toBe(false)
+      expect(31_000).toBeLessThan(DEFAULT_MUTATION_LOCK_WAIT_MS)
+      holder.release()
+      await expect(pulled).resolves.toMatchObject({ state: "updated" })
+    } finally {
+      holder.release()
+      vi.useRealTimers()
+    }
   })
 
   test("reports an unchanged root without touching it", async () => {

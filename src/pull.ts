@@ -3,7 +3,7 @@ import { tmpdir } from "node:os"
 import { decorrelatedJitter } from "@bearly/pacing"
 import { isAbsolute, join, relative, resolve } from "node:path"
 import { readCommitGitlinks } from "./commit-graph.ts"
-import { createExclusive, type Exclusive } from "./exclusive.ts"
+import { createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS, type Exclusive } from "./exclusive.ts"
 import { isSubmoduleExcluded, probeRepository, validateExcludedSubmodules } from "./git.ts"
 import type { NotCompared } from "./diff.ts"
 import { inspectExcludedCheckout } from "./status.ts"
@@ -1053,6 +1053,7 @@ export async function superPull(options: SuperPullOptions): Promise<PullResult> 
   const exclusive =
     options.exclusive ??
     createExclusive(await lockDirectory(git, plan.root), {
+      timeoutMs: DEFAULT_MUTATION_LOCK_WAIT_MS,
       onContended: (holder) => phase(`lock-wait held by ${holder}`),
     })
   phase("lock-wait")
