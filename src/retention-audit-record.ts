@@ -137,28 +137,37 @@ export function readRetentionAudits(
   entry: string,
   manifestPath: string,
   gateOrder: readonly RetentionGateId[],
+  onInvalid?: (path: string, message: string) => void,
 ): readonly ReadRetentionAudit[] {
   const records: ReadRetentionAudit[] = []
   for (const name of readdirSync(entry).sort()) {
     const match = AUDIT_NAME.exec(name)
     if (match === null) continue // Unrecognized siblings remain subject to the verifier's exact wrapper check.
     const path = join(entry, name)
-    const stat = lstatSync(path)
-    requireRecord(stat.isFile() && !stat.isSymbolicLink() && realpathSync(path) === resolve(path), path)
-    const bytes = readFileSync(path)
-    const sha256 = createHash("sha256").update(bytes).digest("hex")
-    requireRecord(match[1] === sha256, `${path} byte digest`)
-    let parsed: unknown
     try {
-      parsed = JSON.parse(bytes.toString("utf8"))
+      const stat = lstatSync(path)
+      requireRecord(
+        stat.isFile() && !stat.isSymbolicLink() && realpathSync(path) === resolve(path),
+        `${path} non-regular or redirected audit path`,
+      )
+      const bytes = readFileSync(path)
+      const sha256 = createHash("sha256").update(bytes).digest("hex")
+      requireRecord(match[1] === sha256, `${path} byte digest`)
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(bytes.toString("utf8"))
+      } catch (error) {
+        throw new Error(`cannot decode JSON in native retention audit ${path}: ${String(error)}`, { cause: error })
+      }
+      const record = validateRetentionAudit(parsed, path, manifestPath, gateOrder)
+      records.push({
+        binding: { path, sha256, devIno: `${stat.dev}:${stat.ino}` },
+        record,
+      })
     } catch (error) {
-      throw new Error(`cannot decode native retention audit ${path}: ${String(error)}`, { cause: error })
+      if (onInvalid === undefined) throw error
+      onInvalid(path, error instanceof Error ? error.message : String(error))
     }
-    const record = validateRetentionAudit(parsed, path, manifestPath, gateOrder)
-    records.push({
-      binding: { path, sha256, devIno: `${stat.dev}:${stat.ino}` },
-      record,
-    })
   }
   return records
 }

@@ -347,6 +347,11 @@ describe("retention verify gates 1-6", () => {
       expect(records).toHaveLength(1)
       expect(records[0]?.record.checks[0]?.outcome).toBe(kind === "unexpired" ? "blocked" : "unknown")
       expect(stdout.output).toContain(kind === "unexpired" ? "1 blocked, 5 unknown" : "0 blocked, 6 unknown")
+      const repeated = outputSink()
+      expect(await runCli(args, repeated, outputSink())).toBe(1)
+      expect(repeated.output).toContain("unchanged since")
+      expect(repeated.output).toContain(kind === "unexpired" ? "1 blocked, 5 unknown" : "0 blocked, 6 unknown")
+      expect(readRetentionAudits(base.entry, manifestPath, GATE_ORDER)).toHaveLength(1)
       for (const check of records[0]?.record.checks ?? []) {
         expect(check.reason).toMatch(/^(pass|blocked|unknown): /)
         expect(check).not.toHaveProperty("status")
@@ -599,18 +604,26 @@ describe("retention verify gates 1-6", () => {
           expect(record.checks.map(({ outcome }) => outcome)).toEqual(GATE_ORDER.map(() => "pass"))
         }
       }
+      // A changed declared estate is a new observation, while the old record remains stale evidence.
+      const changedArgs = [...args, "--namespace", common]
+      expect(await runCli(changedArgs, outputSink(), outputSink())).toBe(0)
+      const changedRecords = readRetentionAudits(base.entry, manifestPath, GATE_ORDER)
+      expect(changedRecords).toHaveLength(2)
+      const changedEstate = scanEstate([fixtureRoot as string, common], [base.entry])
+      const changedMatch = matchRetentionAudit(changedRecords, original, changedEstate)
+      expect(changedMatch.stale).toHaveLength(1)
+      expect(changedMatch.selected?.record.provenance.estate.namespaceRoots).toEqual([fixtureRoot as string, common])
       // The producer's record must be usable by the real actuator, without a fixture-written receipt.
       const records = readRetentionAudits(base.entry, manifestPath, GATE_ORDER)
-      const selected = matchRetentionAudit(
-        records,
-        original,
-        scanEstate([fixtureRoot as string], [base.entry]),
-      ).selected
+      const selected = matchRetentionAudit(records, original, changedEstate).selected
       if (selected === undefined) throw new Error("native audit did not produce matching evidence")
       const auditBytes = readFileSync(selected.binding.path)
       const stdout = outputSink()
       const stderr = outputSink()
-      expect(await runCli(retirementArgs(artifactDir), stdout, stderr), stderr.output || stdout.output).toBe(0)
+      expect(
+        await runCli([...retirementArgs(artifactDir), "--namespace", common], stdout, stderr),
+        stderr.output || stdout.output,
+      ).toBe(0)
       expect(existsSync(base.entry)).toBe(false)
       const certificate = JSON.parse(
         readFileSync(join(artifactDir, "held", "retirement-certificate.json"), "utf8"),
@@ -621,6 +634,71 @@ describe("retention verify gates 1-6", () => {
       expect(readFileSync(join(artifactDir, "held", "metadata", "retention-evidence", "manifest.json"))).toEqual(
         original,
       )
+    } finally {
+      rmSync(artifactDir, { recursive: true, force: true })
+      for (const path of createdLeasePaths) rmSync(path, { recursive: true, force: true })
+    }
+  })
+
+  it("audit enumerates corruption and observation ties without publishing or relaxing retirement", async () => {
+    const artifactDir = mkdtempSync(join("/var/tmp", "git-super-audit-corruption-"))
+    const createdLeasePaths: string[] = []
+    try {
+      await prepareRetirementFixture(artifactDir, createdLeasePaths)
+      const manifestPath = join(base.entry, "manifest.json")
+      const original = readFileSync(manifestPath)
+      const args = retirementArgs(artifactDir).map((argument) => (argument === "retire" ? "audit" : argument))
+      expect(await runCli(args, outputSink(), outputSink())).toBe(0)
+      const first = readRetentionAudits(base.entry, manifestPath, GATE_ORDER)[0]
+      if (first === undefined) throw new Error("native audit fixture produced no record")
+      const observedAt = new Date(Date.parse(first.record.provenance.observedAt) + 60_000).toISOString()
+      const newest = [0, 1]
+        .map(() =>
+          writeAuditRecordFixture({
+            ...first.record,
+            runId: randomUUID(),
+            provenance: { ...first.record.provenance, observedAt },
+          }),
+        )
+        .sort()[0]
+      const bad: { path: string; check: string }[] = []
+      const digest = writeAuditRecordFixture({ ...first.record, runId: randomUUID() })
+      writeFileSync(digest, "changed audit bytes")
+      bad.push({ path: digest, check: "digest" })
+      const bytes = "{ invalid JSON\n"
+      const json = join(base.entry, `retention-audit-${createHash("sha256").update(bytes).digest("hex")}.json`)
+      writeFileSync(json, bytes)
+      bad.push({ path: json, check: "JSON" })
+      bad.push({ path: writeAuditRecordFixture({ schema: "invalid" }), check: "schema" })
+      const redirected = join(base.entry, `retention-audit-${"f".repeat(64)}.json`)
+      symlinkSync(manifestPath, redirected)
+      bad.push({ path: redirected, check: "non-regular" })
+      const before = readdirSync(base.entry).sort()
+      const stdout = outputSink()
+      const stderr = outputSink()
+      expect(await runCli(args, stdout, stderr), stderr.output || stdout.output).toBe(2)
+      const result = JSON.parse(stdout.output) as GitSuperResult
+      const diagnostics = result.repositories.filter((row) => row.detail?.code === "audit-invalid")
+      expect(diagnostics).toHaveLength(4)
+      for (const { path, check } of bad) {
+        expect(diagnostics).toContainEqual(
+          expect.objectContaining({
+            repository: path,
+            detail: expect.objectContaining({ message: expect.stringContaining(check) }),
+          }),
+        )
+      }
+      expect(result.repositories).toContainEqual(
+        expect.objectContaining({
+          repository: newest,
+          detail: expect.objectContaining({ code: "audit-valid-newest" }),
+        }),
+      )
+      expect(stdout.output).toContain("observation tie")
+      expect(readdirSync(base.entry).sort()).toEqual(before)
+      expect(await runCli(retirementArgs(artifactDir), outputSink(), outputSink())).toBe(1)
+      expect(readdirSync(base.entry).sort()).toEqual(before)
+      expect(readFileSync(manifestPath)).toEqual(original)
     } finally {
       rmSync(artifactDir, { recursive: true, force: true })
       for (const path of createdLeasePaths) rmSync(path, { recursive: true, force: true })

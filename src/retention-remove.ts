@@ -54,7 +54,7 @@ function auditIdentity(record: RetentionAuditRecord): string {
     original: record.original.sha256,
     estate: record.provenance.estate.scanDigest,
     common: record.provenance.common.head,
-    tool: record.provenance.tool,
+    tool: { name: record.provenance.tool.name, version: record.provenance.tool.version },
     outcomes: record.checks.map(({ gate, outcome }) => ({ gate, outcome })),
   })
 }
@@ -245,6 +245,48 @@ async function runRetentionOperation(
           throw new Error(
             `audit artifact ${artifact} must be external to ${root} and outside the OS temporary directory`,
           )
+        }
+        phase = "audit-records"
+        const diagnostics: { path: string; message: string }[] = []
+        const existing = readRetentionAudits(entry, join(entry, "manifest.json"), GATE_ORDER, (path, message) => {
+          diagnostics.push({ path, message })
+        })
+        const newest = newestRetentionAudit(existing)
+        if (newest !== undefined) {
+          const instant = Date.parse(newest.record.provenance.observedAt)
+          const tied = existing.filter((audit) => Date.parse(audit.record.provenance.observedAt) === instant)
+          if (tied.length > 1) {
+            row(entry, "unchanged", {
+              code: "audit-observation-tie",
+              phase,
+              message: `Audit observation tie at ${newest.record.provenance.observedAt}: ${tied.map((audit) => audit.binding.path).join(", ")}; full digest order selects ${newest.binding.path}.`,
+              paths: tied.map((audit) => audit.binding.path),
+            })
+          }
+        }
+        if (diagnostics.length > 0) {
+          for (const diagnostic of diagnostics) {
+            row(diagnostic.path, "failed", {
+              code: "audit-invalid",
+              phase,
+              message: diagnostic.message,
+              paths: [diagnostic.path],
+            })
+          }
+          if (newest !== undefined) {
+            row(newest.binding.path, "unchanged", {
+              code: "audit-valid-newest",
+              phase,
+              message: `Newest valid audit is ${newest.binding.path}, observed ${newest.record.provenance.observedAt}; it grants no retirement authority.`,
+              evidence: newest.binding.path,
+            })
+          }
+          return gitSuperResult(rows, {
+            code: "audit-failed",
+            phase,
+            message: `${diagnostics.length} invalid audit record(s); no record published, entry preserved.`,
+            paths: diagnostics.map((diagnostic) => diagnostic.path),
+          })
         }
       }
       phase = "preliminary-proof"
