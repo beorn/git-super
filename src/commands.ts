@@ -30,7 +30,7 @@ import {
   type PrivateStoreCandidateResult,
 } from "./private-store-candidate.ts"
 import { verifyRetainedEntry, type RetentionVerifyOptions, type RetentionVerifyResult } from "./retention-verify.ts"
-import { retireRetainedEntry, type RetentionRetireOptions } from "./retention-remove.ts"
+import { auditRetainedEntry, retireRetainedEntry, type RetentionRetireOptions } from "./retention-remove.ts"
 import { compactRetainedRoot, type CompactRetainedRootReport } from "./retention-compact.ts"
 import { superWorktreeRemove, type SuperWorktreeRemoveOptions } from "./worktree-remove.ts"
 
@@ -420,25 +420,39 @@ const retentionVerify = commandNode<CommandContext, RetentionVerifyParams, Reten
   run: (_context, input) => verifyRetainedEntry(input),
 })
 
+const retentionHeldSchema = params<RetentionRetireParams>((value) => {
+  const input = retentionVerifySchema.parse(value)
+  const extra = record(value)
+  if (typeof extra.common !== "string" || extra.common.trim() === "") {
+    throw new Error("held retention operation requires --common <Git common directory>")
+  }
+  if (input.artifactDir === undefined || input.artifactDir.trim() === "") {
+    throw new Error("held retention operation requires --artifact-dir <external directory>")
+  }
+  if (
+    input.namespaceRoots === undefined ||
+    input.namespaceRoots.length === 0 ||
+    input.namespaceRoots.some((path) => !path.trim())
+  ) {
+    throw new Error("held retention operation requires a complete nonempty --namespace <path> declaration")
+  }
+  return { ...input, common: extra.common, artifactDir: input.artifactDir, namespaceRoots: input.namespaceRoots }
+})
+
 const retentionRetire = commandNode<CommandContext, RetentionRetireParams, GitSuperResult>({
   title: "Retire one verified retained entry under existing writer leases",
   description:
     "Revalidate preliminary proof while holding existing leases, remove only this entry, and retire its exact registry pointers; never unlock a lender.",
-  params: params((value) => {
-    const input = retentionVerifySchema.parse(value)
-    const extra = record(value)
-    if (typeof extra.common !== "string" || extra.common.trim() === "") {
-      throw new Error("retention retire requires --common <Git common directory>")
-    }
-    if (input.artifactDir === undefined || input.artifactDir.trim() === "") {
-      throw new Error("retention retire requires --artifact-dir <external directory>")
-    }
-    if (input.namespaceRoots === undefined || input.namespaceRoots.length === 0) {
-      throw new Error("retention retire requires a complete --namespace <path> declaration")
-    }
-    return { ...input, common: extra.common, artifactDir: input.artifactDir, namespaceRoots: input.namespaceRoots }
-  }),
+  params: retentionHeldSchema,
   run: (_context, input) => retireRetainedEntry(input),
+})
+
+const retentionAudit = commandNode<CommandContext, RetentionRetireParams, GitSuperResult>({
+  title: "Audit one retained entry under existing writer leases",
+  description:
+    "Publish immutable native legacy evidence beside the unchanged original; never retire the entry or unlock a lender.",
+  params: retentionHeldSchema,
+  run: (_context, input) => auditRetainedEntry(input),
 })
 
 const retentionEnroll = commandNode<CommandContext, RetentionEnrollParams, RetentionEnrollReport>({
@@ -576,6 +590,7 @@ export type GitSuperCommands = Readonly<{
     retention: Readonly<{
       verify: CommandNode<CommandContext, RetentionVerifyParams, RetentionVerifyResult>
       retire: CommandNode<CommandContext, RetentionRetireParams, GitSuperResult>
+      audit: CommandNode<CommandContext, RetentionRetireParams, GitSuperResult>
       compact: CommandNode<CommandContext, RetentionCompactParams, CompactRetainedRootReport>
       enroll: CommandNode<CommandContext, RetentionEnrollParams, RetentionEnrollReport>
     }>
@@ -597,7 +612,13 @@ export const commands = defineCommandNodes({
   worktree: {
     add: worktreeAdd,
     remove: worktreeRemove,
-    retention: { verify: retentionVerify, retire: retentionRetire, compact: retentionCompact, enroll: retentionEnroll },
+    retention: {
+      verify: retentionVerify,
+      retire: retentionRetire,
+      audit: retentionAudit,
+      compact: retentionCompact,
+      enroll: retentionEnroll,
+    },
     "private-store": { verify: privateStoreVerify },
   },
 }) satisfies CommandNodeTree<CommandContext> as GitSuperCommands

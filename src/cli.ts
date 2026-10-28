@@ -51,7 +51,7 @@ export type OutputSink = ProcessOutputSink &
 type CapturedInvocation =
   | CapturedEnrollment
   | Readonly<{
-      node: typeof commands.worktree.retention.retire
+      node: typeof commands.worktree.retention.retire | typeof commands.worktree.retention.audit
       params: RetentionRetireParams
       json: boolean
       nul: boolean
@@ -151,6 +151,7 @@ async function commandResult(
     context,
     params,
   )
+  if (invocation.state === "invalid") throw invocation.error
   if (invocation.state !== "ready") throw new Error(`git super: command invocation is ${invocation.state}`)
   return Promise.resolve(node.run(context, invocation.params as never))
 }
@@ -754,14 +755,16 @@ async function runInvocation(
 
   const retention = worktree
     .command("retention")
-    .description("Verify, compact, enroll borrowers, or explicitly retire one retained entry under existing leases")
+    .description(
+      "Verify, audit, compact, enroll borrowers, or explicitly retire one retained entry under existing leases",
+    )
     .allowExcessArguments()
     .action((_options, command) => {
       const subcommand = command.args[0]
       usage =
         (subcommand === undefined
-          ? "git-super: worktree retention needs verify, compact, enroll, or retire\n"
-          : `git-super: unknown worktree retention subcommand '${subcommand}'; choose verify, compact, enroll, or retire\n`) +
+          ? "git-super: worktree retention needs verify, audit, compact, enroll, or retire\n"
+          : `git-super: unknown worktree retention subcommand '${subcommand}'; choose verify, audit, compact, enroll, or retire\n`) +
         command.helpInformation()
     })
   retention
@@ -800,35 +803,44 @@ async function runInvocation(
       }
     })
 
-  retention
-    .command("retire")
-    .description("Retire one eligible retained entry after held-lease revalidation; never unlock a lender")
-    .argument("<entry>", "the retained entry to retire")
-    .requiredOption("--root <directory>", "declared retained-modules root")
-    .requiredOption("--common <directory>", "Git common directory for the existing mutation lease")
-    .requiredOption(
-      "--namespace <path>",
-      "complete managed namespace; repeat for every root",
-      (value: string, previous: string[]) => [...previous, value],
-      [],
-    )
-    .requiredOption("--artifact-dir <directory>", "external durable directory for preliminary and held proofs")
-    .action((entry, _options, command) => {
-      const globals = command.optsWithGlobals() as { json?: boolean }
-      const options = command.opts() as { root: string; common: string; namespace: string[]; artifactDir: string }
-      captured = {
-        node: commands.worktree.retention.retire,
-        params: {
-          entry,
-          root: options.root,
-          common: options.common,
-          namespaceRoots: options.namespace,
-          artifactDir: options.artifactDir,
-        },
-        json: globals.json === true,
-        nul: false,
-      }
-    })
+  for (const verb of ["retire", "audit"] as const) {
+    retention
+      .command(verb)
+      .description(
+        verb === "retire"
+          ? "Retire one eligible retained entry after held-lease revalidation; never unlock a lender"
+          : "Publish immutable audit evidence under existing leases; preserve the original and entry",
+      )
+      .argument(
+        "<entry>",
+        verb === "retire" ? "the retained entry to retire" : "the retained entry to audit without removal",
+      )
+      .requiredOption("--root <directory>", "declared retained-modules root")
+      .requiredOption("--common <directory>", "Git common directory for the existing mutation lease")
+      .requiredOption(
+        "--namespace <path>",
+        "complete managed namespace; repeat for every root",
+        (value: string, previous: string[]) => [...previous, value],
+        [],
+      )
+      .requiredOption("--artifact-dir <directory>", "external durable directory for preliminary and held proofs")
+      .action((entry, _options, command) => {
+        const globals = command.optsWithGlobals() as { json?: boolean }
+        const options = command.opts() as { root: string; common: string; namespace: string[]; artifactDir: string }
+        captured = {
+          node: commands.worktree.retention[verb],
+          params: {
+            entry,
+            root: options.root,
+            common: options.common,
+            namespaceRoots: options.namespace,
+            artifactDir: options.artifactDir,
+          },
+          json: globals.json === true,
+          nul: false,
+        }
+      })
+  }
 
   retention
     .command("enroll")
@@ -1148,6 +1160,10 @@ async function runInvocation(
     const operation = result as GitSuperResult
     return operation.state === "updated" ? 0 : operation.state === "unchanged" ? 1 : 2
   }
+  if (captured.node === commands.worktree.retention.audit) {
+    const operation = result as GitSuperResult
+    return operation.detail?.code === "audit-pass" ? 0 : operation.detail?.code === "audit-incomplete" ? 1 : 2
+  }
   if (captured.node === commands.worktree.retention.verify) {
     const verify = result as RetentionVerifyResult
     return verify.verdict === "candidate" ? 0 : verify.verdict === "blocked" ? 1 : 2
@@ -1284,6 +1300,15 @@ async function writeResult(
     stdout.write(`${verify.verdict}\n`)
     for (const gate of verify.gates) {
       stdout.write(`${gate.status} ${gate.gate}: ${gate.message}\n`)
+    }
+  } else if (captured.node === nodes.worktree.retention.audit) {
+    const operation = result as GitSuperResult
+    if (operation.detail === undefined) throw new Error("retention audit returned no result detail")
+    const product = operation.detail.code === "audit-pass" || operation.detail.code === "audit-incomplete"
+    const sink = product ? stdout : stderr
+    sink.write(`${operation.detail.message}\n`)
+    for (const row of operation.repositories) {
+      if (row.detail?.code === "audit-stale") stdout.write(`${row.detail.message}\n`)
     }
   } else if (captured.node === nodes.worktree.retention.enroll) {
     const report = result as RetentionEnrollReport

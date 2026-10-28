@@ -11,6 +11,7 @@ import {
 import { tmpdir } from "node:os"
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { createHash } from "node:crypto"
+import { fileURLToPath } from "node:url"
 import { digestDirectory, emitCertificate, RETENTION_CERTIFICATE_SCHEMA } from "./retention-certificate.ts"
 import {
   scanContents,
@@ -23,25 +24,35 @@ import {
 import { scanCustody, type CustodyBounds, type WitnessIdentity } from "./retention-custody.ts"
 import { scanEstate, type EstateScan, type EstateScanBounds } from "./retention-estate.ts"
 import { RETENTION_STREAM_RSS_BOUND_BYTES } from "./retention-stream.ts"
+import { readRetentionAudits, matchRetentionAudit, type RetentionAuditBinding } from "./retention-audit-record.ts"
 import {
   canonicalProspectivePath,
   manifest,
   metadataFileDigest,
+  rebuildRetainedCopyProof,
   type ManifestEntry,
   type StoreCustody,
 } from "./worktree-removal.ts"
 
 /** The emitting tool's own name and version, read loudly (an unreadable package.json is fatal). */
-const RETENTION_TOOL = (() => {
-  const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
-    name?: unknown
-    version?: unknown
+const RETENTION_PACKAGE = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
+  name?: unknown
+  version?: unknown
+}
+const RETENTION_TOOL = {
+  name: typeof RETENTION_PACKAGE.name === "string" ? RETENTION_PACKAGE.name : "git-super",
+  version: typeof RETENTION_PACKAGE.version === "string" ? RETENTION_PACKAGE.version : "unknown",
+}
+
+/** The audit requires actual package provenance; the shared codec validates its required version. */
+export function retentionAuditTool(): Readonly<{ name: string; version: string }> {
+  if (typeof RETENTION_PACKAGE.name !== "string" || typeof RETENTION_PACKAGE.version !== "string") {
+    throw new Error(
+      `required retention tool name/version is absent from ${fileURLToPath(new URL("../package.json", import.meta.url))}`,
+    )
   }
-  return {
-    name: typeof pkg.name === "string" ? pkg.name : "git-super",
-    version: typeof pkg.version === "string" ? pkg.version : "unknown",
-  }
-})()
+  return { name: RETENTION_PACKAGE.name, version: RETENTION_PACKAGE.version }
+}
 
 /**
  * Read-only verification of one retained GitSuper entry (a direct child of a declared
@@ -93,6 +104,9 @@ export type RetentionVerifyResult = Readonly<{
   contents?: readonly ComponentContents[] | undefined
   witnesses?: readonly WitnessIdentity[] | undefined
   certificate?: Readonly<{ path: string; digest: string }> | undefined
+  audit?: Readonly<{ path: string; sha256: string }> | undefined
+  wrapperRecords?: readonly RetentionAuditBinding[] | undefined
+  staleAudits?: readonly Readonly<{ path: string; reason: string }>[] | undefined
   coverage: Readonly<{
     declaredNamespaceRoots: readonly string[]
     witnessStores: readonly string[]
@@ -146,7 +160,7 @@ export type RetentionVerifyOptions = Readonly<{
   monotonic?: () => number
 }>
 
-const GATE_ORDER: readonly RetentionGateId[] = [
+export const GATE_ORDER: readonly RetentionGateId[] = [
   "identity-eligibility",
   "copy-manifest",
   "estate-inventory",
@@ -188,15 +202,11 @@ function evidence(path: string): string {
 type RetainedManifest = Readonly<{
   path: string
   head: string
-  repositories: readonly string[]
   modules: string
   retained: string | null
   manifest: string
   createdAt: string
   retainUntil: string
-  writerLocks: readonly unknown[]
-  createdWriterLocks: readonly unknown[]
-  notCompared: readonly unknown[]
   files: Readonly<Record<string, string>>
   entries: Readonly<Record<string, ManifestEntry>>
   externalObjectStores: readonly Readonly<{ path: string; declaration: string; target: string }>[]
@@ -220,27 +230,32 @@ class ManifestShapeError extends Error {
   }
 }
 
-function parseManifest(bytes: string, source: string): RetainedManifest {
-  const value = JSON.parse(bytes) as Record<string, unknown>
+function parseManifestValue(value: Record<string, unknown>, source: string, legacy = false): RetainedManifest {
   const require = (field: string, valid: boolean): void => {
     if (!(field in value)) throw new ManifestShapeError(`${source} does not record '${field}'`, "absent")
     if (!valid) throw new ManifestShapeError(`${source} records an invalid '${field}' field`, "invalid")
   }
   require("path", typeof value.path === "string" && isAbsolute(value.path))
   require("head", typeof value.head === "string" && value.head !== "")
-  require("repositories", isStringArray(value.repositories))
+  if (!legacy) require("repositories", isStringArray(value.repositories))
   require("modules", typeof value.modules === "string" && isAbsolute(value.modules))
   require("retained", value.retained === null || (typeof value.retained === "string" && isAbsolute(value.retained)))
   require("manifest", typeof value.manifest === "string" && isAbsolute(value.manifest))
   require("createdAt", typeof value.createdAt === "string" && !Number.isNaN(Date.parse(value.createdAt)))
   require("retainUntil", typeof value.retainUntil === "string" && !Number.isNaN(Date.parse(value.retainUntil)))
-  require("writerLocks", Array.isArray(value.writerLocks))
-  require("createdWriterLocks", Array.isArray(value.createdWriterLocks))
-  require("notCompared", Array.isArray(value.notCompared))
+  if (!legacy) {
+    require("writerLocks", Array.isArray(value.writerLocks))
+    require("createdWriterLocks", Array.isArray(value.createdWriterLocks))
+    require("notCompared", Array.isArray(value.notCompared))
+  }
   require("files", typeof value.files === "object" && value.files !== null && !Array.isArray(value.files))
   require("entries", typeof value.entries === "object" && value.entries !== null && !Array.isArray(value.entries))
   require("externalObjectStores", Array.isArray(value.externalObjectStores))
   return value as unknown as RetainedManifest
+}
+
+function parseManifest(bytes: string, source: string): RetainedManifest {
+  return parseManifestValue(JSON.parse(bytes) as Record<string, unknown>, source)
 }
 
 /** The expected copy transform: an `objects-link` declaration in the copy is the recorded canonical target. */
@@ -267,6 +282,21 @@ function inside(parent: string, path: string): boolean {
 }
 
 export async function verifyRetainedEntry(options: RetentionVerifyOptions): Promise<RetentionVerifyResult> {
+  return evaluateRetainedEntry(options)
+}
+
+/** Retention-family internal path: the audit supplies its once-held census, never a public options injection. */
+export async function inspectRetainedEntryForAudit(
+  options: RetentionVerifyOptions,
+  estate: EstateScan,
+): Promise<RetentionVerifyResult> {
+  return evaluateRetainedEntry(options, { audit: true, estate })
+}
+
+async function evaluateRetainedEntry(
+  options: RetentionVerifyOptions,
+  context?: Readonly<{ audit: true; estate: EstateScan }>,
+): Promise<RetentionVerifyResult> {
   const clock = options.clock ?? new Date()
   const monotonic = options.monotonic ?? Date.now
   const startedAt = monotonic()
@@ -287,7 +317,11 @@ export async function verifyRetainedEntry(options: RetentionVerifyOptions): Prom
     contents?: readonly ComponentContents[] | undefined
     witnesses?: readonly WitnessIdentity[] | undefined
     certificate?: Readonly<{ path: string; digest: string }> | undefined
+    audit?: Readonly<{ path: string; sha256: string }> | undefined
+    wrapperRecords?: readonly RetentionAuditBinding[] | undefined
+    staleAudits?: readonly Readonly<{ path: string; reason: string }>[] | undefined
   } = { entry: resolve(options.entry), root: resolve(options.root) }
+  if (context !== undefined) result.estate = context.estate
   let witnessStores: readonly string[] = []
 
   const push = (gate: RetentionGateResult): void => {
@@ -323,6 +357,8 @@ export async function verifyRetainedEntry(options: RetentionVerifyOptions): Prom
   let entryReal: string
   let manifestPath: string
   let proof: RetainedManifest
+  let legacy = false
+  let audits: ReturnType<typeof readRetentionAudits> = []
   try {
     const rootReal = realpathSync(result.root)
     result.root = rootReal
@@ -360,7 +396,29 @@ export async function verifyRetainedEntry(options: RetentionVerifyOptions): Prom
       )
       return finish()
     }
-    proof = parseManifest(evidence(manifestPath), manifestPath)
+    audits = readRetentionAudits(entryReal, manifestPath, GATE_ORDER)
+    if (audits.length > 0) result.wrapperRecords = audits.map((audit) => audit.binding)
+    try {
+      proof = parseManifest(evidence(manifestPath), manifestPath)
+    } catch (error) {
+      if (
+        !(error instanceof ManifestShapeError) ||
+        error.kind !== "absent" ||
+        (context === undefined && audits.length === 0)
+      ) {
+        throw error
+      }
+      const mapped = rebuildRetainedCopyProof(entryReal, rootReal)
+      if (typeof mapped === "string") {
+        throw new ManifestShapeError(mapped, mapped.startsWith("incomplete-proof:") ? "absent" : "invalid")
+      }
+      proof = {
+        ...parseManifestValue(mapped.stored, manifestPath, true),
+        retained: mapped.retained,
+        manifest: mapped.manifest,
+      }
+      legacy = true
+    }
     result.manifestSha256 = metadataFileDigest(manifestPath)
     result.head = proof.head
     result.createdAt = proof.createdAt
@@ -373,7 +431,7 @@ export async function verifyRetainedEntry(options: RetentionVerifyOptions): Prom
         ? incomplete("identity-eligibility", message, {
             path: result.entry,
             remedy:
-              "The manifest predates the current retention schema, so its proof cannot be completed; keep the entry until it can be rewritten by a current writer.",
+              "Keep the original manifest unchanged; a native retention audit in the declared live grant window must establish its legacy evidence.",
           })
         : refusal("identity-eligibility", message, {
             path: result.entry,
@@ -427,11 +485,37 @@ export async function verifyRetainedEntry(options: RetentionVerifyOptions): Prom
     path: manifestPath,
   })
 
+  if (legacy) {
+    const estate = context?.estate ?? scanEstate(declaredNamespaceRoots, [entryReal], options.bounds?.estate, monotonic)
+    result.estate = estate
+    const matching = matchRetentionAudit(audits, readFileSync(manifestPath), estate)
+    if (matching.stale.length > 0) result.staleAudits = matching.stale
+    if (matching.selected !== undefined) {
+      result.audit = { path: matching.selected.binding.path, sha256: matching.selected.binding.sha256 }
+    } else if (context === undefined) {
+      push(
+        incomplete(
+          "estate-inventory",
+          `no native audit matches the current original manifest and complete estate for ${entryReal}`,
+          {
+            path: manifestPath,
+            remedy:
+              "Keep the entry; run the native audit immediately before retirement in the same per-row live grant window.",
+          },
+        ),
+      )
+      return finish()
+    }
+  }
+
   // ---- Gate 2: full copy-to-manifest comparison + non-object metadata sidecar -----------
   let metadataBundleDigest: string | undefined
   let sidecarDir: string | undefined
   try {
-    const expectedTop = proof.retained === null ? ["manifest.json"] : ["manifest.json", "modules"]
+    const expectedTop = [
+      ...(proof.retained === null ? ["manifest.json"] : ["manifest.json", "modules"]),
+      ...audits.map((audit) => basename(audit.binding.path)),
+    ].sort()
     const actualTop = readdirSync(entryReal).sort()
     if (JSON.stringify(actualTop) !== JSON.stringify(expectedTop)) {
       push(
@@ -586,6 +670,46 @@ export async function verifyRetainedEntry(options: RetentionVerifyOptions): Prom
             ]
           : []
       })
+      if (legacy && result.audit !== undefined) {
+        const audit = result.audit
+        const originalDigest = metadataFileDigest(manifestPath)
+        if (originalDigest !== result.manifestSha256) {
+          throw new Error(`original manifest ${manifestPath} changed before its external preservation`)
+        }
+        const originalRelative = "retention-evidence/manifest.json"
+        const auditRelative = `retention-evidence/${basename(audit.path)}`
+        const preservation = [
+          {
+            source: manifestPath,
+            target: canonicalProspectivePath(join(bundle, originalRelative)),
+            sha256: originalDigest,
+          },
+          { source: audit.path, target: canonicalProspectivePath(join(bundle, auditRelative)), sha256: audit.sha256 },
+        ]
+        const occupied = new Set(metadataFiles.map((file) => file.target))
+        for (const file of preservation) {
+          if (occupied.has(file.target)) {
+            throw new Error(
+              `legacy evidence ${file.source} would overwrite metadata at ${file.target}; entry preserved`,
+            )
+          }
+          occupied.add(file.target)
+          metadataFiles.push(file)
+        }
+        const originalIdentity = lstatSync(manifestPath)
+        result.wrapperRecords = [
+          ...audits.map(({ binding }) =>
+            binding.path === audit.path ? { ...binding, metadataPath: auditRelative } : binding,
+          ),
+          {
+            path: manifestPath,
+            sha256: originalDigest,
+            devIno: `${originalIdentity.dev}:${originalIdentity.ino}`,
+            metadataPath: originalRelative,
+          },
+        ]
+        result.audit = { path: auditRelative, sha256: audit.sha256 }
+      }
       // Preflight the exact write set before creating even the artifact directory.
       // Metadata writes below iterate this same list; sidecars keep this canonical directory.
       const destinations = [
@@ -698,7 +822,7 @@ export async function verifyRetainedEntry(options: RetentionVerifyOptions): Prom
     )
     return finish()
   }
-  const estate = scanEstate(declaredNamespaceRoots, [entryReal], options.bounds?.estate, monotonic)
+  const estate = result.estate ?? scanEstate(declaredNamespaceRoots, [entryReal], options.bounds?.estate, monotonic)
   result.estate = estate
   witnessStores = estate.objectDirs.filter((path) => !inside(entryReal, path))
   if (estate.status !== "pass") {
@@ -832,6 +956,8 @@ export async function verifyRetainedEntry(options: RetentionVerifyOptions): Prom
     rootDevIno: result.rootDevIno,
     head: proof.head,
     manifestSha256: result.manifestSha256,
+    ...(result.audit === undefined ? {} : { audit: result.audit }),
+    ...(result.wrapperRecords === undefined ? {} : { wrapperRecords: result.wrapperRecords }),
     metadataBundleDigest,
     components: contents.components.map((component) => ({
       component: component.component,

@@ -18,6 +18,7 @@ import { createReadStream } from "node:fs"
 import {
   closeSync,
   existsSync,
+  linkSync,
   mkdirSync,
   openSync,
   renameSync,
@@ -57,10 +58,15 @@ function tempName(dir: string, prefix: string): string {
   return join(dir, `.${prefix}-${process.pid}-${tempCounter}`)
 }
 
-/** Publish whole bytes or an already-streamed sibling by replacing the final name, never following it. */
-export function publishArtifact(path: string, contents: string | { temporaryPath: string }): void {
+/** Publish whole bytes or a closed, caller-owned temporary; create-only publication never replaces a final name. */
+export function publishArtifact(
+  path: string,
+  contents: string | { temporaryPath: string },
+  options: Readonly<{ replace?: boolean }> = {},
+): void {
   const temporary = typeof contents === "string" ? tempName(dirname(path), "artifact") : contents.temporaryPath
-  let owned = false
+  // Create-only publication takes cleanup ownership of a supplied closed temporary too.
+  let owned = typeof contents !== "string" && options.replace === false
   try {
     if (typeof contents === "string") {
       const fd = openSync(temporary, "wx")
@@ -71,18 +77,33 @@ export function publishArtifact(path: string, contents: string | { temporaryPath
         closeSync(fd)
       }
     }
-    renameSync(temporary, path)
+    if (options.replace === false) linkSync(temporary, path)
+    else renameSync(temporary, path)
   } catch (error) {
     if (owned) {
       try {
         unlinkSync(temporary)
       } catch (cleanup) {
         if ((cleanup as NodeJS.ErrnoException).code !== "ENOENT") {
-          throw new AggregateError([error, cleanup], `artifact publication failed and could not remove ${temporary}`)
+          throw new AggregateError(
+            [error, cleanup],
+            `artifact publication to ${path} failed and could not remove ${temporary}`,
+          )
         }
       }
     }
     throw error
+  }
+  if (options.replace === false) {
+    try {
+      unlinkSync(temporary)
+    } catch (cleanup) {
+      if ((cleanup as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw new Error(`artifact ${path} published but could not remove owned temporary ${temporary}`, {
+          cause: cleanup,
+        })
+      }
+    }
   }
 }
 
