@@ -1148,9 +1148,21 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       let children: Awaited<ReturnType<typeof captureLinkedChildren>> = []
       let custodyRefusal: ComponentCustodyRefusal | undefined
       await mutate(removeOptions.operation ?? `worktree remove ${path}`, async () => {
+        const phaseOrigin = Date.now()
+        const phases: Record<string, number> = {}
+        const markPhase = (name: string, started: number) => {
+          phases[name] = Date.now() - started
+        }
+        const logPhases = () => {
+          if (process.env.GIT_SUPER_REMOVAL_PHASES !== "1") return
+          console.error(
+            `git-super removal phases ${JSON.stringify({ path, phases, totalMs: Date.now() - phaseOrigin })}`,
+          )
+        }
         if (removeOptions.retention !== undefined && removeOptions.unlock === true) {
           throw new Error(`retained worktree removal cannot unlock ${path}; resolve its holder first`)
         }
+        const prepareStarted = Date.now()
         const { gitDir, rehome, notCompared, stores } = await prepareRemoval(
           path,
           removeOptions.excludedSubmodules,
@@ -1168,6 +1180,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
           )
         }
         if (rehome === undefined) throw new Error(`worktree ${path} has no prepared borrower custody`)
+        markPhase("prepareRemoval", prepareStarted)
         // No custody rehome or destruction has run; a value-holding store stays in place.
         preserveModuleStoreValueBeforeDelete(stores)
         const proofDeadline = Date.now() + timeouts.cleanup
@@ -1473,10 +1486,12 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
             }
           }
 
+          const removeStarted = Date.now()
           await git.run(removalRepo, ["worktree", "remove", "--force", path], false, timeouts.cleanup)
           if (existsSync(path) || (await inspectWorktree(git, removalRepo, path)).registered) {
             throw new Error(`git reported success but did not fully remove worktree '${path}'`)
           }
+          markPhase("gitWorktreeRemove", removeStarted)
         } catch (error) {
           if (stagingPath !== undefined && existsSync(stagingPath)) {
             let retainedStaging = stagingPath
@@ -1525,6 +1540,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
           }
           throw writerLeases.refusal(error)
         } finally {
+          logPhases()
           writerLeases.release()
         }
       })
