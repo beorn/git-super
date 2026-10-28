@@ -11,6 +11,7 @@ import {
 import { tmpdir } from "node:os"
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { createHash } from "node:crypto"
+import { fileURLToPath } from "node:url"
 import { digestDirectory, emitCertificate, RETENTION_CERTIFICATE_SCHEMA } from "./retention-certificate.ts"
 import {
   scanContents,
@@ -47,7 +48,7 @@ const RETENTION_TOOL = {
 export function retentionAuditTool(): Readonly<{ name: string; version: string }> {
   if (typeof RETENTION_PACKAGE.name !== "string" || typeof RETENTION_PACKAGE.version !== "string") {
     throw new Error(
-      `required retention tool name/version is absent from ${new URL("../package.json", import.meta.url).pathname}`,
+      `required retention tool name/version is absent from ${fileURLToPath(new URL("../package.json", import.meta.url))}`,
     )
   }
   return { name: RETENTION_PACKAGE.name, version: RETENTION_PACKAGE.version }

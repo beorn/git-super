@@ -908,7 +908,7 @@ describe("retention verify gates 1-6", () => {
           if (event === "audit-bytes") writeFileSync(auditPath, Buffer.concat([bytes, Buffer.from("\n")]))
           else {
             const previous = lstatSync(auditPath)
-            const replacement = join(artifactDir, "replacement-audit.json")
+            const replacement = join(dirname(auditPath), "replacement-audit.json")
             writeFileSync(replacement, bytes)
             renameSync(replacement, auditPath)
             expect(lstatSync(auditPath).ino).not.toBe(previous.ino)
