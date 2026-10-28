@@ -3,6 +3,19 @@ import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { afterEach, describe, expect, test, vi } from "vitest"
 
+const lockProbe = vi.hoisted(() => ({ waiting: false }))
+vi.mock("@bearly/flock", async () => {
+  const actual = await vi.importActual<typeof import("@bearly/flock")>("@bearly/flock")
+  return {
+    ...actual,
+    tryAcquireFlock: (...args: Parameters<typeof actual.tryAcquireFlock>) => {
+      const lock = actual.tryAcquireFlock(...args)
+      if (lock === null) lockProbe.waiting = true
+      return lock
+    },
+  }
+})
+
 import { runCli } from "../src/cli.ts"
 import { acquireExclusive, createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS, type Exclusive } from "../src/exclusive.ts"
 import { createLocalGitProcess, type GitProcess } from "../src/process.ts"
@@ -3272,23 +3285,22 @@ describe("a frozen push works only on the children its merge moved (25303, obser
     const common = git(repository, "rev-parse", "--path-format=absolute", "--git-common-dir").trim()
     const holder = await acquireExclusive(join(common, "yrd-worktree-mutations"), { timeoutMs: 0 }, "worktree remove")
     vi.useFakeTimers({ toFake: ["Date"] })
+    lockProbe.waiting = false
     const startedAt = Date.now()
-    const reports: string[] = []
     let settled = false
     const operation = superPush({
       repo: repository,
       remote,
       refspecs: [`${source}:refs/heads/main`],
       recurseSubmodules: "no",
-      report: (line) => reports.push(line),
     }).finally(() => {
       settled = true
     })
     try {
-      for (let poll = 0; poll < 100 && !reports.some((line) => line.includes("wait-writer-lock")); poll += 1) {
+      for (let poll = 0; poll < 100 && !lockProbe.waiting; poll += 1) {
         await new Promise((resolve) => setTimeout(resolve, 20))
       }
-      expect(reports.some((line) => line.includes("wait-writer-lock"))).toBe(true)
+      expect(lockProbe.waiting, "acquireExclusive has failed a flock after recording startedAt").toBe(true)
       vi.setSystemTime(startedAt + 31_000)
       await new Promise((resolve) => setTimeout(resolve, 50))
       expect(settled).toBe(false)
