@@ -473,11 +473,19 @@ describe("retention verify gates 1-6", () => {
     const second = writeRecord({
       ...record,
       runId: randomUUID(),
-      provenance: { ...record.provenance, common: { path: common, head: "1".repeat(40) } },
+      provenance: {
+        ...record.provenance,
+        observedAt: new Date(Date.parse(record.provenance.observedAt) + 60_000).toISOString(),
+        common: { path: common, head: "1".repeat(40) },
+      },
     })
     const records = readRetentionAudits(base.entry, originalPath, GATE_ORDER)
-    const matched = matchRetentionAudit(records, original, proof.estate)
-    expect(matched.selected?.binding.path).toBe([first, second].sort()[0])
+    const byTime = [...records].sort(
+      (a, b) => Date.parse(a.record.provenance.observedAt) - Date.parse(b.record.provenance.observedAt),
+    )
+    const matched = matchRetentionAudit(byTime, original, proof.estate)
+    expect(matched.selected?.binding.path).toBe(second)
+    expect(matchRetentionAudit([...byTime].reverse(), original, proof.estate).selected?.binding.path).toBe(second)
     expect(matched.stale).toEqual([])
     expect(matchRetentionAudit(records, Buffer.from("changed original"), proof.estate).selected).toBeUndefined()
     const changedEstate = matchRetentionAudit(records, original, {
@@ -556,7 +564,8 @@ describe("retention verify gates 1-6", () => {
         expect(await runCli(args, stdout, stderr), stderr.output || stdout.output).toBe(0)
         expect(readFileSync(manifestPath)).toEqual(original)
         const records = readdirSync(base.entry).filter((name) => /^retention-audit-[a-f0-9]{64}\.json$/.test(name))
-        expect(records).toHaveLength(run + 1)
+        expect(records).toHaveLength(1)
+        if (run === 1) expect(stdout.output).toContain("unchanged since")
         for (const name of records) {
           const bytes = readFileSync(join(base.entry, name))
           expect(name).toBe(`retention-audit-${createHash("sha256").update(bytes).digest("hex")}.json`)

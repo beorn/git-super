@@ -9,6 +9,7 @@ import { runGit } from "./git.ts"
 import { publishArtifact } from "./retention-stream.ts"
 import {
   readRetentionAudits,
+  newestRetentionAudit,
   retentionEstateDigest,
   validateRetentionAudit,
   RETENTION_AUDIT_SCHEMA,
@@ -47,6 +48,16 @@ type KeepReason =
   | "lease-missing"
   | "lease-held"
   | "census-shifted"
+
+function auditIdentity(record: RetentionAuditRecord): string {
+  return JSON.stringify({
+    original: record.original.sha256,
+    estate: record.provenance.estate.scanDigest,
+    common: record.provenance.common.head,
+    tool: record.provenance.tool,
+    outcomes: record.checks.map(({ gate, outcome }) => ({ gate, outcome })),
+  })
+}
 
 function within(root: string, path: string): boolean {
   const part = relative(root, path)
@@ -354,7 +365,22 @@ async function runRetentionOperation(
                   : "observed",
           })),
         }
+        const blocked = record.checks.filter((check) => check.outcome === "blocked").length
+        const unknown = record.checks.filter((check) => check.outcome === "unknown").length
         const bytes = `${JSON.stringify(record, null, 2)}\n`
+        const existing = readRetentionAudits(entry, join(entry, "manifest.json"), GATE_ORDER)
+        const newest = newestRetentionAudit(existing)
+        if (newest !== undefined && auditIdentity(newest.record) === auditIdentity(record)) {
+          const detail: GitResultDetail = {
+            code: blocked + unknown === 0 ? "audit-pass" : "audit-incomplete",
+            phase: "publish-audit",
+            message: `Audit unchanged since ${newest.record.provenance.observedAt}: ${blocked} blocked, ${unknown} unknown; no record published, entry preserved.`,
+            evidence: newest.binding.path,
+            paths: [entry, newest.binding.path],
+          }
+          row(entry, "unchanged", detail)
+          return gitSuperResult(rows, detail)
+        }
         auditPath = join(entry, `retention-audit-${createHash("sha256").update(bytes).digest("hex")}.json`)
         validateRetentionAudit(record, auditPath, join(entry, "manifest.json"), GATE_ORDER)
         phase = "publish-audit"
@@ -369,8 +395,6 @@ async function runRetentionOperation(
             })
           }
         }
-        const blocked = record.checks.filter((check) => check.outcome === "blocked").length
-        const unknown = record.checks.filter((check) => check.outcome === "unknown").length
         const detail: GitResultDetail = {
           code: blocked + unknown === 0 ? "audit-pass" : "audit-incomplete",
           phase,

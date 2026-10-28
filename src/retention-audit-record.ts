@@ -163,6 +163,16 @@ export function readRetentionAudits(
   return records
 }
 
+/** Pick the latest observation; full digest order resolves equal observation clocks only. */
+export function newestRetentionAudit(records: readonly ReadRetentionAudit[]): ReadRetentionAudit | undefined {
+  return records.reduce<ReadRetentionAudit | undefined>((latest, candidate) => {
+    if (latest === undefined) return candidate
+    const difference =
+      Date.parse(candidate.record.provenance.observedAt) - Date.parse(latest.record.provenance.observedAt)
+    return difference > 0 || (difference === 0 && candidate.binding.path < latest.binding.path) ? candidate : latest
+  }, undefined)
+}
+
 /** Two validity keys only; common HEAD and observation clocks are provenance, never freshness. */
 export function matchRetentionAudit(
   records: readonly ReadRetentionAudit[],
@@ -183,9 +193,8 @@ export function matchRetentionAudit(
             ? "complete estate digest changed"
             : undefined
     if (reason === undefined) {
-      selected ??= candidate
-    } // readRetentionAudits orders full digest filenames.
-    else stale.push({ path: candidate.binding.path, reason })
+      selected = newestRetentionAudit(selected === undefined ? [candidate] : [selected, candidate])
+    } else stale.push({ path: candidate.binding.path, reason })
   }
   return { ...(selected === undefined ? {} : { selected }), stale }
 }
