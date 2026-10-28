@@ -232,6 +232,49 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
     }
   })
 
+  /**
+   * @failure The writer stays held across witness fsck and the ref-graph walk, and the phase log does not name those steps.
+   * @level l1
+   * @consumer worktree remove that keeps retention custody
+   * Empty removals never enter retention-custody.ts, so they cannot time this hold.
+   */
+  it("names the writer-held fsck and ref-graph steps on a custody removal", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-removal-hold-phases-"))
+    const previous = process.env.GIT_SUPER_REMOVAL_PHASES
+    process.env.GIT_SUPER_REMOVAL_PHASES = "1"
+    const errors: string[] = []
+    const original = console.error
+    console.error = (...args: unknown[]) => {
+      errors.push(args.map((arg) => String(arg)).join(" "))
+    }
+    try {
+      const fixture = createProductFixture(root)
+      const product = fixture.product
+      const target = join(root, "target")
+      git(product, "worktree", "add", "--detach", target)
+      git(target, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
+
+      const result = await superWorktreeRemove({
+        repo: product,
+        path: target,
+        retain: join(root, "retained"),
+        componentCustody: { primaryRoot: product, targetBranch: "main" },
+      })
+      expect(result.state, result.detail?.message ?? JSON.stringify(result)).toBe("updated")
+      const line = errors.find((entry) => entry.includes("git-super removal phases"))
+      expect(line, errors.join("\n")).toBeDefined()
+      const phases = JSON.parse(line!.slice(line!.indexOf("{"))).phases as Record<string, number>
+      expect(phases).toHaveProperty("witnessFsck")
+      expect(phases).toHaveProperty("refGraph")
+    } finally {
+      console.error = original
+      if (previous === undefined) delete process.env.GIT_SUPER_REMOVAL_PHASES
+      else process.env.GIT_SUPER_REMOVAL_PHASES = previous
+      // raw-delete-allow: this isolated mkdtemp fixture owns every path beneath root
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it("removes a root-only worktree while preserving uncustodied root commits", async () => {
     const root = await mkdtemp(join(canonicalTmpdir(), "git-super-root-only-custody-"))
     try {
