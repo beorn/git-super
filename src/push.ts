@@ -862,8 +862,7 @@ async function runPushRefUpdates(
     const groups = groupUpdates(await planUpdates(git, options.updates, timeoutMs), root)
     phase?.(`wait-writer-lock 0/${groups.length}`)
     const exclusive =
-      options.exclusive ??
-      createExclusive(await lockDirectory(git, root), { timeoutMs: DEFAULT_MUTATION_LOCK_WAIT_MS })
+      options.exclusive ?? createExclusive(await lockDirectory(git, root), { timeoutMs: DEFAULT_MUTATION_LOCK_WAIT_MS })
     return await exclusive.run(
       async () => {
         for (const [index, group] of groups.entries()) {
@@ -2476,8 +2475,7 @@ async function leasedFrozenPush(
     await planUpdates(git, [...retention, ...sourceUpdates, ...rootUpdates], timeoutMs)
   }
   const exclusive =
-    options.exclusive ??
-    createExclusive(await lockDirectory(git, root), { timeoutMs: DEFAULT_MUTATION_LOCK_WAIT_MS })
+    options.exclusive ?? createExclusive(await lockDirectory(git, root), { timeoutMs: DEFAULT_MUTATION_LOCK_WAIT_MS })
   progress.phase(`wait-writer-lock 0/${children.length + 1}`)
   return exclusive.run(
     async () => {
