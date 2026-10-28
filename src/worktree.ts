@@ -121,8 +121,10 @@ function selectedCustodyAdapters(
     // Only existing NUL-producing query verbs opt in. Stop at the path separator:
     // a filename named -z or --null must never select a different protocol.
     let commandIndex = 0
-    while (args[commandIndex]?.startsWith("-")) {
-      commandIndex += ["-C", "-c", "--git-dir", "--work-tree"].includes(args[commandIndex]!) ? 2 : 1
+    while (commandIndex < args.length) {
+      const argument = args[commandIndex]
+      if (argument === undefined || !argument.startsWith("-")) break
+      commandIndex += ["-C", "-c", "--git-dir", "--work-tree"].includes(argument) ? 2 : 1
     }
     const pathSeparator = args.indexOf("--", commandIndex)
     const queryOptions = args.slice(commandIndex + 1, pathSeparator === -1 ? undefined : pathSeparator)

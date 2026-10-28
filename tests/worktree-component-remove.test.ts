@@ -331,8 +331,9 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
             if (
               request.env?.GIT_NO_LAZY_FETCH === "1" &&
               (beforePaths.includes("-z") || beforePaths.includes("--null"))
-            )
+            ) {
               nulFraming.push({ args: request.args, framing: request.framing })
+            }
             if (introduced === undefined && request.args.includes("--batch-all-objects")) {
               introduced = git(alphaSource, "commit-tree", tree, "-p", parent, "-m", "introduced before final proof")
             }
