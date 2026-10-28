@@ -1334,6 +1334,9 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
                       stream: adapters.stream,
                       deadline: proofDeadline,
                       witnessPolicy: { targetBranch: removeOptions.componentCustody.targetBranch },
+                      onPhase: (name, ms) => {
+                        phases[name] = (phases[name] ?? 0) + ms
+                      },
                     })
                     if (custody.status !== "pass") {
                       const first: CustodyTarget | undefined = custody.missing[0]
