@@ -10,7 +10,7 @@ import {
   type CommitGitlink,
   type CommitSubmodule,
 } from "./commit-graph.ts"
-import { createExclusive, type Exclusive } from "./exclusive.ts"
+import { createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS, type Exclusive } from "./exclusive.ts"
 import { isSubmoduleExcluded, probeRepository } from "./git.ts"
 import { mapInOrder } from "./map-in-order.ts"
 import { ensureCommitObject } from "./objects.ts"
@@ -861,7 +861,9 @@ async function runPushRefUpdates(
     phase?.(`plan-ref-updates 0/${options.updates.length}`)
     const groups = groupUpdates(await planUpdates(git, options.updates, timeoutMs), root)
     phase?.(`wait-writer-lock 0/${groups.length}`)
-    const exclusive = options.exclusive ?? createExclusive(await lockDirectory(git, root))
+    const exclusive =
+      options.exclusive ??
+      createExclusive(await lockDirectory(git, root), { timeoutMs: DEFAULT_MUTATION_LOCK_WAIT_MS })
     return await exclusive.run(
       async () => {
         for (const [index, group] of groups.entries()) {
@@ -2473,7 +2475,9 @@ async function leasedFrozenPush(
     // writes. The unchanged warm path keeps its zero-observation contract.
     await planUpdates(git, [...retention, ...sourceUpdates, ...rootUpdates], timeoutMs)
   }
-  const exclusive = options.exclusive ?? createExclusive(await lockDirectory(git, root))
+  const exclusive =
+    options.exclusive ??
+    createExclusive(await lockDirectory(git, root), { timeoutMs: DEFAULT_MUTATION_LOCK_WAIT_MS })
   progress.phase(`wait-writer-lock 0/${children.length + 1}`)
   return exclusive.run(
     async () => {

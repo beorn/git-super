@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url"
 import { afterEach, describe, expect, test, vi } from "vitest"
 
 import { runCli } from "../src/cli.ts"
-import { acquireExclusive, createExclusive, type Exclusive } from "../src/exclusive.ts"
+import { acquireExclusive, createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS, type Exclusive } from "../src/exclusive.ts"
 import { createLocalGitProcess, type GitProcess } from "../src/process.ts"
 import { capturePushIntent, pushRefUpdates, remoteContainsCommit, superPush } from "../src/push.ts"
 import { decodePushIntent, encodePushIntent, PUSH_INTENT_TRAILER } from "../src/push-intent.ts"
@@ -3263,6 +3263,40 @@ describe("a frozen push works only on the children its merge moved (25303, obser
     } finally {
       release?.()
       jitteredInterval.mockRestore()
+      vi.useRealTimers()
+    }
+  }, 30_000)
+
+  test("a push still waits after 30 seconds when the writer lock is held", async () => {
+    const { repository, remote, source } = pushFixture("lock-past-30s")
+    const common = git(repository, "rev-parse", "--path-format=absolute", "--git-common-dir").trim()
+    const holder = await acquireExclusive(join(common, "yrd-worktree-mutations"), { timeoutMs: 0 }, "worktree remove")
+    vi.useFakeTimers({ toFake: ["Date"] })
+    const startedAt = Date.now()
+    const reports: string[] = []
+    let settled = false
+    const operation = superPush({
+      repo: repository,
+      remote,
+      refspecs: [`${source}:refs/heads/main`],
+      recurseSubmodules: "no",
+      report: (line) => reports.push(line),
+    }).finally(() => {
+      settled = true
+    })
+    try {
+      for (let poll = 0; poll < 100 && !reports.some((line) => line.includes("wait-writer-lock")); poll += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 20))
+      }
+      expect(reports.some((line) => line.includes("wait-writer-lock"))).toBe(true)
+      vi.setSystemTime(startedAt + 31_000)
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      expect(settled).toBe(false)
+      expect(31_000).toBeLessThan(DEFAULT_MUTATION_LOCK_WAIT_MS)
+      holder.release()
+      await expect(operation).resolves.toMatchObject({ state: "updated" })
+    } finally {
+      holder.release()
       vi.useRealTimers()
     }
   }, 30_000)
