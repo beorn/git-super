@@ -1006,6 +1006,7 @@ describe("git super pull --ff-only", () => {
       expect(lines.some((line) => line.includes("lock-wait held by"))).toBe(true)
       vi.useFakeTimers({ toFake: ["Date"] })
       vi.setSystemTime(Date.now() + 31_000)
+      // ≥ 4 polls at pollIntervalMs 10; raise this wait with the default.
       await new Promise((resolve) => setTimeout(resolve, 50))
       expect(settled).toBe(false)
       expect(31_000).toBeLessThan(DEFAULT_MUTATION_LOCK_WAIT_MS)
