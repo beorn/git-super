@@ -8,10 +8,11 @@
  */
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { spawnSync } from "node:child_process"
+import { createHash } from "node:crypto"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, test } from "vitest"
-import { defaultGitRun, type ComponentContents, type GitRun } from "../src/retention-contents.ts"
+import { defaultGitRun, defaultGitStream, type ComponentContents, type GitRun } from "../src/retention-contents.ts"
 import { scanCustody, type CustodyScan } from "../src/retention-custody.ts"
 import { readLines, SidecarWriter } from "../src/retention-stream.ts"
 
@@ -115,6 +116,111 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     const pinned = await scanCustody(unrelatedRoot, [component], [join(store.root, ".git", "objects")], [], opts)
     expect(pinned.status).toBe("pass")
     expect(pinned.witnesses[0]).toMatchObject({ ref: `refs/yrd/pins/${store.head}`, tip: store.head })
+  })
+
+  // AC: redundant policy ancestors must fit the shared proof budget while preserving
+  // complete positive custody. The existing small-ref fixtures never spend that budget.
+  test("policy ancestor pins fit the shared deadline without repeating their complete graphs", async () => {
+    const store = repoWithCommit("git-super-custody-policy-budget-")
+    const sidecarDir = tmp("git-super-custody-policy-budget-sidecars-")
+    const heads = [store.head]
+    for (let index = 0; index < 6; index += 1) {
+      const prior = heads.at(-1)!
+      git(store.root, ["update-ref", `refs/git-super/pins/${prior}`, prior])
+      writeFileSync(join(store.root, "a.txt"), `version ${index}\n`)
+      git(store.root, ["commit", "-q", "-a", "-m", `version ${index}`])
+      heads.push(git(store.root, ["rev-parse", "HEAD"]))
+    }
+    const head = heads.at(-1)!
+    git(store.root, ["update-ref", `refs/git-super/pins/${head}`, head])
+    const component = await componentOf([...heads, store.tree], sidecarDir)
+    let clock = 0
+    const scan = await scanCustody(store.root, [component], [join(store.root, ".git", "objects")], [], {
+      sidecarDir,
+      witnessPolicy: { targetBranch: "main" },
+      clock: () => clock,
+      deadline: 35_000,
+      stream(args, options) {
+        // Charge actual graph work through the existing clock seam, without sleeps.
+        clock += 10_000
+        return defaultGitStream(args, options)
+      },
+    })
+    expect(scan.status, scan.detail).toBe("pass")
+    expect(scan.witnessCount).toBe(heads.length + 1)
+    expect(scan.missing).toEqual([])
+    expect(scan.witnesses).toHaveLength(1)
+    const witness = scan.witnesses[0]!
+    expect(witness.tip).toBe(head)
+    expect(git(store.root, ["show-ref", "--verify", "--hash", witness.ref])).toBe(head)
+    const graph = git(store.root, ["rev-list", "--objects", head])
+      .split("\n")
+      .map((line) => line.split(" ")[0])
+      .sort()
+      .join("\n")
+    expect(witness.graphDigest).toBe(createHash("sha256").update(`${graph}\n`).digest("hex"))
+  })
+
+  // AC: graph reduction must retain unrelated commits and noncommit policy refs;
+  // generic retention is the unchanged coverage control, including a missing OID.
+  test("policy graph reduction preserves branched, blob and annotated-tag custody", async () => {
+    const store = repoWithCommit("git-super-custody-policy-values-")
+    const sidecarDir = tmp("git-super-custody-policy-values-sidecars-")
+    git(store.root, ["update-ref", `refs/git-super/pins/${store.head}`, store.head])
+    git(store.root, ["switch", "-q", "-c", "side"])
+    writeFileSync(join(store.root, "a.txt"), "side\n")
+    git(store.root, ["commit", "-q", "-a", "-m", "side"])
+    const side = git(store.root, ["rev-parse", "HEAD"])
+    git(store.root, ["update-ref", `refs/git-super/pins/${side}`, side])
+    git(store.root, ["switch", "-q", "main"])
+    writeFileSync(join(store.root, "a.txt"), "main\n")
+    git(store.root, ["commit", "-q", "-a", "-m", "main"])
+    const main = git(store.root, ["rev-parse", "HEAD"])
+    const blobPath = join(sidecarDir, "pinned-blob")
+    writeFileSync(blobPath, "only this blob pin keeps me\n")
+    const blob = git(store.root, ["hash-object", "-w", blobPath])
+    git(store.root, ["update-ref", `refs/git-super/pins/${blob}`, blob])
+    git(store.root, ["tag", "-a", "annotated", "-m", "annotation"])
+    const tag = git(store.root, ["rev-parse", "refs/tags/annotated"])
+    git(store.root, ["update-ref", `refs/git-super/pins/${tag}`, tag])
+    const component = await componentOf([main, side, blob, tag, "f".repeat(40)], sidecarDir)
+    const stores = [join(store.root, ".git", "objects")]
+    const control = await scanCustody(store.root, [component], stores, [], { sidecarDir })
+    const scan = await scanCustody(store.root, [component], stores, [], {
+      sidecarDir,
+      witnessPolicy: { targetBranch: "main" },
+    })
+    expect(control.status, control.detail).toBe("blocked")
+    expect(scan.status, scan.detail).toBe("blocked")
+    expect(scan.witnessCount).toBe(4)
+    expect(scan.missing).toEqual(control.missing)
+    expect(scan.missingCount).toBe(1)
+    expect(scan.witnesses).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ ref: `refs/git-super/pins/${blob}`, tip: blob }),
+        expect.objectContaining({ ref: `refs/git-super/pins/${tag}`, tip: tag }),
+      ]),
+    )
+  })
+
+  // AC: an incomplete or foreign selected-Git answer is unknown, not a smaller
+  // successful witness population. Existing rows exercise other Git commands.
+  test.each(["", `${"f".repeat(40)}\n`])("an unproven independent-tip answer %j remains unknown", async (stdout) => {
+    const store = repoWithCommit("git-super-custody-policy-unproven-")
+    const sidecarDir = tmp("git-super-custody-policy-unproven-sidecars-")
+    git(store.root, ["update-ref", `refs/git-super/pins/${store.head}`, store.head])
+    writeFileSync(join(store.root, "a.txt"), "next\n")
+    git(store.root, ["commit", "-q", "-a", "-m", "next"])
+    const component = await componentOf([store.head], sidecarDir)
+    const scan = await scanCustody(store.root, [component], [join(store.root, ".git", "objects")], [], {
+      sidecarDir,
+      witnessPolicy: { targetBranch: "main" },
+      run: (args, options) =>
+        args.includes("merge-base") ? { code: 0, stdout, stderr: "" } : defaultGitRun(args, options),
+    })
+    expect(scan.status, scan.detail).toBe("unknown")
+    expect(scan.detail).toContain("independent")
+    expect(scan.witnessCount).toBe(0)
   })
 
   test("an exhausted shared proof deadline is unknown before witness queries", async () => {

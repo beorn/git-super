@@ -202,6 +202,47 @@ interface DurableRefRecord {
   readonly sidecar: SidecarRef
 }
 
+interface WitnessRef {
+  readonly ref: string
+  readonly tip: string
+  readonly objectType: string | undefined
+}
+
+/** Select real refs whose complete graphs cover all admitted policy commits. */
+async function independentPolicyRefs(
+  durable: readonly WitnessRef[],
+  gitDir: string,
+  run: GitRun,
+): Promise<readonly WitnessRef[]> {
+  // Descendant graphs contain their ancestors' complete object graphs. Noncommit
+  // refs retain their own graphs; each selected commit keeps one real named ref.
+  const commitRefs = new Map<string, string>()
+  for (const entry of durable) {
+    if (entry.objectType === "commit" && !commitRefs.has(entry.tip)) commitRefs.set(entry.tip, entry.ref)
+  }
+  let independent = new Set(commitRefs.keys())
+  if (commitRefs.size > 1) {
+    const reduced = await run([`--git-dir=${gitDir}`, "merge-base", "--independent", ...commitRefs.keys()])
+    refuseSuccessfulStderr(reduced, `merge-base --independent in witness store ${gitDir}`)
+    if (reduced.code !== 0 || reduced.timedOut === true) {
+      throw new UnknownError(
+        `merge-base --independent did not complete in ${gitDir} (exit ${reduced.code}, timedOut ${reduced.timedOut === true}): ${reduced.stderr.trim()}`,
+      )
+    }
+    const tips = reduced.stdout.trim().split("\n")
+    const unproven = tips.find((tip) => !HEX40.test(tip) || !commitRefs.has(tip))
+    if (unproven !== undefined) {
+      throw new UnknownError(
+        `merge-base --independent returned an unproven tip in ${gitDir} (first 120 characters): ${JSON.stringify(unproven.slice(0, 120))}`,
+      )
+    }
+    independent = new Set(tips)
+  }
+  return durable.filter(
+    (entry) => entry.objectType !== "commit" || (independent.has(entry.tip) && commitRefs.get(entry.tip) === entry.ref),
+  )
+}
+
 async function indexWitnessStores(
   stores: readonly string[],
   removal: readonly string[],
@@ -240,16 +281,25 @@ async function indexWitnessStores(
     if (fsck.code !== 0) {
       throw new UnknownError(`fsck --full failed in witness store ${gitDir}: ${fsck.stderr.trim()}`)
     }
-    const refs = await run([`--git-dir=${gitDir}`, "for-each-ref", "--format=%(refname)%09%(objectname)"])
+    const refFormat =
+      witnessPolicy === undefined ? "%(refname)%09%(objectname)" : "%(refname)%09%(objectname)%09%(objecttype)"
+    const refs = await run([`--git-dir=${gitDir}`, "for-each-ref", `--format=${refFormat}`])
     refuseSuccessfulStderr(refs, `for-each-ref in witness store ${gitDir}`)
     if (refs.code !== 0) {
       throw new UnknownError(`for-each-ref failed in witness store ${gitDir}: ${refs.stderr.trim()}`)
     }
-    const durable: Array<{ ref: string; tip: string }> = []
+    const durable: WitnessRef[] = []
     for (const row of refs.stdout.split("\n")) {
       if (row === "") continue
-      const [ref, tip] = row.split("\t")
-      if (ref === undefined || tip === undefined || !HEX40.test(tip)) {
+      const fields = row.split("\t")
+      const [ref, tip, objectType] = fields
+      if (
+        ref === undefined ||
+        tip === undefined ||
+        !HEX40.test(tip) ||
+        (witnessPolicy !== undefined &&
+          (fields.length !== 3 || objectType === undefined || !["commit", "tag", "tree", "blob"].includes(objectType)))
+      ) {
         throw new UnknownError(`malformed for-each-ref row in witness store ${gitDir}: ${row.slice(0, 120)}`)
       }
       // A transient operation ref, remote-tracking ref or detached HEAD is never a durable
@@ -257,10 +307,11 @@ async function indexWitnessStores(
       if (witnessPolicy === undefined ? !isDurableRef(ref) : !isPolicyRef(ref, tip, witnessPolicy.targetBranch)) {
         continue
       }
-      durable.push({ ref, tip })
+      durable.push({ ref, tip, objectType })
     }
     durable.sort((left, right) => (left.ref < right.ref ? -1 : left.ref > right.ref ? 1 : 0))
-    for (const entry of durable) {
+    const selected = witnessPolicy === undefined ? durable : await independentPolicyRefs(durable, gitDir, run)
+    for (const entry of selected) {
       const started = clock()
       const lineStream = stream([`--git-dir=${gitDir}`, "rev-list", "--objects", entry.tip], {
         timeoutMs: bounds.reachableMs,
