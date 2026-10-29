@@ -5,6 +5,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   renameSync,
   rmdirSync,
@@ -36,6 +37,7 @@ import { compactRetainedModules, type CompactionResult } from "./retention-compa
 import { cleanGitEnvironment, cleanGitRepositoryEnvironment, probeRepository } from "./git.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
 import {
+  readReflogEntries,
   scanContents,
   type ComponentGitSource,
   type GitRun,
@@ -43,7 +45,7 @@ import {
   type GitRunResult,
   type GitStreamFactory,
 } from "./retention-contents.ts"
-import { scanCustody, type CustodyTarget, type WitnessIdentity } from "./retention-custody.ts"
+import { isPolicyRef, scanCustody, type CustodyTarget, type WitnessIdentity } from "./retention-custody.ts"
 import { alternateEntries, alternatesLineage } from "./alternates.ts"
 import { createProgressReporter } from "./progress.ts"
 import { shellQuote } from "./shell-command.ts"
@@ -68,7 +70,131 @@ export type ComponentCustodyRefusal = Readonly<{
   source: string
   detail: string
   oid?: string
+  /** Present only when status === "blocked" and pre-proof and post-proof freshness reads agreed. */
+  fingerprint?: string
 }>
+export type ComponentCustodyFreshness =
+  | Readonly<{ status: "ok"; fingerprint: string }>
+  | Readonly<{ status: "unknown"; source: string; detail: string }>
+
+export const CUSTODY_FRESHNESS_SCHEMA_VERSION = 1
+
+export type CustodyFreshnessInputId =
+  | "schemaVersion"
+  | "policy.targetBranch"
+  | "census.fingerprint"
+  | "witness.objectFormat"
+  | "witness.shallow"
+  | "witness.alternatesContent"
+  | "witness.refs"
+  | "component.head"
+  | "component.refs"
+  | "component.reflogs"
+  | "component.pseudoRefs"
+  | "component.indexStat"
+  | "component.alternatesContent"
+  | "component.privateObjectStore"
+
+export const CUSTODY_FRESHNESS_INPUT_SPEC: readonly Readonly<{
+  input: CustodyFreshnessInputId
+  reason: string
+}>[] = Object.freeze([
+  {
+    input: "schemaVersion",
+    reason:
+      "bumping the freshness schema version deterministically invalidates every stored custody refusal fingerprint",
+  },
+  {
+    input: "policy.targetBranch",
+    reason:
+      "the target branch selects which surviving primary branch and remote-tracking ref can witness component commits",
+  },
+  {
+    input: "census.fingerprint",
+    reason:
+      "the component population, Git-store identities, alternates closure, witness stores, and external owners define the proof boundary",
+  },
+  {
+    input: "witness.objectFormat",
+    reason: "Gate 5 requires each witness store to match the candidate component object format",
+  },
+  {
+    input: "witness.shallow",
+    reason: "Gate 5 refuses a shallow witness repository because its reachable graph is incomplete",
+  },
+  {
+    input: "witness.alternatesContent",
+    reason:
+      "changes to a witness store's objects/info/alternates change its transitive object closure and removal-set disjointness",
+  },
+  {
+    input: "witness.refs",
+    reason:
+      "changes to refs/heads/<targetBranch>, refs/remotes/origin/<targetBranch>, or primary pin refs in a witness store can publish or unpublish a blocked commit",
+  },
+  {
+    input: "component.head",
+    reason: "HEAD is a Gate 4 root OID whose commit must be witnessed in the surviving primary store",
+  },
+  {
+    input: "component.refs",
+    reason: "every ref in a candidate component is a Gate 4 root OID",
+  },
+  {
+    input: "component.reflogs",
+    reason: "every reflog oldOid/newOid in a candidate component is a Gate 4 root OID",
+  },
+  {
+    input: "component.pseudoRefs",
+    reason:
+      "FETCH_HEAD, ORIG_HEAD, MERGE_HEAD, CHERRY_PICK_HEAD, REBASE_HEAD, BISECT_HEAD, and BISECT_LOG in a candidate component are Gate 4 root OIDs",
+  },
+  {
+    input: "component.indexStat",
+    reason: "the candidate component index holds Gate 4 stage root OIDs",
+  },
+  {
+    input: "component.alternatesContent",
+    reason: "a candidate component's objects/info/alternates changes its effective commit inventory",
+  },
+  {
+    input: "component.privateObjectStore",
+    reason:
+      "packs and loose objects in a private component-owned object store (excluded when shared with other worktrees) can introduce or remove dangling commits",
+  },
+])
+
+export type CustodyFreshnessMaterial = Readonly<{
+  schemaVersion: number
+  targetBranch: string
+  censusFingerprint: string
+  witnessStores: readonly Readonly<{
+    store: string
+    objectFormat: string
+    shallow: string
+    alternatesContent: string | null
+    refs: readonly string[]
+  }>[]
+  components: readonly Readonly<{
+    component: string
+    gitDir: string
+    objectDirectory: string
+    head: string | null
+    refs: readonly string[]
+    reflogs: readonly Readonly<{ path: string; sha256: string }>[]
+    pseudoRefs: readonly Readonly<{ name: string; oids: readonly string[] }>[]
+    indexStat: string
+    alternatesContent: string | null
+    privateObjectStore: Readonly<{
+      packs: readonly string[]
+      looseObjects: readonly string[]
+    }> | null
+  }>[]
+}>
+
+export function hashCustodyFreshnessMaterial(material: CustodyFreshnessMaterial): string {
+  return createHash("sha256").update(JSON.stringify(material)).digest("hex")
+}
 const COMPONENT_QUERY_MAX_BYTES = 64 * 1024 * 1024
 const COMPONENT_QUERY_MAX_LINES = 1_000_000
 // A hard aggregate stream byte bound keeps a huge object graph from consuming unbounded disk.
@@ -91,6 +217,7 @@ function selectedCustodyAdapters(
     ...cleanGitRepositoryEnvironment(environment),
     GIT_NO_REPLACE_OBJECTS: "1",
     GIT_NO_LAZY_FETCH: "1",
+    GIT_OPTIONAL_LOCKS: "0",
   }
   const remaining = (): number => deadline - Date.now()
   const stream: GitStreamFactory = (args, streamOptions = {}) => {
@@ -103,7 +230,13 @@ function selectedCustodyAdapters(
     return gitProcess.stream({
       repo,
       args,
-      env: { ...baseEnv, ...streamOptions.env, GIT_NO_REPLACE_OBJECTS: "1", GIT_NO_LAZY_FETCH: "1" },
+      env: {
+        ...baseEnv,
+        ...streamOptions.env,
+        GIT_NO_REPLACE_OBJECTS: "1",
+        GIT_NO_LAZY_FETCH: "1",
+        GIT_OPTIONAL_LOCKS: "0",
+      },
       ...(selectedSignal === undefined ? {} : { signal: selectedSignal }),
       timeoutMs: Math.min(streamOptions.timeoutMs ?? Number.POSITIVE_INFINITY, left),
       maxBytes: Math.min(streamOptions.maxBytes ?? COMPONENT_STREAM_MAX_BYTES, COMPONENT_STREAM_MAX_BYTES),
@@ -507,6 +640,287 @@ async function buildComponentCensus(
     externalOwners: [...externalOwners].sort(),
     removal,
     fingerprint: createHash("sha256").update(fingerprintValue).digest("hex"),
+  }
+}
+
+const FRESHNESS_PSEUDO_REFS = [
+  "FETCH_HEAD",
+  "ORIG_HEAD",
+  "MERGE_HEAD",
+  "CHERRY_PICK_HEAD",
+  "REBASE_HEAD",
+  "BISECT_HEAD",
+  "BISECT_LOG",
+] as const
+const FRESHNESS_HEX40 = /^[0-9a-f]{40}$/u
+
+function isFreshnessWitnessRef(ref: string, tip: string, targetBranch: string): boolean {
+  if (ref === `refs/remotes/origin/${targetBranch}`) return true
+  return isPolicyRef(ref, tip, targetBranch)
+}
+
+function collectReflogFiles(dir: string, found: string[] = []): string[] {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = join(dir, entry.name)
+    if (entry.isDirectory()) collectReflogFiles(path, found)
+    else if (entry.isFile()) found.push(path)
+  }
+  return found
+}
+
+async function computeCustodyFreshness(
+  input: Readonly<{
+    adapters: Readonly<{ run: GitRun; stream: GitStreamFactory }>
+    census: ComponentCensus
+    policy: ComponentCustodyPolicy
+    deadline: number
+  }>,
+): Promise<ComponentCustodyFreshness> {
+  let currentSource = "component custody freshness"
+  const fail: (source: string, message: string) => never = (source, message) => {
+    currentSource = source
+    throw new Error(message)
+  }
+  const remaining = (): number => {
+    const left = input.deadline - Date.now()
+    if (left <= 0) fail(currentSource, "shared proof deadline is exhausted")
+    return left
+  }
+  const runGit = async (args: readonly string[], source: string, allowFailure = false): Promise<GitRunResult> => {
+    currentSource = source
+    const result = await input.adapters.run(["--no-optional-locks", "--no-replace-objects", ...args], {
+      timeoutMs: remaining(),
+    })
+    if (
+      result.timedOut === true ||
+      result.stderr.startsWith("selected ") ||
+      result.stderr.startsWith("component custody proof deadline")
+    ) {
+      fail(source, result.stderr.trim() || "selected Git query did not complete")
+    }
+    if (result.code === 0 && result.stderr.trim() !== "") {
+      fail(source, `exited 0 with unexpected stderr: ${result.stderr.trim()}`)
+    }
+    if (!allowFailure && result.code !== 0) {
+      fail(source, result.stderr.trim() || `git ${args.join(" ")} exited ${result.code}`)
+    }
+    remaining()
+    return result
+  }
+  const readAlternatesFile = (objectDir: string, source: string): string | null => {
+    currentSource = source
+    const file = join(objectDir, "info", "alternates")
+    if (!existsSync(file)) return null
+    const metadata = lstatSync(file)
+    if (!metadata.isFile() || realpathSync(file) !== file) {
+      fail(source, `alternate declaration ${file} is redirected or not a file`)
+    }
+    return readFileSync(file, "utf8")
+  }
+  const withinRemoval = (path: string): boolean =>
+    input.census.removal.some((root) => {
+      const part = relative(root, path)
+      return part === "" || (part !== ".." && !part.startsWith(`..${sep}`) && !isAbsolute(part))
+    })
+
+  try {
+    const witnessStores: CustodyFreshnessMaterial["witnessStores"][number][] = []
+    for (const store of [...input.census.witnessStores].sort()) {
+      remaining()
+      const witnessGitDir = dirname(store)
+      const formatResult = await runGit(
+        [`--git-dir=${witnessGitDir}`, "rev-parse", "--show-object-format"],
+        `witness object format ${witnessGitDir}`,
+      )
+      const objectFormat = formatResult.stdout.trim()
+      if (objectFormat !== "sha1" && objectFormat !== "sha256") {
+        fail(`witness object format ${witnessGitDir}`, `unsupported object format '${objectFormat}'`)
+      }
+      const shallowResult = await runGit(
+        [`--git-dir=${witnessGitDir}`, "rev-parse", "--is-shallow-repository"],
+        `witness shallow state ${witnessGitDir}`,
+      )
+      const shallow = shallowResult.stdout.trim()
+      if (shallow !== "true" && shallow !== "false") {
+        fail(`witness shallow state ${witnessGitDir}`, `unexpected shallow answer '${shallow}'`)
+      }
+      const alternatesContent = readAlternatesFile(store, `witness alternates ${store}`)
+      const refsResult = await runGit(
+        [`--git-dir=${witnessGitDir}`, "for-each-ref", "--format=%(refname)%09%(objectname)%09%(objecttype)"],
+        `witness refs ${witnessGitDir}`,
+      )
+      const refs: string[] = []
+      for (const row of refsResult.stdout.split("\n")) {
+        if (row === "") continue
+        const fields = row.split("\t")
+        const [ref, tip, objectType] = fields
+        if (
+          fields.length !== 3 ||
+          ref === undefined ||
+          tip === undefined ||
+          objectType === undefined ||
+          !FRESHNESS_HEX40.test(tip) ||
+          !["commit", "tag", "tree", "blob"].includes(objectType)
+        ) {
+          fail(`witness refs ${witnessGitDir}`, `malformed for-each-ref row: ${row.slice(0, 120)}`)
+        }
+        if (isFreshnessWitnessRef(ref, tip, input.policy.targetBranch)) {
+          refs.push(`${ref}\t${tip}\t${objectType}`)
+        }
+      }
+      refs.sort()
+      witnessStores.push({
+        store,
+        objectFormat,
+        shallow,
+        alternatesContent,
+        refs,
+      })
+    }
+
+    const components: CustodyFreshnessMaterial["components"][number][] = []
+    const candidateIdentities = input.census.identities
+      .filter((entry) => entry.component !== ".")
+      .sort((left, right) => left.component.localeCompare(right.component))
+    for (const identity of candidateIdentities) {
+      remaining()
+      const headSource = `component HEAD ${identity.component}`
+      const headResult = await runGit([`--git-dir=${identity.gitDir}`, "rev-parse", "HEAD"], headSource, true)
+      let head: string | null = null
+      if (headResult.code === 0) {
+        const oid = headResult.stdout.trim()
+        if (!FRESHNESS_HEX40.test(oid)) fail(headSource, `invalid HEAD OID '${oid}'`)
+        head = oid
+      } else if (!/unknown revision|Needed a single revision|ambiguous argument/u.test(headResult.stderr)) {
+        fail(headSource, headResult.stderr.trim() || "rev-parse HEAD failed")
+      }
+
+      const refsSource = `component refs ${identity.component}`
+      const refsResult = await runGit(
+        [`--git-dir=${identity.gitDir}`, "for-each-ref", "--format=%(refname)%09%(objectname)%09%(symref)"],
+        refsSource,
+      )
+      const refs: string[] = []
+      for (const row of refsResult.stdout.split("\n")) {
+        if (row === "") continue
+        const [ref, tip] = row.split("\t")
+        if (ref === undefined || tip === undefined || !FRESHNESS_HEX40.test(tip)) {
+          fail(refsSource, `malformed for-each-ref row: ${row.slice(0, 120)}`)
+        }
+        refs.push(row)
+      }
+      refs.sort()
+
+      const reflogsSource = `component reflogs ${identity.component}`
+      currentSource = reflogsSource
+      const logsDir = join(identity.gitDir, "logs")
+      const reflogs: { path: string; sha256: string }[] = []
+      if (existsSync(logsDir)) {
+        const files = collectReflogFiles(logsDir).sort()
+        for (const file of files) {
+          remaining()
+          for (const _entry of readReflogEntries(file)) {
+            // Validates every record via the shared reflog decoder.
+          }
+          const content = readFileSync(file, "utf8")
+          reflogs.push({
+            path: relative(identity.gitDir, file).split(sep).join("/"),
+            sha256: createHash("sha256").update(content).digest("hex"),
+          })
+        }
+      }
+
+      const pseudoSource = `component pseudo-refs ${identity.component}`
+      currentSource = pseudoSource
+      const pseudoRefs: { name: string; oids: readonly string[] }[] = []
+      for (const name of FRESHNESS_PSEUDO_REFS) {
+        const path = join(identity.gitDir, name)
+        if (!existsSync(path)) continue
+        const metadata = lstatSync(path)
+        if (!metadata.isFile()) fail(pseudoSource, `pseudo-ref ${path} is not a regular file`)
+        const content = readFileSync(path, "utf8")
+        const found = (content.match(/[0-9a-f]{40}/gu) ?? []).filter((oid) => FRESHNESS_HEX40.test(oid))
+        if (found.length === 0 && content.trim() !== "") {
+          fail(pseudoSource, `pseudo-ref ${path} holds no object id`)
+        }
+        pseudoRefs.push({ name, oids: found })
+      }
+
+      const indexSource = `component index ${identity.component}`
+      currentSource = indexSource
+      const indexPath = join(identity.gitDir, "index")
+      let indexStat = "absent"
+      if (existsSync(indexPath)) {
+        const stat = statSync(indexPath, { bigint: true })
+        indexStat = `${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}:${stat.ino}`
+      }
+
+      const alternatesContent = readAlternatesFile(
+        identity.objectDirectory,
+        `component alternates ${identity.component}`,
+      )
+
+      const privateStore =
+        withinRemoval(identity.objectDirectory) &&
+        identity.commonDir === identity.gitDir &&
+        !input.census.witnessStores.includes(identity.objectDirectory) &&
+        !input.census.externalOwners.includes(identity.commonDir)
+      let privateObjectStore: { packs: readonly string[]; looseObjects: readonly string[] } | null = null
+      if (privateStore) {
+        const storeSource = `component private object store ${identity.component}`
+        currentSource = storeSource
+        const packs: string[] = []
+        const packDir = join(identity.objectDirectory, "pack")
+        if (existsSync(packDir)) {
+          for (const entry of readdirSync(packDir, { withFileTypes: true })) {
+            if (!entry.isFile()) continue
+            const stat = statSync(join(packDir, entry.name))
+            packs.push(`${entry.name}:${stat.size}`)
+          }
+          packs.sort()
+        }
+        const looseObjects: string[] = []
+        for (const entry of readdirSync(identity.objectDirectory, { withFileTypes: true })) {
+          if (!entry.isDirectory() || !/^[0-9a-f]{2}$/u.test(entry.name)) continue
+          remaining()
+          const fanoutDir = join(identity.objectDirectory, entry.name)
+          for (const obj of readdirSync(fanoutDir, { withFileTypes: true })) {
+            if (!obj.isFile()) continue
+            looseObjects.push(`${entry.name}/${obj.name}`)
+          }
+        }
+        looseObjects.sort()
+        privateObjectStore = { packs, looseObjects }
+      }
+
+      components.push({
+        component: identity.component,
+        gitDir: identity.gitDir,
+        objectDirectory: identity.objectDirectory,
+        head,
+        refs,
+        reflogs,
+        pseudoRefs,
+        indexStat,
+        alternatesContent,
+        privateObjectStore,
+      })
+    }
+
+    const material: CustodyFreshnessMaterial = {
+      schemaVersion: CUSTODY_FRESHNESS_SCHEMA_VERSION,
+      targetBranch: input.policy.targetBranch,
+      censusFingerprint: input.census.fingerprint,
+      witnessStores,
+      components,
+    }
+    return { status: "ok", fingerprint: hashCustodyFreshnessMaterial(material) }
+  } catch (error) {
+    return {
+      status: "unknown",
+      source: currentSource,
+      detail: error instanceof Error ? error.message : String(error),
+    }
   }
 }
 
@@ -1279,6 +1693,12 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
                     "component population, Git-store identities, alternates, primary witnesses, or lease owners changed after acquiring writer leases",
                 }
               } else {
+                const preFreshness = await computeCustodyFreshness({
+                  adapters,
+                  census: confirmedCensus,
+                  policy: removeOptions.componentCustody,
+                  deadline: proofDeadline,
+                })
                 const proofSidecarDir = mkdtempSync(join(tmpdir(), "git-super-component-custody-"))
                 sidecarDir = proofSidecarDir
                 const sidecarReal = realpathSync(proofSidecarDir)
@@ -1410,6 +1830,21 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
                       digest,
                       elapsedMs: Date.now() + timeouts.cleanup - proofDeadline,
                     }
+                  }
+                }
+                if (custodyRefusal !== undefined && custodyRefusal.status === "blocked") {
+                  const postFreshness = await computeCustodyFreshness({
+                    adapters,
+                    census: confirmedCensus,
+                    policy: removeOptions.componentCustody,
+                    deadline: proofDeadline,
+                  })
+                  if (
+                    preFreshness.status === "ok" &&
+                    postFreshness.status === "ok" &&
+                    preFreshness.fingerprint === postFreshness.fingerprint
+                  ) {
+                    custodyRefusal = { ...custodyRefusal, fingerprint: postFreshness.fingerprint }
                   }
                 }
               }
@@ -1831,6 +2266,46 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         notCompared: [...prepared.notCompared, ...status.notCompared],
         consultedRepositories: status.consultedRepositories,
         uninitializedSubmodules: status.uninitializedSubmodules,
+      }
+    },
+    async inspectComponentCustodyFreshness(
+      path: string,
+      policy: ComponentCustodyPolicy,
+      inspectOptions: Readonly<{ excludedSubmodules?: readonly string[] }> = {},
+    ): Promise<ComponentCustodyFreshness> {
+      const proofDeadline = Date.now() + timeouts.cleanup
+      const adapters = selectedCustodyAdapters(
+        options.gitProcess,
+        repo,
+        options.env ?? process.env,
+        options.signal,
+        proofDeadline,
+      )
+      try {
+        await assertRemovalRoot(path)
+        const gitDir = realpathSync(await git.text(path, ["--no-optional-locks", "rev-parse", "--absolute-git-dir"]))
+        const census = await buildComponentCensus({
+          git,
+          adapters,
+          repo,
+          worktree: path,
+          rootGitDir: gitDir,
+          excludedSubmodules: inspectOptions.excludedSubmodules ?? [],
+          policy,
+          deadline: proofDeadline,
+        })
+        return await computeCustodyFreshness({
+          adapters,
+          census,
+          policy,
+          deadline: proofDeadline,
+        })
+      } catch (error) {
+        return {
+          status: "unknown",
+          source: "recursive component census",
+          detail: error instanceof Error ? error.message : String(error),
+        }
       }
     },
     /** Retention records the destroyed checkout's own HEAD in its proof. Pool/candidate inputs are retained

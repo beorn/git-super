@@ -112,7 +112,7 @@ function isDurableRef(ref: string): boolean {
   return DURABLE_REF.test(ref) || PIN_REF.test(ref)
 }
 
-function isPolicyRef(ref: string, tip: string, targetBranch: string): boolean {
+export function isPolicyRef(ref: string, tip: string, targetBranch: string): boolean {
   if (ref === `refs/heads/${targetBranch}`) return true
   const pin = /^(?:refs\/git-super\/pins|refs\/yrd\/pins)\/([0-9a-f]{40})$/u.exec(ref)
   return pin?.[1] === tip

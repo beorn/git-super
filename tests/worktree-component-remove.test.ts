@@ -9,7 +9,13 @@ import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { describe, expect, it } from "vitest"
 import { tryAcquireFlock } from "@bearly/flock"
-import { createGitWorktreeStore } from "../src/worktree.ts"
+import {
+  CUSTODY_FRESHNESS_INPUT_SPEC,
+  CUSTODY_FRESHNESS_SCHEMA_VERSION,
+  createGitWorktreeStore,
+  hashCustodyFreshnessMaterial,
+  type CustodyFreshnessMaterial,
+} from "../src/worktree.ts"
 import { createLocalGitProcess } from "../src/process.ts"
 import { gitLineStream, MAX_LINE_LENGTH, type GitStreamOutcome } from "../src/retention-stream.ts"
 import { superWorktreeRemove } from "../src/worktree-remove.ts"
@@ -790,6 +796,265 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
       expect(existsSync(lender)).toBe(true)
     } finally {
       // raw-delete-allow: the fixture tree this test made under its own mkdtemp root
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it("enumerates all custody freshness inputs with reasons and changes the hash when any single input changes", () => {
+    expect(CUSTODY_FRESHNESS_INPUT_SPEC).toHaveLength(14)
+    for (const entry of CUSTODY_FRESHNESS_INPUT_SPEC) {
+      expect(entry.input.trim()).not.toBe("")
+      expect(entry.reason.trim().length).toBeGreaterThan(10)
+    }
+    const baseline: CustodyFreshnessMaterial = {
+      schemaVersion: CUSTODY_FRESHNESS_SCHEMA_VERSION,
+      targetBranch: "main",
+      censusFingerprint: "a".repeat(64),
+      witnessStores: [
+        {
+          store: "/tmp/primary/.git/modules/packages/alpha/objects",
+          objectFormat: "sha1",
+          shallow: "false",
+          alternatesContent: null,
+          refs: ["refs/heads/main\t" + "1".repeat(40) + "\tcommit"],
+        },
+      ],
+      components: [
+        {
+          component: "packages/alpha",
+          gitDir: "/tmp/wt/.git/modules/packages/alpha",
+          objectDirectory: "/tmp/wt/.git/modules/packages/alpha/objects",
+          head: "2".repeat(40),
+          refs: ["refs/heads/task\t" + "2".repeat(40) + "\t"],
+          reflogs: [{ path: "logs/HEAD", sha256: "b".repeat(64) }],
+          pseudoRefs: [{ name: "ORIG_HEAD", oids: ["2".repeat(40)] }],
+          indexStat: "128:100:100:42",
+          alternatesContent: null,
+          privateObjectStore: {
+            packs: ["pack-1.idx:1024", "pack-1.pack:4096"],
+            looseObjects: ["ab/" + "c".repeat(38)],
+          },
+        },
+      ],
+    }
+    const baseHash = hashCustodyFreshnessMaterial(baseline)
+    expect(baseHash).toMatch(/^[0-9a-f]{64}$/u)
+
+    const mutations: Record<(typeof CUSTODY_FRESHNESS_INPUT_SPEC)[number]["input"], CustodyFreshnessMaterial> = {
+      schemaVersion: { ...baseline, schemaVersion: CUSTODY_FRESHNESS_SCHEMA_VERSION + 1 },
+      "policy.targetBranch": { ...baseline, targetBranch: "release" },
+      "census.fingerprint": { ...baseline, censusFingerprint: "c".repeat(64) },
+      "witness.objectFormat": {
+        ...baseline,
+        witnessStores: [{ ...baseline.witnessStores[0]!, objectFormat: "sha256" }],
+      },
+      "witness.shallow": {
+        ...baseline,
+        witnessStores: [{ ...baseline.witnessStores[0]!, shallow: "true" }],
+      },
+      "witness.alternatesContent": {
+        ...baseline,
+        witnessStores: [{ ...baseline.witnessStores[0]!, alternatesContent: "/tmp/alt/objects\n" }],
+      },
+      "witness.refs": {
+        ...baseline,
+        witnessStores: [
+          {
+            ...baseline.witnessStores[0]!,
+            refs: ["refs/heads/main\t" + "3".repeat(40) + "\tcommit"],
+          },
+        ],
+      },
+      "component.head": {
+        ...baseline,
+        components: [{ ...baseline.components[0]!, head: "4".repeat(40) }],
+      },
+      "component.refs": {
+        ...baseline,
+        components: [{ ...baseline.components[0]!, refs: ["refs/heads/task\t" + "4".repeat(40) + "\t"] }],
+      },
+      "component.reflogs": {
+        ...baseline,
+        components: [{ ...baseline.components[0]!, reflogs: [{ path: "logs/HEAD", sha256: "d".repeat(64) }] }],
+      },
+      "component.pseudoRefs": {
+        ...baseline,
+        components: [{ ...baseline.components[0]!, pseudoRefs: [{ name: "ORIG_HEAD", oids: ["5".repeat(40)] }] }],
+      },
+      "component.indexStat": {
+        ...baseline,
+        components: [{ ...baseline.components[0]!, indexStat: "256:100:100:42" }],
+      },
+      "component.alternatesContent": {
+        ...baseline,
+        components: [{ ...baseline.components[0]!, alternatesContent: "/tmp/comp-alt/objects\n" }],
+      },
+      "component.privateObjectStore": {
+        ...baseline,
+        components: [
+          {
+            ...baseline.components[0]!,
+            privateObjectStore: {
+              packs: ["pack-1.idx:1024", "pack-1.pack:4096"],
+              looseObjects: ["ab/" + "c".repeat(38), "de/" + "f".repeat(38)],
+            },
+          },
+        ],
+      },
+    }
+    for (const spec of CUSTODY_FRESHNESS_INPUT_SPEC) {
+      const nextHash = hashCustodyFreshnessMaterial(mutations[spec.input])
+      expect(nextHash, `mutating ${spec.input} alone must change the freshness hash`).not.toBe(baseHash)
+      expect(nextHash).toMatch(/^[0-9a-f]{64}$/u)
+    }
+  })
+
+  it("attaches a custody freshness fingerprint on blocked refusal, ignores unrelated primary noise, and invalidates on witness publication", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-custody-freshness-noise-"))
+    try {
+      const fixture = createProductFixture(root)
+      const product = fixture.product
+      const target = join(root, "target")
+      git(product, "worktree", "add", "--detach", target)
+      git(target, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
+
+      const result = await superWorktreeRemove({
+        repo: product,
+        path: target,
+        retain: join(root, "retained"),
+        componentCustody: { primaryRoot: product, targetBranch: "release" },
+      })
+
+      expect(result.state).toBe("unchanged")
+      expect(result.reason).toBe("component-custody")
+      expect(result.custody).toMatchObject({
+        status: "blocked",
+        component: "packages/alpha",
+        fingerprint: expect.stringMatching(/^[0-9a-f]{64}$/u),
+      })
+      const blockedFingerprint = result.custody!.fingerprint!
+
+      // Noise in primaryRoot and primary submodule: unrelated commit + unrelated branch/tag updates.
+      const productHead = git(product, "rev-parse", "HEAD")
+      const productTree = git(product, "rev-parse", "HEAD^{tree}")
+      const noiseCommit = git(product, "commit-tree", productTree, "-p", productHead, "-m", "unrelated primary commit")
+      git(product, "update-ref", "refs/heads/unrelated-noise", noiseCommit)
+      git(product, "update-ref", "refs/tags/unrelated-tag", noiseCommit)
+      const alphaPrimary = join(product, "packages/alpha")
+      const alphaHead = git(alphaPrimary, "rev-parse", "HEAD")
+      const alphaTree = git(alphaPrimary, "rev-parse", "HEAD^{tree}")
+      const alphaNoise = git(alphaPrimary, "commit-tree", alphaTree, "-p", alphaHead, "-m", "unrelated alpha commit")
+      git(alphaPrimary, "update-ref", "refs/heads/unrelated-alpha", alphaNoise)
+
+      const store = createGitWorktreeStore({ repo: product, gitProcess: createLocalGitProcess() })
+      const afterNoise = await store.inspectComponentCustodyFreshness(target, {
+        primaryRoot: product,
+        targetBranch: "release",
+      })
+      expect(afterNoise).toEqual({ status: "ok", fingerprint: blockedFingerprint })
+
+      // Publishing the target branch in the primary witness store changes the freshness fingerprint.
+      git(alphaPrimary, "update-ref", "refs/heads/release", alphaHead)
+      const afterPublish = await store.inspectComponentCustodyFreshness(target, {
+        primaryRoot: product,
+        targetBranch: "release",
+      })
+      expect(afterPublish.status).toBe("ok")
+      if (afterPublish.status === "ok") {
+        expect(afterPublish.fingerprint).not.toBe(blockedFingerprint)
+      }
+    } finally {
+      // raw-delete-allow: this isolated mkdtemp fixture owns every path beneath root
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it("omits the fingerprint on a blocked refusal when component freshness changes between pre-proof and post-proof reads", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-custody-freshness-prepost-"))
+    try {
+      const fixture = createProductFixture(root)
+      const product = fixture.product
+      const target = join(root, "target")
+      git(product, "worktree", "add", "--detach", target)
+      git(target, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
+      const alphaTarget = join(target, "packages/alpha")
+      const alphaGitDir = git(alphaTarget, "rev-parse", "--absolute-git-dir")
+      const alphaHead = git(alphaTarget, "rev-parse", "HEAD")
+      const baselineOutcome = await createGitWorktreeStore({
+        repo: product,
+        gitProcess: createLocalGitProcess(),
+      }).remove(target, {
+        retention: { root: join(root, "retained"), report: () => undefined },
+        componentCustody: { primaryRoot: product, targetBranch: "release" },
+      })
+      expect(baselineOutcome).toMatchObject({
+        custodyRefusal: {
+          status: "blocked",
+          component: "packages/alpha",
+          fingerprint: expect.stringMatching(/^[0-9a-f]{64}$/u),
+        },
+      })
+      let mutatedDuringProof = false
+      const local = createLocalGitProcess()
+      const localStream = local.stream!
+      const store = createGitWorktreeStore({
+        repo: product,
+        gitProcess: {
+          run: local.run,
+          stream: (request) => {
+            if (!mutatedDuringProof && request.args.includes("fsck")) {
+              writeFileSync(join(alphaGitDir, "ORIG_HEAD"), `${alphaHead}\n`)
+              mutatedDuringProof = true
+            }
+            return localStream(request)
+          },
+        },
+      })
+
+      const outcome = await store.remove(target, {
+        retention: { root: join(root, "retained"), report: () => undefined },
+        componentCustody: { primaryRoot: product, targetBranch: "release" },
+      })
+
+      expect(mutatedDuringProof).toBe(true)
+      expect(outcome).toMatchObject({
+        custodyRefusal: { status: "blocked", component: "packages/alpha" },
+      })
+      if (outcome !== undefined && "custodyRefusal" in outcome) {
+        expect(outcome.custodyRefusal.fingerprint).toBeUndefined()
+      }
+    } finally {
+      // raw-delete-allow: this isolated mkdtemp fixture owns every path beneath root
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it("returns status unknown from inspectComponentCustodyFreshness when an expected input is unreadable", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-custody-freshness-unknown-"))
+    try {
+      const fixture = createProductFixture(root)
+      const product = fixture.product
+      const target = join(root, "target")
+      git(product, "worktree", "add", "--detach", target)
+      git(target, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
+      const alphaTarget = join(target, "packages/alpha")
+      const alphaGitDir = git(alphaTarget, "rev-parse", "--absolute-git-dir")
+      writeFileSync(join(alphaGitDir, "logs", "HEAD"), "corrupt-reflog-line\n")
+
+      const store = createGitWorktreeStore({ repo: product, gitProcess: createLocalGitProcess() })
+      const freshness = await store.inspectComponentCustodyFreshness(target, {
+        primaryRoot: product,
+        targetBranch: "main",
+      })
+
+      expect(freshness).toMatchObject({
+        status: "unknown",
+        source: expect.stringContaining("reflog"),
+        detail: expect.stringContaining("malformed reflog record"),
+      })
+      expect("fingerprint" in freshness).toBe(false)
+    } finally {
+      // raw-delete-allow: this isolated mkdtemp fixture owns every path beneath root
       await rm(root, { recursive: true, force: true })
     }
   })

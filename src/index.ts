@@ -43,3 +43,13 @@ export {
   type WorktreeHomeOptions,
 } from "./worktree-add.ts"
 export { describeModuleStores, type ModuleStore } from "./module-store-custody.ts"
+export {
+  CUSTODY_FRESHNESS_INPUT_SPEC,
+  CUSTODY_FRESHNESS_SCHEMA_VERSION,
+  hashCustodyFreshnessMaterial,
+  type ComponentCustodyFreshness,
+  type ComponentCustodyPolicy,
+  type ComponentCustodyRefusal,
+  type CustodyFreshnessInputId,
+  type CustodyFreshnessMaterial,
+} from "./worktree.ts"
