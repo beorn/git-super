@@ -77,12 +77,13 @@ export type ComponentCustodyFreshness =
   | Readonly<{ status: "ok"; fingerprint: string }>
   | Readonly<{ status: "unknown"; source: string; detail: string }>
 
-export const CUSTODY_FRESHNESS_SCHEMA_VERSION = 1
+export const CUSTODY_FRESHNESS_SCHEMA_VERSION = 2
 
 export type CustodyFreshnessInputId =
   | "schemaVersion"
   | "policy.targetBranch"
   | "census.fingerprint"
+  | "witness.scope"
   | "witness.objectFormat"
   | "witness.shallow"
   | "witness.alternatesContent"
@@ -113,6 +114,11 @@ export const CUSTODY_FRESHNESS_INPUT_SPEC: readonly Readonly<{
     input: "census.fingerprint",
     reason:
       "the component population, Git-store identities, alternates closure, witness stores, and external owners define the proof boundary",
+  },
+  {
+    input: "witness.scope",
+    reason:
+      "a blocked refusal on component C scopes witnessStores to C's primary witness store W(C) from census.witnessStoreByComponent (while a '.' refusal retains the full witness set); a later W(C') change for C' != C can only add a refusal (making the named component stale, never the blocked outcome)",
   },
   {
     input: "witness.objectFormat",
@@ -194,6 +200,51 @@ export type CustodyFreshnessMaterial = Readonly<{
 
 export function hashCustodyFreshnessMaterial(material: CustodyFreshnessMaterial): string {
   return createHash("sha256").update(JSON.stringify(material)).digest("hex")
+}
+
+/**
+ * Scope a collected CustodyFreshnessMaterial to the witness store W(C) of the blocked component C (#31206, @cto 27873fd8).
+ *
+ * Soundness: the custody loop runs scanCustody(path, [component], [W(component)]) per component and breaks at the
+ * first failure. A blocked refusal on C is therefore a function of censusFingerprint, every candidate component's
+ * own material (head, refs, reflogs, pseudoRefs, indexStat, alternatesContent, privateObjectStore), and W(C)'s refs;
+ * W(C') for C' != C enters only other components' scans, so with those inputs unchanged the full proof cannot pass.
+ * Two consequences: (1) a later W(C') change for C' != C can only add a refusal (the named component may then be
+ * stale, the blocked outcome is not), and (2) a "." refusal (recensus, root-reference integrity, inventory) keeps
+ * the full witness set.
+ */
+export function scopeCustodyFreshnessMaterial(
+  material: CustodyFreshnessMaterial,
+  witnessStoreByComponent: readonly Readonly<{ component: string; store: string }>[],
+  component?: string,
+):
+  | Readonly<{ status: "ok"; material: CustodyFreshnessMaterial; fingerprint: string }>
+  | Readonly<{ status: "unknown"; source: string; detail: string }> {
+  if (component === undefined || component === ".") {
+    return {
+      status: "ok",
+      material,
+      fingerprint: hashCustodyFreshnessMaterial(material),
+    }
+  }
+  const store = witnessStoreByComponent.find((entry) => entry.component === component)?.store
+  const witnessEntry = store === undefined ? undefined : material.witnessStores.find((entry) => entry.store === store)
+  if (store === undefined || witnessEntry === undefined) {
+    return {
+      status: "unknown",
+      source: "persistent primary object store",
+      detail: `no exact primary witness store was resolved for component ${component}`,
+    }
+  }
+  const scopedMaterial: CustodyFreshnessMaterial = {
+    ...material,
+    witnessStores: [witnessEntry],
+  }
+  return {
+    status: "ok",
+    material: scopedMaterial,
+    fingerprint: hashCustodyFreshnessMaterial(scopedMaterial),
+  }
 }
 const COMPONENT_QUERY_MAX_BYTES = 64 * 1024 * 1024
 const COMPONENT_QUERY_MAX_LINES = 1_000_000
@@ -668,6 +719,10 @@ function collectReflogFiles(dir: string, found: string[] = []): string[] {
   return found
 }
 
+type ComputedCustodyFreshness =
+  | Readonly<{ status: "ok"; fingerprint: string; material: CustodyFreshnessMaterial }>
+  | Readonly<{ status: "unknown"; source: string; detail: string }>
+
 async function computeCustodyFreshness(
   input: Readonly<{
     adapters: Readonly<{ run: GitRun; stream: GitStreamFactory }>
@@ -675,7 +730,7 @@ async function computeCustodyFreshness(
     policy: ComponentCustodyPolicy
     deadline: number
   }>,
-): Promise<ComponentCustodyFreshness> {
+): Promise<ComputedCustodyFreshness> {
   let currentSource = "component custody freshness"
   const fail: (source: string, message: string) => never = (source, message) => {
     currentSource = source
@@ -914,7 +969,7 @@ async function computeCustodyFreshness(
       witnessStores,
       components,
     }
-    return { status: "ok", fingerprint: hashCustodyFreshnessMaterial(material) }
+    return { status: "ok", fingerprint: hashCustodyFreshnessMaterial(material), material }
   } catch (error) {
     return {
       status: "unknown",
@@ -1844,7 +1899,14 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
                     postFreshness.status === "ok" &&
                     preFreshness.fingerprint === postFreshness.fingerprint
                   ) {
-                    custodyRefusal = { ...custodyRefusal, fingerprint: postFreshness.fingerprint }
+                    const scoped = scopeCustodyFreshnessMaterial(
+                      postFreshness.material,
+                      confirmedCensus.witnessStoreByComponent,
+                      custodyRefusal.component,
+                    )
+                    if (scoped.status === "ok") {
+                      custodyRefusal = { ...custodyRefusal, fingerprint: scoped.fingerprint }
+                    }
                   }
                 }
               }
@@ -2271,7 +2333,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
     async inspectComponentCustodyFreshness(
       path: string,
       policy: ComponentCustodyPolicy,
-      inspectOptions: Readonly<{ excludedSubmodules?: readonly string[] }> = {},
+      inspectOptions: Readonly<{ excludedSubmodules?: readonly string[]; component?: string }> = {},
     ): Promise<ComponentCustodyFreshness> {
       const proofDeadline = Date.now() + timeouts.cleanup
       const adapters = selectedCustodyAdapters(
@@ -2294,12 +2356,20 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
           policy,
           deadline: proofDeadline,
         })
-        return await computeCustodyFreshness({
+        const freshness = await computeCustodyFreshness({
           adapters,
           census,
           policy,
           deadline: proofDeadline,
         })
+        if (freshness.status !== "ok") return freshness
+        const scoped = scopeCustodyFreshnessMaterial(
+          freshness.material,
+          census.witnessStoreByComponent,
+          inspectOptions.component,
+        )
+        if (scoped.status !== "ok") return scoped
+        return { status: "ok", fingerprint: scoped.fingerprint }
       } catch (error) {
         return {
           status: "unknown",

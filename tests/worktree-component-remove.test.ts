@@ -14,6 +14,7 @@ import {
   CUSTODY_FRESHNESS_SCHEMA_VERSION,
   createGitWorktreeStore,
   hashCustodyFreshnessMaterial,
+  scopeCustodyFreshnessMaterial,
   type CustodyFreshnessMaterial,
 } from "../src/worktree.ts"
 import { createLocalGitProcess } from "../src/process.ts"
@@ -801,22 +802,32 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
   })
 
   it("enumerates all custody freshness inputs with reasons and changes the hash when any single input changes", () => {
-    expect(CUSTODY_FRESHNESS_INPUT_SPEC).toHaveLength(14)
+    expect(CUSTODY_FRESHNESS_SCHEMA_VERSION).toBe(2)
+    expect(CUSTODY_FRESHNESS_INPUT_SPEC).toHaveLength(15)
     for (const entry of CUSTODY_FRESHNESS_INPUT_SPEC) {
       expect(entry.input.trim()).not.toBe("")
       expect(entry.reason.trim().length).toBeGreaterThan(10)
     }
+    const alphaWitnessStore = "/tmp/primary/.git/modules/packages/alpha/objects"
+    const betaWitnessStore = "/tmp/primary/.git/modules/vendor/beta/objects"
     const baseline: CustodyFreshnessMaterial = {
       schemaVersion: CUSTODY_FRESHNESS_SCHEMA_VERSION,
       targetBranch: "main",
       censusFingerprint: "a".repeat(64),
       witnessStores: [
         {
-          store: "/tmp/primary/.git/modules/packages/alpha/objects",
+          store: alphaWitnessStore,
           objectFormat: "sha1",
           shallow: "false",
           alternatesContent: null,
           refs: ["refs/heads/main\t" + "1".repeat(40) + "\tcommit"],
+        },
+        {
+          store: betaWitnessStore,
+          objectFormat: "sha1",
+          shallow: "false",
+          alternatesContent: null,
+          refs: ["refs/heads/main\t" + "9".repeat(40) + "\tcommit"],
         },
       ],
       components: [
@@ -840,21 +851,48 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
     const baseHash = hashCustodyFreshnessMaterial(baseline)
     expect(baseHash).toMatch(/^[0-9a-f]{64}$/u)
 
+    const witnessStoreByComponent = [
+      { component: "packages/alpha", store: alphaWitnessStore },
+      { component: "vendor/beta", store: betaWitnessStore },
+    ] as const
+    const alphaScoped = scopeCustodyFreshnessMaterial(baseline, witnessStoreByComponent, "packages/alpha")
+    expect(alphaScoped.status).toBe("ok")
+    if (alphaScoped.status !== "ok") throw new Error("expected alpha scoped material ok")
+    expect(alphaScoped.material.witnessStores).toEqual([baseline.witnessStores[0]!])
+
+    const dotScoped = scopeCustodyFreshnessMaterial(baseline, witnessStoreByComponent, ".")
+    expect(dotScoped).toEqual({
+      status: "ok",
+      material: baseline,
+      fingerprint: baseHash,
+    })
+
+    const missingScoped = scopeCustodyFreshnessMaterial(baseline, witnessStoreByComponent, "packages/missing")
+    expect(missingScoped).toEqual({
+      status: "unknown",
+      source: "persistent primary object store",
+      detail: "no exact primary witness store was resolved for component packages/missing",
+    })
+
     const mutations: Record<(typeof CUSTODY_FRESHNESS_INPUT_SPEC)[number]["input"], CustodyFreshnessMaterial> = {
       schemaVersion: { ...baseline, schemaVersion: CUSTODY_FRESHNESS_SCHEMA_VERSION + 1 },
       "policy.targetBranch": { ...baseline, targetBranch: "release" },
       "census.fingerprint": { ...baseline, censusFingerprint: "c".repeat(64) },
+      "witness.scope": alphaScoped.material,
       "witness.objectFormat": {
         ...baseline,
-        witnessStores: [{ ...baseline.witnessStores[0]!, objectFormat: "sha256" }],
+        witnessStores: [{ ...baseline.witnessStores[0]!, objectFormat: "sha256" }, baseline.witnessStores[1]!],
       },
       "witness.shallow": {
         ...baseline,
-        witnessStores: [{ ...baseline.witnessStores[0]!, shallow: "true" }],
+        witnessStores: [{ ...baseline.witnessStores[0]!, shallow: "true" }, baseline.witnessStores[1]!],
       },
       "witness.alternatesContent": {
         ...baseline,
-        witnessStores: [{ ...baseline.witnessStores[0]!, alternatesContent: "/tmp/alt/objects\n" }],
+        witnessStores: [
+          { ...baseline.witnessStores[0]!, alternatesContent: "/tmp/alt/objects\n" },
+          baseline.witnessStores[1]!,
+        ],
       },
       "witness.refs": {
         ...baseline,
@@ -863,6 +901,7 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
             ...baseline.witnessStores[0]!,
             refs: ["refs/heads/main\t" + "3".repeat(40) + "\tcommit"],
           },
+          baseline.witnessStores[1]!,
         ],
       },
       "component.head": {
@@ -909,7 +948,7 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
     }
   })
 
-  it("attaches a custody freshness fingerprint on blocked refusal, ignores unrelated primary noise, and invalidates on witness publication", async () => {
+  it("attaches a component-scoped custody freshness fingerprint on blocked refusal, ignores W(C') advances in other primary components, and invalidates on W(C) or any candidate component change", async () => {
     const root = await mkdtemp(join(canonicalTmpdir(), "git-super-custody-freshness-noise-"))
     try {
       const fixture = createProductFixture(root)
@@ -918,11 +957,17 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
       git(product, "worktree", "add", "--detach", target)
       git(target, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
 
+      const store = createGitWorktreeStore({ repo: product, gitProcess: createLocalGitProcess() })
+      const policy = { primaryRoot: product, targetBranch: "release" } as const
+      const initialFull = await store.inspectComponentCustodyFreshness(target, policy, { component: "." })
+      expect(initialFull.status).toBe("ok")
+      if (initialFull.status !== "ok") throw new Error("expected initial full freshness ok")
+
       const result = await superWorktreeRemove({
         repo: product,
         path: target,
         retain: join(root, "retained"),
-        componentCustody: { primaryRoot: product, targetBranch: "release" },
+        componentCustody: policy,
       })
 
       expect(result.state).toBe("unchanged")
@@ -933,6 +978,8 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
         fingerprint: expect.stringMatching(/^[0-9a-f]{64}$/u),
       })
       const blockedFingerprint = result.custody!.fingerprint!
+      // (4) A "." refusal hashes the full witness set, whereas a blocked refusal on packages/alpha hashes only W(packages/alpha).
+      expect(blockedFingerprint).not.toBe(initialFull.fingerprint)
 
       // Noise in primaryRoot and primary submodule: unrelated commit + unrelated branch/tag updates.
       const productHead = git(product, "rev-parse", "HEAD")
@@ -946,22 +993,53 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
       const alphaNoise = git(alphaPrimary, "commit-tree", alphaTree, "-p", alphaHead, "-m", "unrelated alpha commit")
       git(alphaPrimary, "update-ref", "refs/heads/unrelated-alpha", alphaNoise)
 
-      const store = createGitWorktreeStore({ repo: product, gitProcess: createLocalGitProcess() })
-      const afterNoise = await store.inspectComponentCustodyFreshness(target, {
-        primaryRoot: product,
-        targetBranch: "release",
+      const afterNoise = await store.inspectComponentCustodyFreshness(target, policy, {
+        component: "packages/alpha",
       })
       expect(afterNoise).toEqual({ status: "ok", fingerprint: blockedFingerprint })
 
-      // Publishing the target branch in the primary witness store changes the freshness fingerprint.
-      git(alphaPrimary, "update-ref", "refs/heads/release", alphaHead)
-      const afterPublish = await store.inspectComponentCustodyFreshness(target, {
-        primaryRoot: product,
-        targetBranch: "release",
+      // (1) Blocked on C ("packages/alpha"), a target-branch or pin advance in W(C') ("vendor/beta")
+      // leaves the C-scoped fingerprint unchanged while the full "." fingerprint changes.
+      const betaPrimary = join(product, "vendor/beta")
+      const betaHead = git(betaPrimary, "rev-parse", "HEAD")
+      const betaTree = git(betaPrimary, "rev-parse", "HEAD^{tree}")
+      const betaAdvance = git(betaPrimary, "commit-tree", betaTree, "-p", betaHead, "-m", "advance vendor/beta release")
+      git(betaPrimary, "update-ref", "refs/heads/release", betaAdvance)
+      git(betaPrimary, "update-ref", "refs/remotes/origin/release", betaAdvance)
+      git(betaPrimary, "update-ref", `refs/yrd/pins/${betaAdvance}`, betaAdvance)
+
+      const afterBetaWitnessAdvanceScoped = await store.inspectComponentCustodyFreshness(target, policy, {
+        component: "packages/alpha",
       })
-      expect(afterPublish.status).toBe("ok")
-      if (afterPublish.status === "ok") {
-        expect(afterPublish.fingerprint).not.toBe(blockedFingerprint)
+      expect(afterBetaWitnessAdvanceScoped).toEqual({ status: "ok", fingerprint: blockedFingerprint })
+
+      const afterBetaWitnessAdvanceFull = await store.inspectComponentCustodyFreshness(target, policy, {
+        component: ".",
+      })
+      expect(afterBetaWitnessAdvanceFull.status).toBe("ok")
+      if (afterBetaWitnessAdvanceFull.status === "ok") {
+        expect(afterBetaWitnessAdvanceFull.fingerprint).not.toBe(initialFull.fingerprint)
+      }
+
+      // (3) Any candidate component's head/ref/reflog change in target — including in C' ("vendor/beta") —
+      // changes the C-scoped fingerprint.
+      const betaTarget = join(target, "vendor/beta")
+      git(betaTarget, "update-ref", "refs/heads/local-beta-wip", betaHead)
+      const afterBetaComponentRefChange = await store.inspectComponentCustodyFreshness(target, policy, {
+        component: "packages/alpha",
+      })
+      expect(afterBetaComponentRefChange.status).toBe("ok")
+      if (afterBetaComponentRefChange.status !== "ok") throw new Error("expected freshness ok after C' ref change")
+      expect(afterBetaComponentRefChange.fingerprint).not.toBe(blockedFingerprint)
+
+      // (2) Publishing the target branch in W(C) ("packages/alpha") changes the C-scoped fingerprint again.
+      git(alphaPrimary, "update-ref", "refs/heads/release", alphaHead)
+      const afterAlphaPublish = await store.inspectComponentCustodyFreshness(target, policy, {
+        component: "packages/alpha",
+      })
+      expect(afterAlphaPublish.status).toBe("ok")
+      if (afterAlphaPublish.status === "ok") {
+        expect(afterAlphaPublish.fingerprint).not.toBe(afterBetaComponentRefChange.fingerprint)
       }
     } finally {
       // raw-delete-allow: this isolated mkdtemp fixture owns every path beneath root

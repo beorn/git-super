@@ -47,6 +47,7 @@ export {
   CUSTODY_FRESHNESS_INPUT_SPEC,
   CUSTODY_FRESHNESS_SCHEMA_VERSION,
   hashCustodyFreshnessMaterial,
+  scopeCustodyFreshnessMaterial,
   type ComponentCustodyFreshness,
   type ComponentCustodyPolicy,
   type ComponentCustodyRefusal,
