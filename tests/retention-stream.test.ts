@@ -393,6 +393,20 @@ describe("retention stream primitives (#27443(b))", () => {
     ).toThrow("incomplete input")
   })
 
+  /**
+   * @failure A child that deliberately stops reading stdin is reported as a failed read, or its EPIPE is
+   *          swallowed together with every other stdin error so a real write failure becomes invisible.
+   * @level l1 @consumer the retention verifier's root walk (#31738)
+   */
+  test("gitLineStream treats a child's early exit before reading stdin as deliberate, not a stdin failure", async () => {
+    const stream = gitLineStream(["--version"], { stdin: "x".repeat(1 << 20) })
+    const lines = await collect(stream.lines)
+    const outcome = await stream.outcome
+    expect(lines[0]).toMatch(/^git version /u)
+    expect(outcome.code).toBe(0)
+    expect(outcome.stdinError).toBeUndefined()
+  })
+
   test("gitLineStream kills the child at the line cap rather than buffering its output", async () => {
     const root = tmp("git-super-stream-repo-")
     const environment = {

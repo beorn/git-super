@@ -404,15 +404,19 @@ export function gitLineStream(args: readonly string[], options: GitStreamOptions
       GIT_OPTIONAL_LOCKS: "0",
     },
   })
-  // EPIPE when git exits before reading (an empty or refused stdin) must not escape as an unhandled
-  // stream error: the child's own exit status is the reported outcome.
-  child.stdin?.on("error", () => {})
   let bytes = 0
   let lines = 0
   let capped = false
   let timedOut = false
   let stderr = ""
   let stdinError: string | undefined
+  // EPIPE when git exits before reading (an empty or refused stdin) must not escape as an unhandled
+  // stream error: the child's own exit status is the reported outcome. Every OTHER stdin failure is
+  // recorded, because it means the child was fed less than the caller asked it to read - the same split
+  // src/process.ts makes, and the reason a truncated input can never pass as a complete one.
+  child.stdin?.on("error", (error: NodeJS.ErrnoException) => {
+    if (error.code !== "EPIPE") stdinError = `stdin failed: ${String(error)}`
+  })
   child.stderr?.on("data", (chunk: Buffer) => {
     if (stderr.length < 8192) stderr += chunk.toString("utf8")
   })
