@@ -530,11 +530,14 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
   })
 
   /**
-   * @failure A dangling commit supplied only by a persistent component alternate is omitted from complete-commit census and removal succeeds.
+   * @failure A commit only a surviving lender store holds, which the environment never references, is
+   *          counted as at risk and refuses a removal that destroys nothing (#31738 @cto ruling).
    * @level l1 @consumer automatic environment removal through GitSuper
-   * Gate 4 verifies alternate enumeration and Gate 5 verifies graph coverage separately; this pins their removal-path composition.
+   * Gate 4 verifies alternate enumeration and Gate 5 verifies graph coverage separately; this pins their
+   * removal-path composition. Complete-commit mode counts what the removal destroys or un-references, so a
+   * borrowed commit no root of this environment reaches is lender debris, and its object outlives the removal.
    */
-  it("keeps a target for an alternate-supplied dangling commit", async () => {
+  it("removes a target whose alternate-supplied commit is lender debris the lender keeps", async () => {
     const root = await mkdtemp(join(canonicalTmpdir(), "git-super-component-custody-alternate-dangling-"))
     try {
       const fixture = createProductFixture(root)
@@ -570,10 +573,10 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
         componentCustody: { primaryRoot: fixture.product, targetBranch: "main" },
       })
 
-      expect(outcome, JSON.stringify(outcome)).toMatchObject({
-        custodyRefusal: { status: "blocked", component: "packages/alpha", oid: dangling },
-      })
-      expect(existsSync(target)).toBe(true)
+      expect(outcome, JSON.stringify(outcome)).not.toHaveProperty("custodyRefusal")
+      expect(existsSync(target)).toBe(false)
+      // The commit is un-referenced by nothing and destroyed by nothing: the lender's store still has it.
+      expect(git(alphaPrimary, "cat-file", "-e", dangling)).toBe("")
     } finally {
       // raw-delete-allow: this isolated mkdtemp root owns every path beneath it
       await rm(root, { recursive: true, force: true })

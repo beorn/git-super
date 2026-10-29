@@ -310,6 +310,14 @@ export interface GitStreamOptions {
    */
   readonly onQueueHighWater?: (depth: number) => void
   /**
+   * Bytes written to the child's stdin, which is a pipe only when this is set. `git rev-list --stdin`
+   * needs it: a root list can exceed any argv bound, and the closure of those roots is what decides
+   * at-risk commits in complete-commit mode (#31738, @cto ruling 2026-10-29). An iterable source is
+   * written with backpressure instead of being materialized, so a caller feeding a sidecar keeps the
+   * bounded-memory contract of the object streams.
+   */
+  readonly stdin?: string | Buffer | AsyncIterable<string | Buffer>
+  /**
    * Test seam: read from this iterable instead of the child's stdout, so a stdout read failure can
    * be injected deterministically. Production always reads the real pipe.
    */
@@ -323,6 +331,8 @@ export interface GitStreamOutcome {
   readonly stderr: string
   readonly timedOut: boolean
   readonly capped: boolean
+  /** Why writing the child's stdin stopped, when it did; the child was killed and `code` is non-zero. */
+  readonly stdinError?: string
 }
 
 export interface GitLineStream {
@@ -383,7 +393,7 @@ export const MAX_LINE_LENGTH = 1 << 20
  */
 export function gitLineStream(args: readonly string[], options: GitStreamOptions = {}): GitLineStream {
   const child = spawn(options.executable ?? "git", [...args], {
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: [options.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
     ...(options.signal === undefined ? {} : { signal: options.signal }),
     ...(options.killSignal === undefined ? {} : { killSignal: options.killSignal }),
     env: options.env ?? {
@@ -394,11 +404,15 @@ export function gitLineStream(args: readonly string[], options: GitStreamOptions
       GIT_OPTIONAL_LOCKS: "0",
     },
   })
+  // EPIPE when git exits before reading (an empty or refused stdin) must not escape as an unhandled
+  // stream error: the child's own exit status is the reported outcome.
+  child.stdin?.on("error", () => {})
   let bytes = 0
   let lines = 0
   let capped = false
   let timedOut = false
   let stderr = ""
+  let stdinError: string | undefined
   child.stderr?.on("data", (chunk: Buffer) => {
     if (stderr.length < 8192) stderr += chunk.toString("utf8")
   })
@@ -408,6 +422,42 @@ export function gitLineStream(args: readonly string[], options: GitStreamOptions
     } catch {
       // silent-fallback-allow: a child that already exited cannot be signalled; cap/deadline still reported
     }
+  }
+  const stdinSource = options.stdin
+  if (stdinSource !== undefined) {
+    void (async (): Promise<void> => {
+      const stdin = child.stdin
+      if (stdin === null) return
+      try {
+        if (typeof stdinSource === "string" || Buffer.isBuffer(stdinSource)) {
+          stdin.end(stdinSource)
+          return
+        }
+        for await (const chunk of stdinSource) {
+          if (stdin.destroyed) return
+          // Backpressure, not buffering: the caller's source is pulled one chunk at a time, so a
+          // sidecar-sized root list never lands in memory whole.
+          if (!stdin.write(chunk)) {
+            await new Promise<void>((resolve) => {
+              const resume = (): void => {
+                stdin.off("drain", resume)
+                stdin.off("close", resume)
+                resolve()
+              }
+              stdin.on("drain", resume)
+              stdin.on("close", resume)
+            })
+          }
+        }
+        if (!stdin.destroyed) stdin.end()
+      } catch (error) {
+        // A source that fails mid-write leaves the child waiting on a closed pipe forever; kill it so
+        // `outcome` settles, and keep the reason, which the caller must treat as an incomplete read.
+        stdinError = error instanceof Error ? error.message : String(error)
+        stdin.destroy()
+        kill()
+      }
+    })()
   }
   const timer =
     options.timeoutMs === undefined
@@ -430,7 +480,7 @@ export function gitLineStream(args: readonly string[], options: GitStreamOptions
   })
   const settle = (code: number): void => {
     if (timer !== undefined) clearTimeout(timer)
-    resolveClose({ code, bytes, lines, stderr, timedOut, capped })
+    resolveClose({ code, bytes, lines, stderr, timedOut, capped, ...(stdinError === undefined ? {} : { stdinError }) })
   }
   child.on("close", (code) => settle(timedOut ? 1 : (code ?? 1)))
   child.on("error", (error: Error) => {
@@ -584,7 +634,7 @@ export function gitLineStream(args: readonly string[], options: GitStreamOptions
       const settled = await closePromise
       await donePromise
       const code = settled.code !== 0 ? settled.code : readFailed || capped || timedOut ? 1 : 0
-      return { code, bytes, lines, stderr, timedOut, capped }
+      return { code, bytes, lines, stderr, timedOut, capped, ...(stdinError === undefined ? {} : { stdinError }) }
     })(),
   }
 }

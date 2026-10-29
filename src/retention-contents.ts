@@ -8,6 +8,12 @@
  * `AtRisk(g) = Effective(g) \ IndependentStores(g,R)`. `Roots(g)` is every ref, reflog old/new,
  * pseudo-ref and index OID, except gitlink entries whose commits belong to the child component.
  *
+ * `retention` mode reports `AtRisk(g)`'s commits: what removing `E` destroys. `complete-commit` mode
+ * reports what removing `E` destroys OR un-references, so it adds every borrowed commit reachable from
+ * `Roots(g)` — a commit a lender also holds still becomes prunable once the reference naming it is gone
+ * — and leaves lender debris, which this removal neither destroys nor un-references, out (@cto ruling
+ * 2026-10-29, #31738).
+ *
  * Every large set is streamed: the two object sets are compared by a k-way merge over the sorted
  * `cat-file` streams (already OID-sorted) and the roots, and the result lands in content-addressed
  * sidecars rather than in a Set/Map/array. Peak memory is the sort run buffer plus one line per
@@ -118,7 +124,11 @@ export interface ContentsScanOptions {
   readonly sidecarDir: string
   readonly run?: GitRun
   readonly stream?: GitStreamFactory
-  /** `complete-commit` inventories every effective commit without independent-store subtraction. */
+  /**
+   * `complete-commit` keeps every commit this removal destroys OR un-references: the owned commits of
+   * `AtRisk(g)` (independent-store subtraction, dangling included) plus every borrowed commit reachable
+   * from `Roots(g)`, whose reference the removal would take away (#31738, @cto ruling 2026-10-29).
+   */
   readonly sourceMode?: "retention" | "complete-commit"
   /** Explicit source Git identities from the live recursive census; otherwise use the manifest adapter. */
   readonly sources?: readonly ComponentGitSource[]
@@ -439,8 +449,10 @@ async function scanComponentGitDir(
     },
   )
   const objects = join(gitDir, "objects")
-  const closureResult =
-    sourceMode === "retention" ? closure(objects, removal, new Set()) : { status: "ok" as const, stores: [objects] }
+  // The alternate closure decides which objects this removal would DESTROY, in both modes: complete-commit
+  // mode inventories a copy that may borrow, and a borrower's removal loses none of the lender's objects
+  // (#31738, @cto ruling 2026-10-29 — the at-risk set is what the removal destroys or un-references).
+  const closureResult = closure(objects, removal, new Set())
   if (closureResult.status !== "ok") throw new UnknownError(`${component}: ${closureResult.detail}`)
   // IndependentStores(g,R) also includes an actual external `objects`-symlink target: its store
   // survives E and those objects are borrowed, never owned (contract gate 4). Dropping the
@@ -450,7 +462,7 @@ async function scanComponentGitDir(
     if (store === objects) continue
     independentStores.add(store)
   }
-  const linkMetadata = sourceMode === "retention" ? lstatSync(objects, { throwIfNoEntry: false }) : undefined
+  const linkMetadata = lstatSync(objects, { throwIfNoEntry: false })
   if (linkMetadata?.isSymbolicLink() === true) {
     let linkTarget: string
     try {
@@ -498,6 +510,61 @@ async function scanComponentGitDir(
       },
     ),
   )
+  // Complete-commit mode also keeps borrowed commits THIS environment references: a commit reachable
+  // from its refs, HEAD, reflog old/new or a commit-typed pseudo-ref is un-referenced by the removal and
+  // becomes prunable, so it stays at risk even when a lender holds the object. Index stage roots are blobs
+  // and stay in the missing-root check only (@cto ruling 2026-10-29, #31738).
+  //
+  // The walk reads the sorted root sidecar one line at a time and writes it to `rev-list`'s stdin, so the
+  // root list is never materialized. `--missing=print` keeps a store that has lost an object from aborting
+  // the walk: what it cannot resolve comes back as `?<oid>` (measured, git 2.56) and is left out of the
+  // reachable set. A lost ROOT is the root-integrity refusal below; a lost ancestor is `unknown`, because
+  // this component's own closure is incomplete and its at-risk set cannot be trusted.
+  const walkMissing: string[] = []
+  let walkMissingCount = 0
+  const rootReachable =
+    sourceMode !== "complete-commit"
+      ? undefined
+      : await externalSortToSidecar(
+          (async function* () {
+            const roots = (async function* (): AsyncGenerator<string> {
+              for await (const line of readLines(rootsRef.path)) {
+                const [oid, source] = line.split("\t")
+                if (oid === undefined || source === "index") continue
+                yield `${oid}\n`
+              }
+            })()
+            const reachable = stream(
+              ["--no-replace-objects", `--git-dir=${gitDir}`, "rev-list", "--stdin", "--missing=print"],
+              {
+                timeoutMs: Math.min(bounds.componentMs, remaining()),
+                maxLines: bounds.maxEffectiveOids,
+                stdin: roots,
+                ...(proofEnv === undefined ? {} : { env: proofEnv }),
+              },
+            )
+            for await (const line of reachable.lines) {
+              if (line === "") continue
+              if (line.startsWith("?")) {
+                walkMissingCount += 1
+                if (walkMissing.length < MISSING_INLINE) walkMissing.push(line.slice(1))
+                continue
+              }
+              yield line
+            }
+            const outcome = await reachable.outcome
+            const cause = [outcome.stdinError, outcome.stderr.trim()].filter(
+              (part): part is string => part !== undefined && part !== "",
+            )
+            assertStreamComplete(outcome, {
+              timedOut: `${component}: rev-list of component roots exceeded the ${bounds.componentMs} ms bound`,
+              capped: `${component}: rev-list of component roots exceeded the ${bounds.maxEffectiveOids} cap`,
+              failed: `${component}: rev-list of component roots failed: ${cause.join("; ")}`,
+              warned: `${component}: rev-list of component roots exited 0 with stderr: ${outcome.stderr.trim()}`,
+            })
+          })(),
+          { dir: sidecarDir, runLines: DEFAULT_SORT_RUN_LINES, deadline, clock },
+        )
   const atRiskWriter = new SidecarWriter(sidecarDir, "txt")
   const missingWriter = new SidecarWriter(sidecarDir, "txt")
   let effective = 0
@@ -510,13 +577,14 @@ async function scanComponentGitDir(
     await mergeSorted(
       [
         { label: "effective", lines: validatedOidLines(effectiveStream, component), keyOf: oidKey },
-        ...(sourceMode === "complete-commit"
+        ...independentStreams.map((source, index) => ({
+          label: `independent:${index}`,
+          lines: validatedOidLines(source, `independent store ${index} of ${component}`),
+          keyOf: oidKey,
+        })),
+        ...(rootReachable === undefined
           ? []
-          : independentStreams.map((source, index) => ({
-              label: `independent:${index}`,
-              lines: validatedOidLines(source, `independent store ${index} of ${component}`),
-              keyOf: oidKey,
-            }))),
+          : [{ label: "root-reachable", lines: readLines(rootReachable.path), keyOf: oidKey }]),
         { label: "roots", lines: readLines(rootsRef.path), keyOf: oidKey },
       ],
       (key, groups) => {
@@ -529,10 +597,15 @@ async function scanComponentGitDir(
         if (effectiveLines.length > 0) effective += 1
         if (independentLines.length > 0) independent += 1
         const rootSources = [...new Set(rootLines.map((line) => line.slice(line.indexOf("\t") + 1)))].join(", ")
+        const rootReachableLines = groups
+          .filter((group) => group.label === "root-reachable")
+          .flatMap((group) => group.lines)
         const first = effectiveLines[0]
         if (
           first !== undefined &&
-          (sourceMode === "complete-commit" ? first.endsWith("\tcommit") : independentLines.length === 0)
+          (sourceMode === "complete-commit"
+            ? first.endsWith("\tcommit") && (independentLines.length === 0 || rootReachableLines.length > 0)
+            : independentLines.length === 0)
         ) {
           const type = first.slice(first.indexOf("\t") + 1)
           atRisk += 1
@@ -554,6 +627,13 @@ async function scanComponentGitDir(
         failed: `${component}: cat-file failed: ${outcome.stderr.trim()}`,
         warned: `${component}: cat-file exited 0 with stderr: ${outcome.stderr.trim()}`,
       })
+    }
+    // Every root resolved and the component's own store still lost an ancestor: `blocked` would name the
+    // wrong thing, and a partial closure must never be read as a complete at-risk set.
+    if (missing === 0 && walkMissingCount > 0) {
+      throw new UnknownError(
+        `${component}: rev-list cannot resolve ${walkMissingCount} object(s) reachable from component roots, e.g. ${walkMissing[0] ?? "none sampled"}`,
+      )
     }
   } catch (error) {
     atRiskWriter.abort()

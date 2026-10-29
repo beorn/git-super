@@ -183,22 +183,73 @@ describe("retention contents scan — gate 4 (#27443(b))", () => {
     expect((await atRiskOf(result)).map((row) => row.oid)).not.toContain(lender.head)
   })
 
-  test("complete-commit mode inventories commits available through alternates without subtracting them", async () => {
+  test("complete-commit mode marks borrowed commits this environment references, and owned dangles, but not lender debris", async () => {
     const lender = repoWithCommit("git-super-contents-complete-lender-")
+    writeFileSync(join(lender.root, "b.txt"), "beta\n")
+    git(lender.root, ["add", "b.txt"])
+    git(lender.root, ["commit", "-q", "-m", "second"])
+    const unborrowed = git(lender.root, ["rev-parse", "HEAD"])
     const borrower = tmp("git-super-contents-complete-borrower-")
     git(borrower, ["init", "-q", "-b", "main"])
     mkdirSync(join(borrower, ".git", "objects", "info"), { recursive: true })
     writeFileSync(join(borrower, ".git", "objects", "info", "alternates"), `${join(lender.root, ".git", "objects")}\n`)
     writeFileSync(join(borrower, ".git", "refs", "heads", "borrowed"), `${lender.head}\n`)
+    // An owned commit in the borrower's own store, reachable from no root: the removal destroys it.
+    const owned = git(borrower, ["commit-tree", `${lender.head}^{tree}`, "-m", "owned dangling"])
     const source = [{ component: "component-a", gitDir: join(borrower, ".git"), workTree: borrower }]
     const complete = await scan(borrower, {}, { sourceMode: "complete-commit", sources: source })
     const retained = await scan(borrower, componentEntries(".git"))
     expect(complete.status).toBe("pass")
     expect(complete.components[0]?.gitDir).toBe(join(borrower, ".git"))
-    expect((await atRiskOf(complete)).map((row) => row.oid)).toContain(lender.head)
+    const atRisk = (await atRiskOf(complete)).map((row) => row.oid)
+    // Borrowed but referenced by this environment's own ref: still at risk, exactly as before the ruling.
+    expect(atRisk).toContain(lender.head)
+    // Owned and dangling: the removal destroys it, so it stays at risk whatever any lender holds.
+    expect(atRisk).toContain(owned)
+    // Borrowed and referenced by nothing here: this removal un-references nothing, so it is lender debris.
+    expect(atRisk).not.toContain(unborrowed)
     expect((await atRiskOf(complete)).every((row) => row.type === "commit")).toBe(true)
     expect(retained.status).toBe("pass")
     expect((await atRiskOf(retained)).map((row) => row.oid)).not.toContain(lender.head)
+  })
+
+  test("complete-commit mode keeps a root the store lost a root-integrity refusal, never a walk failure", async () => {
+    const { root, gitDir } = repoWithCommit("git-super-contents-complete-lost-root-")
+    const ghost = "c".repeat(40)
+    writeFileSync(join(gitDir, "refs", "heads", "ghost"), `${ghost}\n`)
+    const result = await scan(
+      root,
+      {},
+      {
+        sourceMode: "complete-commit",
+        sources: [{ component: "component-a", gitDir, workTree: root }],
+      },
+    )
+    // `rev-list --missing=print` reports the absent root instead of aborting the walk, so the
+    // existing root check still answers `blocked` with the OID rather than `unknown`.
+    expect(result.status).toBe("blocked")
+    expect(result.components[0]!.missingRootsSample).toContain(ghost)
+  })
+
+  test("complete-commit mode is unknown when the store lost an ancestor its own roots reach", async () => {
+    const { root, gitDir, head: first } = repoWithCommit("git-super-contents-complete-lost-ancestor-")
+    writeFileSync(join(root, "b.txt"), "beta\n")
+    git(root, ["add", "b.txt"])
+    git(root, ["commit", "-q", "-m", "second"])
+    // Expire the reflog so the lost commit is reachable from a root only as a parent: `blocked`
+    // would blame a root, and a partial closure must never pass as a complete at-risk set.
+    git(root, ["reflog", "expire", "--expire=now", "--all"])
+    rmSync(join(gitDir, "objects", first.slice(0, 2), first.slice(2)))
+    const result = await scan(
+      root,
+      {},
+      {
+        sourceMode: "complete-commit",
+        sources: [{ component: "component-a", gitDir, workTree: root }],
+      },
+    )
+    expect(result.status).toBe("unknown")
+    expect(result.detail).toContain(first)
   })
 
   test("complete-commit mode refuses an empty source inventory", async () => {
