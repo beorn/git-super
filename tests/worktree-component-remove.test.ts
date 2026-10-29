@@ -805,7 +805,7 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
   })
 
   it("enumerates all custody freshness inputs with reasons and changes the hash when any single input changes", () => {
-    expect(CUSTODY_FRESHNESS_SCHEMA_VERSION).toBe(2)
+    expect(CUSTODY_FRESHNESS_SCHEMA_VERSION).toBe(3)
     expect(CUSTODY_FRESHNESS_INPUT_SPEC).toHaveLength(15)
     for (const entry of CUSTODY_FRESHNESS_INPUT_SPEC) {
       expect(entry.input.trim()).not.toBe("")

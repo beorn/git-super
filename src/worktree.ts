@@ -77,7 +77,9 @@ export type ComponentCustodyFreshness =
   | Readonly<{ status: "ok"; fingerprint: string }>
   | Readonly<{ status: "unknown"; source: string; detail: string }>
 
-export const CUSTODY_FRESHNESS_SCHEMA_VERSION = 2
+// 3: Gate 4 roots exclude refs/remotes/**, logs/refs/remotes/** and FETCH_HEAD (#31771), so every refusal
+// stored under the old roots is proved again.
+export const CUSTODY_FRESHNESS_SCHEMA_VERSION = 3
 
 export type CustodyFreshnessInputId =
   | "schemaVersion"
@@ -144,16 +146,16 @@ export const CUSTODY_FRESHNESS_INPUT_SPEC: readonly Readonly<{
   },
   {
     input: "component.refs",
-    reason: "every ref in a candidate component is a Gate 4 root OID",
+    reason: "every ref in a candidate component outside refs/remotes/** is a Gate 4 root OID",
   },
   {
     input: "component.reflogs",
-    reason: "every reflog oldOid/newOid in a candidate component is a Gate 4 root OID",
+    reason: "every reflog oldOid/newOid outside logs/refs/remotes/** in a candidate component is a Gate 4 root OID",
   },
   {
     input: "component.pseudoRefs",
     reason:
-      "FETCH_HEAD, ORIG_HEAD, MERGE_HEAD, CHERRY_PICK_HEAD, REBASE_HEAD, BISECT_HEAD, and BISECT_LOG in a candidate component are Gate 4 root OIDs",
+      "ORIG_HEAD, MERGE_HEAD, CHERRY_PICK_HEAD, REBASE_HEAD, BISECT_HEAD, and BISECT_LOG in a candidate component are Gate 4 root OIDs; FETCH_HEAD is not a root but stays a freshness input",
   },
   {
     input: "component.indexStat",

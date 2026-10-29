@@ -144,15 +144,10 @@ export interface ComponentGitSource {
   readonly workTree: string
 }
 
-const PSEUDO_REFS = [
-  "FETCH_HEAD",
-  "ORIG_HEAD",
-  "MERGE_HEAD",
-  "CHERRY_PICK_HEAD",
-  "REBASE_HEAD",
-  "BISECT_HEAD",
-  "BISECT_LOG",
-]
+// FETCH_HEAD is not a root (#31771, @cto aacb2ac9): like a remote-tracking ref it records what origin
+// advertised, not this environment's own knowledge, so a commit only it names is not at risk here.
+const PSEUDO_REFS = ["ORIG_HEAD", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REBASE_HEAD", "BISECT_HEAD", "BISECT_LOG"]
+const REMOTE_TRACKING_REFS = "refs/remotes/"
 const HEX40 = /^[0-9a-f]{40}$/u
 const ZERO_OID = /^0+$/u
 const MISSING_INLINE = 100
@@ -294,7 +289,10 @@ export function* readReflogEntries(path: string): Generator<ReflogEntry> {
 
 /**
  * Yields one `<oid>\t<source>` line per root OID the component records: refs, HEAD, reflog
- * old/new, pseudo-refs and the index. Zero OIDs are excluded (the creation record of a reflog and
+ * old/new, pseudo-refs and the index. Remote-tracking refs (`refs/remotes/**`), their reflogs
+ * (`logs/refs/remotes/**`) and FETCH_HEAD are not roots: they mirror origin's knowledge, so a borrowed
+ * commit only they name is not this environment's to keep, while an owned commit stays at risk
+ * whatever the roots (#31771, @cto aacb2ac9). Zero OIDs are excluded (the creation record of a reflog and
  * a symbolic HEAD both name them, and neither is an object the store must carry). Unreadable or
  * malformed root state throws; `scanContents` reports that as `unknown`.
  */
@@ -317,6 +315,7 @@ async function* rootOidLines(
     if (oid === undefined || !HEX40.test(oid)) {
       throw new UnknownError(`malformed for-each-ref row in ${gitDir}: ${line.slice(0, 120)}`)
     }
+    if (name?.startsWith(REMOTE_TRACKING_REFS)) continue
     if (!ZERO_OID.test(oid)) yield `${oid}\tref ${name ?? ""}`.trimEnd()
   }
   const head = await run([`--git-dir=${gitDir}`, "rev-parse", "HEAD"])
@@ -331,6 +330,7 @@ async function* rootOidLines(
   if (existsSync(logs)) {
     let reflogLines = 0
     for (const path of reflogFiles(logs)) {
+      if (relative(logs, path).split(sep).join("/").startsWith(REMOTE_TRACKING_REFS)) continue
       const entries: Iterable<ReflogEntry> | AsyncIterable<ReflogEntry> = options.completeMode
         ? (async function* () {
             for await (const line of readLines(path, {

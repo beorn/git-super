@@ -523,3 +523,103 @@ describe("retention contents scan — gate 4 (#27443(b))", () => {
     expect(result.stdout).toMatch(/^git version/u)
   })
 })
+
+/**
+ * @failure Gate 4 counts origin's mirrored knowledge (remote-tracking refs, their reflogs, FETCH_HEAD)
+ * as this environment's roots, so a landed environment holding a borrowed commit only a mirror names
+ * can never be retired; or the narrowing drops a local root or an owned commit along with them.
+ * @level l1
+ * @consumer the yrd environment sweep's removal gate, gates 4 and 5; #31771 (@cto aacb2ac9)
+ */
+describe("retention contents roots — origin's mirrors are not roots (#31771)", () => {
+  /** A lender with one commit and an empty borrower that reads the lender's objects through an alternate. */
+  function borrowerOf(prefix: string): { lender: string; borrowed: string; borrower: string; gitDir: string } {
+    const lender = repoWithCommit(`${prefix}lender-`)
+    const borrower = tmp(`${prefix}borrower-`)
+    git(borrower, ["init", "-q", "-b", "main"])
+    mkdirSync(join(borrower, ".git", "objects", "info"), { recursive: true })
+    writeFileSync(join(borrower, ".git", "objects", "info", "alternates"), `${join(lender.root, ".git", "objects")}\n`)
+    return { lender: lender.root, borrowed: lender.head, borrower, gitDir: join(borrower, ".git") }
+  }
+
+  function completeScan(borrower: string, gitDir: string): Promise<ContentsScan> {
+    return scan(
+      borrower,
+      {},
+      { sourceMode: "complete-commit", sources: [{ component: "component-a", gitDir, workTree: borrower }] },
+    )
+  }
+
+  function reflogLine(oid: string): string {
+    return `${ZERO} ${oid} Gate4 <g4@example.test> 1 +0000\tfetch: storing head\n`
+  }
+
+  test("a borrowed commit reachable only from refs/remotes/origin/x is not at risk", async () => {
+    const { borrowed, borrower, gitDir } = borrowerOf("git-super-roots-remote-")
+    git(borrower, ["update-ref", "refs/remotes/origin/x", borrowed])
+    const result = await completeScan(borrower, gitDir)
+    expect(result.status).toBe("pass")
+    expect((await atRiskOf(result)).map((row) => row.oid)).not.toContain(borrowed)
+  })
+
+  test("the same commit with its bytes in the environment's own store is at risk", async () => {
+    const { borrowed, borrower, gitDir } = borrowerOf("git-super-roots-owned-")
+    const owned = git(borrower, ["commit-tree", `${borrowed}^{tree}`, "-m", "owned, named only by a mirror"])
+    git(borrower, ["update-ref", "refs/remotes/origin/x", owned])
+    const result = await completeScan(borrower, gitDir)
+    expect(result.status).toBe("pass")
+    // At risk before and after the narrowing: only its source label changes (a mirror ref, then owned).
+    expect((await atRiskOf(result)).map((row) => row.oid)).toContain(owned)
+  })
+
+  test("OIDs only in logs/refs/remotes/origin/x are not roots, so a lost one does not block", async () => {
+    const { borrowed, borrower, gitDir } = borrowerOf("git-super-roots-remote-reflog-")
+    const lost = "d".repeat(40)
+    mkdirSync(join(gitDir, "logs", "refs", "remotes", "origin"), { recursive: true })
+    writeFileSync(join(gitDir, "logs", "refs", "remotes", "origin", "x"), reflogLine(borrowed) + reflogLine(lost))
+    const result = await completeScan(borrower, gitDir)
+    expect(result.status).toBe("pass")
+    expect(result.components[0]!.missingRoots).toBe(0)
+    expect((await atRiskOf(result)).map((row) => row.oid)).not.toContain(borrowed)
+  })
+
+  test("a commit only in FETCH_HEAD is not a root", async () => {
+    const { borrowed, borrower, gitDir } = borrowerOf("git-super-roots-fetch-head-")
+    writeFileSync(
+      join(gitDir, "FETCH_HEAD"),
+      `${borrowed}\t\tbranch 'x' of origin\n${"e".repeat(40)}\tnot-for-merge\tbranch 'y'\n`,
+    )
+    const result = await completeScan(borrower, gitDir)
+    expect(result.status).toBe("pass")
+    expect(result.components[0]!.missingRoots).toBe(0)
+    expect((await atRiskOf(result)).map((row) => row.oid)).not.toContain(borrowed)
+  })
+
+  test.each([
+    { root: "ORIG_HEAD", place: (gitDir: string, oid: string) => writeFileSync(join(gitDir, "ORIG_HEAD"), `${oid}\n`) },
+    {
+      root: "logs/HEAD",
+      place: (gitDir: string, oid: string) => {
+        mkdirSync(join(gitDir, "logs"), { recursive: true })
+        writeFileSync(join(gitDir, "logs", "HEAD"), reflogLine(oid))
+      },
+    },
+  ])("a borrowed commit named only by $root is still a root, unchanged", async ({ place }) => {
+    const { borrowed, borrower, gitDir } = borrowerOf("git-super-roots-local-")
+    place(gitDir, borrowed)
+    const result = await completeScan(borrower, gitDir)
+    expect(result.status).toBe("pass")
+    expect((await atRiskOf(result)).map((row) => row.oid)).toContain(borrowed)
+  })
+
+  test("a missing local root still blocks, even when a remote-tracking ref names the same OID", async () => {
+    const { borrower, gitDir } = borrowerOf("git-super-roots-missing-")
+    const ghost = "c".repeat(40)
+    writeFileSync(join(gitDir, "refs", "heads", "ghost"), `${ghost}\n`)
+    mkdirSync(join(gitDir, "refs", "remotes", "origin"), { recursive: true })
+    writeFileSync(join(gitDir, "refs", "remotes", "origin", "ghost"), `${ghost}\n`)
+    const result = await completeScan(borrower, gitDir)
+    expect(result.status).toBe("blocked")
+    expect(result.components[0]!.missingRootsSample).toEqual([ghost])
+  })
+})
