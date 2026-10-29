@@ -354,6 +354,45 @@ describe("retention stream primitives (#27443(b))", () => {
     expect(outcome.timedOut).toBe(false)
   })
 
+  test("gitLineStream feeds an iterable stdin to the child without materializing it", async () => {
+    const root = tmp("git-super-stream-stdin-")
+    spawnSync("git", ["init", "-q", "-b", "main"], { cwd: root })
+    writeFileSync(join(root, "a.txt"), "alpha\n")
+    spawnSync("git", ["add", "a.txt"], { cwd: root })
+    spawnSync("git", ["-c", "user.name=S", "-c", "user.email=s@e.test", "commit", "-q", "-m", "one"], { cwd: root })
+    const head = spawnSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).stdout.trim()
+    const stream = gitLineStream([`--git-dir=${join(root, ".git")}`, "rev-list", "--stdin"], {
+      stdin: linesOf([`${head}\n`]),
+    })
+    const lines = await collect(stream.lines)
+    const outcome = await stream.outcome
+    expect(lines).toEqual([head])
+    expect(outcome.code).toBe(0)
+    expect(outcome.stdinError).toBeUndefined()
+  })
+
+  /**
+   * @failure A stdin source that dies mid-write lets the child see EOF, exit 0 on the prefix it read, and
+   *          the caller treat a truncated input as a complete one.
+   * @level l1 @consumer the read-only retention verifier's root walk (#31738)
+   */
+  test("gitLineStream fails the outcome when its stdin source dies mid-write", async () => {
+    const root = tmp("git-super-stream-stdin-fail-")
+    spawnSync("git", ["init", "-q", "-b", "main"], { cwd: root })
+    const failing = (async function* (): AsyncGenerator<string> {
+      yield "\n"
+      throw new Error("root sidecar read failed")
+    })()
+    const stream = gitLineStream([`--git-dir=${join(root, ".git")}`, "rev-list", "--stdin"], { stdin: failing })
+    await collect(stream.lines)
+    const outcome = await stream.outcome
+    expect(outcome.stdinError).toContain("root sidecar read failed")
+    expect(outcome.code).not.toBe(0)
+    expect(() =>
+      assertStreamComplete(outcome, { timedOut: "t", capped: "c", failed: "incomplete input", warned: "w" }),
+    ).toThrow("incomplete input")
+  })
+
   test("gitLineStream kills the child at the line cap rather than buffering its output", async () => {
     const root = tmp("git-super-stream-repo-")
     const environment = {

@@ -633,7 +633,11 @@ export function gitLineStream(args: readonly string[], options: GitStreamOptions
     outcome: (async () => {
       const settled = await closePromise
       await donePromise
-      const code = settled.code !== 0 ? settled.code : readFailed || capped || timedOut ? 1 : 0
+      // A stdin source that died mid-write makes the read incomplete even when the child then saw EOF and
+      // exited 0 on the prefix it got: the outcome must still fail, or `assertStreamComplete` reads a
+      // truncated input as a clean one.
+      const truncated = readFailed || capped || timedOut || stdinError !== undefined
+      const code = settled.code !== 0 ? settled.code : truncated ? 1 : 0
       return { code, bytes, lines, stderr, timedOut, capped, ...(stdinError === undefined ? {} : { stdinError }) }
     })(),
   }
