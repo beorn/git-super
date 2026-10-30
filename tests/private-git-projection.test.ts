@@ -420,10 +420,16 @@ it.each([
           ).toBe(repository.configurationSha256)
           expect(git(repository.checkout, "rev-parse", "--absolute-git-dir")).toBe(repository.gitDirectory)
         }
-        await store.remove(source, {
-          retention: { root: join(root, "retained-donor"), report: () => {} },
-          excludedSubmodules,
-        })
+        const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true)
+        try {
+          await store.remove(source, {
+            retention: { root: join(root, "retained-donor"), report: () => {} },
+            excludedSubmodules,
+          })
+          expect(stderr.mock.calls.map(([line]) => String(line)).join("")).toContain("dropped registry entry")
+        } finally {
+          stderr.mockRestore()
+        }
         expect(existsSync(source)).toBe(false)
         for (const [index, copied] of copiedStores.entries()) {
           expect(git(fixture.product, "--git-dir", copied, "rev-parse", "HEAD")).toBe(copiedHeads[index])

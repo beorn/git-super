@@ -799,8 +799,9 @@ describe("git super worktree add", () => {
         write(value: string) {
           if (value.startsWith("worktree removal proof ")) {
             proofBeforeRemoval = existsSync(worktree)
-            if (invalidGraph !== undefined)
+            if (invalidGraph !== undefined) {
               expect(readFileSync(invalidGraph, "utf8")).toBe("invalid copied derived cache\n")
+            }
           }
         },
       }
