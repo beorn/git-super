@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.10.0 — 2026-10-29
+
+- Depend on Flock 0.2.3 so published consumers get bounded lock acquisition and existing-only lease opens.
+- Worktree removal preserves module stores with commits outside the compared refs; it no longer writes archive refs automatically.
 
 - Resolve artifact-directory and destination aliases before retention proof writes; publish certificates through the existing streamed sidecar family's atomic rename, preserving retained custody and typed ancestor errors.
 

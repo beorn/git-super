@@ -5,7 +5,7 @@
     "": {
       "name": "git-super",
       "dependencies": {
-        "@bearly/flock": "0.2.2",
+        "@bearly/flock": "0.2.3",
         "@bearly/pacing": "^0.1.0",
         "@silvery/command": "0.23.2",
         "@silvery/commander": "0.23.2",
@@ -26,7 +26,7 @@
     },
   },
   "packages": {
-    "@bearly/flock": ["@bearly/flock@0.2.2", "", { "dependencies": { "koffi": "3.3.2" } }, "sha512-pmQ0SfqqZ1sLLQImQ3NnmfugIKHg/SC9WyAVPKSZNC1PYRw9LRhRaZrOuzzAJG35i931BG7lF5KCXBZ6FPt8Kg=="],
+    "@bearly/flock": ["@bearly/flock@0.2.3", "", { "dependencies": { "koffi": "3.3.2" } }, "sha512-zAY0hUOjaLB2VfB5IvkV0sZ6sy3TKVXFHV1cKw01CLqrRUX8Hi7htCAGu8NZtmfiCZGSiybD59rqWB/4yrQihw=="],
 
     "@bearly/pacing": ["@bearly/pacing@0.1.0", "", {}, "sha512-t5c9YUrcZjETONe+DvjjnRtfqlNzPexR3CgFFe7sdqeWlMCVQ8e41qHl/ACHwm42wpRERRrn9dHRuZFLl9I7cg=="],
 
