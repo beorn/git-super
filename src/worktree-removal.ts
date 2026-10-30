@@ -1465,7 +1465,7 @@ async function normalizeRetainedModules(
       }
       const kind = retainedStoreCustody(canonical, source, canonicalCommon, [lender], canonicalCommon)
       if (kind === "durable") durable.add(canonical)
-      else if (!within(source, canonical)) removable.add(canonical)
+      else if (canonical !== seed || lstatSync(original).isSymbolicLink()) removable.add(canonical)
     }
     classify(seed, seed)
     alternatesLineageSync([seed], "", undefined, {
@@ -1513,12 +1513,13 @@ async function normalizeRetainedModules(
       throw new Error(`retained copy ${store} has dangling alternate ${target}; worktree preserved`)
     },
   )
-  if (dependency !== false)
+  if (dependency !== false) {
     throw new Error(
       typeof dependency === "string"
         ? dependency
         : `retained copy ${copy} still borrows removable stores; worktree preserved`,
     )
+  }
 }
 
 function validateRetainedObjectsDeclarations(proof: Record<string, unknown>, retained: string): boolean | string {
@@ -1805,7 +1806,15 @@ async function retainResolvedWorktreeModules(context: {
     componentCustody,
   } = context
   const modules = join(gitDir, "modules")
-  const custody = { common, checkout: path, gitDir, modules }
+  // The constructor copies removable payload before deletion. Historical readers
+  // keep their removal boundaries; this source snapshot may contain local donors.
+  const custody = {
+    common,
+    checkout: path,
+    gitDir,
+    modules,
+    ...(privateProjection === undefined ? { removalRoots: [] } : {}),
+  }
   // Use the existing nonmutating guard before retention creates a copy or rehomes borrowers.
   guardRetainedBorrowers(common, gitDir, "inspect")
   // Diagnose metadata links before Git discovery can hide their source and target in an object lookup failure.
@@ -1858,10 +1867,11 @@ async function retainResolvedWorktreeModules(context: {
       ? retainedAlternatesDependency(
           modules,
           common,
-          gitDir,
+          undefined,
           manifest(modules, custody, false).externalObjectStores,
           undefined,
           true,
+          realpathSync(common),
         )
       : false
   if (typeof linkedDependency === "string") throw new Error(linkedDependency)

@@ -5,6 +5,7 @@
  * @reach fs-walk <fixture-only: lists the temp fixture worktree's excluded submodule directory (27147)>
  */
 import {
+  cpSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -13,6 +14,8 @@ import {
   readFileSync,
   renameSync,
   rmSync,
+  statSync,
+  symlinkSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs"
@@ -642,31 +645,72 @@ describe("git super worktree add", () => {
 
   // Retention must preserve physical payload from removable alternate donors,
   // not merely refs whose objects remain readable while those donors exist.
-  it.each([false, true])(
+  it.each([
+    "local",
+    "alternate",
+    "objects-link",
+    "self-link",
+    "two-hops",
+    "packed",
+    "orphan-index",
+    ...(existsSync("/dev/shm") && statSync("/dev/shm").dev !== statSync(tmpdir()).dev ? ["cross-device"] : []),
+  ])(
     "retains complete module stores before removing a clean unlocked populated worktree; removable donor=%s",
-    async (removableDonor) => {
+    async (donorKind) => {
+      const removableDonor = donorKind !== "local" && donorKind !== "orphan-index"
       const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-worktree-remove-"))
       roots.push(fixtureRoot)
       const fixture = createSuperproject(fixtureRoot)
       const worktree = join(fixtureRoot, "candidate")
-      const retained = join(fixtureRoot, "retained")
+      const retained =
+        donorKind === "cross-device"
+          ? mkdtempSync(join("/dev/shm", "git-super-retained-"))
+          : join(fixtureRoot, "retained")
+      if (donorKind === "cross-device") roots.push(retained)
       const out = outputSink()
       const err = outputSink()
       expect(await runCli(["--repo", fixture.product, "worktree", "add", worktree, "HEAD"], out, err)).toBe(0)
       const child = join(worktree, "vendor/dep")
       let author = child
       let donorObjects: string | undefined
-      if (removableDonor) {
+      if (donorKind === "self-link") {
+        // An orphan store inside the same removable modules tree owns the payload.
+        // The regular alternate case never exercises an objects symlink or self custody.
+        const metadata = git(child, ["rev-parse", "--absolute-git-dir"])
+        const orphan = join(metadata, "..", "orphan")
+        cpSync(metadata, orphan, { recursive: true })
+        rmSync(join(metadata, "objects"), { recursive: true })
+        symlinkSync(join(orphan, "objects"), join(metadata, "objects"))
+        donorObjects = join(orphan, "objects")
+      } else if (removableDonor) {
         const lender = join(fixtureRoot, "lender")
         expect(
           await runCli(["--repo", fixture.product, "worktree", "add", lender, "HEAD"], outputSink(), outputSink()),
         ).toBe(0)
         author = join(lender, "vendor/dep")
         donorObjects = join(git(author, ["rev-parse", "--absolute-git-dir"]), "objects")
-        writeFileSync(
-          join(git(child, ["rev-parse", "--absolute-git-dir"]), "objects/info/alternates"),
-          `${donorObjects}\n`,
-        )
+        const objects = join(git(child, ["rev-parse", "--absolute-git-dir"]), "objects")
+        if (donorKind === "objects-link") {
+          rmSync(objects, { recursive: true })
+          symlinkSync(donorObjects, objects)
+        } else if (donorKind === "two-hops") {
+          const intermediate = join(fixtureRoot, "intermediate")
+          expect(
+            await runCli(
+              ["--repo", fixture.product, "worktree", "add", intermediate, "HEAD"],
+              outputSink(),
+              outputSink(),
+            ),
+          ).toBe(0)
+          const intermediateObjects = join(
+            git(join(intermediate, "vendor/dep"), ["rev-parse", "--absolute-git-dir"]),
+            "objects",
+          )
+          writeFileSync(join(intermediateObjects, "info/alternates"), `${donorObjects}\n`)
+          writeFileSync(join(objects, "info/alternates"), `${intermediateObjects}\n`)
+        } else {
+          writeFileSync(join(objects, "info/alternates"), `${donorObjects}\n`)
+        }
       }
       // This object is in no remote or author store. A clean detached HEAD alone
       // cannot prove that removing the child Git directory loses no work.
@@ -678,6 +722,34 @@ describe("git super worktree add", () => {
       git(author, ["checkout", "-q", "--detach", fixture.pin])
       if (removableDonor) git(child, ["update-ref", "refs/heads/spare", spare])
       const source = git(child, ["rev-parse", "--absolute-git-dir"])
+      // Reflogs and unreferenced local payload are distinct preservation roots.
+      // A branch-only fixture can pass after accidentally dropping either one.
+      const reflogOnly = git(author, ["commit-tree", `${fixture.pin}^{tree}`, "-m", "reflog-only work"])
+      git(child, ["update-ref", "--create-reflog", "refs/heads/log-only", reflogOnly])
+      git(child, ["update-ref", "refs/heads/log-only", fixture.pin])
+      const unreachable = git(author, ["commit-tree", `${fixture.pin}^{tree}`, "-m", "unreachable local work"])
+      let indexOnly: string | undefined
+      if (donorKind === "orphan-index") {
+        const orphan = join(source, "..", "orphan")
+        cpSync(source, orphan, { recursive: true })
+        const blob = join(fixtureRoot, "index-only.txt")
+        writeFileSync(blob, "only the orphan index names this blob\n")
+        indexOnly = git(fixtureRoot, ["--git-dir", orphan, "hash-object", "-w", blob])
+        git(fixtureRoot, [
+          "--git-dir",
+          orphan,
+          "update-index",
+          "--add",
+          "--cacheinfo",
+          `100644,${indexOnly},index-only.txt`,
+        ])
+      }
+      if (donorKind === "packed") {
+        git(author, ["repack", "-a", "-d"])
+        const pack = readdirSync(join(donorObjects!, "pack")).find((name) => name.endsWith(".pack"))
+        expect(pack).toBeDefined()
+        writeFileSync(join(donorObjects!, "pack", pack!.replace(/\.pack$/u, ".keep")), "donor-only lease marker\n")
+      }
       const beforeLog = readFileSync(join(source, "logs/HEAD"), "utf8")
 
       for (const dirty of [join(worktree, "untracked.txt"), join(child, "untracked.txt")]) {
@@ -741,8 +813,10 @@ describe("git super worktree add", () => {
       const store = join(result.proof.retained, "vendor/dep")
       expect(readFileSync(join(store, "logs/HEAD"), "utf8")).toBe(beforeLog)
       expect(readFileSync(result.proof.manifest, "utf8")).toContain("vendor/dep/packed-refs")
-      const disconnected = donorObjects === undefined ? undefined : `${donorObjects}.disconnected`
-      if (donorObjects !== undefined && disconnected !== undefined) renameSync(donorObjects, disconnected)
+      // The self-linked donor was removed together with the source modules tree.
+      const removableObjects = donorKind === "self-link" ? undefined : donorObjects
+      const disconnected = removableObjects === undefined ? undefined : `${removableObjects}.disconnected`
+      if (removableObjects !== undefined && disconnected !== undefined) renameSync(removableObjects, disconnected)
       try {
         const integrity = spawnSync("git", ["--git-dir", store, "fsck", "--full"], {
           encoding: "utf8",
@@ -750,8 +824,18 @@ describe("git super worktree add", () => {
         })
         expect(integrity.status, integrity.stderr).toBe(0)
         expect(git(fixtureRoot, ["--git-dir", store, "cat-file", "-t", spare])).toBe("commit")
+        expect(git(fixtureRoot, ["--git-dir", store, "cat-file", "-t", reflogOnly])).toBe("commit")
+        expect(git(fixtureRoot, ["--git-dir", store, "cat-file", "-t", unreachable])).toBe("commit")
+        if (indexOnly !== undefined) {
+          const orphan = join(store, "..", "orphan")
+          expect(git(fixtureRoot, ["--git-dir", orphan, "cat-file", "-t", indexOnly])).toBe("blob")
+          expect(git(fixtureRoot, ["--git-dir", orphan, "fsck", "--full"])).not.toContain("missing")
+        }
+        if (donorKind === "packed") {
+          expect(readdirSync(join(store, "objects/pack")).filter((name) => name.endsWith(".keep"))).toEqual([])
+        }
       } finally {
-        if (donorObjects !== undefined && disconnected !== undefined) renameSync(disconnected, donorObjects)
+        if (removableObjects !== undefined && disconnected !== undefined) renameSync(disconnected, removableObjects)
       }
       const rescued = join(fixtureRoot, "rescued.git")
       git(fixtureRoot, ["clone", "--quiet", "--bare", "--no-hardlinks", store, rescued])
