@@ -1864,8 +1864,8 @@ async function retainResolvedWorktreeModules(context: {
       )
     }
   }
-  // A fresh copy preserves alternates bytes but canonicalizes objects links. Refuse its
-  // self-borrow before creating a retained directory or rehoming any live borrower.
+  // Check source custody before copying or rehoming any live borrower. A normalization
+  // refusal below removes its newly created retained directory.
   const linkedDependency =
     privateProjection === undefined && existsSync(modules)
       ? retainedAlternatesDependency(
@@ -2012,15 +2012,20 @@ async function retainResolvedWorktreeModules(context: {
         )
       }
     }
-    retainedBorrowing = await normalizeRetainedModules(
-      git,
-      copiedCheckout,
-      privateProjection === undefined ? copiedSource : gitDir,
-      privateProjection === undefined ? copiedTree : retained,
-      borrowingCommon,
-      gitDir,
-      privateProjection !== undefined,
-    )
+    try {
+      retainedBorrowing = await normalizeRetainedModules(
+        git,
+        copiedCheckout,
+        privateProjection === undefined ? copiedSource : gitDir,
+        privateProjection === undefined ? copiedTree : retained,
+        borrowingCommon,
+        gitDir,
+        privateProjection !== undefined,
+      )
+    } catch (error) {
+      rmSync(retainedRoot, { recursive: true })
+      throw error
+    }
     finalRetainedManifest = manifest(copiedTree, copiedCustody, true, privateProjection !== undefined)
     if (finalRetainedManifest.externalObjectStores.length !== 0) {
       throw new Error(`retained copy ${retained} still has external objects links; worktree preserved`)
