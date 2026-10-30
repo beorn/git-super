@@ -1,9 +1,12 @@
 import { createHash, randomUUID } from "node:crypto"
 import {
   cpSync,
+  copyFileSync,
+  constants,
   existsSync,
   fstatSync,
   lstatSync,
+  linkSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -11,6 +14,7 @@ import {
   readlinkSync,
   realpathSync,
   renameSync,
+  rmSync,
   statSync,
   symlinkSync,
   unlinkSync,
@@ -1301,6 +1305,22 @@ function registerRetainedBorrower(common: string, retained: string, manifestPath
   }
 }
 
+/** Shared custody classification for historical guards and new retained copies. */
+function retainedStoreCustody(
+  target: string,
+  copy: string,
+  common: string,
+  lenders: readonly string[],
+  registrationCommon?: string,
+): "lender" | "linked" | "durable" | "copy" | undefined {
+  if (lenders.some((lender) => within(lender, target))) return "lender"
+  if (within(join(common, "worktrees"), target)) return "linked"
+  if (within(join(common, "modules"), target)) return "durable"
+  if (within(copy, target)) return "copy"
+  if (registrationCommon === common && within(join(common, "objects"), target)) return "durable"
+  return undefined
+}
+
 /** Inspect actual retained metadata using the existing borrower walk and the one alternates traversal. */
 function retainedAlternatesDependency(
   retained: string,
@@ -1315,8 +1335,6 @@ function retainedAlternatesDependency(
   const copy = realpathSync(retained)
   const lenders = lenderGitDir === undefined ? [] : [...new Set([resolve(lenderGitDir), realpathSync(lenderGitDir)])]
   const canonicalCommon = realpathSync(common)
-  const linkedStores = join(canonicalCommon, "worktrees")
-  const primaryStores = join(canonicalCommon, "modules")
   let linkedDependency = false
   let custodyRefusal: Error | undefined
   const refuse = (message: string): never => {
@@ -1328,17 +1346,14 @@ function retainedAlternatesDependency(
       throw new Error(`retained closure ${retained} exceeded enrollment deadline`)
     }
     for (const target of new Set([declaredPath, canonicalPath])) {
-      if (lenders.some((lender) => within(lender, target))) {
+      const custody = retainedStoreCustody(target, copy, canonicalCommon, lenders, registrationCommon)
+      if (custody === "lender") {
         refuse(
           `retained copy ${retained} borrows from removal store through ${edge} (declared ${declaredPath}, canonical ${canonicalPath}); worktree preserved`,
         )
       }
-      if (within(linkedStores, target)) linkedDependency = true
-      else if (
-        !within(primaryStores, target) &&
-        !within(copy, target) &&
-        !(registrationCommon === canonicalCommon && within(join(canonicalCommon, "objects"), target))
-      ) {
+      if (custody === "linked") linkedDependency = true
+      else if (custody === undefined) {
         refuse(
           `retained copy ${retained} has unknown removal custody through ${edge} (declared ${declaredPath}, canonical ${canonicalPath}); worktree preserved`,
         )
@@ -1386,6 +1401,124 @@ function retainedAlternatesDependency(
     }
   }
   return linkedDependency
+}
+
+/** Copy only physically local Git payload; never follow donor alternates or copy derived caches. */
+function retainPhysicalObjects(source: string, destination: string): void {
+  const retain = (from: string, to: string): void => {
+    if (!lstatSync(from).isFile()) throw new Error(`Git object payload ${from} is not a regular file`)
+    const existing = lstatSync(to, { throwIfNoEntry: false })
+    if (existing !== undefined) {
+      if (!existing.isFile() || metadataFileDigest(from) !== metadataFileDigest(to)) {
+        throw new Error(`retained Git object ${to} differs from donor ${from}; worktree preserved`)
+      }
+      return
+    }
+    try {
+      linkSync(from, to)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EXDEV") throw error
+      copyFileSync(from, to, constants.COPYFILE_EXCL)
+    }
+  }
+  for (const entry of readdirSync(source, { withFileTypes: true })) {
+    if (entry.name !== "pack" && !/^[0-9a-f]{2}$/u.test(entry.name)) continue
+    const directory = join(source, entry.name)
+    if (!entry.isDirectory()) throw new Error(`Git object payload directory ${directory} is not a directory`)
+    const target = join(destination, entry.name)
+    mkdirSync(target, { recursive: true })
+    for (const file of readdirSync(directory)) {
+      const payload =
+        entry.name === "pack"
+          ? /^pack-[0-9a-f]+\.(?:pack|idx|rev)$/u.test(file)
+          : /^(?:[0-9a-f]{38}|[0-9a-f]{62})$/u.test(file)
+      if (payload) retain(join(directory, file), join(target, file))
+    }
+  }
+}
+
+/** New copies retain removable payload and borrow only canonical durable stores. */
+async function normalizeRetainedModules(
+  git: Git,
+  checkout: string,
+  source: string,
+  copy: string,
+  common: string,
+  lender: string,
+): Promise<void> {
+  const canonicalCommon = realpathSync(common)
+  const objects = [...borrowerEntries(copy, undefined)]
+    .filter((entry) => entry.name === "objects" && isGitDirectory(entry.parentPath, copy, false))
+    .map((entry) => join(entry.parentPath, entry.name))
+  for (const destination of objects) {
+    const original = join(source, relative(copy, destination))
+    const seed = realpathSync(original)
+    const durable = new Set<string>()
+    const removable = new Set<string>()
+    const classify = (declared: string, canonical: string): void => {
+      for (const target of new Set([declared, canonical])) {
+        if (retainedStoreCustody(target, source, canonicalCommon, [lender], canonicalCommon) === undefined) {
+          throw new Error(
+            `retained copy ${copy} has unknown removal custody through ${original}: ${target}; worktree preserved`,
+          )
+        }
+      }
+      const kind = retainedStoreCustody(canonical, source, canonicalCommon, [lender], canonicalCommon)
+      if (kind === "durable") durable.add(canonical)
+      else if (!within(source, canonical)) removable.add(canonical)
+    }
+    classify(seed, seed)
+    alternatesLineageSync([seed], "", undefined, {
+      strictReads: true,
+      onDeclaration: (_store, declared, canonical) => classify(declared, canonical),
+      onEdge: () => {},
+      onDangling: (store, target) => {
+        throw new Error(`retention source ${store} has dangling alternate ${target}; worktree preserved`)
+      },
+    })
+    if (lstatSync(destination).isSymbolicLink()) {
+      unlinkSync(destination)
+      mkdirSync(destination)
+    }
+    for (const donor of removable) retainPhysicalObjects(donor, destination)
+    const info = join(destination, "info")
+    mkdirSync(info, { recursive: true })
+    const alternates = join(info, "alternates")
+    const staged = `${alternates}.retention-${randomUUID()}`
+    writeFileSync(staged, durable.size === 0 ? "" : `${[...durable].join("\n")}\n`, { flag: "wx" })
+    renameSync(staged, alternates)
+    const args = ["-c", "protocol.allow=never", "--git-dir", dirname(destination), "--work-tree", checkout]
+    const graph = await git.run(copy, [...args, "commit-graph", "verify"], true, 300_000)
+    if (graph.code !== 0) {
+      if (graph.code !== 1) {
+        throw new Error(graph.stderr.trim() || `commit-graph verification exited ${graph.code}; worktree preserved`)
+      }
+      const caches = [join(info, "commit-graph"), join(info, "commit-graphs")]
+      for (const cache of caches) {
+        if (lstatSync(cache, { throwIfNoEntry: false }) !== undefined) rmSync(cache, { recursive: true })
+      }
+      await git.run(copy, [...args, "commit-graph", "verify"], false, 300_000)
+    }
+    await git.run(copy, [...args, "fsck", "--connectivity-only"], false, 300_000)
+  }
+  const dependency = retainedAlternatesDependency(
+    copy,
+    common,
+    lender,
+    [],
+    undefined,
+    false,
+    canonicalCommon,
+    (store, target) => {
+      throw new Error(`retained copy ${store} has dangling alternate ${target}; worktree preserved`)
+    },
+  )
+  if (dependency !== false)
+    throw new Error(
+      typeof dependency === "string"
+        ? dependency
+        : `retained copy ${copy} still borrows removable stores; worktree preserved`,
+    )
 }
 
 function validateRetainedObjectsDeclarations(proof: Record<string, unknown>, retained: string): boolean | string {
@@ -1840,7 +1973,26 @@ async function retainResolvedWorktreeModules(context: {
       const copied = join(retained, relative(gitDir, repository.gitDirectory))
       // Full integrity includes borrowed stores: the public root takes 62s and a large child 207–239s.
       // Keep a finite five-minute bound for this full scan rather than the interactive deadline.
-      await git.run(copiedCheckout, ["--git-dir", copied, "fsck", "--full", "--no-reflogs"], false, 300_000)
+      await git.run(
+        copiedCheckout,
+        ["--git-dir", copied, "--work-tree", copiedCheckout, "fsck", "--full"],
+        false,
+        300_000,
+      )
+    }
+  }
+  // Normalize ordinary/destroyed copies before their final proof or removal.
+  // Private pointer/config custody is extended through this same stage next.
+  let finalRetainedManifest = retainedManifest
+  if (privateProjection === undefined && retained !== null) {
+    await normalizeRetainedModules(git, copiedCheckout, copiedSource, copiedTree, common, gitDir)
+    finalRetainedManifest = manifest(copiedTree, copiedCustody, true)
+    if (finalRetainedManifest.externalObjectStores.length !== 0) {
+      throw new Error(`retained copy ${retained} still has external objects links; worktree preserved`)
+    }
+    expectedCopy = finalRetainedManifest.entries
+    if (JSON.stringify(manifest(copiedSource, custody, true).entries) !== JSON.stringify(retainedManifest.entries)) {
+      throw new Error(`Git store ${copiedSource} changed during retention; worktree preserved`)
     }
   }
   const rehomedBorrowers =
@@ -1856,16 +2008,18 @@ async function retainResolvedWorktreeModules(context: {
           privateProjection === undefined ? preserved : [],
         )
       : undefined
-  const verifyPrivateManifest = (): void => {
+  const verifyRetainedManifest = (): void => {
     if (
-      privateProjection !== undefined &&
-      (JSON.stringify(manifest(path, custody, true, true).entries) !== JSON.stringify(retainedManifest.entries) ||
-        JSON.stringify(manifest(copiedCheckout, copiedCustody, true, true).entries) !== JSON.stringify(expectedCopy))
+      retained !== null &&
+      (JSON.stringify(manifest(copiedSource, custody, true, privateProjection !== undefined).entries) !==
+        JSON.stringify(retainedManifest.entries) ||
+        JSON.stringify(manifest(copiedTree, copiedCustody, true, privateProjection !== undefined).entries) !==
+          JSON.stringify(expectedCopy))
     ) {
       throw new Error(`worktree ${path} changed during retention; preserved, retry after its writer stops`)
     }
   }
-  verifyPrivateManifest()
+  verifyRetainedManifest()
   if (JSON.stringify(after) !== JSON.stringify(before)) {
     throw new Error(`worktree ${path} changed during retention; preserved, retry after its writer stops`)
   }
@@ -1890,10 +2044,13 @@ async function retainResolvedWorktreeModules(context: {
   }
   writeFileSync(
     proof.manifest,
-    `${JSON.stringify({ ...proof, files: retainedManifest.files, entries: retainedManifest.entries, externalObjectStores: retainedManifest.externalObjectStores }, null, 2)}\n`,
+    `${JSON.stringify({ ...proof, files: finalRetainedManifest.files, entries: finalRetainedManifest.entries, externalObjectStores: finalRetainedManifest.externalObjectStores }, null, 2)}\n`,
     { flag: "wx" },
   )
-  if (retained !== null && (retainedManifest.externalObjectStores.length > 0 || linkedDependency)) {
+  if (
+    retained !== null &&
+    (finalRetainedManifest.externalObjectStores.length > 0 || (privateProjection !== undefined && linkedDependency))
+  ) {
     registerRetainedBorrower(common, retained, proof.manifest)
   }
   if (retained !== null && privateProjection !== undefined) {
@@ -1904,7 +2061,7 @@ async function retainResolvedWorktreeModules(context: {
   retention.report(proof)
   if (retirePrivate !== undefined) {
     if (privateProjection === undefined) throw new Error("private retirement requires its projection record")
-    verifyPrivateManifest()
+    verifyRetainedManifest()
     retirePrivate()
   }
   return proof
