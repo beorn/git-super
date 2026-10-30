@@ -1692,7 +1692,10 @@ describe("createGitWorktreeStore", () => {
       const legacyBytes = await readFile(proof.manifest)
       const commonForLegacy = git(fixture.product, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim()
       const pointerRoot = join(commonForLegacy, "git-super-retained-borrowers")
-      const pointerPath = join(pointerRoot, readdirSync(pointerRoot).find((name) => name.endsWith(".json"))!)
+      const pointerPath = join(
+        pointerRoot,
+        readdirSync(pointerRoot).find((name) => name.endsWith(".json"))!,
+      )
       const pointerBytes = await readFile(pointerPath)
       await writeFile(alternate, join(commonForLegacy, "modules/packages/alpha/objects") + "\n")
       // Unknown legacy proof fields plus a currently independent graph must preserve custody while unrelated cleanup proceeds.
