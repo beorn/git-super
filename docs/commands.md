@@ -213,7 +213,7 @@ git super --repo /work/product --json worktree remove <path> --retain <directory
 Removes one registered, clean, unlocked linked worktree. Steps:
 
 1. Check the root and every checked-out submodule with `status`. Dirty, locked, unreadable or unretained work is refused.
-2. Copy the worktree's submodule Git data to `<directory>`, outside both deletion paths. Compare file manifests (SHA-256 bytes and objects-link identity) to prove the copy.
+2. Copy the submodule Git data outside both deletion paths. Preserve its source manifest, normalize removable object dependencies, then record and verify the final copied bytes.
 3. Print the proof on stderr, then run `git worktree remove --force`. The `--force` only overrides Git's refusal to remove worktrees with submodules; the checks above have already passed.
 4. Compact each copied submodule Git directory: `git pack-refs --all`, drop `logs/refs/remotes/`, keep every local reflog, and rewrite the proof so `worktree retention verify` still matches. Ref values are compared before and after. If compaction fails, the removal still succeeds: refs stay intact, the proof is not rewritten (so a later verify refuses), the copy is kept, and the JSON says `compaction: { status, child, step }`.
 5. Unregister nested linked checkouts that belonged to surviving submodule stores. Branch refs and the copy are not changed.
@@ -230,9 +230,13 @@ If unregistering a nested checkout fails, the command exits nonzero and names th
 
 Object links and borrowers:
 
-- **Symlinked objects directory:** allowed only when its target already exists inside the selected Git common directory and outside both deletion paths. Other metadata links, missing targets, and targets elsewhere are refused with their paths.
-- **External object stores:** never copied or changed. The copy keeps an absolute link and records the dependency in `manifest.json` under `externalObjectStores`, so the copy is not self-contained.
-- **Borrower registry:** each copy that borrows objects is registered under `<git-common-dir>/git-super-retained-borrowers` before removal. Later removals refuse while a registered copy still links into their deletion paths. An entry is dropped (and named) when the copy is gone, has no object links, or depends only on stores under `<git-common-dir>/modules`. Unreadable or unresolved entries refuse; editing `manifest.json` does not prove a copy is independent.
+- **New copies:** replace supported objects symlinks with private directories. Preserve loose objects and packs from removable donors, using hardlinks or a file copy across filesystems.
+- **Canonical borrowing:** rewrite copied alternates to durable common stores only. Donor metadata stays unchanged. The copy still depends on those durable stores and their object-retention policy.
+- **Integrity:** ordinary and destroyed-worktree copies receive connectivity checks; private copies keep full integrity checks. Both include index and reflogs and verify copied commit graphs.
+- **Copied caches:** remove invalid copied commit graphs and verify again, without rewriting graphs. Final manifests describe the normalized bytes and have an empty `externalObjectStores` list.
+- **Historical borrowers:** existing registrations under `<git-common-dir>/git-super-retained-borrowers` still protect copies that link into removable stores. New normalization does not alter old copies.
+  - Later removal drops and names a registration only when the copy is gone or no longer depends on removable stores. Unreadable or unresolved custody preserves the lender.
+  - Editing `manifest.json` alone does not prove independence. New registrations follow the final copied dependencies; durable borrowing retains its existing disposition.
 - **Live borrowers:** a live submodule whose objects link into the worktree being removed blocks the removal, naming the checkout, module and target. git-super does not rewrite those links.
 
 Other options:

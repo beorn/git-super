@@ -653,11 +653,12 @@ describe("git super worktree add", () => {
     "two-hops",
     "packed",
     "orphan-index",
+    "invalid-graph",
     ...(existsSync("/dev/shm") && statSync("/dev/shm").dev !== statSync(tmpdir()).dev ? ["cross-device"] : []),
   ])(
     "retains complete module stores before removing a clean unlocked populated worktree; removable donor=%s",
     async (donorKind) => {
-      const removableDonor = donorKind !== "local" && donorKind !== "orphan-index"
+      const removableDonor = !["local", "orphan-index", "invalid-graph"].includes(donorKind)
       const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-worktree-remove-"))
       roots.push(fixtureRoot)
       const fixture = createSuperproject(fixtureRoot)
@@ -722,6 +723,8 @@ describe("git super worktree add", () => {
       git(author, ["checkout", "-q", "--detach", fixture.pin])
       if (removableDonor) git(child, ["update-ref", "refs/heads/spare", spare])
       const source = git(child, ["rev-parse", "--absolute-git-dir"])
+      const invalidGraph = donorKind === "invalid-graph" ? join(source, "objects/info/commit-graph") : undefined
+      if (invalidGraph !== undefined) writeFileSync(invalidGraph, "invalid copied derived cache\n")
       // Reflogs and unreferenced local payload are distinct preservation roots.
       // A branch-only fixture can pass after accidentally dropping either one.
       const reflogOnly = git(author, ["commit-tree", `${fixture.pin}^{tree}`, "-m", "reflog-only work"])
@@ -794,7 +797,11 @@ describe("git super worktree add", () => {
       let proofBeforeRemoval = false
       const diagnostic = {
         write(value: string) {
-          if (value.startsWith("worktree removal proof ")) proofBeforeRemoval = existsSync(worktree)
+          if (value.startsWith("worktree removal proof ")) {
+            proofBeforeRemoval = existsSync(worktree)
+            if (invalidGraph !== undefined)
+              expect(readFileSync(invalidGraph, "utf8")).toBe("invalid copied derived cache\n")
+          }
         },
       }
       expect(
@@ -811,6 +818,7 @@ describe("git super worktree add", () => {
       expect(existsSync(source)).toBe(false)
       expect(git(fixture.product, ["worktree", "list", "--porcelain"])).not.toContain(worktree)
       const store = join(result.proof.retained, "vendor/dep")
+      if (invalidGraph !== undefined) expect(existsSync(join(store, "objects/info/commit-graph"))).toBe(false)
       expect(readFileSync(join(store, "logs/HEAD"), "utf8")).toBe(beforeLog)
       expect(readFileSync(result.proof.manifest, "utf8")).toContain("vendor/dep/packed-refs")
       // The self-linked donor was removed together with the source modules tree.

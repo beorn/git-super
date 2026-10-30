@@ -1445,8 +1445,10 @@ async function normalizeRetainedModules(
   copy: string,
   common: string,
   lender: string,
-): Promise<void> {
+  fullIntegrity: boolean,
+): Promise<ReadonlySet<string>> {
   const canonicalCommon = realpathSync(common)
+  const borrowed = new Set<string>()
   const objects = [...borrowerEntries(copy, undefined)]
     .filter((entry) => entry.name === "objects" && isGitDirectory(entry.parentPath, copy, false))
     .map((entry) => join(entry.parentPath, entry.name))
@@ -1487,6 +1489,7 @@ async function normalizeRetainedModules(
     const staged = `${alternates}.retention-${randomUUID()}`
     writeFileSync(staged, durable.size === 0 ? "" : `${[...durable].join("\n")}\n`, { flag: "wx" })
     renameSync(staged, alternates)
+    for (const store of durable) borrowed.add(store)
     const args = ["-c", "protocol.allow=never", "--git-dir", dirname(destination), "--work-tree", checkout]
     const graph = await git.run(copy, [...args, "commit-graph", "verify"], true, 300_000)
     if (graph.code !== 0) {
@@ -1499,7 +1502,7 @@ async function normalizeRetainedModules(
       }
       await git.run(copy, [...args, "commit-graph", "verify"], false, 300_000)
     }
-    await git.run(copy, [...args, "fsck", "--connectivity-only"], false, 300_000)
+    await git.run(copy, [...args, "fsck", fullIntegrity ? "--full" : "--connectivity-only"], false, 300_000)
   }
   const dependency = retainedAlternatesDependency(
     copy,
@@ -1520,6 +1523,7 @@ async function normalizeRetainedModules(
         : `retained copy ${copy} still borrows removable stores; worktree preserved`,
     )
   }
+  return borrowed
 }
 
 function validateRetainedObjectsDeclarations(proof: Record<string, unknown>, retained: string): boolean | string {
@@ -1979,29 +1983,53 @@ async function retainResolvedWorktreeModules(context: {
       }
     }
     before = await cleanSnapshot(git, copiedCheckout, inspect, excludedSubmodules)
-    for (const repository of privateProjection.repositories) {
-      const copied = join(retained, relative(gitDir, repository.gitDirectory))
-      // Full integrity includes borrowed stores: the public root takes 62s and a large child 207–239s.
-      // Keep a finite five-minute bound for this full scan rather than the interactive deadline.
-      await git.run(
-        copiedCheckout,
-        ["--git-dir", copied, "--work-tree", copiedCheckout, "fsck", "--full"],
-        false,
-        300_000,
-      )
-    }
   }
-  // Normalize ordinary/destroyed copies before their final proof or removal.
-  // Private pointer/config custody is extended through this same stage next.
+  // One transform handles ordinary, destroyed and attested private metadata.
   let finalRetainedManifest = retainedManifest
-  if (privateProjection === undefined && retained !== null) {
-    await normalizeRetainedModules(git, copiedCheckout, copiedSource, copiedTree, common, gitDir)
-    finalRetainedManifest = manifest(copiedTree, copiedCustody, true)
+  let retainedBorrowing: ReadonlySet<string> = new Set()
+  if (retained !== null) {
+    let borrowingCommon = common
+    if (privateProjection !== undefined) {
+      const objects = join(gitDir, "objects")
+      const lineage = alternatesLineageSync([objects], "", {
+        allowedObjects: new Set([
+          objects,
+          ...privateProjection.mounts.filter((mount) => mount.mode === "ro").map((mount) => mount.source),
+        ]),
+      })
+      // The root's attested lineage identifies its native common directory;
+      // child mounts alone never turn an arbitrary external path into custody.
+      const rootDonor = lineage[0]
+      if (rootDonor !== undefined) {
+        borrowingCommon = realpathSync(
+          await git.text(copiedCheckout, [
+            "--git-dir",
+            dirname(rootDonor),
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+          ]),
+        )
+      }
+    }
+    retainedBorrowing = await normalizeRetainedModules(
+      git,
+      copiedCheckout,
+      privateProjection === undefined ? copiedSource : gitDir,
+      privateProjection === undefined ? copiedTree : retained,
+      borrowingCommon,
+      gitDir,
+      privateProjection !== undefined,
+    )
+    finalRetainedManifest = manifest(copiedTree, copiedCustody, true, privateProjection !== undefined)
     if (finalRetainedManifest.externalObjectStores.length !== 0) {
       throw new Error(`retained copy ${retained} still has external objects links; worktree preserved`)
     }
     expectedCopy = finalRetainedManifest.entries
-    if (JSON.stringify(manifest(copiedSource, custody, true).entries) !== JSON.stringify(retainedManifest.entries)) {
+    if (
+      JSON.stringify(manifest(copiedSource, custody, true, privateProjection !== undefined).entries) !==
+      JSON.stringify(retainedManifest.entries)
+    ) {
       throw new Error(`Git store ${copiedSource} changed during retention; worktree preserved`)
     }
   }
@@ -2064,7 +2092,9 @@ async function retainResolvedWorktreeModules(context: {
     registerRetainedBorrower(common, retained, proof.manifest)
   }
   if (retained !== null && privateProjection !== undefined) {
-    for (const mount of privateProjection.mounts.filter((mount) => mount.mode === "ro")) {
+    for (const mount of privateProjection.mounts.filter(
+      (mount) => mount.mode === "ro" && retainedBorrowing.has(mount.source),
+    )) {
       registerRetainedBorrower(dirname(mount.source), retained, proof.manifest)
     }
   }

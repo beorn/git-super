@@ -28,7 +28,7 @@ import { createExclusive } from "../src/exclusive.ts"
 import { cleanGitEnvironment, withGitEnvironment } from "../src/git.ts"
 import { createLocalGitProcess } from "../src/process.ts"
 import { createGit, createGitWorktreeStore } from "../src/worktree.ts"
-import { acquireRemovalWriterLeases, retainWorktreeModules } from "../src/worktree-removal.ts"
+import { acquireRemovalWriterLeases, manifest, retainWorktreeModules } from "../src/worktree-removal.ts"
 import { shellQuote } from "../src/shell-command.ts"
 import { addNestedAlphaSubmodule, advanceRepository, canonicalTmpdir, createProductFixture, git } from "./fixture.ts"
 
@@ -307,9 +307,11 @@ it.each([
   [false, true, false, false],
   [false, false, true, false],
   [false, false, true, true],
+  [false, true, true, false, true],
+  [true, true, true, false, true],
 ])(
-  "projects a public linked source with its declared child object-store lenders; nested=%s; authored=%s; remove donor=%s; independent=%s",
-  async (nested, authored, removeDonor, independent) => {
+  "projects a public linked source with its declared child object-store lenders; nested=%s; authored=%s; remove donor=%s; independent=%s; normalized=%s",
+  async (nested, authored, removeDonor, independent, normalized = false) => {
     const root = await mkdtemp(join(canonicalTmpdir(), "git-super-linked-source-closure-"))
     roots.push(root)
     const fixture = nested ? addNestedAlphaSubmodule(createProductFixture(root)) : createProductFixture(root)
@@ -371,6 +373,14 @@ it.each([
       // A retained private root has a free writer lease, not an active Git lock.
       // Existing retention journeys never remove its linked-source donor afterwards.
       if (projected.projection === undefined) throw new Error("projection omitted its custody record")
+      const donorOnly = normalized
+        ? git(alpha, "commit-tree", "HEAD^{tree}", "-m", "donor-only reflog work")
+        : undefined
+      if (donorOnly !== undefined) {
+        const privateChild = join(root, "seat/packages/alpha")
+        git(privateChild, "update-ref", "--create-reflog", "refs/heads/reflog-only", donorOnly)
+        git(privateChild, "update-ref", "refs/heads/reflog-only", selected)
+      }
       const retained = await GitSuper.retainPrivateGitProjection(projected.projection, join(root, "retained-seat"))
       expect(retained.state, JSON.stringify(retained.detail)).toBe("updated")
       if (retained.manifest === undefined) throw new Error("retention omitted its dependency manifest")
@@ -392,10 +402,64 @@ it.each([
         proof.retained,
         join(proof.retained, "modules/packages/alpha"),
         join(proof.retained, "modules/vendor/beta"),
+        ...(nested ? [join(proof.retained, "modules/packages/alpha/modules/apps/maddoc")] : []),
       ]
       const copiedHeads = copiedStores.map((storePath) =>
         git(fixture.product, "--git-dir", storePath, "rev-parse", "HEAD"),
       )
+      if (normalized) {
+        expect(proof.externalObjectStores).toEqual([])
+        for (const pair of borrowedPairs) {
+          expect(readFileSync(pair.alternate, "utf8")).not.toContain(donorGit)
+        }
+        for (const repository of projected.projection.repositories) {
+          expect(
+            createHash("sha256")
+              .update(readFileSync(join(repository.gitDirectory, "config")))
+              .digest("hex"),
+          ).toBe(repository.configurationSha256)
+          expect(git(repository.checkout, "rev-parse", "--absolute-git-dir")).toBe(repository.gitDirectory)
+        }
+        await store.remove(source, {
+          retention: { root: join(root, "retained-donor"), report: () => {} },
+          excludedSubmodules,
+        })
+        expect(existsSync(source)).toBe(false)
+        for (const [index, copied] of copiedStores.entries()) {
+          expect(git(fixture.product, "--git-dir", copied, "rev-parse", "HEAD")).toBe(copiedHeads[index])
+          git(fixture.product, "--git-dir", copied, "--work-tree", dirname(proof.retained), "fsck", "--full")
+        }
+        expect(
+          git(
+            fixture.product,
+            "--git-dir",
+            join(proof.retained, "modules/packages/alpha"),
+            "cat-file",
+            "-t",
+            donorOnly!,
+          ),
+        ).toBe("commit")
+        return
+      }
+      if (!independent) {
+        // Historical guard fixtures retain their borrowed edges explicitly;
+        // the new constructor must never recreate this old dependency shape.
+        for (const pair of borrowedPairs) writeFileSync(pair.alternate, `${pair.lender}\n`)
+        const checkout = dirname(proof.retained)
+        const snapshot = manifest(
+          checkout,
+          {
+            common: proof.retained,
+            checkout,
+            gitDir: proof.retained,
+            modules: join(proof.retained, "modules"),
+          },
+          true,
+          true,
+        )
+        const old = JSON.parse(readFileSync(retained.manifest, "utf8")) as Record<string, unknown>
+        writeFileSync(retained.manifest, JSON.stringify({ ...old, ...snapshot }) + "\n")
+      }
       if (independent) {
         // Legal independent counterpart: each private store borrows only the durable public store.
         for (const [storePath, durable] of [
@@ -433,6 +497,15 @@ it.each([
           ...projected.projection.mounts.filter((mount) => mount.mode === "ro").map((mount) => dirname(mount.source)),
         ]),
       ].map((common) => join(common, "git-super-retained-borrowers"))
+      // These old guard cases include registrations at former linked lenders.
+      // The normalized cases above exercise only the actual new writer output.
+      for (const registry of registries) {
+        mkdirSync(registry, { recursive: true })
+        writeFileSync(
+          join(registry, pointerName),
+          JSON.stringify({ retained: proof.retained, manifest: retained.manifest }) + "\n",
+        )
+      }
       const registryBefore = registries.map((registry) => ({
         registry,
         files: readdirSync(registry)

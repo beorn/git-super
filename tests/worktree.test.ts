@@ -111,7 +111,8 @@ function historicalRetainedBorrower(proof: WorktreeRemovalProof, repo: string): 
   })
   writeFileSync(
     proof.manifest,
-    JSON.stringify({ ...JSON.parse(readFileSync(proof.manifest, "utf8")), ...snapshot }) + "\n",
+    JSON.stringify({ ...(JSON.parse(readFileSync(proof.manifest, "utf8")) as Record<string, unknown>), ...snapshot }) +
+      "\n",
   )
   const registry = join(common, "git-super-retained-borrowers")
   mkdirSync(registry, { recursive: true })
