@@ -90,18 +90,18 @@ function registrySnapshot(registry: string) {
 
 // Historical guard fixtures must keep real borrowed metadata: the new writer
 // deliberately stops producing it. Run while report() still has the source.
-function historicalRetainedBorrower(proof: WorktreeRemovalProof, repo: string): void {
+function historicalRetainedBorrower(proof: WorktreeRemovalProof, repo: string, restoreSource = true): void {
   if (proof.retained === null) return
   const original = join(proof.modules, "packages/alpha/objects")
   const objects = join(proof.retained, "packages/alpha/objects")
   const alternate = join(original, "info/alternates")
-  if (lstatSync(original).isSymbolicLink()) {
+  if (restoreSource && lstatSync(original).isSymbolicLink()) {
     rmSync(objects, { recursive: true })
     symlinkSync(realpathSync(original), objects, "dir")
-  } else if (existsSync(alternate)) {
+  } else if (restoreSource && existsSync(alternate)) {
     mkdirSync(join(objects, "info"), { recursive: true })
     writeFileSync(join(objects, "info/alternates"), readFileSync(alternate))
-  } else return
+  } else if (restoreSource) return
   const common = git(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim()
   const snapshot = manifest(proof.retained, {
     common,
@@ -1361,61 +1361,209 @@ describe("createGitWorktreeStore", () => {
   )
 
   // Retained regular-file alternates are absent from the symlink and live-rehome lifecycles.
+  // Cross-common rows distinguish surviving ancestors from foreign/admin impostors,
+  // traverse an accepted ancestor's lender edge, and exclude an owner deleted with its checkout.
   // @failure Removing a lender strands a retained alternates-only copy, directly or transitively (#26497).
   // @level l1
   // @consumer worktree remove retained-copy custody
-  it.each(["direct", "transitive", "symlink-transitive"] as const)(
-    "protects a historical registered retained alternates closure; shape=%s",
-    async (shape) => {
-      const root = await mkdtemp(join(canonicalTmpdir(), "git-super-retained-alternates-"))
-      try {
-        const fixture = createProductFixture(root)
-        const store = createLocalGitWorktreeStore({ repo: fixture.product })
-        const owner = await addAlphaWorktree(store, root, "owner")
-        const intermediate = shape === "direct" ? undefined : await addAlphaWorktree(store, root, "intermediate")
+  it.each([
+    "direct",
+    "transitive",
+    "symlink-transitive",
+    "enclosing-primary",
+    "foreign",
+    "ancestor-lender",
+    "deleted-owner",
+    "head-only",
+  ] as const)("protects a historical registered retained alternates closure; shape=%s", async (shape) => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-retained-alternates-"))
+    try {
+      let fixture = createProductFixture(root)
+      if (!["direct", "transitive", "symlink-transitive"].includes(shape)) {
+        // A native submodule common sits below the enclosing repository's modules.
+        const enclosing = join(root, "enclosing")
+        createRepository(enclosing, "root.txt", "root\n")
+        git(enclosing, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", fixture.product, "component"])
+        git(enclosing, ["commit", "-qam", "add component"])
+        let component = join(enclosing, "component")
+        let primary = join(enclosing, ".git")
+        if (shape === "head-only") {
+          const parent = join(root, "parent-linked")
+          await createLocalGitWorktreeStore({ repo: enclosing }).add({ kind: "detached", path: parent, ref: "HEAD" })
+          git(parent, ["-c", "protocol.file.allow=always", "submodule", "update", "--init", "component"])
+          component = join(parent, "component")
+          primary = git(parent, ["rev-parse", "--absolute-git-dir"]).trim()
+          expect(existsSync(join(primary, "HEAD"))).toBe(true)
+          expect(existsSync(join(primary, "config"))).toBe(false)
+          await symlink(join(enclosing, ".git/objects"), join(primary, "objects"), "dir")
+          expect(lstatSync(join(primary, "objects")).isSymbolicLink()).toBe(true)
+        }
+        fixture = { ...fixture, product: component }
+        let store = createLocalGitWorktreeStore({ repo: component })
         const borrower = await addAlphaWorktree(store, root, "borrower")
         const unrelated = await addAlphaWorktree(store, root, "unrelated")
-        if (intermediate) await writeFile(join(intermediate.objects, "info/alternates"), owner.objects + "\n")
-        if (shape === "symlink-transitive") await linkObjects(borrower.moduleDir, intermediate!.objects)
-        else await writeFile(join(borrower.objects, "info/alternates"), (intermediate?.objects ?? owner.objects) + "\n")
+        let common = git(component, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim()
+        let target = join(primary, "objects")
+        if (shape === "foreign") {
+          const foreign = join(root, "foreign")
+          createRepository(foreign, "foreign.txt", "foreign\n")
+          target = join(foreign, ".git/objects")
+        }
+        if (shape === "deleted-owner") {
+          // Native Git relocates the common into the actual checkout being deleted.
+          const moved = join(borrower.linked, "ignored-primary")
+          git(enclosing, ["init", "-q", "--separate-git-dir", moved])
+          primary = moved
+          common = join(primary, "modules/component")
+          await writeFile(join(component, ".git"), `gitdir: ${common}\n`)
+          git(root, ["--git-dir", common, "--work-tree", component, "config", "core.worktree", component])
+          git(root, [
+            "--git-dir",
+            common,
+            "--work-tree",
+            component,
+            "worktree",
+            "repair",
+            component,
+            borrower.linked,
+            unrelated.linked,
+          ])
+          for (const worktree of [borrower, unrelated]) {
+            const admin = git(worktree.linked, ["rev-parse", "--absolute-git-dir"]).trim()
+            const module = join(admin, "modules/packages/alpha")
+            await writeFile(join(worktree.linked, "packages/alpha/.git"), `gitdir: ${module}\n`)
+            git(root, [
+              "--git-dir",
+              module,
+              "--work-tree",
+              worktree.linked,
+              "config",
+              "core.worktree",
+              join(worktree.linked, "packages/alpha"),
+            ])
+            worktree.moduleDir = module
+            worktree.objects = join(module, "objects")
+          }
+          await writeFile(join(common, "info/exclude"), "ignored-primary/\n")
+          target = join(primary, "objects")
+          store = createLocalGitWorktreeStore({ repo: component })
+        }
+        const sourceBefore = objectStoreSnapshot(borrower.objects)
         const proofs: WorktreeRemovalProof[] = []
+        const nativePositive = shape === "enclosing-primary" || shape === "deleted-owner"
+        if (nativePositive) await writeFile(join(borrower.objects, "info/alternates"), target + "\n")
         const retention = {
           root: join(root, "retained"),
           report: (proof: WorktreeRemovalProof) => {
-            historicalRetainedBorrower(proof, fixture.product)
+            if (nativePositive && proof.path === borrower.linked) {
+              // Do not replace native normalized alternates with source bytes.
+              expect(readFileSync(join(proof.retained!, "packages/alpha/objects/info/alternates"), "utf8")).toBe(
+                target + "\n",
+              )
+              historicalRetainedBorrower(proof, component, false)
+            } else if (!nativePositive) {
+              // Reconstruct historical metadata only after the native writer completed.
+              writeFileSync(join(borrower.objects, "info/alternates"), target + "\n")
+              historicalRetainedBorrower(proof, component)
+            }
             proofs.push(proof)
           },
         }
+        expect(git(join(borrower.linked, "packages/alpha"), ["rev-parse", "HEAD"]).trim()).toBe(fixture.alphaBase)
+        if (shape === "deleted-owner") {
+          await expect(store.remove(borrower.linked, { retention })).rejects.toThrow("unknown removal custody")
+          expect(existsSync(target)).toBe(true)
+          expect(existsSync(borrower.linked)).toBe(true)
+          expect(proofs).toEqual([])
+          return
+        }
         await store.remove(borrower.linked, { retention })
         const proof = proofs[0]!
-        const stored = JSON.parse(await readFile(proof.manifest, "utf8")) as Record<string, unknown>
-        const oldEntry = join(root, "old", dirname(proof.manifest).split("/").at(-1)!)
-        await writeFile(
-          proof.manifest,
-          JSON.stringify({
-            ...stored,
-            retained: join(oldEntry, "modules"),
-            manifest: join(oldEntry, "manifest.json"),
-          }) + "\n",
+        const objects = join(proof.retained!, "packages/alpha/objects")
+        if (shape === "ancestor-lender") await writeFile(join(target, "info/alternates"), unrelated.objects + "\n")
+        const before = objectStoreSnapshot(common)
+        const inspection = await store.inspectRemoval(unrelated.linked).then(
+          () => undefined,
+          (error: unknown) => error,
         )
-        const relocatedProof = await readFile(proof.manifest)
-        const common = git(fixture.product, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim()
-        const registry = join(common, "git-super-retained-borrowers")
-        expect(existsSync(registry)).toBe(true)
-        const pointers = readdirSync(registry).filter((name) => name.endsWith(".json"))
-        expect(pointers).toHaveLength(1)
-        const pointer = join(registry, pointers[0]!)
-        await store.remove(unrelated.linked, { retention })
-        expect(existsSync(pointer)).toBe(true)
-        await expect(store.remove(owner.linked, { retention })).rejects.toThrow(proof.retained!)
-        expect(existsSync(owner.linked)).toBe(true)
-        expect(existsSync(owner.objects)).toBe(true)
-        expect(await readFile(proof.manifest)).toEqual(relocatedProof)
-      } finally {
-        await rm(root, { recursive: true, force: true })
+        expect(objectStoreSnapshot(common)).toEqual(before)
+        if (shape === "enclosing-primary") {
+          expect(inspection).toBeUndefined()
+          expect(await readFile(join(objects, "info/alternates"), "utf8")).toBe(target + "\n")
+          for (const entry of sourceBefore.filter((entry) => entry.bytes !== null)) {
+            expect(await readFile(join(objects, entry.path))).toEqual(entry.bytes)
+          }
+          expect(git(root, ["--git-dir", dirname(objects), "--work-tree", root, "fsck", "--full"])).not.toContain(
+            "missing",
+          )
+          const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true)
+          try {
+            await store.remove(unrelated.linked, { retention })
+            expect(stderr).toHaveBeenCalledWith(
+              expect.stringContaining(
+                `retained borrower ${proof.retained} has no objects links or alternates into removable linked stores; dropped registry entry `,
+              ),
+            )
+          } finally {
+            stderr.mockRestore()
+          }
+          expect(existsSync(unrelated.linked)).toBe(false)
+          expect(existsSync(target)).toBe(true)
+        } else {
+          expect(inspection).toBeInstanceOf(Error)
+          expect((inspection as Error).message).toContain(
+            shape === "ancestor-lender" ? "borrows from removal store" : "unknown removal custody",
+          )
+          expect((inspection as Error).message).toContain(target)
+          expect(existsSync(unrelated.linked)).toBe(true)
+        }
+        return
       }
-    },
-  )
+      const store = createLocalGitWorktreeStore({ repo: fixture.product })
+      const owner = await addAlphaWorktree(store, root, "owner")
+      const intermediate = shape === "direct" ? undefined : await addAlphaWorktree(store, root, "intermediate")
+      const borrower = await addAlphaWorktree(store, root, "borrower")
+      const unrelated = await addAlphaWorktree(store, root, "unrelated")
+      if (intermediate) await writeFile(join(intermediate.objects, "info/alternates"), owner.objects + "\n")
+      if (shape === "symlink-transitive") await linkObjects(borrower.moduleDir, intermediate!.objects)
+      else await writeFile(join(borrower.objects, "info/alternates"), (intermediate?.objects ?? owner.objects) + "\n")
+      const proofs: WorktreeRemovalProof[] = []
+      const retention = {
+        root: join(root, "retained"),
+        report: (proof: WorktreeRemovalProof) => {
+          historicalRetainedBorrower(proof, fixture.product)
+          proofs.push(proof)
+        },
+      }
+      await store.remove(borrower.linked, { retention })
+      const proof = proofs[0]!
+      const stored = JSON.parse(await readFile(proof.manifest, "utf8")) as Record<string, unknown>
+      const oldEntry = join(root, "old", dirname(proof.manifest).split("/").at(-1)!)
+      await writeFile(
+        proof.manifest,
+        JSON.stringify({
+          ...stored,
+          retained: join(oldEntry, "modules"),
+          manifest: join(oldEntry, "manifest.json"),
+        }) + "\n",
+      )
+      const relocatedProof = await readFile(proof.manifest)
+      const common = git(fixture.product, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim()
+      const registry = join(common, "git-super-retained-borrowers")
+      expect(existsSync(registry)).toBe(true)
+      const pointers = readdirSync(registry).filter((name) => name.endsWith(".json"))
+      expect(pointers).toHaveLength(1)
+      const pointer = join(registry, pointers[0]!)
+      await store.remove(unrelated.linked, { retention })
+      expect(existsSync(pointer)).toBe(true)
+      await expect(store.remove(owner.linked, { retention })).rejects.toThrow(proof.retained!)
+      expect(existsSync(owner.linked)).toBe(true)
+      expect(existsSync(owner.objects)).toBe(true)
+      expect(await readFile(proof.manifest)).toEqual(relocatedProof)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
 
   // @failure The last closure crosses the enrollment deadline but its plan still authorizes pointer writes.
   // @level l1
@@ -1692,10 +1840,7 @@ describe("createGitWorktreeStore", () => {
       const legacyBytes = await readFile(proof.manifest)
       const commonForLegacy = git(fixture.product, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim()
       const pointerRoot = join(commonForLegacy, "git-super-retained-borrowers")
-      const pointerPath = join(
-        pointerRoot,
-        readdirSync(pointerRoot).find((name) => name.endsWith(".json"))!,
-      )
+      const pointerPath = join(pointerRoot, readdirSync(pointerRoot).find((name) => name.endsWith(".json"))!)
       const pointerBytes = await readFile(pointerPath)
       await writeFile(alternate, join(commonForLegacy, "modules/packages/alpha/objects") + "\n")
       // Unknown legacy proof fields plus a currently independent graph must preserve custody while unrelated cleanup proceeds.

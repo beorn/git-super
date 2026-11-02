@@ -1311,6 +1311,7 @@ function retainedStoreCustody(
   copy: string,
   common: string,
   lenders: readonly string[],
+  operationRoots: readonly string[],
   registrationCommon?: string,
 ): "lender" | "linked" | "durable" | "copy" | undefined {
   if (lenders.some((lender) => within(lender, target))) return "lender"
@@ -1318,6 +1319,18 @@ function retainedStoreCustody(
   if (within(join(common, "modules"), target)) return "durable"
   if (within(copy, target)) return "copy"
   if (registrationCommon === common && within(join(common, "objects"), target)) return "durable"
+  if (basename(target) === "objects") {
+    const owner = dirname(target)
+    const modules = join(owner, "modules")
+    if (
+      within(modules, common) &&
+      common !== modules &&
+      !operationRoots.some((root) => within(root, owner)) &&
+      isGitDirectory(owner, owner, false)
+    ) {
+      return "durable"
+    }
+  }
   return undefined
 }
 
@@ -1327,6 +1340,7 @@ function retainedAlternatesDependency(
   common: string,
   lenderGitDir: string | undefined,
   externalObjectStores: readonly ExternalObjectStore[],
+  operationRoots: readonly string[],
   deadline?: number,
   canonicalCopiedLinks = false,
   registrationCommon?: string,
@@ -1346,7 +1360,7 @@ function retainedAlternatesDependency(
       throw new Error(`retained closure ${retained} exceeded enrollment deadline`)
     }
     for (const target of new Set([declaredPath, canonicalPath])) {
-      const custody = retainedStoreCustody(target, copy, canonicalCommon, lenders, registrationCommon)
+      const custody = retainedStoreCustody(target, copy, canonicalCommon, lenders, operationRoots, registrationCommon)
       if (custody === "lender") {
         refuse(
           `retained copy ${retained} borrows from removal store through ${edge} (declared ${declaredPath}, canonical ${canonicalPath}); worktree preserved`,
@@ -1445,6 +1459,7 @@ async function normalizeRetainedModules(
   copy: string,
   common: string,
   lender: string,
+  operationRoots: readonly string[],
   fullIntegrity: boolean,
 ): Promise<ReadonlySet<string>> {
   const canonicalCommon = realpathSync(common)
@@ -1459,13 +1474,15 @@ async function normalizeRetainedModules(
     const removable = new Set<string>()
     const classify = (declared: string, canonical: string): void => {
       for (const target of new Set([declared, canonical])) {
-        if (retainedStoreCustody(target, source, canonicalCommon, [lender], canonicalCommon) === undefined) {
+        if (
+          retainedStoreCustody(target, source, canonicalCommon, [lender], operationRoots, canonicalCommon) === undefined
+        ) {
           throw new Error(
             `retained copy ${copy} has unknown removal custody through ${original}: ${target}; worktree preserved`,
           )
         }
       }
-      const kind = retainedStoreCustody(canonical, source, canonicalCommon, [lender], canonicalCommon)
+      const kind = retainedStoreCustody(canonical, source, canonicalCommon, [lender], operationRoots, canonicalCommon)
       if (kind === "durable") durable.add(canonical)
       else if (canonical !== seed || lstatSync(original).isSymbolicLink()) removable.add(canonical)
     }
@@ -1509,6 +1526,7 @@ async function normalizeRetainedModules(
     common,
     lender,
     [],
+    operationRoots,
     undefined,
     false,
     canonicalCommon,
@@ -1664,6 +1682,7 @@ function guardRetainedBorrowers(common: string, lenderGitDir: string, policy: "i
           common,
           lenderGitDir,
           actual.externalObjectStores,
+          [checkout, lenderGitDir],
           undefined,
           false,
           realpathSync(dirname(dirname(registration))),
@@ -1873,6 +1892,7 @@ async function retainResolvedWorktreeModules(context: {
           common,
           undefined,
           manifest(modules, custody, false).externalObjectStores,
+          [path, gitDir],
           undefined,
           true,
           realpathSync(common),
@@ -2020,6 +2040,7 @@ async function retainResolvedWorktreeModules(context: {
         privateProjection === undefined ? copiedTree : retained,
         borrowingCommon,
         gitDir,
+        [path, gitDir],
         privateProjection !== undefined,
       )
     } catch (error) {
@@ -2428,6 +2449,7 @@ export async function enrollRetainedBorrowers(options: RetentionEnrollOptions): 
           common,
           undefined,
           actual.externalObjectStores,
+          [runtime.path, runtime.modules],
           deadline,
           false,
           existing === undefined ? undefined : realpathSync(dirname(dirname(registration))),
