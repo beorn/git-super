@@ -38,6 +38,7 @@ import {
 import { canonicalTmpdir, createRepository, git as gitCwd } from "./fixture.ts"
 import { runCli } from "../src/cli.ts"
 import { acquireExclusive } from "../src/exclusive.ts"
+import { rebuildRetainedCopyProof as readPublicRetainedProof } from "../src/index.ts"
 
 const environment: NodeJS.ProcessEnv = {
   ...process.env,
@@ -163,6 +164,41 @@ function buildSyntheticEntry(remoteCount = 12): {
   const proof = writeProof(entry, modulesCopy, recorded.files, recorded.entries)
   return { root, entry, gitDir, nested, proof }
 }
+
+/** @failure 30783: a native manifest key rename silently breaks Yrd's admitted-close identity check.
+ * @level l2 @consumer Yrd reads only the native writer's head/createdAt keys through the public rebuild reader.
+ * The synthetic compaction fixtures write their own proof, so they cannot detect a native writer format change.
+ */
+it("exposes native removal head and createdAt under the consumer field names (30783)", async () => {
+  const root = mkdtempSync(join(canonicalTmpdir(), "git-super-close-proof-fields-"))
+  roots.push(root)
+  const dependency = join(root, "dependency")
+  const product = join(root, "product")
+  createRepository(dependency, "dep.ts", "export const dep = 1\n")
+  createRepository(product, "file.ts", "export const n = 1\n")
+  gitCwd(product, "-c", "protocol.file.allow=always", "submodule", "add", "-q", dependency, "vendor/dep")
+  gitCwd(product, "commit", "-q", "-m", "add vendor/dep")
+  const head = gitCwd(product, "rev-parse", "HEAD")
+  const worktree = join(root, "candidate")
+  const retainedRoot = join(root, "retained")
+  expect(await runCli(["--repo", product, "worktree", "add", worktree, "HEAD"], outputSink(), outputSink())).toBe(0)
+  let captured: WorktreeRemovalProof | undefined
+  const store = createLocalGitWorktreeStore({ repo: product })
+  await store.remove(worktree, {
+    retention: {
+      root: retainedRoot,
+      report: (proof) => {
+        captured = proof
+      },
+    },
+  })
+  if (captured === undefined) throw new Error("native remove returned no proof")
+  const rebuilt = readPublicRetainedProof(join(captured.manifest, ".."), retainedRoot)
+  if (typeof rebuilt === "string") throw new Error(rebuilt)
+  expect(rebuilt.path).toBe(worktree)
+  expect(rebuilt.stored).toMatchObject({ head, createdAt: captured.createdAt })
+  expect(Number.isFinite(Date.parse(String(rebuilt.stored.createdAt)))).toBe(true)
+})
 
 describe("compactRetainedModules", () => {
   it("packs every ref value, drops remote-tracking reflogs, and keeps HEAD plus local reflogs byte-identical", () => {
