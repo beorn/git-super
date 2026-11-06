@@ -267,15 +267,13 @@ export async function readCommitSubmodules(
     configuredByName: ReadonlyMap<string, ConfiguredSubmodule>,
   ): CommitSubmodule[] | SelectedCommitSubmodules => {
     if (selection === undefined) return joinCommitSubmodules(gitlinks, configuredByName, commit)
-    const selectedPaths = [...selected].map(
-      (path): SelectedCommitPath => ({
-        path,
-        treeEntry: selectedTreeEntries.get(path) ?? null,
-        declarations: [...configuredByName]
-          .filter(([, configured]) => configured.path === path)
-          .map(([name]) => ({ name, path })),
-      }),
-    )
+    const selectedPaths = [...selected].map((path): SelectedCommitPath => ({
+      path,
+      treeEntry: selectedTreeEntries.get(path) ?? null,
+      declarations: [...configuredByName]
+        .filter(([, configured]) => configured.path === path)
+        .map(([name]) => ({ name, path })),
+    }))
     return {
       selectedPaths,
       submodules: joinCommitSubmodules(

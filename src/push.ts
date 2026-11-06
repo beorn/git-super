@@ -2401,15 +2401,13 @@ async function leasedFrozenPush(
     if (!changed.has(row.path) || !sameHostedOwner(intent.rootRemote, row.remote)) continue
     const pins = [...new Set([row.pin, ...(row.publication === undefined ? [] : [row.publication.source])])]
     sourceUpdates.push(
-      ...pins.map(
-        (pin): RefUpdate => ({
-          repository: requirement.repository,
-          remote: row.remote,
-          source: pin,
-          destination: `refs/git-super/pins/${pin}`,
-          expectedDestination: { state: "missing" },
-        }),
-      ),
+      ...pins.map((pin): RefUpdate => ({
+        repository: requirement.repository,
+        remote: row.remote,
+        source: pin,
+        destination: `refs/git-super/pins/${pin}`,
+        expectedDestination: { state: "missing" },
+      })),
     )
     const refspecs = pins.map((pin) => `${pin}:refs/git-super/pins/${pin}`)
     if (row.publication === undefined) {
