@@ -324,6 +324,54 @@ describe("createGitWorktreeStore", () => {
    * @level l1
    * @consumer Yrd drop and local drop, which write no archive ref (30683)
    */
+  // 31936: the caller's exact retained checkout may detach only if a refused
+  // deletion restores its symbolic HEAD; a competing HEAD writer must survive.
+  // The existing detach-only and unchecked-out deletion cases cannot prove this.
+  it.each(["moved branch", "competing HEAD"] as const)("restores retained checkout after %s", async (mode) => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-retained-branch-"))
+    try {
+      const repo = join(root, "repo")
+      createRepository(repo, "root.txt", "root\n")
+      const tip = git(repo, ["rev-parse", "HEAD"]).trim()
+      const branch = "task/drop"
+      const linked = join(root, "linked")
+      git(repo, ["worktree", "add", "--quiet", "-b", branch, linked, tip])
+      git(repo, ["commit", "--allow-empty", "-qm", "competing writer"])
+      const newer = git(repo, ["rev-parse", "HEAD"]).trim()
+      const native = createLocalGitProcess()
+      let moved = false
+      const store = createGitWorktreeStore({
+        repo,
+        gitProcess: {
+          run: async (request) => {
+            const result = await native.run(request)
+            if (!moved && result.code === 0 && request.args.includes("--no-deref") && request.args.includes("HEAD")) {
+              git(repo, ["update-ref", `refs/heads/${branch}`, newer, tip])
+              if (mode === "competing HEAD") git(linked, ["update-ref", "HEAD", newer, tip])
+              moved = true
+            }
+            return result
+          },
+        },
+      })
+      const failure = await store.removeBranch({ branch, tip, retainedCheckout: linked }).then(
+        () => undefined,
+        (cause: unknown) => cause,
+      )
+      expect(moved).toBe(true)
+      expect(String(failure)).toContain(`refs/heads/${branch}`)
+      expect(git(repo, ["rev-parse", `refs/heads/${branch}`]).trim()).toBe(newer)
+      const head = spawnSync("git", ["-C", linked, "symbolic-ref", "--quiet", "HEAD"], { encoding: "utf8" })
+      if (mode === "competing HEAD") {
+        expect(String(failure)).toContain("restore")
+        expect(head.status).toBe(1)
+        expect(git(linked, ["rev-parse", "HEAD"]).trim()).toBe(newer)
+      } else expect(head.stdout.trim()).toBe(`refs/heads/${branch}`)
+    } finally {
+      // raw-delete-allow: root is this test's isolated mkdtemp fixture.
+      await rm(root, { recursive: true, force: true })
+    }
+  })
   it("removes an unchecked-out branch at its exact tip and writes no archive ref", async () => {
     const root = await mkdtemp(join(canonicalTmpdir(), "git-super-branch-removal-"))
     try {
@@ -352,7 +400,21 @@ describe("createGitWorktreeStore", () => {
       await expect(store.removeBranch({ branch, tip: newer, beforeRemove: hold })).rejects.toThrow("caller hold")
       expect(git(repo, ["rev-parse", `refs/heads/${branch}`]).trim()).toBe(newer)
 
-      await store.removeBranch({ branch, tip: newer })
+      const native = createLocalGitProcess()
+      const transactions: (string | undefined)[] = []
+      const ordinary = createGitWorktreeStore({
+        repo,
+        gitProcess: {
+          run: async (request) => {
+            if (request.args.includes("update-ref") && request.args.includes("--stdin")) {
+              transactions.push(request.stdin)
+            }
+            return native.run(request)
+          },
+        },
+      })
+      await ordinary.removeBranch({ branch, tip: newer })
+      expect(transactions).toEqual([`start\noption no-deref\ndelete refs/heads/${branch} ${newer}\nprepare\ncommit\n`])
       expect(git(repo, ["for-each-ref", "--format=%(refname)", `refs/heads/${branch}`]).trim()).toBe("")
       expect(git(repo, ["for-each-ref", "--format=%(refname)", "refs/archive/"]).trim()).toBe("")
     } finally {

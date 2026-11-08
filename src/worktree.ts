@@ -1482,6 +1482,44 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
     return undefined
   }
 
+  const detachAt = async (path: string, expectedTip: string, expectedBranch: string) => {
+    if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(expectedTip)) {
+      throw new Error(`worktree ${path}: expected a full SHA1 or SHA256 tip, got ${JSON.stringify(expectedTip)}`)
+    }
+    const target = realpathSync(path)
+    const registered = await listWorktrees(git, repo)
+    let exact = registered.some((row) => row.path === target)
+    if (!exact) {
+      // Absorbed submodules register their primary administration directory, not their checkout.
+      const common = realpathSync(
+        (await git.run(target, ["rev-parse", "--path-format=absolute", "--git-common-dir"])).stdout.trim(),
+      )
+      const directory = realpathSync((await git.run(target, ["rev-parse", "--absolute-git-dir"])).stdout.trim())
+      const toplevel = realpathSync((await git.run(target, ["rev-parse", "--show-toplevel"])).stdout.trim())
+      exact = directory === common && toplevel === target && registered.some((row) => row.path === common)
+    }
+    if (!exact) throw new Error(`worktree ${path}: no exact registration in ${repo}; refusing to detach HEAD`)
+    const symbolic = await git.run(target, ["symbolic-ref", "--quiet", "--no-recurse", "HEAD"], true)
+    if (symbolic.code !== 0) {
+      throw new Error(`worktree ${path}: HEAD is not a readable symbolic reference: ${symbolic.stderr.trim()}`)
+    }
+    const branch = symbolic.stdout.trim()
+    if (!branch.startsWith("refs/heads/")) {
+      throw new Error(`worktree ${path}: HEAD references ${branch}, expected refs/heads/<branch>`)
+    }
+    await git.run(target, ["check-ref-format", branch])
+    if (branch !== expectedBranch) {
+      throw new Error(`worktree ${path}: HEAD references ${branch}, expected ${expectedBranch}`)
+    }
+    const tip = await git.commit(target, branch)
+    if (tip !== expectedTip) {
+      throw new Error(`worktree ${path}: branch ${branch} tip moved from ${expectedTip} to ${tip}`)
+    }
+    // The expected old OID also refuses a branch that advances after the read above.
+    await git.run(target, ["update-ref", "--no-deref", "HEAD", expectedTip, expectedTip])
+    return { branch, tip: expectedTip }
+  }
+
   return Object.freeze({
     repo,
     git,
@@ -1563,45 +1601,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       expectedTip: string,
       expectedBranch: string,
     ): Promise<Readonly<{ branch: string; tip: string }>> {
-      return mutate(`detach worktree ${path}`, async () => {
-        if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(expectedTip)) {
-          throw new Error(`worktree ${path}: expected a full SHA1 or SHA256 tip, got ${JSON.stringify(expectedTip)}`)
-        }
-        const target = realpathSync(path)
-        const registered = await listWorktrees(git, repo)
-        let exact = registered.some((row) => row.path === target)
-        if (!exact) {
-          // Absorbed submodules register their primary administration directory, not their checkout.
-          const common = realpathSync(
-            (await git.run(target, ["rev-parse", "--path-format=absolute", "--git-common-dir"])).stdout.trim(),
-          )
-          const directory = realpathSync((await git.run(target, ["rev-parse", "--absolute-git-dir"])).stdout.trim())
-          const toplevel = realpathSync((await git.run(target, ["rev-parse", "--show-toplevel"])).stdout.trim())
-          exact = directory === common && toplevel === target && registered.some((row) => row.path === common)
-        }
-        if (!exact) {
-          throw new Error(`worktree ${path}: no exact registration in ${repo}; refusing to detach HEAD`)
-        }
-        const symbolic = await git.run(target, ["symbolic-ref", "--quiet", "--no-recurse", "HEAD"], true)
-        if (symbolic.code !== 0) {
-          throw new Error(`worktree ${path}: HEAD is not a readable symbolic reference: ${symbolic.stderr.trim()}`)
-        }
-        const branch = symbolic.stdout.trim()
-        if (!branch.startsWith("refs/heads/")) {
-          throw new Error(`worktree ${path}: HEAD references ${branch}, expected refs/heads/<branch>`)
-        }
-        await git.run(target, ["check-ref-format", branch])
-        if (branch !== expectedBranch) {
-          throw new Error(`worktree ${path}: HEAD references ${branch}, expected ${expectedBranch}`)
-        }
-        const tip = await git.commit(target, branch)
-        if (tip !== expectedTip) {
-          throw new Error(`worktree ${path}: branch ${branch} tip moved from ${expectedTip} to ${tip}`)
-        }
-        // The expected old OID also refuses a branch that advances after the read above.
-        await git.run(target, ["update-ref", "--no-deref", "HEAD", expectedTip, expectedTip])
-        return { branch, tip: expectedTip }
-      })
+      return mutate(`detach worktree ${path}`, () => detachAt(path, expectedTip, expectedBranch))
     },
     async remove(
       path: string,
@@ -2260,6 +2260,8 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         tip: string
         verify?: Readonly<{ ref: string; oid: string }>
         beforeRemove?: () => Promise<void>
+        /** Preserve this exact attached checkout while retiring its branch; compensate on refusal. */
+        retainedCheckout?: string
       }>,
     ): Promise<void> {
       await mutate(`retire branch ${input.branch}`, async () => {
@@ -2278,28 +2280,49 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         }
         const ref = `refs/heads/${branch}`
         await input.beforeRemove?.()
-        const held = await branchHolder(branch)
-        if (held !== undefined) throw new Error(held)
-        const symbolic = await git.run(repo, ["symbolic-ref", "--quiet", "--no-recurse", ref], true)
-        if (symbolic.code === 0) {
-          throw new Error(
-            `branch ${branch}: symbolic reference to ${symbolic.stdout.trim()}; refusing branch removal; it is an alias, not a branch: run git symbolic-ref --delete ${shellQuote(ref)} to remove only the alias`,
+        let detached = false
+        try {
+          if (input.retainedCheckout !== undefined) {
+            await detachAt(input.retainedCheckout, tip, ref)
+            detached = true
+          }
+          const held = await branchHolder(branch)
+          if (held !== undefined) throw new Error(held)
+          const symbolic = await git.run(repo, ["symbolic-ref", "--quiet", "--no-recurse", ref], true)
+          if (symbolic.code === 0) {
+            throw new Error(
+              `branch ${branch}: symbolic reference to ${symbolic.stdout.trim()}; refusing branch removal; it is an alias, not a branch: run git symbolic-ref --delete ${shellQuote(ref)} to remove only the alias`,
+            )
+          }
+          if (symbolic.code !== 1) {
+            throw new Error(
+              `branch ${branch}: symbolic reference inspection failed (exit ${symbolic.code}): ${symbolic.stderr.trim()}`,
+            )
+          }
+          const verifyLine = verify === undefined ? "" : `verify ${verify.ref} ${verify.oid}\n`
+          await git.run(
+            repo,
+            ["-c", "core.fsync=loose-object,reference", "-c", "core.fsyncMethod=fsync", "update-ref", "--stdin"],
+            false,
+            timeouts.operation,
+            // no-deref is per-command: keep verify unchanged and fence a ref rebound after the symbolic check.
+            { stdin: `start\n${verifyLine}option no-deref\ndelete ${ref} ${tip}\nprepare\ncommit\n` },
           )
+        } catch (cause) {
+          if (detached && input.retainedCheckout !== undefined) {
+            try {
+              await git.run(input.retainedCheckout, ["update-ref", "--stdin"], false, timeouts.operation, {
+                stdin: `start\nsymref-update HEAD ${ref} oid ${tip}\nprepare\ncommit\n`,
+              })
+            } catch (restoreError) {
+              throw new Error(
+                `${String(cause)}; could not restore retained checkout ${input.retainedCheckout}: ${String(restoreError)}`,
+                { cause },
+              )
+            }
+          }
+          throw cause
         }
-        if (symbolic.code !== 1) {
-          throw new Error(
-            `branch ${branch}: symbolic reference inspection failed (exit ${symbolic.code}): ${symbolic.stderr.trim()}`,
-          )
-        }
-        const verifyLine = verify === undefined ? "" : `verify ${verify.ref} ${verify.oid}\n`
-        await git.run(
-          repo,
-          ["-c", "core.fsync=loose-object,reference", "-c", "core.fsyncMethod=fsync", "update-ref", "--stdin"],
-          false,
-          timeouts.operation,
-          // no-deref is per-command: keep verify unchanged and fence a ref rebound after the symbolic check.
-          { stdin: `start\n${verifyLine}option no-deref\ndelete ${ref} ${tip}\nprepare\ncommit\n` },
-        )
       })
     },
     /**
