@@ -327,51 +327,86 @@ describe("createGitWorktreeStore", () => {
   // 31936: the caller's exact retained checkout may detach only if a refused
   // deletion restores its symbolic HEAD; a competing HEAD writer must survive.
   // The existing detach-only and unchecked-out deletion cases cannot prove this.
-  it.each(["moved branch", "competing HEAD"] as const)("restores retained checkout after %s", async (mode) => {
-    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-retained-branch-"))
-    try {
-      const repo = join(root, "repo")
-      createRepository(repo, "root.txt", "root\n")
-      const tip = git(repo, ["rev-parse", "HEAD"]).trim()
-      const branch = "task/drop"
-      const linked = join(root, "linked")
-      git(repo, ["worktree", "add", "--quiet", "-b", branch, linked, tip])
-      git(repo, ["commit", "--allow-empty", "-qm", "competing writer"])
-      const newer = git(repo, ["rev-parse", "HEAD"]).trim()
-      const native = createLocalGitProcess()
-      let moved = false
-      const store = createGitWorktreeStore({
-        repo,
-        gitProcess: {
-          run: async (request) => {
-            const result = await native.run(request)
-            if (!moved && result.code === 0 && request.args.includes("--no-deref") && request.args.includes("HEAD")) {
-              git(repo, ["update-ref", `refs/heads/${branch}`, newer, tip])
-              if (mode === "competing HEAD") git(linked, ["update-ref", "HEAD", newer, tip])
-              moved = true
-            }
-            return result
+  it.each(["moved branch", "competing HEAD", "proof changed", "callback refused"] as const)(
+    "restores retained checkout after %s",
+    async (mode) => {
+      const root = await mkdtemp(join(canonicalTmpdir(), "git-super-retained-branch-"))
+      try {
+        const repo = join(root, "repo")
+        createRepository(repo, "root.txt", "root\n")
+        const tip = git(repo, ["rev-parse", "HEAD"]).trim()
+        const branch = "task/drop"
+        const linked = join(root, "linked")
+        git(repo, ["worktree", "add", "--quiet", "-b", branch, linked, tip])
+        git(repo, ["commit", "--allow-empty", "-qm", "competing writer"])
+        const newer = git(repo, ["rev-parse", "HEAD"]).trim()
+        const proof = join(root, "discard-proof")
+        await writeFile(proof, "valid")
+        const admin = git(linked, ["rev-parse", "--absolute-git-dir"]).trim()
+        const native = createLocalGitProcess()
+        let moved = false
+        let callbackReads = 0
+        let callbackDetached = false
+        const store = createGitWorktreeStore({
+          repo,
+          gitProcess: {
+            run: async (request) => {
+              const result = await native.run(request)
+              if (!moved && result.code === 0 && request.args.includes("--no-deref") && request.args.includes("HEAD")) {
+                if (mode === "proof changed") await writeFile(proof, "changed during detach")
+                else if (mode !== "callback refused") {
+                  git(repo, ["update-ref", `refs/heads/${branch}`, newer, tip])
+                  if (mode === "competing HEAD") git(linked, ["update-ref", "HEAD", newer, tip])
+                }
+                moved = true
+              }
+              return result
+            },
           },
-        },
-      })
-      const failure = await store.removeBranch({ branch, tip, retainedCheckout: linked }).then(
-        () => undefined,
-        (cause: unknown) => cause,
-      )
-      expect(moved).toBe(true)
-      expect(String(failure)).toContain(`refs/heads/${branch}`)
-      expect(git(repo, ["rev-parse", `refs/heads/${branch}`]).trim()).toBe(newer)
-      const head = spawnSync("git", ["-C", linked, "symbolic-ref", "--quiet", "HEAD"], { encoding: "utf8" })
-      if (mode === "competing HEAD") {
-        expect(String(failure)).toContain("restore")
-        expect(head.status).toBe(1)
-        expect(git(linked, ["rev-parse", "HEAD"]).trim()).toBe(newer)
-      } else expect(head.stdout.trim()).toBe(`refs/heads/${branch}`)
-    } finally {
-      // raw-delete-allow: root is this test's isolated mkdtemp fixture.
-      await rm(root, { recursive: true, force: true })
-    }
-  })
+        })
+        // The discard journal readback must occur after detach. Earlier cases
+        // moved refs but never invalidated the caller's proof during that write.
+        const failure = await store
+          .removeBranch({
+            branch,
+            tip,
+            retainedCheckout: linked,
+            beforeRemove: async () => {
+              callbackReads++
+              callbackDetached = !readFileSync(join(admin, "HEAD"), "utf8").startsWith("ref:")
+              if ((await readFile(proof, "utf8")) !== "valid") throw new Error("discard decision proof changed")
+              if (mode === "callback refused") throw new Error("caller hold after detach")
+            },
+          })
+          .then(
+            () => undefined,
+            (cause: unknown) => cause,
+          )
+        expect(moved).toBe(true)
+        expect(callbackReads).toBe(1)
+        expect(String(failure)).toContain(
+          mode === "proof changed"
+            ? "discard decision proof changed"
+            : mode === "callback refused"
+              ? "caller hold after detach"
+              : `refs/heads/${branch}`,
+        )
+        expect(callbackDetached).toBe(true)
+        expect(git(repo, ["rev-parse", `refs/heads/${branch}`]).trim()).toBe(
+          mode === "proof changed" || mode === "callback refused" ? tip : newer,
+        )
+        const head = spawnSync("git", ["-C", linked, "symbolic-ref", "--quiet", "HEAD"], { encoding: "utf8" })
+        if (mode === "competing HEAD") {
+          expect(String(failure)).toContain("restore")
+          expect(head.status).toBe(1)
+          expect(git(linked, ["rev-parse", "HEAD"]).trim()).toBe(newer)
+        } else expect(head.stdout.trim()).toBe(`refs/heads/${branch}`)
+      } finally {
+        // raw-delete-allow: root is this test's isolated mkdtemp fixture.
+        await rm(root, { recursive: true, force: true })
+      }
+    },
+  )
   it("removes an unchecked-out branch at its exact tip and writes no archive ref", async () => {
     const root = await mkdtemp(join(canonicalTmpdir(), "git-super-branch-removal-"))
     try {

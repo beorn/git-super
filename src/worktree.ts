@@ -2279,13 +2279,13 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
           await git.run(repo, ["check-ref-format", verify.ref])
         }
         const ref = `refs/heads/${branch}`
-        await input.beforeRemove?.()
         let detached = false
         try {
           if (input.retainedCheckout !== undefined) {
             await detachAt(input.retainedCheckout, tip, ref)
             detached = true
           }
+          await input.beforeRemove?.()
           const held = await branchHolder(branch)
           if (held !== undefined) throw new Error(held)
           const symbolic = await git.run(repo, ["symbolic-ref", "--quiet", "--no-recurse", ref], true)
