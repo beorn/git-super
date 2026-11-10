@@ -300,10 +300,29 @@ export async function inspectRetainedEntryForAudit(
   return evaluateRetainedEntry(options, { audit: true, estate })
 }
 
+/**
+ * Retention-family internal path for a retirement batch (#33010, @cto dc77f630): one entry's gates against the
+ * batch's ONE shared estate scan. `estate` is this entry's view of it (survivors into this entry only). Every batch
+ * member is excluded from the custody witnesses, so two members never vouch for each other, and none of the audit
+ * leniencies apply: a legacy or manifest-less entry stays as kept as an ordinary verify keeps it.
+ */
+export async function inspectRetainedEntryInBatch(
+  options: RetentionVerifyOptions,
+  estate: EstateScan,
+  batch: readonly string[],
+): Promise<RetentionVerifyResult> {
+  return evaluateRetainedEntry(options, { audit: false, estate, batch })
+}
+
+type EvaluationContext =
+  | Readonly<{ audit: true; estate: EstateScan }>
+  | Readonly<{ audit: false; estate: EstateScan; batch: readonly string[] }>
+
 async function evaluateRetainedEntry(
   options: RetentionVerifyOptions,
-  context?: Readonly<{ audit: true; estate: EstateScan }>,
+  context?: EvaluationContext,
 ): Promise<RetentionVerifyResult> {
+  const auditContext = context?.audit === true
   const clock = options.clock ?? new Date()
   const monotonic = options.monotonic ?? Date.now
   const startedAt = monotonic()
@@ -411,7 +430,7 @@ async function evaluateRetainedEntry(
       if (
         !(error instanceof ManifestShapeError) ||
         error.kind !== "absent" ||
-        (context === undefined && audits.length === 0)
+        (!auditContext && audits.length === 0)
       ) {
         throw error
       }
@@ -499,7 +518,7 @@ async function evaluateRetainedEntry(
     if (matching.stale.length > 0) result.staleAudits = matching.stale
     if (matching.selected !== undefined) {
       result.audit = { path: matching.selected.binding.path, sha256: matching.selected.binding.sha256 }
-    } else if (context === undefined) {
+    } else if (!auditContext) {
       push(
         incomplete(
           "estate-inventory",
@@ -829,12 +848,19 @@ async function evaluateRetainedEntry(
     )
     return finish()
   }
+  const removalSet = context?.audit === false ? context.batch.map((member) => resolve(member)) : [entryReal]
+  if (!removalSet.includes(entryReal)) {
+    throw new Error(`batch removal set does not name its own entry ${entryReal}`)
+  }
   const estate = result.estate ?? scanEstate(declaredNamespaceRoots, [entryReal], options.bounds?.estate, monotonic)
   result.estate = estate
   // A store holding a dangling alternates line is broken (#33010): it is never a custody witness (dropping a
   // witness can only keep more), and a candidate holding one is never retired.
   const broken = new Set(estate.danglingAlternates.map((line) => line.store))
-  witnessStores = estate.objectDirs.filter((path) => !inside(entryReal, path) && !broken.has(path))
+  // In a batch every member is removed, so none of them may witness another's custody.
+  witnessStores = estate.objectDirs.filter(
+    (path) => !removalSet.some((member) => inside(member, path)) && !broken.has(path),
+  )
   const ownDangling = estate.danglingAlternates.filter((line) => inside(entryReal, line.store))
   const firstOwn = ownDangling[0]
   if (firstOwn !== undefined) {
@@ -930,7 +956,7 @@ async function evaluateRetainedEntry(
   })
 
   // ---- Gate 5: positive surviving custody ----------------------------------------------
-  const custody = await scanCustody(expectedCopyRoot, contents.components, witnessStores, [entryReal], {
+  const custody = await scanCustody(expectedCopyRoot, contents.components, witnessStores, removalSet, {
     sidecarDir,
     ...(options.gitRun === undefined ? {} : { run: options.gitRun }),
     ...(options.gitStream === undefined ? {} : { stream: options.gitStream }),
@@ -973,7 +999,7 @@ async function evaluateRetainedEntry(
     schemaId: "hab-sandbox/retained-modules-retirement/1",
     verdict: "candidate",
     entry: entryReal,
-    removal: [entryReal],
+    removal: removalSet,
     root: result.root,
     clock: clock.toISOString(),
     retainUntil: proof.retainUntil,

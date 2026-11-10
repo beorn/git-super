@@ -5,11 +5,18 @@
  * @consumer the read-only retention verifier, gate 3; #27443(b)
  * @testonly none
  */
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { afterEach, describe, expect, test } from "vitest"
-import { canonicalEstateScan, scanEstate } from "../src/retention-estate.ts"
+import {
+  canonicalEstateScan,
+  DEFAULT_ESTATE_BOUNDS,
+  estateDelta,
+  newEstateWalkRecord,
+  scanEstate,
+  type EstateWalkRecord,
+} from "../src/retention-estate.ts"
 
 const cleanup: string[] = []
 afterEach(() => {
@@ -149,6 +156,106 @@ describe("retention estate scan — gate 3 (#27443(b))", () => {
     const scan = scanEstate([namespace], [])
     expect(scan.status).toBe("unknown")
     expect(scan.detail).toContain("non-directory alternate")
+  })
+
+  // #33010 (@cto dc77f630 conditions 1 and 3): a batch reuses one scan, so a lease-held delta must catch every
+  // change to the SET of object dirs, alternates files and registries since the scan, including writes by a writer
+  // that never takes the lease (a hand-run clone or worktree add).
+  describe("estate delta under the lease", () => {
+    const scene = (): { namespace: string; record: EstateWalkRecord; scan: ReturnType<typeof scanEstate> } => {
+      const namespace = tmp("git-super-estate-delta-")
+      const lender = objectDir(namespace, "lender")
+      borrow(objectDir(namespace, "borrower"), lender)
+      objectDir(join(namespace, "deep", "repo"), ".git")
+      const record = newEstateWalkRecord()
+      const scan = scanEstate([namespace], [], DEFAULT_ESTATE_BOUNDS, Date.now, record)
+      expect(scan.status).toBe("pass")
+      return { namespace, record, scan }
+    }
+
+    test("an untouched estate is unchanged, even when unrelated files were written", () => {
+      const { namespace, record, scan } = scene()
+      writeFileSync(join(namespace, "deep", "build-output.txt"), "noise\n")
+      mkdirSync(join(namespace, "deep", "node_modules", "pkg"), { recursive: true })
+      expect(estateDelta(record, scan)).toEqual({ status: "unchanged", changedDirs: 1 })
+    })
+
+    test("an alternates file added between scan and delta ends the batch, naming the file", () => {
+      const { namespace, record, scan } = scene()
+      const repo = join(namespace, "deep", "repo", ".git", "objects")
+      borrow(repo, join(namespace, "lender", "objects"))
+      const delta = estateDelta(record, scan)
+      expect(delta.status).toBe("changed")
+      expect(delta.status === "changed" && delta.detail).toContain(join(repo, "info", "alternates"))
+    })
+
+    test("a rewritten alternates file of the same length ends the batch by its change time", () => {
+      const { namespace, record, scan } = scene()
+      const file = join(namespace, "borrower", "objects", "info", "alternates")
+      const bytes = readFileSync(file, "utf8")
+      const stamp = statSync(file)
+      writeFileSync(file, bytes.replace("lender", "lendex"))
+      utimesSync(file, stamp.atime, stamp.mtime)
+      expect(estateDelta(record, scan).status).toBe("changed")
+    })
+
+    test("a new repository in a new directory ends the batch", () => {
+      const { namespace, record, scan } = scene()
+      objectDir(join(namespace, "fresh", "clone"), ".git")
+      const delta = estateDelta(record, scan)
+      expect(delta.status).toBe("changed")
+      expect(delta.status === "changed" && delta.detail).toContain(join(namespace, "fresh", "clone", ".git", "objects"))
+    })
+
+    test("a vanished object directory ends the batch", () => {
+      const { namespace, record, scan } = scene()
+      rmSync(join(namespace, "deep", "repo", ".git"), { recursive: true })
+      expect(estateDelta(record, scan).status).toBe("changed")
+    })
+
+    // Live estate 2026-11-10: a worktree closed during the 7-minute walk made the whole batch scan unknown.
+    test("a directory that vanishes mid-walk is tolerated only when the walk is recorded for a delta", () => {
+      const namespace = tmp("git-super-estate-vanish-")
+      objectDir(join(namespace, "stays"), ".git")
+      const doomed = join(namespace, "doomed")
+      mkdirSync(join(doomed, "inner"), { recursive: true })
+      let calls = 0
+      // The clock runs once at the start and once per popped directory: call 3 comes after the root listed `doomed`
+      // and before `doomed` is read, whichever order the directory read returns.
+      const clock = (): number => {
+        calls += 1
+        if (calls === 3) rmSync(doomed, { recursive: true, force: true })
+        return 0
+      }
+      const record = newEstateWalkRecord()
+      const recorded = scanEstate([namespace], [], DEFAULT_ESTATE_BOUNDS, clock, record)
+      expect(recorded.status).toBe("pass")
+      expect(recorded.detail).toContain("vanished during the walk")
+      mkdirSync(join(doomed, "inner"), { recursive: true })
+      calls = 0
+      expect(scanEstate([namespace], [], DEFAULT_ESTATE_BOUNDS, clock).status).toBe("unknown")
+    })
+
+    test("a store moved mid-walk into an already-read directory is caught by the delta", () => {
+      const { namespace, record, scan } = scene()
+      // After the scan read `deep`, a writer moves a new repository into it: deep's stamp moves.
+      objectDir(join(namespace, "deep", "moved-in"), ".git")
+      expect(estateDelta(record, scan).status).toBe("changed")
+    })
+
+    test("a changed borrower registry record ends the batch", () => {
+      const namespace = tmp("git-super-estate-delta-registry-")
+      const registry = join(namespace, "common", "git-super-retained-borrowers")
+      mkdirSync(registry, { recursive: true })
+      const manifest = join(namespace, "manifest.json")
+      writeFileSync(manifest, "{}\n")
+      writeFileSync(join(registry, "a.json"), JSON.stringify({ retained: join(namespace, "kept"), manifest }))
+      const record = newEstateWalkRecord()
+      const scan = scanEstate([namespace], [], DEFAULT_ESTATE_BOUNDS, Date.now, record)
+      expect(scan.status).toBe("pass")
+      writeFileSync(join(registry, "b.json"), JSON.stringify({ retained: join(namespace, "other"), manifest }))
+      expect(estateDelta(record, scan).status).toBe("changed")
+    })
   })
 
   test("the scan bound is an unknown verdict carrying the observed count, not a truncation", () => {

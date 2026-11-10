@@ -74,7 +74,7 @@ function keepReason(proof: RetentionVerifyResult): KeepReason {
 }
 
 /** Compare actual, hash-checked proof contents, not hashes derived from differing pass clocks. */
-function proofFacts(proof: RetentionVerifyResult): { facts: string; path: string } {
+export function proofFacts(proof: RetentionVerifyResult): { facts: string; path: string } {
   if (proof.certificate === undefined || proof.artifactDir === undefined) {
     throw new Error(`candidate ${proof.entry} has no certificate or artifact directory`)
   }
@@ -120,7 +120,7 @@ function proofFacts(proof: RetentionVerifyResult): { facts: string; path: string
   }
 }
 
-function pointers(proof: RetentionVerifyResult): ReturnType<typeof readRetainedPointer>[] {
+export function pointers(proof: RetentionVerifyResult): ReturnType<typeof readRetainedPointer>[] {
   if (proof.estate === undefined) throw new Error(`candidate ${proof.entry} has no estate census`)
   return proof.estate.registries.flatMap((registry) =>
     readdirSync(registry)
