@@ -359,6 +359,37 @@ describe("Phase 1 read commands", () => {
   })
 
   /**
+   * @failure The ancestry refusal that means "fetch this pin" names no fetch, so the next reader pays the
+   *          same search again (31308).
+   * @level    l1
+   * @consumer @hh/tooling/31308-git-super-pin-unreadable-names
+   * @testonly none
+   */
+  test("an unreadable component pin names the exact fetch that cures it", async () => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-pin-fetch-remedy-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    // The superproject records a pin its component checkout has never fetched.
+    const alphaHead = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 3\n")
+    git(fixture.product, "update-index", "--cacheinfo", `160000,${alphaHead},packages/alpha`)
+    git(fixture.product, "commit", "-q", "-m", "record an unfetched alpha pin")
+    const stdout = outputSink()
+    const stderr = outputSink()
+    expect(
+      await runCli(
+        ["--repo", fixture.product, "--json", "merge-base", "--is-ancestor", fixture.productBase, "HEAD"],
+        stdout,
+        stderr,
+      ),
+    ).toBe(2)
+    const alphaCheckout = join(fixture.product, "packages/alpha")
+    expect(stderr.output).toContain(`is unreadable in ${alphaCheckout}`)
+    expect(stderr.output).toContain(
+      `git -C ${alphaCheckout} fetch --no-tags --no-recurse-submodules --no-write-fetch-head origin ${alphaHead}:refs/git-super/pins/${alphaHead}`,
+    )
+  })
+
+  /**
    * @failure An absent checkout credits the walked-up parent instead of naming the absence (#27058, #27006 M1).
    * @level l1
    * @consumer worktree-cleanup ancestry reader

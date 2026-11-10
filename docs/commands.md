@@ -112,7 +112,7 @@ Shows tracked, untracked and staged changes in the root and in every checked-out
 git super --repo /work/product merge-base --is-ancestor <commit> <superproject-ref>
 ```
 
-Finds which repository owns `<commit>`, then checks it against that repository's commit as recorded in `<superproject-ref>`. Exit 0 means yes and 1 means no. A failure to select or measure exits 2.
+Finds which repository owns `<commit>`, then checks it against that repository's commit as recorded in `<superproject-ref>`. Exit 0 means yes and 1 means no. A failure to select or measure exits 2. A component pin its checkout does not hold is refused by name, with the exact fetch that lands it (`git -C <component> fetch --no-tags --no-recurse-submodules --no-write-fetch-head <remote> <pin>:refs/git-super/pins/<pin>`); a refusal never reads as a measured "no" (#31308).
 
 ## pull
 

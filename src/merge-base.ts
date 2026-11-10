@@ -11,6 +11,7 @@ import {
   validateExcludedSubmodules,
   type GitResult,
 } from "./git.ts"
+import { pinRef } from "./objects.ts"
 
 export type SuperIsAncestorOptions = Readonly<{
   repo: string
@@ -58,6 +59,31 @@ function resolveAncestorInRoot(root: string, ancestor: string): string {
 
 function objectProbe(root: string, revision: string): GitResult {
   return tryGit(root, ["cat-file", "-e", `${revision}^{commit}`])
+}
+
+/**
+ * The remote a missing component pin is most likely published under: `origin` when the component
+ * configures it, otherwise its first configured remote. Undefined only when it has none, and then the
+ * remedy still names the shape with a placeholder rather than guessing a name.
+ */
+function componentRemote(root: string): string | undefined {
+  const listed = tryGit(root, ["remote"])
+  if (listed.exitCode !== 0) return undefined
+  const remotes = listed.stdout
+    .split("\n")
+    .map((row) => row.trim())
+    .filter((row) => row !== "")
+  return remotes.includes("origin") ? "origin" : remotes[0]
+}
+
+/**
+ * The exact fetch that lands a missing pin. It matches what git-super itself fetches
+ * (`ensureCommitObject`): the pin goes to the ref that keeps it reachable, so a later `gc` cannot take it.
+ * A refusal that names no next step costs the next reader the same search twice (31308).
+ */
+export function pinFetchRemedy(root: string, pin: string): string {
+  const remote = componentRemote(root) ?? "<remote>"
+  return `git -C ${root} fetch --no-tags --no-recurse-submodules --no-write-fetch-head ${remote} ${pin}:${pinRef(pin)}`
 }
 
 function objectExists(root: string, revision: string): boolean {
@@ -140,7 +166,9 @@ export function superIsAncestor(options: SuperIsAncestorOptions): SuperIsAncesto
         throw new Error(`not initialized; initialize ${gitlink.path} before searching its commit ownership`)
       }
       if (!objectExists(nestedRoot, gitlink.pin)) {
-        throw new Error(`comparison pin ${gitlink.pin} is unreadable in ${nestedRoot}`)
+        throw new Error(
+          `comparison pin ${gitlink.pin} is unreadable in ${nestedRoot}; fetch it with: ${pinFetchRemedy(nestedRoot, gitlink.pin)}`,
+        )
       }
       consultedRepositories.push({ path: gitlink.path, root: nestedRoot, to: gitlink.pin })
       if (!objectExists(nestedRoot, ancestor)) continue
