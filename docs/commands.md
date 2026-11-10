@@ -274,6 +274,8 @@ git super --repo /work/product --json worktree retention retire /backups/retaine
 
 The action emits preliminary and held proofs, compares their identity, manifest, contents, custody and estate facts while holding the existing leases, then removes only the selected entry and its exact unchanged registry pointers. Supported writers must use the existing leases; other writers require quiescence. It never unlocks a lender. Legacy or incomplete records stay kept until native evidence can establish their missing facts.
 
+Verify and retire exclude a dangling alternates line (its resolved path does not exist) from the estate by name instead of ending the pass: a missing path lends nothing. Exclusion is per line; the same file's resolvable lines still count as loans, and any other unreadable or non-directory target still makes the estate unknown. Each excluded line is listed under `coverage.excluded` with its file, line and reason. A store holding one is never a custody witness, and a candidate whose own store holds one is kept as broken.
+
 JSON is the existing `GitSuperResult`: proof paths are in `detail.paths`, with the held certificate in `detail.evidence`. A kept row names `legacy-unrecorded`, `incomplete`, `unexpired`, `borrower`, `identity-unknown`, `custody-unknown`, `lease-missing`, `lease-held`, or `census-shifted`. Exit 0 means retired; 1 means kept; 2 means failure or uncertain/partial state. A failure after deletion reports the entry's actual state and any failed pointer path with `partial:true`; no deletion retry or rollback is attempted.
 
 ## gitlink write
