@@ -599,6 +599,9 @@ async function measurePeakRss(run: () => Promise<void>): Promise<number> {
 }
 
 describe("retention stream bounded memory (#27443(b))", () => {
+  // The 5s vitest default is under this sort's wall time on a loaded CI runner
+  // (run 42743260978 timed out at 5000ms before the RSS assertion). 60s is the
+  // budget; the bound under test is still peak RSS, not duration.
   test("a bounded pass keeps peak RSS far below the set size, not proportional to it", async () => {
     const dir = tmp("git-super-bounded-")
     const delta = await measurePeakRss(async () => {
@@ -614,7 +617,7 @@ describe("retention stream bounded memory (#27443(b))", () => {
       )
     })
     expect(delta).toBeLessThan(RETENTION_STREAM_RSS_BOUND_BYTES)
-  })
+  }, 60_000)
 
   test.runIf(process.env.GIT_SUPER_SCALE === "1")(
     "sorts 4,000,000 at-risk and merges 20,000,000 reachable OIDs under the named RSS bound",
