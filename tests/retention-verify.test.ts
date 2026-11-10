@@ -1516,6 +1516,71 @@ describe("retention verify fix-forward #27443(b) gaps", () => {
     }
   })
 
+  // #33010 (@cto e497078d): a dangling line elsewhere in the estate is listed, not fatal; one inside the candidate
+  // marks that store broken, and a broken store is never retired.
+  it("lists a dangling alternates line elsewhere in the estate under coverage.excluded and still certifies", async () => {
+    // A real survivor repository whose lender worktree was recycled: git itself warns on every read in it, so it
+    // must also leave the custody witness set (fewer witnesses can only keep more, never retire more).
+    const stray = join(fixtureRoot as string, "stray-33010")
+    mkdirSync(stray, { recursive: true })
+    git(stray, ["init", "-q", "-b", "main"])
+    const strayObjects = join(stray, ".git", "objects")
+    const gone = join(fixtureRoot as string, "recycled-33010", "objects")
+    writeFileSync(join(strayObjects, "info", "alternates"), `${gone}\n`)
+    try {
+      const result = await verifyRetainedEntry({
+        entry: base.entry,
+        root: base.root,
+        namespaceRoots: [fixtureRoot as string],
+        artifactDir: mkdtempSync(join(tmpdir(), "verify-dangling-")),
+        allowTemporaryArtifactDir: true,
+        clock: eligible(),
+      })
+      expect(result.verdict).toBe("candidate")
+      expect(result.gates[2]).toMatchObject({ gate: "estate-inventory", status: "pass" })
+      expect(result.gates[2]?.message).toContain("1 dangling alternates line(s) excluded")
+      expect(result.coverage.excluded).toEqual([
+        `${join(realpathSync(strayObjects), "info", "alternates")}: ${gone} (dangling: ${gone} does not exist)`,
+      ])
+    } finally {
+      rmSync(stray, { recursive: true, force: true })
+    }
+  })
+
+  it("refuses a candidate whose own store holds a dangling alternates line as broken", async () => {
+    const files: string[] = []
+    const walk = (dir: string): void => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const path = join(dir, entry.name)
+        if (entry.isDirectory()) walk(path)
+        else if (entry.name === "alternates" && basename(dir) === "info") files.push(path)
+      }
+    }
+    walk(base.entry)
+    expect(files.length).toBeGreaterThan(0)
+    const objects = dirname(dirname(files[0] as string))
+    const lender = alternateEntries(readFileSync(files[0] as string, "utf8"), objects)[0] as string
+    const moved = `${lender}.moved-33010`
+    renameSync(lender, moved)
+    try {
+      const result = await verifyRetainedEntry({
+        entry: base.entry,
+        root: base.root,
+        namespaceRoots: [fixtureRoot as string],
+        artifactDir: mkdtempSync(join(tmpdir(), "verify-broken-")),
+        allowTemporaryArtifactDir: true,
+        clock: eligible(),
+      })
+      expect(result.verdict).toBe("blocked")
+      expect(result.gates[2]).toMatchObject({ gate: "estate-inventory", status: "blocked" })
+      expect(result.gates[2]?.message).toContain("broken")
+      expect(result.gates[2]?.message).toContain(lender)
+      expect(result.coverage.excluded.some((line) => line.includes(lender))).toBe(true)
+    } finally {
+      renameSync(moved, lender)
+    }
+  })
+
   it("emits a byte-identical certificate and sidecars on a rerun of the same estate", async () => {
     const artifactDir = mkdtempSync(join(tmpdir(), "verify-rerun-"))
     const options = {

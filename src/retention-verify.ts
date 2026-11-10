@@ -276,6 +276,13 @@ function firstDifference(
   return keys.find((key) => JSON.stringify(expected[key]) !== JSON.stringify(actual[key]))
 }
 
+/** Each alternates line the estate excluded, by store file, line and reason, in a stable order (#33010). */
+function excludedAlternates(estate: EstateScan | undefined): string[] {
+  return (estate?.danglingAlternates ?? [])
+    .map((line) => `${line.alternatesFile}: ${line.line} (dangling: ${line.target} does not exist)`)
+    .sort()
+}
+
 function inside(parent: string, path: string): boolean {
   const part = relative(resolve(parent), resolve(path))
   return part === "" || (part !== ".." && !part.startsWith(`..${sep}`) && !isAbsolute(part))
@@ -349,7 +356,7 @@ async function evaluateRetainedEntry(
       clock: clock.toISOString(),
       gates: ordered,
       reasons,
-      coverage: { declaredNamespaceRoots, witnessStores, excluded: [] },
+      coverage: { declaredNamespaceRoots, witnessStores, excluded: excludedAlternates(result.estate) },
     }
   }
 
@@ -824,7 +831,25 @@ async function evaluateRetainedEntry(
   }
   const estate = result.estate ?? scanEstate(declaredNamespaceRoots, [entryReal], options.bounds?.estate, monotonic)
   result.estate = estate
-  witnessStores = estate.objectDirs.filter((path) => !inside(entryReal, path))
+  // A store holding a dangling alternates line is broken (#33010): it is never a custody witness (dropping a
+  // witness can only keep more), and a candidate holding one is never retired.
+  const broken = new Set(estate.danglingAlternates.map((line) => line.store))
+  witnessStores = estate.objectDirs.filter((path) => !inside(entryReal, path) && !broken.has(path))
+  const ownDangling = estate.danglingAlternates.filter((line) => inside(entryReal, line.store))
+  const firstOwn = ownDangling[0]
+  if (firstOwn !== undefined) {
+    push(
+      refusal(
+        "estate-inventory",
+        `candidate store ${firstOwn.store} is broken: alternates line ${firstOwn.line} names ${firstOwn.target}, which does not exist (${ownDangling.length} such line(s)); a broken store is never retired`,
+        {
+          path: firstOwn.alternatesFile,
+          remedy: "Keep the entry: the objects that line named are already gone, so its own contents cannot be proven.",
+        },
+      ),
+    )
+    return finish()
+  }
   if (estate.status !== "pass") {
     push(
       estate.status === "blocked"
@@ -997,7 +1022,7 @@ async function evaluateRetainedEntry(
     coverage: {
       declaredNamespaceRoots,
       witnessStores,
-      excluded: [],
+      excluded: excludedAlternates(estate),
       artifactDir: result.artifactDir,
     },
   }

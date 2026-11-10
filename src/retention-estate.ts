@@ -6,6 +6,11 @@
  * unreadable registry, a missing or redirected alternate target, an incomplete scan or a bound
  * hit is `unknown`, never a silent skip. A survivor (outside `R`) that borrows into an object
  * directory under `R` is `blocked`.
+ *
+ * A DANGLING alternates line (its resolved path does not exist) is excluded BY NAME and the pass continues (#33010,
+ * @cto e497078d): a path that does not exist cannot be a loan from any store that does, so excluding it loses no
+ * lender fact, and it must not end the inventory for every other entry. Exclusion is per line: the same file's
+ * resolvable lines still count. Any other unreadable or non-directory target still ends the pass as `unknown`.
  */
 import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs"
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
@@ -32,6 +37,17 @@ function compareEstateEdges(left: EstateBorrower, right: EstateBorrower): number
   return left.target < right.target ? -1 : left.target > right.target ? 1 : 0
 }
 
+/** One excluded alternates line: the store declaring it lost the objects that line named. */
+export interface DanglingAlternate {
+  /** The object directory whose `info/alternates` holds the line. */
+  readonly store: string
+  readonly alternatesFile: string
+  /** The line as written (trimmed). */
+  readonly line: string
+  /** The line resolved the way git does, relative lines against `store`. */
+  readonly target: string
+}
+
 export interface EstateScan {
   readonly status: "pass" | "blocked" | "unknown"
   readonly detail: string
@@ -42,11 +58,13 @@ export interface EstateScan {
   readonly registries: readonly string[]
   /** Survivors outside R that borrow into an object directory inside R. */
   readonly survivorIntoRemoval: readonly EstateBorrower[]
+  /** Alternates lines naming a path that does not exist, excluded by name (#33010). */
+  readonly danglingAlternates: readonly DanglingAlternate[]
 }
 
 /** Complete estate identity: only the named top-level sets are unordered; no fields or duplicates are omitted. */
 export function canonicalEstateScan(scan: object): string {
-  const sets = new Set(["roots", "objectDirs", "registries", "borrowers", "survivorIntoRemoval"])
+  const sets = new Set(["roots", "objectDirs", "registries", "borrowers", "survivorIntoRemoval", "danglingAlternates"])
   const compare = (left: string, right: string): number => (left < right ? -1 : left > right ? 1 : 0)
   const edgePart = (value: unknown, field: string): string => {
     if (value !== null && typeof value === "object") {
@@ -123,6 +141,7 @@ export function scanEstate(
         borrowers: [],
         registries: [],
         survivorIntoRemoval: [],
+        danglingAlternates: [],
       }
     }
     roots.push(canonical(root))
@@ -131,6 +150,7 @@ export function scanEstate(
   const objectDirs = new Set<string>()
   const registryDirs = new Set<string>()
   const borrowers: EstateBorrower[] = []
+  const danglingAlternates: DanglingAlternate[] = []
   let alternatesFiles = 0
 
   const unknown = (detail: string): EstateScan => ({
@@ -142,6 +162,7 @@ export function scanEstate(
     borrowers,
     registries: [...registryDirs].sort(),
     survivorIntoRemoval: [],
+    danglingAlternates,
   })
 
   // One worklist of object directories, seeded from the filesystem walk AND from every alternate /
@@ -166,11 +187,24 @@ export function scanEstate(
     } catch (error) {
       return unknown(`cannot read ${alternatesFile}: ${error instanceof Error ? error.message : String(error)}`)
     }
-    for (const target of alternateEntries(content, store)) {
-      const actual = canonical(target)
-      if (!existsSync(actual) || !statSync(actual).isDirectory()) {
-        return unknown(`${alternatesFile} names a missing or non-directory alternate ${target}`)
+    const declared: { line: string; target: string }[] = []
+    alternateEntries(content, store, true, (entry, rawLine) => declared.push({ line: rawLine.trim(), target: entry }))
+    for (const { line, target } of declared) {
+      let isDirectory: boolean
+      try {
+        isDirectory = statSync(target).isDirectory()
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code
+        if (code === "ENOENT" || code === "ENOTDIR") {
+          danglingAlternates.push({ store: canonical(store), alternatesFile, line, target })
+          continue
+        }
+        return unknown(
+          `cannot read alternate ${target} named by ${alternatesFile}: ${error instanceof Error ? error.message : String(error)}`,
+        )
       }
+      if (!isDirectory) return unknown(`${alternatesFile} names a non-directory alternate ${target}`)
+      const actual = canonical(target)
       borrowers.push({ borrower: canonical(store), target: actual })
       const nested = processStore(actual)
       if (nested !== undefined) return nested
@@ -304,14 +338,16 @@ export function scanEstate(
   return {
     status: survivorIntoRemoval.length === 0 ? "pass" : "blocked",
     detail:
-      firstSurvivor === undefined
+      (firstSurvivor === undefined
         ? `${objectDirs.size} object dir(s), ${alternatesFiles} alternates file(s), ${borrowers.length} reverse link(s)`
-        : `${survivorIntoRemoval.length} survivor borrower(s) into the removal set, e.g. ${firstSurvivor.borrower} -> ${firstSurvivor.target}`,
+        : `${survivorIntoRemoval.length} survivor borrower(s) into the removal set, e.g. ${firstSurvivor.borrower} -> ${firstSurvivor.target}`) +
+      (danglingAlternates.length === 0 ? "" : `; ${danglingAlternates.length} dangling alternates line(s) excluded`),
     roots,
     objectDirs: [...objectDirs].sort(),
     alternatesFiles,
     borrowers,
     registries: [...registryDirs].sort(),
     survivorIntoRemoval,
+    danglingAlternates,
   }
 }
