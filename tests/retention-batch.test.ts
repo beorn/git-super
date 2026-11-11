@@ -486,6 +486,11 @@ describe("retention retirement batch (#33010)", () => {
     rmSync(join(root, names[2] as string, "modules", "vendor", "dep", "yrd-worktree-mutations", "writer.lock"))
     const ancestor = join(fixtureRoot, "blocked-owner-parent")
     if (kind === "ancestor-file") {
+      cpSync(
+        join(root, names[2] as string, "modules", "vendor", "dep"),
+        join(root, names[2] as string, "modules", "vendor", "other"),
+        { recursive: true },
+      )
       writeFileSync(ancestor, "not a directory\n")
       manifest.path = join(ancestor, "old-worktree")
       writeFileSync(join(root, names[2] as string, "manifest.json"), JSON.stringify(manifest))
@@ -496,6 +501,16 @@ describe("retention retirement batch (#33010)", () => {
       expect(result.owners?.liveUnleased).toBeGreaterThan(0)
       if (kind === "ancestor-file") {
         expect(warning).toHaveBeenCalledWith(expect.stringContaining("ENOTDIR"))
+        const expected = scanEstate([fixtureRoot], [])
+          .objectDirs.filter((objects) => objects.startsWith(join(root, names[2] as string, "modules") + "/"))
+          .map(dirname)
+          .sort()
+        expect(expected).toHaveLength(2)
+        expect(result.owners?.coldProofFailedOwners).toEqual(expected)
+        expect(result.owners?.coldProofFailed).toBe(expected.length)
+      } else {
+        expect(result.owners?.coldProofFailedOwners).toEqual([])
+        expect(result.owners?.coldProofFailed).toBe(0)
       }
     } finally {
       warning.mockRestore()

@@ -84,6 +84,9 @@ export type RetentionBatchResult = Readonly<{
     leaseMissing: number
     cold: number
     liveUnleased: number
+    /** Owners kept live because their cold evidence could not be read, including shared-source cache hits. */
+    coldProofFailed: number
+    coldProofFailedOwners: readonly string[]
     unproved: number
     leaseMissingExample?: string
     unprovedExample?: string
@@ -100,14 +103,15 @@ function within(root: string, path: string): boolean {
 }
 
 type ColdOwner = Readonly<{ source: string; bytes: string; absent: string }>
+type ColdOwnerRead = ColdOwner | Readonly<{ failure: string }>
 
 /** Cold is an observed absent worktree, never a directory-class assumption (@cto 76cc52e6). */
 function coldOwner(
   owner: string,
   root: string,
   common: string,
-  cache: Map<string, ColdOwner | undefined>,
-): ColdOwner | undefined {
+  cache: Map<string, ColdOwnerRead | undefined>,
+): ColdOwnerRead | undefined {
   let source: string | undefined
   let retained = false
   if (within(root, owner)) {
@@ -123,30 +127,29 @@ function coldOwner(
   if (source === undefined) return undefined
   if (cache.has(source)) return cache.get(source)
   cache.set(source, undefined)
-  if (lstatSync(source, { throwIfNoEntry: false })?.isFile() !== true) return undefined
-  const bytes = readFileSync(source, "utf8")
-  let absent: unknown
-  if (retained) {
-    try {
+  try {
+    if (lstatSync(source, { throwIfNoEntry: false })?.isFile() !== true) return undefined
+    const bytes = readFileSync(source, "utf8")
+    let absent: unknown
+    if (retained) {
       const manifest: unknown = JSON.parse(bytes)
       if (typeof manifest === "object" && manifest !== null && "path" in manifest) absent = manifest.path
-    } catch (error) {
-      // delete-fallback-allow: proof (coldOwner default) undefined keeps the owner out of cold, so it is live and needs its writer lease; failed parsing gives fewer pointer deletes, never more (guard owner fc254a47).
-      console.warn(
-        `retention: cannot parse ${source}: ${error instanceof Error ? error.message : String(error)}; treating its owners as live, requiring their existing writer leases`,
-      )
-      return undefined
+    } else {
+      const gitdir = bytes.trim()
+      if (isAbsolute(gitdir) && basename(gitdir) === ".git") absent = dirname(gitdir)
     }
-  } else {
-    const gitdir = bytes.trim()
-    if (isAbsolute(gitdir) && basename(gitdir) === ".git") absent = dirname(gitdir)
+    const proof =
+      typeof absent === "string" && isAbsolute(absent) && lstatSync(absent, { throwIfNoEntry: false }) === undefined
+        ? { source, bytes, absent }
+        : undefined
+    cache.set(source, proof)
+    return proof
+  } catch (error) {
+    // delete-fallback-allow: failed evidence keeps every owner live, requiring existing leases or connected keeps; it is reported, never used as absence proof (#33010).
+    const failure = { failure: `${source}: ${error instanceof Error ? error.message : String(error)}` }
+    cache.set(source, failure)
+    return failure
   }
-  const proof =
-    typeof absent === "string" && isAbsolute(absent) && lstatSync(absent, { throwIfNoEntry: false }) === undefined
-      ? { source, bytes, absent }
-      : undefined
-  cache.set(source, proof)
-  return proof
 }
 
 function coldOwnerChanged(proofs: ReadonlyMap<string, ColdOwner>): string | undefined {
@@ -357,18 +360,17 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
   for (const registry of scan.registries) owners.add(dirname(registry))
   const ownerList = [...owners].sort()
   const cold = new Map<string, ColdOwner>()
-  const coldCache = new Map<string, ColdOwner | undefined>()
+  const coldCache = new Map<string, ColdOwnerRead | undefined>()
+  const coldProofFailedOwners: string[] = []
   for (const owner of ownerList) {
-    let proof: ColdOwner | undefined
-    try {
-      proof = coldOwner(owner, root, common, coldCache)
-    } catch (error) {
-      // delete-fallback-allow: proof stays undefined, keeping this owner live and requiring its existing writer lease or connected keeps; unreadable cold evidence never authorizes more deletes (#33010).
+    const proof = coldOwner(owner, root, common, coldCache)
+    if (proof === undefined) continue
+    if ("failure" in proof) {
+      coldProofFailedOwners.push(owner)
       console.warn(
-        `retention: cannot prove cold owner ${owner}: ${error instanceof Error ? error.message : String(error)}; treating it as live, requiring its existing writer lease`,
+        `retention: cannot prove cold owner ${owner}: ${proof.failure}; treating it as live, requiring its existing writer lease`,
       )
-    }
-    if (proof !== undefined) cold.set(owner, proof)
+    } else cold.set(owner, proof)
   }
   const liveOwners = ownerList.filter((owner) => !cold.has(owner))
   const leaseMissing = liveOwners.filter(
@@ -379,6 +381,8 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
     leaseMissing: leaseMissing.length,
     cold: cold.size,
     liveUnleased: leaseMissing.length,
+    coldProofFailed: coldProofFailedOwners.length,
+    coldProofFailedOwners,
     unproved: unproved.length,
     ...(leaseMissing[0] === undefined ? {} : { leaseMissingExample: leaseMissing[0] }),
     ...(unproved[0] === undefined ? {} : { unprovedExample: unproved[0] }),
