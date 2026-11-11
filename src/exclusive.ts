@@ -79,7 +79,10 @@ export async function acquireExclusive(
       contended = true
       const describe = (at: number): string => {
         const held = describeRecordedLockHolder(path, at)
-        return `${held.holder} (${held.owner}, age ${held.age})`
+        return (
+          `live ${describeLiveLockHolders(path)}; recorded note, not authority: ` +
+          `${held.holder} (${held.owner}, age ${held.age})`
+        )
       }
       options.onContended?.(describe(now), () => describe(Date.now()))
     }

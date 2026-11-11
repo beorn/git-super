@@ -132,7 +132,12 @@ describe("exclusive writer policy", () => {
         acquireExclusive(dir, { timeoutMs: 40, onContended: (holder) => contended.push(holder) }, "second mutation"),
       ).rejects.toThrow(/lock is busy/u)
       expect(contended).toEqual([
-        expect.stringMatching(new RegExp(`^first mutation \\(pid:${process.pid}, age \\d+ms\\)$`, "u")),
+        expect.stringMatching(
+          new RegExp(
+            `^live holder.*; recorded note, not authority: first mutation \\(pid:${process.pid}, age \\d+ms\\)$`,
+            "u",
+          ),
+        ),
       ])
     } finally {
       first.release()
@@ -175,29 +180,44 @@ describe("exclusive writer policy", () => {
 
   /**
    * @failure 33483: a worktree removal held the lease without rewriting the note, and store-pack's busy report named the
-   *          note's day-dead pid as the holder; the kernel's live holder must lead and the note must say it is not authority.
+   *          note's day-dead pid as the holder; busy errors and progress (33459) must distinguish live ownership from history.
    * @level l1
-   * @consumer store-pack (tools/lib/store-gc.ts) and every busy refusal
+   * @consumer store-pack (tools/lib/store-gc.ts), busy refusals and contention progress
    */
   test.skipIf(process.platform !== "linux")(
-    "a busy report leads with the kernel's live holder and labels a stale note as recorded, not authority",
+    "busy and progress reports distinguish live ownership from a stale note, including after release",
     async () => {
       const dir = await mkdtemp(join(tmpdir(), "git-super-exclusive-"))
       const lock = await acquireExclusive(dir, { timeoutMs: 0 }, "live remover")
+      let released = false
       try {
         // A bodyless lease leaves the previous writer's note behind: a pid that is long gone.
         await writeFile(
           join(dir, "writer.lock"),
           JSON.stringify({ pid: 2_000_000_000, holder: "stale pack", startedAt: "2026-11-10T09:13:03.000Z" }),
         )
-        const refusal = await acquireExclusive(dir, { timeoutMs: 0 }, "pack").catch((error: unknown) => error)
+        const progress: { holder: string; refresh: () => string }[] = []
+        const refusal = await acquireExclusive(
+          dir,
+          { timeoutMs: 0, onContended: (holder, refresh) => progress.push({ holder, refresh }) },
+          "pack",
+        ).catch((error: unknown) => error)
         expect(refusal).toBeInstanceOf(Error)
         const message = (refusal as Error).message
         expect(message).toContain(`live holder: locks: writer.lock ${process.pid}(self) FLOCK WRITE`)
         expect(message).toContain("recorded note, not authority: holder=stale pack;")
         expect(message.indexOf("live holder:")).toBeLessThan(message.indexOf("recorded note"))
-      } finally {
+        expect(progress).toHaveLength(1)
+        expect(progress[0]!.holder).toContain(`live holder: locks: writer.lock ${process.pid}(self) FLOCK WRITE`)
+        expect(progress[0]!.holder).toContain("recorded note, not authority:")
         lock.release()
+        released = true
+        expect(progress[0]!.refresh()).toContain("live holder: none found in the kernel lock table")
+        expect(JSON.parse(await readFile(join(dir, "writer.lock"), "utf8")).pid).toBe(2_000_000_000)
+        const next = await acquireExclusive(dir, { timeoutMs: 0 }, "next writer")
+        next.release()
+      } finally {
+        if (!released) lock.release()
         // raw-delete-allow: teardown of this test's own mkdtemp fixture under tmpdir, as the file's other cases do.
         await rm(dir, { recursive: true, force: true })
       }
@@ -210,7 +230,7 @@ describe("exclusive writer policy", () => {
    * @level l1
    * @consumer Yrd submit merge and post-merge worktree add
    */
-  test("reports the lock's live holder on each tick, not the first poll's", async () => {
+  test("refreshes the recorded note on each tick rather than freezing its first description", async () => {
     const dir = await mkdtemp(join(tmpdir(), "git-super-exclusive-"))
     const lockPath = join(dir, "writer.lock")
     const first = await acquireExclusive(dir, { timeoutMs: 0 }, "first operation")
@@ -220,7 +240,7 @@ describe("exclusive writer policy", () => {
     vi.spyOn(Math, "random").mockReturnValue(0.999)
     vi.mocked(delay).mockImplementation(async () => {
       if (released) return
-      // the holder changed while we waited: the next progress tick must describe the file as it is now
+      // Only the diagnostic note changed; the live kernel holder is still this process.
       await writeFile(
         lockPath,
         JSON.stringify({

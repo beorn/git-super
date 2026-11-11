@@ -968,7 +968,7 @@ describe("git super pull --ff-only", () => {
     expect(git(checkout, "rev-parse", "HEAD")).toBe(target)
     expect(lines.find((line) => line.includes("lock-wait held by"))).toMatch(
       new RegExp(
-        `^git-super pull: lock-wait held by other writer \\(pid:${process.pid}, age \\d+ms\\) \\+\\d+ms\n$`,
+        `^git-super pull: lock-wait held by live holder.*; recorded note, not authority: other writer \\(pid:${process.pid}, age \\d+ms\\) \\+\\d+ms\n$`,
         "u",
       ),
     )
