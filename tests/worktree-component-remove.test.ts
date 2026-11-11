@@ -275,6 +275,11 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
       expect(phases).toHaveProperty("refGraph")
       expect(phases).toHaveProperty("globalWriterHeld")
       expect(phases).toHaveProperty("unlockedProof")
+      expect(phases).toHaveProperty("globalWriterHeldBeforeProof")
+      expect(phases).toHaveProperty("globalWriterHeldAfterProof")
+      expect(phases).toHaveProperty("retainedCopy")
+      expect(phases).toHaveProperty("preserveModuleStoreValue")
+      expect(phases.globalWriterHeld).toBe(phases.globalWriterHeldBeforeProof! + phases.globalWriterHeldAfterProof!)
     } finally {
       console.error = original
       if (previous === undefined) delete process.env.GIT_SUPER_REMOVAL_PHASES

@@ -1650,7 +1650,11 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       }
       const releaseMutation = () => {
         if (mutationLease === undefined) return
-        phases.globalWriterHeld = (phases.globalWriterHeld ?? 0) + Date.now() - heldFrom
+        const heldMs = Date.now() - heldFrom
+        phases.globalWriterHeld = (phases.globalWriterHeld ?? 0) + heldMs
+        const interval =
+          phases.unlockedProof === undefined ? "globalWriterHeldBeforeProof" : "globalWriterHeldAfterProof"
+        phases[interval] = (phases[interval] ?? 0) + heldMs
         const lease = mutationLease
         mutationLease = undefined
         lease.release()
@@ -1679,7 +1683,9 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         if (rehome === undefined) throw new Error(`worktree ${path} has no prepared borrower custody`)
         markPhase("prepareRemoval", prepareStarted)
         // No custody rehome or destruction has run; a value-holding store stays in place.
+        const preserveStarted = Date.now()
         preserveModuleStoreValueBeforeDelete(stores)
+        markPhase("preserveModuleStoreValue", preserveStarted)
         const proofDeadline = Date.now() + timeouts.cleanup
         const adapters =
           removeOptions.componentCustody === undefined
@@ -2046,6 +2052,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
             }
           }
           if (removeOptions.retention !== undefined) {
+            const retainedCopyStarted = Date.now()
             removalProof = await retainWorktreeModules(
               git,
               repo,
@@ -2064,6 +2071,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
               undefined,
               componentCustodyProof,
             )
+            markPhase("retainedCopy", retainedCopyStarted)
           } else {
             if (removeOptions.unlock === true) await unlockWorktree(git, repo, path)
             if (removeOptions.noRehome !== true) rehome.run()
