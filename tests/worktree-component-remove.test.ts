@@ -240,12 +240,12 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
   })
 
   /**
-   * @failure The writer stays held across witness fsck and the ref-graph walk, and the phase log does not name those steps.
+   * @failure Removal diagnostics hide whether slow witness proof or the global writer accounts for the elapsed time.
    * @level l1
    * @consumer worktree remove that keeps retention custody
    * Empty removals never enter retention-custody.ts, so they cannot time this hold.
    */
-  it("names the writer-held fsck and ref-graph steps on a custody removal", async () => {
+  it("names custody proof phases and global writer hold separately", async () => {
     const root = await mkdtemp(join(canonicalTmpdir(), "git-super-removal-hold-phases-"))
     const previous = process.env.GIT_SUPER_REMOVAL_PHASES
     process.env.GIT_SUPER_REMOVAL_PHASES = "1"
@@ -273,10 +273,121 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
       const phases = (JSON.parse(line!.slice(line!.indexOf("{"))) as { phases: Record<string, number> }).phases
       expect(phases).toHaveProperty("witnessFsck")
       expect(phases).toHaveProperty("refGraph")
+      expect(phases).toHaveProperty("globalWriterHeld")
+      expect(phases).toHaveProperty("unlockedProof")
     } finally {
       console.error = original
       if (previous === undefined) delete process.env.GIT_SUPER_REMOVAL_PHASES
       else process.env.GIT_SUPER_REMOVAL_PHASES = previous
+      // raw-delete-allow: this isolated mkdtemp fixture owns every path beneath root
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  /**
+   * @failure A custody scan monopolizes the root writer, or removal acts on source/witness state changed while unlocked.
+   * @level l1 @consumer automatic environment removal and unrelated root writers (31301)
+   * Existing census and phase tests never contend for the actual root flock during a paused witness scan.
+   */
+  it.each([
+    "unchanged",
+    "witness-added",
+    "witness-forwarded",
+    "witness-rewound",
+    "witness-deleted",
+    "component-changed",
+    "identity-changed",
+  ] as const)("admits a root writer during custody proof and validates the gap: %s", async (mode) => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-custody-unlocked-"))
+    const entered = Promise.withResolvers<void>()
+    const resume = Promise.withResolvers<void>()
+    let removal: ReturnType<ReturnType<typeof createGitWorktreeStore>["remove"]> | undefined
+    let contender: ReturnType<typeof tryAcquireFlock> | undefined
+    try {
+      const fixture = createProductFixture(root)
+      const product = fixture.product
+      const target = join(root, "target")
+      git(product, "worktree", "add", "--detach", target)
+      git(target, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
+      const witness = join(product, "packages/alpha")
+      const source = join(target, "packages/alpha")
+      const witnessDir = git(witness, "rev-parse", "--path-format=absolute", "--git-common-dir")
+      const original = git(witness, "rev-parse", "HEAD")
+      const tree = git(witness, "rev-parse", "HEAD^{tree}")
+      const proofTip = git(witness, "commit-tree", tree, "-p", original, "-m", "proof-time witness")
+      const newerTip = git(witness, "commit-tree", tree, "-p", proofTip, "-m", "forward witness")
+      git(witness, "update-ref", "refs/heads/main", proofTip)
+      const common = git(product, "rev-parse", "--path-format=absolute", "--git-common-dir")
+      const local = createLocalGitProcess()
+      const localStream = local.stream!
+      let paused = false
+      const store = createGitWorktreeStore({
+        repo: product,
+        gitProcess: {
+          ...local,
+          stream(request) {
+            const stream = localStream(request)
+            if (!paused && request.args.includes("fsck") && request.args.includes(`--git-dir=${witnessDir}`)) {
+              paused = true
+              entered.resolve()
+              return {
+                ...stream,
+                lines: (async function* () {
+                  await resume.promise
+                  yield* stream.lines
+                })(),
+              }
+            }
+            return stream
+          },
+        },
+      })
+      removal = store.remove(target, {
+        retention: { root: join(root, "retained"), report: () => undefined },
+        componentCustody: { primaryRoot: product, targetBranch: "main" },
+      })
+      await Promise.race([
+        entered.promise,
+        removal.then((outcome) => {
+          throw new Error(`removal ended before witness barrier: ${JSON.stringify(outcome)}`)
+        }),
+      ])
+      contender = tryAcquireFlock(join(common, "yrd-worktree-mutations", "writer.lock"), {
+        body: "unrelated root writer",
+      })
+      expect(contender, "the root writer must be available while custody proof is paused").not.toBeNull()
+      const witnessContender = tryAcquireFlock(join(witnessDir, "yrd-worktree-mutations", "writer.lock"))
+      witnessContender?.release()
+      expect(witnessContender, "the witness owner lease must remain held during the gap").toBeNull()
+      if (mode === "witness-added") git(witness, "update-ref", `refs/git-super/pins/${newerTip}`, newerTip)
+      if (mode === "witness-forwarded") git(witness, "update-ref", "refs/heads/main", newerTip)
+      if (mode === "witness-rewound") git(witness, "update-ref", "refs/heads/main", original)
+      if (mode === "witness-deleted") git(witness, "update-ref", "-d", "refs/heads/main")
+      if (mode === "component-changed") git(source, "update-ref", "refs/heads/during-proof", original)
+      if (mode === "identity-changed") {
+        const beta = git(join(product, "vendor/beta"), "rev-parse", "--path-format=absolute", "--git-path", "objects")
+        writeFileSync(join(witnessDir, "objects/info/alternates"), `${beta}\n`)
+      }
+      contender?.release()
+      contender = undefined
+      resume.resolve()
+      const outcome = await removal
+      const kept = ["witness-rewound", "witness-deleted", "component-changed", "identity-changed"].includes(mode)
+      if (kept) {
+        expect(outcome).toMatchObject({ custodyRefusal: { status: "unknown" } })
+        expect(existsSync(target)).toBe(true)
+        expect(git(product, "worktree", "list", "--porcelain")).toContain(`worktree ${target}\n`)
+      } else {
+        expect(outcome ?? {}).not.toHaveProperty("custodyRefusal")
+        expect(existsSync(target)).toBe(false)
+      }
+      const released = tryAcquireFlock(join(witnessDir, "yrd-worktree-mutations", "writer.lock"))
+      expect(released, "all outcomes must release witness leases").not.toBeNull()
+      released?.release()
+    } finally {
+      contender?.release()
+      resume.resolve()
+      await removal
       // raw-delete-allow: this isolated mkdtemp fixture owns every path beneath root
       await rm(root, { recursive: true, force: true })
     }
@@ -347,12 +458,11 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
   })
 
   /**
-   * @failure A commit created after the first identity census but before leases and the final proof is omitted from
-   * the complete source ledger, allowing removal to proceed on a stale object population.
+   * @failure A commit created while reading the final ledger is omitted, allowing removal on stale source state.
    * @level l1 @consumer automatic environment removal through GitSuper
    * This must be caught at the transaction seam; the Gate 4 inventory unit tests do not exercise census/lease ordering.
    */
-  it("includes a commit introduced after the initial census in the acquired final proof", async () => {
+  it("keeps and names a commit introduced during the acquired final proof", async () => {
     const root = await mkdtemp(join(canonicalTmpdir(), "git-super-component-custody-new-commit-"))
     try {
       const fixture = createProductFixture(root)
@@ -402,7 +512,8 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
       expect(nulFraming.filter((request) => request.framing !== "nul")).toEqual([])
       expect(introduced).toMatch(/^[0-9a-f]{40}$/u)
       expect(outcome).toMatchObject({
-        custodyRefusal: { status: "blocked", component: "packages/alpha", oid: introduced },
+        // The ledger found the new commit; the changed source state invalidates the gap's proof (31301).
+        custodyRefusal: { status: "unknown", component: "packages/alpha", oid: introduced },
       })
       expect(existsSync(target)).toBe(true)
     } finally {
@@ -1050,7 +1161,7 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
     }
   })
 
-  it("omits the fingerprint on a blocked refusal when component freshness changes between pre-proof and post-proof reads", async () => {
+  it("reports unknown without a fingerprint when component freshness changes during proof", async () => {
     const root = await mkdtemp(join(canonicalTmpdir(), "git-super-custody-freshness-prepost-"))
     try {
       const fixture = createProductFixture(root)
@@ -1099,7 +1210,7 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
 
       expect(mutatedDuringProof).toBe(true)
       expect(outcome).toMatchObject({
-        custodyRefusal: { status: "blocked", component: "packages/alpha" },
+        custodyRefusal: { status: "unknown", component: "packages/alpha" },
       })
       if (outcome !== undefined && "custodyRefusal" in outcome) {
         expect(outcome.custodyRefusal.fingerprint).toBeUndefined()
