@@ -2,6 +2,7 @@
  * @failure git-super worktree remove --repo <super> refuses a clean component worktree as not registered in the super (28393).
  * @level l1
  * @consumer WIP sweep retiring landed vendor component worktrees; yrd env close delegates to this verb
+ * @reach fs-walk <fixture-only: isolated Git repositories and their retained children>
  * @testonly none
  */
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs"
