@@ -153,6 +153,38 @@ async function linkedBatch(): Promise<RetentionBatchOptions> {
 }
 
 describe("retention retirement batch (#33010)", () => {
+  // CTO 2cdcedf4: deleting a selected registry holder must not make the batch re-read its missing registry or
+  // owning manifest. Existing fixtures have registries only outside the removal set.
+  it("retires a sealed registry holder and continues through every later batch entry", async () => {
+    const checkout = join(fixtureRoot, "registry-holder")
+    const previous = readdirSync(root).map((name) => join(root, name))
+    expect(await runCli(["--repo", dirname(common), "worktree", "add", checkout, "HEAD"], sink(), sink())).toBe(0)
+    const module = git(join(checkout, "vendor", "dep"), ["rev-parse", "--absolute-git-dir"])
+    mkdirSync(join(module, "git-super-retained-borrowers"))
+    expect(
+      await runCli(["--repo", dirname(common), "worktree", "remove", checkout, "--retain", root], sink(), sink()),
+    ).toBe(0)
+    const first = readdirSync(root)
+      .map((name) => join(root, name))
+      .find((entry) => !previous.includes(entry)) as string
+    const manifest = JSON.parse(readFileSync(join(first, "manifest.json"), "utf8")) as { retainUntil: string }
+    const input = options({ entries: [first, ...previous], clock: new Date(Date.parse(manifest.retainUntil) + 1000) })
+    expect(scanEstate([fixtureRoot], input.entries).registries).toContain(
+      join(first, "modules", "vendor", "dep", "git-super-retained-borrowers"),
+    )
+    const dry = await retireRetainedBatch(input)
+    expect(
+      dry.rows.map((row) => row.outcome),
+      JSON.stringify(dry.rows),
+    ).toEqual(Array(4).fill("would-retire"))
+    const result = await retireRetainedBatch({ ...input, apply: true })
+    expect(result.stopped, JSON.stringify(result.rows)).toBeUndefined()
+    expect(
+      result.rows.map((row) => row.outcome),
+      JSON.stringify(result.rows),
+    ).toEqual(Array(4).fill("retired"))
+    expect(readdirSync(root)).toEqual([])
+  })
   // Accepted requirement: no surviving borrower loses its lender, including when a held gate keeps a batch
   // member. The existing already-kept-member test never exercises members that pass preliminary gates.
   it("retires a sealed cross-entry borrower before its lender regardless of requested order", async () => {

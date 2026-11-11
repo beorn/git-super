@@ -410,6 +410,21 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
 
   // ---- One lease window: delta first, then held re-verify and delete per entry ------------------
   const windows: BatchWindow[] = []
+  const verifiedRemoved: string[] = []
+  // Only current pointer reads omit our own verified removals. The verifier and certificate retain the full
+  // frozen estate, so this bookkeeping cannot hide drift in the preliminary/held proof facts.
+  const currentPointers = (proof: RetentionVerifyResult): ReturnType<typeof pointers> => {
+    if (proof.estate === undefined) return pointers(proof)
+    return pointers({
+      ...proof,
+      estate: {
+        ...proof.estate,
+        registries: proof.estate.registries.filter(
+          (registry) => !verifiedRemoved.some((entry) => within(entry, registry)),
+        ),
+      },
+    })
+  }
   let next = 0
   if (candidates.length > 0) {
     const commonPath = join(common, "yrd-worktree-mutations", "writer.lock")
@@ -473,11 +488,13 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
           const held = await inspectRetainedEntryInBatch(verifyOptions(entry, "held"), entryView(scan, entry), entries)
           const before = proofFacts(pre)
           const after = held.verdict === "candidate" ? proofFacts(held) : undefined
+          const heldPointers = after === undefined ? undefined : currentPointers(held)
           const stat = lstatSync(entry)
           if (
             after === undefined ||
+            heldPointers === undefined ||
             before.facts !== after.facts ||
-            JSON.stringify(pointers(pre)) !== JSON.stringify(pointers(held)) ||
+            JSON.stringify(currentPointers(pre)) !== JSON.stringify(heldPointers) ||
             held.entryDevIno !== `${stat.dev}:${stat.ino}`
           ) {
             kept.set(
@@ -501,10 +518,15 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
               if (lstatSync(entry, { throwIfNoEntry: false }) !== undefined) {
                 throw new Error(`entry ${entry} is still present after deletion`)
               }
-              for (const pointer of pointers(held)) {
+              for (const pointer of heldPointers) {
+                if (within(entry, pointer.path)) continue
                 if (pointer.retained === join(entry, "modules") && pointer.manifest === join(entry, "manifest.json")) {
                   removeRetainedPointer(pointer)
                 }
+              }
+              verifiedRemoved.push(entry)
+              for (const owner of cold.keys()) {
+                if (within(entry, owner)) cold.delete(owner)
               }
             } catch (error) {
               const state = lstatSync(entry, { throwIfNoEntry: false }) === undefined ? "gone" : "partly present"
