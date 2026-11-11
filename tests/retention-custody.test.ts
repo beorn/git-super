@@ -619,6 +619,71 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     expect(scan.rebased).toEqual([])
   })
 
+  // @cto 2026-11-11: `git patch-id --stable` strips whitespace, so a commit whose YAML difference was
+  // indentation only earned a false "landed" twin and the removal would delete the only copy.
+  // Measured on git 2.56.0 for this exact fixture: --stable 5491e9ce for both sides, --verbatim
+  // 95f6a388 vs 8113dd41.
+  test("a patch that differs from published main only in leading whitespace stays refused", async () => {
+    const { remote, work, primary } = publishedStores("git-super-custody-verbatim-")
+    git(work, ["switch", "-q", "-c", "side"])
+    writeFileSync(join(work, "conf.yaml"), "key:\n  child: 1\n")
+    git(work, ["add", "conf.yaml"])
+    git(work, ["commit", "-q", "-m", "indented yaml"])
+    const refused = git(work, ["rev-parse", "HEAD"])
+    git(work, ["switch", "-q", "main"])
+    writeFileSync(join(work, "conf.yaml"), "key:\nchild: 1\n")
+    git(work, ["add", "conf.yaml"])
+    git(work, ["commit", "-q", "-m", "same yaml, de-indented"])
+    git(work, ["push", "-q", remote, "main"])
+    const sidecarDir = tmp("git-super-custody-verbatim-sidecars-")
+    const component = {
+      ...(await componentOf([refused], sidecarDir, "reflog logs/HEAD")),
+      gitDir: join(work, ".git"),
+    }
+    const scan = await scanCustody(work, [component], [join(primary, ".git", "objects")], [], {
+      sidecarDir,
+      witnessPolicy: { targetBranch: "main" },
+    })
+    expect(scan.status).toBe("blocked")
+    expect(scan.rebased).toEqual([])
+    expect(scan.missing.map((entry) => entry.oid)).toEqual([refused])
+  })
+
+  // The own read runs in the component copy and the landed read in the primary store. A store's diff
+  // config must not change the hash of one patch: measured on git 2.56.0, the same rename commit hashes
+  // b3ab7cce with rename detection on and 0a303f30 with diff.renames=false, which without a pinned read
+  // would turn an exact rebase into a false refusal.
+  test("a store's rename-detection config cannot turn an exact rebase into a refusal", async () => {
+    const { remote, work, primary } = publishedStores("git-super-custody-pinned-")
+    git(work, ["switch", "-q", "-c", "side"])
+    git(work, ["mv", "a.txt", "renamed.txt"])
+    git(work, ["commit", "-q", "-m", "rename a"])
+    const refused = git(work, ["rev-parse", "HEAD"])
+    git(work, ["switch", "-q", "main"])
+    writeFileSync(join(work, "b.txt"), "beta\n")
+    git(work, ["add", "b.txt"])
+    git(work, ["commit", "-q", "-m", "main moves"])
+    git(work, ["cherry-pick", refused])
+    const landed = git(work, ["rev-parse", "HEAD"])
+    expect(landed).not.toBe(refused)
+    git(work, ["push", "-q", remote, "main"])
+    git(primary, ["config", "diff.renames", "false"])
+    git(primary, ["config", "diff.noprefix", "true"])
+    const sidecarDir = tmp("git-super-custody-pinned-sidecars-")
+    const component = {
+      ...(await componentOf([refused], sidecarDir, "reflog logs/HEAD")),
+      gitDir: join(work, ".git"),
+    }
+    const scan = await scanCustody(work, [component], [join(primary, ".git", "objects")], [], {
+      sidecarDir,
+      witnessPolicy: { targetBranch: "main" },
+    })
+    expect(scan.status).toBe("pass")
+    expect(scan.rebased).toEqual([
+      { component: ".git", oid: refused, landedOid: landed, ref: "refs/heads/main", tip: landed },
+    ])
+  })
+
   // Two closes of different environments share the primary store, and the proof now fetches into it.
   // Without this, a fetch racing another fetch could be assumed harmless rather than shown so.
   test("two concurrent custody scans against one primary store both pass and leave it intact", async () => {

@@ -129,6 +129,13 @@ function isDurableRef(ref: string): boolean {
 }
 
 const PUBLISHED_READ_TIMEOUT_MS = 120_000
+/**
+ * Diff-producing reads are pinned: the own copy and the primary store must hash the same bytes for one
+ * patch, so a store's diff config can never turn an exact rebase into a false refusal.
+ */
+const PINNED_DIFF_CONFIG = ["-c", "diff.renames=false", "-c", "diff.noprefix=false", "-c", "diff.external="] as const
+const PINNED_DIFF_READ = ["--no-ext-diff", "--no-textconv", "--full-index"] as const
+
 /** A refused set this size still gets a patch-id read; beyond it the answer is unknown, never a pass. */
 const REBASE_CANDIDATE_LIMIT = 500
 /** A patch stream larger than this is not read into memory to guess at a match. */
@@ -573,7 +580,14 @@ async function rebaseWitness(
   let diff: string
   try {
     diff = withGitTimeout(PUBLISHED_READ_TIMEOUT_MS, () =>
-      tryGit(gitDir, [`--git-dir=${gitDir}`, "show", "--no-color", target.oid]),
+      tryGit(gitDir, [
+        `--git-dir=${gitDir}`,
+        ...PINNED_DIFF_CONFIG,
+        "show",
+        ...PINNED_DIFF_READ,
+        "--no-color",
+        target.oid,
+      ]),
     ).stdout
   } catch (error) {
     throw new UnknownError(
@@ -583,7 +597,7 @@ async function rebaseWitness(
   if (diff.length > REBASE_PATCH_BYTES) {
     throw new UnknownError(`at-risk commit ${target.oid}: its patch exceeds ${REBASE_PATCH_BYTES} bytes`)
   }
-  const own = patchIdIndex(gitDir, ["patch-id", "--stable"], diff, `patch-id of ${target.oid}`)
+  const own = patchIdIndex(gitDir, ["patch-id", "--verbatim"], diff, `patch-id of ${target.oid}`)
   const ownId = own.get(target.oid)
   if (ownId === undefined) return undefined
   for (const root of roots) {
@@ -606,7 +620,15 @@ async function rebaseWitness(
       )
     }
     if (candidates.length === 0) continue
-    const complete = await run([`--git-dir=${storeDir}`, "show", "--no-color", "--no-notes", ...candidates])
+    const complete = await run([
+      `--git-dir=${storeDir}`,
+      ...PINNED_DIFF_CONFIG,
+      "show",
+      ...PINNED_DIFF_READ,
+      "--no-color",
+      "--no-notes",
+      ...candidates,
+    ])
     refuseSuccessfulStderr(complete, `show ${root.ref} candidates in ${storeDir}`)
     if (complete.code !== 0) {
       throw new UnknownError(
@@ -618,7 +640,7 @@ async function rebaseWitness(
     }
     const landed = patchIdIndex(
       storeDir,
-      ["patch-id", "--stable"],
+      ["patch-id", "--verbatim"],
       complete.stdout,
       `published patch ids on ${root.ref}`,
     )
@@ -628,6 +650,17 @@ async function rebaseWitness(
     }
   }
   return undefined
+}
+
+/**
+ * A refused commit whose component store path is unknown is never silently dropped from the report:
+ * it stays refused, and the detail says so by name.
+ */
+function uncheckedDetail(unchecked: ReadonlyArray<string>): string {
+  if (unchecked.length === 0) return ""
+  const shown = unchecked.slice(0, 5).join(", ")
+  const more = unchecked.length > 5 ? ` and ${String(unchecked.length - 5)} more` : ""
+  return `; ${String(unchecked.length)} refused OID(s) not patch-id checked because their component store path is unknown: ${shown}${more}`
 }
 
 async function runCustody(
@@ -725,6 +758,7 @@ async function runCustody(
   const missing: CustodyTarget[] = []
   const allMissing: Array<CustodyTarget & Readonly<{ gitDir?: string }>> = []
   const rebased: RebaseWitness[] = []
+  const unchecked: string[] = []
   let witnessCount = 0
   let missingCount = 0
   let merged = 0
@@ -803,7 +837,10 @@ async function runCustody(
       for (const target of allMissing) {
         remaining()
         const gitDir = target.gitDir ?? gitDirs.get(target.component)
-        if (gitDir === undefined) continue
+        if (gitDir === undefined) {
+          unchecked.push(`${target.component}:${target.oid}`)
+          continue
+        }
         const witness = await rebaseWitness(target, gitDir, roots, run)
         if (witness !== undefined) rebased.push(witness)
       }
@@ -839,7 +876,7 @@ async function runCustody(
   if (missingCount > 0 && first !== undefined) {
     return {
       status: "blocked",
-      detail: `${missingCount} at-risk OID(s) have no durable witness, e.g. ${first.component} ${first.oid} (${first.source}); first ${missing.length} inline, full list in ${missingSidecar?.path ?? "a sidecar"}`,
+      detail: `${missingCount} at-risk OID(s) have no durable witness, e.g. ${first.component} ${first.oid} (${first.source}); first ${missing.length} inline, full list in ${missingSidecar?.path ?? "a sidecar"}${uncheckedDetail(unchecked)}`,
       witnesses,
       witnessCount,
       ...(witnessSidecar === undefined ? {} : { witnessSidecar }),
@@ -851,7 +888,7 @@ async function runCustody(
   }
   return {
     status: "pass",
-    detail: `${witnessCount} at-risk OID(s) each have a named surviving witness across ${stores.length} store(s), ${witnesses.length} distinct identities${rebased.length === 0 ? "" : `, plus ${String(rebased.length)} rebased commit(s) matched by patch-id to the published main graph`}`,
+    detail: `${witnessCount} at-risk OID(s) each have a named surviving witness across ${stores.length} store(s), ${witnesses.length} distinct identities${rebased.length === 0 ? "" : `, plus ${String(rebased.length)} rebased commit(s) matched by whitespace-sensitive patch-id to the published main graph`}${uncheckedDetail(unchecked)}`,
     witnesses,
     witnessCount,
     ...(witnessSidecar === undefined ? {} : { witnessSidecar }),
