@@ -186,7 +186,7 @@ describe("retention retirement batch (#33010)", () => {
       }),
     )
     expect(new Set(refs).size).toBe(1)
-    expect(dirname(refs[0])).toBe(join(options().artifactDir, "common"))
+    expect(new Set(refs.map((ref) => dirname(ref)))).toEqual(new Set([join(options().artifactDir, "common")]))
     expect(result.warnings).toEqual([])
   })
 
