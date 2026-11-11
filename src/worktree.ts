@@ -20,7 +20,7 @@ import { appendFile, lstat, readFile, writeFile } from "node:fs/promises"
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { fileURLToPath } from "node:url"
 import { tmpdir } from "node:os"
-import { createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS } from "./exclusive.ts"
+import { acquireExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS, type WriterLock } from "./exclusive.ts"
 import {
   acquireRemovalWriterLeases,
   assertExcludedRemovalCustody,
@@ -1423,28 +1423,34 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
     }
     return children.sort((a, b) => b.path.length - a.path.length)
   }
-  const runWithMutationLock = async <Result>(
-    dir: string,
-    holder: string,
-    operation: () => Promise<Result>,
-  ): Promise<Result> => {
+  const acquireMutationLock = async (dir: string, holder: string): Promise<WriterLock> => {
     const progress = createProgressReporter(
       options.report,
       (owner) => `git-super worktree: waiting for writer lock held by ${owner}\n`,
     )
     try {
-      return await createExclusive(dir, {
-        timeoutMs: timeouts.mutationLock,
-        onContended: progress.phase,
-      }).run(
-        () => {
-          progress.cancel()
-          return operation()
+      return await acquireExclusive(
+        dir,
+        {
+          timeoutMs: timeouts.mutationLock,
+          onContended: progress.phase,
         },
-        { holder },
+        holder,
       )
     } finally {
       progress.cancel()
+    }
+  }
+  const runWithMutationLock = async <Result>(
+    dir: string,
+    holder: string,
+    operation: () => Promise<Result>,
+  ): Promise<Result> => {
+    const lease = await acquireMutationLock(dir, holder)
+    try {
+      return await operation()
+    } finally {
+      lease.release()
     }
   }
   let mutations: Promise<string> | undefined
@@ -1633,18 +1639,23 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       let compaction: CompactionResult | undefined
       let children: Awaited<ReturnType<typeof captureLinkedChildren>> = []
       let custodyRefusal: ComponentCustodyRefusal | undefined
-      await mutate(removeOptions.operation ?? `worktree remove ${path}`, async () => {
-        const phaseOrigin = Date.now()
-        const phases: Record<string, number> = {}
-        const markPhase = (name: string, started: number) => {
-          phases[name] = Date.now() - started
-        }
-        const logPhases = () => {
-          if (process.env.GIT_SUPER_REMOVAL_PHASES !== "1") return
-          console.error(
-            `git-super removal phases ${JSON.stringify({ path, phases, totalMs: Date.now() - phaseOrigin })}`,
-          )
-        }
+      const mutationDirectory = await mutationLock()
+      const holder = removeOptions.operation ?? `worktree remove ${path}`
+      let mutationLease: WriterLock | undefined = await acquireMutationLock(mutationDirectory, holder)
+      const phaseOrigin = Date.now()
+      let heldFrom = phaseOrigin
+      const phases: Record<string, number> = {}
+      const markPhase = (name: string, started: number) => {
+        phases[name] = Date.now() - started
+      }
+      const releaseMutation = () => {
+        if (mutationLease === undefined) return
+        phases.globalWriterHeld = (phases.globalWriterHeld ?? 0) + Date.now() - heldFrom
+        const lease = mutationLease
+        mutationLease = undefined
+        lease.release()
+      }
+      const removeWithOwnerLeases = async () => {
         if (removeOptions.retention !== undefined && removeOptions.unlock === true) {
           throw new Error(`retained worktree removal cannot unlock ${path}; resolve its holder first`)
         }
@@ -1703,7 +1714,6 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
             return
           }
         }
-        const mutationDirectory = await mutationLock()
         let writerLeases: ReturnType<typeof acquireRemovalWriterLeases>
         try {
           writerLeases = acquireRemovalWriterLeases(gitDir, undefined, {
@@ -1756,6 +1766,13 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
                   policy: removeOptions.componentCustody,
                   deadline: proofDeadline,
                 })
+                if (preFreshness.status !== "ok") {
+                  throw new Error(`${preFreshness.source}: ${preFreshness.detail}`)
+                }
+                // Keep every source/witness owner lease, but let unrelated root writers proceed during proof.
+                // Shared-store packing and retained-entry retirement use these same owner leases.
+                releaseMutation()
+                const proofStarted = Date.now()
                 const proofSidecarDir = mkdtempSync(join(tmpdir(), "git-super-component-custody-"))
                 sidecarDir = proofSidecarDir
                 const sidecarReal = realpathSync(proofSidecarDir)
@@ -1889,18 +1906,100 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
                     }
                   }
                 }
-                if (custodyRefusal !== undefined && custodyRefusal.status === "blocked") {
-                  const postFreshness = await computeCustodyFreshness({
+                markPhase("unlockedProof", proofStarted)
+                let postFreshness: ComputedCustodyFreshness | undefined
+                if (custodyRefusal?.status !== "unknown") {
+                  mutationLease = await acquireMutationLock(mutationDirectory, holder)
+                  heldFrom = Date.now()
+                  const mutationCensus = await buildComponentCensus({
+                    git,
                     adapters,
-                    census: confirmedCensus,
+                    repo,
+                    worktree: path,
+                    rootGitDir: gitDir,
+                    excludedSubmodules: removeOptions.excludedSubmodules ?? [],
                     policy: removeOptions.componentCustody,
                     deadline: proofDeadline,
                   })
+                  if (mutationCensus.fingerprint !== confirmedCensus.fingerprint) {
+                    throw new Error(
+                      `${path}: component identities changed during unlocked custody proof; worktree kept`,
+                    )
+                  }
+                  postFreshness = await computeCustodyFreshness({
+                    adapters,
+                    census: mutationCensus,
+                    policy: removeOptions.componentCustody,
+                    deadline: proofDeadline,
+                  })
+                  if (postFreshness.status !== "ok") {
+                    throw new Error(`${postFreshness.source}: ${postFreshness.detail}`)
+                  }
                   if (
-                    preFreshness.status === "ok" &&
-                    postFreshness.status === "ok" &&
-                    preFreshness.fingerprint === postFreshness.fingerprint
+                    JSON.stringify(preFreshness.material.components) !==
+                    JSON.stringify(postFreshness.material.components)
                   ) {
+                    throw new Error(`${path}: component state changed during unlocked custody proof; worktree kept`)
+                  }
+                  for (const before of preFreshness.material.witnessStores) {
+                    const after = postFreshness.material.witnessStores.find((entry) => entry.store === before.store)
+                    if (after === undefined) {
+                      throw new Error(`${before.store}: witness store disappeared during custody proof; worktree kept`)
+                    }
+                    const { refs: beforeRefs, ...beforeIdentity } = before
+                    const { refs: afterRefs, ...afterIdentity } = after
+                    if (JSON.stringify(beforeIdentity) !== JSON.stringify(afterIdentity)) {
+                      throw new Error(`${before.store}: witness identity changed during custody proof; worktree kept`)
+                    }
+                    const currentRefs = new Map(
+                      afterRefs.map((row) => {
+                        const [ref, tip] = row.split("\t")
+                        return [ref, tip] as const
+                      }),
+                    )
+                    // A ref can advance after preFreshness and be read at that newer tip by custody proof.
+                    // Keep the gap's starting tips and every actual witness tip used between scans.
+                    const used =
+                      componentCustodyProof?.witnesses.filter((witness) => witness.store === before.store) ?? []
+                    const proofRefs = new Set([
+                      ...beforeRefs.map((row) => row.split("\t").slice(0, 2).join("\t")),
+                      ...used.map((witness) => `${witness.ref}\t${witness.tip}`),
+                    ])
+                    for (const row of proofRefs) {
+                      const [ref, tip] = row.split("\t")
+                      if (ref === undefined || tip === undefined) {
+                        throw new Error(`${before.store}: malformed proof-time witness ref ${row}; worktree kept`)
+                      }
+                      const current = currentRefs.get(ref)
+                      if (current === undefined) {
+                        throw new Error(
+                          `${before.store}: witness ${ref} was removed during custody proof; worktree kept`,
+                        )
+                      }
+                      if (current === tip) continue
+                      const forward = await adapters.run([
+                        "--no-optional-locks",
+                        "--no-replace-objects",
+                        `--git-dir=${dirname(before.store)}`,
+                        "merge-base",
+                        "--is-ancestor",
+                        tip,
+                        current,
+                      ])
+                      if (forward.code !== 0 || forward.timedOut === true || forward.stderr.trim() !== "") {
+                        throw new Error(
+                          `${before.store}: witness ${ref} did not fast-forward from ${tip} to ${current}; worktree kept: ${forward.stderr.trim()}`,
+                        )
+                      }
+                    }
+                  }
+                }
+                if (
+                  custodyRefusal !== undefined &&
+                  custodyRefusal.status === "blocked" &&
+                  postFreshness?.status === "ok"
+                ) {
+                  if (preFreshness.fingerprint === postFreshness.fingerprint) {
                     const scoped = scopeCustodyFreshnessMaterial(
                       postFreshness.material,
                       confirmedCensus.witnessStoreByComponent,
@@ -1913,11 +2012,13 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
                 }
               }
             } catch (error) {
+              const prior = custodyRefusal
               custodyRefusal = {
                 status: "unknown",
-                component: ".",
+                component: prior?.component ?? ".",
                 source: "component custody proof",
-                detail: error instanceof Error ? error.message : String(error),
+                detail: `${prior?.detail ? `${prior.detail}; ` : ""}${error instanceof Error ? error.message : String(error)}`,
+                ...(prior?.oid === undefined ? {} : { oid: prior.oid }),
               }
             } finally {
               if (sidecarDir !== undefined) {
@@ -1935,6 +2036,8 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
             }
             if (custodyRefusal !== undefined) return
           }
+          // Shared mutation must never proceed without reacquiring the root writer after custody proof.
+          if (mutationLease === undefined) throw new Error(`${path}: root writer lease is not held before removal`)
           if (removeOptions.noRehome === true) {
             const borrowers = rehome.inspect()
             if (borrowers.length > 0) {
@@ -2057,10 +2160,19 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
           }
           throw writerLeases.refusal(error)
         } finally {
-          logPhases()
           writerLeases.release()
         }
-      })
+      }
+      try {
+        await removeWithOwnerLeases()
+      } finally {
+        releaseMutation()
+        if (process.env.GIT_SUPER_REMOVAL_PHASES === "1") {
+          console.error(
+            `git-super removal phases ${JSON.stringify({ path, phases, totalMs: Date.now() - phaseOrigin })}`,
+          )
+        }
+      }
 
       try {
         // After native --force: pack-refs + drop remote reflogs on the retained copy, then rewrite

@@ -220,6 +220,8 @@ Removes one registered, clean, unlocked linked worktree. Steps:
 
 Copies are never deleted automatically. Keep them at least until the proof's `retainUntil` date. Use a durable directory.
 
+Component-custody validation releases the root writer lock during contents and witness proof while retaining the source and witness Git-directory writer leases. Before retention or removal, it reacquires the root lock and rechecks identities and component state. Added witness refs and fast-forwards are allowed; removed or rewound proof-time refs keep the worktree with an unknown custody result. Other object-store writers must honor those existing leases; native Git commands do not acquire them automatically.
+
 Library removal or destroyed-worktree recovery without retained-copy custody preserves a module store when the existing inspection finds commits outside its compared remote default, existing archive refs and available tags.
 
 The error names the store, count and owner value call: land, keep one real branch, or recorded delete. This path creates no archive refs; existing remote archive refs still count in the comparison.
