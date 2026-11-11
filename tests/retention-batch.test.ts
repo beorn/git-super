@@ -181,7 +181,7 @@ describe("retention retirement batch (#33010)", () => {
             join(options().artifactDir, entry.split("/").pop()!, phase, "retirement-certificate.json"),
             "utf8",
           ),
-        )
+        ) as { commonFactsRef: { path: string } }
         return value.commonFactsRef.path
       }),
     )

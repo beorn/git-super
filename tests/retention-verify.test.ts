@@ -286,10 +286,16 @@ describe("retention verify gates 1-6", () => {
       clock: eligible(),
     })
     expect(proof.verdict).toBe("candidate")
-    const certificate = JSON.parse(readFileSync(proof.certificate!.path, "utf8"))
+    const certificate = JSON.parse(readFileSync(proof.certificate!.path, "utf8")) as {
+      schema: string
+      certificateSchema: string
+      estate?: unknown
+      coverage: object
+      commonFactsRef?: { path: string; sha256: string; bytes: number; count: number }
+    }
     expect(certificate.schema).toBe("git-super/retention-certificate/2")
     expect(certificate.estate).toBeUndefined()
-    const ref = certificate.commonFactsRef
+    const ref = certificate.commonFactsRef!
     expect(ref.count).toBe(1)
     const stable = join(base.artifactDir, "retirement-certificate.json")
     expect(statSync(stable).ino).toBe(statSync(proof.certificate!.path).ino)
@@ -305,7 +311,10 @@ describe("retention verify gates 1-6", () => {
         clock: eligible(),
       })
       expect(proofFacts(second).facts).toBe(original)
-      expect(JSON.parse(readFileSync(second.certificate!.path, "utf8")).commonFactsRef.path).toBe(ref.path)
+      const secondCertificate = JSON.parse(readFileSync(second.certificate!.path, "utf8")) as {
+        commonFactsRef: { path: string }
+      }
+      expect(secondCertificate.commonFactsRef.path).toBe(ref.path)
     } else {
       if (fault === "missing") rmSync(ref.path)
       else if (fault === "changed") writeFileSync(ref.path, "changed")
@@ -319,13 +328,17 @@ describe("retention verify gates 1-6", () => {
           certificate.schema = certificate.certificateSchema =
             fault === "v1" ? "git-super/retention-certificate/1" : "git-super/retention-certificate/99"
           if (fault === "v1") {
-            const payload = JSON.parse(readFileSync(ref.path, "utf8"))
+            const payload = JSON.parse(readFileSync(ref.path, "utf8")) as { estate: object; coverage: object }
             certificate.estate = payload.estate
             certificate.coverage = { ...payload.coverage, ...certificate.coverage }
             delete certificate.commonFactsRef
           }
         } else {
-          const payload = JSON.parse(readFileSync(ref.path, "utf8"))
+          const payload = JSON.parse(readFileSync(ref.path, "utf8")) as {
+            schema: string
+            estate: { alternatesFiles: number }
+            coverage: { witnessStores: string[] }
+          }
           if (fault === "foreign estate") payload.estate.alternatesFiles += 1
           else if (fault === "unknown payload version") payload.schema = "git-super/retention-common-facts/99"
           else payload.coverage.witnessStores = []
@@ -862,8 +875,11 @@ describe("retention verify gates 1-6", () => {
       })
       expect(proof.verdict).toBe("candidate")
       const bytes = readFileSync(proof.certificate!.path, "utf8")
-      const saved = JSON.parse(bytes)
-      const common = JSON.parse(readFileSync(saved.commonFactsRef.path, "utf8"))
+      const saved = JSON.parse(bytes) as { commonFactsRef?: { path: string }; coverage: object }
+      const common = JSON.parse(readFileSync(saved.commonFactsRef!.path, "utf8")) as {
+        estate: object
+        coverage: object
+      }
       const certificate = { ...saved, estate: common.estate, coverage: { ...common.coverage, ...saved.coverage } }
       delete certificate.commonFactsRef
       const path = proof.certificate!.path
