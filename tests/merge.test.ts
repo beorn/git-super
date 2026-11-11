@@ -1187,7 +1187,9 @@ describe("git super merge", () => {
         await vi.advanceTimersByTimeAsync(5_000)
       }
       expect(ordinaryResult).toBeInstanceOf(Error)
-      expect((ordinaryResult as Error).message).toMatch(/timeout=30000ms; live holder: .*?; recorded note, not authority: holder=git super merge/u)
+      expect((ordinaryResult as Error).message).toMatch(
+        /timeout=30000ms; live holder: .*?; recorded note, not authority: holder=git super merge/u,
+      )
       // More than the old 30 s cap has now passed on the clock and the merge has still not settled.
       expect(mergeOutcome).toBe("pending")
       release()
