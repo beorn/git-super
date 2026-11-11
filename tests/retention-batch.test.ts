@@ -476,19 +476,30 @@ describe("retention retirement batch (#33010)", () => {
     expect(readdirSync(root)).toEqual(names.slice(2))
   })
 
-  it("a retained-store owner whose env path exists again is live, not cold", async () => {
+  // An unprovable absence must also keep the owner live: historical namespace ancestors can be regular files.
+  it.each(["directory", "ancestor-file"])("a retained-store owner without absence proof is live (%s)", async (kind) => {
     const names = readdirSync(root).sort()
     const entries = names.slice(0, 2).map((name) => join(root, name))
     const manifest = JSON.parse(readFileSync(join(root, names[2] as string, "manifest.json"), "utf8")) as {
       path: string
     }
     rmSync(join(root, names[2] as string, "modules", "vendor", "dep", "yrd-worktree-mutations", "writer.lock"))
-    mkdirSync(manifest.path, { recursive: true })
+    const ancestor = join(fixtureRoot, "blocked-owner-parent")
+    if (kind === "ancestor-file") {
+      writeFileSync(ancestor, "not a directory\n")
+      manifest.path = join(ancestor, "old-worktree")
+      writeFileSync(join(root, names[2] as string, "manifest.json"), JSON.stringify(manifest))
+    } else mkdirSync(manifest.path, { recursive: true })
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined)
     try {
       const result = await retireRetainedBatch({ ...options(), entries })
       expect(result.owners?.liveUnleased).toBeGreaterThan(0)
+      if (kind === "ancestor-file") {
+        expect(warning).toHaveBeenCalledWith(expect.stringContaining("ENOTDIR"))
+      }
     } finally {
-      rmSync(manifest.path, { recursive: true, force: true })
+      warning.mockRestore()
+      rmSync(kind === "ancestor-file" ? ancestor : manifest.path, { recursive: true, force: true })
     }
   })
 

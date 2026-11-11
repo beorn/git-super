@@ -359,7 +359,15 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
   const cold = new Map<string, ColdOwner>()
   const coldCache = new Map<string, ColdOwner | undefined>()
   for (const owner of ownerList) {
-    const proof = coldOwner(owner, root, common, coldCache)
+    let proof: ColdOwner | undefined
+    try {
+      proof = coldOwner(owner, root, common, coldCache)
+    } catch (error) {
+      // delete-fallback-allow: proof stays undefined, keeping this owner live and requiring its existing writer lease or connected keeps; unreadable cold evidence never authorizes more deletes (#33010).
+      console.warn(
+        `retention: cannot prove cold owner ${owner}: ${error instanceof Error ? error.message : String(error)}; treating it as live, requiring its existing writer lease`,
+      )
+    }
     if (proof !== undefined) cold.set(owner, proof)
   }
   const liveOwners = ownerList.filter((owner) => !cold.has(owner))
