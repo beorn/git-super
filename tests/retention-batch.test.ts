@@ -12,10 +12,15 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, 
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { tryAcquireFlock } from "@bearly/flock"
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest"
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest"
 import { runCli } from "../src/cli.ts"
 import { retireRetainedBatch, type RetentionBatchOptions } from "../src/retention-batch.ts"
 import { scanEstate } from "../src/retention-estate.ts"
+
+vi.mock("node:fs", async (importOriginal) => {
+  const fs = await importOriginal<typeof import("node:fs")>()
+  return { ...fs, rmSync: vi.fn(fs.rmSync) }
+})
 
 const environment: NodeJS.ProcessEnv = {
   ...process.env,
@@ -295,6 +300,32 @@ describe("retention retirement batch (#33010)", () => {
     expect(result.stopped).toContain("lease budget")
     expect(result.stopped).not.toContain("census-shifted")
     expect(result.rows.slice(1).every((row) => row.reason.includes("lease budget"))).toBe(true)
+  })
+
+  // CTO d35ae483: a killed/failed recursive deletion must leave an incomplete entry excluded by the next
+  // census. Existing failure tests concern proof/pointer cleanup, not interruption with store files remaining.
+  it("removes the manifest before bulk deletion so an interrupted remainder cannot be selected again", async () => {
+    const input = options({ apply: true })
+    const first = input.entries[0] as string
+    const fs = await vi.importActual<typeof import("node:fs")>("node:fs")
+    const original = fs.rmSync
+    const removal = vi.mocked(rmSync).mockImplementation((path, opts) => {
+      if (String(path) === first && opts?.recursive) {
+        original(join(first, "modules", "vendor", "dep", "objects"), { recursive: true })
+        throw new Error("fixture interruption during bulk removal")
+      }
+      return original(path, opts)
+    })
+    try {
+      const result = await retireRetainedBatch(input)
+      expect(result.rows.map((row) => row.outcome)).toEqual(["failed", "kept", "kept"])
+      expect(result.stopped).toContain("retirement-partial")
+      expect(existsSync(join(first, "modules"))).toBe(true)
+      expect(existsSync(join(first, "modules", "vendor", "dep", "objects"))).toBe(false)
+      expect(existsSync(join(first, "manifest.json"))).toBe(false)
+    } finally {
+      removal.mockImplementation(original)
+    }
   })
 
   // @cto dc77f630 condition 3: a writer that takes no lease (a hand-run clone) is caught by the delta, not the lease.

@@ -7,7 +7,8 @@
  * The lease is NOT held across the scan. Instead one lease window opens with {@link estateDelta}: the estate's SET of
  * object directories, alternates files, `objects` links and borrower registries must still be what the scan saw.
  * Writers that never take the lease exist (a hand-run clone or `git worktree add` writes an alternates file with no
- * lease); that comparison, not the lease, is what catches them between scan and delete. Any change ends the batch
+ * lease); that comparison catches their changes before the delta. A new borrower added without a lease DURING
+ * the held window is not detected by the reused scan (accepted limitation, @cto d35ae483). A changed delta ends the batch
  * with nothing deleted. The lease is then held with no gap through that window's deletes, and its hold time is
  * measured; the command stops once its hold would pass the budget (about 60 s). A subsequent invocation scans afresh.
  *
@@ -493,6 +494,9 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
                 rows.set(entry, { entry, outcome: "kept", reason: stopped })
                 break
               }
+              // Invalidate selection before bulk removal: a kill/partial removal leaves a named manifest-less
+              // remainder for the next census, never another automatically selected expired store (@cto d35ae483).
+              rmSync(join(entry, "manifest.json"), { force: false })
               rmSync(entry, { recursive: true, force: false })
               if (lstatSync(entry, { throwIfNoEntry: false }) !== undefined) {
                 throw new Error(`entry ${entry} is still present after deletion`)

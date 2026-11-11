@@ -282,6 +282,8 @@ JSON is the existing `GitSuperResult`: proof paths are in `detail.paths`, with t
 
 JSON reports `apply`, scan timing and exclusions, owner counts, the lease window and each entry's outcome and reason. Human output names each entry and measured lease holds. An inactive owner needs an observed absent worktree path from its retained manifest or linked-worktree gitdir, rechecked before deletion. A live owner without an existing lease keeps its alternates-connected entries. Borrowers retire before their lenders; a kept borrower also keeps its lenders, and cyclic dependencies stay kept. Each invocation uses at most one lease window. If its budget expires, remaining entries stay kept and a subsequent invocation scans afresh. A changed estate ends the batch; completed deletions are never retried. Exit 0 means the complete report is available, including kept entries; 2 means the batch stopped or a deletion failed. Missing roots or required namespace/evidence options are reported by name, never treated as empty results; evidence directories are created when needed.
 
+Bulk deletion removes the manifest first. An interrupted remainder has no manifest and stays outside later automatic expired-store selection. The delta detects unleased writers' changes before the held window; a new borrower added without a lease during that window is outside the reused scan's detection.
+
 ## gitlink write
 
 ```bash
