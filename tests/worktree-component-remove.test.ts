@@ -297,6 +297,7 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
     "witness-deleted",
     "component-changed",
     "identity-changed",
+    "witness-diverged-after-read",
   ] as const)("admits a root writer during custody proof and validates the gap: %s", async (mode) => {
     const root = await mkdtemp(join(canonicalTmpdir(), "git-super-custody-unlocked-"))
     const entered = Promise.withResolvers<void>()
@@ -316,17 +317,30 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
       const tree = git(witness, "rev-parse", "HEAD^{tree}")
       const proofTip = git(witness, "commit-tree", tree, "-p", original, "-m", "proof-time witness")
       const newerTip = git(witness, "commit-tree", tree, "-p", proofTip, "-m", "forward witness")
+      const otherTip = git(witness, "commit-tree", tree, "-p", proofTip, "-m", "divergent witness")
       git(witness, "update-ref", "refs/heads/main", proofTip)
       const common = git(product, "rev-parse", "--path-format=absolute", "--git-common-dir")
       const local = createLocalGitProcess()
       const localStream = local.stream!
       let paused = false
+      let replacedAfterRead = false
       const store = createGitWorktreeStore({
         repo: product,
         gitProcess: {
           ...local,
           stream(request) {
             const stream = localStream(request)
+            if (
+              mode === "witness-diverged-after-read" &&
+              !replacedAfterRead &&
+              request.args.includes(`--git-dir=${witnessDir}`) &&
+              request.args.includes("rev-list") &&
+              request.args.includes(newerTip)
+            ) {
+              // The graph query already names newerTip; its ref now moves to a sibling of that proof-time tip.
+              git(witness, "update-ref", "refs/heads/main", otherTip)
+              replacedAfterRead = true
+            }
             if (!paused && request.args.includes("fsck") && request.args.includes(`--git-dir=${witnessDir}`)) {
               paused = true
               entered.resolve()
@@ -360,7 +374,9 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
       witnessContender?.release()
       expect(witnessContender, "the witness owner lease must remain held during the gap").toBeNull()
       if (mode === "witness-added") git(witness, "update-ref", `refs/git-super/pins/${newerTip}`, newerTip)
-      if (mode === "witness-forwarded") git(witness, "update-ref", "refs/heads/main", newerTip)
+      if (mode === "witness-forwarded" || mode === "witness-diverged-after-read") {
+        git(witness, "update-ref", "refs/heads/main", newerTip)
+      }
       if (mode === "witness-rewound") git(witness, "update-ref", "refs/heads/main", original)
       if (mode === "witness-deleted") git(witness, "update-ref", "-d", "refs/heads/main")
       if (mode === "component-changed") git(source, "update-ref", "refs/heads/during-proof", original)
@@ -372,7 +388,14 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
       contender = undefined
       resume.resolve()
       const outcome = await removal
-      const kept = ["witness-rewound", "witness-deleted", "component-changed", "identity-changed"].includes(mode)
+      if (mode === "witness-diverged-after-read") expect(replacedAfterRead).toBe(true)
+      const kept = [
+        "witness-rewound",
+        "witness-deleted",
+        "component-changed",
+        "identity-changed",
+        "witness-diverged-after-read",
+      ].includes(mode)
       if (kept) {
         expect(outcome).toMatchObject({ custodyRefusal: { status: "unknown" } })
         expect(existsSync(target)).toBe(true)

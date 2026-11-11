@@ -1957,7 +1957,15 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
                         return [ref, tip] as const
                       }),
                     )
-                    for (const row of beforeRefs) {
+                    // A ref can advance after preFreshness and be read at that newer tip by custody proof.
+                    // Keep the gap's starting tips and every actual witness tip used between scans.
+                    const used =
+                      componentCustodyProof?.witnesses.filter((witness) => witness.store === before.store) ?? []
+                    const proofRefs = new Set([
+                      ...beforeRefs.map((row) => row.split("\t").slice(0, 2).join("\t")),
+                      ...used.map((witness) => `${witness.ref}\t${witness.tip}`),
+                    ])
+                    for (const row of proofRefs) {
                       const [ref, tip] = row.split("\t")
                       if (ref === undefined || tip === undefined) {
                         throw new Error(`${before.store}: malformed proof-time witness ref ${row}; worktree kept`)
