@@ -171,9 +171,14 @@ function keepUnleasedConnections(
   kept: Map<string, string>,
 ): void {
   const graph = new Map<string, string[]>()
+  const link = (from: string, to: string): void => {
+    const targets = graph.get(from)
+    if (targets === undefined) graph.set(from, [to])
+    else targets.push(to)
+  }
   for (const edge of borrowers) {
-    graph.set(edge.borrower, [...(graph.get(edge.borrower) ?? []), edge.target])
-    graph.set(edge.target, [...(graph.get(edge.target) ?? []), edge.borrower])
+    link(edge.borrower, edge.target)
+    link(edge.target, edge.borrower)
   }
   const reached = new Set<string>()
   for (const owner of owners) {

@@ -4,6 +4,8 @@
  *   file is skipped instead of keeping the batch, or the dry run deletes.
  * @level l2 (real git-super retained entries written by `worktree remove --retain`)
  * @consumer yrd's one-shot retained-modules drain; git super worktree retention retire-batch
+ * @testonly none
+ * @reach fs-walk <fixture-only: estate scans visit mkdtempSync(tmpdir()) Git repositories>
  */
 import { execFileSync } from "node:child_process"
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
