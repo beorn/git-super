@@ -525,8 +525,9 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
           (value) => ({ value, error: undefined }),
           (error: unknown) => ({ value: undefined, error }),
         )
-        if (mode === "copy-changed")
+        if (mode === "copy-changed") {
           expect(changedPreparedCopy, "the prepared copy was actually changed after hashing").toBe(true)
+        }
         expect(readFileSync(join(unrelatedEntry, "keep.txt"), "utf8")).toBe("another invocation's custody\n")
         if (mode === "unchanged") {
           expect(outcome.error).toBeUndefined()

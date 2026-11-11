@@ -2099,8 +2099,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
                 componentCustodyProof,
               )
             }
-            markPhase("retainedCopy", retainedCopyStarted)
-            phases.retainedCopy = phases.retainedCopy! + retainedPreparationMs
+            phases.retainedCopy = Date.now() - retainedCopyStarted + retainedPreparationMs
           } else {
             if (removeOptions.unlock === true) await unlockWorktree(git, repo, path)
             if (removeOptions.noRehome !== true) rehome.run()
