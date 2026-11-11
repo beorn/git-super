@@ -685,7 +685,7 @@ function componentSelectionOnRemote(
   parent: string,
   path: string,
   store: string,
-): { onRemote: true } | { onRemote: false; reason: string } {
+): { onRemote: true; headPin: string; indexPin: string } | { onRemote: false; reason: string } {
   const porcelain = gitText(store, ["--no-optional-locks", "status", "--porcelain", "--untracked-files=all"])
   if (porcelain.code !== 0) {
     return {
@@ -819,7 +819,7 @@ function componentSelectionOnRemote(
       }
     }
   }
-  return { onRemote: true }
+  return { onRemote: true, headPin: headPin.stdout.trim(), indexPin: indexPin.stdout.trim() }
 }
 
 /** Drop gitlink records that are on the component remote. They are class `on-remote`, not dirt (31031). */
@@ -836,7 +836,8 @@ export function admitOnRemoteSelections(status: SuperStatusResult): SuperStatusR
     if (component !== undefined && component.path !== "." && parent !== undefined) {
       const selection = componentSelectionOnRemote(parent.root, component.path, component.root)
       if (selection.onRemote) {
-        const label = `on-remote ${component.path}`
+        // 33315: the receipt names the admitted pin move (committed -> staged), so it can be restored from it.
+        const label = `on-remote ${component.path} ${selection.headPin} -> ${selection.indexPin}`
         if (!onRemote.includes(label)) onRemote.push(label)
         continue
       }

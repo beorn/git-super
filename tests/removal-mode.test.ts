@@ -67,8 +67,32 @@ describe("status --removal verdict", () => {
     const { code, result } = await removal(fixture.product)
     expect(code, JSON.stringify(result.records)).toBe(0)
     expect(result.records).toEqual([])
-    expect(result.onRemote).toContain("on-remote packages/alpha")
+    // 33315: the admitted pin move is named committed -> staged, so the receipt alone can restore it.
+    const committed = git(fixture.product, "rev-parse", "HEAD:packages/alpha")
+    expect(result.onRemote).toEqual([`on-remote packages/alpha ${committed} -> ${next}`])
     expect(result).not.toHaveProperty("offRemote")
+  })
+
+  test("a staged pin to an unpushed commit stays dirt even when the checkout is on the remote", async () => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-removal-staged-unpushed-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const checkout = join(fixture.product, "packages/alpha")
+    git(checkout, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    const pushed = git(checkout, "rev-parse", "HEAD")
+    writeFileSync(join(checkout, "local.ts"), "export const local = 1\n")
+    git(checkout, "add", "local.ts")
+    git(checkout, "commit", "-q", "-m", "local only")
+    const unpushed = git(checkout, "rev-parse", "HEAD")
+    git(fixture.product, "add", "packages/alpha")
+    git(checkout, "checkout", "-q", "--detach", pushed)
+    expect(git(fixture.product, "rev-parse", ":packages/alpha")).toBe(unpushed)
+    const { code, result } = await removal(fixture.product)
+    expect(code, JSON.stringify(result)).toBe(1)
+    expect(result.onRemote ?? []).toEqual([])
+    expect(result.offRemote?.map((entry) => entry.reason).join("\n")).toContain(
+      `index gitlink ${unpushed} is not on refs/remotes/origin/main`,
+    )
   })
 
   // 33315: an on-remote selection admits only the records its pin move produced, never the component's own
