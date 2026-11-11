@@ -462,6 +462,19 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
           repo: product,
           gitProcess: {
             ...local,
+            stream(request) {
+              // The post-preparation census uses bounded streaming, unlike normalization's buffered run.
+              if (
+                mode === "copy-changed" &&
+                copiedStore !== "" &&
+                !changedPreparedCopy &&
+                request.args.includes("check-ref-format")
+              ) {
+                writeFileSync(join(copiedStore, "description"), "changed prepared metadata\n")
+                changedPreparedCopy = true
+              }
+              return local.stream!(request)
+            },
             async run(request) {
               const gitDirAt = request.args.indexOf("--git-dir")
               const candidate = gitDirAt < 0 ? undefined : request.args[gitDirAt + 1]
@@ -471,16 +484,6 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
                 entered.resolve()
                 await resume.promise
                 if (mode === "failed-preparation") throw new Error("fixture retention preparation failed")
-              }
-              // The first post-preparation census runs after preparation fixed its expected digests.
-              if (
-                mode === "copy-changed" &&
-                copiedStore !== "" &&
-                !changedPreparedCopy &&
-                request.args.includes("check-ref-format")
-              ) {
-                writeFileSync(join(copiedStore, "description"), "changed prepared metadata\n")
-                changedPreparedCopy = true
               }
               return local.run(request)
             },
@@ -522,6 +525,8 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
           (value) => ({ value, error: undefined }),
           (error: unknown) => ({ value: undefined, error }),
         )
+        if (mode === "copy-changed")
+          expect(changedPreparedCopy, "the prepared copy was actually changed after hashing").toBe(true)
         expect(readFileSync(join(unrelatedEntry, "keep.txt"), "utf8")).toBe("another invocation's custody\n")
         if (mode === "unchanged") {
           expect(outcome.error).toBeUndefined()
@@ -541,7 +546,6 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
             outcome.error !== undefined || (outcome.value !== undefined && "custodyRefusal" in outcome.value),
           ).toBe(true)
         }
-        if (mode === "copy-changed") expect(changedPreparedCopy).toBe(true)
         if (mode !== "unchanged") {
           const released = tryAcquireFlock(join(sourceGitDir, "yrd-worktree-mutations", "writer.lock"))
           released?.release()
