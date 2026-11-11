@@ -7,6 +7,7 @@ import { DEFAULT_MUTATION_LOCK_WAIT_MS } from "./exclusive.ts"
 import { canonicalEstateScan, scanEstate, type EstateScan } from "./retention-estate.ts"
 import { runGit } from "./git.ts"
 import { publishArtifact } from "./retention-stream.ts"
+import { readCertificateFacts } from "./retention-certificate.ts"
 import {
   readRetentionAudits,
   newestRetentionAudit,
@@ -74,7 +75,7 @@ function keepReason(proof: RetentionVerifyResult): KeepReason {
 }
 
 /** Compare actual, hash-checked proof contents, not hashes derived from differing pass clocks. */
-function proofFacts(proof: RetentionVerifyResult): { facts: string; path: string } {
+export function proofFacts(proof: RetentionVerifyResult): { facts: string; path: string } {
   if (proof.certificate === undefined || proof.artifactDir === undefined) {
     throw new Error(`candidate ${proof.entry} has no certificate or artifact directory`)
   }
@@ -84,7 +85,12 @@ function proofFacts(proof: RetentionVerifyResult): { facts: string; path: string
   if (createHash("sha256").update(bytes).digest("hex") !== proof.certificate.digest) {
     throw new Error(`certificate bytes disagree with their digest: ${proof.certificate.path}`)
   }
-  const certificate: unknown = JSON.parse(bytes.toString("utf8"))
+  const certificate = readCertificateFacts(
+    JSON.parse(bytes.toString("utf8")),
+    proof.certificate.commonArtifactDir,
+    proof.estate,
+    proof.coverage,
+  )
   // Only the certificate's own clock/elapsed and these artifact path fields vary by pass.
   // All other keys, array order, identities, manifests, digests and census facts compare.
   const artifactPaths = new Set([
@@ -120,7 +126,7 @@ function proofFacts(proof: RetentionVerifyResult): { facts: string; path: string
   }
 }
 
-function pointers(proof: RetentionVerifyResult): ReturnType<typeof readRetainedPointer>[] {
+export function pointers(proof: RetentionVerifyResult): ReturnType<typeof readRetainedPointer>[] {
   if (proof.estate === undefined) throw new Error(`candidate ${proof.entry} has no estate census`)
   return proof.estate.registries.flatMap((registry) =>
     readdirSync(registry)
@@ -290,7 +296,13 @@ async function runRetentionOperation(
         }
       }
       phase = "preliminary-proof"
-      const preOptions = { ...options, entry, root, artifactDir: join(options.artifactDir, "pre") }
+      const preOptions = {
+        ...options,
+        entry,
+        root,
+        artifactDir: join(options.artifactDir, "pre"),
+        commonArtifactDir: join(options.artifactDir, "common"),
+      }
       const preliminaryEstate =
         mode === "audit"
           ? scanEstate(options.namespaceRoots, [entry], options.bounds?.estate, options.monotonic)
@@ -346,6 +358,7 @@ async function runRetentionOperation(
         entry,
         root,
         artifactDir: join(options.artifactDir, "held"),
+        commonArtifactDir: join(options.artifactDir, "common"),
       }
       const heldEstate =
         mode === "audit"

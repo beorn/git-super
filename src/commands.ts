@@ -32,6 +32,7 @@ import {
 import { verifyRetainedEntry, type RetentionVerifyOptions, type RetentionVerifyResult } from "./retention-verify.ts"
 import { auditRetainedEntry, retireRetainedEntry, type RetentionRetireOptions } from "./retention-remove.ts"
 import { compactRetainedRoot, type CompactRetainedRootReport } from "./retention-compact.ts"
+import { retireRetainedBatch, type RetentionBatchOptions, type RetentionBatchResult } from "./retention-batch.ts"
 import { superWorktreeRemove, type SuperWorktreeRemoveOptions } from "./worktree-remove.ts"
 
 export type CommandContext = Readonly<{ repo: string; report?: (message: string) => void }>
@@ -49,6 +50,10 @@ export type RetentionVerifyParams = Omit<RetentionVerifyOptions, "clock">
 export type RetentionRetireParams = Omit<RetentionRetireOptions, "clock">
 export type RetentionEnrollParams = Readonly<{ root: string; common: string; apply?: boolean }>
 export type RetentionCompactParams = Readonly<{ root: string; dryRun?: boolean; limit?: number }>
+export type RetentionBatchParams = Pick<
+  RetentionBatchOptions,
+  "entries" | "root" | "common" | "namespaceRoots" | "artifactDir" | "apply"
+>
 export type PrivateStoreVerifyParams = Omit<PrivateStoreCandidateOptions, "git">
 export type PrivateStoreVerifyNode = CommandNode<CommandContext, PrivateStoreVerifyParams, PrivateStoreCandidateResult>
 
@@ -447,6 +452,30 @@ const retentionRetire = commandNode<CommandContext, RetentionRetireParams, GitSu
   run: (_context, input) => retireRetainedEntry(input),
 })
 
+const retentionBatch = commandNode<CommandContext, RetentionBatchParams, RetentionBatchResult>({
+  title: "Retire selected retained entries on one estate scan",
+  description:
+    "Dry run by default; --apply rechecks the estate and each entry under existing writer leases before deletion.",
+  params: params((value) => {
+    const input = record(value)
+    const entries = stringArray(input.entries, "entries")
+    if (entries.length === 0) throw new Error("retire-batch requires at least one selected entry")
+    if (input.apply !== undefined && typeof input.apply !== "boolean") {
+      throw new Error("retire-batch apply must be a boolean")
+    }
+    const held = retentionHeldSchema.parse({ ...input, entry: entries[0] })
+    return {
+      entries,
+      root: held.root,
+      common: held.common,
+      namespaceRoots: held.namespaceRoots,
+      artifactDir: held.artifactDir,
+      ...(input.apply === true ? { apply: true } : {}),
+    }
+  }),
+  run: (_context, input) => retireRetainedBatch(input),
+})
+
 const retentionAudit = commandNode<CommandContext, RetentionRetireParams, GitSuperResult>({
   title: "Audit one retained entry under existing writer leases",
   description:
@@ -590,6 +619,7 @@ export type GitSuperCommands = Readonly<{
     retention: Readonly<{
       verify: CommandNode<CommandContext, RetentionVerifyParams, RetentionVerifyResult>
       retire: CommandNode<CommandContext, RetentionRetireParams, GitSuperResult>
+      "retire-batch": CommandNode<CommandContext, RetentionBatchParams, RetentionBatchResult>
       audit: CommandNode<CommandContext, RetentionRetireParams, GitSuperResult>
       compact: CommandNode<CommandContext, RetentionCompactParams, CompactRetainedRootReport>
       enroll: CommandNode<CommandContext, RetentionEnrollParams, RetentionEnrollReport>
@@ -615,6 +645,7 @@ export const commands = defineCommandNodes({
     retention: {
       verify: retentionVerify,
       retire: retentionRetire,
+      "retire-batch": retentionBatch,
       audit: retentionAudit,
       compact: retentionCompact,
       enroll: retentionEnroll,

@@ -6,8 +6,14 @@
  * unreadable registry, a missing or redirected alternate target, an incomplete scan or a bound
  * hit is `unknown`, never a silent skip. A survivor (outside `R`) that borrows into an object
  * directory under `R` is `blocked`.
+ *
+ * A DANGLING alternates line (its resolved path does not exist) is excluded BY NAME and the pass continues (#33010,
+ * @cto e497078d): a path that does not exist cannot be a loan from any store that does, so excluding it loses no
+ * lender fact, and it must not end the inventory for every other entry. Exclusion is per line: the same file's
+ * resolvable lines still count. Any other unreadable or non-directory target still ends the pass as `unknown`.
  */
-import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs"
+import { createHash } from "node:crypto"
+import { existsSync, lstatSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs"
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { alternateEntries } from "./alternates.ts"
 
@@ -19,6 +25,57 @@ export interface EstateScanBounds {
 }
 
 export const DEFAULT_ESTATE_BOUNDS: EstateScanBounds = { maxAlternatesFiles: 60_000, scanMs: 180_000 }
+
+/**
+ * The raised bounds for the ONE scan a retirement batch reuses (#33010, @cto dc77f630 condition 5); an ordinary
+ * verify keeps {@link DEFAULT_ESTATE_BOUNDS}. Measured 2026-11-10 on the live estate: 149,443 alternates files, 469-496 s.
+ */
+export const BATCH_ESTATE_BOUNDS: EstateScanBounds = { maxAlternatesFiles: 300_000, scanMs: 900_000 }
+
+/**
+ * What one scan saw, so a lease-held {@link estateDelta} can prove the estate's SET unchanged without a second walk
+ * (#33010, @cto dc77f630 condition 1). Stamps carry the inode and the change time, never the modification time
+ * alone, which any writer can set back.
+ */
+export interface EstateWalkRecord {
+  /** Every directory the walk read, by path: `ino:mtimeMs:ctimeMs`, taken before it was read. */
+  readonly dirs: Map<string, string>
+  /** Every reached object directory's `info/alternates`, by path: `ino:size:ctimeMs`, or `absent`. */
+  readonly alternates: Map<string, string>
+  /** Every `objects` symlink the walk met, by path: its resolved target. */
+  readonly objectLinks: Map<string, string>
+  /** Every borrower registry directory, by path: a digest of its record names and bytes. */
+  readonly registries: Map<string, string>
+}
+
+export function newEstateWalkRecord(): EstateWalkRecord {
+  return { dirs: new Map(), alternates: new Map(), objectLinks: new Map(), registries: new Map() }
+}
+
+function dirStamp(path: string): string {
+  const stat = lstatSync(path)
+  return `${stat.ino}:${stat.mtimeMs}:${stat.ctimeMs}`
+}
+
+function fileStamp(path: string): string {
+  const link = lstatSync(path, { throwIfNoEntry: false })
+  if (link === undefined) return "absent"
+  const stat = link.isSymbolicLink() ? statSync(path) : link
+  return `${link.dev}:${link.ino}:${link.size}:${link.ctimeMs}/${stat.dev}:${stat.ino}:${stat.size}:${stat.ctimeMs}`
+}
+
+function registryDigest(dir: string): string {
+  const hash = createHash("sha256")
+  for (const name of readdirSync(dir)
+    .filter((entry) => entry.endsWith(".json"))
+    .sort()) {
+    hash
+      .update(`${name}\0`)
+      .update(readFileSync(join(dir, name)))
+      .update("\0")
+  }
+  return hash.digest("hex")
+}
 
 export interface EstateBorrower {
   /** The object directory that declares the alternate (the borrower). */
@@ -32,6 +89,17 @@ function compareEstateEdges(left: EstateBorrower, right: EstateBorrower): number
   return left.target < right.target ? -1 : left.target > right.target ? 1 : 0
 }
 
+/** One excluded alternates line: the store declaring it lost the objects that line named. */
+export interface DanglingAlternate {
+  /** The object directory whose `info/alternates` holds the line. */
+  readonly store: string
+  readonly alternatesFile: string
+  /** The line as written (trimmed). */
+  readonly line: string
+  /** The line resolved the way git does, relative lines against `store`. */
+  readonly target: string
+}
+
 export interface EstateScan {
   readonly status: "pass" | "blocked" | "unknown"
   readonly detail: string
@@ -42,11 +110,13 @@ export interface EstateScan {
   readonly registries: readonly string[]
   /** Survivors outside R that borrow into an object directory inside R. */
   readonly survivorIntoRemoval: readonly EstateBorrower[]
+  /** Alternates lines naming a path that does not exist, excluded by name (#33010). */
+  readonly danglingAlternates: readonly DanglingAlternate[]
 }
 
 /** Complete estate identity: only the named top-level sets are unordered; no fields or duplicates are omitted. */
 export function canonicalEstateScan(scan: object): string {
-  const sets = new Set(["roots", "objectDirs", "registries", "borrowers", "survivorIntoRemoval"])
+  const sets = new Set(["roots", "objectDirs", "registries", "borrowers", "survivorIntoRemoval", "danglingAlternates"])
   const compare = (left: string, right: string): number => (left < right ? -1 : left > right ? 1 : 0)
   const edgePart = (value: unknown, field: string): string => {
     if (value !== null && typeof value === "object") {
@@ -109,6 +179,7 @@ export function scanEstate(
   removal: readonly string[],
   bounds: EstateScanBounds = DEFAULT_ESTATE_BOUNDS,
   clock: () => number = Date.now,
+  record?: EstateWalkRecord,
 ): EstateScan {
   const started = clock()
   const roots: string[] = []
@@ -123,6 +194,7 @@ export function scanEstate(
         borrowers: [],
         registries: [],
         survivorIntoRemoval: [],
+        danglingAlternates: [],
       }
     }
     roots.push(canonical(root))
@@ -131,7 +203,9 @@ export function scanEstate(
   const objectDirs = new Set<string>()
   const registryDirs = new Set<string>()
   const borrowers: EstateBorrower[] = []
+  const danglingAlternates: DanglingAlternate[] = []
   let alternatesFiles = 0
+  let vanishedDuringWalk = 0
 
   const unknown = (detail: string): EstateScan => ({
     status: "unknown",
@@ -142,6 +216,7 @@ export function scanEstate(
     borrowers,
     registries: [...registryDirs].sort(),
     survivorIntoRemoval: [],
+    danglingAlternates,
   })
 
   // One worklist of object directories, seeded from the filesystem walk AND from every alternate /
@@ -153,6 +228,14 @@ export function scanEstate(
     processedStores.add(store)
     objectDirs.add(store)
     const alternatesFile = join(store, "info", "alternates")
+    // Stamped before the read, so a write racing the read shows as a change at the delta.
+    try {
+      record?.alternates.set(alternatesFile, fileStamp(alternatesFile))
+    } catch (error) {
+      return unknown(
+        `cannot read alternates metadata ${alternatesFile}: ${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
     if (!existsSync(alternatesFile)) return undefined
     alternatesFiles += 1
     if (alternatesFiles > bounds.maxAlternatesFiles) {
@@ -166,11 +249,24 @@ export function scanEstate(
     } catch (error) {
       return unknown(`cannot read ${alternatesFile}: ${error instanceof Error ? error.message : String(error)}`)
     }
-    for (const target of alternateEntries(content, store)) {
-      const actual = canonical(target)
-      if (!existsSync(actual) || !statSync(actual).isDirectory()) {
-        return unknown(`${alternatesFile} names a missing or non-directory alternate ${target}`)
+    const declared: { line: string; target: string }[] = []
+    alternateEntries(content, store, true, (entry, rawLine) => declared.push({ line: rawLine.trim(), target: entry }))
+    for (const { line, target } of declared) {
+      let isDirectory: boolean
+      try {
+        isDirectory = statSync(target).isDirectory()
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code
+        if (code === "ENOENT" || code === "ENOTDIR") {
+          danglingAlternates.push({ store: canonical(store), alternatesFile, line, target })
+          continue
+        }
+        return unknown(
+          `cannot read alternate ${target} named by ${alternatesFile}: ${error instanceof Error ? error.message : String(error)}`,
+        )
       }
+      if (!isDirectory) return unknown(`${alternatesFile} names a non-directory alternate ${target}`)
+      const actual = canonical(target)
       borrowers.push({ borrower: canonical(store), target: actual })
       const nested = processStore(actual)
       if (nested !== undefined) return nested
@@ -185,6 +281,7 @@ export function scanEstate(
     registryDirs.add(dir)
     let names: string[]
     try {
+      record?.registries.set(dir, registryDigest(dir))
       names = readdirSync(dir)
         .filter((name) => name.endsWith(".json"))
         .sort()
@@ -252,8 +349,17 @@ export function scanEstate(
     visited.add(current)
     let entries
     try {
+      record?.dirs.set(current, dirStamp(current))
       entries = readdirSync(current, { withFileTypes: true })
     } catch (error) {
+      // A recorded walk (a retirement batch) tolerates a directory that vanished after its parent listed it: it lends
+      // nothing now, and if it was moved into a directory already read, that directory's stamp moved, so the
+      // lease-held estateDelta re-reads it and finds the store (#33010). An unrecorded walk has no such check.
+      if (record !== undefined && (error as NodeJS.ErrnoException).code === "ENOENT" && !roots.includes(current)) {
+        record.dirs.delete(current)
+        vanishedDuringWalk += 1
+        continue
+      }
       return unknown(`cannot read ${current}: ${error instanceof Error ? error.message : String(error)}`)
     }
     for (const entry of entries) {
@@ -272,6 +378,7 @@ export function scanEstate(
             `objects link ${path} has an unavailable or redirected target: ${error instanceof Error ? error.message : String(error)}`,
           )
         }
+        record?.objectLinks.set(path, target)
         borrowers.push({ borrower: path, target })
         const nested = processStore(target)
         if (nested !== undefined) return nested
@@ -304,14 +411,103 @@ export function scanEstate(
   return {
     status: survivorIntoRemoval.length === 0 ? "pass" : "blocked",
     detail:
-      firstSurvivor === undefined
+      (firstSurvivor === undefined
         ? `${objectDirs.size} object dir(s), ${alternatesFiles} alternates file(s), ${borrowers.length} reverse link(s)`
-        : `${survivorIntoRemoval.length} survivor borrower(s) into the removal set, e.g. ${firstSurvivor.borrower} -> ${firstSurvivor.target}`,
+        : `${survivorIntoRemoval.length} survivor borrower(s) into the removal set, e.g. ${firstSurvivor.borrower} -> ${firstSurvivor.target}`) +
+      (danglingAlternates.length === 0 ? "" : `; ${danglingAlternates.length} dangling alternates line(s) excluded`) +
+      (vanishedDuringWalk === 0 ? "" : `; ${vanishedDuringWalk} director(ies) vanished during the walk`),
     roots,
     objectDirs: [...objectDirs].sort(),
     alternatesFiles,
     borrowers,
     registries: [...registryDirs].sort(),
     survivorIntoRemoval,
+    danglingAlternates,
+  }
+}
+
+export type EstateDelta =
+  | Readonly<{ status: "unchanged"; changedDirs: number }>
+  | Readonly<{ status: "changed"; detail: string }>
+
+/** The first object directory, `objects` link or borrower registry under a directory the scan never read. */
+function storeUnder(root: string): string | undefined {
+  const stack = [root]
+  while (stack.length > 0) {
+    const current = stack.pop() as string
+    for (const entry of readdirSync(current, { withFileTypes: true })) {
+      const path = join(current, entry.name)
+      if (entry.isSymbolicLink()) {
+        if (entry.name === "objects") return `objects link ${path}`
+        continue
+      }
+      if (!entry.isDirectory()) continue
+      if (entry.name === "objects" && isObjectDir(path)) return `object directory ${path}`
+      if (entry.name === "git-super-retained-borrowers") return `borrower registry ${path}`
+      stack.push(path)
+    }
+  }
+  return undefined
+}
+
+/**
+ * The lease-held check a retirement batch runs before it deletes anything (#33010, @cto dc77f630 conditions 1 and 3):
+ * is the estate's SET of object directories, alternates files, `objects` links and borrower registries still what
+ * `scan` (recorded into `record`) saw? Writers that never take the lease exist — a hand-run clone or `git worktree
+ * add` writes an alternates file with no lease — so this comparison, not the lease, is what catches them between the
+ * scan and the delete. It re-stats every directory the scan read and re-reads only the ones whose stamp moved: a
+ * changed directory that only gained files is unchanged for the estate; one that gained a store, a link or a
+ * registry, at any depth, is a change. Any read failure is a change: the batch then deletes nothing.
+ */
+export function estateDelta(record: EstateWalkRecord, scan: EstateScan): EstateDelta {
+  const changed = (detail: string): EstateDelta => ({ status: "changed", detail })
+  try {
+    for (const [file, stamp] of record.alternates) {
+      const now = fileStamp(file)
+      if (now !== stamp) return changed(`alternates file ${file} changed since the scan (${stamp} -> ${now})`)
+    }
+    const known = new Set(scan.objectDirs)
+    for (const dir of scan.objectDirs) {
+      // Scan object directories are walked plain directories or canonical alternate targets, never links.
+      if (lstatSync(dir, { throwIfNoEntry: false })?.isDirectory() !== true) {
+        return changed(`object directory ${dir} vanished or is no longer a directory since the scan`)
+      }
+    }
+    for (const [link, target] of record.objectLinks) {
+      const now = existsSync(link) ? realpathSync(link) : "absent"
+      if (now !== target) return changed(`objects link ${link} now resolves to ${now}, not ${target}`)
+    }
+    for (const [dir, digest] of record.registries) {
+      if (registryDigest(dir) !== digest) return changed(`borrower registry ${dir} changed since the scan`)
+    }
+    let changedDirs = 0
+    for (const [dir, stamp] of record.dirs) {
+      const now = lstatSync(dir, { throwIfNoEntry: false })
+      // A vanished directory removed nothing the estate counts unless a store or registry under it went too, and
+      // those were checked by path above.
+      if (now === undefined || `${now.ino}:${now.mtimeMs}:${now.ctimeMs}` === stamp) continue
+      changedDirs += 1
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const path = join(dir, entry.name)
+        if (entry.isSymbolicLink()) {
+          if (entry.name === "objects" && !record.objectLinks.has(path)) return changed(`new objects link ${path}`)
+          continue
+        }
+        if (!entry.isDirectory() || record.dirs.has(path)) continue
+        if (entry.name === "objects" && isObjectDir(path)) {
+          if (!known.has(path)) return changed(`new object directory ${path}`)
+          continue
+        }
+        if (entry.name === "git-super-retained-borrowers") {
+          if (!record.registries.has(path)) return changed(`new borrower registry ${path}`)
+          continue
+        }
+        const found = storeUnder(path)
+        if (found !== undefined) return changed(`new ${found} under ${dir}`)
+      }
+    }
+    return { status: "unchanged", changedDirs }
+  } catch (error) {
+    return changed(`estate delta could not be read: ${error instanceof Error ? error.message : String(error)}`)
   }
 }

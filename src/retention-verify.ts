@@ -12,7 +12,12 @@ import { tmpdir } from "node:os"
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { createHash } from "node:crypto"
 import { fileURLToPath } from "node:url"
-import { digestDirectory, emitCertificate, RETENTION_CERTIFICATE_SCHEMA } from "./retention-certificate.ts"
+import {
+  certificateEstate,
+  digestDirectory,
+  emitCertificate,
+  RETENTION_CERTIFICATE_SCHEMA,
+} from "./retention-certificate.ts"
 import {
   scanContents,
   type ComponentContents,
@@ -103,7 +108,9 @@ export type RetentionVerifyResult = Readonly<{
   estate?: EstateScan | undefined
   contents?: readonly ComponentContents[] | undefined
   witnesses?: readonly WitnessIdentity[] | undefined
-  certificate?: Readonly<{ path: string; digest: string }> | undefined
+  certificate?:
+    | Readonly<{ path: string; digest: string; commonArtifactDir: string; warnings?: readonly string[] }>
+    | undefined
   audit?: Readonly<{ path: string; sha256: string }> | undefined
   wrapperRecords?: readonly RetentionAuditBinding[] | undefined
   staleAudits?: readonly Readonly<{ path: string; reason: string }>[] | undefined
@@ -145,6 +152,8 @@ export type RetentionVerifyOptions = Readonly<{
    * produced, so gates 2 and 6 report `unknown`.
    */
   artifactDir?: string
+  /** Native shared evidence namespace; the emitter derives its standalone default when absent. */
+  commonArtifactDir?: string
   /**
    * TEST SEAM ONLY. The production CLI never sets this; a unit test that must build its fixture under
    * the OS temporary directory sets it so gates 1-6 stay reachable. Without it, an `artifactDir`
@@ -276,6 +285,13 @@ function firstDifference(
   return keys.find((key) => JSON.stringify(expected[key]) !== JSON.stringify(actual[key]))
 }
 
+/** Each alternates line the estate excluded, by store file, line and reason, in a stable order (#33010). */
+function excludedAlternates(estate: EstateScan | undefined): string[] {
+  return (estate?.danglingAlternates ?? [])
+    .map((line) => `${line.alternatesFile}: ${line.line} (dangling: ${line.target} does not exist)`)
+    .sort()
+}
+
 function inside(parent: string, path: string): boolean {
   const part = relative(resolve(parent), resolve(path))
   return part === "" || (part !== ".." && !part.startsWith(`..${sep}`) && !isAbsolute(part))
@@ -293,10 +309,29 @@ export async function inspectRetainedEntryForAudit(
   return evaluateRetainedEntry(options, { audit: true, estate })
 }
 
+/**
+ * Retention-family internal path for a retirement batch (#33010, @cto dc77f630): one entry's gates against the
+ * batch's ONE shared estate scan. `estate` is this entry's view of it (survivors into this entry only). Every batch
+ * member is excluded from the custody witnesses, so two members never vouch for each other, and none of the audit
+ * leniencies apply: a legacy or manifest-less entry stays as kept as an ordinary verify keeps it.
+ */
+export async function inspectRetainedEntryInBatch(
+  options: RetentionVerifyOptions,
+  estate: EstateScan,
+  batch: readonly string[],
+): Promise<RetentionVerifyResult> {
+  return evaluateRetainedEntry(options, { audit: false, estate, batch })
+}
+
+type EvaluationContext =
+  | Readonly<{ audit: true; estate: EstateScan }>
+  | Readonly<{ audit: false; estate: EstateScan; batch: readonly string[] }>
+
 async function evaluateRetainedEntry(
   options: RetentionVerifyOptions,
-  context?: Readonly<{ audit: true; estate: EstateScan }>,
+  context?: EvaluationContext,
 ): Promise<RetentionVerifyResult> {
+  const auditContext = context?.audit === true
   const clock = options.clock ?? new Date()
   const monotonic = options.monotonic ?? Date.now
   const startedAt = monotonic()
@@ -316,7 +351,9 @@ async function evaluateRetainedEntry(
     estate?: EstateScan | undefined
     contents?: readonly ComponentContents[] | undefined
     witnesses?: readonly WitnessIdentity[] | undefined
-    certificate?: Readonly<{ path: string; digest: string }> | undefined
+    certificate?:
+      | Readonly<{ path: string; digest: string; commonArtifactDir: string; warnings?: readonly string[] }>
+      | undefined
     audit?: Readonly<{ path: string; sha256: string }> | undefined
     wrapperRecords?: readonly RetentionAuditBinding[] | undefined
     staleAudits?: readonly Readonly<{ path: string; reason: string }>[] | undefined
@@ -349,7 +386,7 @@ async function evaluateRetainedEntry(
       clock: clock.toISOString(),
       gates: ordered,
       reasons,
-      coverage: { declaredNamespaceRoots, witnessStores, excluded: [] },
+      coverage: { declaredNamespaceRoots, witnessStores, excluded: excludedAlternates(result.estate) },
     }
   }
 
@@ -401,11 +438,7 @@ async function evaluateRetainedEntry(
     try {
       proof = parseManifest(evidence(manifestPath), manifestPath)
     } catch (error) {
-      if (
-        !(error instanceof ManifestShapeError) ||
-        error.kind !== "absent" ||
-        (context === undefined && audits.length === 0)
-      ) {
+      if (!(error instanceof ManifestShapeError) || error.kind !== "absent" || (!auditContext && audits.length === 0)) {
         throw error
       }
       const mapped = rebuildRetainedCopyProof(entryReal, rootReal)
@@ -492,7 +525,7 @@ async function evaluateRetainedEntry(
     if (matching.stale.length > 0) result.staleAudits = matching.stale
     if (matching.selected !== undefined) {
       result.audit = { path: matching.selected.binding.path, sha256: matching.selected.binding.sha256 }
-    } else if (context === undefined) {
+    } else if (!auditContext) {
       push(
         incomplete(
           "estate-inventory",
@@ -822,9 +855,34 @@ async function evaluateRetainedEntry(
     )
     return finish()
   }
+  const removalSet = context?.audit === false ? context.batch.map((member) => resolve(member)) : [entryReal]
+  if (!removalSet.includes(entryReal)) {
+    throw new Error(`batch removal set does not name its own entry ${entryReal}`)
+  }
   const estate = result.estate ?? scanEstate(declaredNamespaceRoots, [entryReal], options.bounds?.estate, monotonic)
   result.estate = estate
-  witnessStores = estate.objectDirs.filter((path) => !inside(entryReal, path))
+  // A store holding a dangling alternates line is broken (#33010): it is never a custody witness (dropping a
+  // witness can only keep more), and a candidate holding one is never retired.
+  const broken = new Set(estate.danglingAlternates.map((line) => line.store))
+  // In a batch every member is removed, so none of them may witness another's custody.
+  witnessStores = estate.objectDirs.filter(
+    (path) => !removalSet.some((member) => inside(member, path)) && !broken.has(path),
+  )
+  const ownDangling = estate.danglingAlternates.filter((line) => inside(entryReal, line.store))
+  const firstOwn = ownDangling[0]
+  if (firstOwn !== undefined) {
+    push(
+      refusal(
+        "estate-inventory",
+        `candidate store ${firstOwn.store} is broken: alternates line ${firstOwn.line} names ${firstOwn.target}, which does not exist (${ownDangling.length} such line(s)); a broken store is never retired`,
+        {
+          path: firstOwn.alternatesFile,
+          remedy: "Keep the entry: the objects that line named are already gone, so its own contents cannot be proven.",
+        },
+      ),
+    )
+    return finish()
+  }
   if (estate.status !== "pass") {
     push(
       estate.status === "blocked"
@@ -905,7 +963,7 @@ async function evaluateRetainedEntry(
   })
 
   // ---- Gate 5: positive surviving custody ----------------------------------------------
-  const custody = await scanCustody(expectedCopyRoot, contents.components, witnessStores, [entryReal], {
+  const custody = await scanCustody(expectedCopyRoot, contents.components, witnessStores, removalSet, {
     sidecarDir,
     ...(options.gitRun === undefined ? {} : { run: options.gitRun }),
     ...(options.gitStream === undefined ? {} : { stream: options.gitStream }),
@@ -948,7 +1006,7 @@ async function evaluateRetainedEntry(
     schemaId: "hab-sandbox/retained-modules-retirement/1",
     verdict: "candidate",
     entry: entryReal,
-    removal: [entryReal],
+    removal: removalSet,
     root: result.root,
     clock: clock.toISOString(),
     retainUntil: proof.retainUntil,
@@ -971,14 +1029,7 @@ async function evaluateRetainedEntry(
         ? {}
         : { missingRootsSidecar: component.missingRootsSidecar.path }),
     })),
-    estate: {
-      roots: estate.roots,
-      objectDirs: estate.objectDirs,
-      alternatesFiles: estate.alternatesFiles,
-      borrowers: estate.borrowers,
-      registries: estate.registries,
-      survivorIntoRemoval: estate.survivorIntoRemoval,
-    },
+    estate: certificateEstate(estate),
     witnesses: custody.witnesses,
     witnessCount: custody.witnessCount,
     ...(custody.witnessSidecar === undefined ? {} : { witnessSidecar: custody.witnessSidecar.path }),
@@ -997,15 +1048,21 @@ async function evaluateRetainedEntry(
     coverage: {
       declaredNamespaceRoots,
       witnessStores,
-      excluded: [],
+      excluded: excludedAlternates(estate),
       artifactDir: result.artifactDir,
     },
   }
-  const emission = emitCertificate(
+  const emission = await emitCertificate(
     { ...certificate, certificateSchema: RETENTION_CERTIFICATE_SCHEMA },
     result.artifactDir,
+    options.commonArtifactDir,
   )
-  if (emission.status !== "pass" || emission.path === undefined || emission.digest === undefined) {
+  if (
+    emission.status !== "pass" ||
+    emission.path === undefined ||
+    emission.digest === undefined ||
+    emission.commonArtifactDir === undefined
+  ) {
     push(
       incomplete("certificate", emission.detail, {
         path: result.artifactDir,
@@ -1014,7 +1071,12 @@ async function evaluateRetainedEntry(
     )
     return finish()
   }
-  result.certificate = { path: emission.path, digest: emission.digest }
+  result.certificate = {
+    path: emission.path,
+    digest: emission.digest,
+    commonArtifactDir: emission.commonArtifactDir,
+    ...(emission.warnings === undefined ? {} : { warnings: emission.warnings }),
+  }
   push({
     gate: "certificate",
     status: "pass",

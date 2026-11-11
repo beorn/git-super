@@ -375,6 +375,32 @@ async function runCustody(
   deadline?: number,
   onPhase?: (name: string, ms: number) => void,
 ): Promise<CustodyScan> {
+  const remaining = (): number => {
+    const left = deadline === undefined ? Number.POSITIVE_INFINITY : deadline - clock()
+    if (left <= 0) throw new UnknownError("shared proof deadline is exhausted")
+    return left
+  }
+  remaining()
+  // Callers enter only after a completed contents scan. An empty risk set needs no
+  // witness (#33010, @cto 81aae278), but counters alone cannot replace its sidecars.
+  const noAtRiskObjects =
+    components.length > 0 &&
+    components.every((component) => {
+      if (component.missingRoots !== 0 || component.atRisk !== 0) return false
+      const sidecar = statSync(component.atRiskSidecar.path)
+      return sidecar.isFile() && sidecar.size === 0
+    })
+  remaining()
+  if (noAtRiskObjects) {
+    return {
+      status: "pass",
+      detail: `${components.length} component(s); no at-risk objects; no witness needed`,
+      witnesses: [],
+      witnessCount: 0,
+      missing: [],
+      missingCount: 0,
+    }
+  }
   const stores = [...new Set(witnessStores.map((store) => realpathSync(store)))]
     .filter((store) => !removal.some((root) => within(root, store)))
     .sort()
@@ -388,11 +414,6 @@ async function runCustody(
       missing: [],
       missingCount: 0,
     }
-  }
-  const remaining = (): number => {
-    const left = deadline === undefined ? Number.POSITIVE_INFINITY : deadline - clock()
-    if (left <= 0) throw new UnknownError("shared proof deadline is exhausted")
-    return left
   }
   const proofRun: GitRun = async (args, runOptions = {}) => {
     const timeoutMs = Math.min(runOptions.timeoutMs ?? Number.POSITIVE_INFINITY, remaining())
