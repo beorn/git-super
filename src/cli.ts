@@ -717,7 +717,10 @@ async function runInvocation(
     .command("remove")
     .description(commands.worktree.remove.description ?? commands.worktree.remove.title)
     .requiredOption("--retain <directory>", "durable directory outside the worktree and its Git directory")
-    .option("--component-custody <json>", "prove every component commit has durable custody in the named primary store")
+    .option(
+      "--component-custody <json>",
+      "prove every component commit has durable custody in the named primary store; the proof reads each component remote at check time and writes into the primary store (fetched objects, and GitSuper pin refs under their own names), so it is not write-free and runs under the removal's existing writer leases",
+    )
     .option("--no-rehome", "keep a lender with borrowers instead of changing their object stores")
     .option(
       "--exclude-submodule <path>",

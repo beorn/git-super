@@ -79,6 +79,24 @@ async function sidecarText(scan: CustodyScan, which: "witness" | "missing"): Pro
   return lines
 }
 
+/** A bare remote, a working repository that publishes to it, and a primary that has not re-fetched. */
+function publishedStores(prefix: string, remoteName = "origin.git"): { remote: string; work: string; primary: string } {
+  const remote = join(tmp(prefix), remoteName)
+  mkdirSync(remote, { recursive: true })
+  git(remote, ["init", "-q", "--bare", "-b", "main"])
+  const work = tmp(`${prefix}work-`)
+  git(work, ["init", "-q", "-b", "main"])
+  writeFileSync(join(work, "a.txt"), "alpha\n")
+  git(work, ["add", "a.txt"])
+  git(work, ["commit", "-q", "-m", "first"])
+  git(work, ["push", "-q", remote, "main"])
+  const parent = tmp(`${prefix}clone-`)
+  git(parent, ["clone", "-q", remote, join(parent, "primary")])
+  const primary = join(parent, "primary")
+  expect(git(primary, ["rev-parse", "HEAD"])).toBe(git(work, ["rev-parse", "HEAD"]))
+  return { remote, work, primary }
+}
+
 describe("retention custody scan — gate 5 (#27443(b))", () => {
   // AC #33010: a completed zero-risk input needs no witness read, but missing evidence,
   // an exhausted deadline, absent components or any real risk must never take that path.
@@ -496,5 +514,312 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     })
     expect(scan.status).toBe("unknown")
     expect(scan.detail).toContain("stderr")
+  })
+
+  // What a component's remote publishes now decides durability, never this store's own copy of it.
+  // The existing policy fixtures never configure a remote, so a stale local branch was untested.
+  test("a branch published after the witness store's last fetch still witnesses the at-risk commit", async () => {
+    const { remote, work, primary } = publishedStores("git-super-custody-published-")
+    writeFileSync(join(work, "b.txt"), "beta\n")
+    git(work, ["add", "b.txt"])
+    git(work, ["commit", "-q", "-m", "second"])
+    const landed = git(work, ["rev-parse", "HEAD"])
+    git(work, ["push", "-q", remote, "main"])
+    expect(git(primary, ["rev-parse", "HEAD"])).not.toBe(landed)
+    const sidecarDir = tmp("git-super-custody-published-sidecars-")
+    const component = {
+      ...(await componentOf([landed], sidecarDir, "reflog logs/HEAD")),
+      gitDir: join(work, ".git"),
+    }
+    const scan = await scanCustody(work, [component], [join(primary, ".git", "objects")], [], {
+      sidecarDir,
+      witnessPolicy: { targetBranch: "main" },
+    })
+    expect(scan.status).toBe("pass")
+    expect(scan.witnessCount).toBe(1)
+    expect(scan.witnesses[0]).toMatchObject({ ref: "refs/heads/main", tip: landed })
+  })
+
+  test("a remote that cannot be read is unknown and names the remote, never a fallback to local refs", async () => {
+    const { work, primary } = publishedStores("git-super-custody-unreachable-")
+    writeFileSync(join(work, "b.txt"), "beta\n")
+    git(work, ["add", "b.txt"])
+    git(work, ["commit", "-q", "-m", "second"])
+    const landed = git(work, ["rev-parse", "HEAD"])
+    const gone = join(tmp("git-super-custody-gone-"), "absent.git")
+    git(primary, ["remote", "set-url", "origin", gone])
+    const sidecarDir = tmp("git-super-custody-unreachable-sidecars-")
+    const component = {
+      ...(await componentOf([landed], sidecarDir)),
+      gitDir: join(work, ".git"),
+    }
+    const scan = await scanCustody(work, [component], [join(primary, ".git", "objects")], [], {
+      sidecarDir,
+      witnessPolicy: { targetBranch: "main" },
+    })
+    expect(scan.status).toBe("unknown")
+    expect(scan.detail).toContain(gone)
+    expect(scan.witnessCount).toBe(0)
+  })
+
+  // A rebase rewrites the commit, so the published main never names the refused OID. The stable
+  // patch-id is the only witness that commit ever gets; an unlanded patch must never earn it.
+  test("a rebased-away at-risk commit passes by patch-id and records its landed twin", async () => {
+    const { remote, work, primary } = publishedStores("git-super-custody-rebase-")
+    git(work, ["switch", "-q", "-c", "side"])
+    writeFileSync(join(work, "b.txt"), "beta\n")
+    git(work, ["add", "b.txt"])
+    git(work, ["commit", "-q", "-m", "side work"])
+    const refused = git(work, ["rev-parse", "HEAD"])
+    git(work, ["switch", "-q", "main"])
+    // Main moves on, so the cherry-pick keeps the patch but changes the parent: a real rebase.
+    writeFileSync(join(work, "a.txt"), "alpha\nmore\n")
+    git(work, ["add", "a.txt"])
+    git(work, ["commit", "-q", "-m", "main moves"])
+    git(work, ["cherry-pick", refused])
+    const landed = git(work, ["rev-parse", "HEAD"])
+    expect(landed).not.toBe(refused)
+    git(work, ["push", "-q", remote, "main"])
+    const sidecarDir = tmp("git-super-custody-rebase-sidecars-")
+    const component = {
+      ...(await componentOf([refused], sidecarDir, "reflog logs/HEAD")),
+      gitDir: join(work, ".git"),
+    }
+    const scan = await scanCustody(work, [component], [join(primary, ".git", "objects")], [], {
+      sidecarDir,
+      witnessPolicy: { targetBranch: "main" },
+    })
+    expect(scan.status).toBe("pass")
+    expect(scan.rebased).toEqual([
+      { component: ".git", oid: refused, landedOid: landed, ref: "refs/heads/main", tip: landed },
+    ])
+    expect(await sidecarText(scan, "missing")).toEqual([])
+  })
+
+  test("a patch that is nowhere on published main stays refused", async () => {
+    const { remote, work, primary } = publishedStores("git-super-custody-unlanded-")
+    git(work, ["switch", "-q", "-c", "side"])
+    writeFileSync(join(work, "c.txt"), "gamma\n")
+    git(work, ["add", "c.txt"])
+    git(work, ["commit", "-q", "-m", "abandoned experiment"])
+    const refused = git(work, ["rev-parse", "HEAD"])
+    git(work, ["switch", "-q", "main"])
+    git(work, ["push", "-q", remote, "main"])
+    const sidecarDir = tmp("git-super-custody-unlanded-sidecars-")
+    const component = {
+      ...(await componentOf([refused], sidecarDir, "reflog logs/HEAD")),
+      gitDir: join(work, ".git"),
+    }
+    const scan = await scanCustody(work, [component], [join(primary, ".git", "objects")], [], {
+      sidecarDir,
+      witnessPolicy: { targetBranch: "main" },
+    })
+    expect(scan.status).toBe("blocked")
+    expect(scan.missing.map((entry) => entry.oid)).toEqual([refused])
+    expect(scan.rebased).toEqual([])
+  })
+
+  // @cto 2026-11-11: `git patch-id --stable` strips whitespace, so a commit whose YAML difference was
+  // indentation only earned a false "landed" twin and the removal would delete the only copy.
+  // Measured on git 2.56.0 for this exact fixture: --stable 5491e9ce for both sides, --verbatim
+  // 95f6a388 vs 8113dd41.
+  test("a patch that differs from published main only in leading whitespace stays refused", async () => {
+    const { remote, work, primary } = publishedStores("git-super-custody-verbatim-")
+    git(work, ["switch", "-q", "-c", "side"])
+    writeFileSync(join(work, "conf.yaml"), "key:\n  child: 1\n")
+    git(work, ["add", "conf.yaml"])
+    git(work, ["commit", "-q", "-m", "indented yaml"])
+    const refused = git(work, ["rev-parse", "HEAD"])
+    git(work, ["switch", "-q", "main"])
+    writeFileSync(join(work, "conf.yaml"), "key:\nchild: 1\n")
+    git(work, ["add", "conf.yaml"])
+    git(work, ["commit", "-q", "-m", "same yaml, de-indented"])
+    git(work, ["push", "-q", remote, "main"])
+    const sidecarDir = tmp("git-super-custody-verbatim-sidecars-")
+    const component = {
+      ...(await componentOf([refused], sidecarDir, "reflog logs/HEAD")),
+      gitDir: join(work, ".git"),
+    }
+    const scan = await scanCustody(work, [component], [join(primary, ".git", "objects")], [], {
+      sidecarDir,
+      witnessPolicy: { targetBranch: "main" },
+    })
+    expect(scan.status).toBe("blocked")
+    expect(scan.rebased).toEqual([])
+    expect(scan.missing.map((entry) => entry.oid)).toEqual([refused])
+  })
+
+  // The own read runs in the component copy and the landed read in the primary store. A store's diff
+  // config must not change the hash of one patch: measured on git 2.56.0, the same rename commit hashes
+  // b3ab7cce with rename detection on and 0a303f30 with diff.renames=false, which without a pinned read
+  // would turn an exact rebase into a false refusal.
+  test("a store's rename-detection config cannot turn an exact rebase into a refusal", async () => {
+    const { remote, work, primary } = publishedStores("git-super-custody-pinned-")
+    git(work, ["switch", "-q", "-c", "side"])
+    git(work, ["mv", "a.txt", "renamed.txt"])
+    git(work, ["commit", "-q", "-m", "rename a"])
+    const refused = git(work, ["rev-parse", "HEAD"])
+    git(work, ["switch", "-q", "main"])
+    writeFileSync(join(work, "b.txt"), "beta\n")
+    git(work, ["add", "b.txt"])
+    git(work, ["commit", "-q", "-m", "main moves"])
+    git(work, ["cherry-pick", refused])
+    const landed = git(work, ["rev-parse", "HEAD"])
+    expect(landed).not.toBe(refused)
+    git(work, ["push", "-q", remote, "main"])
+    git(primary, ["config", "diff.renames", "false"])
+    git(primary, ["config", "diff.noprefix", "true"])
+    const sidecarDir = tmp("git-super-custody-pinned-sidecars-")
+    const component = {
+      ...(await componentOf([refused], sidecarDir, "reflog logs/HEAD")),
+      gitDir: join(work, ".git"),
+    }
+    const scan = await scanCustody(work, [component], [join(primary, ".git", "objects")], [], {
+      sidecarDir,
+      witnessPolicy: { targetBranch: "main" },
+    })
+    expect(scan.status).toBe("pass")
+    expect(scan.rebased).toEqual([
+      { component: ".git", oid: refused, landedOid: landed, ref: "refs/heads/main", tip: landed },
+    ])
+  })
+
+  // Two closes of different environments share the primary store, and the proof now fetches into it.
+  // Without this, a fetch racing another fetch could be assumed harmless rather than shown so.
+  test("two concurrent custody scans against one primary store both pass and leave it intact", async () => {
+    const { remote, work, primary } = publishedStores("git-super-custody-concurrent-")
+    writeFileSync(join(work, "b.txt"), "beta\n")
+    git(work, ["add", "b.txt"])
+    git(work, ["commit", "-q", "-m", "second"])
+    const landed = git(work, ["rev-parse", "HEAD"])
+    git(work, ["push", "-q", remote, "main"])
+    const first = tmp("git-super-custody-concurrent-a-")
+    const second = tmp("git-super-custody-concurrent-b-")
+    const store = [join(primary, ".git", "objects")]
+    const [left, right] = await Promise.all([
+      scanCustody(
+        work,
+        [{ ...(await componentOf([landed], first, "reflog logs/HEAD")), gitDir: join(work, ".git") }],
+        store,
+        [],
+        { sidecarDir: first, witnessPolicy: { targetBranch: "main" } },
+      ),
+      scanCustody(
+        work,
+        [{ ...(await componentOf([landed], second, "reflog logs/HEAD")), gitDir: join(work, ".git") }],
+        store,
+        [],
+        { sidecarDir: second, witnessPolicy: { targetBranch: "main" } },
+      ),
+    ])
+    expect(left.status).toBe("pass")
+    expect(right.status).toBe("pass")
+    expect(left.witnesses[0]).toMatchObject({ ref: "refs/heads/main", tip: landed })
+    expect(right.witnesses[0]).toMatchObject({ ref: "refs/heads/main", tip: landed })
+    // Objects fetched for a read stay unreferenced, which is expected; what must not appear is damage.
+    expect(git(primary, ["fsck", "--full", "--no-progress", "--no-dangling"])).toBe("")
+  })
+
+  // A candidate must be hashed on its complete patch: a commit that also changed another file is a
+  // different patch, and matching its projection would record a landed twin that never carried this.
+  test("a published commit that also changed another file is not this commit's landed twin", async () => {
+    const { remote, work, primary } = publishedStores("git-super-custody-projection-")
+    git(work, ["switch", "-q", "-c", "side"])
+    writeFileSync(join(work, "b.txt"), "beta\n")
+    git(work, ["add", "b.txt"])
+    git(work, ["commit", "-q", "-m", "adds b only"])
+    const refused = git(work, ["rev-parse", "HEAD"])
+    git(work, ["switch", "-q", "main"])
+    writeFileSync(join(work, "b.txt"), "beta\n")
+    writeFileSync(join(work, "c.txt"), "gamma\n")
+    git(work, ["add", "b.txt", "c.txt"])
+    git(work, ["commit", "-q", "-m", "adds b and c"])
+    const landed = git(work, ["rev-parse", "HEAD"])
+    git(work, ["push", "-q", remote, "main"])
+    const sidecarDir = tmp("git-super-custody-projection-sidecars-")
+    const component = {
+      ...(await componentOf([refused], sidecarDir, "reflog logs/HEAD")),
+      gitDir: join(work, ".git"),
+    }
+    const scan = await scanCustody(work, [component], [join(primary, ".git", "objects")], [], {
+      sidecarDir,
+      witnessPolicy: { targetBranch: "main" },
+    })
+    expect(landed).not.toBe(refused)
+    expect(scan.status).toBe("blocked")
+    expect(scan.rebased).toEqual([])
+    expect(scan.missing.map((entry) => entry.oid)).toEqual([refused])
+  })
+
+  test("a remote name containing a dot is read whole and its failure is unknown, not a local pass", async () => {
+    const { work, primary } = publishedStores("git-super-custody-dotted-")
+    writeFileSync(join(work, "b.txt"), "beta\n")
+    git(work, ["add", "b.txt"])
+    git(work, ["commit", "-q", "-m", "second"])
+    const landed = git(work, ["rev-parse", "HEAD"])
+    const gone = join(tmp("git-super-custody-dotted-gone-"), "absent.git")
+    git(primary, ["remote", "remove", "origin"])
+    git(primary, ["remote", "add", "mirror.one", gone])
+    const sidecarDir = tmp("git-super-custody-dotted-sidecars-")
+    const component = {
+      ...(await componentOf([landed], sidecarDir)),
+      gitDir: join(work, ".git"),
+    }
+    const scan = await scanCustody(work, [component], [join(primary, ".git", "objects")], [], {
+      sidecarDir,
+      witnessPolicy: { targetBranch: "main" },
+    })
+    expect(scan.status).toBe("unknown")
+    expect(scan.detail).toContain("mirror.one")
+    expect(scan.witnessCount).toBe(0)
+  })
+
+  test("two non-origin remotes leave no authority to choose, so the answer is unknown", async () => {
+    const { work, primary } = publishedStores("git-super-custody-two-remotes-")
+    writeFileSync(join(work, "b.txt"), "beta\n")
+    git(work, ["add", "b.txt"])
+    git(work, ["commit", "-q", "-m", "second"])
+    const landed = git(work, ["rev-parse", "HEAD"])
+    const gone = tmp("git-super-custody-two-remotes-gone-")
+    git(primary, ["remote", "remove", "origin"])
+    git(primary, ["remote", "add", "alpha", join(gone, "alpha.git")])
+    git(primary, ["remote", "add", "beta", join(gone, "beta.git")])
+    const sidecarDir = tmp("git-super-custody-two-remotes-sidecars-")
+    const component = {
+      ...(await componentOf([landed], sidecarDir)),
+      gitDir: join(work, ".git"),
+    }
+    const scan = await scanCustody(work, [component], [join(primary, ".git", "objects")], [], {
+      sidecarDir,
+      witnessPolicy: { targetBranch: "main" },
+    })
+    expect(scan.status).toBe("unknown")
+    expect(scan.detail).toContain("alpha")
+    expect(scan.detail).toContain("beta")
+    expect(scan.witnessCount).toBe(0)
+  })
+
+  // A remote URL that itself ends in `.url` once made the remote name swallow the value, so origin
+  // vanished and a reachable, published environment read as unknown. The name now comes from a
+  // listing of names, never from parsing around a value.
+  test("a remote whose URL ends in .url is still origin and still witnesses", async () => {
+    const { remote, work, primary } = publishedStores("git-super-custody-doturl-", "published.url")
+    writeFileSync(join(work, "b.txt"), "beta\n")
+    git(work, ["add", "b.txt"])
+    git(work, ["commit", "-q", "-m", "second"])
+    const landed = git(work, ["rev-parse", "HEAD"])
+    git(work, ["push", "-q", remote, "main"])
+    expect(git(primary, ["remote"])).toBe("origin")
+    const sidecarDir = tmp("git-super-custody-doturl-sidecars-")
+    const component = {
+      ...(await componentOf([landed], sidecarDir, "reflog logs/HEAD")),
+      gitDir: join(work, ".git"),
+    }
+    const scan = await scanCustody(work, [component], [join(primary, ".git", "objects")], [], {
+      sidecarDir,
+      witnessPolicy: { targetBranch: "main" },
+    })
+    expect(scan.status).toBe("pass")
+    expect(scan.witnesses[0]).toMatchObject({ ref: "refs/heads/main", tip: landed })
   })
 })
