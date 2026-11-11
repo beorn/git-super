@@ -71,6 +71,30 @@ describe("status --removal verdict", () => {
     expect(result).not.toHaveProperty("offRemote")
   })
 
+  // 33315: an on-remote selection admits only the records its pin move produced, never the component's own
+  // staged or unstaged edits that share its path prefix (a reaper read 'MM ag' with 8 staged files as clean).
+  test.each([
+    ["staged", true],
+    ["unstaged", false],
+  ] as const)("%s content inside an on-remote component stays dirt", async (_kind, stage) => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-removal-on-remote-dirt-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const checkout = join(fixture.product, "packages/alpha")
+    const next = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 2\n")
+    git(checkout, "fetch", "-q", "origin")
+    git(checkout, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    git(checkout, "checkout", "-q", "--detach", next)
+    git(fixture.product, "add", "packages/alpha")
+    writeFileSync(join(checkout, "work.ts"), "export const work = 1\n")
+    writeFileSync(join(checkout, "alpha.ts"), "export const alpha = 3\n")
+    if (stage) git(checkout, "add", "work.ts", "alpha.ts")
+    const { code, result } = await removal(fixture.product)
+    expect(code, JSON.stringify(result.records)).toBe(1)
+    expect(result.records.join("\n")).toContain("packages/alpha/work.ts")
+    expect(result.records.join("\n")).toContain("packages/alpha/alpha.ts")
+  })
+
   test("a missing component remote target keeps dirt and names the fetch cure", async () => {
     const root = mkdtempSync(join(canonicalTmpdir(), "git-super-removal-missing-target-"))
     roots.push(root)
