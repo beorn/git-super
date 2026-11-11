@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs"
 import { mkdir } from "node:fs/promises"
 import { join } from "node:path"
 import { tryAcquireFlock } from "@bearly/flock"
+import { fileLockHolders, formatLockHolders } from "@bearly/flock/holders"
 import { fullJitter } from "@bearly/pacing"
 import { setTimeout as delay } from "node:timers/promises"
 
@@ -91,9 +92,25 @@ function busy(path: string, now: number, waitedMs: number, timeoutMs: number, co
   const { owner, holder, age } = describeRecordedLockHolder(path, now)
   return new Error(
     `git-super: worktree mutation lock is busy after ${waitedMs}ms ` +
-      `(timeout=${timeoutMs}ms; holder=${holder}; age=${age}; owner=${owner}; contender=pid:${process.pid}` +
+      `(timeout=${timeoutMs}ms; live ${describeLiveLockHolders(path)}; ` +
+      `recorded note, not authority: holder=${holder}; age=${age}; owner=${owner}; contender=pid:${process.pid}` +
       `${contender === undefined ? "" : ` operation=${contender}`}; ${path})`,
   )
+}
+
+/**
+ * Who holds `path` NOW, from the kernel's lock table (33483, @cto 37021b7f condition 4). A worktree removal takes
+ * writer leases without rewriting the note, so the note can name a holder dead for a day while a live process holds
+ * the lock; the busy report therefore leads with the kernel's answer and says so plainly when it finds no holder.
+ */
+function describeLiveLockHolders(path: string): string {
+  const report = fileLockHolders([path], { self: process.pid })
+  if (report.kind === "unknown") return `holder unknown (${report.reason})`
+  const file = report.files[0]
+  if (file === undefined || "absent" in file) return "holder: none found (lock file absent)"
+  if ("unreadable" in file) return `holder unknown (${file.unreadable})`
+  if (file.locks.every((lock) => lock.waiter)) return `holder: none found in the kernel lock table (${file.id})`
+  return `holder: ${formatLockHolders(report)}`
 }
 
 /**

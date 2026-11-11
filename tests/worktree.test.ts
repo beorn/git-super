@@ -2671,7 +2671,7 @@ describe("createGitWorktreeStore", () => {
     const stderr = vi.spyOn(process.stderr, "write")
     try {
       await expect(store.ready()).rejects.toThrow(
-        /timeout=0ms; holder=outer mutation.*operation=worktree configuration repair/iu,
+        /timeout=0ms; live holder: .*?; recorded note, not authority: holder=outer mutation.*operation=worktree configuration repair/iu,
       )
       expect(stderr).not.toHaveBeenCalled()
       expect(requests.map(({ args }) => args)).toEqual([

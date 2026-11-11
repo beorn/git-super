@@ -106,7 +106,7 @@ describe("exclusive writer policy", () => {
       })
       const startedAt = Date.now()
       await expect(acquireExclusive(dir, { timeoutMs: 25 }, "second mutation")).rejects.toThrow(
-        /lock is busy after \d+ms \(timeout=25ms; holder=first mutation; age=\d+ms;.*operation=second mutation/u,
+        /lock is busy after \d+ms \(timeout=25ms; live holder: .*?; recorded note, not authority: holder=first mutation; age=\d+ms;.*operation=second mutation/u,
       )
       expect(Date.now() - startedAt).toBeGreaterThanOrEqual(25)
     } finally {
@@ -166,6 +166,36 @@ describe("exclusive writer policy", () => {
         await expect(acquireExclusive(dir, { timeoutMs: 0 }, "contender")).rejects.toThrow(
           /holder=legacy writer; age=unknown;.*operation=contender/u,
         )
+      } finally {
+        lock.release()
+        await rm(dir, { recursive: true, force: true })
+      }
+    },
+  )
+
+  /**
+   * @failure 33483: a worktree removal held the lease without rewriting the note, and store-pack's busy report named the
+   *          note's day-dead pid as the holder; the kernel's live holder must lead and the note must say it is not authority.
+   * @level l1
+   * @consumer store-pack (tools/lib/store-gc.ts) and every busy refusal
+   */
+  test.skipIf(process.platform !== "linux")(
+    "a busy report leads with the kernel's live holder and labels a stale note as recorded, not authority",
+    async () => {
+      const dir = await mkdtemp(join(tmpdir(), "git-super-exclusive-"))
+      const lock = await acquireExclusive(dir, { timeoutMs: 0 }, "live remover")
+      try {
+        // A bodyless lease leaves the previous writer's note behind: a pid that is long gone.
+        await writeFile(
+          join(dir, "writer.lock"),
+          JSON.stringify({ pid: 2_000_000_000, holder: "stale pack", startedAt: "2026-11-10T09:13:03.000Z" }),
+        )
+        const refusal = await acquireExclusive(dir, { timeoutMs: 0 }, "pack").catch((error: unknown) => error)
+        expect(refusal).toBeInstanceOf(Error)
+        const message = (refusal as Error).message
+        expect(message).toContain(`live holder: locks: writer.lock ${process.pid}(self) FLOCK WRITE`)
+        expect(message).toContain("recorded note, not authority: holder=stale pack;")
+        expect(message.indexOf("live holder:")).toBeLessThan(message.indexOf("recorded note"))
       } finally {
         lock.release()
         await rm(dir, { recursive: true, force: true })
