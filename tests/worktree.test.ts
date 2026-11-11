@@ -2573,7 +2573,7 @@ describe("createGitWorktreeStore", () => {
       expect(existsSync(linked)).toBe(true)
       for (const line of reports) {
         expect(line).toMatch(
-          /^git-super worktree: waiting for writer lock held by git super merge \(pid:\d+, age \d+ms\)\n$/u,
+          /^git-super worktree: waiting for writer lock held by live holder: locks: writer\.lock \d+\(self\) FLOCK WRITE 0-EOF; recorded note, not authority: git super merge \(pid:\d+, age \d+ms\)\n$/u,
         )
       }
     } finally {

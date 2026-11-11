@@ -1155,7 +1155,9 @@ describe("git super merge", () => {
       // In-process there is no separate stderr: every line the reporter emits is a waiting-lock line.
       expect(
         reports.every((line) =>
-          /^git-super merge: waiting for writer lock held by git super merge \(pid:\d+, age \d+ms\)\n$/u.test(line),
+          /^git-super merge: waiting for writer lock held by live holder: locks: writer\.lock \d+\(self\) FLOCK WRITE 0-EOF; recorded note, not authority: git super merge \(pid:\d+, age \d+ms\)\n$/u.test(
+            line,
+          ),
         ),
       ).toBe(true)
       // Past the old 30 s default the merge is still waiting under the shared four-minute policy, while a
@@ -1231,7 +1233,9 @@ describe("git super merge", () => {
       vi.setSystemTime(startedAt + 31_000)
       const result = await running
       expect(result).toMatchObject({ state: "updated", partial: false })
-      expect(reports[0]).toMatch(/^git-super merge: waiting for writer lock held by queue merge /u)
+      expect(reports[0]).toMatch(
+        /^git-super merge: waiting for writer lock held by live holder: locks: writer\.lock \d+\(self\) FLOCK WRITE 0-EOF; recorded note, not authority: queue merge /u,
+      )
     } finally {
       await releaseSoon
       release()

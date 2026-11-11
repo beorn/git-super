@@ -231,7 +231,7 @@ describe("git super worktree add", () => {
       expect(await invocation).toBe(0)
       expect(JSON.parse(stdout.output)).toMatchObject({ state: "updated" })
       expect(stderr.output).toMatch(
-        /^git-super worktree: waiting for writer lock held by git super merge \(pid:\d+, age \d+ms\)\n$/u,
+        /^git-super worktree: waiting for writer lock held by live holder: locks: writer\.lock \d+\(self\) FLOCK WRITE 0-EOF; recorded note, not authority: git super merge \(pid:\d+, age \d+ms\)\n$/u,
       )
     } finally {
       release()
