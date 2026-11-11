@@ -14,6 +14,7 @@ import {
   cpSync,
   existsSync,
   mkdirSync,
+  linkSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
@@ -31,7 +32,7 @@ import { scanEstate } from "../src/retention-estate.ts"
 
 vi.mock("node:fs", async (importOriginal) => {
   const fs = await importOriginal<typeof import("node:fs")>()
-  return { ...fs, rmSync: vi.fn(fs.rmSync) }
+  return { ...fs, rmSync: vi.fn(fs.rmSync), linkSync: vi.fn(fs.linkSync) }
 })
 
 const environment: NodeJS.ProcessEnv = {
@@ -165,6 +166,53 @@ async function linkedBatch(): Promise<RetentionBatchOptions> {
 }
 
 describe("retention retirement batch (#33010)", () => {
+  // AC33010: two entries and both proof phases share exact immutable common bytes, without changing deletion.
+  it("shared batch certificates use one explicit common folder across entries and phases", async () => {
+    const entries = readdirSync(root)
+      .sort()
+      .slice(0, 2)
+      .map((name) => join(root, name))
+    const result = await retireRetainedBatch(options({ entries, apply: true }))
+    expect(result.rows.map((row) => row.outcome)).toEqual(["retired", "retired"])
+    const refs = entries.flatMap((entry) =>
+      ["pre", "held"].map((phase) => {
+        const value = JSON.parse(
+          readFileSync(
+            join(options().artifactDir, entry.split("/").pop()!, phase, "retirement-certificate.json"),
+            "utf8",
+          ),
+        )
+        return value.commonFactsRef.path
+      }),
+    )
+    expect(new Set(refs).size).toBe(1)
+    expect(dirname(refs[0])).toBe(join(options().artifactDir, "common"))
+    expect(result.warnings).toEqual([])
+  })
+
+  // AC33010: linking is an allocation optimization; a copy fallback keeps the same outcome and names its cost.
+  it("shared batch link fallback preserves outcomes and emits one typed warning", async () => {
+    const originalLink = vi.mocked(linkSync).getMockImplementation()!
+    let failed = false
+    vi.mocked(linkSync).mockImplementation((source, target) => {
+      if (!failed && String(target).includes("certificate-alias")) {
+        failed = true
+        throw new Error("forced link failure")
+      }
+      // The production primitive is synchronous; keep all unrelated native links unchanged.
+      return originalLink(source, target)
+    })
+    try {
+      const result = await retireRetainedBatch(options())
+      expect(result.rows.every((row) => row.outcome === "would-retire")).toBe(true)
+      expect(result.warnings).toEqual([
+        { entry: expect.any(String), phase: "pre", message: expect.stringContaining("forced link failure") },
+      ])
+    } finally {
+      vi.mocked(linkSync).mockImplementation(originalLink)
+    }
+  })
+
   // CTO cbd8921c: after successful deletion, an external pointer cleanup failure must say both that the entry
   // is gone and which phase failed. Existing partial-removal coverage fails before bulk deletion finishes.
   it("names a pointer cleanup failure after the entry is gone and keeps later entries", async () => {

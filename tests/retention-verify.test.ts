@@ -49,7 +49,7 @@ import {
   verifyRetainedEntry,
 } from "../src/retention-verify.ts"
 import { canonicalProspectivePath, type ManifestEntry } from "../src/worktree-removal.ts"
-import { auditRetainedEntry } from "../src/retention-remove.ts"
+import { auditRetainedEntry, proofFacts } from "../src/retention-remove.ts"
 
 /** The shared, real-writer fixture and the pristine snapshot used to restore it in place. */
 let fixtureRoot: string | undefined
@@ -263,6 +263,89 @@ function writeAuditRecordFixture(value: unknown): string {
 }
 
 describe("retention verify gates 1-6", () => {
+  // AC33010: shared facts preserve full observed estate/coverage and reject stale or redirected evidence.
+  // Existing envelope fixtures cannot detect a hash-valid foreign common payload or physical alias tampering.
+  it.each([
+    "none",
+    "missing",
+    "changed",
+    "redirected",
+    "foreign estate",
+    "foreign coverage",
+    "v1",
+    "unknown version",
+    "unknown payload version",
+    "alias tamper",
+  ])("shared certificate facts preserve %s binding", async (fault) => {
+    let proof = await verifyRetainedEntry({
+      entry: base.entry,
+      root: base.root,
+      namespaceRoots: [fixtureRoot as string],
+      artifactDir: base.artifactDir,
+      allowTemporaryArtifactDir: true,
+      clock: eligible(),
+    })
+    expect(proof.verdict).toBe("candidate")
+    const certificate = JSON.parse(readFileSync(proof.certificate!.path, "utf8"))
+    expect(certificate.schema).toBe("git-super/retention-certificate/2")
+    expect(certificate.estate).toBeUndefined()
+    const ref = certificate.commonFactsRef
+    expect(ref.count).toBe(1)
+    const stable = join(base.artifactDir, "retirement-certificate.json")
+    expect(statSync(stable).ino).toBe(statSync(proof.certificate!.path).ino)
+    const original = proofFacts(proof).facts
+    if (fault === "none") {
+      const second = await verifyRetainedEntry({
+        entry: base.entry,
+        root: base.root,
+        namespaceRoots: [fixtureRoot as string],
+        artifactDir: join(base.artifactDir, "held"),
+        commonArtifactDir: proof.certificate!.commonArtifactDir,
+        allowTemporaryArtifactDir: true,
+        clock: eligible(),
+      })
+      expect(proofFacts(second).facts).toBe(original)
+      expect(JSON.parse(readFileSync(second.certificate!.path, "utf8")).commonFactsRef.path).toBe(ref.path)
+    } else {
+      if (fault === "missing") rmSync(ref.path)
+      else if (fault === "changed") writeFileSync(ref.path, "changed")
+      else if (fault === "redirected") {
+        const target = ref.path + ".moved"
+        renameSync(ref.path, target)
+        symlinkSync(target, ref.path)
+      } else if (fault === "alias tamper") writeFileSync(stable, "changed through alias")
+      else {
+        if (fault === "v1" || fault === "unknown version") {
+          certificate.schema = certificate.certificateSchema =
+            fault === "v1" ? "git-super/retention-certificate/1" : "git-super/retention-certificate/99"
+          if (fault === "v1") {
+            const payload = JSON.parse(readFileSync(ref.path, "utf8"))
+            certificate.estate = payload.estate
+            certificate.coverage = { ...payload.coverage, ...certificate.coverage }
+            delete certificate.commonFactsRef
+          }
+        } else {
+          const payload = JSON.parse(readFileSync(ref.path, "utf8"))
+          if (fault === "foreign estate") payload.estate.alternatesFiles += 1
+          else if (fault === "unknown payload version") payload.schema = "git-super/retention-common-facts/99"
+          else payload.coverage.witnessStores = []
+          const bytes = JSON.stringify(payload) + "\n"
+          ref.path = join(dirname(ref.path), "foreign.common-facts.jsonl")
+          writeFileSync(ref.path, bytes)
+          ref.bytes = Buffer.byteLength(bytes)
+          ref.sha256 = createHash("sha256").update(bytes).digest("hex")
+        }
+        const bytes = JSON.stringify(certificate) + "\n"
+        writeFileSync(proof.certificate!.path, bytes)
+        proof = {
+          ...proof,
+          certificate: { ...proof.certificate!, digest: createHash("sha256").update(bytes).digest("hex") },
+        }
+      }
+      expect(() => proofFacts(proof)).toThrow()
+    }
+  })
+
   it.each(["held-common", "held-original-shift", "missing-common-head"])(
     "audit preserves E and publishes no record for %s",
     async (kind) => {
@@ -766,20 +849,32 @@ describe("retention verify gates 1-6", () => {
     },
   )
 
-  it("publishes the computed certificate name without following its existing symlink", () => {
+  it("publishes the computed certificate name without following its existing symlink", async () => {
     const artifactDir = mkdtempSync(join("/var/tmp", "git-super-certificate-publication-"))
     try {
-      const certificate = { entry: base.entry, verdict: "candidate" }
-      const bytes = `${JSON.stringify(certificate, null, 2)}\n`
-      const digest = createHash("sha256").update(bytes).digest("hex")
-      const path = join(artifactDir, `retirement-certificate-${digest.slice(0, 16)}.json`)
+      const proof = await verifyRetainedEntry({
+        entry: base.entry,
+        root: base.root,
+        namespaceRoots: [fixtureRoot as string],
+        artifactDir,
+        allowTemporaryArtifactDir: true,
+        clock: eligible(),
+      })
+      expect(proof.verdict).toBe("candidate")
+      const bytes = readFileSync(proof.certificate!.path, "utf8")
+      const saved = JSON.parse(bytes)
+      const common = JSON.parse(readFileSync(saved.commonFactsRef.path, "utf8"))
+      const certificate = { ...saved, estate: common.estate, coverage: { ...common.coverage, ...saved.coverage } }
+      delete certificate.commonFactsRef
+      const path = proof.certificate!.path
+      rmSync(path)
       const target = join(base.entry, "manifest.json")
       const before = readFileSync(target)
       symlinkSync(target, path)
-      expect(emitCertificate(certificate, artifactDir).status).toBe("pass")
+      expect((await emitCertificate(certificate, artifactDir)).status).toBe("pass")
       expect(readFileSync(target)).toEqual(before)
       expect(readFileSync(path, "utf8")).toBe(bytes)
-      expect(emitCertificate(certificate, artifactDir).status).toBe("pass")
+      expect((await emitCertificate(certificate, artifactDir)).status).toBe("pass")
     } finally {
       rmSync(artifactDir, { recursive: true, force: true })
     }
@@ -940,12 +1035,19 @@ describe("retention verify gates 1-6", () => {
         if (event === "manifest" || event === "census") {
           const readCertificate = (
             pass: string,
-          ): { verdict: string; manifestSha256: string; estate: { objectDirs: string[] } } =>
-            JSON.parse(readFileSync(join(artifactDir, "operation", pass, "retirement-certificate.json"), "utf8")) as {
+          ): { verdict: string; manifestSha256: string; estate: { objectDirs: string[] } } => {
+            const certificate = JSON.parse(
+              readFileSync(join(artifactDir, "operation", pass, "retirement-certificate.json"), "utf8"),
+            ) as {
               verdict: string
               manifestSha256: string
+              commonFactsRef: { path: string }
+            }
+            const commonFacts = JSON.parse(readFileSync(certificate.commonFactsRef.path, "utf8")) as {
               estate: { objectDirs: string[] }
             }
+            return { ...certificate, estate: commonFacts.estate }
+          }
           const pre = readCertificate("pre")
           const held = readCertificate("held")
           expect(held.verdict).toBe("candidate")

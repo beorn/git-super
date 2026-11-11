@@ -12,7 +12,12 @@ import { tmpdir } from "node:os"
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { createHash } from "node:crypto"
 import { fileURLToPath } from "node:url"
-import { digestDirectory, emitCertificate, RETENTION_CERTIFICATE_SCHEMA } from "./retention-certificate.ts"
+import {
+  certificateEstate,
+  digestDirectory,
+  emitCertificate,
+  RETENTION_CERTIFICATE_SCHEMA,
+} from "./retention-certificate.ts"
 import {
   scanContents,
   type ComponentContents,
@@ -103,7 +108,9 @@ export type RetentionVerifyResult = Readonly<{
   estate?: EstateScan | undefined
   contents?: readonly ComponentContents[] | undefined
   witnesses?: readonly WitnessIdentity[] | undefined
-  certificate?: Readonly<{ path: string; digest: string }> | undefined
+  certificate?:
+    | Readonly<{ path: string; digest: string; commonArtifactDir: string; warnings?: readonly string[] }>
+    | undefined
   audit?: Readonly<{ path: string; sha256: string }> | undefined
   wrapperRecords?: readonly RetentionAuditBinding[] | undefined
   staleAudits?: readonly Readonly<{ path: string; reason: string }>[] | undefined
@@ -145,6 +152,8 @@ export type RetentionVerifyOptions = Readonly<{
    * produced, so gates 2 and 6 report `unknown`.
    */
   artifactDir?: string
+  /** Native shared evidence namespace; the emitter derives its standalone default when absent. */
+  commonArtifactDir?: string
   /**
    * TEST SEAM ONLY. The production CLI never sets this; a unit test that must build its fixture under
    * the OS temporary directory sets it so gates 1-6 stay reachable. Without it, an `artifactDir`
@@ -342,7 +351,9 @@ async function evaluateRetainedEntry(
     estate?: EstateScan | undefined
     contents?: readonly ComponentContents[] | undefined
     witnesses?: readonly WitnessIdentity[] | undefined
-    certificate?: Readonly<{ path: string; digest: string }> | undefined
+    certificate?:
+      | Readonly<{ path: string; digest: string; commonArtifactDir: string; warnings?: readonly string[] }>
+      | undefined
     audit?: Readonly<{ path: string; sha256: string }> | undefined
     wrapperRecords?: readonly RetentionAuditBinding[] | undefined
     staleAudits?: readonly Readonly<{ path: string; reason: string }>[] | undefined
@@ -1018,14 +1029,7 @@ async function evaluateRetainedEntry(
         ? {}
         : { missingRootsSidecar: component.missingRootsSidecar.path }),
     })),
-    estate: {
-      roots: estate.roots,
-      objectDirs: estate.objectDirs,
-      alternatesFiles: estate.alternatesFiles,
-      borrowers: estate.borrowers,
-      registries: estate.registries,
-      survivorIntoRemoval: estate.survivorIntoRemoval,
-    },
+    estate: certificateEstate(estate),
     witnesses: custody.witnesses,
     witnessCount: custody.witnessCount,
     ...(custody.witnessSidecar === undefined ? {} : { witnessSidecar: custody.witnessSidecar.path }),
@@ -1048,11 +1052,17 @@ async function evaluateRetainedEntry(
       artifactDir: result.artifactDir,
     },
   }
-  const emission = emitCertificate(
+  const emission = await emitCertificate(
     { ...certificate, certificateSchema: RETENTION_CERTIFICATE_SCHEMA },
     result.artifactDir,
+    options.commonArtifactDir,
   )
-  if (emission.status !== "pass" || emission.path === undefined || emission.digest === undefined) {
+  if (
+    emission.status !== "pass" ||
+    emission.path === undefined ||
+    emission.digest === undefined ||
+    emission.commonArtifactDir === undefined
+  ) {
     push(
       incomplete("certificate", emission.detail, {
         path: result.artifactDir,
@@ -1061,7 +1071,12 @@ async function evaluateRetainedEntry(
     )
     return finish()
   }
-  result.certificate = { path: emission.path, digest: emission.digest }
+  result.certificate = {
+    path: emission.path,
+    digest: emission.digest,
+    commonArtifactDir: emission.commonArtifactDir,
+    ...(emission.warnings === undefined ? {} : { warnings: emission.warnings }),
+  }
   push({
     gate: "certificate",
     status: "pass",

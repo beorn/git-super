@@ -71,6 +71,8 @@ export type BatchWindow = Readonly<{
 
 export type RetentionBatchResult = Readonly<{
   apply: boolean
+  /** Allocation warnings are informational and never change a row outcome. */
+  warnings: readonly Readonly<{ entry: string; phase: "pre" | "held"; message: string }>[]
   scan: Readonly<{
     status: EstateScan["status"]
     detail: string
@@ -289,11 +291,16 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
   }
   if (new Set(entries).size !== entries.length) throw new Error("batch names an entry twice")
   const rows = new Map<string, BatchRow>()
+  const warnings: { entry: string; phase: "pre" | "held"; message: string }[] = []
+  const recordWarnings = (proof: RetentionVerifyResult, phase: "pre" | "held"): void => {
+    for (const message of proof.certificate?.warnings ?? []) warnings.push({ entry: proof.entry, phase, message })
+  }
   const verifyOptions = (entry: string, phase: "pre" | "held"): RetentionVerifyOptions => ({
     entry,
     root,
     namespaceRoots: options.namespaceRoots,
     artifactDir: join(options.artifactDir, basename(entry), phase),
+    commonArtifactDir: join(options.artifactDir, "common"),
     ...(options.clock === undefined ? {} : { clock: options.clock }),
     ...(options.allowTemporaryArtifactDir === undefined
       ? {}
@@ -314,6 +321,7 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
   const ownerSummary: { current?: RetentionBatchResult["owners"] } = {}
   const result = (windows: BatchWindow[], stopped?: string): RetentionBatchResult => ({
     apply,
+    warnings,
     scan: scanSummary,
     ...(ownerSummary.current === undefined ? {} : { owners: ownerSummary.current }),
     windows,
@@ -333,6 +341,7 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
   const kept = new Map<string, string>()
   for (const entry of entries) {
     const proof = await inspectRetainedEntryInBatch(verifyOptions(entry, "pre"), entryView(scan, entry), entries)
+    recordWarnings(proof, "pre")
     preliminary.set(entry, proof)
     if (proof.verdict !== "candidate") kept.set(entry, `${proof.verdict}: ${proof.reasons.join("; ")}`)
   }
@@ -368,7 +377,7 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
     if ("failure" in proof) {
       coldProofFailedOwners.push(owner)
       console.warn(
-        `retention: cannot prove cold owner ${owner}: ${proof.failure}; treating it as live, requiring its existing writer lease`,
+        `retention: cannot prove cold owner ${owner}: ${proof.failure}; treating it as live, requiring its existing writer lease or keeping its connected stores`,
       )
     } else cold.set(owner, proof)
   }
@@ -498,6 +507,7 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
           }
           const pre = preliminary.get(entry) as RetentionVerifyResult
           const held = await inspectRetainedEntryInBatch(verifyOptions(entry, "held"), entryView(scan, entry), entries)
+          recordWarnings(held, "held")
           const before = proofFacts(pre)
           const after = held.verdict === "candidate" ? proofFacts(held) : undefined
           const heldPointers = after === undefined ? undefined : currentPointers(held)
