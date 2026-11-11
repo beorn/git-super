@@ -427,7 +427,7 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
    * @level l1 @consumer automatic retained environment removal (31301)
    * The custody-gap table pauses witness proof, before the distinct retention normalization stage.
    */
-  it.each(["unchanged", "source-changed", "copy-changed", "failed-preparation"] as const)(
+  it.each(["unchanged", "source-changed", "copy-changed", "failed-preparation", "publication-failed"] as const)(
     "prepares retention without the root writer and validates its exact child: %s",
     async (mode) => {
       const root = await mkdtemp(join(canonicalTmpdir(), "git-super-retention-unlocked-"))
@@ -458,6 +458,7 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
         let paused = false
         let copiedStore = ""
         let changedPreparedCopy = false
+        let blockedPublication = false
         let reports = 0
         const store = createGitWorktreeStore({
           repo: product,
@@ -473,6 +474,17 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
               ) {
                 writeFileSync(join(copiedStore, "description"), "changed prepared metadata\n")
                 changedPreparedCopy = true
+              }
+              if (
+                mode === "publication-failed" &&
+                copiedStore !== "" &&
+                !blockedPublication &&
+                request.args.includes("check-ref-format")
+              ) {
+                const child = readdirSync(retainedRoot).find((name) => name !== "other-keeper")
+                expect(child).toBeTruthy()
+                mkdirSync(join(retainedRoot, child!, "manifest.json"))
+                blockedPublication = true
               }
               return local.stream!(request)
             },
@@ -539,6 +551,14 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
           expect(ownEntry).toBeTruthy()
           expect(existsSync(join(retainedRoot, ownEntry!, "manifest.json"))).toBe(true)
           expect(existsSync(join(retainedRoot, ownEntry!, "preparation.json"))).toBe(false)
+        } else if (mode === "publication-failed") {
+          expect(blockedPublication, "manifest publication was actually blocked").toBe(true)
+          expect(outcome.error).toBeInstanceOf(Error)
+          expect(existsSync(target)).toBe(true)
+          expect((await store.inspect(target)).registered).toBe(true)
+          expect(reports).toBe(0)
+          expect(existsSync(preparingPath)).toBe(true)
+          expect(existsSync(join(preparingPath, "preparation.json"))).toBe(false)
         } else {
           expect(existsSync(target)).toBe(true)
           expect((await store.inspect(target)).registered).toBe(true)

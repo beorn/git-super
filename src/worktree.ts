@@ -1745,7 +1745,6 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         }
         const resolvedPath = resolve(path)
         let preparedRetention: Awaited<ReturnType<typeof prepareWorktreeModulesRetention>> | undefined
-        let retainedPreparationMs = 0
         try {
           if (removeOptions.componentCustody !== undefined && adapters !== undefined && initialCensus !== undefined) {
             let sidecarDir: string | undefined
@@ -1916,7 +1915,6 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
                   }
                 }
                 if (custodyRefusal === undefined && removeOptions.retention !== undefined) {
-                  const preparationStarted = Date.now()
                   preparedRetention = await prepareWorktreeModulesRetention(
                     git,
                     repo,
@@ -1935,7 +1933,6 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
                     undefined,
                     componentCustodyProof,
                   )
-                  retainedPreparationMs = Date.now() - preparationStarted
                 }
                 markPhase("unlockedProof", proofStarted)
                 let postFreshness: ComputedCustodyFreshness | undefined
@@ -2099,7 +2096,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
                 componentCustodyProof,
               )
             }
-            phases.retainedCopy = Date.now() - retainedCopyStarted + retainedPreparationMs
+            phases.retainedCopy = Date.now() - retainedCopyStarted
           } else {
             if (removeOptions.unlock === true) await unlockWorktree(git, repo, path)
             if (removeOptions.noRehome !== true) rehome.run()

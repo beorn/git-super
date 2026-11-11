@@ -1761,7 +1761,7 @@ export async function retainWorktreeModules(
     preserved,
     destroyed,
     componentCustody,
-    false,
+    { unpublished: false },
   )
   try {
     return await prepared.complete()
@@ -1788,8 +1788,9 @@ export async function prepareWorktreeModulesRetention(
   preserved: readonly string[] = [],
   destroyed?: Readonly<{ gitDir: string; common: string; head: string }>,
   componentCustody?: ComponentCustodyProof,
-  unpublished = true,
+  preparation: Readonly<{ unpublished: boolean }> = { unpublished: true },
 ): Promise<{ complete: () => Promise<WorktreeRemovalProof>; discard: () => void }> {
+  const { unpublished } = preparation
   const path = destroyed === undefined ? realpathSync(requested) : resolve(requested)
   if (privateProjection === undefined && destroyed === undefined) {
     const registered = await inspect(repo, path)
@@ -2153,7 +2154,11 @@ async function prepareResolvedWorktreeModules(context: {
           verifyRetainedManifest()
           guardRetainedBorrowers(common, gitDir, "inspect")
         }
-        // A borrower may now rely on the result; preserve custody on any later failure.
+        // Beyond preparation a borrower may rely on this child; an absent manifest must read as unknown.
+        if (ownsPreparation) {
+          unlinkSync(preparationPath)
+          ownsPreparation = false
+        }
         sharedMutationStarted = true
         const rehomedBorrowers =
           privateProjection === undefined
@@ -2201,10 +2206,6 @@ async function prepareResolvedWorktreeModules(context: {
           `${JSON.stringify({ ...proof, files: finalRetainedManifest.files, entries: finalRetainedManifest.entries, externalObjectStores: finalRetainedManifest.externalObjectStores }, null, 2)}\n`,
           { flag: "wx" },
         )
-        if (ownsPreparation) {
-          unlinkSync(preparationPath)
-          ownsPreparation = false
-        }
         if (
           retained !== null &&
           (finalRetainedManifest.externalObjectStores.length > 0 ||
