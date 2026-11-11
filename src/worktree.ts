@@ -2036,6 +2036,8 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
             }
             if (custodyRefusal !== undefined) return
           }
+          // Shared mutation must never proceed without reacquiring the root writer after custody proof.
+          if (mutationLease === undefined) throw new Error(`${path}: root writer lease is not held before removal`)
           if (removeOptions.noRehome === true) {
             const borrowers = rehome.inspect()
             if (borrowers.length > 0) {
