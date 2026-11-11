@@ -561,6 +561,105 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
     },
   )
 
+  /**
+   * @failure SIGKILL leaves an unidentifiable partial retained copy or source deletion without publication.
+   * @level l1 @consumer a host inspecting retained custody after its remover process dies (31301)
+   * The exception table runs finally/discard; only a separate killed process proves the no-finally boundary.
+   */
+  it("keeps an identifiable unpublished child and its registered source after the preparation process is killed", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-retention-killed-"))
+    let child: ReturnType<typeof Bun.spawn> | undefined
+    let killDeadline: ReturnType<typeof setTimeout> | undefined
+    try {
+      const fixture = createProductFixture(root)
+      const product = fixture.product
+      const target = join(root, "target")
+      const retainedRoot = join(root, "retained")
+      const published = join(root, "published")
+      git(product, "worktree", "add", "--detach", target)
+      git(target, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
+      const sourceGitDir = git(target, "rev-parse", "--absolute-git-dir")
+      const sourceStore = git(join(target, "packages/alpha"), "rev-parse", "--absolute-git-dir")
+      const witnessDir = git(join(product, "packages/alpha"), "rev-parse", "--path-format=absolute", "--git-common-dir")
+      const common = git(product, "rev-parse", "--path-format=absolute", "--git-common-dir")
+      const script = `
+        import { createGitWorktreeStore } from ${JSON.stringify(new URL("../src/worktree.ts", import.meta.url).href)};
+        import { createLocalGitProcess } from ${JSON.stringify(new URL("../src/process.ts", import.meta.url).href)};
+        import { writeFileSync } from "node:fs";
+        const local = createLocalGitProcess();
+        const retainedRoot = ${JSON.stringify(retainedRoot)};
+        const store = createGitWorktreeStore({repo: ${JSON.stringify(product)}, gitProcess: {
+          ...local,
+          async run(request) {
+            const at = request.args.indexOf("--git-dir");
+            const candidate = at < 0 ? undefined : request.args[at + 1];
+            if (request.args.includes("fsck") && candidate?.startsWith(retainedRoot + "/")) {
+              console.log("retention-preparation-ready");
+              await Bun.sleep(60000);
+            }
+            return local.run(request);
+          }
+        }});
+        await store.remove(${JSON.stringify(target)}, {
+          retention: {root: retainedRoot, report: () => writeFileSync(${JSON.stringify(published)}, "published")},
+          componentCustody: {primaryRoot: ${JSON.stringify(product)}, targetBranch: "main"}
+        });
+      `
+      const running = Bun.spawn([process.execPath, "--eval", script], {
+        cwd: product,
+        env: { ...process.env, GIT_SUPER_REMOVAL_PHASES: "0" },
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      })
+      child = running
+      // Readiness has a generous bound under fleet load; the child is always reaped, including a failed setup.
+      killDeadline = setTimeout(() => running.kill("SIGKILL"), 20_000)
+      const reader = running.stdout.getReader()
+      const decoder = new TextDecoder()
+      const ended = running.exited.then(async (code) => {
+        throw new Error(
+          `remover exited before preparation barrier (${code}): ${await new Response(running.stderr).text()}`,
+        )
+      })
+      let output = ""
+      while (!output.includes("retention-preparation-ready\n")) {
+        const next = await Promise.race([reader.read(), ended])
+        if (next.done) throw new Error("remover stdout ended before its preparation barrier")
+        output += decoder.decode(next.value, { stream: true })
+      }
+      const children = readdirSync(retainedRoot)
+      expect(children).toHaveLength(1)
+      const partial = join(retainedRoot, children[0]!)
+      expect(existsSync(join(partial, "preparation.json"))).toBe(true)
+      const marker = JSON.parse(readFileSync(join(partial, "preparation.json"), "utf8")) as Record<string, unknown>
+      expect(marker).toMatchObject({ version: 1, state: "preparing", sourceGitDir })
+      expect(typeof marker.createdAt === "string" && Number.isFinite(Date.parse(marker.createdAt))).toBe(true)
+      expect(existsSync(join(partial, "manifest.json"))).toBe(false)
+      expect(existsSync(published)).toBe(false)
+
+      running.kill("SIGKILL")
+      expect(await running.exited).not.toBe(0)
+      clearTimeout(killDeadline)
+      killDeadline = undefined
+      expect(existsSync(join(partial, "preparation.json"))).toBe(true)
+      expect(existsSync(join(partial, "manifest.json"))).toBe(false)
+      expect(existsSync(target)).toBe(true)
+      expect(git(product, "worktree", "list", "--porcelain")).toContain(`worktree ${target}\n`)
+      for (const owner of [common, sourceGitDir, sourceStore, witnessDir]) {
+        const released = tryAcquireFlock(join(owner, "yrd-worktree-mutations", "writer.lock"))
+        released?.release()
+        expect(released, `killed remover releases its writer lease: ${owner}`).not.toBeNull()
+      }
+    } finally {
+      if (killDeadline !== undefined) clearTimeout(killDeadline)
+      if (child?.exitCode === null) child.kill("SIGKILL")
+      await child?.exited
+      // raw-delete-allow: this test owns the isolated fixture and the explicitly reaped child process
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 30_000)
+
   it("removes a root-only worktree while preserving uncustodied root commits", async () => {
     const root = await mkdtemp(join(canonicalTmpdir(), "git-super-root-only-custody-"))
     try {
