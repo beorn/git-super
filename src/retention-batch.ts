@@ -131,7 +131,7 @@ function coldOwner(
       const manifest: unknown = JSON.parse(bytes)
       if (typeof manifest === "object" && manifest !== null && "path" in manifest) absent = manifest.path
     } catch (error) {
-      // A malformed manifest proves no closed environment: this owner remains live and needs its lease.
+      // delete-fallback-allow: proof (coldOwner default) undefined keeps the owner out of cold, so it is live and needs its writer lease; failed parsing gives fewer pointer deletes, never more (guard owner fc254a47).
       console.warn(
         `retention: cannot parse ${source}: ${error instanceof Error ? error.message : String(error)}; treating its owners as live, requiring their existing writer leases`,
       )
@@ -504,6 +504,7 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
             closeOverKeptBorrowers(entries, scan.borrowers, kept)
             for (const [member, reason] of kept) rows.set(member, { entry: member, outcome: "kept", reason })
           } else {
+            let phase = "deletion"
             try {
               const changedCold = coldOwnerChanged(cold)
               if (changedCold !== undefined) {
@@ -518,6 +519,7 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
               if (lstatSync(entry, { throwIfNoEntry: false }) !== undefined) {
                 throw new Error(`entry ${entry} is still present after deletion`)
               }
+              phase = "pointer cleanup"
               for (const pointer of heldPointers) {
                 if (within(entry, pointer.path)) continue
                 if (pointer.retained === join(entry, "modules") && pointer.manifest === join(entry, "manifest.json")) {
@@ -533,7 +535,7 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
               rows.set(entry, {
                 entry,
                 outcome: "failed",
-                reason: `${error instanceof Error ? error.message : String(error)}; actual entry state: ${state}; no retry`,
+                reason: `${error instanceof Error ? error.message : String(error)}; ${phase} failed; actual entry state: ${state}; no retry`,
               })
               stopped = `retirement-partial at ${entry}; the batch deleted nothing more`
               break

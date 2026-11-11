@@ -8,7 +8,19 @@
  * @reach fs-walk <fixture-only: estate scans visit mkdtempSync(tmpdir()) Git repositories>
  */
 import { execFileSync } from "node:child_process"
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { createHash } from "node:crypto"
+import {
+  chmodSync,
+  cpSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { tryAcquireFlock } from "@bearly/flock"
@@ -153,6 +165,50 @@ async function linkedBatch(): Promise<RetentionBatchOptions> {
 }
 
 describe("retention retirement batch (#33010)", () => {
+  // CTO cbd8921c: after successful deletion, an external pointer cleanup failure must say both that the entry
+  // is gone and which phase failed. Existing partial-removal coverage fails before bulk deletion finishes.
+  it("names a pointer cleanup failure after the entry is gone and keeps later entries", async () => {
+    const checkout = join(fixtureRoot, "pointer-cleanup")
+    const previous = readdirSync(root).map((name) => join(root, name))
+    expect(await runCli(["--repo", dirname(common), "worktree", "add", checkout, "HEAD"], sink(), sink())).toBe(0)
+    expect(
+      await runCli(["--repo", dirname(common), "worktree", "remove", checkout, "--retain", root], sink(), sink()),
+    ).toBe(0)
+    const first = readdirSync(root)
+      .map((name) => join(root, name))
+      .find((entry) => !previous.includes(entry)) as string
+    const manifest = JSON.parse(readFileSync(join(first, "manifest.json"), "utf8")) as { retainUntil: string }
+    const registry = join(common, "git-super-retained-borrowers")
+    // Historical registry input, not current-writer output: keep the native entry and manifest unchanged.
+    mkdirSync(registry, { recursive: true })
+    const manifestPath = join(first, "manifest.json")
+    const pointer = join(registry, `${createHash("sha256").update(manifestPath).digest("hex")}.json`)
+    writeFileSync(pointer, `${JSON.stringify({ retained: join(first, "modules"), manifest: manifestPath })}\n`)
+    const mode = statSync(registry).mode & 0o777
+    const second = previous[0] as string
+    try {
+      const result = await retireRetainedBatch(
+        options({
+          entries: [first, second],
+          apply: true,
+          clock: new Date(Date.parse(manifest.retainUntil) + 1000),
+          afterScan: () => chmodSync(registry, 0o555),
+        }),
+      )
+      expect(
+        result.rows.map((row) => row.outcome),
+        JSON.stringify(result.rows),
+      ).toEqual(["failed", "kept"])
+      expect(existsSync(first)).toBe(false)
+      expect(existsSync(pointer)).toBe(true)
+      expect(existsSync(second)).toBe(true)
+      expect(result.rows[0]?.reason).toContain("actual entry state: gone")
+      expect(result.rows[0]?.reason).toContain("pointer cleanup failed")
+    } finally {
+      chmodSync(registry, mode)
+      rmSync(pointer, { force: true })
+    }
+  })
   // CTO 2cdcedf4: deleting a selected registry holder must not make the batch re-read its missing registry or
   // owning manifest. Existing fixtures have registries only outside the removal set.
   it("retires a sealed registry holder and continues through every later batch entry", async () => {
