@@ -34,8 +34,9 @@ export function certificateEstate(estate: EstateScan): object {
 }
 
 function plain(value: unknown): Record<string, unknown> {
-  if (value === null || typeof value !== "object" || Array.isArray(value))
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("certificate facts must be an object")
+  }
   return value as Record<string, unknown>
 }
 
@@ -69,8 +70,9 @@ export function readCertificateFacts(
   if (
     certificate.schema !== RETENTION_CERTIFICATE_SCHEMA ||
     certificate.certificateSchema !== RETENTION_CERTIFICATE_SCHEMA
-  )
+  ) {
     throw new Error("unsupported retention certificate version")
+  }
   const ref = plain(certificate.commonFactsRef)
   if (
     typeof ref.path !== "string" ||
@@ -79,26 +81,34 @@ export function readCertificateFacts(
     !/^[0-9a-f]{64}$/u.test(ref.sha256) ||
     !Number.isSafeInteger(ref.bytes) ||
     ref.count !== 1
-  )
+  ) {
     throw new Error("invalid common facts reference")
+  }
   const namespace = unredirected(commonArtifactDir)
-  if (!contained(namespace, unredirected(ref.path)) || ref.path === namespace || !lstatSync(ref.path).isFile())
+  if (!contained(namespace, unredirected(ref.path)) || ref.path === namespace || !lstatSync(ref.path).isFile()) {
     throw new Error("common facts reference is outside its native regular-file namespace")
+  }
   const bytes = readFileSync(ref.path)
-  if (bytes.length !== ref.bytes || createHash("sha256").update(bytes).digest("hex") !== ref.sha256)
+  if (bytes.length !== ref.bytes || createHash("sha256").update(bytes).digest("hex") !== ref.sha256) {
     throw new Error("common facts bytes disagree with their reference")
-  if (bytes.at(-1) !== 10 || bytes.subarray(0, -1).includes(10))
+  }
+  if (bytes.at(-1) !== 10 || bytes.subarray(0, -1).includes(10)) {
     throw new Error("common facts must contain exactly one newline-terminated JSON record")
+  }
   const facts = plain(JSON.parse(bytes.toString("utf8")))
-  if (facts.schema !== COMMON_FACTS_SCHEMA || Object.keys(facts).sort().join(",") !== "coverage,estate,schema")
+  if (facts.schema !== COMMON_FACTS_SCHEMA || Object.keys(facts).sort().join(",") !== "coverage,estate,schema") {
     throw new Error("unsupported common facts version or shape")
-  if (canonicalEstateScan(plain(facts.estate)) !== canonicalEstateScan(certificateEstate(estate)))
+  }
+  if (canonicalEstateScan(plain(facts.estate)) !== canonicalEstateScan(certificateEstate(estate))) {
     throw new Error("common facts estate differs from the observed estate projection")
-  if (canonicalEstateScan(plain(facts.coverage)) !== canonicalEstateScan(coverage))
+  }
+  if (canonicalEstateScan(plain(facts.coverage)) !== canonicalEstateScan(coverage)) {
     throw new Error("common facts coverage differs from the observed coverage")
+  }
   const { commonFactsRef: _ref, ...local } = certificate
-  if ("estate" in local || Object.keys(plain(local.coverage)).join(",") !== "artifactDir")
+  if ("estate" in local || Object.keys(plain(local.coverage)).join(",") !== "artifactDir") {
     throw new Error("unsupported inline certificate facts")
+  }
   return { ...local, estate: facts.estate, coverage: { ...plain(facts.coverage), ...plain(local.coverage) } }
 }
 
@@ -151,14 +161,18 @@ export async function emitCertificate(
 ): Promise<CertificateEmission> {
   try {
     const original = plain(certificate)
-    if (original.schema !== RETENTION_CERTIFICATE_SCHEMA || original.certificateSchema !== RETENTION_CERTIFICATE_SCHEMA)
+    if (
+      original.schema !== RETENTION_CERTIFICATE_SCHEMA ||
+      original.certificateSchema !== RETENTION_CERTIFICATE_SCHEMA
+    ) {
       throw new Error("unsupported retention certificate writer version")
+    }
     const common = unredirected(commonArtifactDir ?? join(artifactDir, "common"))
-    const roots = [...(Array.isArray(original.removal) ? original.removal : []), original.root, original.entry].filter(
-      (root): root is string => typeof root === "string",
-    )
-    if (roots.some((root) => contained(resolve(root), common)))
+    const removal: readonly unknown[] = Array.isArray(original.removal) ? original.removal : []
+    const roots = [...removal, original.root, original.entry].filter((root): root is string => typeof root === "string")
+    if (roots.some((root) => contained(resolve(root), common))) {
       throw new Error("common facts directory is inside removal custody")
+    }
     mkdirSync(artifactDir, { recursive: true })
     const { estate, coverage, ...local } = original
     const { artifactDir: localArtifactDir, ...commonCoverage } = plain(coverage)
