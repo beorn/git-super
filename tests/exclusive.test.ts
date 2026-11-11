@@ -213,7 +213,7 @@ describe("exclusive writer policy", () => {
         lock.release()
         released = true
         expect(progress[0]!.refresh()).toContain("live holder: none found in the kernel lock table")
-        expect(JSON.parse(await readFile(join(dir, "writer.lock"), "utf8")).pid).toBe(2_000_000_000)
+        expect(JSON.parse(await readFile(join(dir, "writer.lock"), "utf8"))).toMatchObject({ pid: 2_000_000_000 })
         const next = await acquireExclusive(dir, { timeoutMs: 0 }, "next writer")
         next.release()
       } finally {
