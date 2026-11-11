@@ -16,6 +16,7 @@
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs"
 import { dirname, isAbsolute, join, relative, sep } from "node:path"
 import { alternateEntries } from "./alternates.ts"
+import { tryGit, withGitTimeout } from "./git.ts"
 import {
   assertStreamComplete,
   DEFAULT_SORT_RUN_LINES,
@@ -78,6 +79,21 @@ export interface CustodyScan {
   readonly missing: readonly CustodyTarget[]
   readonly missingCount: number
   readonly missingSidecar?: SidecarRef | undefined
+  /** At-risk commits a rebase removed that the published main graph still holds by patch-id. */
+  readonly rebased?: readonly RebaseWitness[] | undefined
+}
+
+/**
+ * A refused at-risk commit whose stable patch-id equals that of a commit the published main graph
+ * holds. The pair is carried out so a close receipt can name the landed commit that stands for the
+ * refused one; a patch-id match alone is never a silent pass.
+ */
+export interface RebaseWitness {
+  readonly component: string
+  readonly oid: string
+  readonly landedOid: string
+  readonly ref: string
+  readonly tip: string
 }
 
 export interface CustodyScanOptions {
@@ -110,6 +126,151 @@ class UnknownError extends Error {
 
 function isDurableRef(ref: string): boolean {
   return DURABLE_REF.test(ref) || PIN_REF.test(ref)
+}
+
+const PUBLISHED_READ_TIMEOUT_MS = 120_000
+/** A refused set this size still gets a patch-id read; beyond it the answer is unknown, never a pass. */
+const REBASE_CANDIDATE_LIMIT = 500
+/** A patch stream larger than this is not read into memory to guess at a match. */
+const REBASE_PATCH_BYTES = 8 * 1024 * 1024
+
+/**
+ * The remote whose published refs decide durability: `origin` when configured, else the only one.
+ * Two non-origin remotes leave no authority to choose, so that is unknown rather than a guess; a
+ * store with no remote has nothing newer to read and keeps the local refs it always had.
+ */
+async function configuredRemote(gitDir: string, run: GitRun): Promise<string | undefined> {
+  // `git remote` answers names only. Reading `config --get-regexp` means parsing around the URL value,
+  // and a URL that itself ends in `.url` made the name swallow the value.
+  const remotes = await run([`--git-dir=${gitDir}`, "remote"])
+  if (remotes.code !== 0) {
+    throw new UnknownError(
+      `witness store ${gitDir}: its remotes could not be listed (${remotes.stderr.trim() || `exit ${String(remotes.code)}`})`,
+    )
+  }
+  const ordered = [
+    ...new Set(
+      remotes.stdout
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((name) => name !== ""),
+    ),
+  ].sort()
+  if (ordered.includes("origin")) return "origin"
+  if (ordered.length === 1) return ordered[0]
+  if (ordered.length === 0) return undefined
+  throw new UnknownError(
+    `witness store ${gitDir}: it configures ${String(ordered.length)} remotes and no origin (${ordered.join(", ")}), so which one publishes its refs is unknown`,
+  )
+}
+
+/**
+ * Read what the component's remote publishes NOW for the target branch and its GitSuper pins, then
+ * make those commits readable in this witness store. A local remote-tracking ref or branch may be
+ * days stale, so it never decides what is published; a remote that cannot be read is unknown, with
+ * no fallback to the local copies (operator 2026-10-21, same rule as the value reader).
+ *
+ * Pins are named by the commit they point at, so fetching them by name is idempotent. The target
+ * branch is fetched for its objects only, because a custody check must never move the primary's
+ * own branch.
+ */
+async function refreshPublishedRefs(
+  gitDir: string,
+  remote: string,
+  targetBranch: string,
+  run: GitRun,
+): Promise<Readonly<{ branchTip?: string; pinCount: number }>> {
+  const targetRef = `refs/heads/${targetBranch}`
+  const listed = await run(
+    [`--git-dir=${gitDir}`, "ls-remote", "--symref", remote, targetRef, "refs/git-super/pins/*"],
+    { timeoutMs: PUBLISHED_READ_TIMEOUT_MS },
+  )
+  if (listed.code !== 0) {
+    throw new UnknownError(
+      `witness store ${gitDir}: its remote ${remote} did not answer ls-remote (${listed.stderr.trim() || `exit ${String(listed.code)}`}), so the refs it publishes are unknown`,
+    )
+  }
+  let branchTip: string | undefined
+  let pinCount = 0
+  for (const line of listed.stdout.split("\n")) {
+    if (line.trim() === "" || line.startsWith("ref: ")) continue
+    const [, sha, ref] = /^([0-9a-f]{40,64})\t(\S+)$/u.exec(line) ?? []
+    if (sha === undefined || ref === undefined) {
+      throw new UnknownError(
+        `witness store ${gitDir}: ls-remote ${remote} answered an unreadable line ${JSON.stringify(line)}`,
+      )
+    }
+    if (ref === targetRef) branchTip = sha
+    else if (PIN_REF.test(ref)) pinCount += 1
+  }
+  if (pinCount > 0) {
+    const fetched = await run(
+      [
+        `--git-dir=${gitDir}`,
+        "fetch",
+        "--quiet",
+        "--no-tags",
+        "--no-recurse-submodules",
+        "--no-write-fetch-head",
+        "--no-auto-maintenance",
+        remote,
+        `+refs/git-super/pins/*:refs/git-super/pins/*`,
+      ],
+      { timeoutMs: PUBLISHED_READ_TIMEOUT_MS },
+    )
+    if (fetched.code !== 0) {
+      throw new UnknownError(
+        `witness store ${gitDir}: fetching the pins ${remote} publishes failed (${fetched.stderr.trim() || `exit ${String(fetched.code)}`}), so their custody is unknown`,
+      )
+    }
+  }
+  if (branchTip !== undefined) {
+    const fetched = await run(
+      [
+        `--git-dir=${gitDir}`,
+        "fetch",
+        "--quiet",
+        "--no-tags",
+        "--no-recurse-submodules",
+        "--no-write-fetch-head",
+        "--no-auto-maintenance",
+        "--refmap=",
+        remote,
+        targetRef,
+      ],
+      { timeoutMs: PUBLISHED_READ_TIMEOUT_MS },
+    )
+    if (fetched.code !== 0) {
+      throw new UnknownError(
+        `witness store ${gitDir}: fetching ${targetRef} from ${remote} failed (${fetched.stderr.trim() || `exit ${String(fetched.code)}`}), so the commits it publishes are unknown`,
+      )
+    }
+  }
+  return { ...(branchTip === undefined ? {} : { branchTip }), pinCount }
+}
+
+/**
+ * `git patch-id` reads its patch stream on stdin, which the injected `GitRun` cannot carry. This one
+ * read therefore goes through the package's own runner, bounded, and every failure is loud.
+ */
+function patchIdIndex(
+  gitDir: string,
+  args: readonly string[],
+  input: string | undefined,
+  what: string,
+): Map<string, string> {
+  let stdout: string
+  try {
+    stdout = withGitTimeout(PUBLISHED_READ_TIMEOUT_MS, () => tryGit(gitDir, args, undefined, input)).stdout
+  } catch (error) {
+    throw new UnknownError(`${what} could not be read: ${error instanceof Error ? error.message : String(error)}`)
+  }
+  const byId = new Map<string, string>()
+  for (const line of stdout.split("\n")) {
+    const [, patchId, commitId] = /^([0-9a-f]{40,64}) ([0-9a-f]{40,64})$/u.exec(line.trim()) ?? []
+    if (patchId !== undefined && commitId !== undefined) byId.set(commitId, patchId)
+  }
+  return byId
 }
 
 export function isPolicyRef(ref: string, tip: string, targetBranch: string): boolean {
@@ -273,9 +434,14 @@ async function indexWitnessStores(
   witnessPolicy?: Readonly<{ targetBranch: string }>,
   deadline?: number,
   onPhase?: (name: string, ms: number) => void,
-): Promise<{ records: DurableRefRecord[]; formats: Map<string, string> }> {
+): Promise<{
+  records: DurableRefRecord[]
+  formats: Map<string, string>
+  published: ReadonlyArray<Readonly<{ store: string; tip: string }>>
+}> {
   const records: DurableRefRecord[] = []
   const formats = new Map<string, string>()
+  const published: Array<Readonly<{ store: string; tip: string }>> = []
   let witnessFsckMs = 0
   let refGraphMs = 0
   for (const store of stores) {
@@ -283,6 +449,7 @@ async function indexWitnessStores(
     const format = await objectFormat(gitDir, run)
     if (format.status !== "ok") throw new UnknownError(format.detail)
     formats.set(store, format.format)
+    let publishedBranchTip: string | undefined
     if (witnessPolicy !== undefined) {
       const shallow = await run([`--git-dir=${gitDir}`, "rev-parse", "--is-shallow-repository"])
       refuseSuccessfulStderr(shallow, `rev-parse --is-shallow-repository in ${gitDir}`)
@@ -293,6 +460,13 @@ async function indexWitnessStores(
       }
       if (shallow.stdout.trim() === "true") {
         throw new UnknownError(`witness graph in ${gitDir} is shallow and cannot prove complete custody`)
+      }
+      // What the remote publishes now, never this store's possibly days-old copy of it.
+      const remote = await configuredRemote(gitDir, run)
+      if (remote !== undefined) {
+        const refreshed = await refreshPublishedRefs(gitDir, remote, witnessPolicy.targetBranch, run)
+        publishedBranchTip = refreshed.branchTip
+        if (refreshed.branchTip !== undefined) published.push({ store, tip: refreshed.branchTip })
       }
     }
     const closureResult = alternateClosure(store, removal)
@@ -333,6 +507,13 @@ async function indexWitnessStores(
       }
       durable.push({ ref, tip, objectType })
     }
+    if (witnessPolicy !== undefined && publishedBranchTip !== undefined) {
+      const targetRef = `refs/heads/${witnessPolicy.targetBranch}`
+      if (!durable.some((entry) => entry.ref === targetRef && entry.tip === publishedBranchTip)) {
+        // The published tip is a durable name for the same ref even though no local ref names it yet.
+        durable.push({ ref: targetRef, tip: publishedBranchTip, objectType: "commit" })
+      }
+    }
     durable.sort((left, right) => (left.ref < right.ref ? -1 : left.ref > right.ref ? 1 : 0))
     const selected = witnessPolicy === undefined ? durable : await independentPolicyRefs(durable, gitDir, run)
     const refStarted = clock()
@@ -358,7 +539,95 @@ async function indexWitnessStores(
   }
   onPhase?.("witnessFsck", witnessFsckMs)
   onPhase?.("refGraph", refGraphMs)
-  return { records, formats }
+  return { records, formats, published }
+}
+
+/**
+ * The one second witness a rebase earns: a commit the published main graph still holds whose stable
+ * patch-id equals the refused commit's. Merges and empty commits have no patch of their own, so an
+ * empty patch-id never passes; the search is bounded by the commits on main that touch the refused
+ * commit's paths, and passing that bound is unknown rather than a pass.
+ */
+async function rebaseWitness(
+  target: Readonly<{ component: string; oid: string; source: string }>,
+  gitDir: string,
+  roots: ReadonlyArray<Readonly<{ store: string; ref: string; tip: string }>>,
+  run: GitRun,
+): Promise<RebaseWitness | undefined> {
+  const names = await run([`--git-dir=${gitDir}`, "show", "--no-color", "--pretty=format:", "--name-only", target.oid])
+  refuseSuccessfulStderr(names, `show --name-only ${target.oid} in ${gitDir}`)
+  if (names.code !== 0) {
+    throw new UnknownError(
+      `at-risk commit ${target.oid}: its changed paths could not be read (${names.stderr.trim() || `exit ${String(names.code)}`})`,
+    )
+  }
+  const paths = [
+    ...new Set(
+      names.stdout
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line !== ""),
+    ),
+  ]
+  if (paths.length === 0) return undefined
+  let diff: string
+  try {
+    diff = withGitTimeout(PUBLISHED_READ_TIMEOUT_MS, () =>
+      tryGit(gitDir, [`--git-dir=${gitDir}`, "show", "--no-color", target.oid]),
+    ).stdout
+  } catch (error) {
+    throw new UnknownError(
+      `at-risk commit ${target.oid}: its patch could not be read (${error instanceof Error ? error.message : String(error)})`,
+    )
+  }
+  if (diff.length > REBASE_PATCH_BYTES) {
+    throw new UnknownError(`at-risk commit ${target.oid}: its patch exceeds ${REBASE_PATCH_BYTES} bytes`)
+  }
+  const own = patchIdIndex(gitDir, ["patch-id", "--stable"], diff, `patch-id of ${target.oid}`)
+  const ownId = own.get(target.oid)
+  if (ownId === undefined) return undefined
+  for (const root of roots) {
+    const storeDir = dirname(root.store)
+    // The paths only choose candidates. Every candidate is then hashed on its COMPLETE patch, never
+    // on the projection onto those paths: a commit that also changed other files is a different
+    // patch, and matching it would record a landed twin that never carried this change.
+    const listed = await run([`--git-dir=${storeDir}`, "rev-list", root.tip, "--", ...paths])
+    refuseSuccessfulStderr(listed, `rev-list ${root.tip} in ${storeDir}`)
+    if (listed.code !== 0) {
+      throw new UnknownError(`published ${root.ref} history in ${storeDir} could not be read (${listed.stderr.trim()})`)
+    }
+    const candidates = listed.stdout
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line !== "")
+    if (candidates.length > REBASE_CANDIDATE_LIMIT) {
+      throw new UnknownError(
+        `${String(candidates.length)} commit(s) on published ${root.ref} touch the paths of ${target.oid}, above the ${REBASE_CANDIDATE_LIMIT} patch-id bound`,
+      )
+    }
+    if (candidates.length === 0) continue
+    const complete = await run([`--git-dir=${storeDir}`, "show", "--no-color", "--no-notes", ...candidates])
+    refuseSuccessfulStderr(complete, `show ${root.ref} candidates in ${storeDir}`)
+    if (complete.code !== 0) {
+      throw new UnknownError(
+        `published ${root.ref} patches in ${storeDir} could not be read (${complete.stderr.trim()})`,
+      )
+    }
+    if (complete.stdout.length > REBASE_PATCH_BYTES) {
+      throw new UnknownError(`published ${root.ref} patches in ${storeDir} exceed ${REBASE_PATCH_BYTES} bytes`)
+    }
+    const landed = patchIdIndex(
+      storeDir,
+      ["patch-id", "--stable"],
+      complete.stdout,
+      `published patch ids on ${root.ref}`,
+    )
+    for (const [landedOid, patchId] of landed) {
+      if (patchId !== ownId) continue
+      return { component: target.component, oid: target.oid, landedOid, ref: root.ref, tip: root.tip }
+    }
+  }
+  return undefined
 }
 
 async function runCustody(
@@ -433,7 +702,7 @@ async function runCustody(
         ? {}
         : { env: { ...streamOptions.env, GIT_NO_REPLACE_OBJECTS: "1", GIT_NO_LAZY_FETCH: "1" } }),
     })
-  const { records, formats } = await indexWitnessStores(
+  const { records, formats, published } = await indexWitnessStores(
     stores,
     removal,
     proofStream,
@@ -454,6 +723,8 @@ async function runCustody(
   const missingWriter = new SidecarWriter(sidecarDir, "txt")
   const identities = new Map<string, WitnessIdentity>()
   const missing: CustodyTarget[] = []
+  const allMissing: Array<CustodyTarget & Readonly<{ gitDir?: string }>> = []
+  const rebased: RebaseWitness[] = []
   let witnessCount = 0
   let missingCount = 0
   let merged = 0
@@ -476,7 +747,12 @@ async function runCustody(
           if (indexLines === undefined || indexLines.length === 0) {
             missingCount += 1
             if (missing.length < MISSING_INLINE) missing.push({ component: component.component, oid: key, source })
-            missingWriter.add(`${key}\t${component.component}\t${source}`)
+            allMissing.push({
+              component: component.component,
+              oid: key,
+              source,
+              ...(component.gitDir === undefined ? {} : { gitDir: component.gitDir }),
+            })
             return
           }
           const rank = indexLines[0]?.split("\t")[1]
@@ -503,6 +779,49 @@ async function runCustody(
       )
       remaining()
     }
+    // Second witness, rebase only: a refused commit whose stable patch-id the published main graph
+    // still holds is superseded, not lost. The pair is recorded so the receipt can be audited.
+    const roots =
+      witnessPolicy === undefined
+        ? []
+        : [...new Map(published.map((entry) => [`${entry.store}\t${entry.tip}`, entry])).values()].map((entry) => ({
+            store: entry.store,
+            ref: `refs/heads/${witnessPolicy.targetBranch}`,
+            tip: entry.tip,
+          }))
+    if (allMissing.length > 0 && roots.length > 0) {
+      if (allMissing.length > REBASE_CANDIDATE_LIMIT) {
+        throw new UnknownError(
+          `${String(allMissing.length)} un-witnessed at-risk OID(s) exceed the ${REBASE_CANDIDATE_LIMIT} patch-id bound`,
+        )
+      }
+      const gitDirs = new Map<string, string>()
+      for (const component of components) {
+        const dir = component.gitDir ?? join(copyRoot, component.component)
+        gitDirs.set(component.component, dir)
+      }
+      for (const target of allMissing) {
+        remaining()
+        const gitDir = target.gitDir ?? gitDirs.get(target.component)
+        if (gitDir === undefined) continue
+        const witness = await rebaseWitness(target, gitDir, roots, run)
+        if (witness !== undefined) rebased.push(witness)
+      }
+    }
+    if (rebased.length > 0) {
+      const rebasedKeys = new Set(rebased.map((witness) => `${witness.component}\0${witness.oid}`))
+      const stillMissing = allMissing.filter((target) => !rebasedKeys.has(`${target.component}\0${target.oid}`))
+      missingCount = stillMissing.length
+      missing.length = 0
+      for (const target of stillMissing) {
+        if (missing.length < MISSING_INLINE) {
+          missing.push({ component: target.component, oid: target.oid, source: target.source })
+        }
+        missingWriter.add(`${target.oid}\t${target.component}\t${target.source}`)
+      }
+    } else {
+      for (const target of allMissing) missingWriter.add(`${target.oid}\t${target.component}\t${target.source}`)
+    }
   } catch (error) {
     witnessWriter.abort()
     missingWriter.abort()
@@ -527,16 +846,18 @@ async function runCustody(
       missing,
       missingCount,
       ...(missingSidecar === undefined ? {} : { missingSidecar }),
+      rebased,
     }
   }
   return {
     status: "pass",
-    detail: `${witnessCount} at-risk OID(s) each have a named surviving witness across ${stores.length} store(s), ${witnesses.length} distinct identities`,
+    detail: `${witnessCount} at-risk OID(s) each have a named surviving witness across ${stores.length} store(s), ${witnesses.length} distinct identities${rebased.length === 0 ? "" : `, plus ${String(rebased.length)} rebased commit(s) matched by patch-id to the published main graph`}`,
     witnesses,
     witnessCount,
     ...(witnessSidecar === undefined ? {} : { witnessSidecar }),
     missing: [],
     missingCount: 0,
+    rebased,
   }
 }
 

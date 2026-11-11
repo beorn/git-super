@@ -1829,6 +1829,9 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
                 } else {
                   const contentComponents = contents?.components ?? []
                   const witnesses: WitnessIdentity[] = []
+                  const rebased: Array<
+                    Readonly<{ component: string; oid: string; landedOid: string; ref: string; tip: string }>
+                  > = []
                   const witnessKeys = new Set<string>()
                   let witnessCount = 0
                   let custodyFailure: ComponentCustodyRefusal | undefined
@@ -1867,6 +1870,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
                       break
                     }
                     witnessCount += custody.witnessCount
+                    rebased.push(...(custody.rebased ?? []))
                     for (const witness of custody.witnesses) {
                       const key = `${witness.store}\0${witness.ref}\0${witness.tip}`
                       if (witnessKeys.has(key)) continue
@@ -1898,6 +1902,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
                           sources: sourceSummary,
                           atRiskDigest,
                           witnesses,
+                          rebased,
                           witnessCount,
                         }),
                       )
@@ -1906,6 +1911,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
                       targetBranch: removeOptions.componentCustody.targetBranch,
                       sources: sourceSummary,
                       witnesses,
+                      rebased,
                       componentCount: contentComponents.length,
                       effectiveCommitCount: contentComponents.reduce((count, entry) => count + entry.atRisk, 0),
                       witnessCount,

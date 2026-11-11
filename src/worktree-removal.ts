@@ -181,6 +181,11 @@ export type ComponentCustodyProof = Readonly<{
   targetBranch: string
   sources: readonly Readonly<{ component: string; gitDir: string; commonDir: string; objectDirectory: string }>[]
   witnesses: readonly Readonly<{ store: string; ref: string; tip: string; graphDigest: string }>[]
+  /**
+   * Refused commits a rebase rewrote, each with the published commit whose stable patch-id matches.
+   * A pass by patch-id is only auditable as a pair, so the receipt carries every pair that earned it.
+   */
+  rebased?: readonly Readonly<{ component: string; oid: string; landedOid: string; ref: string; tip: string }>[]
   componentCount: number
   effectiveCommitCount: number
   witnessCount: number
