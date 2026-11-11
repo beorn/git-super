@@ -13,7 +13,7 @@
  *
  * Dry run by default: `apply: false` reports the entries that would be retired and why every other one is kept.
  */
-import { lstatSync, realpathSync, rmSync } from "node:fs"
+import { lstatSync, readFileSync, realpathSync, rmSync } from "node:fs"
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { acquireFlockWithTimeout, type FlockHandle } from "@bearly/flock"
 import { DEFAULT_MUTATION_LOCK_WAIT_MS } from "./exclusive.ts"
@@ -27,7 +27,11 @@ import {
   type EstateScanBounds,
 } from "./retention-estate.ts"
 import { pointers, proofFacts } from "./retention-remove.ts"
-import { inspectRetainedEntryInBatch, type RetentionVerifyOptions, type RetentionVerifyResult } from "./retention-verify.ts"
+import {
+  inspectRetainedEntryInBatch,
+  type RetentionVerifyOptions,
+  type RetentionVerifyResult,
+} from "./retention-verify.ts"
 import { acquireRemovalWriterLeases, removeRetainedPointer } from "./worktree-removal.ts"
 
 export type RetentionBatchOptions = Readonly<{
@@ -66,11 +70,19 @@ export type BatchWindow = Readonly<{
 
 export type RetentionBatchResult = Readonly<{
   apply: boolean
-  scan: Readonly<{ status: EstateScan["status"]; detail: string; ms: number; alternatesFiles: number; excluded: number }>
+  scan: Readonly<{
+    status: EstateScan["status"]
+    detail: string
+    ms: number
+    alternatesFiles: number
+    excluded: number
+  }>
   /** The outside Git owners whose existing writer leases a window holds, and how many cannot be leased. */
   owners?: Readonly<{
     total: number
     leaseMissing: number
+    cold: number
+    liveUnleased: number
     unproved: number
     leaseMissingExample?: string
     unprovedExample?: string
@@ -84,6 +96,96 @@ export type RetentionBatchResult = Readonly<{
 function within(root: string, path: string): boolean {
   const part = relative(root, path)
   return part === "" || (part !== ".." && !part.startsWith(`..${sep}`) && !isAbsolute(part))
+}
+
+type ColdOwner = Readonly<{ source: string; bytes: string; absent: string }>
+
+/** Cold is an observed absent worktree, never a directory-class assumption (@cto 76cc52e6). */
+function coldOwner(
+  owner: string,
+  root: string,
+  common: string,
+  cache: Map<string, ColdOwner | undefined>,
+): ColdOwner | undefined {
+  let source: string | undefined
+  let retained = false
+  if (within(root, owner)) {
+    const name = relative(root, owner).split(sep)[0]
+    if (name !== undefined && within(join(root, name, "modules"), owner)) {
+      source = join(root, name, "manifest.json")
+      retained = true
+    }
+  } else if (within(join(common, "worktrees"), owner)) {
+    const name = relative(join(common, "worktrees"), owner).split(sep)[0]
+    if (name !== undefined) source = join(common, "worktrees", name, "gitdir")
+  }
+  if (source === undefined) return undefined
+  if (cache.has(source)) return cache.get(source)
+  cache.set(source, undefined)
+  if (lstatSync(source, { throwIfNoEntry: false })?.isFile() !== true) return undefined
+  const bytes = readFileSync(source, "utf8")
+  let absent: unknown
+  if (retained) {
+    try {
+      const manifest: unknown = JSON.parse(bytes)
+      if (typeof manifest === "object" && manifest !== null && "path" in manifest) absent = manifest.path
+    } catch {
+      // A malformed manifest proves no closed environment: this owner remains live and needs its lease.
+      return undefined
+    }
+  } else {
+    const gitdir = bytes.trim()
+    if (isAbsolute(gitdir) && basename(gitdir) === ".git") absent = dirname(gitdir)
+  }
+  const proof =
+    typeof absent === "string" && isAbsolute(absent) && lstatSync(absent, { throwIfNoEntry: false }) === undefined
+      ? { source, bytes, absent }
+      : undefined
+  cache.set(source, proof)
+  return proof
+}
+
+function coldOwnerChanged(proofs: ReadonlyMap<string, ColdOwner>): string | undefined {
+  const checked = new Set<string>()
+  for (const [owner, proof] of proofs) {
+    if (checked.has(proof.source)) continue
+    checked.add(proof.source)
+    if (
+      readFileSync(proof.source, "utf8") !== proof.bytes ||
+      lstatSync(proof.absent, { throwIfNoEntry: false }) !== undefined
+    ) {
+      return `cold owner ${owner} changed: ${proof.source} or absent worktree ${proof.absent}`
+    }
+  }
+  return undefined
+}
+
+/** An unleased live owner's whole alternates-connected component remains in custody. */
+function keepUnleasedConnections(
+  entries: readonly string[],
+  borrowers: readonly EstateBorrower[],
+  owners: readonly string[],
+  kept: Map<string, string>,
+): void {
+  const graph = new Map<string, string[]>()
+  for (const edge of borrowers) {
+    graph.set(edge.borrower, [...(graph.get(edge.borrower) ?? []), edge.target])
+    graph.set(edge.target, [...(graph.get(edge.target) ?? []), edge.borrower])
+  }
+  const reached = new Set<string>()
+  for (const owner of owners) {
+    const queue = [join(owner, "objects")]
+    for (let i = 0; i < queue.length; i++) {
+      const path = queue[i] as string
+      if (reached.has(path)) continue
+      reached.add(path)
+      const entry = entries.find((entry) => within(entry, path))
+      if (entry !== undefined && !kept.has(entry)) {
+        kept.set(entry, `live owner ${owner} has no existing writer lease; alternates-connected store kept`)
+      }
+      queue.push(...(graph.get(path) ?? []))
+    }
+  }
 }
 
 /** This entry's view of the shared scan: only survivors that borrow into THIS entry block it. */
@@ -163,11 +265,11 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
     alternatesFiles: scan.alternatesFiles,
     excluded: scan.danglingAlternates.length,
   }
-  let ownerSummary: RetentionBatchResult["owners"]
+  const ownerSummary: { current?: RetentionBatchResult["owners"] } = {}
   const result = (windows: BatchWindow[], stopped?: string): RetentionBatchResult => ({
     apply,
     scan: scanSummary,
-    ...(ownerSummary === undefined ? {} : { owners: ownerSummary }),
+    ...(ownerSummary.current === undefined ? {} : { owners: ownerSummary.current }),
     windows,
     rows: entries.map(
       (entry) => rows.get(entry) ?? { entry, outcome: "not-reached", reason: stopped ?? "not evaluated" },
@@ -190,7 +292,6 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
   }
   closeOverKeptBorrowers(entries, scan.borrowers, kept)
   for (const [entry, reason] of kept) rows.set(entry, { entry, outcome: "kept", reason })
-  const candidates = entries.filter((entry) => !kept.has(entry))
 
   // Every Git owner of a reached object directory outside the batch, plus registry holders: their EXISTING writer
   // leases are held for the whole window, as the single-entry retire holds them, so no lender moves mid-delete. A
@@ -212,12 +313,21 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
   }
   for (const registry of scan.registries) owners.add(dirname(registry))
   const ownerList = [...owners].sort()
-  const leaseMissing = ownerList.filter(
+  const cold = new Map<string, ColdOwner>()
+  const coldCache = new Map<string, ColdOwner | undefined>()
+  for (const owner of ownerList) {
+    const proof = coldOwner(owner, root, common, coldCache)
+    if (proof !== undefined) cold.set(owner, proof)
+  }
+  const liveOwners = ownerList.filter((owner) => !cold.has(owner))
+  const leaseMissing = liveOwners.filter(
     (owner) => lstatSync(join(owner, "yrd-worktree-mutations", "writer.lock"), { throwIfNoEntry: false }) === undefined,
   )
-  ownerSummary = {
+  ownerSummary.current = {
     total: ownerList.length,
     leaseMissing: leaseMissing.length,
+    cold: cold.size,
+    liveUnleased: leaseMissing.length,
     unproved: unproved.length,
     ...(leaseMissing[0] === undefined ? {} : { leaseMissingExample: leaseMissing[0] }),
     ...(unproved[0] === undefined ? {} : { unprovedExample: unproved[0] }),
@@ -225,9 +335,14 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
   const ownerStop =
     unproved.length > 0
       ? `identity-unknown: ${unproved.length} object director(ies) have no proved Git owner, e.g. ${unproved[0]}`
-      : leaseMissing.length > 0
-        ? `lease-missing: ${leaseMissing.length} of ${ownerList.length} owner(s) have no existing writer lease, e.g. ${leaseMissing[0]}; retirement never creates one`
+      : leaseMissing.includes(common)
+        ? `lease-missing: common owner ${common} has no existing writer lease`
         : undefined
+  keepUnleasedConnections(entries, scan.borrowers, leaseMissing, kept)
+  closeOverKeptBorrowers(entries, scan.borrowers, kept)
+  for (const [entry, reason] of kept) rows.set(entry, { entry, outcome: "kept", reason })
+  const candidates = entries.filter((entry) => !kept.has(entry))
+  const leasedOwners = liveOwners.filter((owner) => !leaseMissing.includes(owner))
 
   if (!apply) {
     for (const entry of candidates) {
@@ -260,7 +375,9 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
       createParent: false,
       noFollow: true,
     })
-    if (commonLease === null) return result(windows, `lease-held: common lease ${commonPath} is held; nothing more deleted`)
+    if (commonLease === null) {
+      return result(windows, `lease-held: common lease ${commonPath} is held; nothing more deleted`)
+    }
     const heldFrom = monotonic()
     const ownerLeases: ReturnType<typeof acquireRemovalWriterLeases>[] = []
     const windowEntries: string[] = []
@@ -268,11 +385,22 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
     let deltaMs = 0
     let stopped: string | undefined
     try {
+      // Acquire outside owners BEFORE checking the delta; otherwise a leased writer could change an alternate
+      // after that check and before its lease is acquired. Hold the first entry's leases through its deletion too.
+      const first = candidates[next] as string
+      ownerLeases.push(
+        acquireRemovalWriterLeases(first, undefined, {
+          existingOnly: true,
+          additionalGitDirs: leasedOwners,
+          skip: [commonPath],
+        }),
+      )
       const delta = estateDelta(record, scan)
+      const coldChanged = coldOwnerChanged(cold)
       deltaMs = Math.round(monotonic() - heldFrom)
-      if (delta.status === "changed") {
+      if (delta.status === "changed" || coldChanged !== undefined) {
         deltaStatus = "changed"
-        stopped = `census-shifted: ${delta.detail}; the batch deleted nothing more`
+        stopped = `census-shifted: ${coldChanged ?? (delta.status === "changed" ? delta.detail : "cold owner changed")}; the batch deleted nothing more`
       } else {
         // Each entry costs about what the last one did; stop before the hold would pass the budget.
         let lastEntryMs = 0
@@ -283,13 +411,20 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
           windowEntries.push(entry)
           // The window's first entry also carries every outside owner's lease, once: flock is per open file, so a
           // second acquisition of the same lease in this process would refuse itself.
-          ownerLeases.push(
-            acquireRemovalWriterLeases(entry, undefined, {
-              existingOnly: true,
-              additionalGitDirs: windowEntries.length === 1 ? ownerList : [],
-              skip: [commonPath],
-            }),
-          )
+          if (windowEntries.length > 1) {
+            ownerLeases.push(
+              acquireRemovalWriterLeases(entry, undefined, {
+                existingOnly: true,
+                skip: [commonPath],
+              }),
+            )
+          }
+          const changedCold = coldOwnerChanged(cold)
+          if (changedCold !== undefined) {
+            stopped = `census-shifted: ${changedCold}; the batch deleted nothing more`
+            rows.set(entry, { entry, outcome: "kept", reason: stopped })
+            break
+          }
           const pre = preliminary.get(entry) as RetentionVerifyResult
           const held = await inspectRetainedEntryInBatch(verifyOptions(entry, "held"), entryView(scan, entry), entries)
           const before = proofFacts(pre)
@@ -308,6 +443,12 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
             })
           } else {
             try {
+              const changedCold = coldOwnerChanged(cold)
+              if (changedCold !== undefined) {
+                stopped = `census-shifted: ${changedCold}; the batch deleted nothing more`
+                rows.set(entry, { entry, outcome: "kept", reason: stopped })
+                break
+              }
               rmSync(entry, { recursive: true, force: false })
               if (lstatSync(entry, { throwIfNoEntry: false }) !== undefined) {
                 throw new Error(`entry ${entry} is still present after deletion`)
@@ -331,7 +472,12 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
           }
           lastEntryMs = monotonic() - entryStarted
         }
+        if (windowEntries.length === 0) {
+          stopped = `lease budget ${budget}ms exhausted by the delta; nothing more deleted`
+        }
       }
+    } catch (error) {
+      stopped = `retirement stopped: ${error instanceof Error ? error.message : String(error)}; nothing more deleted`
     } finally {
       for (const lease of ownerLeases.reverse()) lease.release()
       commonLease.release()

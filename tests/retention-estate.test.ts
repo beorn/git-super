@@ -132,7 +132,9 @@ describe("retention estate scan — gate 3 (#27443(b))", () => {
     borrow(borrower, "../../gone/objects")
     const scan = scanEstate([namespace], [])
     expect(scan.status).toBe("pass")
-    expect(scan.danglingAlternates).toMatchObject([{ line: "../../gone/objects", target: join(namespace, "gone", "objects") }])
+    expect(scan.danglingAlternates).toMatchObject([
+      { line: "../../gone/objects", target: join(namespace, "gone", "objects") },
+    ])
   })
 
   test("exclusion is per line: a store's other lines still count as loans, so its lender stays refused", () => {

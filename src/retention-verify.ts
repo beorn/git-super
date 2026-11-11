@@ -427,11 +427,7 @@ async function evaluateRetainedEntry(
     try {
       proof = parseManifest(evidence(manifestPath), manifestPath)
     } catch (error) {
-      if (
-        !(error instanceof ManifestShapeError) ||
-        error.kind !== "absent" ||
-        (!auditContext && audits.length === 0)
-      ) {
+      if (!(error instanceof ManifestShapeError) || error.kind !== "absent" || (!auditContext && audits.length === 0)) {
         throw error
       }
       const mapped = rebuildRetainedCopyProof(entryReal, rootReal)

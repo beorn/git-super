@@ -67,7 +67,10 @@ function registryDigest(dir: string): string {
   for (const name of readdirSync(dir)
     .filter((entry) => entry.endsWith(".json"))
     .sort()) {
-    hash.update(`${name}\0`).update(readFileSync(join(dir, name))).update("\0")
+    hash
+      .update(`${name}\0`)
+      .update(readFileSync(join(dir, name)))
+      .update("\0")
   }
   return hash.digest("hex")
 }
@@ -423,7 +426,7 @@ export type EstateDelta =
 function storeUnder(root: string): string | undefined {
   const stack = [root]
   while (stack.length > 0) {
-    const current = stack.pop()!
+    const current = stack.pop() as string
     for (const entry of readdirSync(current, { withFileTypes: true })) {
       const path = join(current, entry.name)
       if (entry.isSymbolicLink()) {

@@ -86,6 +86,9 @@ beforeEach(() => {
   cpSync(pristine, root, { recursive: true })
   rmSync(join(fixtureRoot, "artifacts"), { recursive: true, force: true })
   rmSync(join(fixtureRoot, "hand-clone"), { recursive: true, force: true })
+  rmSync(join(fixtureRoot, "unrelated"), { recursive: true, force: true })
+  rmSync(join(common, "worktrees", "cold-owner"), { recursive: true, force: true })
+  rmSync(join(fixtureRoot, "revived-owner"), { recursive: true, force: true })
 })
 
 function options(extra: Partial<RetentionBatchOptions> = {}): RetentionBatchOptions {
@@ -145,22 +148,115 @@ describe("retention retirement batch (#33010)", () => {
     expect(result.windows).toEqual([expect.objectContaining({ entries: [], delta: "changed" })])
   })
 
-  it("an owner with no existing writer lease stops the batch before any lease is taken", async () => {
+  // @cto 76cc52e6: a live owner with no lease keeps only the stores alternates-connected to it, named; the batch
+  // itself is not stopped and unconnected candidates still retire.
+  it("a live owner with no lease keeps its alternates-connected entries, named, and retires the rest", async () => {
     const lock = join(common, "modules", "vendor", "dep", "yrd-worktree-mutations", "writer.lock")
-    const kept = `${lock}.moved`
-    cpSync(lock, kept)
+    const keptAside = `${lock}.moved`
+    cpSync(lock, keptAside)
     rmSync(lock)
     try {
       const dry = await retireRetainedBatch(options())
-      expect(dry.owners?.leaseMissing).toBe(1)
-      expect(dry.stopped).toContain("lease-missing")
-      expect(dry.rows.every((row) => row.reason.includes("apply would stop first: lease-missing"))).toBe(true)
+      expect(dry.owners?.liveUnleased).toBe(1)
+      expect(dry.stopped).toBeUndefined()
+      expect(dry.rows.every((row) => row.outcome === "kept" && row.reason.includes("no existing writer lease"))).toBe(
+        true,
+      )
+      expect(dry.rows.every((row) => row.reason.includes(join(common, "modules", "vendor", "dep")))).toBe(true)
       const applied = await retireRetainedBatch(options({ apply: true }))
+      expect(applied.stopped).toBeUndefined()
       expect(applied.rows.map((row) => row.outcome)).toEqual(["kept", "kept", "kept"])
       expect(readdirSync(root)).toHaveLength(3)
     } finally {
-      cpSync(kept, lock)
-      rmSync(kept)
+      cpSync(keptAside, lock)
+      rmSync(keptAside)
+    }
+  })
+
+  // @cto 76cc52e6: an owner inside a retained store whose env is closed (its manifest path is gone) cannot write,
+  // so it needs no lease; the delta covers it. The third store stays out of the batch, so its module gitdirs are
+  // outside owners with no writer.lock (the fixture only creates leases outside the root).
+  it("owners inside a retained store of a closed env need no lease", async () => {
+    const names = readdirSync(root).sort()
+    const entries = names.slice(0, 2).map((name) => join(root, name))
+    const result = await retireRetainedBatch({ ...options({ apply: true }), entries })
+    expect(result.stopped).toBeUndefined()
+    expect(result.owners?.cold).toBeGreaterThan(0)
+    expect(result.owners?.liveUnleased).toBe(0)
+    expect(result.rows.map((row) => row.outcome)).toEqual(["retired", "retired"])
+    expect(readdirSync(root)).toEqual(names.slice(2))
+  })
+
+  it("a retained-store owner whose env path exists again is live, not cold", async () => {
+    const names = readdirSync(root).sort()
+    const entries = names.slice(0, 2).map((name) => join(root, name))
+    const manifest = JSON.parse(readFileSync(join(root, names[2] as string, "manifest.json"), "utf8")) as {
+      path: string
+    }
+    rmSync(join(root, names[2] as string, "modules", "vendor", "dep", "yrd-worktree-mutations", "writer.lock"))
+    mkdirSync(manifest.path, { recursive: true })
+    try {
+      const result = await retireRetainedBatch({ ...options(), entries })
+      expect(result.owners?.liveUnleased).toBeGreaterThan(0)
+    } finally {
+      rmSync(manifest.path, { recursive: true, force: true })
+    }
+  })
+
+  it("an unrelated live owner with no lease does not stop retirement", async () => {
+    const unrelated = join(fixtureRoot, "unrelated")
+    mkdirSync(unrelated)
+    git(unrelated, ["init", "-q"])
+    git(unrelated, [
+      "-c",
+      "user.name=fixture",
+      "-c",
+      "user.email=fixture@example.invalid",
+      "commit",
+      "--allow-empty",
+      "-q",
+      "-m",
+      "unrelated",
+    ])
+    const result = await retireRetainedBatch(options({ apply: true }))
+    expect(result.owners?.liveUnleased).toBe(1)
+    expect(result.stopped).toBeUndefined()
+    expect(
+      result.rows.map((row) => row.outcome),
+      JSON.stringify(result.rows),
+    ).toEqual(["retired", "retired", "retired"])
+  })
+
+  // Accepted requirement: a linked-worktree owner is cold only while its recorded worktree is absent; the
+  // ordinary estate delta cannot see a re-created empty worktree (no objects), so this needs its own regression.
+  it.each([false, true])("rechecks an absent linked worktree before deletion (revived=%s)", async (revived) => {
+    const owner = join(common, "worktrees", "cold-owner")
+    mkdirSync(owner, { recursive: true })
+    git(owner, ["init", "--bare", "-q"])
+    git(owner, ["fetch", "-q", join(fixtureRoot, "dependency"), "main:refs/heads/main"])
+    git(owner, ["symbolic-ref", "HEAD", "refs/heads/main"])
+    const worktree = join(fixtureRoot, "revived-owner")
+    writeFileSync(join(owner, "gitdir"), `${join(worktree, ".git")}\n`)
+    const result = await retireRetainedBatch(
+      options({
+        apply: true,
+        afterScan: () => {
+          if (revived) mkdirSync(worktree)
+        },
+      }),
+    )
+    expect(result.owners?.cold).toBeGreaterThan(0)
+    expect(result.owners?.liveUnleased).toBe(0)
+    if (revived) {
+      expect(result.stopped, JSON.stringify(result.rows)).toContain("cold owner")
+      expect(result.rows.every((row) => row.outcome === "kept")).toBe(true)
+      expect(readdirSync(root)).toHaveLength(3)
+    } else {
+      expect(result.stopped).toBeUndefined()
+      expect(
+        result.rows.map((row) => row.outcome),
+        JSON.stringify(result.rows),
+      ).toEqual(["retired", "retired", "retired"])
     }
   })
 
