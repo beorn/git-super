@@ -4,7 +4,7 @@
  * @consumer WIP sweep retiring landed vendor component worktrees; yrd env close delegates to this verb
  * @testonly none
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs"
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { describe, expect, it } from "vitest"
@@ -420,6 +420,129 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
       await rm(root, { recursive: true, force: true })
     }
   })
+
+  /**
+   * @failure Retention verification holds the root writer or a changed prepared copy authorizes deletion.
+   * @level l1 @consumer automatic retained environment removal (31301)
+   * The custody-gap table pauses witness proof, before the distinct retention normalization stage.
+   */
+  it.each(["unchanged", "source-changed", "copy-changed", "failed-preparation"] as const)(
+    "prepares retention without the root writer and validates its exact child: %s",
+    async (mode) => {
+      const root = await mkdtemp(join(canonicalTmpdir(), "git-super-retention-unlocked-"))
+      const entered = Promise.withResolvers<void>()
+      const resume = Promise.withResolvers<void>()
+      let removal: ReturnType<ReturnType<typeof createGitWorktreeStore>["remove"]> | undefined
+      let contender: ReturnType<typeof tryAcquireFlock> | undefined
+      try {
+        const fixture = createProductFixture(root)
+        const product = fixture.product
+        const target = join(root, "target")
+        const retainedRoot = join(root, "retained")
+        const unrelatedEntry = join(retainedRoot, "other-keeper")
+        mkdirSync(unrelatedEntry, { recursive: true })
+        writeFileSync(join(unrelatedEntry, "keep.txt"), "another invocation's custody\n")
+        git(product, "worktree", "add", "--detach", target)
+        git(target, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
+        const sourceGitDir = git(target, "rev-parse", "--absolute-git-dir")
+        const sourceStore = git(join(target, "packages/alpha"), "rev-parse", "--absolute-git-dir")
+        const witnessDir = git(
+          join(product, "packages/alpha"),
+          "rev-parse",
+          "--path-format=absolute",
+          "--git-common-dir",
+        )
+        const common = git(product, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        const local = createLocalGitProcess()
+        let paused = false
+        let copiedStore = ""
+        let changedPreparedCopy = false
+        let reports = 0
+        const store = createGitWorktreeStore({
+          repo: product,
+          gitProcess: {
+            ...local,
+            async run(request) {
+              const gitDirAt = request.args.indexOf("--git-dir")
+              const candidate = gitDirAt < 0 ? undefined : request.args[gitDirAt + 1]
+              if (!paused && request.args.includes("fsck") && candidate?.startsWith(`${retainedRoot}/`)) {
+                paused = true
+                copiedStore = candidate
+                entered.resolve()
+                await resume.promise
+                if (mode === "failed-preparation") throw new Error("fixture retention preparation failed")
+              }
+              // The first post-preparation census runs after preparation fixed its expected digests.
+              if (
+                mode === "copy-changed" &&
+                copiedStore !== "" &&
+                !changedPreparedCopy &&
+                request.args.includes("check-ref-format")
+              ) {
+                writeFileSync(join(copiedStore, "description"), "changed prepared metadata\n")
+                changedPreparedCopy = true
+              }
+              return local.run(request)
+            },
+          },
+        })
+        removal = store.remove(target, {
+          retention: { root: retainedRoot, report: () => reports++ },
+          componentCustody: { primaryRoot: product, targetBranch: "main" },
+        })
+        await Promise.race([
+          entered.promise,
+          removal.then((outcome) => {
+            throw new Error(`removal ended before retention barrier: ${JSON.stringify(outcome)}`)
+          }),
+        ])
+        contender = tryAcquireFlock(join(common, "yrd-worktree-mutations", "writer.lock"))
+        expect(contender, "root writer must be available during retention verification").not.toBeNull()
+        for (const owner of [sourceGitDir, sourceStore, witnessDir]) {
+          const competingOwner = tryAcquireFlock(join(owner, "yrd-worktree-mutations", "writer.lock"))
+          competingOwner?.release()
+          expect(competingOwner, `source/witness owner remains held: ${owner}`).toBeNull()
+        }
+        if (mode === "source-changed") writeFileSync(join(sourceStore, "description"), "changed source metadata\n")
+        contender?.release()
+        contender = undefined
+        resume.resolve()
+        const outcome = await removal.then(
+          (value) => ({ value, error: undefined }),
+          (error: unknown) => ({ value: undefined, error }),
+        )
+        expect(readFileSync(join(unrelatedEntry, "keep.txt"), "utf8")).toBe("another invocation's custody\n")
+        if (mode === "unchanged") {
+          expect(outcome.error).toBeUndefined()
+          expect(outcome.value ?? {}).not.toHaveProperty("custodyRefusal")
+          expect(existsSync(target)).toBe(false)
+          expect(reports).toBe(1)
+          const ownEntry = readdirSync(retainedRoot).find((name) => name !== "other-keeper")
+          expect(ownEntry).toBeTruthy()
+          expect(existsSync(join(retainedRoot, ownEntry!, "manifest.json"))).toBe(true)
+          expect(existsSync(join(retainedRoot, ownEntry!, "preparation.json"))).toBe(false)
+        } else {
+          expect(existsSync(target)).toBe(true)
+          expect((await store.inspect(target)).registered).toBe(true)
+          expect(reports).toBe(0)
+          expect(readdirSync(retainedRoot)).toEqual(["other-keeper"])
+          expect(outcome.error !== undefined || outcome.value?.custodyRefusal !== undefined).toBe(true)
+        }
+        if (mode === "copy-changed") expect(changedPreparedCopy).toBe(true)
+        if (mode !== "unchanged") {
+          const released = tryAcquireFlock(join(sourceGitDir, "yrd-worktree-mutations", "writer.lock"))
+          released?.release()
+          expect(released).not.toBeNull()
+        }
+      } finally {
+        contender?.release()
+        resume.resolve()
+        await removal?.catch(() => undefined)
+        // raw-delete-allow: this test owns the isolated mkdtemp fixture, never an authored checkout
+        await rm(root, { recursive: true, force: true })
+      }
+    },
+  )
 
   it("removes a root-only worktree while preserving uncustodied root commits", async () => {
     const root = await mkdtemp(join(canonicalTmpdir(), "git-super-root-only-custody-"))
