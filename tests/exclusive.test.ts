@@ -198,6 +198,7 @@ describe("exclusive writer policy", () => {
         expect(message.indexOf("live holder:")).toBeLessThan(message.indexOf("recorded note"))
       } finally {
         lock.release()
+        // raw-delete-allow: teardown of this test's own mkdtemp fixture under tmpdir, as the file's other cases do.
         await rm(dir, { recursive: true, force: true })
       }
     },
