@@ -26,6 +26,7 @@ import {
   assertExcludedRemovalCustody,
   inspectRemovalStatusWithGit,
   prepareRemovalBorrowers,
+  prepareWorktreeModulesRetention,
   rehomeBorrowers,
   retainWorktreeModules,
   type ComponentCustodyProof,
@@ -1743,6 +1744,8 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
           throw error
         }
         const resolvedPath = resolve(path)
+        let preparedRetention: Awaited<ReturnType<typeof prepareWorktreeModulesRetention>> | undefined
+        let retainedPreparationMs = 0
         try {
           if (removeOptions.componentCustody !== undefined && adapters !== undefined && initialCensus !== undefined) {
             let sidecarDir: string | undefined
@@ -1912,6 +1915,28 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
                     }
                   }
                 }
+                if (custodyRefusal === undefined && removeOptions.retention !== undefined) {
+                  const preparationStarted = Date.now()
+                  preparedRetention = await prepareWorktreeModulesRetention(
+                    git,
+                    repo,
+                    path,
+                    removeOptions.retention,
+                    (repository, target) => inspectWorktree(git, repository, target),
+                    writerLeases.proof,
+                    writerLeases.created,
+                    removeOptions.noRehome === true ? () => [] : rehome.run,
+                    removeOptions.excludedSubmodules,
+                    notCompared,
+                    undefined,
+                    undefined,
+                    undefined,
+                    removeOptions.preserved,
+                    undefined,
+                    componentCustodyProof,
+                  )
+                  retainedPreparationMs = Date.now() - preparationStarted
+                }
                 markPhase("unlockedProof", proofStarted)
                 let postFreshness: ComputedCustodyFreshness | undefined
                 if (custodyRefusal?.status !== "unknown") {
@@ -2053,25 +2078,29 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
           }
           if (removeOptions.retention !== undefined) {
             const retainedCopyStarted = Date.now()
-            removalProof = await retainWorktreeModules(
-              git,
-              repo,
-              path,
-              removeOptions.retention,
-              (repository, target) => inspectWorktree(git, repository, target),
-              writerLeases.proof,
-              writerLeases.created,
-              removeOptions.noRehome === true ? () => [] : rehome.run,
-              removeOptions.excludedSubmodules,
-              notCompared,
-              undefined,
-              undefined,
-              undefined,
-              removeOptions.preserved,
-              undefined,
-              componentCustodyProof,
-            )
+            if (preparedRetention !== undefined) removalProof = await preparedRetention.complete()
+            else {
+              removalProof = await retainWorktreeModules(
+                git,
+                repo,
+                path,
+                removeOptions.retention,
+                (repository, target) => inspectWorktree(git, repository, target),
+                writerLeases.proof,
+                writerLeases.created,
+                removeOptions.noRehome === true ? () => [] : rehome.run,
+                removeOptions.excludedSubmodules,
+                notCompared,
+                undefined,
+                undefined,
+                undefined,
+                removeOptions.preserved,
+                undefined,
+                componentCustodyProof,
+              )
+            }
             markPhase("retainedCopy", retainedCopyStarted)
+            phases.retainedCopy = phases.retainedCopy! + retainedPreparationMs
           } else {
             if (removeOptions.unlock === true) await unlockWorktree(git, repo, path)
             if (removeOptions.noRehome !== true) rehome.run()
@@ -2168,7 +2197,11 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
           }
           throw writerLeases.refusal(error)
         } finally {
-          writerLeases.release()
+          try {
+            preparedRetention?.discard()
+          } finally {
+            writerLeases.release()
+          }
         }
       }
       try {

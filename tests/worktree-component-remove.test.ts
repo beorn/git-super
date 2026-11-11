@@ -496,6 +496,17 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
             throw new Error(`removal ended before retention barrier: ${JSON.stringify(outcome)}`)
           }),
         ])
+        const preparingChild = readdirSync(retainedRoot).find((name) => name !== "other-keeper")
+        expect(preparingChild).toBeTruthy()
+        const preparingPath = join(retainedRoot, preparingChild!)
+        const marker = JSON.parse(readFileSync(join(preparingPath, "preparation.json"), "utf8")) as Record<
+          string,
+          unknown
+        >
+        expect(marker).toMatchObject({ version: 1, state: "preparing", sourceGitDir })
+        expect(typeof marker.createdAt === "string" && Number.isFinite(Date.parse(marker.createdAt))).toBe(true)
+        expect(existsSync(join(preparingPath, "manifest.json"))).toBe(false)
+        expect(reports).toBe(0)
         contender = tryAcquireFlock(join(common, "yrd-worktree-mutations", "writer.lock"))
         expect(contender, "root writer must be available during retention verification").not.toBeNull()
         for (const owner of [sourceGitDir, sourceStore, witnessDir]) {
@@ -526,7 +537,9 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
           expect((await store.inspect(target)).registered).toBe(true)
           expect(reports).toBe(0)
           expect(readdirSync(retainedRoot)).toEqual(["other-keeper"])
-          expect(outcome.error !== undefined || outcome.value?.custodyRefusal !== undefined).toBe(true)
+          expect(
+            outcome.error !== undefined || (outcome.value !== undefined && "custodyRefusal" in outcome.value),
+          ).toBe(true)
         }
         if (mode === "copy-changed") expect(changedPreparedCopy).toBe(true)
         if (mode !== "unchanged") {
