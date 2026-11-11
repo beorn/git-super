@@ -278,6 +278,10 @@ Verify and retire exclude a dangling alternates line (its resolved path does not
 
 JSON is the existing `GitSuperResult`: proof paths are in `detail.paths`, with the held certificate in `detail.evidence`. A kept row names `legacy-unrecorded`, `incomplete`, `unexpired`, `borrower`, `identity-unknown`, `custody-unknown`, `lease-missing`, `lease-held`, or `census-shifted`. Exit 0 means retired; 1 means kept; 2 means failure or uncertain/partial state. A failure after deletion reports the entry's actual state and any failed pointer path with `partial:true`; no deletion retry or rollback is attempted.
 
+`git super worktree retention retire-batch <entries...> --root <retained-root> --common <git-common-dir> --namespace <managed-root> --artifact-dir <external-evidence-dir>` shares one estate scan across the exact selected entries. Repeat `--namespace` for the complete managed estate. It defaults to a dry run; `--apply` enables deletion after lease-held revalidation. The batch scan alone allows 300,000 alternates files and 15 minutes. Other entry gates retain their existing bounds.
+
+JSON reports `apply`, scan timing and exclusions, owner counts, lease windows and each entry's outcome and reason. Human output names each entry and measured lease holds. An inactive owner needs an observed absent worktree path from its retained manifest or linked-worktree gitdir, rechecked before deletion. A live owner without an existing lease keeps its alternates-connected entries. A changed estate ends the batch and reports deletions already completed; it never retries them. Exit 0 means the complete report is available, including kept entries; 2 means the batch stopped or a deletion failed. Missing roots, namespaces or evidence directories are reported by name, never treated as empty results.
+
 ## gitlink write
 
 ```bash

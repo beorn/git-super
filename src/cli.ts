@@ -14,6 +14,7 @@ import {
   type PrivateStoreVerifyNode,
   type PrivateStoreVerifyParams,
   type RetentionCompactParams,
+  type RetentionBatchParams,
   type RetentionVerifyParams,
   type RetentionRetireParams,
   type StatusParams,
@@ -27,6 +28,7 @@ import type { SuperMergeResult } from "./merge.ts"
 import type { GitSuperResult } from "./result.ts"
 import type { RetentionVerifyResult } from "./retention-verify.ts"
 import type { CompactRetainedRootReport } from "./retention-compact.ts"
+import type { RetentionBatchResult } from "./retention-batch.ts"
 import type { PrivateStoreCandidateResult } from "./private-store-candidate.ts"
 import type { SuperStatusResult } from "./status.ts"
 import type { SuperSubmodulePrepareResult } from "./submodule-prepare.ts"
@@ -50,6 +52,12 @@ export type OutputSink = ProcessOutputSink &
 
 type CapturedInvocation =
   | CapturedEnrollment
+  | Readonly<{
+      node: (typeof commands.worktree.retention)["retire-batch"]
+      params: RetentionBatchParams
+      json: boolean
+      nul: boolean
+    }>
   | Readonly<{
       node: typeof commands.worktree.retention.retire | typeof commands.worktree.retention.audit
       params: RetentionRetireParams
@@ -130,6 +138,7 @@ async function commandResult(
   | RetentionVerifyResult
   | RetentionEnrollReport
   | CompactRetainedRootReport
+  | RetentionBatchResult
   | PrivateStoreCandidateResult
   | GitSuperResult
 > {
@@ -145,6 +154,7 @@ async function commandResult(
       | SuperSubmodulePrepareResult
       | RetentionVerifyResult
       | RetentionEnrollReport
+      | RetentionBatchResult
       | PrivateStoreCandidateResult
       | GitSuperResult
     >,
@@ -763,8 +773,8 @@ async function runInvocation(
       const subcommand = command.args[0]
       usage =
         (subcommand === undefined
-          ? "git-super: worktree retention needs verify, audit, compact, enroll, or retire\n"
-          : `git-super: unknown worktree retention subcommand '${subcommand}'; choose verify, audit, compact, enroll, or retire\n`) +
+          ? "git-super: worktree retention needs verify, audit, compact, enroll, retire, or retire-batch\n"
+          : `git-super: unknown worktree retention subcommand '${subcommand}'; choose verify, audit, compact, enroll, retire, or retire-batch\n`) +
         command.helpInformation()
     })
   retention
@@ -841,6 +851,46 @@ async function runInvocation(
         }
       })
   }
+
+  retention
+    .command("retire-batch")
+    .description(
+      "Dry-run selected retained entries on one estate scan; --apply re-verifies under held leases and deletes",
+    )
+    .requiredOption("--root <directory>", "declared retention root whose direct children are selected")
+    .requiredOption("--common <directory>", "owning Git common directory")
+    .requiredOption("--artifact-dir <directory>", "external caller-owned directory for per-entry evidence")
+    .option(
+      "--namespace <path>",
+      "complete estate namespace; repeat for each managed root",
+      (value: string, previous: string[]) => [...previous, value],
+      [],
+    )
+    .option("--apply", "delete only entries passing preliminary and lease-held proofs; omitted means dry run")
+    .argument("<entries...>", "exact retained entries selected by the caller")
+    .action((entries: string[], _options, command) => {
+      const globals = command.optsWithGlobals() as { json?: boolean }
+      const options = command.opts() as {
+        root: string
+        common: string
+        artifactDir: string
+        namespace: string[]
+        apply?: boolean
+      }
+      captured = {
+        node: commands.worktree.retention["retire-batch"],
+        params: {
+          entries,
+          root: options.root,
+          common: options.common,
+          artifactDir: options.artifactDir,
+          namespaceRoots: options.namespace,
+          ...(options.apply === true ? { apply: true } : {}),
+        },
+        json: globals.json === true,
+        nul: false,
+      }
+    })
 
   retention
     .command("enroll")
@@ -1049,6 +1099,7 @@ async function runInvocation(
     | RetentionVerifyResult
     | RetentionEnrollReport
     | CompactRetainedRootReport
+    | RetentionBatchResult
     | PrivateStoreCandidateResult
     | GitSuperResult
   try {
@@ -1155,6 +1206,10 @@ async function runInvocation(
       )
     }
     return operation.state === "updated" || operation.state === "unchanged" ? 0 : 2
+  }
+  if (captured.node === commands.worktree.retention["retire-batch"]) {
+    const batch = result as RetentionBatchResult
+    return batch.stopped === undefined && !batch.rows.some((row) => row.outcome === "failed") ? 0 : 2
   }
   if (captured.node === commands.worktree.retention.retire) {
     const operation = result as GitSuperResult
@@ -1310,6 +1365,18 @@ async function writeResult(
     for (const row of operation.repositories) {
       if (row.detail?.code === "audit-stale") stdout.write(`${row.detail.message}\n`)
     }
+  } else if (captured.node === nodes.worktree.retention["retire-batch"]) {
+    const batch = result as RetentionBatchResult
+    stdout.write(
+      `${batch.apply ? "apply" : "dry-run"} retained batch: ${batch.rows.length} selected entries; scan ${batch.scan.status} ${batch.scan.ms}ms\n`,
+    )
+    for (const row of batch.rows) stdout.write(`${row.outcome} ${row.entry}: ${row.reason}\n`)
+    for (const window of batch.windows) {
+      stdout.write(
+        `lease hold ${window.holdMs}ms; delta ${window.delta} ${window.deltaMs}ms; entries ${window.entries.length}\n`,
+      )
+    }
+    if (batch.stopped !== undefined) stderr.write(`${batch.stopped}\n`)
   } else if (captured.node === nodes.worktree.retention.enroll) {
     const report = result as RetentionEnrollReport
     stdout.write(`${report.apply ? "apply" : "dry-run"} enroll ${report.root} common ${report.common}\n`)

@@ -109,6 +109,80 @@ function options(extra: Partial<RetentionBatchOptions> = {}): RetentionBatchOpti
 }
 
 describe("retention retirement batch (#33010)", () => {
+  // Accepted requirement: the production CLI defaults to dry run and requires a complete estate declaration.
+  // Direct batch tests cannot prove Commander reaches the batch or that its flags are preserved.
+  it("CLI defaults to dry run and names every selected entry without deleting it", async () => {
+    let output = ""
+    let errors = ""
+    const entries = readdirSync(root)
+      .sort()
+      .map((name) => join(root, name))
+    const code = await runCli(
+      [
+        "--repo",
+        dirname(common),
+        "--json",
+        "worktree",
+        "retention",
+        "retire-batch",
+        "--root",
+        root,
+        "--common",
+        common,
+        "--namespace",
+        fixtureRoot,
+        "--artifact-dir",
+        join(fixtureRoot, "artifacts"),
+        ...entries,
+      ],
+      {
+        write: (value) => {
+          output += value
+        },
+      },
+      {
+        write: (value) => {
+          errors += value
+        },
+      },
+    )
+    expect(code, errors).toBe(0)
+    const report = JSON.parse(output) as { apply: boolean; rows: { entry: string; outcome: string }[] }
+    expect(report.apply).toBe(false)
+    expect(report.rows.map((row) => row.entry)).toEqual(entries)
+    expect(report.rows.every((row) => row.outcome !== "retired")).toBe(true)
+    expect(readdirSync(root)).toHaveLength(3)
+  })
+
+  it("CLI names the missing estate namespace and exits nonzero", async () => {
+    let errors = ""
+    const entry = join(root, readdirSync(root)[0] as string)
+    const code = await runCli(
+      [
+        "--repo",
+        dirname(common),
+        "worktree",
+        "retention",
+        "retire-batch",
+        "--root",
+        root,
+        "--common",
+        common,
+        "--artifact-dir",
+        join(fixtureRoot, "artifacts"),
+        entry,
+      ],
+      sink(),
+      {
+        write: (value) => {
+          errors += value
+        },
+      },
+    )
+    expect(code).not.toBe(0)
+    expect(errors).toContain("namespace")
+    expect(readdirSync(root)).toHaveLength(3)
+  })
   it("dry run names every candidate it would retire and deletes nothing", async () => {
     const result = await retireRetainedBatch(options())
     expect(result.apply).toBe(false)
