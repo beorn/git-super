@@ -1115,6 +1115,32 @@ describe("retention verify gates 1-6", () => {
     expect(retentionRemovalBoundary(result).reason).toContain("preliminary")
   })
 
+  // AC #33010: incomplete contents cannot be promoted to empty-risk custody. The custody
+  // suite receives completed components; only this real verifier fixture proves its caller
+  // preserves failed/partial scans before entering the new empty-risk path.
+  it.each(["timeout", "throw"])("keeps an entry when its contents scan has a %s", async (fault) => {
+    const result = await verifyRetainedEntry({
+      entry: base.entry,
+      root: base.root,
+      namespaceRoots: [fixtureRoot as string],
+      artifactDir: base.artifactDir,
+      allowTemporaryArtifactDir: true,
+      clock: eligible(),
+      gitRun: () => {
+        if (fault === "throw") throw new Error("contents scan read failed")
+        return { code: 1, stdout: "", stderr: "contents scan timed out", timedOut: true }
+      },
+    })
+    expect(result.verdict).toBe("unknown")
+    expect(result.gates.find((gate) => gate.gate === "candidate-contents")).toMatchObject({ status: "unknown" })
+    expect(result.gates.find((gate) => gate.gate === "positive-custody")).toMatchObject({
+      status: "unknown",
+      message: "not evaluated: an earlier gate ended the pass before this one ran",
+    })
+    expect(result.certificate).toBeUndefined()
+    expect(retentionRemovalBoundary(result).authorized).toBe(false)
+  })
+
   it("reports gate 2 unknown when no external pass directory was supplied", async () => {
     const result = await verifyRetainedEntry({ entry: base.entry, root: base.root, clock: eligible() })
     expect(result.verdict).toBe("unknown")

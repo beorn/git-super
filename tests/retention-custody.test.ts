@@ -80,6 +80,50 @@ async function sidecarText(scan: CustodyScan, which: "witness" | "missing"): Pro
 }
 
 describe("retention custody scan — gate 5 (#27443(b))", () => {
+  // AC #33010: a completed zero-risk input needs no witness read, but missing evidence,
+  // an exhausted deadline, absent components or any real risk must never take that path.
+  // Existing cases only cover nonempty custody and would not catch unrelated fsck work.
+  test.each([
+    { fault: "none", status: "pass", detail: "1 component(s); no at-risk objects; no witness needed" },
+    { fault: "missing sidecar", status: "unknown", detail: "ENOENT" },
+    { fault: "failed stat", status: "unknown", detail: "ENOTDIR" },
+    { fault: "expired deadline", status: "unknown", detail: "shared proof deadline is exhausted" },
+    { fault: "absent component", status: "unknown", detail: "witness proof reached" },
+    { fault: "missing root", status: "unknown", detail: "witness proof reached" },
+    { fault: "false zero", status: "unknown", detail: "witness proof reached" },
+    { fault: "mixed risk", status: "unknown", detail: "witness proof reached" },
+  ])("empty-risk custody preserves $fault evidence", async ({ fault, status, detail }) => {
+    const store = repoWithCommit("git-super-custody-zero-")
+    const sidecarDir = tmp("git-super-custody-zero-sidecars-")
+    const empty = await componentOf([], sidecarDir)
+    let component = empty
+    if (fault === "missing sidecar") {
+      component = { ...empty, atRiskSidecar: { ...empty.atRiskSidecar, path: join(sidecarDir, "absent") } }
+    } else if (fault === "failed stat") {
+      component = { ...empty, atRiskSidecar: { ...empty.atRiskSidecar, path: join(empty.atRiskSidecar.path, "child") } }
+    } else if (fault === "missing root") {
+      component = { ...empty, missingRoots: 1, missingRootsSample: [store.head] }
+    } else if (fault === "false zero") {
+      component = { ...(await componentOf([store.head], sidecarDir)), atRisk: 0 }
+    }
+    const components = fault === "absent component" ? [] : [component]
+    if (fault === "mixed risk") components.push(await componentOf([store.head], sidecarDir))
+    let witnessReads = 0
+    const scan = await scanCustody(store.root, components, [join(store.root, ".git", "objects")], [], {
+      sidecarDir,
+      ...(fault === "expired deadline" ? { clock: () => 1, deadline: 1 } : {}),
+      run: () => {
+        witnessReads += 1
+        throw new Error("witness proof reached")
+      },
+    })
+    expect(scan.status).toBe(status)
+    expect(scan.detail).toContain(detail)
+    expect(scan.witnessCount).toBe(0)
+    expect(scan.witnesses).toEqual([])
+    if (fault === "none") expect(witnessReads).toBe(0)
+  })
+
   // AC: a killed/capped/failed/warning stream outranks its malformed partial row,
   // while a complete malformed stream stays malformed. Existing fixtures only emit valid OIDs.
   test.each([
@@ -112,8 +156,9 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
   ])("drains before classifying a $fault rev-list", async ({ detail, fault: _fault, ...outcome }) => {
     const store = repoWithCommit("git-super-custody-fault-")
     const sidecarDir = tmp("git-super-custody-fault-sidecars-")
+    const component = await componentOf([store.head], sidecarDir)
     let drained = false
-    const scan = await scanCustody(store.root, [], [join(store.root, ".git", "objects")], [], {
+    const scan = await scanCustody(store.root, [component], [join(store.root, ".git", "objects")], [], {
       sidecarDir,
       stream: () => ({
         lines: (async function* () {
@@ -134,8 +179,9 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
   test("drains a backpressured malformed rev-list and reports its native read failure", async () => {
     const store = repoWithCommit("git-super-custody-backpressure-")
     const sidecarDir = tmp("git-super-custody-backpressure-sidecars-")
+    const component = await componentOf([store.head], sidecarDir)
     let highWater = 0
-    const scan = await scanCustody(store.root, [], [join(store.root, ".git", "objects")], [], {
+    const scan = await scanCustody(store.root, [component], [join(store.root, ".git", "objects")], [], {
       sidecarDir,
       stream: () =>
         gitLineStream(["--version"], {
