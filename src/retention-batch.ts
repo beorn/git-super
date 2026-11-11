@@ -129,8 +129,11 @@ function coldOwner(
     try {
       const manifest: unknown = JSON.parse(bytes)
       if (typeof manifest === "object" && manifest !== null && "path" in manifest) absent = manifest.path
-    } catch {
+    } catch (error) {
       // A malformed manifest proves no closed environment: this owner remains live and needs its lease.
+      console.warn(
+        `retention: cannot parse ${source}: ${error instanceof Error ? error.message : String(error)}; treating its owners as live, requiring their existing writer leases`,
+      )
       return undefined
     }
   } else {
