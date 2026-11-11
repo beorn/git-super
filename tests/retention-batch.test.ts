@@ -91,6 +91,7 @@ beforeEach(() => {
   rmSync(join(fixtureRoot, "unrelated"), { recursive: true, force: true })
   rmSync(join(common, "worktrees", "cold-owner"), { recursive: true, force: true })
   rmSync(join(fixtureRoot, "revived-owner"), { recursive: true, force: true })
+  rmSync(join(common, "modules", "retained-batch"), { recursive: true, force: true })
 })
 
 function options(extra: Partial<RetentionBatchOptions> = {}): RetentionBatchOptions {
@@ -108,7 +109,82 @@ function options(extra: Partial<RetentionBatchOptions> = {}): RetentionBatchOpti
   }
 }
 
+/** Seal the cross-entry loan through the real retention writer, rather than editing a certified copy. */
+async function linkedBatch(): Promise<RetentionBatchOptions> {
+  const batchRoot = join(common, "modules", "retained-batch")
+  const lenderCheckout = join(fixtureRoot, "linked-lender")
+  const checkout = join(fixtureRoot, "linked-borrower")
+  const product = dirname(common)
+  expect(await runCli(["--repo", product, "worktree", "add", lenderCheckout, "HEAD"], sink(), sink())).toBe(0)
+  expect(
+    await runCli(["--repo", product, "worktree", "remove", lenderCheckout, "--retain", batchRoot], sink(), sink()),
+  ).toBe(0)
+  const before = new Set(readdirSync(batchRoot))
+  const lender = join(batchRoot, [...before][0] as string)
+  expect(await runCli(["--repo", product, "worktree", "add", checkout, "HEAD"], sink(), sink())).toBe(0)
+  const module = git(join(checkout, "vendor", "dep"), ["rev-parse", "--absolute-git-dir"])
+  writeFileSync(
+    join(module, "objects", "info", "alternates"),
+    `${join(lender, "modules", "vendor", "dep", "objects")}\n`,
+  )
+  let errors = ""
+  expect(
+    await runCli(["--repo", product, "worktree", "remove", checkout, "--retain", batchRoot], sink(), {
+      write: (value) => {
+        errors += value
+      },
+    }),
+    errors,
+  ).toBe(0)
+  const name = readdirSync(batchRoot).find((name) => !before.has(name)) as string
+  const borrower = join(batchRoot, name)
+  const manifest = JSON.parse(readFileSync(join(borrower, "manifest.json"), "utf8")) as { retainUntil: string }
+  return {
+    ...options(),
+    root: batchRoot,
+    entries: [lender, borrower],
+    clock: new Date(Date.parse(manifest.retainUntil) + 1000),
+  }
+}
+
 describe("retention retirement batch (#33010)", () => {
+  // Accepted requirement: no surviving borrower loses its lender, including when a held gate keeps a batch
+  // member. The existing already-kept-member test never exercises members that pass preliminary gates.
+  it("retires a sealed cross-entry borrower before its lender regardless of requested order", async () => {
+    const input = await linkedBatch()
+    const dry = await retireRetainedBatch(input)
+    expect(
+      dry.rows.map((row) => row.outcome),
+      JSON.stringify(dry.rows),
+    ).toEqual(["would-retire", "would-retire"])
+    const result = await retireRetainedBatch({ ...input, apply: true })
+    expect(
+      result.rows.map((row) => row.outcome),
+      JSON.stringify(result.rows),
+    ).toEqual(["retired", "retired"])
+    expect(result.windows[0]?.entries).toEqual([...input.entries].reverse())
+  })
+
+  it("a borrower kept by held re-verification also keeps its candidate lender", async () => {
+    const input = await linkedBatch()
+    const borrower = input.entries[1] as string
+    const result = await retireRetainedBatch({
+      ...input,
+      apply: true,
+      afterScan: () => {
+        const path = join(borrower, "manifest.json")
+        const manifest = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>
+        manifest.retainUntil = "2999-01-01T00:00:00Z"
+        writeFileSync(path, JSON.stringify(manifest))
+      },
+    })
+    expect(
+      result.rows.map((row) => row.outcome),
+      JSON.stringify(result.rows),
+    ).toEqual(["kept", "kept"])
+    expect(existsSync(input.entries[0] as string)).toBe(true)
+    expect(existsSync(borrower)).toBe(true)
+  })
   // Accepted requirement: the production CLI defaults to dry run and requires a complete estate declaration.
   // Direct batch tests cannot prove Commander reaches the batch or that its flags are preserved.
   it("CLI defaults to dry run and names every selected entry without deleting it", async () => {
@@ -201,6 +277,24 @@ describe("retention retirement batch (#33010)", () => {
     expect(result.windows).toHaveLength(1)
     expect(result.windows[0]).toMatchObject({ delta: "unchanged" })
     expect(result.windows[0]?.holdMs).toBeGreaterThanOrEqual(result.windows[0]?.deltaMs ?? 0)
+  })
+
+  // Accepted requirement: a bounded lease ends with named remaining entries; the old multi-window loop
+  // mistakes its own first deletion for an outsider's estate change when it reuses the original scan.
+  it("ends after one lease window when the budget expires, naming the remaining entries", async () => {
+    const input = options()
+    const first = input.entries[0] as string
+    const result = await retireRetainedBatch({
+      ...input,
+      apply: true,
+      holdBudgetMs: 100,
+      monotonic: () => (existsSync(first) ? 0 : 1000),
+    })
+    expect(result.rows.map((row) => row.outcome)).toEqual(["retired", "kept", "kept"])
+    expect(result.windows).toHaveLength(1)
+    expect(result.stopped).toContain("lease budget")
+    expect(result.stopped).not.toContain("census-shifted")
+    expect(result.rows.slice(1).every((row) => row.reason.includes("lease budget"))).toBe(true)
   })
 
   // @cto dc77f630 condition 3: a writer that takes no lease (a hand-run clone) is caught by the delta, not the lease.

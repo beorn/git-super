@@ -5,7 +5,7 @@
  * @consumer the read-only retention verifier, gate 3; #27443(b)
  * @testonly none
  */
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { afterEach, describe, expect, test } from "vitest"
@@ -198,6 +198,23 @@ describe("retention estate scan — gate 3 (#27443(b))", () => {
       const stamp = statSync(file)
       writeFileSync(file, bytes.replace("lender", "lendex"))
       utimesSync(file, stamp.atime, stamp.mtime)
+      expect(estateDelta(record, scan).status).toBe("changed")
+    })
+
+    // Accepted requirement: the reused scan detects every changed alternates declaration. A symlink's own
+    // lstat cannot see writes to its target; a broken borrower can gain a valid loan while remaining broken.
+    test("an alternates symlink target gaining a surviving loan ends the batch", () => {
+      const namespace = tmp("git-super-estate-delta-link-")
+      const lender = objectDir(namespace, "lender")
+      const borrower = objectDir(namespace, "borrower")
+      const target = join(namespace, "alternates-target")
+      writeFileSync(target, `${join(namespace, "gone", "objects")}\n`)
+      symlinkSync(target, join(borrower, "info", "alternates"))
+      const record = newEstateWalkRecord()
+      const scan = scanEstate([namespace], [dirname(lender)], DEFAULT_ESTATE_BOUNDS, Date.now, record)
+      expect(scan.status).toBe("pass")
+      expect(scan.danglingAlternates).toHaveLength(1)
+      writeFileSync(target, `${join(namespace, "gone", "objects")}\n${lender}\n`)
       expect(estateDelta(record, scan).status).toBe("changed")
     })
 

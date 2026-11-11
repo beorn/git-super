@@ -58,8 +58,10 @@ function dirStamp(path: string): string {
 }
 
 function fileStamp(path: string): string {
-  const stat = lstatSync(path, { throwIfNoEntry: false })
-  return stat === undefined ? "absent" : `${stat.ino}:${stat.size}:${stat.ctimeMs}`
+  const link = lstatSync(path, { throwIfNoEntry: false })
+  if (link === undefined) return "absent"
+  const stat = link.isSymbolicLink() ? statSync(path) : link
+  return `${link.dev}:${link.ino}:${link.size}:${link.ctimeMs}/${stat.dev}:${stat.ino}:${stat.size}:${stat.ctimeMs}`
 }
 
 function registryDigest(dir: string): string {
@@ -227,7 +229,13 @@ export function scanEstate(
     objectDirs.add(store)
     const alternatesFile = join(store, "info", "alternates")
     // Stamped before the read, so a write racing the read shows as a change at the delta.
-    record?.alternates.set(alternatesFile, fileStamp(alternatesFile))
+    try {
+      record?.alternates.set(alternatesFile, fileStamp(alternatesFile))
+    } catch (error) {
+      return unknown(
+        `cannot read alternates metadata ${alternatesFile}: ${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
     if (!existsSync(alternatesFile)) return undefined
     alternatesFiles += 1
     if (alternatesFiles > bounds.maxAlternatesFiles) {

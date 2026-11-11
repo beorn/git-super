@@ -4,12 +4,12 @@
  * per-entry bound. Every other gate still runs per entry, twice: a preliminary pass with no lease, then a held
  * re-verify under the lease whose facts must equal the preliminary ones before that entry is deleted.
  *
- * The lease is NOT held across the scan. Instead each lease window opens with {@link estateDelta}: the estate's SET of
+ * The lease is NOT held across the scan. Instead one lease window opens with {@link estateDelta}: the estate's SET of
  * object directories, alternates files, `objects` links and borrower registries must still be what the scan saw.
  * Writers that never take the lease exist (a hand-run clone or `git worktree add` writes an alternates file with no
  * lease); that comparison, not the lease, is what catches them between scan and delete. Any change ends the batch
  * with nothing deleted. The lease is then held with no gap through that window's deletes, and its hold time is
- * measured; a window closes once its hold would pass the budget (about 60 s).
+ * measured; the command stops once its hold would pass the budget (about 60 s). A subsequent invocation scans afresh.
  *
  * Dry run by default: `apply: false` reports the entries that would be retired and why every other one is kept.
  */
@@ -239,6 +239,40 @@ function closeOverKeptBorrowers(
   }
 }
 
+/** Delete borrowers before their lenders, so any refused entry or early stop leaves its loans intact. */
+function borrowerOrder(
+  entries: readonly string[],
+  borrowers: readonly EstateBorrower[],
+  kept: Map<string, string>,
+): string[] {
+  const candidates = entries.filter((entry) => !kept.has(entry))
+  const lenders = new Map(candidates.map((entry) => [entry, new Set<string>()]))
+  const incoming = new Map(candidates.map((entry) => [entry, 0]))
+  for (const edge of borrowers) {
+    const from = candidates.find((entry) => within(entry, edge.borrower))
+    const to = candidates.find((entry) => within(entry, edge.target))
+    if (from === undefined || to === undefined || from === to) continue
+    const targets = lenders.get(from) as Set<string>
+    if (targets.has(to)) continue
+    targets.add(to)
+    incoming.set(to, (incoming.get(to) as number) + 1)
+  }
+  const ordered = candidates.filter((entry) => incoming.get(entry) === 0)
+  for (let i = 0; i < ordered.length; i++) {
+    for (const lender of lenders.get(ordered[i] as string) as Set<string>) {
+      const remaining = (incoming.get(lender) as number) - 1
+      incoming.set(lender, remaining)
+      if (remaining === 0) ordered.push(lender)
+    }
+  }
+  for (const entry of candidates) {
+    if (!ordered.includes(entry)) {
+      kept.set(entry, "borrower: unresolved cyclic batch dependency; its borrowers must remain in custody")
+    }
+  }
+  return ordered
+}
+
 export async function retireRetainedBatch(options: RetentionBatchOptions): Promise<RetentionBatchResult> {
   const apply = options.apply === true
   const monotonic = options.monotonic ?? (() => performance.now())
@@ -348,8 +382,8 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
         : undefined
   keepUnleasedConnections(entries, scan.borrowers, leaseMissing, kept)
   closeOverKeptBorrowers(entries, scan.borrowers, kept)
+  const candidates = borrowerOrder(entries, scan.borrowers, kept)
   for (const [entry, reason] of kept) rows.set(entry, { entry, outcome: "kept", reason })
-  const candidates = entries.filter((entry) => !kept.has(entry))
   const leasedOwners = liveOwners.filter((owner) => !leaseMissing.includes(owner))
 
   if (!apply) {
@@ -373,10 +407,10 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
   }
   options.afterScan?.()
 
-  // ---- Lease windows: delta first, then held re-verify and delete per entry ---------------------
+  // ---- One lease window: delta first, then held re-verify and delete per entry ------------------
   const windows: BatchWindow[] = []
   let next = 0
-  while (next < candidates.length) {
+  if (candidates.length > 0) {
     const commonPath = join(common, "yrd-worktree-mutations", "writer.lock")
     const commonLease: FlockHandle | null = acquireFlockWithTimeout(commonPath, DEFAULT_MUTATION_LOCK_WAIT_MS, {
       create: false,
@@ -415,6 +449,7 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
         while (next < candidates.length && monotonic() - heldFrom + lastEntryMs < budget) {
           const entry = candidates[next] as string
           next += 1
+          if (kept.has(entry)) continue
           const entryStarted = monotonic()
           windowEntries.push(entry)
           // The window's first entry also carries every outside owner's lease, once: flock is per open file, so a
@@ -444,11 +479,12 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
             JSON.stringify(pointers(pre)) !== JSON.stringify(pointers(held)) ||
             held.entryDevIno !== `${stat.dev}:${stat.ino}`
           ) {
-            rows.set(entry, {
+            kept.set(
               entry,
-              outcome: "kept",
-              reason: `census-shifted: preliminary and held proofs differ${after === undefined ? `: ${held.reasons.join("; ")}` : ""}`,
-            })
+              `census-shifted: preliminary and held proofs differ${after === undefined ? `: ${held.reasons.join("; ")}` : ""}`,
+            )
+            closeOverKeptBorrowers(entries, scan.borrowers, kept)
+            for (const [member, reason] of kept) rows.set(member, { entry: member, outcome: "kept", reason })
           } else {
             try {
               const changedCold = coldOwnerChanged(cold)
@@ -480,8 +516,8 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
           }
           lastEntryMs = monotonic() - entryStarted
         }
-        if (windowEntries.length === 0) {
-          stopped = `lease budget ${budget}ms exhausted by the delta; nothing more deleted`
+        if (stopped === undefined && next < candidates.length) {
+          stopped = `lease budget ${budget}ms exhausted; remaining entries kept; rerun with a fresh estate scan`
         }
       }
     } catch (error) {
@@ -492,7 +528,9 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
     }
     windows.push({ entries: windowEntries, delta: deltaStatus, deltaMs, holdMs: Math.round(monotonic() - heldFrom) })
     if (stopped !== undefined) {
-      for (const entry of candidates.slice(next)) rows.set(entry, { entry, outcome: "kept", reason: stopped })
+      for (const entry of candidates.slice(next)) {
+        if (!rows.has(entry)) rows.set(entry, { entry, outcome: "kept", reason: stopped })
+      }
       return result(windows, stopped)
     }
   }
