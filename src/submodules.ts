@@ -980,7 +980,10 @@ export async function materializeSubmodules(
                 return { code: 1, stdout: "", stderr: `missing frozen gitlink for ${path} in ${worktree}` }
               }
               const ownSubmodule = join(worktree, path)
-              const heldInWorktree = await referenceContains(git, ownSubmodule, required)
+              // A fresh child directory discovers the parent repository until
+              // initialized; never probe its commit in that parent's store.
+              const heldInWorktree =
+                (await referenceStoreAt(git, ownSubmodule)) && (await referenceContains(git, ownSubmodule, required))
               let referenceSubmodule = reference === undefined ? undefined : join(reference, path)
               let referenceIsPrepared = false
               let referenceHasIt =

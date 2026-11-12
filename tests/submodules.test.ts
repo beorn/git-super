@@ -1923,6 +1923,58 @@ describe("materializeSubmodules", () => {
     expect(fetched).toBe(0)
   })
 
+  it("never probes a fresh child's commit through its promisor parent", async () => {
+    // A directory without its own Git metadata discovers the parent. Ordinary
+    // parents fail this lookup cheaply; promisor parents can fetch the wrong SHA.
+    // Keep that fetch local and unreachable, and observe actual Git authority.
+    const root = await mkdtemp(join(tmpdir(), "git-super-fresh-promisor-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const candidate = join(root, "candidate")
+    git(fixture.product, ["worktree", "add", "-q", "--detach", candidate, "HEAD"])
+    git(fixture.product, ["config", "remote.origin.url", join(root, "absent-promisor.git")])
+    git(fixture.product, ["config", "remote.origin.promisor", "true"])
+    git(fixture.product, ["config", "remote.origin.partialclonefilter", "blob:none"])
+    const parentDirectory = git(candidate, ["rev-parse", "--absolute-git-dir"]).trim()
+    const child = join(candidate, "packages/alpha")
+    expect(existsSync(join(child, ".git"))).toBe(false)
+    expect(git(child, ["rev-parse", "--absolute-git-dir"]).trim()).toBe(parentDirectory)
+
+    const native = createLocalGitProcess({
+      ...cleanGitRepositoryEnvironment(process.env),
+      GIT_ALLOW_PROTOCOL: "file",
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+    })
+    const probes: Array<{ argv: readonly string[]; cwd: string; directory: string; code: number; stderr: string }> = []
+    const result = await materializeSubmodulesWithProcess(
+      {
+        async run(request) {
+          const directory =
+            request.args[0] === "cat-file" ? git(request.repo, ["rev-parse", "--absolute-git-dir"]).trim() : undefined
+          const response = await native.run(request)
+          if (directory !== undefined) {
+            probes.push({
+              argv: ["git", "-C", request.repo, ...request.args],
+              cwd: request.repo,
+              directory,
+              code: response.code,
+              stderr: response.stderr,
+            })
+          }
+          return response
+        },
+      },
+      { worktree: candidate, referenceWorktree: fixture.product },
+    )
+
+    expect(result.code, result.stderr).toBe(0)
+    expect(probes.filter((probe) => probe.directory === parentDirectory)).toEqual([])
+    expect(git(child, ["rev-parse", "HEAD"]).trim()).toBe(fixture.alphaBase)
+    expect(git(join(candidate, "vendor/beta"), ["rev-parse", "HEAD"]).trim()).toBe(fixture.betaBase)
+    expect(probes.length).toBeGreaterThan(0)
+  })
+
   it("initializes sibling paths in one config mutation before parallel updates", async () => {
     const worktree = await mkdtemp(join(tmpdir(), "git-super-siblings-candidate-"))
     roots.push(worktree)
