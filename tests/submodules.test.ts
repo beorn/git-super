@@ -1952,11 +1952,13 @@ describe("materializeSubmodules", () => {
         async run(request) {
           const directory =
             request.args[0] === "cat-file" ? git(request.repo, ["rev-parse", "--absolute-git-dir"]).trim() : undefined
+          // The native port inherits cwd and selects the repository with -C.
+          const cwd = process.cwd()
           const response = await native.run(request)
           if (directory !== undefined) {
             probes.push({
               argv: ["git", "-C", request.repo, ...request.args],
-              cwd: request.repo,
+              cwd,
               directory,
               code: response.code,
               stderr: response.stderr,
