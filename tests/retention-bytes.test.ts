@@ -10,7 +10,7 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } fr
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, test } from "vitest"
-import { measureRetainedBytes } from "../src/retention-bytes.ts"
+import { formatRetainedBytes, measureRetainedBytes } from "../src/retention-bytes.ts"
 
 const cleanup: string[] = []
 afterEach(() => {
@@ -72,5 +72,13 @@ describe("retained bytes (#34270)", async () => {
       bytes: 0,
       unreadable: 0,
     })
+  })
+
+  // The figure an operator reads in the dry-run line: exact bytes always, a rounded size beside them.
+  test("the human figure keeps the exact byte count beside the rounded one", async () => {
+    expect(formatRetainedBytes(0)).toBe("0 B")
+    expect(formatRetainedBytes(999)).toBe("999 B")
+    expect(formatRetainedBytes(1536)).toBe("1.5 KiB (1,536 B)")
+    expect(formatRetainedBytes(13_014_125_285)).toBe("12.1 GiB (13,014,125,285 B)")
   })
 })
