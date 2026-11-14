@@ -104,15 +104,10 @@ async function fileStampAsync(path: string): Promise<string> {
     if (absent(error)) return "absent"
     throw error
   }
-  let stamp = link
-  if (link.isSymbolicLink()) {
-    try {
-      stamp = await statAsync(path)
-    } catch (error) {
-      if (absent(error)) return "absent"
-      throw error
-    }
-  }
+  // A symlink whose target is gone is NOT an absence (@cto R1): the alternates file is declared through a link that
+  // leads nowhere, so the read failure must reach `processStore`'s `unknown`. The sync `fileStamp` used by the delta
+  // throws on the same link; the two must agree, and answering "absent" here would hide it from both.
+  const stamp = link.isSymbolicLink() ? await statAsync(path) : link
   return `${link.dev}:${link.ino}:${link.size}:${link.ctimeMs}/${stamp.dev}:${stamp.ino}:${stamp.size}:${stamp.ctimeMs}`
 }
 

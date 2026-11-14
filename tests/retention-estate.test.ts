@@ -394,5 +394,22 @@ describe("retention estate scan — gate 3 (#27443(b))", async () => {
         expect(scan.detail).toContain(join(broken, "pack"))
       }
     })
+
+    // @cto R1: an alternates file reached through a dangling symlink is a read failure, not an absence. Answering
+    // "absent" would proceed with no alternates while estateDelta's sync stamp throws on the same link, so every batch
+    // on such an estate would end "changed" with nothing naming the cure.
+    test("an alternates file that is a dangling symlink ends the pass as unknown", async () => {
+      const namespace = tmp("git-super-estate-dangling-alternates-")
+      const objects = objectDir(namespace, "repo")
+      const alternates = join(objects, "info", "alternates")
+      symlinkSync(join(namespace, "gone", "alternates-target"), alternates)
+      for (const scan of [
+        await scanEstate([namespace], []),
+        await scanEstate([namespace], [], { ...DEFAULT_ESTATE_BOUNDS, workers: 1 }),
+      ]) {
+        expect(scan.status).toBe("unknown")
+        expect(scan.detail).toContain(alternates)
+      }
+    })
   })
 })
