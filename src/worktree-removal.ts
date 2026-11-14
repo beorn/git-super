@@ -2180,8 +2180,9 @@ async function prepareResolvedWorktreeModules(context: {
             ),
           )
           verifyRetainedManifest()
-          if (retained !== null)
+          if (retained !== null) {
             finalRetainedManifest = manifest(copiedTree, copiedCustody, true, privateProjection !== undefined)
+          }
           verified = true
         } catch (error) {
           if (unpublished) discard()
