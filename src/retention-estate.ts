@@ -14,6 +14,8 @@
  */
 import { createHash } from "node:crypto"
 import { existsSync, lstatSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs"
+import { readdir as readdirAsync } from "node:fs/promises"
+import { cpus } from "node:os"
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { alternateEntries } from "./alternates.ts"
 
@@ -22,6 +24,12 @@ export interface EstateScanBounds {
   readonly maxAlternatesFiles: number
   /** 180 s in the contract's initial pass. */
   readonly scanMs: number
+  /**
+   * How many directories the walk reads at once; the production default is `min(16, cpus)`.
+   * A test that depends on the order directories are read pins this to 1, which is the serial
+   * walk the scan used before #34270 — the node set is identical either way.
+   */
+  readonly workers?: number
 }
 
 export const DEFAULT_ESTATE_BOUNDS: EstateScanBounds = { maxAlternatesFiles: 60_000, scanMs: 180_000 }
@@ -174,13 +182,13 @@ function isObjectDir(path: string): boolean {
   return existsSync(join(path, "pack")) || existsSync(join(path, "info"))
 }
 
-export function scanEstate(
+export async function scanEstate(
   namespace: readonly string[],
   removal: readonly string[],
   bounds: EstateScanBounds = DEFAULT_ESTATE_BOUNDS,
   clock: () => number = Date.now,
   record?: EstateWalkRecord,
-): EstateScan {
+): Promise<EstateScan> {
   const started = clock()
   const roots: string[] = []
   for (const root of namespace) {
@@ -338,19 +346,21 @@ export function scanEstate(
     return undefined
   }
 
+  // The walk is I/O bound and the estate is millions of directories (#34270: 2,492,722 under `/hh` + `/home/hh`,
+  // measured 2026-11-14 at ~10.4 k readdir/s on one thread, so ~240 s of floor before a single alternates file opens).
+  // A bounded pool visits the SAME nodes: same roots, same push rule, same store/registry handling, same `unknown`
+  // policy, same record — only the overlap changes. Every collected set is sorted below, so the bytes this produces do
+  // not depend on scheduling.
   const visited = new Set<string>()
-  const stack = [...roots]
-  while (stack.length > 0) {
-    if (clock() - started > bounds.scanMs) {
-      return unknown(`estate declaration scan exceeded ${bounds.scanMs} ms after ${alternatesFiles} alternates file(s)`)
-    }
-    const current = stack.pop()!
-    if (visited.has(current)) continue
-    visited.add(current)
+  const pending: string[] = [...roots]
+  let inFlight = 0
+  let walkFailure: EstateScan | undefined
+
+  const visit = async (current: string): Promise<void> => {
     let entries
     try {
       record?.dirs.set(current, dirStamp(current))
-      entries = readdirSync(current, { withFileTypes: true })
+      entries = await readdirAsync(current, { withFileTypes: true })
     } catch (error) {
       // A recorded walk (a retirement batch) tolerates a directory that vanished after its parent listed it: it lends
       // nothing now, and if it was moved into a directory already read, that directory's stamp moved, so the
@@ -358,15 +368,16 @@ export function scanEstate(
       if (record !== undefined && (error as NodeJS.ErrnoException).code === "ENOENT" && !roots.includes(current)) {
         record.dirs.delete(current)
         vanishedDuringWalk += 1
-        continue
+        return
       }
-      return unknown(`cannot read ${current}: ${error instanceof Error ? error.message : String(error)}`)
+      walkFailure ??= unknown(`cannot read ${current}: ${error instanceof Error ? error.message : String(error)}`)
+      return
     }
     for (const entry of entries) {
       const path = join(current, entry.name)
       if (entry.isSymbolicLink()) {
         if (entry.name !== "objects") {
-          if (entry.isDirectory()) stack.push(path)
+          if (entry.isDirectory()) pending.push(path)
           continue
         }
         let target: string
@@ -374,30 +385,79 @@ export function scanEstate(
           target = realpathSync(path)
           if (!statSync(target).isDirectory()) throw new Error("target is not a directory")
         } catch (error) {
-          return unknown(
+          walkFailure ??= unknown(
             `objects link ${path} has an unavailable or redirected target: ${error instanceof Error ? error.message : String(error)}`,
           )
+          return
         }
         record?.objectLinks.set(path, target)
         borrowers.push({ borrower: path, target })
         const nested = processStore(target)
-        if (nested !== undefined) return nested
+        if (nested !== undefined) {
+          walkFailure ??= nested
+          return
+        }
         continue
       }
       if (!entry.isDirectory()) continue
       if (entry.name === "objects" && isObjectDir(path)) {
         const nested = processStore(path)
-        if (nested !== undefined) return nested
+        if (nested !== undefined) {
+          walkFailure ??= nested
+          return
+        }
         continue
       }
       if (entry.name === "git-super-retained-borrowers") {
         const registry = readRegistry(path)
-        if (registry !== undefined) return registry
+        if (registry !== undefined) {
+          walkFailure ??= registry
+          return
+        }
         continue
       }
-      stack.push(path)
+      pending.push(path)
     }
   }
+
+  // One worker retires only when the queue is empty AND nothing is in flight: a directory another worker is still
+  // reading can push more work, so an early exit would silently scan part of the estate.
+  const walker = async (): Promise<void> => {
+    for (;;) {
+      if (walkFailure !== undefined) return
+      if (clock() - started > bounds.scanMs) {
+        walkFailure ??= unknown(
+          `estate declaration scan exceeded ${bounds.scanMs} ms after ${alternatesFiles} alternates file(s)`,
+        )
+        return
+      }
+      const current = pending.pop()
+      if (current === undefined) {
+        if (inFlight === 0) return
+        await new Promise<void>((resolve) => {
+          setImmediate(resolve)
+        })
+        continue
+      }
+      if (visited.has(current)) continue
+      visited.add(current)
+      inFlight += 1
+      try {
+        await visit(current)
+      } finally {
+        inFlight -= 1
+      }
+    }
+  }
+  const walkers = Math.max(1, bounds.workers ?? Math.min(16, Math.max(2, cpus().length)))
+  await Promise.all(Array.from({ length: walkers }, () => walker()))
+  if (walkFailure !== undefined) return walkFailure
+
+  borrowers.sort(compareEstateEdges)
+  danglingAlternates.sort((left, right) => {
+    if (left.alternatesFile !== right.alternatesFile) return left.alternatesFile < right.alternatesFile ? -1 : 1
+    return left.line < right.line ? -1 : left.line > right.line ? 1 : 0
+  })
   const survivorIntoRemoval = borrowers.filter(
     (edge) =>
       removalRoots.some((root) => within(root, edge.target)) &&

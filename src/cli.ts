@@ -29,6 +29,7 @@ import type { GitSuperResult } from "./result.ts"
 import type { RetentionVerifyResult } from "./retention-verify.ts"
 import type { CompactRetainedRootReport } from "./retention-compact.ts"
 import type { RetentionBatchResult } from "./retention-batch.ts"
+import { formatRetainedBytes } from "./retention-bytes.ts"
 import type { PrivateStoreCandidateResult } from "./private-store-candidate.ts"
 import type { SuperStatusResult } from "./status.ts"
 import type { SuperSubmodulePrepareResult } from "./submodule-prepare.ts"
@@ -1371,7 +1372,14 @@ async function writeResult(
   } else if (captured.node === nodes.worktree.retention["retire-batch"]) {
     const batch = result as RetentionBatchResult
     stdout.write(
-      `${batch.apply ? "apply" : "dry-run"} retained batch: ${batch.rows.length} selected entries; scan ${batch.scan.status} ${batch.scan.ms}ms\n`,
+      `${batch.apply ? "apply" : "dry-run"} retained batch: ${batch.rows.length} selected entries; scan ${batch.scan.status} ${batch.scan.ms}ms` +
+        (batch.bytesPlanned === undefined
+          ? ""
+          : `; ${formatRetainedBytes(batch.bytesPlanned)} allocated in the selected stores` +
+            (batch.bytesUnreadable === undefined || batch.bytesUnreadable === 0
+              ? ""
+              : ` (${batch.bytesUnreadable} unreadable path(s) NOT counted, so the figure understates the free space)`)) +
+        "\n",
     )
     for (const row of batch.rows) stdout.write(`${row.outcome} ${row.entry}: ${row.reason}\n`)
     for (const window of batch.windows) {

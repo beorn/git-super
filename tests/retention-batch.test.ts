@@ -86,7 +86,7 @@ beforeAll(async () => {
   }
   eligible = new Date(latest + 1000)
   // Retirement only opens EXISTING owner leases, so the fixture creates one for every owner outside the root.
-  for (const objects of scanEstate([fixtureRoot], []).objectDirs) {
+  for (const objects of (await scanEstate([fixtureRoot], [])).objectDirs) {
     if (objects.startsWith(`${root}/`)) continue
     const lock = join(dirname(objects), "yrd-worktree-mutations", "writer.lock")
     if (existsSync(lock)) continue
@@ -165,7 +165,7 @@ async function linkedBatch(): Promise<RetentionBatchOptions> {
   }
 }
 
-describe("retention retirement batch (#33010)", () => {
+describe("retention retirement batch (#33010)", async () => {
   // AC33010: two entries and both proof phases share exact immutable common bytes, without changing deletion.
   it("shared batch certificates use one explicit common folder across entries and phases", async () => {
     const entries = readdirSync(root)
@@ -273,7 +273,7 @@ describe("retention retirement batch (#33010)", () => {
       .find((entry) => !previous.includes(entry)) as string
     const manifest = JSON.parse(readFileSync(join(first, "manifest.json"), "utf8")) as { retainUntil: string }
     const input = options({ entries: [first, ...previous], clock: new Date(Date.parse(manifest.retainUntil) + 1000) })
-    expect(scanEstate([fixtureRoot], input.entries).registries).toContain(
+    expect((await scanEstate([fixtureRoot], input.entries)).registries).toContain(
       join(first, "modules", "vendor", "dep", "git-super-retained-borrowers"),
     )
     const dry = await retireRetainedBatch(input)
@@ -549,8 +549,8 @@ describe("retention retirement batch (#33010)", () => {
       expect(result.owners?.liveUnleased).toBeGreaterThan(0)
       if (kind === "ancestor-file") {
         expect(warning).toHaveBeenCalledWith(expect.stringContaining("ENOTDIR"))
-        const expected = scanEstate([fixtureRoot], [])
-          .objectDirs.filter((objects) => objects.startsWith(join(root, names[2] as string, "modules") + "/"))
+        const expected = (await scanEstate([fixtureRoot], [])).objectDirs
+          .filter((objects) => objects.startsWith(join(root, names[2] as string, "modules") + "/"))
           .map(dirname)
           .sort()
         expect(expected).toHaveLength(2)

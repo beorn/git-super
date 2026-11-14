@@ -519,7 +519,8 @@ async function evaluateRetainedEntry(
   })
 
   if (legacy) {
-    const estate = context?.estate ?? scanEstate(declaredNamespaceRoots, [entryReal], options.bounds?.estate, monotonic)
+    const estate =
+      context?.estate ?? (await scanEstate(declaredNamespaceRoots, [entryReal], options.bounds?.estate, monotonic))
     result.estate = estate
     const matching = matchRetentionAudit(audits, readFileSync(manifestPath), estate)
     if (matching.stale.length > 0) result.staleAudits = matching.stale
@@ -859,7 +860,8 @@ async function evaluateRetainedEntry(
   if (!removalSet.includes(entryReal)) {
     throw new Error(`batch removal set does not name its own entry ${entryReal}`)
   }
-  const estate = result.estate ?? scanEstate(declaredNamespaceRoots, [entryReal], options.bounds?.estate, monotonic)
+  const estate =
+    result.estate ?? (await scanEstate(declaredNamespaceRoots, [entryReal], options.bounds?.estate, monotonic))
   result.estate = estate
   // A store holding a dangling alternates line is broken (#33010): it is never a custody witness (dropping a
   // witness can only keep more), and a candidate holding one is never retired.

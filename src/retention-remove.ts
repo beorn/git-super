@@ -305,7 +305,7 @@ async function runRetentionOperation(
       }
       const preliminaryEstate =
         mode === "audit"
-          ? scanEstate(options.namespaceRoots, [entry], options.bounds?.estate, options.monotonic)
+          ? await scanEstate(options.namespaceRoots, [entry], options.bounds?.estate, options.monotonic)
           : undefined
       if (preliminaryEstate?.status === "unknown") {
         throw new Error(`audit estate unavailable: ${preliminaryEstate.detail}`)
@@ -362,7 +362,7 @@ async function runRetentionOperation(
       }
       const heldEstate =
         mode === "audit"
-          ? scanEstate(options.namespaceRoots, [entry], options.bounds?.estate, options.monotonic)
+          ? await scanEstate(options.namespaceRoots, [entry], options.bounds?.estate, options.monotonic)
           : undefined
       if (heldEstate?.status === "unknown") throw new Error(`held audit estate unavailable: ${heldEstate.detail}`)
       const commonHead = mode === "audit" ? runGit(common, ["rev-parse", "--verify", "HEAD"]).trim() : undefined

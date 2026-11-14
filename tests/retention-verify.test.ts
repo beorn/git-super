@@ -262,7 +262,7 @@ function writeAuditRecordFixture(value: unknown): string {
   return path
 }
 
-describe("retention verify gates 1-6", () => {
+describe("retention verify gates 1-6", async () => {
   // AC33010: shared facts preserve full observed estate/coverage and reject stale or redirected evidence.
   // Existing envelope fixtures cannot detect a hash-valid foreign common payload or physical alias tampering.
   it.each([
@@ -678,7 +678,7 @@ describe("retention verify gates 1-6", () => {
           })
           expect(record["schema"]).toBe("git-super/retention-audit/1")
         }
-        const estate = scanEstate([fixtureRoot as string], [base.entry])
+        const estate = await scanEstate([fixtureRoot as string], [base.entry])
         const nativeRecords = readRetentionAudits(base.entry, manifestPath, GATE_ORDER)
         for (const { record } of nativeRecords) {
           expect(record.provenance).toMatchObject({
@@ -705,7 +705,7 @@ describe("retention verify gates 1-6", () => {
       expect(await runCli(changedArgs, outputSink(), outputSink())).toBe(0)
       const changedRecords = readRetentionAudits(base.entry, manifestPath, GATE_ORDER)
       expect(changedRecords).toHaveLength(2)
-      const changedEstate = scanEstate([fixtureRoot as string, common], [base.entry])
+      const changedEstate = await scanEstate([fixtureRoot as string, common], [base.entry])
       const changedMatch = matchRetentionAudit(changedRecords, original, changedEstate)
       expect(changedMatch.stale).toHaveLength(1)
       expect(changedMatch.selected?.record.provenance.estate.namespaceRoots).toEqual([fixtureRoot as string, common])
@@ -1471,7 +1471,7 @@ describe("retention verify gates 1-6", () => {
     expect(result.gates[1]?.message).toContain("bound")
   })
 
-  it("defaults the per-entry non-object metadata bound to the contract's 256 MiB", () => {
+  it("defaults the per-entry non-object metadata bound to the contract's 256 MiB", async () => {
     expect(DEFAULT_NON_OBJECT_METADATA_BOUNDS.maxBytes).toBe(256 * 1024 * 1024)
   })
 
@@ -1507,7 +1507,7 @@ describe("retention verify gates 1-6", () => {
   })
 })
 
-describe("retention verify fix-forward #27443(b) gaps", () => {
+describe("retention verify fix-forward #27443(b) gaps", async () => {
   it("follows alternate targets transitively and blocks a survivor that borrows into the removal set", async () => {
     const scene = mkdtempSync(join(tmpdir(), "estate-transitive-"))
     const roots = join(scene, "S")
@@ -1518,7 +1518,7 @@ describe("retention verify fix-forward #27443(b) gaps", () => {
     mkdirSync(join(removal, "kept", "objects", "info"), { recursive: true })
     writeFileSync(join(roots, "objects", "info", "alternates"), `${join(target, "objects")}\n`)
     writeFileSync(join(target, "objects", "info", "alternates"), `${join(removal, "kept", "objects")}\n`)
-    const result = scanEstate([roots], [removal])
+    const result = await scanEstate([roots], [removal])
     expect(result.status).toBe("blocked")
     expect(result.objectDirs).toContain(realpathSync(join(target, "objects")))
     expect(result.survivorIntoRemoval.some((edge) => edge.borrower === realpathSync(join(target, "objects")))).toBe(
@@ -1533,7 +1533,7 @@ describe("retention verify fix-forward #27443(b) gaps", () => {
     mkdirSync(join(roots, "objects", "info"), { recursive: true })
     mkdirSync(join(target, "objects", "info"), { recursive: true })
     writeFileSync(join(roots, "objects", "info", "alternates"), `${join(target, "objects")}\n`)
-    const result = scanEstate([roots], [join(scene, "E")])
+    const result = await scanEstate([roots], [join(scene, "E")])
     expect(result.status).toBe("pass")
   })
 
@@ -1542,7 +1542,7 @@ describe("retention verify fix-forward #27443(b) gaps", () => {
     const roots = join(scene, "R")
     mkdirSync(join(roots, "git-super-retained-borrowers"), { recursive: true })
     writeFileSync(join(roots, "git-super-retained-borrowers", "broken.json"), "{ not json")
-    const result = scanEstate([roots], [join(scene, "E")])
+    const result = await scanEstate([roots], [join(scene, "E")])
     expect(result.status).toBe("unknown")
     expect(result.detail).toContain("not valid JSON")
   })
@@ -1559,7 +1559,7 @@ describe("retention verify fix-forward #27443(b) gaps", () => {
       join(roots, "git-super-retained-borrowers", "good.json"),
       `${JSON.stringify({ retained: entry, manifest: manifestPath })}\n`,
     )
-    const result = scanEstate([roots], [join(scene, "E")])
+    const result = await scanEstate([roots], [join(scene, "E")])
     expect(result.status).toBe("pass")
     expect(result.registries).toHaveLength(1)
   })
@@ -1787,7 +1787,7 @@ describe("retention verify fix-forward #27443(b) gaps", () => {
   })
 })
 
-describe("native retirement alongside supported materialization", () => {
+describe("native retirement alongside supported materialization", async () => {
   it("keeps the materializer's actual object target at the durable primary while retirement runs", async () => {
     const artifactDir = mkdtempSync(join("/var/tmp", "git-super-retire-materializer-"))
     const createdLeasePaths: string[] = []
@@ -1834,7 +1834,7 @@ describe("native retirement alongside supported materialization", () => {
         realpathSync(join(product, ".git", "modules", "vendor", "dep", "objects")),
       )
       expect(objects.startsWith(`${base.entry}/`)).toBe(false)
-      expect(scanEstate([fixtureRoot as string], [base.entry]).survivorIntoRemoval).toEqual([])
+      expect((await scanEstate([fixtureRoot as string], [base.entry])).survivorIntoRemoval).toEqual([])
       git(join(checkout, "vendor/dep"), ["fsck", "--full"])
     } finally {
       blocker?.release()

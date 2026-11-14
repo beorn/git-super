@@ -14,6 +14,7 @@
  *
  * Dry run by default: `apply: false` reports the entries that would be retired and why every other one is kept.
  */
+import { measureRetainedBytes } from "./retention-bytes.ts"
 import { lstatSync, readFileSync, realpathSync, rmSync } from "node:fs"
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { acquireFlockWithTimeout, type FlockHandle } from "@bearly/flock"
@@ -95,6 +96,10 @@ export type RetentionBatchResult = Readonly<{
   }>
   windows: readonly BatchWindow[]
   rows: readonly BatchRow[]
+  /** Allocated bytes the batch would free, measured from the retained stores themselves (never an estimate). */
+  bytesPlanned?: number
+  /** Paths the byte total could not read; non-zero means the figure understates what would be freed. */
+  bytesUnreadable?: number
   /** Set when the batch stopped early; every entry not yet deleted is kept. */
   stopped?: string
 }>
@@ -310,7 +315,13 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
   // ---- One shared scan, recorded for the delta ------------------------------------------------
   const record = newEstateWalkRecord()
   const scanStarted = monotonic()
-  const scan = scanEstate(options.namespaceRoots, entries, options.scanBounds ?? BATCH_ESTATE_BOUNDS, Date.now, record)
+  const scan = await scanEstate(
+    options.namespaceRoots,
+    entries,
+    options.scanBounds ?? BATCH_ESTATE_BOUNDS,
+    Date.now,
+    record,
+  )
   const scanSummary = {
     status: scan.status,
     detail: scan.detail,
@@ -319,11 +330,15 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
     excluded: scan.danglingAlternates.length,
   }
   const ownerSummary: { current?: RetentionBatchResult["owners"] } = {}
+  const byteSummary: { current?: Awaited<ReturnType<typeof measureRetainedBytes>> } = {}
   const result = (windows: BatchWindow[], stopped?: string): RetentionBatchResult => ({
     apply,
     warnings,
     scan: scanSummary,
     ...(ownerSummary.current === undefined ? {} : { owners: ownerSummary.current }),
+    ...(byteSummary.current === undefined
+      ? {}
+      : { bytesPlanned: byteSummary.current.bytes, bytesUnreadable: byteSummary.current.unreadable }),
     windows,
     rows: entries.map(
       (entry) => rows.get(entry) ?? { entry, outcome: "not-reached", reason: stopped ?? "not evaluated" },
@@ -584,5 +599,14 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
       return result(windows, stopped)
     }
   }
+  // The byte total is a measurement of the trees being removed, taken once the rows are final: it is the number an
+  // operator approves a deletion against, so it is never an estimate from the manifests (which carry path -> sha256 and
+  // no sizes) and it names any subtree it could not read.
+  byteSummary.current = await measureRetainedBytes(
+    entries.filter((entry) => {
+      const outcome = rows.get(entry)?.outcome
+      return outcome === "would-retire" || outcome === "retired"
+    }),
+  )
   return result(windows)
 }
