@@ -2071,6 +2071,15 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
             if (custodyRefusal !== undefined) return
           }
           if (removeOptions.retention !== undefined && preparedRetention === undefined) {
+            // An already-borrowed lender must refuse before creating any retained directory.
+            // Check again below after preparation, since other root writers may add borrowers meanwhile.
+            if (removeOptions.noRehome === true) {
+              const borrowers = rehome.inspect()
+              if (borrowers.length > 0) {
+                borrowed = { borrowers }
+                return
+              }
+            }
             // Source owners stay leased; only publication and native removal need the root writer.
             releaseMutation()
             const proofStarted = Date.now()
