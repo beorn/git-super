@@ -1539,29 +1539,39 @@ describe("retention verify fix-forward #27443(b) gaps", async () => {
 
   it("reports a malformed borrower registry record unknown", async () => {
     const scene = mkdtempSync(join(tmpdir(), "estate-registry-"))
-    const roots = join(scene, "R")
-    mkdirSync(join(roots, "git-super-retained-borrowers"), { recursive: true })
-    writeFileSync(join(roots, "git-super-retained-borrowers", "broken.json"), "{ not json")
-    const result = await scanEstate([roots], [join(scene, "E")])
-    expect(result.status).toBe("unknown")
-    expect(result.detail).toContain("not valid JSON")
+    try {
+      const roots = join(scene, "R")
+      mkdirSync(join(roots, "git-super-retained-borrowers"), { recursive: true })
+      writeFileSync(join(roots, "git-super-retained-borrowers", "broken.json"), "{ not json")
+      const result = await scanEstate([roots], [join(scene, "E")])
+      expect(result.status).toBe("unknown")
+      expect(result.detail).toContain("not valid JSON")
+    } finally {
+      // A malformed registry left in the shared test root is not inert: it ends every real estate scan that reaches
+      // it as unknown, so a dry-run over the host reads as unprovable (#34272).
+      rmSync(scene, { recursive: true, force: true })
+    }
   })
 
   it("reads a valid borrower registry record and reconciles it with the manifest it names", async () => {
     const scene = mkdtempSync(join(tmpdir(), "estate-registry-good-"))
-    const roots = join(scene, "R")
-    const entry = join(scene, "entry")
-    mkdirSync(join(roots, "git-super-retained-borrowers"), { recursive: true })
-    mkdirSync(entry, { recursive: true })
-    const manifestPath = join(entry, "manifest.json")
-    writeFileSync(manifestPath, `${JSON.stringify({ retainUntil: "2020-01-01T00:00:00Z" })}\n`)
-    writeFileSync(
-      join(roots, "git-super-retained-borrowers", "good.json"),
-      `${JSON.stringify({ retained: entry, manifest: manifestPath })}\n`,
-    )
-    const result = await scanEstate([roots], [join(scene, "E")])
-    expect(result.status).toBe("pass")
-    expect(result.registries).toHaveLength(1)
+    try {
+      const roots = join(scene, "R")
+      const entry = join(scene, "entry")
+      mkdirSync(join(roots, "git-super-retained-borrowers"), { recursive: true })
+      mkdirSync(entry, { recursive: true })
+      const manifestPath = join(entry, "manifest.json")
+      writeFileSync(manifestPath, `${JSON.stringify({ retainUntil: "2020-01-01T00:00:00Z" })}\n`)
+      writeFileSync(
+        join(roots, "git-super-retained-borrowers", "good.json"),
+        `${JSON.stringify({ retained: entry, manifest: manifestPath })}\n`,
+      )
+      const result = await scanEstate([roots], [join(scene, "E")])
+      expect(result.status).toBe("pass")
+      expect(result.registries).toHaveLength(1)
+    } finally {
+      rmSync(scene, { recursive: true, force: true })
+    }
   })
 
   it("records the at-risk OID's own type in the sidecar and names the ref whose closure carries it", async () => {

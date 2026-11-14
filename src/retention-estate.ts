@@ -14,7 +14,7 @@
  */
 import { createHash } from "node:crypto"
 import { existsSync, lstatSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs"
-import { readdir as readdirAsync } from "node:fs/promises"
+import { lstat as lstatAsync, readdir, readFile as readFileAsync, realpath as realpathAsync, stat as statAsync } from "node:fs/promises"
 import { cpus } from "node:os"
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { alternateEntries } from "./alternates.ts"
@@ -80,6 +80,33 @@ function registryDigest(dir: string): string {
     hash
       .update(`${name}\0`)
       .update(readFileSync(join(dir, name)))
+      .update("\0")
+  }
+  return hash.digest("hex")
+}
+
+// The walk's own copy of those three stamps, and of the canonical/object-dir reads, in async form. A `*Sync` call made
+// from inside an async worker blocks the one thread every worker shares, so the pool still ran at about two cores: the
+// first concurrent version scanned the whole estate in 346 s that way, against a 180 s target (#34272). `estateDelta`
+// keeps the sync forms above — it runs after the scan, on the apply path, and is not what a dry-run waits for.
+async function dirStampAsync(path: string): Promise<string> {
+  const stamp = await lstatAsync(path)
+  return `${stamp.ino}:${stamp.mtimeMs}:${stamp.ctimeMs}`
+}
+
+async function fileStampAsync(path: string): Promise<string> {
+  const link = await lstatAsync(path, { throwIfNoEntry: false })
+  if (link === undefined) return "absent"
+  const stamp = link.isSymbolicLink() ? await statAsync(path) : link
+  return `${link.dev}:${link.ino}:${link.size}:${link.ctimeMs}/${stamp.dev}:${stamp.ino}:${stamp.size}:${stamp.ctimeMs}`
+}
+
+async function registryDigestAsync(dir: string): Promise<string> {
+  const hash = createHash("sha256")
+  for (const name of (await readdir(dir)).filter((entry) => entry.endsWith(".json")).sort()) {
+    hash
+      .update(`${name}\0`)
+      .update(await readFileAsync(join(dir, name)))
       .update("\0")
   }
   return hash.digest("hex")
@@ -174,12 +201,30 @@ function canonical(path: string): string {
   }
 }
 
+async function canonicalAsync(path: string): Promise<string> {
+  try {
+    return await realpathAsync(path)
+  } catch {
+    return resolve(path)
+  }
+}
+
 /** A directory is an object store when it is named `objects` and carries pack/info (or is a symlink to one). */
 function isObjectDir(path: string): boolean {
   if (!existsSync(path)) return false
   const stat = statSync(path)
   if (!stat.isDirectory()) return false
   return existsSync(join(path, "pack")) || existsSync(join(path, "info"))
+}
+
+/** The walk's async form of {@link isObjectDir}: same answer, and no thread-blocking call inside a pool worker. */
+async function isObjectDirAsync(path: string): Promise<boolean> {
+  const store = await statAsync(path, { throwIfNoEntry: false })
+  if (store === undefined || !store.isDirectory()) return false
+  const parts = await Promise.all(
+    ["pack", "info"].map((name) => statAsync(join(path, name), { throwIfNoEntry: false })),
+  )
+  return parts.some((part) => part !== undefined)
 }
 
 export async function scanEstate(
@@ -231,14 +276,15 @@ export async function scanEstate(
   // objects-link target reached. Scanning a reached target is what makes the inventory the closed
   // transitive set the contract requires; it reads only `info/alternates`, never a pack store walk.
   const processedStores = new Set<string>()
-  const processStore = (store: string): EstateScan | undefined => {
+  const processStore = async (store: string): Promise<EstateScan | undefined> => {
     if (processedStores.has(store)) return undefined
     processedStores.add(store)
     objectDirs.add(store)
     const alternatesFile = join(store, "info", "alternates")
     // Stamped before the read, so a write racing the read shows as a change at the delta.
     try {
-      record?.alternates.set(alternatesFile, fileStamp(alternatesFile))
+      const stamp = await fileStampAsync(alternatesFile)
+      if (record !== undefined) record.alternates.set(alternatesFile, stamp)
     } catch (error) {
       return unknown(
         `cannot read alternates metadata ${alternatesFile}: ${error instanceof Error ? error.message : String(error)}`,
@@ -253,7 +299,7 @@ export async function scanEstate(
     }
     let content: string
     try {
-      content = readFileSync(alternatesFile, "utf8")
+      content = await readFileAsync(alternatesFile, "utf8")
     } catch (error) {
       return unknown(`cannot read ${alternatesFile}: ${error instanceof Error ? error.message : String(error)}`)
     }
@@ -262,7 +308,7 @@ export async function scanEstate(
     for (const { line, target } of declared) {
       let isDirectory: boolean
       try {
-        isDirectory = statSync(target).isDirectory()
+        isDirectory = (await statAsync(target)).isDirectory()
       } catch (error) {
         const code = (error as NodeJS.ErrnoException).code
         if (code === "ENOENT" || code === "ENOTDIR") {
@@ -274,9 +320,9 @@ export async function scanEstate(
         )
       }
       if (!isDirectory) return unknown(`${alternatesFile} names a non-directory alternate ${target}`)
-      const actual = canonical(target)
-      borrowers.push({ borrower: canonical(store), target: actual })
-      const nested = processStore(actual)
+      const actual = await canonicalAsync(target)
+      borrowers.push({ borrower: await canonicalAsync(store), target: actual })
+      const nested = await processStore(actual)
       if (nested !== undefined) return nested
     }
     return undefined
@@ -285,23 +331,22 @@ export async function scanEstate(
   // Read every borrower-registry record; an unreadable, malformed or stale proof is `unknown`. The
   // record names a survivor retained borrower of the holder's stores, so it is recorded as a reverse
   // link and a survivor-into-R is blocked without invoking the mutating lender guard.
-  const readRegistry = (dir: string): EstateScan | undefined => {
+  const readRegistry = async (dir: string): Promise<EstateScan | undefined> => {
     registryDirs.add(dir)
     let names: string[]
     try {
-      record?.registries.set(dir, registryDigest(dir))
-      names = readdirSync(dir)
-        .filter((name) => name.endsWith(".json"))
-        .sort()
+      const digest = await registryDigestAsync(dir)
+      if (record !== undefined) record.registries.set(dir, digest)
+      names = (await readdir(dir)).filter((name) => name.endsWith(".json")).sort()
     } catch (error) {
       return unknown(`cannot read borrower registry ${dir}: ${error instanceof Error ? error.message : String(error)}`)
     }
-    const holder = canonical(dirname(dir))
+    const holder = await canonicalAsync(dirname(dir))
     for (const name of names) {
       const file = join(dir, name)
       let bytes: string
       try {
-        bytes = readFileSync(file, "utf8")
+        bytes = await readFileAsync(file, "utf8")
       } catch (error) {
         return unknown(
           `cannot read borrower registry record ${file}: ${error instanceof Error ? error.message : String(error)}`,
@@ -330,7 +375,7 @@ export async function scanEstate(
       // Reconcile the record with the manifest it names: a stale or unreadable proof is unknown.
       let manifestBytes: string
       try {
-        manifestBytes = readFileSync(row.manifest as string, "utf8")
+        manifestBytes = await readFileAsync(row.manifest as string, "utf8")
       } catch (error) {
         return unknown(
           `borrower registry record ${file} names an unreadable manifest ${row.manifest}: ${error instanceof Error ? error.message : String(error)}`,
@@ -341,7 +386,7 @@ export async function scanEstate(
       } catch {
         return unknown(`borrower registry record ${file} names a manifest that is not valid JSON: ${row.manifest}`)
       }
-      borrowers.push({ borrower: canonical(row.retained as string), target: holder })
+      borrowers.push({ borrower: await canonicalAsync(row.retained as string), target: holder })
     }
     return undefined
   }
@@ -359,8 +404,9 @@ export async function scanEstate(
   const visit = async (current: string): Promise<void> => {
     let entries
     try {
-      record?.dirs.set(current, dirStamp(current))
-      entries = await readdirAsync(current, { withFileTypes: true })
+      const stamp = await dirStampAsync(current)
+      if (record !== undefined) record.dirs.set(current, stamp)
+      entries = await readdir(current, { withFileTypes: true })
     } catch (error) {
       // A recorded walk (a retirement batch) tolerates a directory that vanished after its parent listed it: it lends
       // nothing now, and if it was moved into a directory already read, that directory's stamp moved, so the
@@ -382,8 +428,8 @@ export async function scanEstate(
         }
         let target: string
         try {
-          target = realpathSync(path)
-          if (!statSync(target).isDirectory()) throw new Error("target is not a directory")
+          target = await realpathAsync(path)
+          if (!(await statAsync(target)).isDirectory()) throw new Error("target is not a directory")
         } catch (error) {
           walkFailure ??= unknown(
             `objects link ${path} has an unavailable or redirected target: ${error instanceof Error ? error.message : String(error)}`,
@@ -392,7 +438,7 @@ export async function scanEstate(
         }
         record?.objectLinks.set(path, target)
         borrowers.push({ borrower: path, target })
-        const nested = processStore(target)
+        const nested = await processStore(target)
         if (nested !== undefined) {
           walkFailure ??= nested
           return
@@ -400,8 +446,8 @@ export async function scanEstate(
         continue
       }
       if (!entry.isDirectory()) continue
-      if (entry.name === "objects" && isObjectDir(path)) {
-        const nested = processStore(path)
+      if (entry.name === "objects" && (await isObjectDirAsync(path))) {
+        const nested = await processStore(path)
         if (nested !== undefined) {
           walkFailure ??= nested
           return
@@ -409,7 +455,7 @@ export async function scanEstate(
         continue
       }
       if (entry.name === "git-super-retained-borrowers") {
-        const registry = readRegistry(path)
+        const registry = await readRegistry(path)
         if (registry !== undefined) {
           walkFailure ??= registry
           return
