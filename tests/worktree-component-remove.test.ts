@@ -7,7 +7,7 @@
  */
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs"
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises"
-import { join } from "node:path"
+import { join, relative } from "node:path"
 import { describe, expect, it } from "vitest"
 import { tryAcquireFlock } from "@bearly/flock"
 import {
@@ -552,10 +552,11 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
         expect(existsSync(join(preparingPath, "manifest.json"))).toBe(false)
         expect(reports).toBe(0)
         if (donor !== undefined) {
-          expect(readFileSync(join(copiedStore, "objects/info/alternates"), "utf8")).not.toContain(donorObjects)
+          const copiedDonorConsumer = join(preparingPath, "modules", relative(join(sourceGitDir, "modules"), sourceStore))
+          expect(readFileSync(join(copiedDonorConsumer, "objects/info/alternates"), "utf8")).not.toContain(donorObjects)
           expect(
-            existsSync(join(copiedStore, "objects", donorBlob.slice(0, 2), donorBlob.slice(2))),
-            JSON.stringify({ copiedStore, donorObjects, donorBlob, stores: readdirSync(join(preparingPath, "modules")) }),
+            existsSync(join(copiedDonorConsumer, "objects", donorBlob.slice(0, 2), donorBlob.slice(2))),
+            JSON.stringify({ copiedDonorConsumer, donorObjects, donorBlob }),
           ).toBe(true)
         }
         for (const owner of [sourceGitDir, sourceStore, ...(componentCustody ? [witnessDir] : [])]) {

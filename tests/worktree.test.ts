@@ -507,6 +507,7 @@ describe("createGitWorktreeStore", () => {
     "remove-failure-new-holder",
   ])("retains destroyed-checkout module custody before unregistering: %s", async (mode) => {
     const root = await mkdtemp(join(canonicalTmpdir(), "git-super-destroyed-custody-"))
+    let verifiedOutsideRoot = false
     try {
       const fixture = createProductFixture(root)
       const native = createLocalGitProcess()
@@ -514,6 +515,13 @@ describe("createGitWorktreeStore", () => {
         repo: fixture.product,
         gitProcess: {
           run: (request) => {
+            if (mode === "unlocked" && request.args.includes("fsck")) {
+              const common = git(fixture.product, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim()
+              const rootWriter = tryAcquireFlock(join(common, "yrd-worktree-mutations", "writer.lock"))
+              rootWriter?.release()
+              expect(rootWriter, "destroyed recovery must verify outside the root writer").not.toBeNull()
+              verifiedOutsideRoot = true
+            }
             if (mode.startsWith("remove-failure") && request.args[0] === "worktree" && request.args[1] === "remove") {
               if (mode === "remove-failure-new-holder") writeFileSync(join(admin, "locked"), "manual replacement\n")
               return Promise.resolve({ code: 1, stdout: "", stderr: "controlled native removal failure" })
@@ -620,6 +628,7 @@ describe("createGitWorktreeStore", () => {
         ).toBe(tip)
       } else {
         await recovery
+        if (mode === "unlocked") expect(verifiedOutsideRoot).toBe(true)
         expect(await store.inspect(linked)).toEqual({ registered: false })
         expect(existsSync(admin)).toBe(false)
       }

@@ -28,7 +28,6 @@ import {
   prepareRemovalBorrowers,
   prepareWorktreeModulesRetention,
   rehomeBorrowers,
-  retainWorktreeModules,
   type ComponentCustodyProof,
   type WorktreeRemovalProof,
   type WorktreeRetention,
@@ -2593,7 +2592,9 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       operation = `recover destroyed worktree ${path}`,
       retention?: WorktreeRetention,
     ): Promise<void> {
-      await mutate(operation, async () => {
+      const mutationDirectory = await mutationLock()
+      let mutationLease: WriterLock | undefined = await acquireMutationLock(mutationDirectory, operation)
+      try {
         try {
           await lstat(join(path, ".git"))
           throw new Error(`yrd: refusing destroyed-worktree recovery while '${path}/.git' still exists`)
@@ -2624,6 +2625,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
           )
         }
         const writerLeases = acquireRemovalWriterLeases(directory)
+        let preparedRetention: Awaited<ReturnType<typeof prepareWorktreeModulesRetention>> | undefined
         let releasedHold: { head: string; pointer: string; body: Uint8Array } | undefined
         try {
           if (retention === undefined) {
@@ -2635,7 +2637,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
             const pointer = await readFile(join(directory, "gitdir"), "utf8")
             const lock = identity.locked === undefined ? undefined : await readFile(join(directory, "locked"))
             const head = await git.text(repo, ["--git-dir", directory, "rev-parse", "--verify", "HEAD^{commit}"])
-            await retainWorktreeModules(
+            preparedRetention = await prepareWorktreeModulesRetention(
               git,
               repo,
               path,
@@ -2652,6 +2654,11 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
               undefined,
               { gitDir: directory, common, head },
             )
+            mutationLease.release()
+            mutationLease = undefined
+            await preparedRetention.verify()
+            mutationLease = await acquireMutationLock(mutationDirectory, operation)
+            await preparedRetention.complete()
             const current = await inspectWorktree(git, repo, path)
             if (
               !current.registered ||
@@ -2708,9 +2715,15 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
           }
           throw writerLeases.refusal(error)
         } finally {
-          writerLeases.release()
+          try {
+            preparedRetention?.discard()
+          } finally {
+            writerLeases.release()
+          }
         }
-      })
+      } finally {
+        mutationLease?.release()
+      }
     },
   })
 }

@@ -1460,7 +1460,6 @@ function retainPhysicalObjects(source: string, destination: string): void {
 /** New copies retain removable payload and borrow only canonical durable stores. */
 function normalizeRetainedModules(
   git: Git,
-  checkout: string,
   source: string,
   copy: string,
   common: string,
@@ -1541,7 +1540,7 @@ function normalizeRetainedModules(
     async verify() {
       const removedCaches: string[] = []
       for (const destination of objects) {
-        const args = ["-c", "protocol.allow=never", "--git-dir", dirname(destination), "--work-tree", checkout]
+        const args = ["-c", "protocol.allow=never", "--git-dir", dirname(destination), "--work-tree", copy]
         const graph = await git.run(copy, [...args, "commit-graph", "verify"], true, 300_000)
         if (graph.code !== 0) {
           if (graph.code !== 1) {
@@ -2129,7 +2128,6 @@ async function prepareResolvedWorktreeModules(context: {
       try {
         const normalized = normalizeRetainedModules(
           git,
-          copiedCheckout,
           privateProjection === undefined ? copiedSource : gitDir,
           privateProjection === undefined ? copiedTree : retained,
           borrowingCommon,
