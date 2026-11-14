@@ -16,6 +16,7 @@ import {
   mkdirSync,
   linkSync,
   mkdtempSync,
+  lstatSync,
   readdirSync,
   readFileSync,
   rmSync,
@@ -46,6 +47,13 @@ const environment: NodeJS.ProcessEnv = {
 
 function git(repo: string, args: readonly string[]): string {
   return execFileSync("git", ["-C", repo, ...args], { env: environment, encoding: "utf8" }).trim()
+}
+
+/** `du`-style allocated bytes for one tree, computed independently of the measurement under test. */
+function allocatedBytes(path: string): number {
+  const stat = lstatSync(path)
+  if (!stat.isDirectory()) return stat.blocks * 512
+  return readdirSync(path).reduce((total, name) => total + allocatedBytes(join(path, name)), stat.blocks * 512)
 }
 
 const sink = (): { write(value: string): void } => ({ write: () => undefined })
@@ -211,6 +219,19 @@ describe("retention retirement batch (#33010)", async () => {
     } finally {
       vi.mocked(linkSync).mockImplementation(originalLink)
     }
+  })
+
+  // The byte total is what an operator approves a deletion against (#34272), so it is measured from the entries the
+  // batch would retire, in allocated blocks, and it says so when it could not read part of them.
+  it("a dry run reports the allocated bytes of exactly the entries it would retire", async () => {
+    const plan = options()
+    const result = await retireRetainedBatch(plan)
+    expect(result.rows.every((row) => row.outcome === "would-retire")).toBe(true)
+    const planned = result.rows.reduce((total, row) => total + allocatedBytes(row.entry), 0)
+    expect(result.bytesUnreadable).toBe(0)
+    expect(result.bytesPlanned).toBe(planned)
+    // Allocated blocks, not apparent size: the fixture holds directories whose size field is well under their blocks.
+    expect(result.bytesPlanned).toBeGreaterThan(planned === 0 ? -1 : 0)
   })
 
   // CTO cbd8921c: after successful deletion, an external pointer cleanup failure must say both that the entry

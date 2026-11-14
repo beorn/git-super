@@ -331,6 +331,18 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
   }
   const ownerSummary: { current?: RetentionBatchResult["owners"] } = {}
   const byteSummary: { current?: Awaited<ReturnType<typeof measureRetainedBytes>> } = {}
+  // The byte total is a measurement of the trees being removed, taken once the rows are final: it is the number an
+  // operator approves a deletion against, so it is never an estimate from the manifests (which carry path -> sha256 and
+  // no sizes) and it names any subtree it could not read. A dry run is where that number is read, so it measures there
+  // too, not only on the apply path.
+  const measurePlannedBytes = async (): Promise<void> => {
+    byteSummary.current = await measureRetainedBytes(
+      entries.filter((entry) => {
+        const outcome = rows.get(entry)?.outcome
+        return outcome === "would-retire" || outcome === "retired"
+      }),
+    )
+  }
   const result = (windows: BatchWindow[], stopped?: string): RetentionBatchResult => ({
     apply,
     warnings,
@@ -436,6 +448,7 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
         ...(evidence === undefined ? {} : { evidence }),
       })
     }
+    await measurePlannedBytes()
     return result([], ownerStop)
   }
   if (ownerStop !== undefined) {
@@ -599,14 +612,6 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
       return result(windows, stopped)
     }
   }
-  // The byte total is a measurement of the trees being removed, taken once the rows are final: it is the number an
-  // operator approves a deletion against, so it is never an estimate from the manifests (which carry path -> sha256 and
-  // no sizes) and it names any subtree it could not read.
-  byteSummary.current = await measureRetainedBytes(
-    entries.filter((entry) => {
-      const outcome = rows.get(entry)?.outcome
-      return outcome === "would-retire" || outcome === "retired"
-    }),
-  )
+  await measurePlannedBytes()
   return result(windows)
 }
