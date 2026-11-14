@@ -506,6 +506,31 @@ describe("retention retirement batch (#33010)", async () => {
     expect(result.windows).toEqual([expect.objectContaining({ entries: [], delta: "changed" })])
   })
 
+  // @cto 2026-11-14 (34127 REVISE): the shape a churning worktree leaves mid-scan. A recorded store that is GONE by
+  // the time the lease window opens is caught by the estate delta, not by the owner pass — so any future rule that
+  // admits absence has to relax THIS stop, not just the identity-unknown one. Characterization: the stop is the
+  // expected behaviour and this test must fail loudly if a change quietly admits it.
+  it("a recorded store removed between the scan and the lease window ends the batch, named by the estate delta", async () => {
+    // Inside an entry, so the owner pass skips it (entries are the deletion set, not lease owners) and the DELTA is
+    // the first gate that can see it go. This is the gate a future "admit absence" rule would have to relax.
+    const [first] = readdirSync(root).sort() as [string]
+    const vanishing = join(root, first, "modules", "vendor", "vanishing", "objects")
+    mkdirSync(join(vanishing, "info"), { recursive: true })
+    mkdirSync(join(vanishing, "pack"), { recursive: true })
+    const result = await retireRetainedBatch(
+      options({ apply: true, afterScan: () => rmSync(vanishing, { recursive: true, force: true }) }),
+    )
+    expect(result.stopped).toContain("census-shifted")
+    expect(result.stopped).toContain(`object directory ${vanishing} vanished`)
+    expect(result.stopped).not.toContain("identity-unknown")
+    expect(
+      result.rows.every((row) => row.outcome === "kept"),
+      JSON.stringify(result.rows),
+    ).toBe(true)
+    expect(readdirSync(root)).toHaveLength(3)
+    expect(result.windows).toEqual([expect.objectContaining({ entries: [], delta: "changed" })])
+  })
+
   // @cto 2026-11-14 (34127): the undirected walk that used to keep every alternates-connected store is gone. A live
   // owner with no lease protects the stores it BORROWS FROM (survivorIntoRemoval / entryView), never a sibling that
   // merely borrows from the same common store: alternates is borrower -> lender, one direction only. Amends
