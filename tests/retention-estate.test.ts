@@ -374,5 +374,25 @@ describe("retention estate scan — gate 3 (#27443(b))", async () => {
         chmodSync(locked, 0o755)
       }
     })
+
+    // @cto 7a5c26cd B2: the object-store probe runs outside visit's own try blocks. A probe that fails there must be a
+    // verdict naming the directory, exactly as the serial walk answered, never a rejected scan.
+    test("an `objects` probe that fails ends the pass as unknown instead of throwing", async () => {
+      const namespace = tmp("git-super-estate-probe-")
+      objectDir(join(namespace, "readable", "repo"), ".git")
+      const broken = join(namespace, "broken", "objects")
+      mkdirSync(join(broken, "info"), { recursive: true })
+      // `pack` is a symlink loop, so stat reports ELOOP: not an absence the walk may skip, and not a crash either.
+      symlinkSync(join(broken, "pack"), join(broken, "pack"))
+      for (const scan of [
+        await scanEstate([namespace], []),
+        await scanEstate([namespace], [], { ...DEFAULT_ESTATE_BOUNDS, workers: 1 }),
+      ]) {
+        expect(scan.status).toBe("unknown")
+        // The probe runs while `broken` is being listed, so that directory is the one the verdict names.
+        expect(scan.detail).toContain(`cannot read ${join(namespace, "broken")}`)
+        expect(scan.detail).toContain(join(broken, "pack"))
+      }
+    })
   })
 })

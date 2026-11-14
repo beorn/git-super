@@ -98,6 +98,8 @@ export type RetentionBatchResult = Readonly<{
   rows: readonly BatchRow[]
   /** Allocated bytes the batch would free, measured from the retained stores themselves (never an estimate). */
   bytesPlanned?: number
+  /** Allocated bytes in files the batch would NOT free, because those files are also linked outside the set. */
+  bytesSharedLinked?: number
   /** Paths the byte total could not read; non-zero means the figure understates what would be freed. */
   bytesUnreadable?: number
   /** Set when the batch stopped early; every entry not yet deleted is kept. */
@@ -350,7 +352,13 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
     ...(ownerSummary.current === undefined ? {} : { owners: ownerSummary.current }),
     ...(byteSummary.current === undefined
       ? {}
-      : { bytesPlanned: byteSummary.current.bytes, bytesUnreadable: byteSummary.current.unreadable }),
+      : {
+          bytesPlanned: byteSummary.current.bytes,
+          bytesUnreadable: byteSummary.current.unreadable,
+          ...(byteSummary.current.sharedBytes === undefined
+            ? {}
+            : { bytesSharedLinked: byteSummary.current.sharedBytes }),
+        }),
     windows,
     rows: entries.map(
       (entry) => rows.get(entry) ?? { entry, outcome: "not-reached", reason: stopped ?? "not evaluated" },

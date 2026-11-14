@@ -95,10 +95,31 @@ async function dirStampAsync(path: string): Promise<string> {
 }
 
 async function fileStampAsync(path: string): Promise<string> {
-  const link = await lstatAsync(path, { throwIfNoEntry: false })
-  if (link === undefined) return "absent"
-  const stamp = link.isSymbolicLink() ? await statAsync(path) : link
+  // ENOENT is handled here, in words, rather than left to `throwIfNoEntry` on the promises API (@cto 7a5c26cd B3): the
+  // package also supports a Node whose promises option I have not verified, and "absent" must not rest on a quirk.
+  let link
+  try {
+    link = await lstatAsync(path)
+  } catch (error) {
+    if (absent(error)) return "absent"
+    throw error
+  }
+  let stamp = link
+  if (link.isSymbolicLink()) {
+    try {
+      stamp = await statAsync(path)
+    } catch (error) {
+      if (absent(error)) return "absent"
+      throw error
+    }
+  }
   return `${link.dev}:${link.ino}:${link.size}:${link.ctimeMs}/${stamp.dev}:${stamp.ino}:${stamp.size}:${stamp.ctimeMs}`
+}
+
+/** A path that is not there: absent, or a parent that is not a directory. Any other error is a read failure. */
+function absent(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException).code
+  return code === "ENOENT" || code === "ENOTDIR"
 }
 
 async function registryDigestAsync(dir: string): Promise<string> {
@@ -219,10 +240,23 @@ function isObjectDir(path: string): boolean {
 
 /** The walk's async form of {@link isObjectDir}: same answer, and no thread-blocking call inside a pool worker. */
 async function isObjectDirAsync(path: string): Promise<boolean> {
-  const store = await statAsync(path, { throwIfNoEntry: false })
-  if (store === undefined || !store.isDirectory()) return false
+  let store
+  try {
+    store = await statAsync(path)
+  } catch (error) {
+    if (absent(error)) return false
+    throw error
+  }
+  if (!store.isDirectory()) return false
   const parts = await Promise.all(
-    ["pack", "info"].map((name) => statAsync(join(path, name), { throwIfNoEntry: false })),
+    ["pack", "info"].map(async (name) => {
+      try {
+        return await statAsync(join(path, name))
+      } catch (error) {
+        if (absent(error)) return undefined
+        throw error
+      }
+    }),
   )
   return parts.some((part) => part !== undefined)
 }
@@ -391,8 +425,9 @@ export async function scanEstate(
     return undefined
   }
 
-  // The walk is I/O bound and the estate is millions of directories (#34270: 2,492,722 under `/hh` + `/home/hh`,
-  // measured 2026-11-14 at ~10.4 k readdir/s on one thread, so ~240 s of floor before a single alternates file opens).
+  // The walk is I/O bound and the estate is millions of directories (#34270: a 240 s capped one-thread walk still had
+  // 1,286 directories left, and the completed scan records 10,409,624 of them under `/hh` + `/home/hh` at ~10.4 k
+  // readdir/s, so the serial floor alone is many minutes before a single alternates file opens).
   // A bounded pool visits the SAME nodes: same roots, same push rule, same store/registry handling, same `unknown`
   // policy, same record — only the overlap changes. Every collected set is sorted below, so the bytes this produces do
   // not depend on scheduling.
@@ -490,6 +525,10 @@ export async function scanEstate(
       inFlight += 1
       try {
         await visit(current)
+      } catch (error) {
+        // A read that fails outside visit's own try blocks (an `objects` probe on ELOOP or EACCES is one) is a verdict,
+        // not a crash (@cto 7a5c26cd B2): the serial walk answered `unknown` naming the directory, and so does this one.
+        walkFailure ??= unknown(`cannot read ${current}: ${error instanceof Error ? error.message : String(error)}`)
       } finally {
         inFlight -= 1
       }

@@ -8,6 +8,12 @@
  * A path that cannot be read is COUNTED, never silently dropped: the caller prints the count beside the total, because a
  * total that quietly excludes a subtree would understate the deletion it is asking an operator to approve.
  *
+ * A HARD LINK is one file, not several (@cto 7a5c26cd B1). Counting blocks per directory entry would count one inode
+ * once per link, and would count a file whose other link lives outside the set even though removing the set frees none
+ * of it. Local clones hard-link packs, so both cases are ordinary here. An inode with more than one link is therefore
+ * counted once, and only when every one of its links was seen inside the set; the rest is reported separately, because
+ * an operator has to know how much of the figure is not actually freed.
+ *
  * The walk is the same bounded-pool shape as the estate scan: a store set of thousands of trees is I/O bound, and the
  * number is only ever read by a human deciding whether to delete.
  */
@@ -15,8 +21,10 @@ import { lstat, readdir } from "node:fs/promises"
 import { join } from "node:path"
 
 export interface RetainedBytes {
-  /** Allocated bytes under every readable path in the named roots. */
+  /** Allocated bytes the removal frees: every single-link entry plus every inode whose links are all inside the set. */
   readonly bytes: number
+  /** Allocated bytes NOT freed: files also linked outside the set, which stay on disk after the set is removed. */
+  readonly sharedBytes?: number
   /** Paths that could not be read or listed: their bytes are NOT in `bytes`. */
   readonly unreadable: number
   /** First unreadable path, so the count can be acted on rather than guessed at. */
@@ -40,6 +48,8 @@ export async function measureRetainedBytes(roots: readonly string[], workers = 8
   let bytes = 0
   let unreadable = 0
   let unreadableExample: string | undefined
+  // One entry per inode seen through more than one link; `links` counts the names this walk has actually read.
+  const linkedInodes = new Map<string, { blocks: number; nlink: number; links: number }>()
   const pending: string[] = [...roots]
   let inFlight = 0
 
@@ -56,7 +66,16 @@ export async function measureRetainedBytes(roots: readonly string[], workers = 8
       }
       return
     }
-    bytes += stat.blocks * 512
+    const allocated = stat.blocks * 512
+    if (!stat.isDirectory() && stat.nlink > 1) {
+      const key = `${stat.dev}:${stat.ino}`
+      const seen = linkedInodes.get(key)
+      if (seen === undefined) linkedInodes.set(key, { blocks: allocated, nlink: stat.nlink, links: 1 })
+      else seen.links += 1
+    } else {
+      // A directory's own link count carries its subdirectories, so it is never a shared-file question.
+      bytes += allocated
+    }
     if (!stat.isDirectory()) return
     let entries
     try {
@@ -90,5 +109,15 @@ export async function measureRetainedBytes(roots: readonly string[], workers = 8
     }
   }
   await Promise.all(Array.from({ length: Math.max(1, workers) }, () => worker()))
-  return unreadableExample === undefined ? { bytes, unreadable } : { bytes, unreadable, unreadableExample }
+  let sharedBytes = 0
+  for (const inode of linkedInodes.values()) {
+    if (inode.links >= inode.nlink) bytes += inode.blocks
+    else sharedBytes += inode.blocks
+  }
+  return {
+    bytes,
+    ...(sharedBytes === 0 ? {} : { sharedBytes }),
+    unreadable,
+    ...(unreadableExample === undefined ? {} : { unreadableExample }),
+  }
 }

@@ -6,7 +6,7 @@
  * @consumer `yrd env retained --retire-expired` dry-run; #34270
  * @testonly none
  */
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs"
+import { chmodSync, linkSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, test } from "vitest"
@@ -80,5 +80,42 @@ describe("retained bytes (#34270)", async () => {
     expect(formatRetainedBytes(999)).toBe("999 B")
     expect(formatRetainedBytes(1536)).toBe("1.5 KiB (1,536 B)")
     expect(formatRetainedBytes(13_014_125_285)).toBe("12.1 GiB (13,014,125,285 B)")
+  })
+
+  // @cto 7a5c26cd B1: local clones hard-link packs, so one inode with several names is ordinary, not exotic.
+  test("one inode with two links inside the set is counted once, and its bytes are freed", async () => {
+    const root = tmp("git-super-retained-bytes-links-")
+    const store = join(root, "store")
+    const pack = join(store, "pack")
+    mkdirSync(pack, { recursive: true })
+    const first = join(pack, "a.pack")
+    const second = join(pack, "b.pack")
+    writeFileSync(first, "x".repeat(4096))
+    linkSync(first, second)
+    const inode = statSync(first)
+    expect(inode.nlink).toBe(2)
+    const directories = [root, store, pack].reduce((total, path) => total + statSync(path).blocks * 512, 0)
+
+    const measured = await measureRetainedBytes([root], 1)
+    // The inode appears under two names but occupies its blocks once.
+    expect(measured).toEqual({ bytes: directories + inode.blocks * 512, unreadable: 0 })
+  })
+
+  test("a file also linked outside the set is not counted as freed, it is named separately", async () => {
+    const root = tmp("git-super-retained-bytes-shared-")
+    const outside = tmp("git-super-retained-bytes-outside-")
+    const store = join(root, "store")
+    mkdirSync(store, { recursive: true })
+    const kept = join(store, "shared.pack")
+    writeFileSync(kept, "x".repeat(4096))
+    linkSync(kept, join(outside, "shared.pack"))
+    const inode = statSync(kept)
+    expect(inode.nlink).toBe(2)
+    const directories = [root, store].reduce((total, path) => total + statSync(path).blocks * 512, 0)
+
+    const measured = await measureRetainedBytes([root], 1)
+    // Removing the store frees nothing of that inode: the outside link keeps the bytes alive.
+    expect(measured.bytes).toBe(directories)
+    expect(measured.sharedBytes).toBe(inode.blocks * 512)
   })
 })

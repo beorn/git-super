@@ -1376,6 +1376,9 @@ async function writeResult(
         (batch.bytesPlanned === undefined
           ? ""
           : `; ${formatRetainedBytes(batch.bytesPlanned)} allocated in the selected stores` +
+            (batch.bytesSharedLinked === undefined
+              ? ""
+              : `, plus ${formatRetainedBytes(batch.bytesSharedLinked)} in files also linked outside the set, not freed`) +
             (batch.bytesUnreadable === undefined || batch.bytesUnreadable === 0
               ? ""
               : ` (${batch.bytesUnreadable} unreadable path(s) NOT counted, so the figure understates the free space)`)) +
