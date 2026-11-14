@@ -447,11 +447,16 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
         const product = fixture.product
         const target = join(root, "target")
         const retainedRoot = join(root, "retained")
+        const concurrentTarget = !componentCustody && mode === "unchanged" ? join(root, "concurrent-target") : undefined
         const unrelatedEntry = join(retainedRoot, "other-keeper")
         mkdirSync(unrelatedEntry, { recursive: true })
         writeFileSync(join(unrelatedEntry, "keep.txt"), "another invocation's custody\n")
         git(product, "worktree", "add", "--detach", target)
         git(target, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
+        if (concurrentTarget !== undefined) {
+          git(product, "worktree", "add", "--detach", concurrentTarget)
+          git(concurrentTarget, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
+        }
         const sourceGitDir = git(target, "rev-parse", "--absolute-git-dir")
         const sourceStore = git(join(target, "packages/alpha"), "rev-parse", "--absolute-git-dir")
         const witnessDir = git(
@@ -537,6 +542,17 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
         if (mode === "source-changed") writeFileSync(join(sourceStore, "description"), "changed source metadata\n")
         contender?.release()
         contender = undefined
+        if (concurrentTarget !== undefined) {
+          let concurrentReports = 0
+          await store.remove(concurrentTarget, {
+            retention: { root: join(root, "concurrent-retained"), report: () => concurrentReports++ },
+          })
+          expect(concurrentReports).toBe(1)
+          expect(existsSync(concurrentTarget)).toBe(false)
+          expect((await store.inspect(concurrentTarget)).registered).toBe(false)
+          expect(existsSync(target)).toBe(true)
+          expect(reports).toBe(0)
+        }
         resume.resolve()
         const outcome = await removal.then(
           (value) => ({ value, error: undefined }),
