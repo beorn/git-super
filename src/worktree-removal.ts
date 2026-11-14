@@ -1458,7 +1458,7 @@ function retainPhysicalObjects(source: string, destination: string): void {
 }
 
 /** New copies retain removable payload and borrow only canonical durable stores. */
-async function normalizeRetainedModules(
+function normalizeRetainedModules(
   git: Git,
   checkout: string,
   source: string,
@@ -1467,7 +1467,7 @@ async function normalizeRetainedModules(
   lender: string,
   operationRoots: readonly string[],
   fullIntegrity: boolean,
-): Promise<ReadonlySet<string>> {
+): { borrowed: ReadonlySet<string>; verify: () => Promise<readonly string[]> } {
   const canonicalCommon = realpathSync(common)
   const borrowed = new Set<string>()
   const objects = [...borrowerEntries(copy, undefined)]
@@ -1513,19 +1513,6 @@ async function normalizeRetainedModules(
     writeFileSync(staged, durable.size === 0 ? "" : `${[...durable].join("\n")}\n`, { flag: "wx" })
     renameSync(staged, alternates)
     for (const store of durable) borrowed.add(store)
-    const args = ["-c", "protocol.allow=never", "--git-dir", dirname(destination), "--work-tree", checkout]
-    const graph = await git.run(copy, [...args, "commit-graph", "verify"], true, 300_000)
-    if (graph.code !== 0) {
-      if (graph.code !== 1) {
-        throw new Error(graph.stderr.trim() || `commit-graph verification exited ${graph.code}; worktree preserved`)
-      }
-      const caches = [join(info, "commit-graph"), join(info, "commit-graphs")]
-      for (const cache of caches) {
-        if (lstatSync(cache, { throwIfNoEntry: false }) !== undefined) rmSync(cache, { recursive: true })
-      }
-      await git.run(copy, [...args, "commit-graph", "verify"], false, 300_000)
-    }
-    await git.run(copy, [...args, "fsck", fullIntegrity ? "--full" : "--connectivity-only"], false, 300_000)
   }
   const dependency = retainedAlternatesDependency(
     copy,
@@ -1547,7 +1534,32 @@ async function normalizeRetainedModules(
         : `retained copy ${copy} still borrows removable stores; worktree preserved`,
     )
   }
-  return borrowed
+  // This existing dependency proof runs before the caller can release the root writer.
+  // Verification below reads only our normalized copy and its canonical durable alternates.
+  return {
+    borrowed,
+    async verify() {
+      const removedCaches: string[] = []
+      for (const destination of objects) {
+        const args = ["-c", "protocol.allow=never", "--git-dir", dirname(destination), "--work-tree", checkout]
+        const graph = await git.run(copy, [...args, "commit-graph", "verify"], true, 300_000)
+        if (graph.code !== 0) {
+          if (graph.code !== 1) {
+            throw new Error(graph.stderr.trim() || `commit-graph verification exited ${graph.code}; worktree preserved`)
+          }
+          for (const cache of [join(destination, "info/commit-graph"), join(destination, "info/commit-graphs")]) {
+            if (lstatSync(cache, { throwIfNoEntry: false }) !== undefined) {
+              rmSync(cache, { recursive: true })
+              removedCaches.push(cache)
+            }
+          }
+          await git.run(copy, [...args, "commit-graph", "verify"], false, 300_000)
+        }
+        await git.run(copy, [...args, "fsck", fullIntegrity ? "--full" : "--connectivity-only"], false, 300_000)
+      }
+      return removedCaches
+    },
+  }
 }
 
 function validateRetainedObjectsDeclarations(proof: Record<string, unknown>, retained: string): boolean | string {
@@ -1769,6 +1781,7 @@ export async function retainWorktreeModules(
     { unpublished: false },
   )
   try {
+    await prepared.verify()
     return await prepared.complete()
   } finally {
     prepared.discard()
@@ -1794,7 +1807,7 @@ export async function prepareWorktreeModulesRetention(
   destroyed?: Readonly<{ gitDir: string; common: string; head: string }>,
   componentCustody?: ComponentCustodyProof,
   preparation: Readonly<{ unpublished: boolean }> = { unpublished: true },
-): Promise<{ complete: () => Promise<WorktreeRemovalProof>; discard: () => void }> {
+): Promise<{ verify: () => Promise<void>; complete: () => Promise<WorktreeRemovalProof>; discard: () => void }> {
   const { unpublished } = preparation
   const path = destroyed === undefined ? realpathSync(requested) : resolve(requested)
   if (privateProjection === undefined && destroyed === undefined) {
@@ -1863,7 +1876,7 @@ async function prepareResolvedWorktreeModules(context: {
   destroyedHead: string | undefined
   componentCustody: ComponentCustodyProof | undefined
   unpublished: boolean
-}): Promise<{ complete: () => Promise<WorktreeRemovalProof>; discard: () => void }> {
+}): Promise<{ verify: () => Promise<void>; complete: () => Promise<WorktreeRemovalProof>; discard: () => void }> {
   const {
     git,
     path,
@@ -1958,7 +1971,6 @@ async function prepareResolvedWorktreeModules(context: {
   mkdirSync(canonical, { recursive: true })
   onRetainedPath?.(canonical)
   const retainedRoot = mkdtempSync(join(canonical, `${basename(gitDir)}-`))
-  onRetainedPath?.(retainedRoot)
   const preparationPath = join(retainedRoot, "preparation.json")
   let ownsPreparation = false
   let sharedMutationStarted = false
@@ -1977,6 +1989,7 @@ async function prepareResolvedWorktreeModules(context: {
       )
       ownsPreparation = true
     }
+    onRetainedPath?.(retainedRoot)
     const copiedSource = privateProjection === undefined ? modules : path
     const copiedCheckout = privateProjection === undefined ? path : join(retainedRoot, "checkout")
     const copiedTree = privateProjection === undefined ? join(retainedRoot, "modules") : copiedCheckout
@@ -2087,6 +2100,7 @@ async function prepareResolvedWorktreeModules(context: {
     // One transform handles ordinary, destroyed and attested private metadata.
     let finalRetainedManifest = retainedManifest
     let retainedBorrowing: ReadonlySet<string> = new Set()
+    let verifyNormalized: (() => Promise<readonly string[]>) | undefined
     if (retained !== null) {
       let borrowingCommon = common
       if (privateProjection !== undefined) {
@@ -2113,7 +2127,7 @@ async function prepareResolvedWorktreeModules(context: {
         }
       }
       try {
-        retainedBorrowing = await normalizeRetainedModules(
+        const normalized = normalizeRetainedModules(
           git,
           copiedCheckout,
           privateProjection === undefined ? copiedSource : gitDir,
@@ -2123,6 +2137,8 @@ async function prepareResolvedWorktreeModules(context: {
           [path, gitDir],
           privateProjection !== undefined,
         )
+        retainedBorrowing = normalized.borrowed
+        verifyNormalized = normalized.verify
       } catch (error) {
         if (unpublished) discard()
         else rmSync(retainedRoot, { recursive: true })
@@ -2151,26 +2167,34 @@ async function prepareResolvedWorktreeModules(context: {
         throw new Error(`worktree ${path} changed during retention; preserved, retry after its writer stops`)
       }
     }
+    let verified = false
     return {
       discard,
+      async verify() {
+        if (verified) return
+        try {
+          const removedCaches = (await verifyNormalized?.()) ?? []
+          // Only the verifier's explicit derived-cache removals may change the prepared snapshot.
+          const removed = removedCaches.map((cache) => relative(copiedTree, cache))
+          expectedCopy = Object.fromEntries(
+            Object.entries(expectedCopy).filter(([key]) => !removed.some((cache) => key === cache || key.startsWith(`${cache}${sep}`))),
+          )
+          verifyRetainedManifest()
+          if (retained !== null) finalRetainedManifest = manifest(copiedTree, copiedCustody, true, privateProjection !== undefined)
+          verified = true
+        } catch (error) {
+          if (unpublished) discard()
+          else rmSync(retainedRoot, { recursive: true })
+          throw error
+        }
+      },
       async complete() {
+        if (!verified) throw new Error(`retained integrity verification is incomplete for ${path}; worktree preserved`)
         // Re-read source and normalized copy only after the caller reacquires the root writer.
         if (unpublished) {
           verifyRetainedManifest()
           guardRetainedBorrowers(common, gitDir, "inspect")
         }
-        // Beyond preparation a borrower may rely on this child; an absent manifest must read as unknown.
-        if (ownsPreparation) {
-          unlinkSync(preparationPath)
-          ownsPreparation = false
-        }
-        sharedMutationStarted = true
-        const rehomedBorrowers =
-          privateProjection === undefined
-            ? rehome === undefined
-              ? rehomeBorrowers(common, gitDir, modules)
-              : rehome()
-            : []
         const inspectedPath = copiedCheckout
         const after =
           destroyedHead === undefined
@@ -2189,6 +2213,18 @@ async function prepareResolvedWorktreeModules(context: {
         if (before === undefined && destroyedHead === undefined) {
           throw new Error(`private snapshot missing for ${path}; worktree preserved`)
         }
+        // Pre-mutation refusals still own their marker and can discard the unreferenced child.
+        if (ownsPreparation) {
+          unlinkSync(preparationPath)
+          ownsPreparation = false
+        }
+        sharedMutationStarted = true
+        const rehomedBorrowers =
+          privateProjection === undefined
+            ? rehome === undefined
+              ? rehomeBorrowers(common, gitDir, modules)
+              : rehome()
+            : []
         const proof: WorktreeRemovalProof = {
           path,
           head: destroyedHead ?? (await git.commit(inspectedPath, "HEAD")),

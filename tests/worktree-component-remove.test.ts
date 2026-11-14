@@ -428,10 +428,10 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
    * The custody-gap table pauses witness proof, before the distinct retention normalization stage.
    */
   it.each(
-    (["unchanged", "source-changed", "copy-changed", "failed-preparation", "publication-failed"] as const).flatMap(
+    (["unchanged", "source-changed", "copy-changed", "failed-preparation", "publication-failed", "linked-donor"] as const).flatMap(
       (mode) => [
         { mode, componentCustody: false },
-        { mode, componentCustody: true },
+        ...(mode === "linked-donor" ? [] : [{ mode, componentCustody: true }]),
       ],
     ),
   )(
@@ -448,6 +448,9 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
         const target = join(root, "target")
         const retainedRoot = join(root, "retained")
         const concurrentTarget = !componentCustody && mode === "unchanged" ? join(root, "concurrent-target") : undefined
+        const donor = mode === "linked-donor" ? join(root, "linked-donor") : undefined
+        let donorObjects = ""
+        let donorBlob = ""
         const unrelatedEntry = join(retainedRoot, "other-keeper")
         mkdirSync(unrelatedEntry, { recursive: true })
         writeFileSync(join(unrelatedEntry, "keep.txt"), "another invocation's custody\n")
@@ -466,6 +469,15 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
           "--git-common-dir",
         )
         const common = git(product, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        if (donor !== undefined) {
+          git(product, "worktree", "add", "--detach", donor)
+          git(donor, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
+          const donorRepo = join(donor, "packages/alpha")
+          donorObjects = join(git(donorRepo, "rev-parse", "--absolute-git-dir"), "objects")
+          writeFileSync(join(root, "donor-blob"), "retained removable donor payload\n")
+          donorBlob = git(donorRepo, "hash-object", "-w", join(root, "donor-blob"))
+          writeFileSync(join(sourceStore, "objects/info/alternates"), `${donorObjects}\n`)
+        }
         const local = createLocalGitProcess()
         let paused = false
         let copiedStore = ""
@@ -477,6 +489,11 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
           gitProcess: {
             ...local,
             async run(request) {
+              if (mode === "linked-donor" && copiedStore === "" && request.args.includes("status")) {
+                const preparationWriter = tryAcquireFlock(join(common, "yrd-worktree-mutations", "writer.lock"))
+                preparationWriter?.release()
+                expect(preparationWriter, "donor-dependent preparation must keep the root writer").toBeNull()
+              }
               // Completion reads status after preparation, on both removal paths.
               if (
                 mode === "copy-changed" &&
@@ -534,6 +551,13 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
         expect(typeof marker.createdAt === "string" && Number.isFinite(Date.parse(marker.createdAt))).toBe(true)
         expect(existsSync(join(preparingPath, "manifest.json"))).toBe(false)
         expect(reports).toBe(0)
+        if (donor !== undefined) {
+          expect(readFileSync(join(copiedStore, "objects/info/alternates"), "utf8")).not.toContain(donorObjects)
+          expect(
+            existsSync(join(copiedStore, "objects", donorBlob.slice(0, 2), donorBlob.slice(2))),
+            JSON.stringify({ copiedStore, donorObjects, donorBlob, stores: readdirSync(join(preparingPath, "modules")) }),
+          ).toBe(true)
+        }
         for (const owner of [sourceGitDir, sourceStore, ...(componentCustody ? [witnessDir] : [])]) {
           const competingOwner = tryAcquireFlock(join(owner, "yrd-worktree-mutations", "writer.lock"))
           competingOwner?.release()
@@ -562,7 +586,7 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
           expect(changedPreparedCopy, "the prepared copy was actually changed after hashing").toBe(true)
         }
         expect(readFileSync(join(unrelatedEntry, "keep.txt"), "utf8")).toBe("another invocation's custody\n")
-        if (mode === "unchanged") {
+        if (mode === "unchanged" || mode === "linked-donor") {
           expect(outcome.error).toBeUndefined()
           expect(outcome.value ?? {}).not.toHaveProperty("custodyRefusal")
           expect(existsSync(target)).toBe(false)
@@ -571,11 +595,8 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
           expect(ownEntry).toBeTruthy()
           expect(existsSync(join(retainedRoot, ownEntry!, "manifest.json"))).toBe(true)
           expect(existsSync(join(retainedRoot, ownEntry!, "preparation.json"))).toBe(false)
-        } else if (mode === "publication-failed" || mode === "copy-changed") {
-          if (mode === "publication-failed") {
-            expect(blockedPublication, "manifest publication was actually blocked").toBe(true)
-          }
-          // These faults occur during completion, after borrower mutation can have begun: keep the child.
+        } else if (mode === "publication-failed") {
+          expect(blockedPublication, "manifest publication was actually blocked").toBe(true)
           expect(outcome.error).toBeInstanceOf(Error)
           expect(existsSync(target)).toBe(true)
           expect((await store.inspect(target)).registered).toBe(true)

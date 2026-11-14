@@ -1921,6 +1921,9 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
                   }
                 }
                 if (custodyRefusal === undefined && removeOptions.retention !== undefined) {
+                  mutationLease = await acquireMutationLock(mutationDirectory, holder)
+                  heldFrom = Date.now()
+                  const preparationStarted = Date.now()
                   preparedRetention = await prepareWorktreeModulesRetention(
                     git,
                     repo,
@@ -1939,6 +1942,9 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
                     undefined,
                     componentCustodyProof,
                   )
+                  markPhase("retainedPreparation", preparationStarted)
+                  releaseMutation()
+                  await preparedRetention.verify()
                 }
                 markPhase("unlockedProof", proofStarted)
                 let postFreshness: ComputedCustodyFreshness | undefined
@@ -2080,10 +2086,8 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
                 return
               }
             }
-            // Source owners stay leased; only publication and native removal need the root writer.
-            releaseMutation()
-            const proofStarted = Date.now()
-            try {
+            // Donor-dependent copying/normalization stays under the root writer.
+            const preparationStarted = Date.now()
               preparedRetention = await prepareWorktreeModulesRetention(
                 git,
                 repo,
@@ -2102,6 +2106,11 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
                 undefined,
                 componentCustodyProof,
               )
+            markPhase("retainedPreparation", preparationStarted)
+            releaseMutation()
+            const proofStarted = Date.now()
+            try {
+              await preparedRetention.verify()
             } finally {
               markPhase("unlockedProof", proofStarted)
             }
