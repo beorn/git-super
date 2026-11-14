@@ -506,9 +506,11 @@ describe("retention retirement batch (#33010)", async () => {
     expect(result.windows).toEqual([expect.objectContaining({ entries: [], delta: "changed" })])
   })
 
-  // @cto 76cc52e6: a live owner with no lease keeps only the stores alternates-connected to it, named; the batch
-  // itself is not stopped and unconnected candidates still retire.
-  it("a live owner with no lease keeps its alternates-connected entries, named, and retires the rest", async () => {
+  // @cto 2026-11-14 (34127): the undirected walk that used to keep every alternates-connected store is gone. A live
+  // owner with no lease protects the stores it BORROWS FROM (survivorIntoRemoval / entryView), never a sibling that
+  // merely borrows from the same common store: alternates is borrower -> lender, one direction only. Amends
+  // @cto 76cc52e6, whose guard was kept for the lender case and deleted for the sibling case (see the next test).
+  it("a live owner with no lease does not keep a sibling borrower of the same common store", async () => {
     const lock = join(common, "modules", "vendor", "dep", "yrd-worktree-mutations", "writer.lock")
     const keptAside = `${lock}.moved`
     cpSync(lock, keptAside)
@@ -517,17 +519,41 @@ describe("retention retirement batch (#33010)", async () => {
       const dry = await retireRetainedBatch(options())
       expect(dry.owners?.liveUnleased).toBe(1)
       expect(dry.stopped).toBeUndefined()
-      expect(dry.rows.every((row) => row.outcome === "kept" && row.reason.includes("no existing writer lease"))).toBe(
-        true,
-      )
-      expect(dry.rows.every((row) => row.reason.includes(join(common, "modules", "vendor", "dep")))).toBe(true)
+      expect(
+        dry.rows.map((row) => row.outcome),
+        JSON.stringify(dry.rows),
+      ).toEqual(["would-retire", "would-retire", "would-retire"])
       const applied = await retireRetainedBatch(options({ apply: true }))
       expect(applied.stopped).toBeUndefined()
-      expect(applied.rows.map((row) => row.outcome)).toEqual(["kept", "kept", "kept"])
-      expect(readdirSync(root)).toHaveLength(3)
+      expect(applied.rows.map((row) => row.outcome)).toEqual(["retired", "retired", "retired"])
+      expect(readdirSync(root)).toHaveLength(0)
     } finally {
       cpSync(keptAside, lock)
       rmSync(keptAside)
+    }
+  })
+
+  // The control the deletion above must not lose: a live owner with no lease that BORROWS FROM a candidate keeps it,
+  // through the directed survivor check rather than any traversal of the store graph.
+  it("a live owner with no lease keeps the entry it borrows from, named as a survivor", async () => {
+    const [candidate] = readdirSync(root).sort() as [string]
+    const entry = join(root, candidate)
+    const borrower = join(fixtureRoot, "live-borrower", ".git")
+    mkdirSync(join(borrower, "objects", "info"), { recursive: true })
+    mkdirSync(join(borrower, "objects", "pack"), { recursive: true })
+    writeFileSync(
+      join(borrower, "objects", "info", "alternates"),
+      `${join(entry, "modules", "vendor", "dep", "objects")}\n`,
+    )
+    try {
+      const result = await retireRetainedBatch({ ...options({ apply: true }), entries: [entry] })
+      const row = result.rows.find((candidate) => candidate.entry === entry)
+      expect(row?.outcome, JSON.stringify(result.rows)).toBe("kept")
+      expect(row?.reason).toContain("survivor borrower(s) into")
+      expect(readdirSync(root)).toHaveLength(3)
+      expect(result.owners?.liveUnleased).toBeGreaterThan(0)
+    } finally {
+      rmSync(join(fixtureRoot, "live-borrower"), { recursive: true, force: true })
     }
   })
 

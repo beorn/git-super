@@ -176,39 +176,6 @@ function coldOwnerChanged(proofs: ReadonlyMap<string, ColdOwner>): string | unde
   return undefined
 }
 
-/** An unleased live owner's whole alternates-connected component remains in custody. */
-function keepUnleasedConnections(
-  entries: readonly string[],
-  borrowers: readonly EstateBorrower[],
-  owners: readonly string[],
-  kept: Map<string, string>,
-): void {
-  const graph = new Map<string, string[]>()
-  const link = (from: string, to: string): void => {
-    const targets = graph.get(from)
-    if (targets === undefined) graph.set(from, [to])
-    else targets.push(to)
-  }
-  for (const edge of borrowers) {
-    link(edge.borrower, edge.target)
-    link(edge.target, edge.borrower)
-  }
-  const reached = new Set<string>()
-  for (const owner of owners) {
-    const queue = [join(owner, "objects")]
-    for (let i = 0; i < queue.length; i++) {
-      const path = queue[i] as string
-      if (reached.has(path)) continue
-      reached.add(path)
-      const entry = entries.find((entry) => within(entry, path))
-      if (entry !== undefined && !kept.has(entry)) {
-        kept.set(entry, `live owner ${owner} has no existing writer lease; alternates-connected store kept`)
-      }
-      queue.push(...(graph.get(path) ?? []))
-    }
-  }
-}
-
 /** This entry's view of the shared scan: only survivors that borrow into THIS entry block it. */
 function entryView(scan: EstateScan, entry: string): EstateScan {
   const mine = scan.survivorIntoRemoval.filter((edge) => within(entry, edge.target))
@@ -437,7 +404,6 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
       : leaseMissing.includes(common)
         ? `lease-missing: common owner ${common} has no existing writer lease`
         : undefined
-  keepUnleasedConnections(entries, scan.borrowers, leaseMissing, kept)
   closeOverKeptBorrowers(entries, scan.borrowers, kept)
   const candidates = borrowerOrder(entries, scan.borrowers, kept)
   for (const [entry, reason] of kept) rows.set(entry, { entry, outcome: "kept", reason })
