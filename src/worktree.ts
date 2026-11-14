@@ -557,17 +557,41 @@ async function buildComponentCensus(
     if (registrations.length === 0) {
       throw custodyIdentityError(`${repository.component}: ${commonDir} has no native worktree registration`)
     }
-    if (
-      !registrations.some((entry) => {
-        const registeredPath = canonical(entry.path, `${repository.component} source registration`)
-        return (
-          registeredPath === workTree ||
-          (repository.component !== "." && gitDir === commonDir && registeredPath === commonDir)
+    // The source is a linked registration of its own store as often as it is the primary one, so rows
+    // before it are compared too. A row whose directory is gone cannot be this source -- the source is
+    // the checkout this census resolved above -- and skipping it must not be silent: canonical() wrapped
+    // its ENOENT into a custody refusal, so one dead row aborted the whole lookup (34326). A row that
+    // fails for any other reason is unproven I/O about a registration and refuses by name below.
+    const vanishedSourceRegistrations: string[] = []
+    const sourceRegistered = registrations.some((entry) => {
+      let registeredPath: string
+      try {
+        registeredPath = realpathSync(entry.path)
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code
+        if (code === "ENOENT") {
+          vanishedSourceRegistrations.push(entry.path)
+          return false
+        }
+        throw custodyIdentityError(
+          `${repository.component}: source registration ${entry.path} could not be read (${
+            code ?? (error instanceof Error ? error.message : String(error))
+          })`,
         )
-      })
-    ) {
+      }
+      return (
+        registeredPath === workTree ||
+        (repository.component !== "." && gitDir === commonDir && registeredPath === commonDir)
+      )
+    })
+    if (!sourceRegistered) {
       throw custodyIdentityError(
-        `${repository.component}: source ${workTree} has no exact native registration in ${commonDir}`,
+        `${repository.component}: source ${workTree} has no exact native registration in ${commonDir}` +
+          (vanishedSourceRegistrations.length === 0
+            ? ""
+            : `; ${vanishedSourceRegistrations.length} registration(s) name a directory that is gone and could not be compared (${vanishedSourceRegistrations
+                .map((path) => JSON.stringify(path))
+                .join(", ")})`),
       )
     }
     const selectedPrimary = primaryRepositories.get(repository.component)

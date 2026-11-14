@@ -1461,6 +1461,39 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
     }
   })
 
+  it("admits custody when the removal checkout is registered after a gone scratch registration in its own store (34326)", async () => {
+    // The linked-source counterexample disclosed at 34326: the removal checkout is a LINKED registration of
+    // its store, so the source lookup has to canonicalise rows other than the first. A dead scratch row
+    // listed before it made canonical() throw ENOENT for the whole lookup, and no close could be certified.
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-dead-own-registration-"))
+    try {
+      const fixture = createProductFixture(root)
+      const product = fixture.product
+      const scratch = join(root, "product-scratch")
+      git(product, "worktree", "add", "--detach", scratch)
+      // raw-delete-allow: this isolated mkdtemp fixture owns every path beneath root
+      await rm(scratch, { recursive: true, force: true })
+      expect(git(product, "worktree", "list", "--porcelain")).toContain("product-scratch")
+
+      const target = join(root, "target")
+      git(product, "worktree", "add", "--detach", target)
+      git(target, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
+      const registrations = git(product, "worktree", "list", "--porcelain")
+      expect(registrations.indexOf("product-scratch")).toBeLessThan(registrations.indexOf(target))
+
+      const store = createGitWorktreeStore({ repo: product, gitProcess: createLocalGitProcess() })
+      const census = await store.inspectComponentCustodyFreshness(target, {
+        primaryRoot: product,
+        targetBranch: "main",
+      })
+      expect(JSON.stringify(census)).not.toContain("is missing or redirected")
+      expect(census.status, JSON.stringify(census)).not.toBe("unknown")
+    } finally {
+      // raw-delete-allow: this isolated mkdtemp fixture owns every path beneath root
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it("attaches a component-scoped custody freshness fingerprint on blocked refusal, ignores W(C') advances in other primary components, and invalidates on W(C) or any candidate component change", async () => {
     const root = await mkdtemp(join(canonicalTmpdir(), "git-super-custody-freshness-noise-"))
     try {
