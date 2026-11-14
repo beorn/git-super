@@ -598,12 +598,19 @@ async function buildComponentCensus(
     const primaryRegistrations = parseRegisteredWorktrees(
       await query(primaryCommon, ["worktree", "list", "--porcelain", "-z"]),
     )
-    const canonicalPrimaryRegistrations = primaryRegistrations.map((entry) =>
-      canonical(entry.path, `${repository.component} primary registration`),
-    )
+    // Only the FIRST native registration decides primary identity here; every later row is a linked
+    // worktree whose own removal is judged where it is removed. Canonicalising all of them made one
+    // dead linked registration (a /tmp tree whose directory is gone) abort custody for the whole
+    // component, so no close in it could ever be certified (34326). A primary that cannot resolve
+    // still refuses, by name, exactly as before.
+    const [firstPrimaryRegistration] = primaryRegistrations
+    const firstRegisteredPath =
+      firstPrimaryRegistration === undefined
+        ? undefined
+        : canonical(firstPrimaryRegistration.path, `${repository.component} primary registration`)
     const primaryRegistrationIdentity =
       repository.component !== "." && primaryGitDir === primaryCommon ? primaryCommon : primaryPath
-    if (canonicalPrimaryRegistrations[0] !== primaryRegistrationIdentity) {
+    if (firstRegisteredPath !== primaryRegistrationIdentity) {
       throw custodyIdentityError(
         `${repository.component}: persistent primary ${primaryPath} is not the first native registration in ${primaryCommon}`,
       )

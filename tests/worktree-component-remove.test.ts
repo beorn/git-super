@@ -1407,6 +1407,60 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
     }
   })
 
+  it("admits component custody and removal when a later linked registration is gone, without retiring it (34326)", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-dead-linked-registration-"))
+    try {
+      const fixture = createProductFixture(root)
+      const product = fixture.product
+      const target = join(root, "target")
+      git(product, "worktree", "add", "--detach", target)
+      git(target, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
+
+      // A hand-made scratch worktree of a COMPONENT that outlived its run: the shape a /tmp
+      // registration leaves behind. Its directory is gone and git keeps listing it until prune. Before
+      // this fix the census canonicalised every registration, so one such row made custody unknowable
+      // for the whole component and no close in it could ever be certified.
+      // The registration must live in the PRIMARY component's store: that is the registry the census
+      // reads, and the one a /tmp scratch tree leaves a dead row in.
+      const alphaPrimary = join(product, "packages/alpha")
+      const scratch = join(root, "alpha-scratch")
+      git(alphaPrimary, "worktree", "add", "--detach", scratch)
+      await rm(scratch, { recursive: true, force: true })
+      const beforeCensus = git(alphaPrimary, "worktree", "list", "--porcelain")
+      expect(beforeCensus).toContain("alpha-scratch")
+
+      // The primary identity is still exact: a root that is not the first registration refuses, even
+      // though every one of its own paths resolves.
+      const other = join(root, "other")
+      git(product, "worktree", "add", "--detach", other)
+      git(other, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
+      const store = createGitWorktreeStore({ repo: product, gitProcess: createLocalGitProcess() })
+      const refused = await store.inspectComponentCustodyFreshness(target, {
+        primaryRoot: other,
+        targetBranch: "main",
+      })
+      expect(refused.status).toBe("unknown")
+      expect(JSON.stringify(refused)).toContain("is not the first native registration")
+
+      // Read-only toward the dead registration: a census proves custody, it never retires the row.
+      expect(git(alphaPrimary, "worktree", "list", "--porcelain")).toBe(beforeCensus)
+
+      const result = await superWorktreeRemove({
+        repo: product,
+        path: target,
+        retain: join(root, "retained"),
+        componentCustody: { primaryRoot: product, targetBranch: "main" },
+      })
+
+      expect(result.state, result.detail?.message ?? JSON.stringify(result)).toBe("updated")
+      expect(result.proof?.componentCustody).toMatchObject({ componentCount: 2 })
+      expect(existsSync(target)).toBe(false)
+    } finally {
+      // raw-delete-allow: this isolated mkdtemp fixture owns every path beneath root
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it("attaches a component-scoped custody freshness fingerprint on blocked refusal, ignores W(C') advances in other primary components, and invalidates on W(C) or any candidate component change", async () => {
     const root = await mkdtemp(join(canonicalTmpdir(), "git-super-custody-freshness-noise-"))
     try {
