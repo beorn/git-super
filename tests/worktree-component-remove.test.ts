@@ -427,9 +427,16 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
    * @level l1 @consumer automatic retained environment removal (31301)
    * The custody-gap table pauses witness proof, before the distinct retention normalization stage.
    */
-  it.each(["unchanged", "source-changed", "copy-changed", "failed-preparation", "publication-failed"] as const)(
-    "prepares retention without the root writer and validates its exact child: %s",
-    async (mode) => {
+  it.each(
+    (["unchanged", "source-changed", "copy-changed", "failed-preparation", "publication-failed"] as const).flatMap(
+      (mode) => [
+        { mode, componentCustody: false },
+        { mode, componentCustody: true },
+      ],
+    ),
+  )(
+    "prepares retention without the root writer and validates its exact child: $componentCustody/$mode",
+    async ({ mode, componentCustody }) => {
       const root = await mkdtemp(join(canonicalTmpdir(), "git-super-retention-unlocked-"))
       const entered = Promise.withResolvers<void>()
       const resume = Promise.withResolvers<void>()
@@ -464,13 +471,13 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
           repo: product,
           gitProcess: {
             ...local,
-            stream(request) {
-              // The post-preparation census uses bounded streaming, unlike normalization's buffered run.
+            async run(request) {
+              // Completion reads status after preparation, on both removal paths.
               if (
                 mode === "copy-changed" &&
                 copiedStore !== "" &&
                 !changedPreparedCopy &&
-                request.args.includes("check-ref-format")
+                request.args.includes("status")
               ) {
                 writeFileSync(join(copiedStore, "description"), "changed prepared metadata\n")
                 changedPreparedCopy = true
@@ -479,16 +486,13 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
                 mode === "publication-failed" &&
                 copiedStore !== "" &&
                 !blockedPublication &&
-                request.args.includes("check-ref-format")
+                request.args.includes("status")
               ) {
                 const child = readdirSync(retainedRoot).find((name) => name !== "other-keeper")
                 expect(child).toBeTruthy()
                 mkdirSync(join(retainedRoot, child!, "manifest.json"))
                 blockedPublication = true
               }
-              return local.stream!(request)
-            },
-            async run(request) {
               const gitDirAt = request.args.indexOf("--git-dir")
               const candidate = gitDirAt < 0 ? undefined : request.args[gitDirAt + 1]
               if (!paused && request.args.includes("fsck") && candidate?.startsWith(`${retainedRoot}/`)) {
@@ -504,7 +508,7 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
         })
         removal = store.remove(target, {
           retention: { root: retainedRoot, report: () => reports++ },
-          componentCustody: { primaryRoot: product, targetBranch: "main" },
+          ...(componentCustody ? { componentCustody: { primaryRoot: product, targetBranch: "main" } } : {}),
         })
         await Promise.race([
           entered.promise,
@@ -512,6 +516,8 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
             throw new Error(`removal ended before retention barrier: ${JSON.stringify(outcome)}`)
           }),
         ])
+        contender = tryAcquireFlock(join(common, "yrd-worktree-mutations", "writer.lock"))
+        expect(contender, "root writer must be available during retention verification").not.toBeNull()
         const preparingChild = readdirSync(retainedRoot).find((name) => name !== "other-keeper")
         expect(preparingChild).toBeTruthy()
         const preparingPath = join(retainedRoot, preparingChild!)
@@ -523,9 +529,7 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
         expect(typeof marker.createdAt === "string" && Number.isFinite(Date.parse(marker.createdAt))).toBe(true)
         expect(existsSync(join(preparingPath, "manifest.json"))).toBe(false)
         expect(reports).toBe(0)
-        contender = tryAcquireFlock(join(common, "yrd-worktree-mutations", "writer.lock"))
-        expect(contender, "root writer must be available during retention verification").not.toBeNull()
-        for (const owner of [sourceGitDir, sourceStore, witnessDir]) {
+        for (const owner of [sourceGitDir, sourceStore, ...(componentCustody ? [witnessDir] : [])]) {
           const competingOwner = tryAcquireFlock(join(owner, "yrd-worktree-mutations", "writer.lock"))
           competingOwner?.release()
           expect(competingOwner, `source/witness owner remains held: ${owner}`).toBeNull()
@@ -551,8 +555,11 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
           expect(ownEntry).toBeTruthy()
           expect(existsSync(join(retainedRoot, ownEntry!, "manifest.json"))).toBe(true)
           expect(existsSync(join(retainedRoot, ownEntry!, "preparation.json"))).toBe(false)
-        } else if (mode === "publication-failed") {
-          expect(blockedPublication, "manifest publication was actually blocked").toBe(true)
+        } else if (mode === "publication-failed" || mode === "copy-changed") {
+          if (mode === "publication-failed") {
+            expect(blockedPublication, "manifest publication was actually blocked").toBe(true)
+          }
+          // These faults occur during completion, after borrower mutation can have begun: keep the child.
           expect(outcome.error).toBeInstanceOf(Error)
           expect(existsSync(target)).toBe(true)
           expect((await store.inspect(target)).registered).toBe(true)

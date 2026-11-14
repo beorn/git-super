@@ -2070,20 +2070,12 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
             }
             if (custodyRefusal !== undefined) return
           }
-          // Shared mutation must never proceed without reacquiring the root writer after custody proof.
-          if (mutationLease === undefined) throw new Error(`${path}: root writer lease is not held before removal`)
-          if (removeOptions.noRehome === true) {
-            const borrowers = rehome.inspect()
-            if (borrowers.length > 0) {
-              borrowed = { borrowers }
-              return
-            }
-          }
-          if (removeOptions.retention !== undefined) {
-            const retainedCopyStarted = Date.now()
-            if (preparedRetention !== undefined) removalProof = await preparedRetention.complete()
-            else {
-              removalProof = await retainWorktreeModules(
+          if (removeOptions.retention !== undefined && preparedRetention === undefined) {
+            // Source owners stay leased; only publication and native removal need the root writer.
+            releaseMutation()
+            const proofStarted = Date.now()
+            try {
+              preparedRetention = await prepareWorktreeModulesRetention(
                 git,
                 repo,
                 path,
@@ -2101,7 +2093,24 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
                 undefined,
                 componentCustodyProof,
               )
+            } finally {
+              markPhase("unlockedProof", proofStarted)
             }
+            mutationLease = await acquireMutationLock(mutationDirectory, holder)
+            heldFrom = Date.now()
+          }
+          // Shared mutation must never proceed without reacquiring the root writer after custody proof.
+          if (mutationLease === undefined) throw new Error(`${path}: root writer lease is not held before removal`)
+          if (removeOptions.noRehome === true) {
+            const borrowers = rehome.inspect()
+            if (borrowers.length > 0) {
+              borrowed = { borrowers }
+              return
+            }
+          }
+          if (preparedRetention !== undefined) {
+            const retainedCopyStarted = Date.now()
+            removalProof = await preparedRetention.complete()
             phases.retainedCopy = Date.now() - retainedCopyStarted
           } else {
             if (removeOptions.unlock === true) await unlockWorktree(git, repo, path)
