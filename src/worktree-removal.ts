@@ -2175,10 +2175,13 @@ async function prepareResolvedWorktreeModules(context: {
           // Only the verifier's explicit derived-cache removals may change the prepared snapshot.
           const removed = removedCaches.map((cache) => relative(copiedTree, cache))
           expectedCopy = Object.fromEntries(
-            Object.entries(expectedCopy).filter(([key]) => !removed.some((cache) => key === cache || key.startsWith(`${cache}${sep}`))),
+            Object.entries(expectedCopy).filter(
+              ([key]) => !removed.some((cache) => key === cache || key.startsWith(`${cache}${sep}`)),
+            ),
           )
           verifyRetainedManifest()
-          if (retained !== null) finalRetainedManifest = manifest(copiedTree, copiedCustody, true, privateProjection !== undefined)
+          if (retained !== null)
+            finalRetainedManifest = manifest(copiedTree, copiedCustody, true, privateProjection !== undefined)
           verified = true
         } catch (error) {
           if (unpublished) discard()

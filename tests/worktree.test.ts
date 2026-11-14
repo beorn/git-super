@@ -496,6 +496,7 @@ describe("createGitWorktreeStore", () => {
    * @level l1
    * @consumer Candidate and integration-root orphan lifecycle
    * @testonly none
+   * Verification-window mutations must refuse before publication; report-time mutations exercise the later boundary.
    */
   it.each([
     "unlocked",
@@ -505,6 +506,8 @@ describe("createGitWorktreeStore", () => {
     "recreated-checkout",
     "remove-failure",
     "remove-failure-new-holder",
+    "changed-during-verification",
+    "recreated-during-verification",
   ])("retains destroyed-checkout module custody before unregistering: %s", async (mode) => {
     const root = await mkdtemp(join(canonicalTmpdir(), "git-super-destroyed-custody-"))
     let verifiedOutsideRoot = false
@@ -515,6 +518,16 @@ describe("createGitWorktreeStore", () => {
         repo: fixture.product,
         gitProcess: {
           run: (request) => {
+            if (request.args.includes("fsck")) {
+              if (mode === "changed-during-verification") {
+                writeFileSync(join(admin, "HEAD"), `${git(fixture.product, ["rev-parse", "HEAD~1"]).trim()}\n`)
+              }
+              if (mode === "recreated-during-verification" && !existsSync(linked)) {
+                mkdirSync(linked)
+                writeFileSync(join(linked, ".git"), `gitdir: ${admin}\n`)
+                writeFileSync(join(linked, "new-authored-payload"), "arrived during verification\n")
+              }
+            }
             if (mode === "unlocked" && request.args.includes("fsck")) {
               const common = git(fixture.product, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim()
               const rootWriter = tryAcquireFlock(join(common, "yrd-worktree-mutations", "writer.lock"))
@@ -597,6 +610,8 @@ describe("createGitWorktreeStore", () => {
           "recreated-checkout",
           "remove-failure",
           "remove-failure-new-holder",
+          "changed-during-verification",
+          "recreated-during-verification",
         ].includes(mode)
       ) {
         await expect(recovery).rejects.toThrow(
@@ -604,7 +619,7 @@ describe("createGitWorktreeStore", () => {
             ? "retention receipt unavailable"
             : mode.startsWith("remove-failure")
               ? "controlled native removal failure"
-              : mode === "recreated-checkout"
+              : mode === "recreated-checkout" || mode === "recreated-during-verification"
                 ? /checkout|appeared|exists/u
                 : /lock|hold/u,
         )
@@ -632,9 +647,14 @@ describe("createGitWorktreeStore", () => {
         expect(await store.inspect(linked)).toEqual({ registered: false })
         expect(existsSync(admin)).toBe(false)
       }
-      expect(proofs).toHaveLength(1)
-      const manifest = JSON.parse(await readFile(proofs[0]!.manifest, "utf8")) as { checkout?: string }
-      expect(manifest.checkout).toBe("absent")
+      if (mode.endsWith("during-verification")) {
+        expect(proofs).toHaveLength(0)
+        expect(readdirSync(retention.root)).toEqual([])
+      } else {
+        expect(proofs).toHaveLength(1)
+        const manifest = JSON.parse(await readFile(proofs[0]!.manifest, "utf8")) as { checkout?: string }
+        expect(manifest.checkout).toBe("absent")
+      }
     } finally {
       // raw-delete-allow: root is this test's fresh mkdtemp fixture, never a caller-supplied checkout or Git store.
       await rm(root, { recursive: true, force: true })

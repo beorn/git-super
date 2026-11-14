@@ -2087,24 +2087,24 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
             }
             // Donor-dependent copying/normalization stays under the root writer.
             const preparationStarted = Date.now()
-              preparedRetention = await prepareWorktreeModulesRetention(
-                git,
-                repo,
-                path,
-                removeOptions.retention,
-                (repository, target) => inspectWorktree(git, repository, target),
-                writerLeases.proof,
-                writerLeases.created,
-                removeOptions.noRehome === true ? () => [] : rehome.run,
-                removeOptions.excludedSubmodules,
-                notCompared,
-                undefined,
-                undefined,
-                undefined,
-                removeOptions.preserved,
-                undefined,
-                componentCustodyProof,
-              )
+            preparedRetention = await prepareWorktreeModulesRetention(
+              git,
+              repo,
+              path,
+              removeOptions.retention,
+              (repository, target) => inspectWorktree(git, repository, target),
+              writerLeases.proof,
+              writerLeases.created,
+              removeOptions.noRehome === true ? () => [] : rehome.run,
+              removeOptions.excludedSubmodules,
+              notCompared,
+              undefined,
+              undefined,
+              undefined,
+              removeOptions.preserved,
+              undefined,
+              componentCustodyProof,
+            )
             markPhase("retainedPreparation", preparationStarted)
             releaseMutation()
             const proofStarted = Date.now()
@@ -2637,6 +2637,29 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
             const pointer = await readFile(join(directory, "gitdir"), "utf8")
             const lock = identity.locked === undefined ? undefined : await readFile(join(directory, "locked"))
             const head = await git.text(repo, ["--git-dir", directory, "rev-parse", "--verify", "HEAD^{commit}"])
+            const assertRecoveryIdentity = async (adminDirectory: string): Promise<void> => {
+              const current = await inspectWorktree(git, repo, path)
+              if (
+                !current.registered ||
+                current.locked !== identity.locked ||
+                (await readFile(join(adminDirectory, "gitdir"), "utf8")) !== pointer ||
+                (await git.text(repo, ["--git-dir", adminDirectory, "rev-parse", "--verify", "HEAD^{commit}"])) !==
+                  head ||
+                (lock !== undefined && !lock.equals(await readFile(join(adminDirectory, "locked"))))
+              ) {
+                throw new Error(
+                  `destroyed worktree ${path} identity or hold changed during retention; registration preserved`,
+                )
+              }
+              try {
+                lstatSync(path)
+                throw new Error(
+                  `destroyed worktree ${path} checkout reappeared during retention; checkout and registration preserved`,
+                )
+              } catch (error) {
+                if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+              }
+            }
             preparedRetention = await prepareWorktreeModulesRetention(
               git,
               repo,
@@ -2658,27 +2681,11 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
             mutationLease = undefined
             await preparedRetention.verify()
             mutationLease = await acquireMutationLock(mutationDirectory, operation)
+            // Verification released the fleet writer. Reject a replacement before publishing custody;
+            // the existing post-report check still fences callbacks before native removal.
+            await assertRecoveryIdentity(directory)
             await preparedRetention.complete()
-            const current = await inspectWorktree(git, repo, path)
-            if (
-              !current.registered ||
-              current.locked !== identity.locked ||
-              (await readFile(join(directory, "gitdir"), "utf8")) !== pointer ||
-              (await git.text(repo, ["--git-dir", directory, "rev-parse", "--verify", "HEAD^{commit}"])) !== head ||
-              (lock !== undefined && !lock.equals(await readFile(join(directory, "locked"))))
-            ) {
-              throw new Error(
-                `destroyed worktree ${path} identity or hold changed during retention; registration preserved`,
-              )
-            }
-            try {
-              lstatSync(path)
-              throw new Error(
-                `destroyed worktree ${path} checkout reappeared during retention; checkout and registration preserved`,
-              )
-            } catch (error) {
-              if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
-            }
+            await assertRecoveryIdentity(directory)
             if (lock !== undefined) {
               releasedHold = { head, pointer, body: lock }
               await unlockWorktree(git, repo, path)

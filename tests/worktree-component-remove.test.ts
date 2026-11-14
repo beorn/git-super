@@ -428,12 +428,19 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
    * The custody-gap table pauses witness proof, before the distinct retention normalization stage.
    */
   it.each(
-    (["unchanged", "source-changed", "copy-changed", "failed-preparation", "publication-failed", "linked-donor"] as const).flatMap(
-      (mode) => [
-        { mode, componentCustody: false },
-        ...(mode === "linked-donor" ? [] : [{ mode, componentCustody: true }]),
-      ],
-    ),
+    (
+      [
+        "unchanged",
+        "source-changed",
+        "copy-changed",
+        "failed-preparation",
+        "publication-failed",
+        "linked-donor",
+      ] as const
+    ).flatMap((mode) => [
+      { mode, componentCustody: false },
+      ...(mode === "linked-donor" ? [] : [{ mode, componentCustody: true }]),
+    ]),
   )(
     "prepares retention without the root writer and validates its exact child: $componentCustody/$mode",
     async ({ mode, componentCustody }) => {
@@ -552,7 +559,11 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
         expect(existsSync(join(preparingPath, "manifest.json"))).toBe(false)
         expect(reports).toBe(0)
         if (donor !== undefined) {
-          const copiedDonorConsumer = join(preparingPath, "modules", relative(join(sourceGitDir, "modules"), sourceStore))
+          const copiedDonorConsumer = join(
+            preparingPath,
+            "modules",
+            relative(join(sourceGitDir, "modules"), sourceStore),
+          )
           expect(readFileSync(join(copiedDonorConsumer, "objects/info/alternates"), "utf8")).not.toContain(donorObjects)
           expect(
             existsSync(join(copiedDonorConsumer, "objects", donorBlob.slice(0, 2), donorBlob.slice(2))),
