@@ -7,6 +7,7 @@
  */
 import { createHash } from "node:crypto"
 import * as fs from "node:fs"
+import * as childProcess from "node:child_process"
 import {
   chmodSync,
   cpSync,
@@ -50,7 +51,17 @@ vi.mock("node:fs", async (importOriginal) => {
     readFileSync: vi.fn(actual.readFileSync),
     readSync: vi.fn(actual.readSync),
     openSync: vi.fn(actual.openSync),
+    existsSync: vi.fn(actual.existsSync),
+    lstatSync: vi.fn(actual.lstatSync),
+    readdirSync: vi.fn(actual.readdirSync),
+    rmSync: vi.fn(actual.rmSync),
+    writeFileSync: vi.fn(actual.writeFileSync),
+    renameSync: vi.fn(actual.renameSync),
   }
+})
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>()
+  return { ...actual, spawnSync: vi.fn(actual.spawnSync) }
 })
 
 const environment: NodeJS.ProcessEnv = {
@@ -232,6 +243,38 @@ it("exposes native removal head and createdAt under the consumer field names (30
 })
 
 describe("compactRetainedModules", () => {
+  // Full close-budget acceptance: compaction must leave the event loop available to seal the deadline.
+  // Existing tests prove retained bytes and refs but allow blocking discovery, Git and proof publication.
+  it("compacts retained metadata without synchronous filesystem or child operations", async () => {
+    const { proof } = await buildSyntheticEntry(2)
+    const blockingOperations = {
+      read: vi.mocked(fs.readFileSync),
+      exists: vi.mocked(fs.existsSync),
+      stat: vi.mocked(fs.lstatSync),
+      list: vi.mocked(fs.readdirSync),
+      remove: vi.mocked(fs.rmSync),
+      write: vi.mocked(fs.writeFileSync),
+      rename: vi.mocked(fs.renameSync),
+      child: vi.mocked(childProcess.spawnSync),
+    }
+    for (const operation of Object.values(blockingOperations)) operation.mockClear()
+    expect(await compactRetainedModules(proof, inRun())).toEqual({ status: "ok" })
+    expect(
+      Object.fromEntries(
+        Object.entries(blockingOperations).map(([name, operation]) => [name, operation.mock.calls.length]),
+      ),
+    ).toEqual({
+      read: 0,
+      exists: 0,
+      stat: 0,
+      list: 0,
+      remove: 0,
+      write: 0,
+      rename: 0,
+      child: 0,
+    })
+  })
+
   it("packs every ref value, drops remote-tracking reflogs, and keeps HEAD plus local reflogs byte-identical", async () => {
     const { gitDir, nested, proof } = await buildSyntheticEntry()
     const before = {
