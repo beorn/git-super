@@ -6,6 +6,7 @@
  * @testonly none
  */
 import { createHash } from "node:crypto"
+import * as fs from "node:fs"
 import {
   chmodSync,
   cpSync,
@@ -33,12 +34,24 @@ import {
   rebuildRetainedCopyProof,
   type RetentionEnrollReport,
   manifest,
+  metadataFileDigest,
   type WorktreeRemovalProof,
 } from "../src/worktree-removal.ts"
 import { canonicalTmpdir, createRepository, git as gitCwd } from "./fixture.ts"
 import { runCli } from "../src/cli.ts"
 import { acquireExclusive } from "../src/exclusive.ts"
 import { rebuildRetainedCopyProof as readPublicRetainedProof } from "../src/index.ts"
+
+vi.hoisted(() => vi.resetModules())
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>()
+  return {
+    ...actual,
+    readFileSync: vi.fn(actual.readFileSync),
+    readSync: vi.fn(actual.readSync),
+    openSync: vi.fn(actual.openSync),
+  }
+})
 
 const environment: NodeJS.ProcessEnv = {
   ...process.env,
@@ -50,6 +63,24 @@ const environment: NodeJS.ProcessEnv = {
 }
 
 const roots: string[] = []
+
+// The close deadline cannot seal while this shared proof primitive blocks its event loop.
+// Existing compaction tests verify digests but permit an unbounded synchronous whole-file read.
+it("hashes proof metadata without synchronous filesystem reads", async () => {
+  const root = mkdtempSync(join(canonicalTmpdir(), "git-super-async-metadata-"))
+  roots.push(root)
+  const path = join(root, "metadata")
+  const contents = Buffer.alloc(256 * 1024, 97)
+  writeFileSync(path, contents)
+  vi.mocked(fs.readFileSync).mockClear()
+  vi.mocked(fs.readSync).mockClear()
+  vi.mocked(fs.openSync).mockClear()
+  const actual = await metadataFileDigest(path)
+  expect(fs.readFileSync).not.toHaveBeenCalled()
+  expect(fs.readSync).not.toHaveBeenCalled()
+  expect(fs.openSync).not.toHaveBeenCalled()
+  expect(actual).toBe(createHash("sha256").update(contents).digest("hex"))
+})
 
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
