@@ -130,6 +130,73 @@ async function historicalRetainedBorrower(
 }
 
 describe("createGitWorktreeStore", () => {
+  // A retained manifest precedes native removal and cannot prove that a suspended cleanup already removed its target.
+  it("reports verified native removal and the pending leaf before staging deletion settles", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-removal-progress-"))
+    const reached = Promise.withResolvers<void>()
+    const resume = Promise.withResolvers<void>()
+    let removal: Promise<unknown> | undefined
+    let pendingPath: string | undefined
+    const lines: string[] = []
+    const originalUnlink = (await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises")).unlink
+    const unlink = vi.spyOn(fsPromises, "unlink").mockImplementation(async (path) => {
+      if (pendingPath === undefined && String(path).includes("/.trash/")) {
+        pendingPath = String(path)
+        reached.resolve()
+        await resume.promise
+      }
+      return originalUnlink(path)
+    })
+    try {
+      const repo = join(root, "repo")
+      createRepository(repo, "tracked.txt", "preserved bytes\n")
+      const store = createLocalGitWorktreeStore({ repo, report: (line) => lines.push(line) })
+      const target = join(root, "target")
+      await store.add({ kind: "detached", path: target, ref: "HEAD" })
+      removal = store.remove(target)
+      await reached.promise
+      expect(existsSync(target)).toBe(false)
+      expect((await store.list()).some((row) => row.path === target)).toBe(false)
+      expect(lines).toContainEqual(expect.stringContaining(`${target}: native removal verified;`))
+      expect(lines).toContainEqual(expect.stringContaining(`staging deletion in flight at ${dirname(pendingPath!)}`))
+      expect(lines.some((line) => line.includes("remainder cleanup completed"))).toBe(false)
+    } finally {
+      resume.resolve()
+      await removal
+      unlink.mockRestore()
+      await rm(root, { recursive: true, force: true })
+    }
+    expect(lines.filter((line) => line.includes("native removal verified;"))).toHaveLength(1)
+    expect(lines.filter((line) => line.includes("remainder cleanup completed"))).toHaveLength(1)
+  })
+
+  it("does not restore a verified removal when its progress report sink throws", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-removal-report-failure-"))
+    try {
+      const repo = join(root, "repo")
+      createRepository(repo, "tracked.txt", "preserved bytes\n")
+      const store = createLocalGitWorktreeStore({
+        repo,
+        report: (line) => {
+          if (line.includes("native removal verified")) throw new Error("progress sink failed")
+        },
+      })
+      const target = join(root, "target")
+      await store.add({ kind: "detached", path: target, ref: "HEAD" })
+      await expect(store.remove(target)).rejects.toThrow("progress sink failed")
+      expect(existsSync(target)).toBe(false)
+      expect((await store.list()).some((row) => row.path === target)).toBe(false)
+      const staged = readdirSync(join(root, ".trash"))
+      expect(staged).toHaveLength(1)
+      expect(readFileSync(join(root, ".trash", staged[0]!, "tracked.txt"), "utf8")).toBe("preserved bytes\n")
+      const lease = tryAcquireFlock(join(repo, ".git/yrd-worktree-mutations/writer.lock"))
+      expect(lease).not.toBeNull()
+      lease?.release()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   // The host's close policy must be rechecked inside native removal, including after lengthy preparation.
   it.each([1, 2])("keeps a worktree when conditional admission refuses at locked checkpoint %i", async (refuseAt) => {
     const root = await mkdtemp(join(tmpdir(), "git-super-conditional-remove-"))
@@ -137,7 +204,8 @@ describe("createGitWorktreeStore", () => {
       const repo = join(root, "repo")
       const head = createRepository(repo, "tracked.txt", "keep these bytes\n")
       const linked = join(root, "linked")
-      const store = createLocalGitWorktreeStore({ repo })
+      const lines: string[] = []
+      const store = createLocalGitWorktreeStore({ repo, report: (line) => lines.push(line) })
       await store.add({ kind: "new-branch", path: linked, branch: "task/conditional", ref: "HEAD" })
       let calls = 0
       const selection = {
@@ -161,6 +229,7 @@ describe("createGitWorktreeStore", () => {
       expect(calls).toBe(refuseAt)
       expect(readFileSync(join(linked, "tracked.txt"), "utf8")).toBe("keep these bytes\n")
       expect(await store.inspect(linked)).toMatchObject({ registered: true, head })
+      expect(lines.some((line) => line.includes("native removal verified"))).toBe(false)
     } finally {
       await rm(root, { recursive: true, force: true })
     }

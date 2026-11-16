@@ -1690,6 +1690,8 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         }
       }
       let stagingPath: string | undefined
+      let nativeRemovalVerified = false
+      let stagingRemainder = false
       let borrowed: Readonly<{ borrowers: readonly string[] }> | undefined
       let removalProof: WorktreeRemovalProof | undefined
       let componentCustodyProof: ComponentCustodyProof | undefined
@@ -2235,6 +2237,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
           if (existsSync(path) || (await inspectWorktree(git, removalRepo, path)).registered) {
             throw new Error(`git reported success but did not fully remove worktree '${path}'`)
           }
+          nativeRemovalVerified = true
           markPhase("gitWorktreeRemove", removeStarted)
         } catch (error) {
           if (stagingPath !== undefined && existsSync(stagingPath)) {
@@ -2302,6 +2305,13 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         }
       }
 
+      // This fact crosses the no-restoration boundary. A sink failure here cannot enter the staging restore catch.
+      if (nativeRemovalVerified) {
+        const pending = [removalProof?.retained, stagingPath].filter((entry): entry is string => entry != null)
+        options.report?.(
+          `${path}: native removal verified; ${pending.length === 0 ? "no compaction/staging work remains" : `compaction/staging work remains at ${pending.join(", ")}`}`,
+        )
+      }
       try {
         // After native --force: pack-refs + drop remote reflogs on the retained copy, then rewrite
         // the proof so gate 2 still matches. Compaction must not throw: --force already succeeded,
@@ -2309,6 +2319,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         // ref value stays intact, the proof is not rewritten (later retention verify refuses), and
         // the copy is never deleted.
         if (removalProof?.retained != null) {
+          options.report?.(`${path}: retained compaction in flight at ${removalProof.retained}`)
           compaction = await compactRetainedModules(removalProof, {
             common: removalRepo,
             preState: { kind: "in-run" },
@@ -2321,6 +2332,9 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         // Join each staged leaf operation in this caller, outside the mutation lock.
         if (stagingPath !== undefined) {
           try {
+            options.report?.(
+              `${path}: staging deletion in flight at ${stagingPath}; individual leaf operations awaited`,
+            )
             await deleteStagedTree(stagingPath, execution)
             try {
               checkRemovalExecution(execution)
@@ -2339,10 +2353,13 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
               }
             }
           } catch (error) {
+            stagingRemainder = true
             console.warn(
               `git-super: failed to delete staged worktree directory '${stagingPath}': ${error instanceof Error ? error.message : String(error)}`,
             )
           }
+          if (stagingRemainder)
+            options.report?.(`${path}: removed-with-remainder; staged work remains at ${stagingPath}`)
         }
       }
       if (custodyRefusal !== undefined) return { custodyRefusal }
@@ -2393,6 +2410,15 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         }
       }
       if (failures.length > 0) throw new AggregateError(failures, failures.map((error) => error.message).join("; "))
+      if (nativeRemovalVerified) {
+        if (compaction?.status === "failed") {
+          options.report?.(
+            `${path}: removed-with-remainder; retained compaction remains at ${compaction.child}; failed step ${compaction.step}`,
+          )
+        } else if (!stagingRemainder) {
+          options.report?.(`${path}: native removal and remainder cleanup completed at this later point`)
+        }
+      }
       if (compaction !== undefined) return { compaction }
       return undefined
     },
