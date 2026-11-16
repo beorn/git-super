@@ -136,7 +136,7 @@ export function findRetainedGitDirs(root: string): string[] {
   return found
 }
 
-function collectLocalReflogDigests(gitDir: string): Readonly<Record<string, string>> {
+async function collectLocalReflogDigests(gitDir: string): Promise<Readonly<Record<string, string>>> {
   const digests: Record<string, string> = {}
   const visit = async (relativePath: string): Promise<void> => {
     const path = join(gitDir, relativePath)
@@ -150,15 +150,15 @@ function collectLocalReflogDigests(gitDir: string): Readonly<Record<string, stri
       return
     }
     if (stats.isDirectory()) {
-      for (const name of readdirSync(path)) visit(join(relativePath, name))
+      for (const name of readdirSync(path)) await visit(join(relativePath, name))
     }
   }
-  visit("logs/HEAD")
-  visit("logs/refs/heads")
+  await visit("logs/HEAD")
+  await visit("logs/refs/heads")
   return Object.fromEntries(Object.entries(digests).sort(([left], [right]) => left.localeCompare(right)))
 }
 
-function snapshotRefValues(gitDir: string): RefSnapshot {
+async function snapshotRefValues(gitDir: string): Promise<RefSnapshot> {
   const refs = runAtGitDir(gitDir, ["for-each-ref", "--format=%(refname) %(objectname)"])
   if (refs.exitCode !== 0) {
     throw new Error(`for-each-ref failed in ${gitDir}: ${refs.stderr || refs.stdout}`)
@@ -171,7 +171,7 @@ function snapshotRefValues(gitDir: string): RefSnapshot {
     refs: refs.stdout,
     headValue: head.stdout.trim(),
     headSymbolic: existsSync(join(gitDir, "HEAD")) ? readFileSync(join(gitDir, "HEAD"), "utf8") : "",
-    localReflogDigests: collectLocalReflogDigests(gitDir),
+    localReflogDigests: await collectLocalReflogDigests(gitDir),
   }
 }
 
@@ -184,8 +184,8 @@ function dropRemoteReflogs(gitDir: string): void {
   rmSync(remotes, { recursive: true, force: false })
 }
 
-function compactOneGitDir(gitDir: string): void {
-  const before = snapshotRefValues(gitDir)
+async function compactOneGitDir(gitDir: string): Promise<void> {
+  const before = await snapshotRefValues(gitDir)
   const packed = runAtGitDir(gitDir, ["pack-refs", "--all"])
   if (packed.exitCode !== 0) {
     throw Object.assign(new Error(`pack-refs failed in ${gitDir}: ${packed.stderr || packed.stdout}`), {
@@ -197,7 +197,7 @@ function compactOneGitDir(gitDir: string): void {
   } catch (error) {
     throw Object.assign(error instanceof Error ? error : new Error(String(error)), { step: "drop-remote-reflogs" })
   }
-  const after = snapshotRefValues(gitDir)
+  const after = await snapshotRefValues(gitDir)
   if (JSON.stringify(before) !== JSON.stringify(after)) {
     throw Object.assign(new Error(`ref values were not byte-identical after compaction in ${gitDir}`), {
       step: "g1-snapshot",
@@ -327,7 +327,10 @@ async function rewriteProof(proof: RetainedCopyProof, retained: string, common: 
   }
 }
 
-export function compactRetainedModules(proof: RetainedCopyProof, options: CompactionOptions): CompactionResult {
+export async function compactRetainedModules(
+  proof: RetainedCopyProof,
+  options: CompactionOptions,
+): Promise<CompactionResult> {
   if (proof.retained === null) return { status: "skipped" }
   const retained = proof.retained
   if (!existsSync(retained)) {
@@ -338,7 +341,7 @@ export function compactRetainedModules(proof: RetainedCopyProof, options: Compac
   }
   try {
     if (options.preState.kind === "gate-2") {
-      assertStoredProofMatchesCopy(proof, retained, options.common)
+      await assertStoredProofMatchesCopy(proof, retained, options.common)
     } else if (options.preState.kind !== "in-run") {
       const exhaustive: never = options.preState
       throw Object.assign(new Error(`unknown compaction pre-state ${JSON.stringify(exhaustive)}`), {
@@ -359,13 +362,13 @@ export function compactRetainedModules(proof: RetainedCopyProof, options: Compac
   }
   for (const gitDir of children) {
     try {
-      compactOneGitDir(gitDir)
+      await compactOneGitDir(gitDir)
     } catch (error) {
       return failedCompaction(gitDir, error)
     }
   }
   try {
-    rewriteProof(proof, retained, options.common)
+    await rewriteProof(proof, retained, options.common)
   } catch (error) {
     return failedCompaction(retained, error)
   }
@@ -460,7 +463,10 @@ export type CompactRetainedRootOptions = Readonly<{
  * directory and symlink identities were never recorded), and children with no readable manifest are
  * skipped and reported by class. The first eligible child to fail verification stops the run.
  */
-export function compactRetainedRoot(root: string, options: CompactRetainedRootOptions = {}): CompactRetainedRootReport {
+export async function compactRetainedRoot(
+  root: string,
+  options: CompactRetainedRootOptions = {},
+): Promise<CompactRetainedRootReport> {
   const dryRun = options.dryRun === true
   const limit = options.limit ?? null
   const common = options.common ?? sep
@@ -542,7 +548,7 @@ export function compactRetainedRoot(root: string, options: CompactRetainedRootOp
       break
     }
     if (dryRun) {
-      const verified = verifyRetainedCopy(rebuilt, common)
+      const verified = await verifyRetainedCopy(rebuilt, common)
       if (verified.status === "failed") {
         if (PRE_MUTATION_REFUSALS.has(verified.step)) {
           refusal(entry, verified.step)
@@ -553,7 +559,7 @@ export function compactRetainedRoot(root: string, options: CompactRetainedRootOp
         break
       }
     } else {
-      const result = compactRetainedModules(rebuilt, { common, preState: { kind: "gate-2" } })
+      const result = await compactRetainedModules(rebuilt, { common, preState: { kind: "gate-2" } })
       if (result.status === "failed") {
         if (PRE_MUTATION_REFUSALS.has(result.step)) {
           refusal(entry, result.step)
@@ -571,7 +577,7 @@ export function compactRetainedRoot(root: string, options: CompactRetainedRootOp
 }
 
 /** C3 dry run: run the existing-stock gate-2 copy verification without compacting anything. */
-export function verifyRetainedCopy(proof: RetainedCopyProof, common: string = sep): CompactionResult {
+export async function verifyRetainedCopy(proof: RetainedCopyProof, common: string = sep): Promise<CompactionResult> {
   const retained = proof.retained
   if (retained === null || !existsSync(retained)) {
     return failedCompaction(
@@ -580,7 +586,7 @@ export function verifyRetainedCopy(proof: RetainedCopyProof, common: string = se
     )
   }
   try {
-    assertStoredProofMatchesCopy(proof, retained, common)
+    await assertStoredProofMatchesCopy(proof, retained, common)
   } catch (error) {
     return failedCompaction(retained, error)
   }

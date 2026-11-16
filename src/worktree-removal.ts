@@ -411,14 +411,18 @@ export async function prepareRemovalBorrowers(
   custody: ExcludedRemovalCustody,
   excludedSubmodules: readonly string[] = [],
 ): Promise<
-  Readonly<{ run: () => readonly string[]; inspect: () => readonly string[]; notCompared: readonly NotCompared[] }>
+  Readonly<{
+    run: () => Promise<readonly string[]>
+    inspect: () => Promise<readonly string[]>
+    notCompared: readonly NotCompared[]
+  }>
 > {
   const lenderModules = join(lenderGitDir, "modules")
   if (excludedSubmodules.length === 0) {
     return {
-      run: () => rehomeBorrowers(commonDir, lenderGitDir, lenderModules),
-      inspect: () =>
-        rehomeBorrowerCandidates(
+      run: async () => await rehomeBorrowers(commonDir, lenderGitDir, lenderModules),
+      inspect: async () =>
+        await rehomeBorrowerCandidates(
           commonDir,
           lenderGitDir,
           lenderModules,
@@ -492,19 +496,20 @@ export async function prepareRemovalBorrowers(
     candidates.push({ ...candidate, excludedStores, includedStores })
   }
   return {
-    run: () => rehomeBorrowerCandidates(commonDir, lenderGitDir, lenderModules, candidates),
-    inspect: () => rehomeBorrowerCandidates(commonDir, lenderGitDir, lenderModules, candidates, undefined, "inspect"),
+    run: async () => await rehomeBorrowerCandidates(commonDir, lenderGitDir, lenderModules, candidates),
+    inspect: async () =>
+      await rehomeBorrowerCandidates(commonDir, lenderGitDir, lenderModules, candidates, undefined, "inspect"),
     notCompared,
   }
 }
 
-export function rehomeBorrowers(
+export async function rehomeBorrowers(
   commonDir: string,
   lenderGitDir: string,
   lenderModules: string,
   options?: RehomeBorrowersOptions,
-): readonly string[] {
-  return rehomeBorrowerCandidates(
+): Promise<readonly string[]> {
+  return await rehomeBorrowerCandidates(
     commonDir,
     lenderGitDir,
     lenderModules,
@@ -513,15 +518,15 @@ export function rehomeBorrowers(
   )
 }
 
-function rehomeBorrowerCandidates(
+async function rehomeBorrowerCandidates(
   commonDir: string,
   lenderGitDir: string,
   lenderModules: string,
   candidates: readonly RemovalBorrower[],
   options?: RehomeBorrowersOptions,
   policy: "inspect" | "rehome" = "rehome",
-): readonly string[] {
-  guardRetainedBorrowers(commonDir, lenderGitDir, policy)
+): Promise<readonly string[]> {
+  await guardRetainedBorrowers(commonDir, lenderGitDir, policy)
   const hasLenderModules = present(lenderModules)
   const canonicalCommon = realpathSync(commonDir)
 
@@ -1461,7 +1466,7 @@ function retainedAlternatesDependency(
 }
 
 /** Copy only physically local Git payload; never follow donor alternates or copy derived caches. */
-function retainPhysicalObjects(source: string, destination: string): void {
+async function retainPhysicalObjects(source: string, destination: string): Promise<void> {
   const retain = async (from: string, to: string): Promise<void> => {
     if (!lstatSync(from).isFile()) throw new Error(`Git object payload ${from} is not a regular file`)
     const existing = lstatSync(to, { throwIfNoEntry: false })
@@ -1489,13 +1494,13 @@ function retainPhysicalObjects(source: string, destination: string): void {
         entry.name === "pack"
           ? /^pack-[0-9a-f]+\.(?:pack|idx|rev)$/u.test(file)
           : /^(?:[0-9a-f]{38}|[0-9a-f]{62})$/u.test(file)
-      if (payload) retain(join(directory, file), join(target, file))
+      if (payload) await retain(join(directory, file), join(target, file))
     }
   }
 }
 
 /** New copies retain removable payload and borrow only canonical durable stores. */
-function normalizeRetainedModules(
+async function normalizeRetainedModules(
   git: Git,
   source: string,
   copy: string,
@@ -1503,7 +1508,7 @@ function normalizeRetainedModules(
   lender: string,
   operationRoots: readonly string[],
   fullIntegrity: boolean,
-): { borrowed: ReadonlySet<string>; verify: () => Promise<readonly string[]> } {
+): Promise<{ borrowed: ReadonlySet<string>; verify: () => Promise<readonly string[]> }> {
   const canonicalCommon = realpathSync(common)
   const borrowed = new Set<string>()
   const objects = [...borrowerEntries(copy, undefined)]
@@ -1541,7 +1546,7 @@ function normalizeRetainedModules(
       unlinkSync(destination)
       mkdirSync(destination)
     }
-    for (const donor of removable) retainPhysicalObjects(donor, destination)
+    for (const donor of removable) await retainPhysicalObjects(donor, destination)
     const info = join(destination, "info")
     mkdirSync(info, { recursive: true })
     const alternates = join(info, "alternates")
@@ -1791,7 +1796,7 @@ export async function retainWorktreeModules(
   inspect: (repository: string, path: string) => Promise<WorktreeInspection>,
   writerLocks: readonly WriterLockProof[],
   createdWriterLocks: readonly WriterLockProof[],
-  rehome?: () => readonly string[],
+  rehome?: () => readonly string[] | Promise<readonly string[]>,
   excludedSubmodules: readonly string[] = [],
   notCompared: readonly NotCompared[] = [],
   privateProjection?: PrivateGitProjection,
@@ -1837,7 +1842,7 @@ export async function prepareWorktreeModulesRetention(
   inspect: (repository: string, path: string) => Promise<WorktreeInspection>,
   writerLocks: readonly WriterLockProof[],
   createdWriterLocks: readonly WriterLockProof[],
-  rehome?: () => readonly string[],
+  rehome?: () => readonly string[] | Promise<readonly string[]>,
   excludedSubmodules: readonly string[] = [],
   notCompared: readonly NotCompared[] = [],
   privateProjection?: PrivateGitProjection,
@@ -1906,7 +1911,7 @@ async function prepareResolvedWorktreeModules(context: {
   inspect: (repository: string, path: string) => Promise<WorktreeInspection>
   writerLocks: readonly WriterLockProof[]
   createdWriterLocks: readonly WriterLockProof[]
-  rehome: (() => readonly string[]) | undefined
+  rehome: (() => readonly string[] | Promise<readonly string[]>) | undefined
   excludedSubmodules: readonly string[]
   notCompared: readonly NotCompared[]
   privateProjection: PrivateGitProjection | undefined
@@ -1948,7 +1953,7 @@ async function prepareResolvedWorktreeModules(context: {
     ...(privateProjection === undefined ? { removalRoots: [] } : {}),
   }
   // Inspection can retire stale registry pointers; deferred preparation leaves that under the root writer.
-  if (!unpublished) guardRetainedBorrowers(common, gitDir, "inspect")
+  if (!unpublished) await guardRetainedBorrowers(common, gitDir, "inspect")
   // Diagnose metadata links before Git discovery can hide their source and target in an object lookup failure.
   await manifest(gitDir, custody, false, false)
   if (privateProjection !== undefined) {
@@ -2167,7 +2172,7 @@ async function prepareResolvedWorktreeModules(context: {
         }
       }
       try {
-        const normalized = normalizeRetainedModules(
+        const normalized = await normalizeRetainedModules(
           git,
           privateProjection === undefined ? copiedSource : gitDir,
           privateProjection === undefined ? copiedTree : retained,
@@ -2220,7 +2225,7 @@ async function prepareResolvedWorktreeModules(context: {
               ([key]) => !removed.some((cache) => key === cache || key.startsWith(`${cache}${sep}`)),
             ),
           )
-          verifyRetainedManifest()
+          await verifyRetainedManifest()
           if (retained !== null) {
             finalRetainedManifest = await manifest(copiedTree, copiedCustody, true, privateProjection !== undefined)
           }
@@ -2235,8 +2240,8 @@ async function prepareResolvedWorktreeModules(context: {
         if (!verified) throw new Error(`retained integrity verification is incomplete for ${path}; worktree preserved`)
         // Re-read source and normalized copy only after the caller reacquires the root writer.
         if (unpublished) {
-          verifyRetainedManifest()
-          guardRetainedBorrowers(common, gitDir, "inspect")
+          await verifyRetainedManifest()
+          await guardRetainedBorrowers(common, gitDir, "inspect")
         }
         const inspectedPath = copiedCheckout
         const after =
@@ -2249,7 +2254,7 @@ async function prepareResolvedWorktreeModules(context: {
                 privateProjection === undefined ? preserved : [],
               )
             : undefined
-        verifyRetainedManifest()
+        await verifyRetainedManifest()
         if (JSON.stringify(after) !== JSON.stringify(before)) {
           throw new Error(`worktree ${path} changed during retention; preserved, retry after its writer stops`)
         }
@@ -2265,8 +2270,8 @@ async function prepareResolvedWorktreeModules(context: {
         const rehomedBorrowers =
           privateProjection === undefined
             ? rehome === undefined
-              ? rehomeBorrowers(common, gitDir, modules)
-              : rehome()
+              ? await rehomeBorrowers(common, gitDir, modules)
+              : await rehome()
             : []
         const proof: WorktreeRemovalProof = {
           path,
@@ -2304,10 +2309,11 @@ async function prepareResolvedWorktreeModules(context: {
             registerRetainedBorrower(dirname(mount.source), retained, proof.manifest)
           }
         }
-        retention.report(proof)
+        // The existing void callback can return async work; join it before native mutation.
+        await Promise.resolve(retention.report(proof))
         if (retirePrivate !== undefined) {
           if (privateProjection === undefined) throw new Error("private retirement requires its projection record")
-          verifyRetainedManifest()
+          await verifyRetainedManifest()
           retirePrivate()
         }
         return proof
@@ -2694,7 +2700,7 @@ export async function enrollRetainedBorrowers(options: RetentionEnrollOptions): 
       result.entries.every((row) => row.classification !== "not-enrolled")
     return result
   }
-  const initial = plan()
+  const initial = await plan()
   if (options.apply !== true || initial.boundHit || initial.errors.length > 0) return initial
   const remaining = deadline - Date.now()
   if (remaining <= 0) {
@@ -2709,7 +2715,7 @@ export async function enrollRetainedBorrowers(options: RetentionEnrollOptions): 
     onContended: (holder) => options.report?.(`retention enrollment waiting for common writer lock held by ${holder}`),
   }).run(
     async () => {
-      const current = plan()
+      const current = await plan()
       if (current.boundHit || current.errors.length > 0) return Promise.resolve(current)
       if (Date.now() >= deadline) {
         current.boundHit = true

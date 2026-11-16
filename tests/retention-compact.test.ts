@@ -246,7 +246,7 @@ describe("compactRetainedModules", () => {
     expect(existsSync(join(gitDir, "logs/refs/remotes/origin/topic-1"))).toBe(true)
     expect(existsSync(join(nested, "refs/remotes/origin/topic-1"))).toBe(true)
 
-    expect(compactRetainedModules(proof, inRun())).toEqual({ status: "ok" })
+    expect(await compactRetainedModules(proof, inRun())).toEqual({ status: "ok" })
 
     expect(gitAt(gitDir, ["for-each-ref", "--format=%(refname) %(objectname)"])).toBe(before.refs)
     expect(gitAt(nested, ["for-each-ref", "--format=%(refname) %(objectname)"])).toBe(before.nestedRefs)
@@ -270,7 +270,7 @@ describe("compactRetainedModules", () => {
       retainUntil: string
       files: Record<string, string>
     }
-    expect(compactRetainedModules(proof, inRun())).toEqual({ status: "ok" })
+    expect(await compactRetainedModules(proof, inRun())).toEqual({ status: "ok" })
     const afterBytes = readFileSync(proof.manifest, "utf8")
     const after = JSON.parse(afterBytes) as {
       createdAt: string
@@ -312,7 +312,7 @@ describe("compactRetainedModules", () => {
     const before = readFileSync(proof.manifest)
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
     try {
-      expect(compactRetainedModules(proof, inRun())).toEqual({
+      expect(await compactRetainedModules(proof, inRun())).toEqual({
         status: "failed",
         child: gitDir,
         step: "pack-refs",
@@ -349,7 +349,7 @@ describe("compactRetainedModules", () => {
     const before = readFileSync(proof.manifest)
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
     try {
-      const result = compactRetainedModules(proof, inRun(join(entry, "not-the-common")))
+      const result = await compactRetainedModules(proof, inRun(join(entry, "not-the-common")))
       expect(result.status).toBe("failed")
       if (result.status !== "failed") throw new Error("expected failed compaction")
       expect(result.step).toBe("rewrite-proof")
@@ -367,7 +367,7 @@ describe("compactRetainedModules", () => {
     const packedBefore = existsSync(join(gitDir, "packed-refs"))
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
     try {
-      expect(compactRetainedModules(proof, { common: sep, preState: { kind: "gate-2" } })).toEqual({
+      expect(await compactRetainedModules(proof, { common: sep, preState: { kind: "gate-2" } })).toEqual({
         status: "failed",
         child: proof.retained,
         step: "gate-2",
@@ -586,7 +586,7 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
     const b = await buildRetainedEntry(retainedRoot, "b-entry")
     expect(existsSync(join(a.gitDir, "logs/refs/remotes/origin/topic-1"))).toBe(true)
 
-    const report = compactRetainedRoot(retainedRoot)
+    const report = await compactRetainedRoot(retainedRoot)
 
     expect(report.children).toBe(2)
     expect(report.counts.eligible).toBe(2)
@@ -616,7 +616,7 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
       manifest: join(scratch, "hh-dev%23main", "retained-modules", "stale-entry", "manifest.json"),
     })
 
-    const report = compactRetainedRoot(retainedRoot)
+    const report = await compactRetainedRoot(retainedRoot)
 
     expect(report.failed).toBeNull()
     expect(report.processed).toEqual([entry])
@@ -666,7 +666,7 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
     })
     const retainUntil = String(legacy.retainUntil)
 
-    const report = compactRetainedRoot(retainedRoot)
+    const report = await compactRetainedRoot(retainedRoot)
     expect(report.failed).toBeNull()
     expect(report.processed).toEqual([entry])
 
@@ -712,7 +712,7 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
     const legacyCopyBefore = treeDigest(legacy.gitDir)
     const incompleteCopyBefore = treeDigest(incomplete.gitDir)
 
-    const report = compactRetainedRoot(retainedRoot)
+    const report = await compactRetainedRoot(retainedRoot)
 
     expect(report.counts).toEqual({
       eligible: 1,
@@ -754,7 +754,7 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
     const first = await buildRetainedEntry(retainedRoot, "b-first")
     const second = await buildRetainedEntry(retainedRoot, "c-second")
 
-    const report = compactRetainedRoot(retainedRoot, { limit: 1 })
+    const report = await compactRetainedRoot(retainedRoot, { limit: 1 })
 
     expect(report.limit).toBe(1)
     expect(report.processed).toEqual([first.entry])
@@ -770,7 +770,7 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
     const { entry, gitDir } = await buildRetainedEntry(retainedRoot, "a-entry")
     const before = readFileSync(join(entry, "manifest.json"), "utf8")
 
-    const report = compactRetainedRoot(retainedRoot, { dryRun: true })
+    const report = await compactRetainedRoot(retainedRoot, { dryRun: true })
 
     expect(report.dryRun).toBe(true)
     expect(report.processed).toEqual([entry])
@@ -792,9 +792,9 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
     const copyBefore = treeDigest(damaged.gitDir)
 
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
-    let report: ReturnType<typeof compactRetainedRoot>
+    let report: Awaited<ReturnType<typeof compactRetainedRoot>>
     try {
-      report = compactRetainedRoot(retainedRoot)
+      report = await compactRetainedRoot(retainedRoot)
       expect(warn.mock.calls).toEqual([
         [
           expect.stringContaining(
@@ -830,7 +830,7 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
     chmodSync(first.gitDir, 0o500)
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
     try {
-      const report = compactRetainedRoot(retainedRoot)
+      const report = await compactRetainedRoot(retainedRoot)
       expect(warn.mock.calls).toEqual([
         [expect.stringContaining(`git-super: retained compaction failed for ${first.gitDir}: pack-refs:`)],
       ])
@@ -864,7 +864,7 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
     chmodSync(unwritable.gitDir, 0o500)
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
     try {
-      const report = compactRetainedRoot(retainedRoot)
+      const report = await compactRetainedRoot(retainedRoot)
       expect(warn.mock.calls).toEqual([
         [expect.stringContaining(`git-super: retained compaction failed for ${unwritable.gitDir}: pack-refs:`)],
       ])
@@ -902,7 +902,7 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
     chmodSync(nested, 0o500)
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
     try {
-      const report = compactRetainedRoot(retainedRoot)
+      const report = await compactRetainedRoot(retainedRoot)
       expect(warn.mock.calls).toEqual([
         [expect.stringContaining(`git-super: retained compaction failed for ${nested}: pack-refs:`)],
       ])
@@ -935,7 +935,7 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
       retained: join(retainedRoot, "someone-else", "modules"),
     })
 
-    const report = compactRetainedRoot(retainedRoot)
+    const report = await compactRetainedRoot(retainedRoot)
 
     // Another pre-mutation refusal: the class is the family and step names which refusal.
     expect(report.failed).toBeNull()
@@ -945,8 +945,8 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
     expect(row?.step).toBe("foreign-proof")
   })
 
-  it("refuses an absent root loudly instead of reporting an empty success", () => {
-    expect(() => compactRetainedRoot(join(canonicalTmpdir(), "git-super-c3-absent-root"))).toThrow(
+  it("refuses an absent root loudly instead of reporting an empty success", async () => {
+    await expect(compactRetainedRoot(join(canonicalTmpdir(), "git-super-c3-absent-root"))).rejects.toThrow(
       /is absent or not a directory/,
     )
   })
@@ -962,7 +962,7 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
     const alias = join(scratch, "retained-alias")
     symlinkSync(retainedRoot, alias, "dir")
 
-    expect(() => compactRetainedRoot(alias)).toThrow(/root .*absent or not a directory/u)
+    await expect(compactRetainedRoot(alias)).rejects.toThrow(/root .*absent or not a directory/u)
     expect(readFileSync(join(child.entry, "manifest.json"))).toEqual(beforeProof)
     expect(treeDigest(child.entry)).toBe(beforeTree)
   })
@@ -1190,7 +1190,8 @@ describe("retention enrollment", () => {
     const common = join(repo, ".git")
     const root = join(scratch, "retained")
     mkdirSync(root)
-    const linked = (await buildRetainedEntry(root, "linked"))(await buildRetainedEntry(root, "durable"))
+    const linked = await buildRetainedEntry(root, "linked")
+    await buildRetainedEntry(root, "durable")
     const lender = join(common, "worktrees/lender/modules/dep/objects")
     mkdirSync(join(lender, "info"), { recursive: true })
     writeFileSync(join(linked.gitDir, "objects/info/alternates"), lender + "\n")

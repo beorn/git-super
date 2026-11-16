@@ -529,8 +529,8 @@ const retentionCompact = commandNode<CommandContext, RetentionCompactParams, Com
       ...(input.limit === undefined ? {} : { limit: input.limit as number }),
     }
   }),
-  run: (_context, input) =>
-    compactRetainedRoot(input.root, {
+  run: async (_context, input) =>
+    await compactRetainedRoot(input.root, {
       ...(input.dryRun === true ? { dryRun: true } : {}),
       ...(input.limit === undefined ? {} : { limit: input.limit }),
     }),

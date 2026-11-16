@@ -2131,7 +2131,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
             // An already-borrowed lender must refuse before creating any retained directory.
             // Check again below after preparation, since other root writers may add borrowers meanwhile.
             if (removeOptions.noRehome === true) {
-              const borrowers = rehome.inspect()
+              const borrowers = await rehome.inspect()
               if (borrowers.length > 0) {
                 borrowed = { borrowers }
                 return
@@ -2171,7 +2171,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
           // Shared mutation must never proceed without reacquiring the root writer after custody proof.
           if (mutationLease === undefined) throw new Error(`${path}: root writer lease is not held before removal`)
           if (removeOptions.noRehome === true) {
-            const borrowers = rehome.inspect()
+            const borrowers = await rehome.inspect()
             if (borrowers.length > 0) {
               borrowed = { borrowers }
               return
@@ -2183,7 +2183,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
             phases.retainedCopy = Date.now() - retainedCopyStarted
           } else {
             if (removeOptions.unlock === true) await unlockWorktree(git, repo, path)
-            if (removeOptions.noRehome !== true) rehome.run()
+            if (removeOptions.noRehome !== true) await rehome.run()
           }
           children = await captureLinkedChildren(resolvedPath, gitDir, removeOptions.excludedSubmodules ?? [])
           await admitCaller()
@@ -2303,7 +2303,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         // ref value stays intact, the proof is not rewritten (later retention verify refuses), and
         // the copy is never deleted.
         if (removalProof?.retained != null) {
-          compaction = compactRetainedModules(removalProof, {
+          compaction = await compactRetainedModules(removalProof, {
             common: removalRepo,
             preState: { kind: "in-run" },
           })
@@ -2581,7 +2581,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         throw new Error(`worktree ${path} has no prepared borrower custody`)
       }
       return {
-        borrowers: prepared.rehome === undefined ? [] : prepared.rehome.inspect(),
+        borrowers: prepared.rehome === undefined ? [] : await prepared.rehome.inspect(),
         moduleStores: prepared.stores,
         records: status.records,
         notCompared: [...prepared.notCompared, ...status.notCompared],
@@ -2684,7 +2684,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
           if (retention === undefined) {
             // Keep the same value inspection; unresolved value preserves the registration and all its stores.
             preserveModuleStoreValueBeforeDelete(inspectDestroyedModuleStores(directory).stores)
-            rehomeBorrowers(common, directory, join(directory, "modules"))
+            await rehomeBorrowers(common, directory, join(directory, "modules"))
           } else {
             const identity = await inspectWorktree(git, repo, path)
             const pointer = await readFile(join(directory, "gitdir"), "utf8")

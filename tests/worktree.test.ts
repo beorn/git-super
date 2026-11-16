@@ -1625,13 +1625,12 @@ describe("createGitWorktreeStore", () => {
               // Do not replace native normalized alternates with source bytes.
               expect(readFileSync(join(proof.retained!, "packages/alpha/objects/info/alternates"), "utf8")).toBe(
                 target + "\n",
-              )(await historicalRetainedBorrower(proof, component, false))
+              )
+              await historicalRetainedBorrower(proof, component, false)
             } else if (!nativePositive) {
               // Reconstruct historical metadata only after the native writer completed.
-              writeFileSync(
-                join(borrower.objects, "info/alternates"),
-                target + "\n",
-              )(await historicalRetainedBorrower(proof, component))
+              writeFileSync(join(borrower.objects, "info/alternates"), target + "\n")
+              await historicalRetainedBorrower(proof, component)
             }
             proofs.push(proof)
           },
@@ -3069,7 +3068,7 @@ describe("createGitWorktreeStore", () => {
         stderr: "",
       })) as unknown as typeof spawnSync
 
-      expect(() => rehomeBorrowers(root, join(root, "lender"), lenderModules, { spawn: fakeSpawn })).toThrow(
+      await expect(rehomeBorrowers(root, join(root, "lender"), lenderModules, { spawn: fakeSpawn })).rejects.toThrow(
         /timed out after 120s bound/,
       )
     } finally {
@@ -3118,7 +3117,7 @@ describe("createGitWorktreeStore", () => {
         pid: 1,
       })) as unknown as typeof spawnSync
       try {
-        expect(() => rehomeBorrowers(root, join(root, "lender"), lenderModules, { spawn: fakeSpawn })).not.toThrow()
+        await rehomeBorrowers(root, join(root, "lender"), lenderModules, { spawn: fakeSpawn })
         expect(await readFile(alternates, "utf8")).toBe("")
         expect(readdir.mock.calls.some(([path]) => String(path) === fanout)).toBe(false)
       } finally {
