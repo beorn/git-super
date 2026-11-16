@@ -1,23 +1,18 @@
 import { createHash, randomUUID } from "node:crypto"
-import {
-  existsSync,
-  lstatSync,
-  readdirSync,
-  readFileSync,
-  renameSync,
-  rmSync,
-  unlinkSync,
-  writeFileSync,
-} from "node:fs"
-import { spawnSync } from "node:child_process"
+import { existsSync, lstatSync, readdirSync } from "node:fs"
+import { lstat, readdir, readFile, rename, unlink, writeFile } from "node:fs/promises"
 import { dirname, join, sep } from "node:path"
 import { cleanGitRepositoryEnvironment } from "./git.ts"
+import { createLocalGitProcess, type GitProcess } from "./process.ts"
 import {
   manifest,
   metadataFileDigest,
   readStoredManifest,
   readProofLocation,
   rebuildRetainedCopyProof,
+  checkRemovalExecution,
+  deleteStagedTree,
+  type RemovalExecution,
   type WorktreeRemovalProof,
 } from "./worktree-removal.ts"
 
@@ -78,6 +73,8 @@ export type CompactionOptions = Readonly<{
    */
   common: string
   preState: CompactionPreState
+  gitProcess?: GitProcess
+  execution?: RemovalExecution
 }>
 
 /**
@@ -96,61 +93,92 @@ type RefSnapshot = Readonly<{
   localReflogDigests: Readonly<Record<string, string>>
 }>
 
-function runAtGitDir(gitDir: string, args: readonly string[]): { exitCode: number; stdout: string; stderr: string } {
+async function runAtGitDir(
+  gitDir: string,
+  args: readonly string[],
+  gitProcess: GitProcess,
+  execution?: RemovalExecution,
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
   // --bare: the retained copy still records core.worktree for the checkout native --force just
   // deleted. Without it, for-each-ref and pack-refs die on chdir to that missing path.
-  const result = spawnSync("git", ["--git-dir", gitDir, "--bare", ...args], {
-    encoding: "utf8",
+  checkRemovalExecution(execution)
+  const result = await gitProcess.run({
+    repo: dirname(gitDir),
+    args: ["--git-dir", gitDir, "--bare", ...args],
     env: cleanGitRepositoryEnvironment(),
-    maxBuffer: 64 * 1024 * 1024,
+    ...(execution?.signal === undefined ? {} : { signal: execution.signal }),
+    ...(execution?.remainingMs === undefined ? {} : { timeoutMs: Math.max(1, Math.floor(execution.remainingMs())) }),
   })
-  if (result.error) throw new Error(`failed to run git in ${gitDir}: ${result.error.message}`)
+  if (result.failure !== undefined) throw new Error(`failed to run git in ${gitDir}: ${result.failure}`)
+  checkRemovalExecution(execution)
   return {
-    exitCode: result.status ?? 1,
-    stdout: result.stdout ?? "",
-    stderr: (result.stderr ?? "").trim(),
+    exitCode: result.code,
+    stdout: result.stdout,
+    stderr: result.stderr.trim(),
   }
 }
 
-function isRetainedGitDir(path: string): boolean {
+async function compactionStat(
+  path: string,
+  execution?: RemovalExecution,
+): Promise<Awaited<ReturnType<typeof lstat>> | undefined> {
+  checkRemovalExecution(execution)
+  try {
+    return await lstat(path)
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === "ENOENT" || code === "ENOTDIR") return undefined
+    throw error
+  }
+}
+
+async function isRetainedGitDir(path: string, execution?: RemovalExecution): Promise<boolean> {
   const head = join(path, "HEAD")
-  if (!existsSync(head) || !lstatSync(head).isFile()) return false
+  if (!(await compactionStat(head, execution))?.isFile()) return false
   const refs = join(path, "refs")
   const packed = join(path, "packed-refs")
-  return (existsSync(refs) && lstatSync(refs).isDirectory()) || (existsSync(packed) && lstatSync(packed).isFile())
+  return (
+    (await compactionStat(refs, execution))?.isDirectory() === true ||
+    (await compactionStat(packed, execution))?.isFile() === true
+  )
 }
 
 /** HEAD plus (refs/ or packed-refs); recurse only into `modules/` of a gitdir. */
-export function findRetainedGitDirs(root: string): string[] {
+export async function findRetainedGitDirs(root: string, execution?: RemovalExecution): Promise<string[]> {
   const found: string[] = []
-  const consider = (path: string): void => {
-    if (!existsSync(path) || !lstatSync(path).isDirectory()) return
-    if (isRetainedGitDir(path)) {
+  const consider = async (path: string): Promise<void> => {
+    if (!(await compactionStat(path, execution))?.isDirectory()) return
+    if (await isRetainedGitDir(path, execution)) {
       found.push(path)
-      consider(join(path, "modules"))
+      await consider(join(path, "modules"))
       return
     }
-    for (const name of readdirSync(path)) consider(join(path, name))
+    checkRemovalExecution(execution)
+    for (const name of await readdir(path)) await consider(join(path, name))
   }
-  consider(root)
+  await consider(root)
   return found
 }
 
-async function collectLocalReflogDigests(gitDir: string): Promise<Readonly<Record<string, string>>> {
+async function collectLocalReflogDigests(
+  gitDir: string,
+  execution?: RemovalExecution,
+): Promise<Readonly<Record<string, string>>> {
   const digests: Record<string, string> = {}
   const visit = async (relativePath: string): Promise<void> => {
     const path = join(gitDir, relativePath)
-    if (!existsSync(path)) return
-    const stats = lstatSync(path)
+    const stats = await compactionStat(path, execution)
+    if (stats === undefined) return
     if (stats.isSymbolicLink()) {
       throw new Error(`local reflog path ${path} is a symlink; preserve before compaction`)
     }
     if (stats.isFile()) {
-      digests[relativePath] = await metadataFileDigest(path)
+      digests[relativePath] = await metadataFileDigest(path, execution)
       return
     }
     if (stats.isDirectory()) {
-      for (const name of readdirSync(path)) await visit(join(relativePath, name))
+      checkRemovalExecution(execution)
+      for (const name of await readdir(path)) await visit(join(relativePath, name))
     }
   }
   await visit("logs/HEAD")
@@ -158,46 +186,56 @@ async function collectLocalReflogDigests(gitDir: string): Promise<Readonly<Recor
   return Object.fromEntries(Object.entries(digests).sort(([left], [right]) => left.localeCompare(right)))
 }
 
-async function snapshotRefValues(gitDir: string): Promise<RefSnapshot> {
-  const refs = runAtGitDir(gitDir, ["for-each-ref", "--format=%(refname) %(objectname)"])
+async function snapshotRefValues(
+  gitDir: string,
+  gitProcess: GitProcess,
+  execution?: RemovalExecution,
+): Promise<RefSnapshot> {
+  const refs = await runAtGitDir(gitDir, ["for-each-ref", "--format=%(refname) %(objectname)"], gitProcess, execution)
   if (refs.exitCode !== 0) {
     throw new Error(`for-each-ref failed in ${gitDir}: ${refs.stderr || refs.stdout}`)
   }
-  const head = runAtGitDir(gitDir, ["rev-parse", "HEAD"])
+  const head = await runAtGitDir(gitDir, ["rev-parse", "HEAD"], gitProcess, execution)
   if (head.exitCode !== 0) {
     throw new Error(`rev-parse HEAD failed in ${gitDir}: ${head.stderr || head.stdout}`)
+  }
+  let headSymbolic = ""
+  if (await compactionStat(join(gitDir, "HEAD"), execution)) {
+    checkRemovalExecution(execution)
+    headSymbolic = await readFile(join(gitDir, "HEAD"), "utf8")
   }
   return {
     refs: refs.stdout,
     headValue: head.stdout.trim(),
-    headSymbolic: existsSync(join(gitDir, "HEAD")) ? readFileSync(join(gitDir, "HEAD"), "utf8") : "",
-    localReflogDigests: await collectLocalReflogDigests(gitDir),
+    headSymbolic,
+    localReflogDigests: await collectLocalReflogDigests(gitDir, execution),
   }
 }
 
-function dropRemoteReflogs(gitDir: string): void {
+async function dropRemoteReflogs(gitDir: string, execution?: RemovalExecution): Promise<void> {
   const remotes = join(gitDir, "logs", "refs", "remotes")
-  if (!existsSync(remotes)) return
-  if (lstatSync(remotes).isSymbolicLink()) {
+  const stats = await compactionStat(remotes, execution)
+  if (stats === undefined) return
+  if (stats.isSymbolicLink()) {
     throw new Error(`${remotes} is a symlink; preserve before compaction`)
   }
-  rmSync(remotes, { recursive: true, force: false })
+  await deleteStagedTree(remotes, execution)
 }
 
-async function compactOneGitDir(gitDir: string): Promise<void> {
-  const before = await snapshotRefValues(gitDir)
-  const packed = runAtGitDir(gitDir, ["pack-refs", "--all"])
+async function compactOneGitDir(gitDir: string, gitProcess: GitProcess, execution?: RemovalExecution): Promise<void> {
+  const before = await snapshotRefValues(gitDir, gitProcess, execution)
+  const packed = await runAtGitDir(gitDir, ["pack-refs", "--all"], gitProcess, execution)
   if (packed.exitCode !== 0) {
     throw Object.assign(new Error(`pack-refs failed in ${gitDir}: ${packed.stderr || packed.stdout}`), {
       step: "pack-refs",
     })
   }
   try {
-    dropRemoteReflogs(gitDir)
+    await dropRemoteReflogs(gitDir, execution)
   } catch (error) {
     throw Object.assign(error instanceof Error ? error : new Error(String(error)), { step: "drop-remote-reflogs" })
   }
-  const after = await snapshotRefValues(gitDir)
+  const after = await snapshotRefValues(gitDir, gitProcess, execution)
   if (JSON.stringify(before) !== JSON.stringify(after)) {
     throw Object.assign(new Error(`ref values were not byte-identical after compaction in ${gitDir}`), {
       step: "g1-snapshot",
@@ -233,8 +271,14 @@ function expectedCopyEntries(entries: Readonly<Record<string, unknown>>): Readon
   )
 }
 
-async function assertStoredProofMatchesCopy(proof: RetainedCopyProof, retained: string, common: string): Promise<void> {
-  const current = JSON.parse(readFileSync(proof.manifest).toString("utf8")) as {
+async function assertStoredProofMatchesCopy(
+  proof: RetainedCopyProof,
+  retained: string,
+  common: string,
+  execution?: RemovalExecution,
+): Promise<void> {
+  checkRemovalExecution(execution)
+  const current = JSON.parse((await readFile(proof.manifest)).toString("utf8")) as {
     files?: unknown
     entries?: unknown
   }
@@ -254,6 +298,7 @@ async function assertStoredProofMatchesCopy(proof: RetainedCopyProof, retained: 
     },
     true,
     false,
+    execution,
   )
   if (JSON.stringify(current.files) !== JSON.stringify(actual.files)) {
     throw Object.assign(new Error(`gate 2 files mismatch in ${retained}; compaction refused`), { step: "gate-2" })
@@ -266,9 +311,15 @@ async function assertStoredProofMatchesCopy(proof: RetainedCopyProof, retained: 
   }
 }
 
-async function rewriteProof(proof: RetainedCopyProof, retained: string, common: string): Promise<void> {
+async function rewriteProof(
+  proof: RetainedCopyProof,
+  retained: string,
+  common: string,
+  execution?: RemovalExecution,
+): Promise<void> {
   try {
-    const currentBytes = readFileSync(proof.manifest)
+    checkRemovalExecution(execution)
+    const currentBytes = await readFile(proof.manifest)
     const current = JSON.parse(currentBytes.toString("utf8")) as Record<string, unknown>
     const files = current.files
     if (typeof files !== "object" || files === null || Array.isArray(files)) {
@@ -285,6 +336,7 @@ async function rewriteProof(proof: RetainedCopyProof, retained: string, common: 
       },
       true,
       false,
+      execution,
     )
     const next = {
       ...current,
@@ -310,11 +362,18 @@ async function rewriteProof(proof: RetainedCopyProof, retained: string, common: 
     }
     const tmp = join(dirname(proof.manifest), `manifest.${randomUUID()}.json.tmp`)
     try {
-      writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`, { flag: "wx" })
-      renameSync(tmp, proof.manifest)
+      checkRemovalExecution(execution)
+      await writeFile(tmp, `${JSON.stringify(next, null, 2)}\n`, { flag: "wx" })
+      checkRemovalExecution(execution)
+      await rename(tmp, proof.manifest)
     } catch (error) {
       try {
-        if (existsSync(tmp)) unlinkSync(tmp)
+        // A cancelled attempt keeps its named temp proof; do not begin another operation after cutoff.
+        checkRemovalExecution(execution)
+        if (await compactionStat(tmp, execution)) {
+          checkRemovalExecution(execution)
+          await unlink(tmp)
+        }
       } catch (cleanupError) {
         console.warn(
           `git-super: retained compaction left temp proof ${tmp}: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
@@ -333,15 +392,14 @@ export async function compactRetainedModules(
 ): Promise<CompactionResult> {
   if (proof.retained === null) return { status: "skipped" }
   const retained = proof.retained
-  if (!existsSync(retained)) {
-    return failedCompaction(
-      retained,
-      Object.assign(new Error(`retained copy ${retained} is missing; compaction refused`), { step: "missing-copy" }),
-    )
-  }
   try {
+    if (!(await compactionStat(retained, options.execution))) {
+      throw Object.assign(new Error(`retained copy ${retained} is missing; compaction refused`), {
+        step: "missing-copy",
+      })
+    }
     if (options.preState.kind === "gate-2") {
-      await assertStoredProofMatchesCopy(proof, retained, options.common)
+      await assertStoredProofMatchesCopy(proof, retained, options.common, options.execution)
     } else if (options.preState.kind !== "in-run") {
       const exhaustive: never = options.preState
       throw Object.assign(new Error(`unknown compaction pre-state ${JSON.stringify(exhaustive)}`), {
@@ -353,22 +411,23 @@ export async function compactRetainedModules(
   }
   let children: string[]
   try {
-    children = findRetainedGitDirs(retained)
+    children = await findRetainedGitDirs(retained, options.execution)
   } catch (error) {
     return failedCompaction(
       retained,
       Object.assign(error instanceof Error ? error : new Error(String(error)), { step: "discovery" }),
     )
   }
+  const gitProcess = options.gitProcess ?? createLocalGitProcess()
   for (const gitDir of children) {
     try {
-      await compactOneGitDir(gitDir)
+      await compactOneGitDir(gitDir, gitProcess, options.execution)
     } catch (error) {
       return failedCompaction(gitDir, error)
     }
   }
   try {
-    await rewriteProof(proof, retained, options.common)
+    await rewriteProof(proof, retained, options.common, options.execution)
   } catch (error) {
     return failedCompaction(retained, error)
   }

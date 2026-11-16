@@ -30,6 +30,7 @@ import {
   type CompactionOptions,
 } from "../src/retention-compact.ts"
 import { createLocalGitWorktreeStore } from "../src/worktree.ts"
+import { createLocalGitProcess } from "../src/process.ts"
 import { verifyRetainedEntry } from "../src/retention-verify.ts"
 import {
   rebuildRetainedCopyProof,
@@ -243,6 +244,68 @@ it("exposes native removal head and createdAt under the consumer field names (30
 })
 
 describe("compactRetainedModules", () => {
+  // Existing ref-preservation cases do not prove that cancellation stops the NEXT unit of work.
+  it("keeps the proof and remote reflogs when the shared signal expires after pack-refs", async () => {
+    const { proof, gitDir } = await buildSyntheticEntry(2)
+    const originalProof = readFileSync(proof.manifest)
+    const controller = new AbortController()
+    const runner = createLocalGitProcess(environment)
+    const run = vi.fn(async (request: Parameters<typeof runner.run>[0]) => {
+      const result = await runner.run(request)
+      if (request.args.includes("pack-refs")) controller.abort(new Error("shared work cutoff"))
+      return result
+    })
+    const warned = vi.spyOn(console, "warn").mockImplementation(() => {})
+    try {
+      expect(
+        await compactRetainedModules(proof, {
+          ...inRun(),
+          gitProcess: { run },
+          execution: { signal: controller.signal, remainingMs: () => 10_000 },
+        }),
+      ).toMatchObject({ status: "failed" })
+      expect(run).toHaveBeenCalledTimes(3)
+      expect(
+        run.mock.calls.every(([request]) => request.signal === controller.signal && request.timeoutMs! <= 10_000),
+      ).toBe(true)
+      expect(existsSync(join(gitDir, "logs/refs/remotes"))).toBe(true)
+      expect(readFileSync(proof.manifest)).toEqual(originalProof)
+      expect(existsSync(proof.retained!)).toBe(true)
+      expect(warned).toHaveBeenCalledWith(expect.stringContaining("shared work cutoff"))
+    } finally {
+      warned.mockRestore()
+    }
+  })
+
+  it.each(["signal", "allowance"])("starts no compaction I/O after an exhausted %s", async (expired) => {
+    const { proof } = await buildSyntheticEntry(2)
+    const originalProof = readFileSync(proof.manifest)
+    const controller = new AbortController()
+    if (expired === "signal") controller.abort(new Error("shared work cutoff"))
+    const run = vi.fn(async () => {
+      throw new Error("unexpected child after cutoff")
+    })
+    const warned = vi.spyOn(console, "warn").mockImplementation(() => {})
+    vi.mocked(fs.lstatSync).mockClear()
+    vi.mocked(fs.readdirSync).mockClear()
+    try {
+      expect(
+        await compactRetainedModules(proof, {
+          ...inRun(),
+          gitProcess: { run },
+          execution: { signal: controller.signal, remainingMs: () => (expired === "allowance" ? 0 : 10_000) },
+        }),
+      ).toMatchObject({ status: "failed" })
+      expect(run).not.toHaveBeenCalled()
+      expect(fs.lstatSync).not.toHaveBeenCalled()
+      expect(fs.readdirSync).not.toHaveBeenCalled()
+      expect(readFileSync(proof.manifest)).toEqual(originalProof)
+      expect(warned).toHaveBeenCalled()
+    } finally {
+      warned.mockRestore()
+    }
+  })
+
   // Full close-budget acceptance: compaction must leave the event loop available to seal the deadline.
   // Existing tests prove retained bytes and refs but allow blocking discovery, Git and proof publication.
   it("compacts retained metadata without synchronous filesystem or child operations", async () => {
@@ -449,10 +512,10 @@ describe("compactRetainedModules", () => {
       const outcome = await store.remove(worktree, {
         retention: {
           root: retainedRoot,
-          report: (proof) => {
+          report: async (proof) => {
             captured = proof
             if (proof.retained === null) return
-            for (const gitDir of findRetainedGitDirs(proof.retained)) {
+            for (const gitDir of await findRetainedGitDirs(proof.retained)) {
               mkdirSync(join(gitDir, "packed-refs.lock"))
             }
           },

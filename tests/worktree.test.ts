@@ -16,6 +16,7 @@ import {
   writeFileSync,
 } from "node:fs"
 import { createHash } from "node:crypto"
+import * as fsPromises from "node:fs/promises"
 import { mkdir, mkdtemp, readFile, readlink, rename, rm, symlink, utimes, writeFile } from "node:fs/promises"
 import { spawnSync } from "node:child_process"
 import { tmpdir } from "node:os"
@@ -46,6 +47,10 @@ vi.mock("node:fs", async (importOriginal) => {
 vi.mock("node:child_process", async (importOriginal) => {
   const process = await importOriginal<typeof import("node:child_process")>()
   return { ...process, spawnSync: vi.fn(process.spawnSync) }
+})
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const fs = await importOriginal<typeof import("node:fs/promises")>()
+  return { ...fs, unlink: vi.fn(fs.unlink) }
 })
 
 function git(repo: string, args: readonly string[]): string {
@@ -3318,9 +3323,11 @@ describe("createGitWorktreeStore", () => {
 
       let concurrentAcquiredDuringPhase2 = false
       const fs = await import("node:fs")
-      const origRmSync = fs.rmSync
+      const origUnlink = (await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises")).unlink
       const mutationLockFile = join(repo, ".git", "yrd-worktree-mutations", "writer.lock")
-      const rmSpy = vi.spyOn(fs, "rmSync").mockImplementation((targetPath, opts) => {
+      const syncRemoval = vi.spyOn(fs, "rmSync")
+      let syncTrashCalls = 0
+      const unlinkSpy = vi.spyOn(fsPromises, "unlink").mockImplementation(async (targetPath) => {
         if (String(targetPath).includes(".trash")) {
           const lock = tryAcquireFlock(mutationLockFile, {
             body: JSON.stringify({ pid: process.pid, holder: "concurrent test" }),
@@ -3330,16 +3337,19 @@ describe("createGitWorktreeStore", () => {
             lock.release()
           }
         }
-        return origRmSync(targetPath, opts as any)
+        return origUnlink(targetPath)
       })
 
       try {
         await store.remove(target)
       } finally {
-        rmSpy.mockRestore()
+        unlinkSpy.mockRestore()
+        syncTrashCalls = syncRemoval.mock.calls.filter(([path]) => String(path).includes(".trash")).length
+        syncRemoval.mockRestore()
       }
 
       expect(concurrentAcquiredDuringPhase2).toBe(true)
+      expect(syncTrashCalls).toBe(0)
       expect(existsSync(target)).toBe(false)
     } finally {
       await rm(root, { recursive: true, force: true })

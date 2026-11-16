@@ -21,7 +21,7 @@ import {
   writeFileSync,
   type Dirent,
 } from "node:fs"
-import { open, readdir, readlink, realpath, stat } from "node:fs/promises"
+import { lstat, open, readdir, readlink, realpath, rmdir, stat, unlink } from "node:fs/promises"
 import { createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS } from "./exclusive.ts"
 import { tryAcquireFlock, type FlockHandle } from "@bearly/flock"
 import { fileLockHolders, formatLockHolders } from "@bearly/flock/holders"
@@ -1201,6 +1201,27 @@ export function checkRemovalExecution(execution?: RemovalExecution): void {
   const remaining = execution?.remainingMs?.()
   if (remaining !== undefined && (!Number.isFinite(remaining) || remaining <= 0)) {
     throw new Error("worktree removal work allowance exhausted or invalid; no further operation started")
+  }
+}
+
+/** One awaited filesystem operation per leaf; never hide a subtree behind recursive rm. */
+export async function deleteStagedTree(path: string, execution?: RemovalExecution): Promise<void> {
+  checkRemovalExecution(execution)
+  let entry: Awaited<ReturnType<typeof lstat>>
+  try {
+    entry = await lstat(path)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return
+    throw error
+  }
+  if (entry.isDirectory() && !entry.isSymbolicLink()) {
+    checkRemovalExecution(execution)
+    for (const name of await readdir(path)) await deleteStagedTree(join(path, name), execution)
+    checkRemovalExecution(execution)
+    await rmdir(path)
+  } else {
+    checkRemovalExecution(execution)
+    await unlink(path)
   }
 }
 

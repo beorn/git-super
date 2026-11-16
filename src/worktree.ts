@@ -16,7 +16,7 @@ import {
 import { createHash, randomUUID } from "node:crypto"
 import { spawnSync } from "node:child_process"
 import { setTimeout as delay } from "node:timers/promises"
-import { appendFile, lstat, readFile, writeFile } from "node:fs/promises"
+import { appendFile, lstat, readFile, rmdir, writeFile } from "node:fs/promises"
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { fileURLToPath } from "node:url"
 import { tmpdir } from "node:os"
@@ -28,6 +28,8 @@ import {
   prepareRemovalBorrowers,
   prepareWorktreeModulesRetention,
   rehomeBorrowers,
+  checkRemovalExecution,
+  deleteStagedTree,
   type ComponentCustodyProof,
   type WorktreeRemovalProof,
   type WorktreeRetention,
@@ -1023,6 +1025,8 @@ export type GitWorktreeStoreOptions = Readonly<{
   gitProcess: GitProcess
   env?: NodeJS.ProcessEnv
   signal?: AbortSignal
+  /** Remaining allowance from the caller's existing clock; creates no native timer. */
+  remainingMs?: () => number
   timeouts?: Partial<GitWorktreeTimeouts>
   /**
    * Reports writer-lock contention, and the module stores a removal archives or releases, without writing to
@@ -1659,6 +1663,8 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       | Readonly<{ compaction: CompactionResult }>
       | Readonly<{ custodyRefusal: ComponentCustodyRefusal }>
     > {
+      const execution = { signal: options.signal, remainingMs: options.remainingMs }
+      checkRemovalExecution(execution)
       await assertRemovalRoot(path)
       if (removeOptions.componentCustody !== undefined && removeOptions.retention === undefined) {
         throw new Error("component custody requires the existing retention proof on worktree removal")
@@ -1666,12 +1672,12 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       // The selected checkout can be the removal target. Its registry outlives it.
       const removalRepo = await git.text(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"])
       const admitCaller = async () => {
-        options.signal?.throwIfAborted()
+        checkRemovalExecution(execution)
         if (removeOptions.beforeRemove === undefined) return
         const target = (await listWorktrees(git, removalRepo)).find((row) => row.path === resolve(path))
         if (target === undefined) throw new Error(`${path}: worktree is no longer registered; caller admission refused`)
         await removeOptions.beforeRemove(target)
-        options.signal?.throwIfAborted()
+        checkRemovalExecution(execution)
         const current = (await listWorktrees(git, removalRepo)).find((row) => row.path === target.path)
         if (
           current === undefined ||
@@ -2306,16 +2312,19 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
           compaction = await compactRetainedModules(removalProof, {
             common: removalRepo,
             preState: { kind: "in-run" },
+            gitProcess: options.gitProcess,
+            execution,
           })
         }
       } finally {
         // Phase 2 (outside mutation lock):
-        // Delete the staging directory synchronously in the caller. Never fire-and-forget.
+        // Join each staged leaf operation in this caller, outside the mutation lock.
         if (stagingPath !== undefined) {
           try {
-            rmSync(stagingPath, { recursive: true, force: true })
+            await deleteStagedTree(stagingPath, execution)
             try {
-              rmdirSync(dirname(stagingPath))
+              checkRemovalExecution(execution)
+              await rmdir(dirname(stagingPath))
             } catch (error) {
               // Other removals may still own entries in the shared staging directory.
               if (
