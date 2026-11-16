@@ -2001,6 +2001,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
                     removeOptions.preserved,
                     undefined,
                     componentCustodyProof,
+                    { unpublished: true, execution },
                   )
                   markPhase("retainedPreparation", preparationStarted)
                   releaseMutation()
@@ -2165,6 +2166,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
               removeOptions.preserved,
               undefined,
               componentCustodyProof,
+              { unpublished: true, execution },
             )
             markPhase("retainedPreparation", preparationStarted)
             releaseMutation()

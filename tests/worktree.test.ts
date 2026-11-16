@@ -130,6 +130,48 @@ async function historicalRetainedBorrower(
 }
 
 describe("createGitWorktreeStore", () => {
+  // Aborting a Git child is insufficient: metadata traversal must stop between filesystem operations too.
+  it("starts no further metadata directory reads after the shared preparation cutoff", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-preparation-cutoff-"))
+    const controller = new AbortController()
+    try {
+      const repo = join(root, "repo")
+      createRepository(repo, "tracked.txt", "keep target\n")
+      const plain = createLocalGitWorktreeStore({ repo })
+      const target = join(root, "target")
+      await plain.add({ kind: "detached", path: target, ref: "HEAD" })
+      const admin = git(target, ["rev-parse", "--absolute-git-dir"]).trim()
+      mkdirSync(join(admin, "budget-walk/nested"), { recursive: true })
+      writeFileSync(join(admin, "budget-walk/nested/metadata"), "proof bytes\n")
+      const afterCutoff: string[] = []
+      let interrupted = false
+      const original = (await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises")).readdir
+      using _read = vi.spyOn(fsPromises, "readdir").mockImplementation((async (...args: unknown[]) => {
+        if (controller.signal.aborted) afterCutoff.push(String(args[0]))
+        const rows = await Reflect.apply(original, undefined, args)
+        if (String(args[0]) === admin && !interrupted) {
+          interrupted = true
+          controller.abort(new Error("metadata work cutoff"))
+        }
+        return rows
+      }) as typeof original)
+      const bounded = createLocalGitWorktreeStore({
+        repo,
+        signal: controller.signal,
+        remainingMs: () => (controller.signal.aborted ? 0 : 30_000),
+      })
+      await expect(
+        bounded.remove(target, { retention: { root: join(root, "retained"), report: () => {} } }),
+      ).rejects.toThrow("metadata work cutoff")
+      expect(interrupted).toBe(true)
+      expect(afterCutoff).toEqual([])
+      expect(readFileSync(join(target, "tracked.txt"), "utf8")).toBe("keep target\n")
+      expect((await plain.list()).some((row) => row.path === target)).toBe(true)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   // A target can be verified gone while a later leaf deletion fails; void wrongly resembles complete cleanup.
   it("returns a named staging remainder after verified removal when leaf deletion fails", async () => {
     const root = await mkdtemp(join(canonicalTmpdir(), "git-super-removal-remainder-"))

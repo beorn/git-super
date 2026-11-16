@@ -1872,7 +1872,7 @@ export async function prepareWorktreeModulesRetention(
   preserved: readonly string[] = [],
   destroyed?: Readonly<{ gitDir: string; common: string; head: string }>,
   componentCustody?: ComponentCustodyProof,
-  preparation: Readonly<{ unpublished: boolean }> = { unpublished: true },
+  preparation: Readonly<{ unpublished: boolean; execution?: RemovalExecution }> = { unpublished: true },
 ): Promise<{ verify: () => Promise<void>; complete: () => Promise<WorktreeRemovalProof>; discard: () => void }> {
   const { unpublished } = preparation
   const path = destroyed === undefined ? realpathSync(requested) : resolve(requested)
@@ -1919,6 +1919,7 @@ export async function prepareWorktreeModulesRetention(
     destroyedHead: destroyed?.head,
     componentCustody,
     unpublished,
+    execution: preparation.execution,
   })
 }
 
@@ -1942,6 +1943,7 @@ async function prepareResolvedWorktreeModules(context: {
   destroyedHead: string | undefined
   componentCustody: ComponentCustodyProof | undefined
   unpublished: boolean
+  execution?: RemovalExecution
 }): Promise<{ verify: () => Promise<void>; complete: () => Promise<WorktreeRemovalProof>; discard: () => void }> {
   const {
     git,
@@ -1962,7 +1964,9 @@ async function prepareResolvedWorktreeModules(context: {
     destroyedHead,
     componentCustody,
     unpublished,
+    execution,
   } = context
+  checkRemovalExecution(execution)
   const modules = join(gitDir, "modules")
   // The constructor copies removable payload before deletion. Historical readers
   // keep their removal boundaries; this source snapshot may contain local donors.
@@ -1976,7 +1980,7 @@ async function prepareResolvedWorktreeModules(context: {
   // Inspection can retire stale registry pointers; deferred preparation leaves that under the root writer.
   if (!unpublished) await guardRetainedBorrowers(common, gitDir, "inspect")
   // Diagnose metadata links before Git discovery can hide their source and target in an object lookup failure.
-  await manifest(gitDir, custody, false, false)
+  await manifest(gitDir, custody, false, false, execution)
   if (privateProjection !== undefined) {
     if (privateProjection.checkout !== path || gitDir !== join(path, ".git")) {
       throw new Error(`private projection metadata does not match ${path}`)
@@ -2001,7 +2005,7 @@ async function prepareResolvedWorktreeModules(context: {
       : undefined
   // Check metadata locks before copying. The modules subtree includes every store,
   // even one left by an earlier gitlink that the current tree no longer records.
-  const metadata = await manifest(gitDir, custody, true, false)
+  const metadata = await manifest(gitDir, custody, true, false, execution)
   const requestedRoot = resolve(retention.root)
   // Resolve existing ancestors before creating anything, so a symlink cannot put
   // the only retained copy back inside either native deletion path.
@@ -2026,7 +2030,7 @@ async function prepareResolvedWorktreeModules(context: {
           modules,
           common,
           undefined,
-          (await manifest(modules, custody, false)).externalObjectStores,
+          (await manifest(modules, custody, false, false, execution)).externalObjectStores,
           [path, gitDir],
           undefined,
           true,
@@ -2076,7 +2080,7 @@ async function prepareResolvedWorktreeModules(context: {
     let expectedCopy: Readonly<Record<string, ManifestEntry>> = {}
     let retainedManifest: StoreManifest = { entries: {}, files: {}, externalObjectStores: [] }
     if (retained !== null) {
-      retainedManifest = await manifest(copiedSource, custody, true, privateProjection !== undefined)
+      retainedManifest = await manifest(copiedSource, custody, true, privateProjection !== undefined, execution)
       cpSync(copiedSource, copiedTree, {
         recursive: true,
         errorOnExist: true,
@@ -2098,10 +2102,12 @@ async function prepareResolvedWorktreeModules(context: {
         ]),
       )
       if (
-        JSON.stringify((await manifest(copiedTree, copiedCustody, true, privateProjection !== undefined)).entries) !==
-          JSON.stringify(expectedCopy) ||
-        JSON.stringify((await manifest(copiedSource, custody, true, privateProjection !== undefined)).entries) !==
-          JSON.stringify(retainedManifest.entries)
+        JSON.stringify(
+          (await manifest(copiedTree, copiedCustody, true, privateProjection !== undefined, execution)).entries,
+        ) !== JSON.stringify(expectedCopy) ||
+        JSON.stringify(
+          (await manifest(copiedSource, custody, true, privateProjection !== undefined, execution)).entries,
+        ) !== JSON.stringify(retainedManifest.entries)
       ) {
         throw new Error(
           `Git store ${modules} changed during retention at ${retained}; worktree preserved, retry after its writer stops`,
@@ -2135,7 +2141,7 @@ async function prepareResolvedWorktreeModules(context: {
         const configuration = join(copied, "config")
         if (
           !lstatSync(configuration).isFile() ||
-          (await metadataFileDigest(configuration)) !== repository.configurationSha256
+          (await metadataFileDigest(configuration, execution)) !== repository.configurationSha256
         ) {
           throw new Error(`private Git configuration changed or is unknown: ${configuration}; preserve before custody`)
         }
@@ -2158,7 +2164,7 @@ async function prepareResolvedWorktreeModules(context: {
         writeFileSync(pointer, `gitdir: ${copied}\n`)
         expectedCopy = {
           ...expectedCopy,
-          [relative(copiedCheckout, pointer)]: { kind: "file", sha256: await metadataFileDigest(pointer) },
+          [relative(copiedCheckout, pointer)]: { kind: "file", sha256: await metadataFileDigest(pointer, execution) },
         }
       }
       before = await cleanSnapshot(git, copiedCheckout, inspect, excludedSubmodules)
@@ -2209,14 +2215,21 @@ async function prepareResolvedWorktreeModules(context: {
         else rmSync(retainedRoot, { recursive: true })
         throw error
       }
-      finalRetainedManifest = await manifest(copiedTree, copiedCustody, true, privateProjection !== undefined)
+      finalRetainedManifest = await manifest(
+        copiedTree,
+        copiedCustody,
+        true,
+        privateProjection !== undefined,
+        execution,
+      )
       if (finalRetainedManifest.externalObjectStores.length !== 0) {
         throw new Error(`retained copy ${retained} still has external objects links; worktree preserved`)
       }
       expectedCopy = finalRetainedManifest.entries
       if (
-        JSON.stringify((await manifest(copiedSource, custody, true, privateProjection !== undefined)).entries) !==
-        JSON.stringify(retainedManifest.entries)
+        JSON.stringify(
+          (await manifest(copiedSource, custody, true, privateProjection !== undefined, execution)).entries,
+        ) !== JSON.stringify(retainedManifest.entries)
       ) {
         throw new Error(`Git store ${copiedSource} changed during retention; worktree preserved`)
       }
@@ -2224,10 +2237,12 @@ async function prepareResolvedWorktreeModules(context: {
     const verifyRetainedManifest = async (): Promise<void> => {
       if (
         retained !== null &&
-        (JSON.stringify((await manifest(copiedSource, custody, true, privateProjection !== undefined)).entries) !==
-          JSON.stringify(retainedManifest.entries) ||
-          JSON.stringify((await manifest(copiedTree, copiedCustody, true, privateProjection !== undefined)).entries) !==
-            JSON.stringify(expectedCopy))
+        (JSON.stringify(
+          (await manifest(copiedSource, custody, true, privateProjection !== undefined, execution)).entries,
+        ) !== JSON.stringify(retainedManifest.entries) ||
+          JSON.stringify(
+            (await manifest(copiedTree, copiedCustody, true, privateProjection !== undefined, execution)).entries,
+          ) !== JSON.stringify(expectedCopy))
       ) {
         throw new Error(`worktree ${path} changed during retention; preserved, retry after its writer stops`)
       }
@@ -2248,7 +2263,13 @@ async function prepareResolvedWorktreeModules(context: {
           )
           await verifyRetainedManifest()
           if (retained !== null) {
-            finalRetainedManifest = await manifest(copiedTree, copiedCustody, true, privateProjection !== undefined)
+            finalRetainedManifest = await manifest(
+              copiedTree,
+              copiedCustody,
+              true,
+              privateProjection !== undefined,
+              execution,
+            )
           }
           verified = true
         } catch (error) {
