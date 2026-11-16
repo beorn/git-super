@@ -35,14 +35,29 @@ function fixtureRoot(label: string): string {
 }
 
 /** A linked slot with its own `modules/packages/alpha` store, exactly as a pool slot carries one. */
-async function linkedSlot(root: string) {
+async function linkedSlot(root: string, linkedChild = false) {
   const fixture = createProductFixture(root)
   const store = createLocalGitWorktreeStore({ repo: fixture.product })
   const linked = join(root, "slot")
   await store.add({ kind: "detached", path: linked, ref: "HEAD" })
-  git(linked, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "packages/alpha")
   const gitDir = git(linked, "rev-parse", "--absolute-git-dir").trim()
   const modules = join(gitDir, "modules")
+  if (linkedChild) {
+    const child = join(linked, "packages/alpha")
+    git(linked, "submodule", "init", "packages/alpha")
+    git(fixture.alpha, "worktree", "add", "--detach", child, "HEAD")
+    const admin = git(child, "rev-parse", "--absolute-git-dir")
+    const common = git(child, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    const module = join(modules, "packages/alpha")
+    mkdirSync(join(modules, "packages"), { recursive: true })
+    // Reproduce the slot-local administration layout; objects and config stay in the independent common store.
+    renameSync(admin, module)
+    writeFileSync(join(module, "commondir"), `${common}\n`)
+    writeFileSync(join(child, ".git"), `gitdir: ${module}\n`)
+    git(child, "fetch", "-q", fixture.alpha, "HEAD")
+  } else {
+    git(linked, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "packages/alpha")
+  }
   return { fixture, store, linked, gitDir, modules, child: join(linked, "packages/alpha") }
 }
 
@@ -432,6 +447,28 @@ describe("slot module store custody", () => {
     await slot.store.remove(slot.linked)
     expect(existsSync(slot.linked)).toBe(false)
     expect(existsSync(slot.modules)).toBe(false)
+  })
+
+  test("a declared linked module uses its common store instead of treating FETCH_HEAD as an unknown entry (34434)", async () => {
+    const slot = await linkedSlot(fixtureRoot("module-linked-common"), true)
+    const module = join(slot.modules, "packages/alpha")
+    // Existing mapped-slot coverage has a full local store, so it misses valid commondir administration.
+    expect(git(slot.child, "rev-parse", "HEAD")).toBe(slot.fixture.alphaBase)
+    expect(git(slot.child, "rev-parse", "--path-format=absolute", "--git-common-dir")).toBe(
+      join(slot.fixture.alpha, ".git"),
+    )
+    expect(existsSync(join(module, "objects"))).toBe(false)
+    expect(existsSync(join(module, "config"))).toBe(false)
+    expect(existsSync(join(module, "FETCH_HEAD"))).toBe(true)
+    expect(inspectModuleStores(slot.linked, slot.gitDir)).toEqual({ stores: [] })
+  })
+
+  test("an unknown module entry still refuses removal and preserves the slot (34434)", async () => {
+    const slot = await linkedSlot(fixtureRoot("module-unknown-entry"))
+    writeFileSync(join(slot.modules, "unknown"), "unclassified custody\n")
+    await expect(slot.store.remove(slot.linked)).rejects.toThrow(/unknown is not a Git store/u)
+    expect(existsSync(slot.linked)).toBe(true)
+    expect(existsSync(slot.gitDir)).toBe(true)
   })
 
   test("an unreadable store stops removal before anything is deleted", async () => {
