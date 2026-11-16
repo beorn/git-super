@@ -135,7 +135,7 @@ describe("createGitWorktreeStore", () => {
     const root = await mkdtemp(join(canonicalTmpdir(), "git-super-removal-remainder-"))
     const originalUnlink = (await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises")).unlink
     let failedPath: string | undefined
-    using unlink = vi.spyOn(fsPromises, "unlink").mockImplementation(async (path) => {
+    using _unlink = vi.spyOn(fsPromises, "unlink").mockImplementation(async (path) => {
       if (String(path).includes("/.trash/")) {
         failedPath = String(path)
         throw Object.assign(new Error("fixture leaf deletion denied"), { code: "EACCES" })
