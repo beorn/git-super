@@ -1661,6 +1661,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       | void
       | Readonly<{ borrowers: readonly string[] }>
       | Readonly<{ compaction: CompactionResult }>
+      | Readonly<{ remainder: readonly string[]; compaction?: CompactionResult }>
       | Readonly<{ custodyRefusal: ComponentCustodyRefusal }>
     > {
       const execution = { signal: options.signal, remainingMs: options.remainingMs }
@@ -2418,6 +2419,9 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         } else if (!stagingRemainder) {
           options.report?.(`${path}: native removal and remainder cleanup completed at this later point`)
         }
+      }
+      if (stagingRemainder && stagingPath !== undefined) {
+        return { remainder: [stagingPath], ...(compaction === undefined ? {} : { compaction }) }
       }
       if (compaction !== undefined) return { compaction }
       return undefined

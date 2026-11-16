@@ -130,6 +130,37 @@ async function historicalRetainedBorrower(
 }
 
 describe("createGitWorktreeStore", () => {
+  // A target can be verified gone while a later leaf deletion fails; void wrongly resembles complete cleanup.
+  it("returns a named staging remainder after verified removal when leaf deletion fails", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-removal-remainder-"))
+    const originalUnlink = (await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises")).unlink
+    let failedPath: string | undefined
+    using unlink = vi.spyOn(fsPromises, "unlink").mockImplementation(async (path) => {
+      if (String(path).includes("/.trash/")) {
+        failedPath = String(path)
+        throw Object.assign(new Error("fixture leaf deletion denied"), { code: "EACCES" })
+      }
+      return originalUnlink(path)
+    })
+    using warned = vi.spyOn(console, "warn").mockImplementation(() => {})
+    try {
+      const repo = join(root, "repo")
+      createRepository(repo, "tracked.txt", "keep staged bytes\n")
+      const store = createLocalGitWorktreeStore({ repo })
+      const target = join(root, "target")
+      await store.add({ kind: "detached", path: target, ref: "HEAD" })
+      const outcome = await store.remove(target)
+      expect(existsSync(target)).toBe(false)
+      expect((await store.list()).some((row) => row.path === target)).toBe(false)
+      expect(failedPath).toBeTypeOf("string")
+      expect(outcome).toMatchObject({ remainder: [dirname(failedPath!)] })
+      expect(readFileSync(join(dirname(failedPath!), "tracked.txt"), "utf8")).toBe("keep staged bytes\n")
+      expect(warned).toHaveBeenCalled()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   // A retained manifest precedes native removal and cannot prove that a suspended cleanup already removed its target.
   it("reports verified native removal and the pending leaf before staging deletion settles", async () => {
     const root = await mkdtemp(join(canonicalTmpdir(), "git-super-removal-progress-"))

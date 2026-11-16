@@ -53,6 +53,8 @@ export type SuperWorktreeRemoveResult = GitSuperResult &
     borrowers?: readonly string[]
     /** Present when a retained copy was compacted after native --force; failure does not fail the removal. */
     compaction?: CompactionResult
+    /** Verified target removal left named staged filesystem work. */
+    remainder?: readonly string[]
   }>
 
 /** Retention and cleanliness are owned by the same store that performs native removal. */
@@ -115,6 +117,7 @@ export async function superWorktreeRemove(options: SuperWorktreeRemoveOptions): 
       notCompared: proof.notCompared,
       proof,
       ...(outcome !== undefined && "compaction" in outcome ? { compaction: outcome.compaction } : {}),
+      ...(outcome !== undefined && "remainder" in outcome ? { remainder: outcome.remainder } : {}),
     }
   } catch (error) {
     const detail = {
