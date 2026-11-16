@@ -163,13 +163,13 @@ function writeProof(
   return proof
 }
 
-function buildSyntheticEntry(remoteCount = 12): {
+async function buildSyntheticEntry(remoteCount = 12): Promise<{
   root: string
   entry: string
   gitDir: string
   nested: string
   proof: WorktreeRemovalProof
-} {
+}> {
   const root = mkdtempSync(join(canonicalTmpdir(), "git-super-retention-compact-"))
   roots.push(root)
   const donor = join(root, "donor")
@@ -186,7 +186,7 @@ function buildSyntheticEntry(remoteCount = 12): {
   cpSync(join(nestedDonor, ".git"), nested, { recursive: true })
   addLooseRemotes(gitDir, remoteCount)
   addLooseRemotes(nested, remoteCount)
-  const recorded = manifest(modulesCopy, {
+  const recorded = await manifest(modulesCopy, {
     common: sep,
     checkout: join(entry, "checkout"),
     gitDir: join(entry, "original-modules", ".."),
@@ -232,8 +232,8 @@ it("exposes native removal head and createdAt under the consumer field names (30
 })
 
 describe("compactRetainedModules", () => {
-  it("packs every ref value, drops remote-tracking reflogs, and keeps HEAD plus local reflogs byte-identical", () => {
-    const { gitDir, nested, proof } = buildSyntheticEntry()
+  it("packs every ref value, drops remote-tracking reflogs, and keeps HEAD plus local reflogs byte-identical", async () => {
+    const { gitDir, nested, proof } = await buildSyntheticEntry()
     const before = {
       refs: gitAt(gitDir, ["for-each-ref", "--format=%(refname) %(objectname)"]),
       nestedRefs: gitAt(nested, ["for-each-ref", "--format=%(refname) %(objectname)"]),
@@ -262,8 +262,8 @@ describe("compactRetainedModules", () => {
     expect(existsSync(join(gitDir, "logs/refs/heads/main"))).toBe(true)
   })
 
-  it("keeps the at-close proof and rewrites files/entries atomically with a compaction record", () => {
-    const { entry, proof } = buildSyntheticEntry()
+  it("keeps the at-close proof and rewrites files/entries atomically with a compaction record", async () => {
+    const { entry, proof } = await buildSyntheticEntry()
     const beforeBytes = readFileSync(proof.manifest, "utf8")
     const before = JSON.parse(beforeBytes) as {
       createdAt: string
@@ -296,7 +296,7 @@ describe("compactRetainedModules", () => {
     })
     expect(after.compaction.filesAfter).toBeLessThan(after.compaction.filesBefore)
     expect(after.compaction.filesBefore).toBe(Object.keys(before.files).length)
-    const actual = manifest(proof.retained as string, {
+    const actual = await manifest(proof.retained as string, {
       common: sep,
       checkout: proof.path,
       gitDir: join(entry, "original-modules", ".."),
@@ -306,8 +306,8 @@ describe("compactRetainedModules", () => {
     expect(actual.entries).toEqual(after.entries)
   })
 
-  it("does not rewrite the proof or delete the copy when pack-refs fails", () => {
-    const { gitDir, proof } = buildSyntheticEntry()
+  it("does not rewrite the proof or delete the copy when pack-refs fails", async () => {
+    const { gitDir, proof } = await buildSyntheticEntry()
     mkdirSync(join(gitDir, "packed-refs.lock"))
     const before = readFileSync(proof.manifest)
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
@@ -328,14 +328,14 @@ describe("compactRetainedModules", () => {
     }
   })
 
-  it("refuses rewrite when an objects-link sits outside the real common dir", () => {
-    const { proof, gitDir, entry, root } = buildSyntheticEntry()
+  it("refuses rewrite when an objects-link sits outside the real common dir", async () => {
+    const { proof, gitDir, entry, root } = await buildSyntheticEntry()
     const objects = join(gitDir, "objects")
     const outside = join(root, "outside-objects")
     rmSync(objects, { recursive: true, force: true })
     mkdirSync(outside, { recursive: true })
     symlinkSync(outside, objects)
-    const recorded = manifest(proof.retained as string, {
+    const recorded = await manifest(proof.retained as string, {
       common: sep,
       checkout: proof.path,
       gitDir: join(entry, "original-modules", ".."),
@@ -360,8 +360,8 @@ describe("compactRetainedModules", () => {
     }
   })
 
-  it("gate-2 refuses a damaged child before packing and does not rewrite the proof", () => {
-    const { gitDir, proof } = buildSyntheticEntry()
+  it("gate-2 refuses a damaged child before packing and does not rewrite the proof", async () => {
+    const { gitDir, proof } = await buildSyntheticEntry()
     writeFileSync(join(gitDir, "config"), `${readFileSync(join(gitDir, "config"), "utf8")}\n# damaged\n`)
     const before = readFileSync(proof.manifest)
     const packedBefore = existsSync(join(gitDir, "packed-refs"))
@@ -528,7 +528,11 @@ describe("compactRetainedModules", () => {
  * @reach fs-walk <fixture-only: mkdtempSync Git repos under canonicalTmpdir()>
  * @testonly none
  */
-function buildRetainedEntry(retainedRoot: string, name: string, remoteCount = 8): { entry: string; gitDir: string } {
+async function buildRetainedEntry(
+  retainedRoot: string,
+  name: string,
+  remoteCount = 8,
+): Promise<{ entry: string; gitDir: string }> {
   const donor = mkdtempSync(join(canonicalTmpdir(), "git-super-c3-donor-"))
   roots.push(donor)
   createRepository(donor, "file.ts", "export const n = 1\n")
@@ -538,7 +542,7 @@ function buildRetainedEntry(retainedRoot: string, name: string, remoteCount = 8)
   mkdirSync(gitDir, { recursive: true })
   cpSync(join(donor, ".git"), gitDir, { recursive: true })
   addLooseRemotes(gitDir, remoteCount)
-  const recorded = manifest(modulesCopy, {
+  const recorded = await manifest(modulesCopy, {
     common: sep,
     checkout: join(entry, "checkout"),
     gitDir: join(entry, "original-modules", ".."),
@@ -573,13 +577,13 @@ function writeStoredProof(entry: string, proof: Record<string, unknown>): void {
 }
 
 describe("compactRetainedRoot (C3 existing stock)", () => {
-  it("compacts every eligible child, drops remote-tracking reflogs, and records the compaction", () => {
+  it("compacts every eligible child, drops remote-tracking reflogs, and records the compaction", async () => {
     const scratch = mkdtempSync(join(canonicalTmpdir(), "git-super-c3-"))
     roots.push(scratch)
     const retainedRoot = join(scratch, "retained-modules")
     mkdirSync(retainedRoot, { recursive: true })
-    const a = buildRetainedEntry(retainedRoot, "a-entry")
-    const b = buildRetainedEntry(retainedRoot, "b-entry")
+    const a = await buildRetainedEntry(retainedRoot, "a-entry")
+    const b = await buildRetainedEntry(retainedRoot, "b-entry")
     expect(existsSync(join(a.gitDir, "logs/refs/remotes/origin/topic-1"))).toBe(true)
 
     const report = compactRetainedRoot(retainedRoot)
@@ -600,12 +604,12 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
     })
   })
 
-  it("rebuilds a stale-root proof from the child's own directory instead of replaying its paths", () => {
+  it("rebuilds a stale-root proof from the child's own directory instead of replaying its paths", async () => {
     const scratch = mkdtempSync(join(canonicalTmpdir(), "git-super-c3-stale-"))
     roots.push(scratch)
     const retainedRoot = join(scratch, "retained-modules")
     mkdirSync(retainedRoot, { recursive: true })
-    const { entry, gitDir } = buildRetainedEntry(retainedRoot, "stale-entry")
+    const { entry, gitDir } = await buildRetainedEntry(retainedRoot, "stale-entry")
     writeStoredProof(entry, {
       ...storedProof(entry),
       retained: join(scratch, "hh-dev%23main", "retained-modules", "stale-entry", "modules"),
@@ -680,18 +684,18 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
     expect(verified.verdict).toBe("candidate")
   }, 120_000)
 
-  it("skips and reports already-compacted, no-entries-map, incomplete-proof and no-manifest children by class", () => {
+  it("skips and reports already-compacted, no-entries-map, incomplete-proof and no-manifest children by class", async () => {
     const scratch = mkdtempSync(join(canonicalTmpdir(), "git-super-c3-classes-"))
     roots.push(scratch)
     const retainedRoot = join(scratch, "retained-modules")
     mkdirSync(retainedRoot, { recursive: true })
-    const eligible = buildRetainedEntry(retainedRoot, "a-eligible")
-    const compacted = buildRetainedEntry(retainedRoot, "b-compacted")
+    const eligible = await buildRetainedEntry(retainedRoot, "a-eligible")
+    const compacted = await buildRetainedEntry(retainedRoot, "b-compacted")
     writeStoredProof(compacted.entry, {
       ...storedProof(compacted.entry),
       compaction: { at: "2026-01-01T00:00:00.000Z" },
     })
-    const legacy = buildRetainedEntry(retainedRoot, "c-legacy")
+    const legacy = await buildRetainedEntry(retainedRoot, "c-legacy")
     const legacyProof = storedProof(legacy.entry)
     delete legacyProof.entries
     writeStoredProof(legacy.entry, legacyProof)
@@ -699,7 +703,7 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
     writeFileSync(join(retainedRoot, "d-no-manifest", "note.txt"), "orphan\n")
     mkdirSync(join(retainedRoot, "e-unreadable"))
     writeFileSync(join(retainedRoot, "e-unreadable", "manifest.json"), "{ not json\n")
-    const incomplete = buildRetainedEntry(retainedRoot, "f-incomplete")
+    const incomplete = await buildRetainedEntry(retainedRoot, "f-incomplete")
     const incompleteProof = storedProof(incomplete.entry)
     delete incompleteProof.modules
     writeStoredProof(incomplete.entry, incompleteProof)
@@ -741,14 +745,14 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
     expect(storedProof(compacted.entry).compaction).toEqual({ at: "2026-01-01T00:00:00.000Z" })
   })
 
-  it("counts --limit over eligible children only, in sorted order", () => {
+  it("counts --limit over eligible children only, in sorted order", async () => {
     const scratch = mkdtempSync(join(canonicalTmpdir(), "git-super-c3-limit-"))
     roots.push(scratch)
     const retainedRoot = join(scratch, "retained-modules")
     mkdirSync(retainedRoot, { recursive: true })
     mkdirSync(join(retainedRoot, "a-skip"))
-    const first = buildRetainedEntry(retainedRoot, "b-first")
-    const second = buildRetainedEntry(retainedRoot, "c-second")
+    const first = await buildRetainedEntry(retainedRoot, "b-first")
+    const second = await buildRetainedEntry(retainedRoot, "c-second")
 
     const report = compactRetainedRoot(retainedRoot, { limit: 1 })
 
@@ -758,12 +762,12 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
     expect(existsSync(join(second.gitDir, "logs/refs/remotes"))).toBe(true)
   })
 
-  it("dry-run verifies each eligible child and writes nothing", () => {
+  it("dry-run verifies each eligible child and writes nothing", async () => {
     const scratch = mkdtempSync(join(canonicalTmpdir(), "git-super-c3-dry-"))
     roots.push(scratch)
     const retainedRoot = join(scratch, "retained-modules")
     mkdirSync(retainedRoot, { recursive: true })
-    const { entry, gitDir } = buildRetainedEntry(retainedRoot, "a-entry")
+    const { entry, gitDir } = await buildRetainedEntry(retainedRoot, "a-entry")
     const before = readFileSync(join(entry, "manifest.json"), "utf8")
 
     const report = compactRetainedRoot(retainedRoot, { dryRun: true })
@@ -776,13 +780,13 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
     expect(readFileSync(join(entry, "manifest.json"), "utf8")).toBe(before)
   })
 
-  it("reports a gate-2 refusal by class and carries on to the next eligible child", () => {
+  it("reports a gate-2 refusal by class and carries on to the next eligible child", async () => {
     const scratch = mkdtempSync(join(canonicalTmpdir(), "git-super-c3-damaged-"))
     roots.push(scratch)
     const retainedRoot = join(scratch, "retained-modules")
     mkdirSync(retainedRoot, { recursive: true })
-    const damaged = buildRetainedEntry(retainedRoot, "a-damaged")
-    const after = buildRetainedEntry(retainedRoot, "b-after")
+    const damaged = await buildRetainedEntry(retainedRoot, "a-damaged")
+    const after = await buildRetainedEntry(retainedRoot, "b-after")
     writeFileSync(join(damaged.gitDir, "description"), "tampered after the proof was written\n")
     const proofBefore = readFileSync(join(damaged.entry, "manifest.json"), "utf8")
     const copyBefore = treeDigest(damaged.gitDir)
@@ -816,13 +820,13 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
     expect(existsSync(join(after.gitDir, "logs/refs/remotes"))).toBe(false)
   })
 
-  it("still stops the run on a failure that began mutating the copy", () => {
+  it("still stops the run on a failure that began mutating the copy", async () => {
     const scratch = mkdtempSync(join(canonicalTmpdir(), "git-super-c3-postmutation-"))
     roots.push(scratch)
     const retainedRoot = join(scratch, "retained-modules")
     mkdirSync(retainedRoot, { recursive: true })
-    const first = buildRetainedEntry(retainedRoot, "a-unwritable")
-    const after = buildRetainedEntry(retainedRoot, "b-after")
+    const first = await buildRetainedEntry(retainedRoot, "a-unwritable")
+    const after = await buildRetainedEntry(retainedRoot, "b-after")
     chmodSync(first.gitDir, 0o500)
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
     try {
@@ -849,14 +853,14 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
     }
   }, 120_000)
 
-  it("labels a mid-run stop stopped-partial, never refused, and leaves the next sibling alone", () => {
+  it("labels a mid-run stop stopped-partial, never refused, and leaves the next sibling alone", async () => {
     const scratch = mkdtempSync(join(canonicalTmpdir(), "git-super-c3-stopped-partial-"))
     roots.push(scratch)
     const retainedRoot = join(scratch, "retained-modules")
     mkdirSync(retainedRoot, { recursive: true })
-    const compacted = buildRetainedEntry(retainedRoot, "a-compacted")
-    const unwritable = buildRetainedEntry(retainedRoot, "b-unwritable")
-    const untouched = buildRetainedEntry(retainedRoot, "c-untouched")
+    const compacted = await buildRetainedEntry(retainedRoot, "a-compacted")
+    const unwritable = await buildRetainedEntry(retainedRoot, "b-unwritable")
+    const untouched = await buildRetainedEntry(retainedRoot, "c-untouched")
     chmodSync(unwritable.gitDir, 0o500)
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
     try {
@@ -886,13 +890,13 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
     }
   }, 120_000)
 
-  it("labels the SAME child stopped-partial once its first gitdir compacted and a later one failed", () => {
+  it("labels the SAME child stopped-partial once its first gitdir compacted and a later one failed", async () => {
     // The case that makes `stopped-partial` true, and the one that triggered the original bug: ONE
     // child whose first gitdir is compacted before its second fails (CTO 6de5bcf7). The three-children
     // row above covers the cross-entry stop; its stopped child never changed, so it cannot prove this.
-    const { root, entry, gitDir, nested } = buildSyntheticEntry()
+    const { root, entry, gitDir, nested } = await buildSyntheticEntry()
     const retainedRoot = join(root, "retained")
-    const sibling = buildRetainedEntry(retainedRoot, "z-sibling")
+    const sibling = await buildRetainedEntry(retainedRoot, "z-sibling")
     expect(existsSync(join(gitDir, "logs/refs/remotes"))).toBe(true)
     expect(existsSync(join(nested, "logs/refs/remotes"))).toBe(true)
     chmodSync(nested, 0o500)
@@ -920,12 +924,12 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
     }
   }, 120_000)
 
-  it("refuses a manifest whose recorded entry name is not this child", () => {
+  it("refuses a manifest whose recorded entry name is not this child", async () => {
     const scratch = mkdtempSync(join(canonicalTmpdir(), "git-super-c3-foreign-"))
     roots.push(scratch)
     const retainedRoot = join(scratch, "retained-modules")
     mkdirSync(retainedRoot, { recursive: true })
-    const { entry } = buildRetainedEntry(retainedRoot, "a-entry")
+    const { entry } = await buildRetainedEntry(retainedRoot, "a-entry")
     writeStoredProof(entry, {
       ...storedProof(entry),
       retained: join(retainedRoot, "someone-else", "modules"),
@@ -947,12 +951,12 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
     )
   })
 
-  it("refuses a symlinked retained root before reading or compacting children", () => {
+  it("refuses a symlinked retained root before reading or compacting children", async () => {
     const scratch = mkdtempSync(join(canonicalTmpdir(), "git-super-c3-root-alias-"))
     roots.push(scratch)
     const retainedRoot = join(scratch, "retained-modules")
     mkdirSync(retainedRoot, { recursive: true })
-    const child = buildRetainedEntry(retainedRoot, "a-entry")
+    const child = await buildRetainedEntry(retainedRoot, "a-entry")
     const beforeProof = readFileSync(join(child.entry, "manifest.json"))
     const beforeTree = treeDigest(child.entry)
     const alias = join(scratch, "retained-alias")
@@ -968,7 +972,7 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
     roots.push(scratch)
     const retainedRoot = join(scratch, "retained-modules")
     mkdirSync(retainedRoot, { recursive: true })
-    const { gitDir } = buildRetainedEntry(retainedRoot, "a-entry")
+    const { gitDir } = await buildRetainedEntry(retainedRoot, "a-entry")
     const repo = join(scratch, "repo")
     createRepository(repo, "file.ts", "export const n = 1\n")
     const stdout = outputSink()
@@ -997,8 +1001,8 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
     roots.push(scratch)
     const retainedRoot = join(scratch, "retained-modules")
     mkdirSync(retainedRoot, { recursive: true })
-    const damaged = buildRetainedEntry(retainedRoot, "a-damaged")
-    const healthy = buildRetainedEntry(retainedRoot, "b-healthy")
+    const damaged = await buildRetainedEntry(retainedRoot, "a-damaged")
+    const healthy = await buildRetainedEntry(retainedRoot, "b-healthy")
     writeFileSync(join(damaged.gitDir, "description"), "tampered after the proof was written\n")
     const repo = join(scratch, "repo")
     createRepository(repo, "file.ts", "export const n = 1\n")
@@ -1055,8 +1059,8 @@ describe("retention enrollment", () => {
     const common = join(repo, ".git")
     const root = join(scratch, "retained")
     mkdirSync(root)
-    const first = buildRetainedEntry(root, "a-linked")
-    const second = buildRetainedEntry(root, "b-linked")
+    const first = await buildRetainedEntry(root, "a-linked")
+    const second = await buildRetainedEntry(root, "b-linked")
     const lender = join(common, "worktrees/lender/modules/dep/objects")
     mkdirSync(join(lender, "info"), { recursive: true })
     writeFileSync(join(first.gitDir, "objects/info/alternates"), lender + "\n")
@@ -1104,7 +1108,7 @@ describe("retention enrollment", () => {
     const common = join(repo, ".git")
     const root = join(scratch, "retained")
     mkdirSync(root)
-    const child = buildRetainedEntry(root, "child")
+    const child = await buildRetainedEntry(root, "child")
     const lender = join(common, "worktrees/lender/modules/dep/objects")
     mkdirSync(join(lender, "info"), { recursive: true })
     writeFileSync(join(child.gitDir, "objects/info/alternates"), lender + "\n")
@@ -1186,8 +1190,7 @@ describe("retention enrollment", () => {
     const common = join(repo, ".git")
     const root = join(scratch, "retained")
     mkdirSync(root)
-    const linked = buildRetainedEntry(root, "linked")
-    buildRetainedEntry(root, "durable")
+    const linked = (await buildRetainedEntry(root, "linked"))(await buildRetainedEntry(root, "durable"))
     const lender = join(common, "worktrees/lender/modules/dep/objects")
     mkdirSync(join(lender, "info"), { recursive: true })
     writeFileSync(join(linked.gitDir, "objects/info/alternates"), lender + "\n")
@@ -1257,7 +1260,7 @@ describe("retention enrollment", () => {
     const common = join(repo, ".git")
     const root = join(scratch, "retained")
     mkdirSync(root)
-    const child = buildRetainedEntry(root, "child")
+    const child = await buildRetainedEntry(root, "child")
     const originalCheckout = join(common, "worktrees", "owner")
     const originalModules = join(originalCheckout, "modules")
     const siblingLender = join(common, "worktrees", "owner-sibling", "modules", "dep", "objects")
@@ -1303,12 +1306,12 @@ describe("retention enrollment", () => {
     "redirected-manifest",
     "redirected-modules",
     "missing-child",
-  ] as const)("refuses %s without guessing a runtime proof", (shape) => {
+  ] as const)("refuses %s without guessing a runtime proof", async (shape) => {
     const scratch = mkdtempSync(join(canonicalTmpdir(), "git-super-enroll-identity-"))
     roots.push(scratch)
     const root = join(scratch, "retained")
     mkdirSync(root)
-    const { entry } = buildRetainedEntry(root, "child")
+    const { entry } = await buildRetainedEntry(root, "child")
     if (shape === "incoherent-pair") {
       writeStoredProof(entry, { ...storedProof(entry), manifest: join(scratch, "foreign/child/manifest.json") })
     }
@@ -1348,7 +1351,7 @@ describe("retention enrollment", () => {
       otherRoot = join(scratch, "two")
     mkdirSync(root)
     mkdirSync(otherRoot)
-    const copy = buildRetainedEntry(root, "child")
+    const copy = await buildRetainedEntry(root, "child")
     const lender = join(common, "worktrees/lender/modules/dep/objects")
     mkdirSync(join(lender, "info"), { recursive: true })
     writeFileSync(join(copy.gitDir, "objects/info/alternates"), lender + "\n")
@@ -1399,8 +1402,8 @@ describe("retention enrollment", () => {
     const common = join(repo, ".git")
     const root = join(scratch, "retained")
     mkdirSync(root)
-    const linked = buildRetainedEntry(root, "legacy-linked")
-    const independent = buildRetainedEntry(root, "legacy-independent")
+    const linked = await buildRetainedEntry(root, "legacy-linked")
+    const independent = await buildRetainedEntry(root, "legacy-independent")
     const linkedProof = storedProof(linked.entry)
     delete linkedProof.entries
     delete linkedProof.externalObjectStores
@@ -1467,8 +1470,8 @@ describe("retention enrollment", () => {
     const common = join(repo, ".git")
     const root = join(scratch, "retained")
     mkdirSync(root)
-    const modern = buildRetainedEntry(root, "a-modern")
-    const legacy = buildRetainedEntry(root, "b-legacy")
+    const modern = await buildRetainedEntry(root, "a-modern")
+    const legacy = await buildRetainedEntry(root, "b-legacy")
     writeStoredProof(modern.entry, {
       ...storedProof(modern.entry),
       externalObjectStores: [{ path: "dep/objects", target: 7 }],
@@ -1524,7 +1527,7 @@ describe("retention enrollment", () => {
     const common = join(repo, ".git")
     const root = join(scratch, "retained")
     mkdirSync(root)
-    const entry = buildRetainedEntry(root, "modern")
+    const entry = await buildRetainedEntry(root, "modern")
     const proof = { ...storedProof(entry.entry), ...partial }
     if (!("entries" in partial)) delete (proof as Record<string, unknown>).entries
     if (!("externalObjectStores" in partial)) delete (proof as Record<string, unknown>).externalObjectStores
@@ -1576,7 +1579,7 @@ describe("retention enrollment", () => {
         outputSink(),
       ),
     ).not.toBe(0)
-    const malformed = buildRetainedEntry(root, "malformed-proof")
+    const malformed = await buildRetainedEntry(root, "malformed-proof")
     writeStoredProof(malformed.entry, {
       ...storedProof(malformed.entry),
       externalObjectStores: [{ path: "dep/objects", target: 42 }],

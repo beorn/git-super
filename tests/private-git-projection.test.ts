@@ -452,7 +452,7 @@ it.each([
         // the new constructor must never recreate this old dependency shape.
         for (const pair of borrowedPairs) writeFileSync(pair.alternate, `${pair.lender}\n`)
         const checkout = dirname(proof.retained)
-        const snapshot = manifest(
+        const snapshot = await manifest(
           checkout,
           {
             common: proof.retained,

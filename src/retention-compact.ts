@@ -138,7 +138,7 @@ export function findRetainedGitDirs(root: string): string[] {
 
 function collectLocalReflogDigests(gitDir: string): Readonly<Record<string, string>> {
   const digests: Record<string, string> = {}
-  const visit = (relativePath: string): void => {
+  const visit = async (relativePath: string): Promise<void> => {
     const path = join(gitDir, relativePath)
     if (!existsSync(path)) return
     const stats = lstatSync(path)
@@ -146,7 +146,7 @@ function collectLocalReflogDigests(gitDir: string): Readonly<Record<string, stri
       throw new Error(`local reflog path ${path} is a symlink; preserve before compaction`)
     }
     if (stats.isFile()) {
-      digests[relativePath] = metadataFileDigest(path)
+      digests[relativePath] = await metadataFileDigest(path)
       return
     }
     if (stats.isDirectory()) {
@@ -233,7 +233,7 @@ function expectedCopyEntries(entries: Readonly<Record<string, unknown>>): Readon
   )
 }
 
-function assertStoredProofMatchesCopy(proof: RetainedCopyProof, retained: string, common: string): void {
+async function assertStoredProofMatchesCopy(proof: RetainedCopyProof, retained: string, common: string): Promise<void> {
   const current = JSON.parse(readFileSync(proof.manifest).toString("utf8")) as {
     files?: unknown
     entries?: unknown
@@ -244,7 +244,7 @@ function assertStoredProofMatchesCopy(proof: RetainedCopyProof, retained: string
   if (typeof current.entries !== "object" || current.entries === null || Array.isArray(current.entries)) {
     throw Object.assign(new Error(`${proof.manifest} does not record an entries map`), { step: "gate-2" })
   }
-  const actual = manifest(
+  const actual = await manifest(
     retained,
     {
       common,
@@ -266,7 +266,7 @@ function assertStoredProofMatchesCopy(proof: RetainedCopyProof, retained: string
   }
 }
 
-function rewriteProof(proof: RetainedCopyProof, retained: string, common: string): void {
+async function rewriteProof(proof: RetainedCopyProof, retained: string, common: string): Promise<void> {
   try {
     const currentBytes = readFileSync(proof.manifest)
     const current = JSON.parse(currentBytes.toString("utf8")) as Record<string, unknown>
@@ -275,7 +275,7 @@ function rewriteProof(proof: RetainedCopyProof, retained: string, common: string
       throw new Error(`${proof.manifest} does not record a files map`)
     }
     const filesBefore = Object.keys(files).length
-    const actual = manifest(
+    const actual = await manifest(
       retained,
       {
         common,

@@ -90,7 +90,11 @@ function registrySnapshot(registry: string) {
 
 // Historical guard fixtures must keep real borrowed metadata: the new writer
 // deliberately stops producing it. Run while report() still has the source.
-function historicalRetainedBorrower(proof: WorktreeRemovalProof, repo: string, restoreSource = true): void {
+async function historicalRetainedBorrower(
+  proof: WorktreeRemovalProof,
+  repo: string,
+  restoreSource = true,
+): Promise<void> {
   if (proof.retained === null) return
   const original = join(proof.modules, "packages/alpha/objects")
   const objects = join(proof.retained, "packages/alpha/objects")
@@ -103,7 +107,7 @@ function historicalRetainedBorrower(proof: WorktreeRemovalProof, repo: string, r
     writeFileSync(join(objects, "info/alternates"), readFileSync(alternate))
   } else if (restoreSource) return
   const common = git(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim()
-  const snapshot = manifest(proof.retained, {
+  const snapshot = await manifest(proof.retained, {
     common,
     checkout: proof.path,
     gitDir: dirname(proof.modules),
@@ -1616,17 +1620,18 @@ describe("createGitWorktreeStore", () => {
         if (nativePositive) await writeFile(join(borrower.objects, "info/alternates"), target + "\n")
         const retention = {
           root: join(root, "retained"),
-          report: (proof: WorktreeRemovalProof) => {
+          report: async (proof: WorktreeRemovalProof) => {
             if (nativePositive && proof.path === borrower.linked) {
               // Do not replace native normalized alternates with source bytes.
               expect(readFileSync(join(proof.retained!, "packages/alpha/objects/info/alternates"), "utf8")).toBe(
                 target + "\n",
-              )
-              historicalRetainedBorrower(proof, component, false)
+              )(await historicalRetainedBorrower(proof, component, false))
             } else if (!nativePositive) {
               // Reconstruct historical metadata only after the native writer completed.
-              writeFileSync(join(borrower.objects, "info/alternates"), target + "\n")
-              historicalRetainedBorrower(proof, component)
+              writeFileSync(
+                join(borrower.objects, "info/alternates"),
+                target + "\n",
+              )(await historicalRetainedBorrower(proof, component))
             }
             proofs.push(proof)
           },
@@ -1692,8 +1697,8 @@ describe("createGitWorktreeStore", () => {
       const proofs: WorktreeRemovalProof[] = []
       const retention = {
         root: join(root, "retained"),
-        report: (proof: WorktreeRemovalProof) => {
-          historicalRetainedBorrower(proof, fixture.product)
+        report: async (proof: WorktreeRemovalProof) => {
+          await historicalRetainedBorrower(proof, fixture.product)
           proofs.push(proof)
         },
       }
@@ -1743,7 +1748,10 @@ describe("createGitWorktreeStore", () => {
       await linkObjects(borrower.moduleDir, owner.objects)
       const retainedRoot = join(root, "retained")
       await store.remove(borrower.linked, {
-        retention: { root: retainedRoot, report: (proof) => historicalRetainedBorrower(proof, fixture.product) },
+        retention: {
+          root: retainedRoot,
+          report: async (proof) => await historicalRetainedBorrower(proof, fixture.product),
+        },
       })
       const common = git(fixture.product, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim()
       const registry = join(common, "git-super-retained-borrowers")
@@ -1910,8 +1918,8 @@ describe("createGitWorktreeStore", () => {
         const proofs: WorktreeRemovalProof[] = []
         const retention = {
           root: join(root, "retained"),
-          report: (proof: WorktreeRemovalProof) => {
-            historicalRetainedBorrower(proof, fixture.product)
+          report: async (proof: WorktreeRemovalProof) => {
+            await historicalRetainedBorrower(proof, fixture.product)
             proofs.push(proof)
           },
         }
@@ -1985,8 +1993,8 @@ describe("createGitWorktreeStore", () => {
       const proofs: WorktreeRemovalProof[] = []
       const retention = {
         root: join(root, "retained"),
-        report: (proof: WorktreeRemovalProof) => {
-          historicalRetainedBorrower(proof, fixture.product)
+        report: async (proof: WorktreeRemovalProof) => {
+          await historicalRetainedBorrower(proof, fixture.product)
           proofs.push(proof)
         },
       }
@@ -2242,8 +2250,8 @@ describe("createGitWorktreeStore", () => {
         const proofs: WorktreeRemovalProof[] = []
         const retention = {
           root: join(root, "retained"),
-          report: (proof: WorktreeRemovalProof) => {
-            historicalRetainedBorrower(proof, fixture.product)
+          report: async (proof: WorktreeRemovalProof) => {
+            await historicalRetainedBorrower(proof, fixture.product)
             proofs.push(proof)
           },
         }
@@ -2319,8 +2327,8 @@ describe("createGitWorktreeStore", () => {
       const proofs: WorktreeRemovalProof[] = []
       const retention = {
         root: join(root, "retained"),
-        report: (proof: WorktreeRemovalProof) => {
-          historicalRetainedBorrower(proof, fixture.product)
+        report: async (proof: WorktreeRemovalProof) => {
+          await historicalRetainedBorrower(proof, fixture.product)
           proofs.push(proof)
         },
       }
@@ -2366,8 +2374,8 @@ describe("createGitWorktreeStore", () => {
       const proofs: WorktreeRemovalProof[] = []
       const retention = {
         root: join(root, "retained"),
-        report: (proof: WorktreeRemovalProof) => {
-          historicalRetainedBorrower(proof, fixture.product)
+        report: async (proof: WorktreeRemovalProof) => {
+          await historicalRetainedBorrower(proof, fixture.product)
           proofs.push(proof)
         },
       }
@@ -2423,8 +2431,8 @@ describe("createGitWorktreeStore", () => {
       const proofs: WorktreeRemovalProof[] = []
       const retention = {
         root: join(root, "retained"),
-        report: (proof: WorktreeRemovalProof) => {
-          historicalRetainedBorrower(proof, fixture.product)
+        report: async (proof: WorktreeRemovalProof) => {
+          await historicalRetainedBorrower(proof, fixture.product)
           proofs.push(proof)
         },
       }

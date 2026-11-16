@@ -21,6 +21,7 @@ import {
   writeFileSync,
   type Dirent,
 } from "node:fs"
+import { open, readdir, readlink, realpath, stat } from "node:fs/promises"
 import { createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS } from "./exclusive.ts"
 import { tryAcquireFlock, type FlockHandle } from "@bearly/flock"
 import { fileLockHolders, formatLockHolders } from "@bearly/flock/holders"
@@ -1188,11 +1189,43 @@ export function acquireRemovalWriterLeases(
 }
 
 /** Inspect link identities without walking their objects; only common-store objects directories may be borrowed. */
-export function metadataFileDigest(path: string): string {
-  return createHash("sha256").update(readFileSync(path)).digest("hex")
+export type RemovalExecution = Readonly<{ signal?: AbortSignal; remainingMs?: () => number }>
+
+export function checkRemovalExecution(execution?: RemovalExecution): void {
+  execution?.signal?.throwIfAborted()
+  const remaining = execution?.remainingMs?.()
+  if (remaining !== undefined && (!Number.isFinite(remaining) || remaining <= 0)) {
+    throw new Error("worktree removal work allowance exhausted or invalid; no further operation started")
+  }
 }
 
-export function manifest(root: string, custody: StoreCustody, hashFiles = true, workingTree = false): StoreManifest {
+export async function metadataFileDigest(path: string, execution?: RemovalExecution): Promise<string> {
+  checkRemovalExecution(execution)
+  const file = await open(path, "r")
+  try {
+    const hash = createHash("sha256")
+    const buffer = Buffer.allocUnsafe(64 * 1024)
+    for (;;) {
+      checkRemovalExecution(execution)
+      const { bytesRead } = await file.read(buffer, 0, buffer.length, null)
+      if (bytesRead === 0) break
+      hash.update(buffer.subarray(0, bytesRead))
+    }
+    checkRemovalExecution(execution)
+    return hash.digest("hex")
+  } finally {
+    // Descriptor close settles an operation already started; cancellation never leaks its resource.
+    await file.close()
+  }
+}
+
+export async function manifest(
+  root: string,
+  custody: StoreCustody,
+  hashFiles = true,
+  workingTree = false,
+  execution?: RemovalExecution,
+): Promise<StoreManifest> {
   const removalRoots = custody.removalRoots ?? [
     custody.checkout,
     ...(custody.gitDir === undefined ? [] : [custody.gitDir]),
@@ -1200,8 +1233,10 @@ export function manifest(root: string, custody: StoreCustody, hashFiles = true, 
   const entries: Record<string, ManifestEntry> = {}
   const files: Record<string, string> = {}
   const externalObjectStores: ExternalObjectStore[] = []
-  const visit = (directory: string): void => {
-    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+  const visit = async (directory: string): Promise<void> => {
+    checkRemovalExecution(execution)
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      checkRemovalExecution(execution)
       const path = join(directory, entry.name)
       const key = relative(root, path)
       const metadata = custody.gitDir !== undefined && within(custody.gitDir, path)
@@ -1213,12 +1248,12 @@ export function manifest(root: string, custody: StoreCustody, hashFiles = true, 
         throw new Error(`Git lock ${path} prevents worktree removal; resolve its holder (${describeLockBarrier(path)})`)
       }
       if (entry.isDirectory()) {
-        visit(path)
+        await visit(path)
         continue
       }
       if (entry.isSymbolicLink()) {
         if (workingTree && !metadata) {
-          entries[key] = { kind: "symlink", declaration: readlinkSync(path) }
+          entries[key] = { kind: "symlink", declaration: await readlink(path) }
           continue
         }
         const modulePath = relative(custody.modules, path)
@@ -1227,11 +1262,13 @@ export function manifest(root: string, custody: StoreCustody, hashFiles = true, 
             `Git metadata link ${path} is not a submodule objects directory; preserve and resolve it before removal`,
           )
         }
-        const declaration = readlinkSync(path)
+        const declaration = await readlink(path)
         let target: string
         try {
-          target = realpathSync(path)
-          if (!statSync(target).isDirectory()) throw new Error("target is not a directory")
+          checkRemovalExecution(execution)
+          target = await realpath(path)
+          checkRemovalExecution(execution)
+          if (!(await stat(target)).isDirectory()) throw new Error("target is not a directory")
         } catch (error) {
           throw new Error(`Git objects link ${path} has an unavailable target ${declaration}; worktree preserved`, {
             cause: error,
@@ -1250,12 +1287,12 @@ export function manifest(root: string, custody: StoreCustody, hashFiles = true, 
         throw new Error(`Git store ${path} is not a regular file; preserve and resolve it before removal`)
       }
       if (!hashFiles) continue
-      const sha256 = metadataFileDigest(path)
+      const sha256 = await metadataFileDigest(path, execution)
       files[key] = sha256
       entries[key] = { kind: "file", sha256 }
     }
   }
-  visit(root)
+  await visit(root)
   return {
     entries: Object.fromEntries(Object.entries(entries).sort(([a], [b]) => a.localeCompare(b))),
     files: Object.fromEntries(Object.entries(files).sort(([a], [b]) => a.localeCompare(b))),
@@ -1425,11 +1462,11 @@ function retainedAlternatesDependency(
 
 /** Copy only physically local Git payload; never follow donor alternates or copy derived caches. */
 function retainPhysicalObjects(source: string, destination: string): void {
-  const retain = (from: string, to: string): void => {
+  const retain = async (from: string, to: string): Promise<void> => {
     if (!lstatSync(from).isFile()) throw new Error(`Git object payload ${from} is not a regular file`)
     const existing = lstatSync(to, { throwIfNoEntry: false })
     if (existing !== undefined) {
-      if (!existing.isFile() || metadataFileDigest(from) !== metadataFileDigest(to)) {
+      if (!existing.isFile() || (await metadataFileDigest(from)) !== (await metadataFileDigest(to))) {
         throw new Error(`retained Git object ${to} differs from donor ${from}; worktree preserved`)
       }
       return
@@ -1640,7 +1677,11 @@ export function removeRetainedPointer(expected: ReturnType<typeof readRetainedPo
 }
 
 /** Retained copies are borrowers too: verify their actual links before allowing an owner store to disappear. */
-function guardRetainedBorrowers(common: string, lenderGitDir: string, policy: "inspect" | "rehome" = "rehome"): void {
+async function guardRetainedBorrowers(
+  common: string,
+  lenderGitDir: string,
+  policy: "inspect" | "rehome" = "rehome",
+): Promise<void> {
   const registry = join(common, "git-super-retained-borrowers")
   if (!present(registry)) return
   if (!lstatSync(registry).isDirectory()) {
@@ -1688,7 +1729,7 @@ function guardRetainedBorrowers(common: string, lenderGitDir: string, policy: "i
       const legacy = validateRetainedObjectsDeclarations(proof, retained)
       if (typeof legacy === "string") throw new Error(legacy)
       // The manifest declaration cannot hide an actual link or authorise deletion of its current target.
-      const actual = manifest(retained, { common, checkout, gitDir: lenderGitDir, modules: retained }, false)
+      const actual = await manifest(retained, { common, checkout, gitDir: lenderGitDir, modules: retained }, false)
       const dangling: string[] = []
       let observed = false
       let linkedDependency: boolean
@@ -1909,7 +1950,7 @@ async function prepareResolvedWorktreeModules(context: {
   // Inspection can retire stale registry pointers; deferred preparation leaves that under the root writer.
   if (!unpublished) guardRetainedBorrowers(common, gitDir, "inspect")
   // Diagnose metadata links before Git discovery can hide their source and target in an object lookup failure.
-  manifest(gitDir, custody, false, false)
+  await manifest(gitDir, custody, false, false)
   if (privateProjection !== undefined) {
     if (privateProjection.checkout !== path || gitDir !== join(path, ".git")) {
       throw new Error(`private projection metadata does not match ${path}`)
@@ -1934,7 +1975,7 @@ async function prepareResolvedWorktreeModules(context: {
       : undefined
   // Check metadata locks before copying. The modules subtree includes every store,
   // even one left by an earlier gitlink that the current tree no longer records.
-  const metadata = manifest(gitDir, custody, true, false)
+  const metadata = await manifest(gitDir, custody, true, false)
   const requestedRoot = resolve(retention.root)
   // Resolve existing ancestors before creating anything, so a symlink cannot put
   // the only retained copy back inside either native deletion path.
@@ -1959,7 +2000,7 @@ async function prepareResolvedWorktreeModules(context: {
           modules,
           common,
           undefined,
-          manifest(modules, custody, false).externalObjectStores,
+          (await manifest(modules, custody, false)).externalObjectStores,
           [path, gitDir],
           undefined,
           true,
@@ -2009,7 +2050,7 @@ async function prepareResolvedWorktreeModules(context: {
     let expectedCopy: Readonly<Record<string, ManifestEntry>> = {}
     let retainedManifest: StoreManifest = { entries: {}, files: {}, externalObjectStores: [] }
     if (retained !== null) {
-      retainedManifest = manifest(copiedSource, custody, true, privateProjection !== undefined)
+      retainedManifest = await manifest(copiedSource, custody, true, privateProjection !== undefined)
       cpSync(copiedSource, copiedTree, {
         recursive: true,
         errorOnExist: true,
@@ -2031,9 +2072,9 @@ async function prepareResolvedWorktreeModules(context: {
         ]),
       )
       if (
-        JSON.stringify(manifest(copiedTree, copiedCustody, true, privateProjection !== undefined).entries) !==
+        JSON.stringify((await manifest(copiedTree, copiedCustody, true, privateProjection !== undefined)).entries) !==
           JSON.stringify(expectedCopy) ||
-        JSON.stringify(manifest(copiedSource, custody, true, privateProjection !== undefined).entries) !==
+        JSON.stringify((await manifest(copiedSource, custody, true, privateProjection !== undefined)).entries) !==
           JSON.stringify(retainedManifest.entries)
       ) {
         throw new Error(
@@ -2068,7 +2109,7 @@ async function prepareResolvedWorktreeModules(context: {
         const configuration = join(copied, "config")
         if (
           !lstatSync(configuration).isFile() ||
-          metadataFileDigest(configuration) !== repository.configurationSha256
+          (await metadataFileDigest(configuration)) !== repository.configurationSha256
         ) {
           throw new Error(`private Git configuration changed or is unknown: ${configuration}; preserve before custody`)
         }
@@ -2091,7 +2132,7 @@ async function prepareResolvedWorktreeModules(context: {
         writeFileSync(pointer, `gitdir: ${copied}\n`)
         expectedCopy = {
           ...expectedCopy,
-          [relative(copiedCheckout, pointer)]: { kind: "file", sha256: metadataFileDigest(pointer) },
+          [relative(copiedCheckout, pointer)]: { kind: "file", sha256: await metadataFileDigest(pointer) },
         }
       }
       before = await cleanSnapshot(git, copiedCheckout, inspect, excludedSubmodules)
@@ -2142,24 +2183,24 @@ async function prepareResolvedWorktreeModules(context: {
         else rmSync(retainedRoot, { recursive: true })
         throw error
       }
-      finalRetainedManifest = manifest(copiedTree, copiedCustody, true, privateProjection !== undefined)
+      finalRetainedManifest = await manifest(copiedTree, copiedCustody, true, privateProjection !== undefined)
       if (finalRetainedManifest.externalObjectStores.length !== 0) {
         throw new Error(`retained copy ${retained} still has external objects links; worktree preserved`)
       }
       expectedCopy = finalRetainedManifest.entries
       if (
-        JSON.stringify(manifest(copiedSource, custody, true, privateProjection !== undefined).entries) !==
+        JSON.stringify((await manifest(copiedSource, custody, true, privateProjection !== undefined)).entries) !==
         JSON.stringify(retainedManifest.entries)
       ) {
         throw new Error(`Git store ${copiedSource} changed during retention; worktree preserved`)
       }
     }
-    const verifyRetainedManifest = (): void => {
+    const verifyRetainedManifest = async (): Promise<void> => {
       if (
         retained !== null &&
-        (JSON.stringify(manifest(copiedSource, custody, true, privateProjection !== undefined).entries) !==
+        (JSON.stringify((await manifest(copiedSource, custody, true, privateProjection !== undefined)).entries) !==
           JSON.stringify(retainedManifest.entries) ||
-          JSON.stringify(manifest(copiedTree, copiedCustody, true, privateProjection !== undefined).entries) !==
+          JSON.stringify((await manifest(copiedTree, copiedCustody, true, privateProjection !== undefined)).entries) !==
             JSON.stringify(expectedCopy))
       ) {
         throw new Error(`worktree ${path} changed during retention; preserved, retry after its writer stops`)
@@ -2181,7 +2222,7 @@ async function prepareResolvedWorktreeModules(context: {
           )
           verifyRetainedManifest()
           if (retained !== null) {
-            finalRetainedManifest = manifest(copiedTree, copiedCustody, true, privateProjection !== undefined)
+            finalRetainedManifest = await manifest(copiedTree, copiedCustody, true, privateProjection !== undefined)
           }
           verified = true
         } catch (error) {
@@ -2481,7 +2522,7 @@ export async function enrollRetainedBorrowers(options: RetentionEnrollOptions): 
     throw new Error(`retention enrollment common ${common} is not a Git common directory`)
   }
   const deadline = Date.now() + 5 * 60_000
-  const plan = (): RetentionEnrollReport => {
+  const plan = async (): Promise<RetentionEnrollReport> => {
     const names = readdirSync(root).sort()
     const result: RetentionEnrollReport = {
       root,
@@ -2573,7 +2614,7 @@ export async function enrollRetainedBorrowers(options: RetentionEnrollOptions): 
           row.reason = legacy
           continue
         }
-        const actual = manifest(
+        const actual = await manifest(
           runtime.retained,
           {
             common,

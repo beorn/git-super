@@ -452,7 +452,7 @@ async function evaluateRetainedEntry(
       }
       legacy = true
     }
-    result.manifestSha256 = metadataFileDigest(manifestPath)
+    result.manifestSha256 = await metadataFileDigest(manifestPath)
     result.head = proof.head
     result.createdAt = proof.createdAt
     result.retainUntil = proof.retainUntil
@@ -580,7 +580,7 @@ async function evaluateRetainedEntry(
         gitDir: dirname(proof.modules),
         modules: expectedCopyRoot,
       }
-      const actual = manifest(expectedCopyRoot, custody, true, false)
+      const actual = await manifest(expectedCopyRoot, custody, true, false)
       const expectedEntries = expectedCopy(proof.entries)
       const differingEntry = firstDifference(expectedEntries, actual.entries)
       if (differingEntry !== undefined) {
@@ -706,7 +706,7 @@ async function evaluateRetainedEntry(
       })
       if (legacy && result.audit !== undefined) {
         const audit = result.audit
-        const originalDigest = metadataFileDigest(manifestPath)
+        const originalDigest = await metadataFileDigest(manifestPath)
         if (originalDigest !== result.manifestSha256) {
           throw new Error(`original manifest ${manifestPath} changed before its external preservation`)
         }

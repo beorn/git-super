@@ -132,7 +132,7 @@ async function preserveProjection(
       if (
         (await lstat(configuration)).isSymbolicLink() ||
         !/^[0-9a-f]{64}$/u.test(repository.configurationSha256) ||
-        metadataFileDigest(configuration) !== repository.configurationSha256
+        (await metadataFileDigest(configuration)) !== repository.configurationSha256
       ) {
         throw new Error(
           `private Git configuration changed or is unknown: ${configuration}; preserve the checkout and inspect its configuration before custody`,
@@ -423,10 +423,12 @@ export async function projectPrivateGitWorktree(
       base: options.commit,
       branch: options.branch,
       createdAt: new Date().toISOString(),
-      repositories: repositories.map((repository) => ({
-        ...repository,
-        configurationSha256: metadataFileDigest(join(repository.gitDirectory, "config")),
-      })),
+      repositories: await Promise.all(
+        repositories.map(async (repository) => ({
+          ...repository,
+          configurationSha256: await metadataFileDigest(join(repository.gitDirectory, "config")),
+        })),
+      ),
       mounts: [
         { source: destination, target: destination, mode: "rw" },
         ...[...stores].map((store) => ({ source: store, target: store, mode: "ro" as const })),
