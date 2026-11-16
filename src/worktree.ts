@@ -1650,6 +1650,8 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         noRehome?: boolean
         preserved?: readonly string[]
         componentCustody?: ComponentCustodyPolicy
+        /** Caller policy, under removal leases before custody changes and again immediately before staging. */
+        beforeRemove?: (target: RegisteredWorktree) => Promise<void>
       }> = {},
     ): Promise<
       | void
@@ -1663,6 +1665,24 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       }
       // The selected checkout can be the removal target. Its registry outlives it.
       const removalRepo = await git.text(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"])
+      const admitCaller = async () => {
+        options.signal?.throwIfAborted()
+        if (removeOptions.beforeRemove === undefined) return
+        const target = (await listWorktrees(git, removalRepo)).find((row) => row.path === resolve(path))
+        if (target === undefined) throw new Error(`${path}: worktree is no longer registered; caller admission refused`)
+        await removeOptions.beforeRemove(target)
+        options.signal?.throwIfAborted()
+        const current = (await listWorktrees(git, removalRepo)).find((row) => row.path === target.path)
+        if (
+          current === undefined ||
+          current.head !== target.head ||
+          current.branch !== target.branch ||
+          current.detached !== target.detached ||
+          current.locked !== target.locked
+        ) {
+          throw new Error(`${path}: native target changed during caller admission; worktree kept`)
+        }
+      }
       let stagingPath: string | undefined
       let borrowed: Readonly<{ borrowers: readonly string[] }> | undefined
       let removalProof: WorktreeRemovalProof | undefined
@@ -1776,6 +1796,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         const resolvedPath = resolve(path)
         let preparedRetention: Awaited<ReturnType<typeof prepareWorktreeModulesRetention>> | undefined
         try {
+          await admitCaller()
           if (removeOptions.componentCustody !== undefined && adapters !== undefined && initialCensus !== undefined) {
             let sidecarDir: string | undefined
             try {
@@ -2165,6 +2186,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
             if (removeOptions.noRehome !== true) rehome.run()
           }
           children = await captureLinkedChildren(resolvedPath, gitDir, removeOptions.excludedSubmodules ?? [])
+          await admitCaller()
 
           // Target-only two-phase removal (#27551, CTO ruling beadc3d2):
           // Phase 1 (under mutation lock):

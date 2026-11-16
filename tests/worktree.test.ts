@@ -121,6 +121,42 @@ function historicalRetainedBorrower(proof: WorktreeRemovalProof, repo: string, r
 }
 
 describe("createGitWorktreeStore", () => {
+  // The host's close policy must be rechecked inside native removal, including after lengthy preparation.
+  it.each([1, 2])("keeps a worktree when conditional admission refuses at locked checkpoint %i", async (refuseAt) => {
+    const root = await mkdtemp(join(tmpdir(), "git-super-conditional-remove-"))
+    try {
+      const repo = join(root, "repo")
+      const head = createRepository(repo, "tracked.txt", "keep these bytes\n")
+      const linked = join(root, "linked")
+      const store = createLocalGitWorktreeStore({ repo })
+      await store.add({ kind: "new-branch", path: linked, branch: "task/conditional", ref: "HEAD" })
+      let calls = 0
+      const selection = {
+        operation: "conditional removal fixture",
+        beforeRemove: async (target: { path: string; head?: string; branch?: string }) => {
+          calls++
+          expect(target).toMatchObject({ path: linked, head, branch: "refs/heads/task/conditional" })
+          const common = git(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim()
+          const admin = git(linked, ["rev-parse", "--absolute-git-dir"]).trim()
+          for (const owner of [common, admin]) {
+            const lock = tryAcquireFlock(join(owner, "yrd-worktree-mutations", "writer.lock"))
+            if (lock !== null) {
+              lock.release()
+              throw new Error(`native admission did not hold writer lease ${owner}`)
+            }
+          }
+          if (calls === refuseAt) throw new Error("caller policy now holds this worktree")
+        },
+      }
+      await expect(store.remove(linked, selection)).rejects.toThrow("caller policy now holds this worktree")
+      expect(calls).toBe(refuseAt)
+      expect(readFileSync(join(linked, "tracked.txt"), "utf8")).toBe("keep these bytes\n")
+      expect(await store.inspect(linked)).toMatchObject({ registered: true, head })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   /**
    * @failure Branch release resets staged/dirty/private bytes or detaches a moved or non-local HEAD.
    * @level l1
