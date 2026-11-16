@@ -80,7 +80,18 @@ function within(parent: string, candidate: string): boolean {
 }
 
 function isStore(path: string): boolean {
-  return existsSync(join(path, "HEAD")) && existsSync(join(path, "objects")) && existsSync(join(path, "config"))
+  if (!existsSync(join(path, "HEAD"))) return false
+  if (existsSync(join(path, "objects")) && existsSync(join(path, "config"))) return true
+  if (!existsSync(join(path, "commondir"))) return false
+  // Linked administration owns HEAD/index, while native Git resolves its required shared repository.
+  // Explicit --git-dir prevents an invalid candidate from resolving to the enclosing checkout instead.
+  const resolved = storeGit(path, ["rev-parse", "--absolute-git-dir"])
+  if (resolved.status !== 0 || resolved.stdout.trim() === "") {
+    throw new Error(
+      `module store ${path} is not a readable Git repository (${resolved.stderr.trim()}); worktree preserved`,
+    )
+  }
+  return true
 }
 
 function readEntries(path: string): Dirent[] {
@@ -98,7 +109,7 @@ function readEntries(path: string): Dirent[] {
 }
 
 /**
- * Every entry under `modules/`, in git's own layout: a directory holding HEAD, objects/ and config is a module
+ * Every entry under `modules/`, in git's own layout: a full store or native-validated linked administration is a
  * repository, and the walk never descends into one (nested submodules live at `<store>/modules/` and ride with
  * that store). Namespace directories between the root and a store are transparent; anything else is handed back
  * as a non-store entry rather than guessed at.

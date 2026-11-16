@@ -13,7 +13,7 @@
  * @reach fs-walk <fixture-only: linked worktrees and module stores under mkdtempSync(canonicalTmpdir())>
  */
 import { cpSync, existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs"
-import { join } from "node:path"
+import { join, relative } from "node:path"
 import { afterEach, describe, expect, test, vi } from "vitest"
 import { describeModuleStores, inspectModuleStores, moduleStoreValue } from "../src/module-store-custody.ts"
 import { superStatus } from "../src/status.ts"
@@ -52,7 +52,7 @@ async function linkedSlot(root: string, linkedChild = false) {
     mkdirSync(join(modules, "packages"), { recursive: true })
     // Reproduce the slot-local administration layout; objects and config stay in the independent common store.
     renameSync(admin, module)
-    writeFileSync(join(module, "commondir"), `${common}\n`)
+    writeFileSync(join(module, "commondir"), `${relative(module, common)}\n`)
     writeFileSync(join(child, ".git"), `gitdir: ${module}\n`)
     git(child, "fetch", "-q", fixture.alpha, "HEAD")
   } else {
@@ -461,6 +461,53 @@ describe("slot module store custody", () => {
     expect(existsSync(join(module, "config"))).toBe(false)
     expect(existsSync(join(module, "FETCH_HEAD"))).toBe(true)
     expect(inspectModuleStores(slot.linked, slot.gitDir)).toEqual({ stores: [] })
+    // Relocating administration does not create a native registration in the shared store.
+    // Recognition must not relax that independent removal check.
+    await expect(slot.store.remove(slot.linked)).rejects.toThrow(/no exact native registration/u)
+    expect(existsSync(slot.linked)).toBe(true)
+    expect(git(slot.fixture.alpha, "rev-parse", "HEAD")).toBe(slot.fixture.alphaBase)
+    expect(git(slot.child, "rev-parse", "HEAD")).toBe(slot.fixture.alphaBase)
+  })
+
+  test.each(["missing", "corrupt"] as const)(
+    "a %s linked common repository fails native validation and preserves the slot (34434)",
+    async (damage) => {
+      const slot = await linkedSlot(fixtureRoot("module-linked-invalid"), true)
+      if (damage === "missing") {
+        renameSync(join(slot.fixture.alpha, ".git"), join(slot.fixture.alpha, ".git-preserved"))
+      } else {
+        writeFileSync(join(slot.fixture.alpha, ".git/config"), "not a git config\n")
+      }
+      const message = refusal(() => inspectModuleStores(slot.linked, slot.gitDir))
+      expect(message).toContain(`module store ${join(slot.modules, "packages/alpha")} is not a readable Git repository`)
+      expect(message).not.toContain("FETCH_HEAD")
+      expect(existsSync(slot.child)).toBe(true)
+      expect(existsSync(join(slot.modules, "packages/alpha/HEAD"))).toBe(true)
+      expect(
+        existsSync(join(slot.fixture.alpha, damage === "missing" ? ".git-preserved/objects" : ".git/objects")),
+      ).toBe(true)
+    },
+  )
+
+  test("an undeclared linked HEAD keeps its private value without changing its shared primary (34434)", async () => {
+    const slot = await linkedSlot(fixtureRoot("module-linked-value"), true)
+    git(slot.child, "remote", "add", "origin", slot.fixture.alpha)
+    const tip = localCommit(slot.child)
+    // Drop only the declaration; the linked checkout and its native HEAD remain available for custody.
+    git(slot.linked, "config", "--file", ".gitmodules", "--remove-section", "submodule.packages/alpha")
+    git(slot.linked, "add", ".gitmodules")
+    git(slot.linked, "commit", "-q", "-m", "drop alpha declaration")
+    expect(inspectModuleStores(slot.linked, slot.gitDir).stores).toEqual([
+      expect.objectContaining({
+        name: "packages/alpha",
+        gitDir: join(slot.modules, "packages/alpha"),
+        valueCommits: 1,
+        head: tip.slice(0, 12),
+      }),
+    ])
+    await expect(slot.store.remove(slot.linked)).rejects.toThrow(/holds 1 commit\(s\)/u)
+    expect(git(slot.fixture.alpha, "rev-parse", "HEAD")).toBe(slot.fixture.alphaBase)
+    expect(git(slot.child, "rev-parse", "HEAD")).toBe(tip)
   })
 
   test("an unknown module entry still refuses removal and preserves the slot (34434)", async () => {
