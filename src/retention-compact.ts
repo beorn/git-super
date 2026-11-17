@@ -74,7 +74,7 @@ export type CompactionOptions = Readonly<{
   common: string
   preState: CompactionPreState
   gitProcess?: GitProcess
-  execution?: RemovalExecution
+  execution?: RemovalExecution | undefined
 }>
 
 /**

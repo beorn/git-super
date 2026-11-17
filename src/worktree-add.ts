@@ -462,7 +462,11 @@ export async function superWorktreeAdd(options: SuperWorktreeAddOptions): Promis
     }
   } catch (error) {
     const reason = message(error)
-    const { failure: undone } = await rollback(store, path)
+    // The rollback undoes this add's own half-made tree. Its removal progress is not the add's to report: on stderr
+    // it would stand in front of the refusal for a caller that reads stderr first (yrd, hh 34589). A rollback that
+    // fails is still said, in the refusal below.
+    const quiet = createLocalGitWorktreeStore({ repo, ...(env === undefined ? {} : { env }) })
+    const { failure: undone } = await rollback(quiet, path)
     if (undone === undefined) {
       return failed(
         "failed",

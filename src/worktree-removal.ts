@@ -1194,7 +1194,8 @@ export function acquireRemovalWriterLeases(
 }
 
 /** Inspect link identities without walking their objects; only common-store objects directories may be borrowed. */
-export type RemovalExecution = Readonly<{ signal?: AbortSignal; remainingMs?: () => number }>
+// Callers forward their own optional options, so each field also takes an explicit undefined (exactOptionalPropertyTypes).
+export type RemovalExecution = Readonly<{ signal?: AbortSignal | undefined; remainingMs?: (() => number) | undefined }>
 
 export function checkRemovalExecution(execution?: RemovalExecution): void {
   execution?.signal?.throwIfAborted()
@@ -1943,7 +1944,7 @@ async function prepareResolvedWorktreeModules(context: {
   destroyedHead: string | undefined
   componentCustody: ComponentCustodyProof | undefined
   unpublished: boolean
-  execution?: RemovalExecution
+  execution?: RemovalExecution | undefined
 }): Promise<{ verify: () => Promise<void>; complete: () => Promise<WorktreeRemovalProof>; discard: () => void }> {
   const {
     git,
