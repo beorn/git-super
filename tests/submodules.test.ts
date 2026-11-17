@@ -3074,6 +3074,79 @@ describe("materializeSubmodules", () => {
     }
   })
 
+  /**
+   * hh 34531 (@cto local-url-owner-ruling-0459): the shared superproject config holds a LOCAL submodule URL (the
+   * /hh/dev reference store), and a linked worktree inherits it. A local path may supply objects, never the child's
+   * logical destination: the child's origin is the committed .gitmodules declaration, so a later frozen push of that
+   * child has a hosted identity. The shared config is left as it was. A hosted URL in config is an intentional
+   * override and is kept.
+   */
+  async function sharedLocalUrlFixture(configuredUrl: (owner: string) => string) {
+    const root = await mkdtemp(join(tmpdir(), "git-super-34531-"))
+    roots.push(root)
+    const depRemote = join(root, "dep-remote.git")
+    git(root, ["init", "-q", "--bare", "--initial-branch=main", depRemote])
+    const depWork = join(root, "dep-work")
+    git(root, ["clone", "-q", depRemote, depWork])
+    git(depWork, ["config", "user.name", "Git Super Test"])
+    git(depWork, ["config", "user.email", "git-super@example.invalid"])
+    writeFileSync(join(depWork, "file.txt"), "v1\n")
+    git(depWork, ["add", "file.txt"])
+    git(depWork, ["commit", "-qm", "v1"])
+    git(depWork, ["push", "-q", "origin", "main"])
+
+    const owner = join(root, "owner")
+    git(root, ["init", "-q", "-b", "main", owner])
+    git(owner, ["config", "user.name", "Git Super Test"])
+    git(owner, ["config", "user.email", "git-super@example.invalid"])
+    git(owner, ["config", "protocol.file.allow", "always"])
+    writeFileSync(join(owner, "README.md"), "owner\n")
+    git(owner, ["add", "README.md"])
+    git(owner, ["commit", "-qm", "init owner"])
+    git(owner, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", depRemote, "vendor/dep"])
+    git(owner, ["config", "--file", ".gitmodules", "submodule.vendor/dep.url", "git@github.com:example/dep.git"])
+    git(owner, ["add", ".gitmodules"])
+    git(owner, ["commit", "-qm", "add dep, declared hosted"])
+    git(owner, ["config", "submodule.vendor/dep.url", configuredUrl(owner)])
+    const sharedBefore = git(owner, ["config", "--local", "--get", "submodule.vendor/dep.url"]).trim()
+
+    const candidate = join(root, "candidate")
+    git(owner, ["worktree", "add", "-q", "--detach", candidate, "HEAD"])
+    const previousGitAllowProtocol = process.env.GIT_ALLOW_PROTOCOL
+    process.env.GIT_ALLOW_PROTOCOL = "file"
+    try {
+      const materialized = await materializeSubmodulesFromLocalWorktreeParallel({
+        worktree: candidate,
+        referenceWorktree: owner,
+      })
+      return { owner, candidate, sharedBefore, materialized }
+    } finally {
+      if (previousGitAllowProtocol === undefined) delete process.env.GIT_ALLOW_PROTOCOL
+      else process.env.GIT_ALLOW_PROTOCOL = previousGitAllowProtocol
+    }
+  }
+
+  it("borrows from a local configured URL but keeps the declared hosted origin (hh 34531)", async () => {
+    const { owner, candidate, sharedBefore, materialized } = await sharedLocalUrlFixture((owner) =>
+      join(owner, "vendor/dep"),
+    )
+    expect(materialized.exitCode).toBe(0)
+    expect(materialized.borrowed).toBe(1)
+    expect(git(join(candidate, "vendor/dep"), ["remote", "get-url", "origin"]).trim()).toBe(
+      "git@github.com:example/dep.git",
+    )
+    expect(git(owner, ["config", "--local", "--get", "submodule.vendor/dep.url"]).trim()).toBe(sharedBefore)
+    expect(sharedBefore).toBe(join(owner, "vendor/dep"))
+  })
+
+  it("keeps a hosted configured URL as an intentional override (hh 34531)", async () => {
+    const { candidate, materialized } = await sharedLocalUrlFixture(() => "git@github.com:fork/dep.git")
+    expect(materialized.exitCode).toBe(0)
+    expect(git(join(candidate, "vendor/dep"), ["remote", "get-url", "origin"]).trim()).toBe(
+      "git@github.com:fork/dep.git",
+    )
+  })
+
   it("initializes component origin/main via worktree store on fresh borrowed clone", async () => {
     const root = await mkdtemp(join(tmpdir(), "git-super-store-origin-main-"))
     roots.push(root)

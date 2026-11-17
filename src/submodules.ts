@@ -13,6 +13,7 @@ import { createLocalGitProcess, type GitProcess, type GitProcessRequest, type Gi
 import { shellQuote } from "./shell-command.ts"
 import { nestedStoreMissingDetail, preparedPinFetchArgs, preparedSubmoduleStore } from "./submodule-prepare.ts"
 import { resolveSubmoduleOrigin } from "./submodule-origin.ts"
+import { hasHostedIdentity } from "./push-intent.ts"
 import { ensureCommitObject } from "./objects.ts"
 import { readCommitSubmodules, type CommitSubmodule, type SelectedCommitSubmodules } from "./commit-graph.ts"
 
@@ -1276,7 +1277,11 @@ export async function materializeSubmodules(
       }
       const borrowFrom = referenceHasIt && referenceSubmodule !== undefined ? referenceSubmodule : undefined
       let selectedRemote = configuredUrl.stdout.trim()
-      if (referenceIsPrepared) {
+      // hh 34531 (@cto 0459): a linked worktree inherits the shared config's URL, which on a reference host is the
+      // local store. A local path may supply objects (the borrow below) but never the child's logical destination, so
+      // a configured URL with no hosted identity yields to the committed declaration, as a prepared reference does. A
+      // hosted configured URL is an intentional override and stays. Nothing here writes the shared config.
+      if (referenceIsPrepared || !hasHostedIdentity(selectedRemote)) {
         const blob = source === "index" ? ":.gitmodules" : "HEAD:.gitmodules"
         const declared = await git.run(worktree, ["config", "--blob", blob, "--get", `submodule.${name}.url`], true)
         if (
