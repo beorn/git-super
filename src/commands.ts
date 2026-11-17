@@ -530,7 +530,7 @@ const retentionCompact = commandNode<CommandContext, RetentionCompactParams, Com
     }
   }),
   run: async (_context, input) =>
-    await compactRetainedRoot(input.root, {
+    compactRetainedRoot(input.root, {
       ...(input.dryRun === true ? { dryRun: true } : {}),
       ...(input.limit === undefined ? {} : { limit: input.limit }),
     }),

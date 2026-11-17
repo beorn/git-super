@@ -2361,8 +2361,9 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
               `git-super: failed to delete staged worktree directory '${stagingPath}': ${error instanceof Error ? error.message : String(error)}`,
             )
           }
-          if (stagingRemainder)
+          if (stagingRemainder) {
             options.report?.(`${path}: removed-with-remainder; staged work remains at ${stagingPath}`)
+          }
         }
       }
       if (custodyRefusal !== undefined) return { custodyRefusal }

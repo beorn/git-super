@@ -205,7 +205,7 @@ export type RemovalWriterLeases = Readonly<{
 
 export type WorktreeRetention = Readonly<{
   root: string
-  report: (proof: WorktreeRemovalProof) => void
+  report: (proof: WorktreeRemovalProof) => unknown
 }>
 
 function within(parent: string, path: string): boolean {
@@ -420,9 +420,9 @@ export async function prepareRemovalBorrowers(
   const lenderModules = join(lenderGitDir, "modules")
   if (excludedSubmodules.length === 0) {
     return {
-      run: async () => await rehomeBorrowers(commonDir, lenderGitDir, lenderModules),
+      run: async () => rehomeBorrowers(commonDir, lenderGitDir, lenderModules),
       inspect: async () =>
-        await rehomeBorrowerCandidates(
+        rehomeBorrowerCandidates(
           commonDir,
           lenderGitDir,
           lenderModules,
@@ -496,9 +496,9 @@ export async function prepareRemovalBorrowers(
     candidates.push({ ...candidate, excludedStores, includedStores })
   }
   return {
-    run: async () => await rehomeBorrowerCandidates(commonDir, lenderGitDir, lenderModules, candidates),
+    run: async () => rehomeBorrowerCandidates(commonDir, lenderGitDir, lenderModules, candidates),
     inspect: async () =>
-      await rehomeBorrowerCandidates(commonDir, lenderGitDir, lenderModules, candidates, undefined, "inspect"),
+      rehomeBorrowerCandidates(commonDir, lenderGitDir, lenderModules, candidates, undefined, "inspect"),
     notCompared,
   }
 }
@@ -509,7 +509,7 @@ export async function rehomeBorrowers(
   lenderModules: string,
   options?: RehomeBorrowersOptions,
 ): Promise<readonly string[]> {
-  return await rehomeBorrowerCandidates(
+  return rehomeBorrowerCandidates(
     commonDir,
     lenderGitDir,
     lenderModules,
