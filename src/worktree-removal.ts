@@ -1675,10 +1675,10 @@ async function normalizeRetainedModules(
       for (const destination of objects) {
         const args = ["-c", "protocol.allow=never", "--git-dir", dirname(destination), "--work-tree", copy]
         const graph = await git.run(copy, [...args, "commit-graph", "verify"], true, 300_000)
+        // Any nonzero verify marks the copied commit-graph as an invalid derived cache: a bad
+        // checksum exits 2, a bad signature or chunk exits 1 (26497). Drop the copy and verify
+        // again; the second verify throws if the store itself is still unreadable.
         if (graph.code !== 0) {
-          if (graph.code !== 1) {
-            throw new Error(graph.stderr.trim() || `commit-graph verification exited ${graph.code}; worktree preserved`)
-          }
           for (const cache of [join(destination, "info/commit-graph"), join(destination, "info/commit-graphs")]) {
             if (lstatSync(cache, { throwIfNoEntry: false }) !== undefined) {
               rmSync(cache, { recursive: true })
@@ -2259,15 +2259,36 @@ async function prepareResolvedWorktreeModules(context: {
       let borrowingCommon = common
       if (privateProjection !== undefined) {
         const objects = join(gitDir, "objects")
-        const lineage = alternatesLineageSync([objects], "", {
-          allowedObjects: new Set([
-            objects,
-            ...privateProjection.mounts.filter((mount) => mount.mode === "ro").map((mount) => mount.source),
-          ]),
-        })
-        // The root's attested lineage identifies its native common directory;
-        // child mounts alone never turn an arbitrary external path into custody.
+        // The root's attested lineage identifies its native common directory, and child mounts alone never turn an
+        // arbitrary external path into custody. Lineage is post-order, so its first entry is the root's first
+        // alternate only while that common borrows no objects itself (26497): refuse by that name otherwise.
+        const assumption =
+          "retention takes the root store's first alternate as its native common directory, which holds only while that common borrows no objects"
+        let firstAlternate: string | undefined
+        const lineage = alternatesLineageSync(
+          [objects],
+          "",
+          {
+            allowedObjects: new Set([
+              objects,
+              ...privateProjection.mounts.filter((mount) => mount.mode === "ro").map((mount) => mount.source),
+            ]),
+          },
+          {
+            strictReads: true,
+            onEdge: (store, target) => {
+              if (store === objects) firstAlternate ??= target
+            },
+            // With an object-store policy, a missing alternate already throws while it is validated.
+            onDangling: (_store, target) => {
+              throw new Error(`dangling alternate object store: ${target}`)
+            },
+          },
+        )
         const rootDonor = lineage[0]
+        if (rootDonor !== firstAlternate) {
+          throw new Error(`${assumption}: ${firstAlternate ?? "(none)"} borrows from ${rootDonor}; worktree preserved`)
+        }
         if (rootDonor !== undefined) {
           borrowingCommon = realpathSync(
             await git.text(copiedCheckout, [
@@ -2429,11 +2450,9 @@ async function prepareResolvedWorktreeModules(context: {
           `${JSON.stringify({ ...proof, files: finalRetainedManifest.files, entries: finalRetainedManifest.entries, externalObjectStores: finalRetainedManifest.externalObjectStores }, null, 2)}\n`,
           { flag: "wx" },
         )
-        if (
-          retained !== null &&
-          (finalRetainedManifest.externalObjectStores.length > 0 ||
-            (privateProjection !== undefined && linkedDependency))
-        ) {
+        // A private projection never registers here: its source custody check is skipped (linkedDependency is false)
+        // and its borrowed read-only mounts register each lender below (26497).
+        if (retained !== null && finalRetainedManifest.externalObjectStores.length > 0) {
           registerRetainedBorrower(common, retained, proof.manifest)
         }
         if (retained !== null && privateProjection !== undefined) {

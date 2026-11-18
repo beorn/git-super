@@ -5,6 +5,7 @@
  * @reach fs-walk <fixture-only: lists the temp fixture worktree's excluded submodule directory (27147)>
  */
 import {
+  chmodSync,
   cpSync,
   existsSync,
   lstatSync,
@@ -654,11 +655,13 @@ describe("git super worktree add", () => {
     "packed",
     "orphan-index",
     "invalid-graph",
+    // A real cache whose checksum is wrong: `git commit-graph verify` exits 2, not 1 (26497, @cto finding 2).
+    "checksum-graph",
     ...(existsSync("/dev/shm") && statSync("/dev/shm").dev !== statSync(tmpdir()).dev ? ["cross-device"] : []),
   ])(
     "retains complete module stores before removing a clean unlocked populated worktree; removable donor=%s",
     async (donorKind) => {
-      const removableDonor = !["local", "orphan-index", "invalid-graph"].includes(donorKind)
+      const removableDonor = !["local", "orphan-index", "invalid-graph", "checksum-graph"].includes(donorKind)
       const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-worktree-remove-"))
       roots.push(fixtureRoot)
       const fixture = createSuperproject(fixtureRoot)
@@ -723,8 +726,19 @@ describe("git super worktree add", () => {
       git(author, ["checkout", "-q", "--detach", fixture.pin])
       if (removableDonor) git(child, ["update-ref", "refs/heads/spare", spare])
       const source = git(child, ["rev-parse", "--absolute-git-dir"])
-      const invalidGraph = donorKind === "invalid-graph" ? join(source, "objects/info/commit-graph") : undefined
-      if (invalidGraph !== undefined) writeFileSync(invalidGraph, "invalid copied derived cache\n")
+      const invalidGraph =
+        donorKind === "invalid-graph" || donorKind === "checksum-graph"
+          ? join(source, "objects/info/commit-graph")
+          : undefined
+      if (donorKind === "invalid-graph") writeFileSync(invalidGraph!, "invalid copied derived cache\n")
+      if (donorKind === "checksum-graph") {
+        git(child, ["commit-graph", "write", "--reachable"])
+        const bytes = readFileSync(invalidGraph!)
+        bytes[bytes.length - 3]! ^= 0xff
+        chmodSync(invalidGraph!, 0o644)
+        writeFileSync(invalidGraph!, bytes)
+      }
+      const invalidGraphBytes = invalidGraph === undefined ? undefined : readFileSync(invalidGraph)
       // Reflogs and unreferenced local payload are distinct preservation roots.
       // A branch-only fixture can pass after accidentally dropping either one.
       const reflogOnly = git(author, ["commit-tree", `${fixture.pin}^{tree}`, "-m", "reflog-only work"])
@@ -800,7 +814,7 @@ describe("git super worktree add", () => {
           if (value.startsWith("worktree removal proof ")) {
             proofBeforeRemoval = existsSync(worktree)
             if (invalidGraph !== undefined) {
-              expect(readFileSync(invalidGraph, "utf8")).toBe("invalid copied derived cache\n")
+              expect(readFileSync(invalidGraph).equals(invalidGraphBytes!)).toBe(true)
             }
           }
         },

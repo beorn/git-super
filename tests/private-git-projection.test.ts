@@ -299,6 +299,35 @@ it.each(["unknown-store", "unknown-hook"] as const)(
   },
 )
 
+// 26497 @cto finding 3: retention takes the root store's first lineage entry as its native common directory.
+// That holds only while that common borrows nothing. A common borrowing from a store the projection already
+// approved would be mistaken for that store's repository: refuse by name.
+it("refuses to retain when the root's native common directory itself borrows objects, naming the assumption", async () => {
+  const root = await mkdtemp(join(canonicalTmpdir(), "git-super-root-lineage-"))
+  roots.push(root)
+  const fixture = createProductFixture(root)
+  const destination = join(root, "seat")
+  const projected = await GitSuper.projectPrivateGitWorktree({
+    sourceCheckout: fixture.product,
+    commit: fixture.productBase,
+    branch: "task/seat",
+    destination,
+  })
+  if (projected.projection === undefined) throw new Error(JSON.stringify(projected.detail))
+  // Projection and the retention preflight refuse an unapproved lender, so the common borrows from an approved
+  // store: the child's durable objects, mounted read-only.
+  const donor = join(fixture.product, ".git/modules/packages/alpha/objects")
+  expect(projected.projection.mounts.some((mount) => mount.mode === "ro" && mount.source === donor)).toBe(true)
+  writeFileSync(join(fixture.product, ".git/objects/info/alternates"), `${donor}\n`)
+  const retained = await GitSuper.retainPrivateGitProjection(projected.projection, join(root, "retained"))
+  expect(retained.state, JSON.stringify(retained)).toBe("failed")
+  expect(retained.detail?.message).toContain(
+    "native common directory, which holds only while that common borrows no objects",
+  )
+  expect(retained.detail?.message).toContain(`borrows from ${donor}`)
+  expect(existsSync(destination)).toBe(true)
+})
+
 // CTO343fc3e2/0a13f6da: host-selected linked environments borrow declared public stores transitively.
 // Existing primary-source fixtures have no public alternates and therefore miss real Yrd source closure.
 it.each([
