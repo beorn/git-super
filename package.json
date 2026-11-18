@@ -35,6 +35,7 @@
     "./submodules": "./src/submodules.ts",
     "./submodule-origin": "./src/submodule-origin.ts",
     "./worktree": "./src/worktree.ts",
+    "./worktree-home": "./src/worktree-home.ts",
     "./archive-ref": "./src/archive-ref.ts",
     "./merge-base": "./src/merge-base.ts"
   },
@@ -116,6 +117,10 @@
         "types": "./dist/worktree.d.ts",
         "import": "./dist/worktree.js"
       },
+      "./worktree-home": {
+        "types": "./dist/worktree-home.d.ts",
+        "import": "./dist/worktree-home.js"
+      },
       "./archive-ref": {
         "types": "./dist/archive-ref.d.ts",
         "import": "./dist/archive-ref.js"
@@ -178,6 +183,7 @@
       "src/submodules.ts",
       "src/submodule-origin.ts",
       "src/worktree.ts",
+      "src/worktree-home.ts",
       "src/archive-ref.ts",
       "src/merge-base.ts"
     ],
