@@ -55,9 +55,10 @@ async function componentOf(
   atRiskOids: readonly string[],
   sidecarDir: string,
   refSource = "owned",
+  types: Readonly<Record<string, string>> = {},
 ): Promise<ComponentContents> {
   const writer = new SidecarWriter(sidecarDir, "txt")
-  for (const oid of [...atRiskOids].sort()) writer.add(`${oid}\tblob\t${refSource}`)
+  for (const oid of [...atRiskOids].sort()) writer.add(`${oid}\t${types[oid] ?? "blob"}\t${refSource}`)
   const atRiskSidecar = await writer.finish()
   return {
     component: ".git",
@@ -432,6 +433,36 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     expect(scan.detail).toContain(orphan)
     expect(scan.missingSidecar).toBeDefined()
     expect(await sidecarText(scan, "missing")).toEqual([`${orphan}\t.git\towned`])
+  })
+
+  // 34787 (@cto 34787-component-retention-ruling correction 4): an owner discard must bind to the exact loss, so a
+  // blocked gate 5 names it per component: the count by object type and the commit roots with their subjects. The
+  // inline `missing` sample (first 100) alone cannot say which commits a discard would lose.
+  test("a blocked scan names the loss: counts by type and the commit roots with subjects (34787)", async () => {
+    const store = repoWithCommit("git-super-custody-loss-")
+    git(store.root, ["switch", "-q", "--detach"])
+    writeFileSync(join(store.root, "b.txt"), "beta\n")
+    git(store.root, ["add", "b.txt"])
+    git(store.root, ["commit", "-q", "-m", "local one"])
+    const first = git(store.root, ["rev-parse", "HEAD"])
+    writeFileSync(join(store.root, "b.txt"), "gamma\n")
+    git(store.root, ["commit", "-q", "-am", "local two"])
+    const second = git(store.root, ["rev-parse", "HEAD"])
+    const blob = git(store.root, ["rev-parse", "HEAD:b.txt"])
+    const sidecarDir = tmp("git-super-custody-loss-sidecars-")
+    const component = await componentOf([first, second, blob], sidecarDir, "owned", {
+      [first]: "commit",
+      [second]: "commit",
+    })
+    // Only refs/heads/main is durable; the detached line is reachable from HEAD alone, which never witnesses.
+    const scan = await scanCustody(store.root, [component], [join(store.root, ".git", "objects")], [], {
+      sidecarDir,
+    })
+    expect(scan.status, scan.detail).toBe("blocked")
+    expect(scan.missingCount).toBe(3)
+    expect(scan.loss).toEqual([
+      { component: ".git", count: 3, types: { blob: 1, commit: 2 }, roots: [{ oid: second, subject: "local two" }] },
+    ])
   })
 
   test("a witness store borrowing into the removal set is unknown, never a witness", async () => {

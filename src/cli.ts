@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs"
+import type { RetentionDiscard } from "./retention-discard.ts"
 import { checkRetentionAttribution, type RetentionEnrollReport } from "./worktree-removal.ts"
 import type { RetentionEnrollParams } from "./commands.ts"
 import type { CommandNode } from "@silvery/command"
@@ -826,7 +828,7 @@ async function runInvocation(
     })
 
   for (const verb of ["retire", "audit"] as const) {
-    retention
+    const subcommand = retention
       .command(verb)
       .description(
         verb === "retire"
@@ -846,22 +848,45 @@ async function runInvocation(
         [],
       )
       .requiredOption("--artifact-dir <directory>", "external durable directory for preliminary and held proofs")
-      .action((entry, _options, command) => {
-        const globals = command.optsWithGlobals() as { json?: boolean }
-        const options = command.opts() as { root: string; common: string; namespace: string[]; artifactDir: string }
-        captured = {
-          node: commands.worktree.retention[verb],
-          params: {
-            entry,
-            root: options.root,
-            common: options.common,
-            namespaceRoots: options.namespace,
-            artifactDir: options.artifactDir,
-          },
-          json: globals.json === true,
-          nul: false,
+    if (verb === "retire") {
+      subcommand.option(
+        "--discard <disposition.json>",
+        "explicitly lose exactly the un-witnessed objects this file names (entry, manifest, missing-object list, commit roots, reason, attribution); every other check still applies",
+      )
+    }
+    subcommand.action((entry, _options, command) => {
+      const globals = command.optsWithGlobals() as { json?: boolean }
+      const options = command.opts() as {
+        root: string
+        common: string
+        namespace: string[]
+        artifactDir: string
+        discard?: string
+      }
+      let discard: unknown
+      if (options.discard !== undefined) {
+        try {
+          discard = JSON.parse(readFileSync(options.discard, "utf8")) as unknown
+        } catch (error) {
+          usage = `git super worktree retention retire: --discard ${options.discard} is not readable JSON: ${error instanceof Error ? error.message : String(error)}`
+          return
         }
-      })
+      }
+      captured = {
+        node: commands.worktree.retention[verb],
+        params: {
+          entry,
+          root: options.root,
+          common: options.common,
+          namespaceRoots: options.namespace,
+          artifactDir: options.artifactDir,
+          // The command's params run checkRetentionDiscard on this parsed value before any effect.
+          ...(discard === undefined ? {} : { discard: discard as RetentionDiscard }),
+        },
+        json: globals.json === true,
+        nul: false,
+      }
+    })
   }
 
   retention

@@ -16,7 +16,15 @@ export {
   type RetentionVerifyOptions,
   type RetentionVerifyResult,
   type RetentionVerifyVerdict,
+  type RetentionExplicitLoss,
 } from "./retention-verify.ts"
+export {
+  checkRetentionDiscard,
+  retentionDiscardDigest,
+  RETENTION_DISCARD_SCHEMA,
+  type RetentionDiscard,
+} from "./retention-discard.ts"
+export type { MissingComponentLoss } from "./retention-custody.ts"
 export {
   inspectCheckoutGitMetadata,
   projectPrivateGitWorktree,

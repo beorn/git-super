@@ -17,6 +17,7 @@ import { isAbsolute, join } from "node:path"
 import { repositoryRoot } from "./git.ts"
 import { ensureCommitObject } from "./objects.ts"
 import { superStatus, type SuperStatusOptions, type SuperStatusResult } from "./status.ts"
+import { checkRetentionDiscard } from "./retention-discard.ts"
 import {
   admitOnRemoteSelections,
   checkRetentionAttribution,
@@ -446,7 +447,13 @@ const retentionHeldSchema = params<RetentionRetireParams>((value) => {
   ) {
     throw new Error("held retention operation requires a complete nonempty --namespace <path> declaration")
   }
-  return { ...input, common: extra.common, artifactDir: input.artifactDir, namespaceRoots: input.namespaceRoots }
+  return {
+    ...input,
+    common: extra.common,
+    artifactDir: input.artifactDir,
+    namespaceRoots: input.namespaceRoots,
+    ...(extra.discard === undefined ? {} : { discard: checkRetentionDiscard(extra.discard) }),
+  }
 })
 
 const retentionRetire = commandNode<CommandContext, RetentionRetireParams, GitSuperResult>({

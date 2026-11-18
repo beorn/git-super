@@ -49,6 +49,7 @@ type KeepReason =
   | "lease-missing"
   | "lease-held"
   | "census-shifted"
+  | "discard-refused"
 
 function auditIdentity(record: RetentionAuditRecord): string {
   return JSON.stringify({
@@ -314,8 +315,26 @@ async function runRetentionOperation(
         preliminaryEstate === undefined
           ? await verifyRetainedEntry(preOptions)
           : await inspectRetainedEntryForAudit(preOptions, preliminaryEstate)
-      if (mode === "retire" && proof.verdict !== "candidate") return kept(keepReason(proof), proof.reasons.join("; "))
-      const before = proof.verdict === "candidate" ? proofFacts(proof) : undefined
+      // 34787: a discard disposition is retire-only, and it is the only way a `discard-candidate` proceeds.
+      if (mode === "audit" && options.discard !== undefined) {
+        return kept("discard-refused", "An audit never takes a discard disposition; entry preserved.")
+      }
+      const eligible = options.discard === undefined ? "candidate" : "discard-candidate"
+      if (mode === "retire" && options.discard !== undefined && proof.verdict === "candidate") {
+        return kept(
+          "discard-refused",
+          "Every at-risk object has a durable witness, so there is nothing to discard; retire without a disposition.",
+        )
+      }
+      if (mode === "retire" && proof.verdict !== eligible) {
+        return kept(
+          options.discard !== undefined && keepReason(proof) === "custody-unknown"
+            ? "discard-refused"
+            : keepReason(proof),
+          proof.reasons.join("; "),
+        )
+      }
+      const before = proof.verdict === eligible ? proofFacts(proof) : undefined
       const auditBefore =
         preliminaryEstate === undefined ? undefined : auditSnapshot(entry, root, proof, preliminaryEstate)
       const registrations = pointers(proof)
@@ -370,7 +389,7 @@ async function runRetentionOperation(
         heldEstate === undefined
           ? await verifyRetainedEntry(heldOptions)
           : await inspectRetainedEntryForAudit(heldOptions, heldEstate)
-      const after = held.verdict === "candidate" ? proofFacts(held) : undefined
+      const after = held.verdict === eligible ? proofFacts(held) : undefined
       if (mode === "audit") {
         if (heldEstate === undefined || auditBefore === undefined || commonHead === undefined) {
           throw new Error("held audit provenance is incomplete")
@@ -479,10 +498,14 @@ async function runRetentionOperation(
       rmSync(entry, { recursive: true, force: false })
       if (remaining() !== "gone") throw new Error(`entry readback after deletion is ${remaining()}`)
       const evidence = after.path
+      const loss = held.explicitLoss
       row(entry, "updated", {
-        code: "retired",
+        code: loss === undefined ? "retired" : "discarded",
         phase,
-        message: `Removed ${entry}; absence verified.`,
+        message:
+          loss === undefined
+            ? `Removed ${entry}; absence verified.`
+            : `Removed ${entry} by explicit discard: ${String(loss.missingCount)} un-witnessed object(s) lost under disposition ${loss.dispositionSha256} (${loss.reason}); no surviving witness is claimed; absence verified.`,
         evidence,
         paths: [before.path, evidence],
       })
@@ -507,9 +530,12 @@ async function runRetentionOperation(
         })
       }
       return gitSuperResult(rows, {
-        code: "retired",
+        code: loss === undefined ? "retired" : "discarded",
         phase: "complete",
-        message: `Retired ${entry}; lender locks remain held by their owners.`,
+        message:
+          loss === undefined
+            ? `Retired ${entry}; lender locks remain held by their owners.`
+            : `Discarded ${entry}: ${String(loss.missingCount)} un-witnessed object(s) explicitly lost under disposition ${loss.dispositionSha256}; no surviving witness is claimed; lender locks remain held by their owners.`,
         evidence,
         paths: [before.path, evidence],
       })

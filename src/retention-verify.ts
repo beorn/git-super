@@ -26,9 +26,14 @@ import {
   type GitRun,
   type GitStreamFactory,
 } from "./retention-contents.ts"
-import { scanCustody, type CustodyBounds, type WitnessIdentity } from "./retention-custody.ts"
+import {
+  scanCustody,
+  type CustodyBounds,
+  type MissingComponentLoss,
+  type WitnessIdentity,
+} from "./retention-custody.ts"
 import { scanEstate, type EstateScan, type EstateScanBounds } from "./retention-estate.ts"
-import { RETENTION_STREAM_RSS_BOUND_BYTES } from "./retention-stream.ts"
+import { RETENTION_STREAM_RSS_BOUND_BYTES, type SidecarRef } from "./retention-stream.ts"
 import { readRetentionAudits, matchRetentionAudit, type RetentionAuditBinding } from "./retention-audit-record.ts"
 import {
   canonicalProspectivePath,
@@ -36,8 +41,10 @@ import {
   metadataFileDigest,
   rebuildRetainedCopyProof,
   type ManifestEntry,
+  type RetentionAttribution,
   type StoreCustody,
 } from "./worktree-removal.ts"
+import { retentionDiscardDigest, retentionDiscardMismatch, type RetentionDiscard } from "./retention-discard.ts"
 
 /** The emitting tool's own name and version, read loudly (an unreadable package.json is fatal). */
 const RETENTION_PACKAGE = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
@@ -88,7 +95,21 @@ export type RetentionGateResult = Readonly<{
   remedy?: string
 }>
 
-export type RetentionVerifyVerdict = "candidate" | "blocked" | "unknown"
+/**
+ * `discard-candidate` (34787): every gate passed except positive custody, which stays blocked, and the caller's
+ * disposition names exactly that loss. Only a retire given that disposition acts on it; every other caller keeps it.
+ */
+export type RetentionVerifyVerdict = "candidate" | "discard-candidate" | "blocked" | "unknown"
+
+/** 34787: the loss a matching discard disposition accepts; reported apart from witnessed custody, never as it. */
+export type RetentionExplicitLoss = Readonly<{
+  dispositionSha256: string
+  missingCount: number
+  missingSidecarSha256: string
+  loss: readonly MissingComponentLoss[]
+  reason: string
+  attribution: RetentionAttribution
+}>
 
 export type RetentionVerifyResult = Readonly<{
   schema: string
@@ -108,6 +129,15 @@ export type RetentionVerifyResult = Readonly<{
   estate?: EstateScan | undefined
   contents?: readonly ComponentContents[] | undefined
   witnesses?: readonly WitnessIdentity[] | undefined
+  /**
+   * 34787 (@cto 34787-component-retention-ruling correction 4): when gate 5 blocks, the exact un-witnessed set: its
+   * count, the complete sidecar (path and sha256), and per component the count by type and the commit roots. An owner
+   * discard binds to this; it is evidence, never removal authority.
+   */
+  custody?:
+    | Readonly<{ missingCount: number; missingSidecar?: SidecarRef | undefined; loss: readonly MissingComponentLoss[] }>
+    | undefined
+  explicitLoss?: RetentionExplicitLoss | undefined
   certificate?:
     | Readonly<{ path: string; digest: string; commonArtifactDir: string; warnings?: readonly string[] }>
     | undefined
@@ -167,6 +197,11 @@ export type RetentionVerifyOptions = Readonly<{
   /** Injected line stream for the large object ledgers; tests use it to fake a capped or large run. */
   gitStream?: GitStreamFactory
   monotonic?: () => number
+  /**
+   * 34787: an explicit discard of exactly the loss gate 5 finds. It never passes gate 5; a match makes the verdict
+   * `discard-candidate` and the loss is reported as `explicitLoss`. A mismatch keeps the entry and names the field.
+   */
+  discard?: RetentionDiscard
 }>
 
 export const GATE_ORDER: readonly RetentionGateId[] = [
@@ -351,6 +386,8 @@ async function evaluateRetainedEntry(
     estate?: EstateScan | undefined
     contents?: readonly ComponentContents[] | undefined
     witnesses?: readonly WitnessIdentity[] | undefined
+    custody?: RetentionVerifyResult["custody"]
+    explicitLoss?: RetentionExplicitLoss | undefined
     certificate?:
       | Readonly<{ path: string; digest: string; commonArtifactDir: string; warnings?: readonly string[] }>
       | undefined
@@ -374,11 +411,16 @@ async function evaluateRetainedEntry(
       if (found !== undefined) return found
       return incomplete(gate, "not evaluated: an earlier gate ended the pass before this one ran")
     })
-    const verdict: RetentionVerifyVerdict = ordered.some((gate) => gate.status === "blocked")
-      ? "blocked"
-      : ordered.some((gate) => gate.status === "unknown")
-        ? "unknown"
-        : "candidate"
+    const discardOnly =
+      result.explicitLoss !== undefined &&
+      ordered.every((gate) => gate.status === "pass" || (gate.gate === "positive-custody" && gate.status === "blocked"))
+    const verdict: RetentionVerifyVerdict = discardOnly
+      ? "discard-candidate"
+      : ordered.some((gate) => gate.status === "blocked")
+        ? "blocked"
+        : ordered.some((gate) => gate.status === "unknown")
+          ? "unknown"
+          : "candidate"
     return {
       schema: RETENTION_CERTIFICATE_SCHEMA,
       verdict,
@@ -973,7 +1015,54 @@ async function evaluateRetainedEntry(
     clock: monotonic,
   })
   result.witnesses = custody.witnesses
-  if (custody.status !== "pass") {
+  if (custody.status === "blocked") {
+    result.custody = {
+      missingCount: custody.missingCount,
+      ...(custody.missingSidecar === undefined ? {} : { missingSidecar: custody.missingSidecar }),
+      loss: custody.loss ?? [],
+    }
+  }
+  if (custody.status === "blocked" && options.discard !== undefined) {
+    const discard = options.discard
+    const mismatch = retentionDiscardMismatch(discard, {
+      entry: entryReal,
+      entryDevIno: result.entryDevIno,
+      manifestSha256: result.manifestSha256,
+      missingCount: custody.missingCount,
+      missingSidecarSha256: custody.missingSidecar?.sha256,
+      loss: custody.loss ?? [],
+    })
+    if (mismatch !== undefined || custody.missingSidecar === undefined) {
+      push(
+        refusal(
+          "positive-custody",
+          `${custody.detail}; the discard disposition does not name this loss: ${mismatch ?? "no missing-object list was written"}`,
+          {
+            path: expectedCopyRoot,
+            remedy: "Keep the entry; preview the discard again and record a new decision for the loss observed now.",
+          },
+        ),
+      )
+      return finish()
+    }
+    const dispositionSha256 = retentionDiscardDigest(discard)
+    result.explicitLoss = {
+      dispositionSha256,
+      missingCount: custody.missingCount,
+      missingSidecarSha256: custody.missingSidecar.sha256,
+      loss: custody.loss ?? [],
+      reason: discard.reason,
+      attribution: discard.attribution,
+    }
+    // Gate 5 stays blocked: no witness exists. The pass continues so every later gate still runs.
+    push(
+      refusal(
+        "positive-custody",
+        `${custody.detail}; explicit loss accepted by discard disposition ${dispositionSha256}, no witness claimed`,
+        { path: expectedCopyRoot, remedy: "Only a retire given this exact disposition removes the entry." },
+      ),
+    )
+  } else if (custody.status !== "pass") {
     push(
       custody.status === "blocked"
         ? refusal("positive-custody", custody.detail, {
@@ -986,13 +1075,14 @@ async function evaluateRetainedEntry(
           }),
     )
     return finish()
+  } else {
+    push({
+      gate: "positive-custody",
+      status: "pass",
+      message: custody.detail,
+      path: expectedCopyRoot,
+    })
   }
-  push({
-    gate: "positive-custody",
-    status: "pass",
-    message: custody.detail,
-    path: expectedCopyRoot,
-  })
 
   // ---- Gate 6: preliminary certificate -------------------------------------------------
   if (options.artifactDir === undefined || result.artifactDir === undefined) {
@@ -1006,7 +1096,8 @@ async function evaluateRetainedEntry(
   const certificate = {
     schema: RETENTION_CERTIFICATE_SCHEMA,
     schemaId: "hab-sandbox/retained-modules-retirement/1",
-    verdict: "candidate",
+    verdict: result.explicitLoss === undefined ? "candidate" : "discard-candidate",
+    ...(result.explicitLoss === undefined ? {} : { explicitLoss: result.explicitLoss }),
     entry: entryReal,
     removal: removalSet,
     root: result.root,

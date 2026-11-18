@@ -81,7 +81,27 @@ export interface CustodyScan {
   readonly missingSidecar?: SidecarRef | undefined
   /** At-risk commits a rebase removed that the published main graph still holds by patch-id. */
   readonly rebased?: readonly RebaseWitness[] | undefined
+  /**
+   * 34787 (@cto 34787-component-retention-ruling correction 4): when blocked, the exact loss per component: the
+   * un-witnessed object count by type and the commit roots (the missing commits no other missing commit reaches),
+   * each with its subject. It describes the complete `missingSidecar`; it never stands in for it.
+   */
+  readonly loss?: readonly MissingComponentLoss[] | undefined
 }
+
+/** 34787: one component's un-witnessed objects. `roots` is absent, with `rootsUnknown` saying why, when unproven. */
+export interface MissingComponentLoss {
+  readonly component: string
+  readonly count: number
+  readonly types: Readonly<Record<string, number>>
+  readonly roots?: readonly Readonly<{ oid: string; subject: string }>[] | undefined
+  readonly rootsUnknown?: string | undefined
+}
+
+/** 34787: the commit count past which commit roots are reported unknown rather than computed. */
+const LOSS_ROOT_COMMIT_LIMIT = 10_000
+/** 34787: the per-call bound on describing the loss; a slower call reports the roots unknown. */
+const LOSS_GIT_TIMEOUT_MS = 120_000
 
 /**
  * A refused at-risk commit whose stable patch-id equals that of a commit the published main graph
@@ -756,7 +776,9 @@ async function runCustody(
   const missingWriter = new SidecarWriter(sidecarDir, "txt")
   const identities = new Map<string, WitnessIdentity>()
   const missing: CustodyTarget[] = []
-  const allMissing: Array<CustodyTarget & Readonly<{ gitDir?: string }>> = []
+  const allMissing: Array<CustodyTarget & Readonly<{ gitDir?: string; objectType: string }>> = []
+  // 34787: the final un-witnessed set after the rebase subtraction, described per component when gate 5 blocks.
+  let finalMissing: readonly (CustodyTarget & Readonly<{ gitDir?: string; objectType: string }>)[] = allMissing
   const rebased: RebaseWitness[] = []
   const unchecked: string[] = []
   let witnessCount = 0
@@ -777,6 +799,7 @@ async function runCustody(
           const atRiskLines = groups.find((group) => group.label === "at-risk")?.lines
           if (atRiskLines === undefined || atRiskLines.length === 0) return
           const source = atRiskLines[0]?.split("\t")[2] ?? "owned"
+          const objectType = atRiskLines[0]?.split("\t")[1] ?? "unknown"
           const indexLines = groups.find((group) => group.label === "witness-index")?.lines
           if (indexLines === undefined || indexLines.length === 0) {
             missingCount += 1
@@ -785,6 +808,7 @@ async function runCustody(
               component: component.component,
               oid: key,
               source,
+              objectType,
               ...(component.gitDir === undefined ? {} : { gitDir: component.gitDir }),
             })
             return
@@ -848,6 +872,7 @@ async function runCustody(
     if (rebased.length > 0) {
       const rebasedKeys = new Set(rebased.map((witness) => `${witness.component}\0${witness.oid}`))
       const stillMissing = allMissing.filter((target) => !rebasedKeys.has(`${target.component}\0${target.oid}`))
+      finalMissing = stillMissing
       missingCount = stillMissing.length
       missing.length = 0
       for (const target of stillMissing) {
@@ -874,6 +899,7 @@ async function runCustody(
   remaining()
   const first = missing[0]
   if (missingCount > 0 && first !== undefined) {
+    const loss = await describeLoss(finalMissing, components, copyRoot, run)
     return {
       status: "blocked",
       detail: `${missingCount} at-risk OID(s) have no durable witness, e.g. ${first.component} ${first.oid} (${first.source}); first ${missing.length} inline, full list in ${missingSidecar?.path ?? "a sidecar"}${uncheckedDetail(unchecked)}`,
@@ -884,6 +910,7 @@ async function runCustody(
       missingCount,
       ...(missingSidecar === undefined ? {} : { missingSidecar }),
       rebased,
+      loss,
     }
   }
   return {
@@ -896,6 +923,91 @@ async function runCustody(
     missingCount: 0,
     rebased,
   }
+}
+
+/**
+ * 34787 (@cto 34787-component-retention-ruling correction 4): name the exact loss a blocked gate 5 found, so an owner
+ * discard can bind to it: per component, the count by object type and the commit roots with their subjects. Read-only.
+ * A root set that cannot be proven (too many commits, a failed git call, a malformed answer) is reported unknown by
+ * name; the counts stay, and nothing here changes gate 5's verdict.
+ */
+async function describeLoss(
+  missing: readonly (CustodyTarget & Readonly<{ gitDir?: string; objectType: string }>)[],
+  components: readonly ComponentContents[],
+  copyRoot: string,
+  run: GitRun,
+): Promise<readonly MissingComponentLoss[]> {
+  const byComponent = new Map<string, (CustodyTarget & Readonly<{ gitDir?: string; objectType: string }>)[]>()
+  for (const target of missing) {
+    const list = byComponent.get(target.component) ?? []
+    list.push(target)
+    byComponent.set(target.component, list)
+  }
+  const loss: MissingComponentLoss[] = []
+  for (const [component, targets] of [...byComponent].sort(([left], [right]) =>
+    left < right ? -1 : left > right ? 1 : 0,
+  )) {
+    const types: Record<string, number> = {}
+    for (const target of targets) types[target.objectType] = (types[target.objectType] ?? 0) + 1
+    const commits = targets.filter((target) => target.objectType === "commit").map((target) => target.oid)
+    const declared = components.find((entry) => entry.component === component)
+    const gitDir = targets[0]?.gitDir ?? declared?.gitDir ?? join(copyRoot, component)
+    const roots = await commitRoots(commits, gitDir, run)
+    loss.push({
+      component,
+      count: targets.length,
+      types,
+      ...("roots" in roots ? { roots: roots.roots } : { rootsUnknown: roots.unknown }),
+    })
+  }
+  return loss
+}
+
+async function commitRoots(
+  commits: readonly string[],
+  gitDir: string,
+  run: GitRun,
+): Promise<Readonly<{ roots: readonly Readonly<{ oid: string; subject: string }>[] }> | Readonly<{ unknown: string }>> {
+  if (commits.length === 0) return { roots: [] }
+  if (commits.length > LOSS_ROOT_COMMIT_LIMIT) {
+    return {
+      unknown: `${String(commits.length)} missing commits exceed the ${String(LOSS_ROOT_COMMIT_LIMIT)} root bound`,
+    }
+  }
+  let tips = [...commits]
+  if (commits.length > 1) {
+    const reduced = await run([`--git-dir=${gitDir}`, "merge-base", "--independent", ...commits], {
+      timeoutMs: LOSS_GIT_TIMEOUT_MS,
+    })
+    if (reduced.code !== 0 || reduced.timedOut === true || reduced.stderr.trim() !== "") {
+      return {
+        unknown: `merge-base --independent in ${gitDir} did not complete cleanly (exit ${String(reduced.code)}): ${reduced.stderr.trim()}`,
+      }
+    }
+    tips = reduced.stdout.trim().split("\n")
+    const known = new Set(commits)
+    const stray = tips.find((tip) => !HEX40.test(tip) || !known.has(tip))
+    if (stray !== undefined) return { unknown: `merge-base --independent in ${gitDir} answered ${stray.slice(0, 80)}` }
+  }
+  const described = await run([`--git-dir=${gitDir}`, "log", "--no-walk=unsorted", "--format=%H%x09%s", ...tips], {
+    timeoutMs: LOSS_GIT_TIMEOUT_MS,
+  })
+  if (described.code !== 0 || described.timedOut === true || described.stderr.trim() !== "") {
+    return {
+      unknown: `log of the commit roots in ${gitDir} did not complete cleanly (exit ${String(described.code)}): ${described.stderr.trim()}`,
+    }
+  }
+  const subjects = new Map<string, string>()
+  for (const line of described.stdout.split("\n")) {
+    if (line === "") continue
+    const tab = line.indexOf("\t")
+    subjects.set(tab === -1 ? line : line.slice(0, tab), tab === -1 ? "" : line.slice(tab + 1))
+  }
+  const missingSubject = tips.find((tip) => !subjects.has(tip))
+  if (missingSubject !== undefined) {
+    return { unknown: `log in ${gitDir} did not describe commit root ${missingSubject}` }
+  }
+  return { roots: [...tips].sort().map((oid) => ({ oid, subject: subjects.get(oid) ?? "" })) }
 }
 
 /**
