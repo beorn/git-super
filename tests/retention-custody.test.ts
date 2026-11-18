@@ -5,8 +5,9 @@
  * @level l1
  * @consumer the read-only retention verifier, gate 5; #27443(b)
  * @testonly none
+ * @reach fs-walk <fixture-only: counts lines in the scan's own temporary sidecar directory>
  */
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs"
 import { spawnSync } from "node:child_process"
 import { createHash } from "node:crypto"
 import { tmpdir } from "node:os"
@@ -255,6 +256,198 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     const pinned = await scanCustody(unrelatedRoot, [component], [join(store.root, ".git", "objects")], [], opts)
     expect(pinned.status).toBe("pass")
     expect(pinned.witnesses[0]).toMatchObject({ ref: `refs/yrd/pins/${store.head}`, tip: store.head })
+  })
+
+  // #34920 (@dev/5 cost plan r2): retention-mode witness indexing wrote every durable ref's FULL closure as its own
+  // sidecar, so a component whose history is repeated across many refs and stores cost refs x closure (live: 1,423
+  // sidecars, 100,042,074 lines for 484,541 distinct OIDs). The existing witness tests use one or two refs, where the
+  // two shapes cannot be told apart.
+  function sharedHistoryWitnesses(prefix: string, branches: number) {
+    const store = repoWithCommit(prefix)
+    for (let index = 0; index < 12; index += 1) {
+      writeFileSync(join(store.root, `base-${index}.txt`), `base ${index}\n`)
+      git(store.root, ["add", "."])
+      git(store.root, ["commit", "-q", "-m", `base ${index}`])
+    }
+    const base = git(store.root, ["rev-parse", "HEAD"])
+    const tips: string[] = []
+    for (let index = 0; index < branches; index += 1) {
+      git(store.root, ["checkout", "-q", "-b", `topic-${String(index).padStart(2, "0")}`, base])
+      writeFileSync(join(store.root, `topic-${index}.txt`), `topic ${index}\n`)
+      git(store.root, ["add", "."])
+      git(store.root, ["commit", "-q", "-m", `topic ${index}`])
+      tips.push(git(store.root, ["rev-parse", "HEAD"]))
+    }
+    git(store.root, ["checkout", "-q", "main"])
+    const parent = tmp(`${prefix}clone-`)
+    const clone = join(parent, "clone")
+    git(parent, ["clone", "-q", "--no-local", store.root, clone])
+    for (let index = 0; index < branches; index += 1) {
+      const name = `topic-${String(index).padStart(2, "0")}`
+      git(clone, ["branch", "-q", name, `origin/${name}`])
+    }
+    const stores = [join(store.root, ".git", "objects"), join(clone, ".git", "objects")]
+    const distinct = new Set(
+      git(store.root, ["rev-list", "--objects", "--all"])
+        .split("\n")
+        .map((line) => line.slice(0, 40)),
+    )
+    return { store, clone, stores, base, tips, distinct }
+  }
+
+  function sidecarLineTotal(dir: string, exclude: readonly string[]): number {
+    let total = 0
+    for (const name of readdirSync(dir)) {
+      const path = join(dir, name)
+      if (!name.endsWith(".txt") || exclude.includes(path)) continue
+      const text = readFileSync(path, "utf8")
+      total += text === "" ? 0 : text.split("\n").filter((line) => line !== "").length
+    }
+    return total
+  }
+
+  test("witness index fragments hold each shared object about once; only the used witness gets a full certificate (#34920)", async () => {
+    const fixture = sharedHistoryWitnesses("git-super-custody-shared-", 8)
+    const sidecarDir = tmp("git-super-custody-shared-sidecars-")
+    // One at-risk object, so exactly one witness is used while all 18 durable refs are considered.
+    const component = await componentOf([fixture.base], sidecarDir, "owned")
+    const scan = await scanCustody(fixture.store.root, [component], fixture.stores, [], { sidecarDir })
+    expect(scan.status).toBe("pass")
+    expect(scan.witnesses).toHaveLength(1)
+    const used = scan.witnesses[0]!
+    const certificate = join(sidecarDir, `${used.graphDigest}.txt`)
+    const fullClosure = git(fixture.store.root, ["rev-list", "--objects", used.tip]).split("\n").length
+    expect(
+      readFileSync(certificate, "utf8")
+        .split("\n")
+        .filter((line) => line !== ""),
+    ).toHaveLength(fullClosure)
+    const fragments = sidecarLineTotal(sidecarDir, [
+      component.atRiskSidecar.path,
+      certificate,
+      ...(scan.witnessSidecar === undefined ? [] : [scan.witnessSidecar.path]),
+      ...(scan.missingSidecar === undefined ? [] : [scan.missingSidecar.path]),
+    ])
+    // 2 stores x (main + 8 topics) = 18 refs, each closure ~45 objects: full per-ref closures are ~800 lines. The
+    // fragments plus the OID -> first-witness index are each about the ~60-object union; 3x the union bounds both.
+    expect(fragments).toBeLessThanOrEqual(3 * fixture.distinct.size)
+  })
+
+  function commitOn(root: string, branch: string, file: string): string {
+    git(root, ["checkout", "-q", "-b", branch])
+    writeFileSync(join(root, file), `${branch}\n`)
+    git(root, ["add", "."])
+    git(root, ["commit", "-q", "-m", branch])
+    const head = git(root, ["rev-parse", "HEAD"])
+    git(root, ["checkout", "-q", "main"])
+    return head
+  }
+
+  /** Each case is two or more witness stores and an at-risk set; `blocked` names OIDs no durable ref reaches. */
+  function custodyCase(kind: string): { root: string; stores: string[]; atRisk: string[]; blocked: string[] } {
+    const fixture = sharedHistoryWitnesses(`git-super-custody-case-${kind}-`, 5)
+    const a = fixture.store.root
+    const b = fixture.clone
+    const atRisk = [fixture.base, ...fixture.tips, fixture.store.tree]
+    const stores = [...fixture.stores]
+    const blocked: string[] = []
+    if (kind === "earlier tip absent") {
+      atRisk.push(commitOn(a, "only-a", "only-a.txt"), commitOn(b, "only-b", "only-b.txt"))
+    } else if (kind === "shared alternates") {
+      const parent = tmp("git-super-custody-case-alternates-")
+      const shared = join(parent, "shared")
+      git(parent, ["clone", "-q", "--shared", a, shared])
+      git(shared, ["branch", "-q", "topic-01", "origin/topic-01"])
+      atRisk.push(commitOn(shared, "alt-only", "alt-only.txt"))
+      stores.push(join(shared, ".git", "objects"))
+    } else if (kind === "disjoint histories") {
+      const other = repoWithCommit("git-super-custody-case-disjoint-")
+      atRisk.push(other.head, other.tree, commitOn(other.root, "other-topic", "other.txt"))
+      stores.push(join(other.root, ".git", "objects"))
+    } else if (kind === "tag tree and blob refs") {
+      git(a, ["tag", "-a", "-m", "annotated", "v1", fixture.tips[2]!])
+      const lonely = spawnSync("git", ["hash-object", "-w", "--stdin"], {
+        cwd: a,
+        input: "lonely blob\n",
+        encoding: "utf8",
+        env: environment,
+      }).stdout.trim()
+      git(a, ["update-ref", "refs/tags/tree-ref", fixture.store.tree])
+      git(a, ["update-ref", "refs/tags/blob-ref", lonely])
+      atRisk.push(git(a, ["rev-parse", "refs/tags/v1"]), lonely)
+    } else if (kind === "distinct traversal contexts") {
+      // A replace ref rewrites b's traversal; the generic runner honours it, so b must not subtract across stores.
+      git(b, ["replace", fixture.tips[1]!, fixture.tips[3]!])
+    } else if (kind === "blocked") {
+      const dangling = spawnSync("git", ["hash-object", "-w", "--stdin"], {
+        cwd: a,
+        input: "no ref reaches me\n",
+        encoding: "utf8",
+        env: environment,
+      }).stdout.trim()
+      atRisk.push(dangling)
+      blocked.push(dangling)
+    }
+    return { root: a, stores, atRisk: [...new Set(atRisk)], blocked }
+  }
+
+  // AC (@cto 34920-witness-index-direction item 4): every at-risk object's chosen store/ref/tip, the emitted
+  // graphDigest and the verdict equal the old full-closure algorithm, computed here straight from git.
+  test.each([
+    "shared history",
+    "earlier tip absent",
+    "shared alternates",
+    "disjoint histories",
+    "tag tree and blob refs",
+    "distinct traversal contexts",
+    "blocked",
+  ])("witness labels, graphDigest and verdict match the full-closure algorithm: %s (#34920)", async (kind) => {
+    const fixture = custodyCase(kind)
+    const sidecarDir = tmp("git-super-custody-label-sidecars-")
+    const component = await componentOf(fixture.atRisk, sidecarDir, "owned")
+    const scan = await scanCustody(fixture.root, [component], fixture.stores, [], { sidecarDir })
+    // The old algorithm: stores by realpath, refs by name, each ref's full closure in its own store (honouring that
+    // store's replace refs, as the generic runner does); the first ref whose closure holds an OID is its witness.
+    const ranked: Array<{ store: string; ref: string; tip: string; closure: string[] }> = []
+    for (const objects of fixture.stores.map((path) => realpathSync(path)).sort()) {
+      const gitDir = join(objects, "..")
+      const refs = git(gitDir, ["--git-dir", gitDir, "for-each-ref", "--format=%(refname)\t%(objectname)"])
+        .split("\n")
+        .filter((row) => /^refs\/(?:heads|tags)\//u.test(row))
+        .map((row) => row.split("\t") as [string, string])
+        .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+      for (const [ref, tip] of refs) {
+        const closure = git(gitDir, ["--git-dir", gitDir, "rev-list", "--objects", tip])
+          .split("\n")
+          .map((line) => line.split(" ")[0]!)
+        ranked.push({ store: objects, ref, tip, closure })
+      }
+    }
+    const witnessed = [...fixture.atRisk].sort().flatMap((oid) => {
+      const first = ranked.find((entry) => entry.closure.includes(oid))
+      return first === undefined ? [] : [{ oid, first }]
+    })
+    expect(scan.status).toBe(fixture.blocked.length === 0 ? "pass" : "blocked")
+    expect(scan.missing.map((target) => target.oid)).toEqual(fixture.blocked)
+    expect(await sidecarText(scan, "witness")).toEqual(
+      witnessed.map(({ oid, first }) => `${oid}\t.git\t${first.store}\t${first.ref}\t${first.tip}`),
+    )
+    const used = [
+      ...new Map(witnessed.map(({ first }) => [`${first.store}\t${first.ref}\t${first.tip}`, first])).values(),
+    ]
+    expect(scan.witnesses).toEqual(
+      used.map((entry) => ({
+        store: entry.store,
+        ref: entry.ref,
+        tip: entry.tip,
+        graphDigest: createHash("sha256")
+          .update(`${[...entry.closure].sort().join("\n")}\n`)
+          .digest("hex"),
+      })),
+    )
+    if (kind === "distinct traversal contexts") {
+      expect(scan.detail).toMatch(/without cross-store subtraction: .*replace refs present/u)
+    }
   })
 
   // AC: redundant policy ancestors must fit the shared proof budget while preserving

@@ -401,12 +401,95 @@ async function* reachableOidLines(
   if (malformed !== undefined) throw malformed
 }
 
+/**
+ * One durable witness ref, in global rank order. `fragment` is a PRIVATE index input, never a graph certificate:
+ * the ref's sorted reachable OIDs minus those reachable from earlier-ranked tips whose traversal is equivalent in
+ * this store (#34920, @cto 34920-witness-index-direction A3). `complete` is true only when no tip was subtracted, so
+ * the fragment IS the full sorted closure and its sha256 may stand as the graphDigest.
+ */
 interface DurableRefRecord {
   readonly store: string
+  readonly gitDir: string
   readonly ref: string
   readonly tip: string
   readonly format: string
-  readonly sidecar: SidecarRef
+  readonly fragment: SidecarRef
+  readonly complete: boolean
+}
+
+/** #34920: a store's traversal may be subtracted across stores only when nothing rewrites or truncates it. */
+interface TraversalContext {
+  readonly plain: boolean
+  /** Why it is not plain; reported in the scan detail, never silent. */
+  readonly reason?: string
+}
+
+/** At most this many earlier tips are subtracted per walk; any subset is correct, fewer only repeats more objects. */
+const MAX_SUBTRACTED_TIPS = 4096
+
+async function traversalContext(
+  gitDir: string,
+  refRows: readonly string[],
+  run: GitRun,
+  witnessPolicy: Readonly<{ targetBranch: string }> | undefined,
+): Promise<TraversalContext> {
+  // The policy runner passes --no-replace-objects and GIT_NO_REPLACE_OBJECTS, so replace refs cannot act there; the
+  // generic runner passes neither, so a replace ref (or a moved replace base) rewrites this store's traversal.
+  if (witnessPolicy === undefined) {
+    if (process.env.GIT_REPLACE_REF_BASE !== undefined) return { plain: false, reason: "GIT_REPLACE_REF_BASE is set" }
+    if (process.env.GIT_NO_REPLACE_OBJECTS === undefined && refRows.some((row) => row.startsWith("refs/replace/"))) {
+      return { plain: false, reason: "replace refs present" }
+    }
+  }
+  if (process.env.GIT_GRAFT_FILE !== undefined) return { plain: false, reason: "GIT_GRAFT_FILE is set" }
+  if (existsSync(join(gitDir, "info", "grafts"))) return { plain: false, reason: "info/grafts present" }
+  if (existsSync(join(gitDir, "shallow"))) return { plain: false, reason: "shallow" }
+  const promisor = await run([
+    `--git-dir=${gitDir}`,
+    "config",
+    "--get-regexp",
+    "^(extensions\\.partialclone|remote\\..*\\.promisor)$",
+  ])
+  refuseSuccessfulStderr(promisor, `config --get-regexp promisor in ${gitDir}`)
+  if (promisor.code === 0 && promisor.stdout.trim() !== "") return { plain: false, reason: "partial clone (promisor)" }
+  if (promisor.code !== 0 && promisor.code !== 1) {
+    throw new UnknownError(`config --get-regexp promisor failed in ${gitDir}: ${promisor.stderr.trim()}`)
+  }
+  return { plain: true }
+}
+
+/**
+ * Sorted reachable OIDs of `tip` minus those reachable from `subtract`. With nothing subtracted this is the complete
+ * closure: the canonical graph certificate whose sha256 is a witness's graphDigest.
+ */
+async function reachableSidecar(
+  gitDir: string,
+  tip: string,
+  subtract: readonly string[],
+  stream: GitStreamFactory,
+  bounds: CustodyBounds,
+  clock: () => number,
+  sidecarDir: string,
+  deadline: number | undefined,
+): Promise<SidecarRef> {
+  const started = clock()
+  // --ignore-missing drops a subtracted tip this store lacks; dropping one only repeats objects, never loses one.
+  const args =
+    subtract.length === 0
+      ? [`--git-dir=${gitDir}`, "rev-list", "--objects", tip]
+      : [`--git-dir=${gitDir}`, "rev-list", "--objects", "--ignore-missing", tip, "--not", ...subtract]
+  const lineStream = stream(args, { timeoutMs: bounds.reachableMs, maxLines: bounds.maxReachableOids })
+  const sidecar = await externalSortToSidecar(reachableOidLines(lineStream, gitDir, tip, bounds), {
+    dir: sidecarDir,
+    runLines: DEFAULT_SORT_RUN_LINES,
+    deadline,
+    clock,
+  })
+  if (clock() - started > bounds.reachableMs) {
+    throw new UnknownError(`rev-list ${tip} in ${gitDir} exceeded the ${bounds.reachableMs} ms bound`)
+  }
+  if (deadline !== undefined && clock() >= deadline) throw new UnknownError("shared proof deadline is exhausted")
+  return sidecar
 }
 
 interface WitnessRef {
@@ -465,8 +548,12 @@ async function indexWitnessStores(
   records: DurableRefRecord[]
   formats: Map<string, string>
   published: ReadonlyArray<Readonly<{ store: string; tip: string }>>
+  /** Stores whose traversal is not plain, so their refs were walked without cross-store subtraction, and why. */
+  unsubtracted: readonly string[]
 }> {
   const records: DurableRefRecord[] = []
+  const prior: Array<Readonly<{ store: string; tip: string; plain: boolean }>> = []
+  const unsubtracted: string[] = []
   const formats = new Map<string, string>()
   const published: Array<Readonly<{ store: string; tip: string }>> = []
   let witnessFsckMs = 0
@@ -543,30 +630,43 @@ async function indexWitnessStores(
     }
     durable.sort((left, right) => (left.ref < right.ref ? -1 : left.ref > right.ref ? 1 : 0))
     const selected = witnessPolicy === undefined ? durable : await independentPolicyRefs(durable, gitDir, run)
+    const context = await traversalContext(gitDir, refs.stdout.split("\n"), run, witnessPolicy)
+    if (!context.plain && selected.length > 0) {
+      unsubtracted.push(`${gitDir} (${context.reason ?? "traversal not plain"})`)
+    }
     const refStarted = clock()
     for (const entry of selected) {
-      const started = clock()
-      const lineStream = stream([`--git-dir=${gitDir}`, "rev-list", "--objects", entry.tip], {
-        timeoutMs: bounds.reachableMs,
-        maxLines: bounds.maxReachableOids,
-      })
-      const sidecar = await externalSortToSidecar(reachableOidLines(lineStream, gitDir, entry.tip, bounds), {
-        dir: sidecarDir,
-        runLines: DEFAULT_SORT_RUN_LINES,
-        deadline,
-        clock,
-      })
-      if (clock() - started > bounds.reachableMs) {
-        throw new UnknownError(`rev-list ${entry.tip} in ${gitDir} exceeded the ${bounds.reachableMs} ms bound`)
+      // #34920 A3: subtract earlier-ranked tips whose closure this store's walk computes exactly as their own store
+      // did: always this store's own earlier refs; another store's only when both traversals are plain. The object
+      // set each ref emits shrinks, but the minimum-rank ref reaching an OID still emits it (none of its subtracted
+      // tips are earlier-ranked reachers), so the labeled merge picks the same witness as a full walk.
+      const subtract: string[] = []
+      const seen = new Set<string>()
+      for (let index = prior.length - 1; index >= 0 && subtract.length < MAX_SUBTRACTED_TIPS; index -= 1) {
+        const earlier = prior[index]
+        if (earlier === undefined) continue
+        if (earlier.store !== store && !(earlier.plain && context.plain)) continue
+        if (seen.has(earlier.tip)) continue
+        seen.add(earlier.tip)
+        subtract.push(earlier.tip)
       }
-      if (deadline !== undefined && clock() >= deadline) throw new UnknownError("shared proof deadline is exhausted")
-      records.push({ store, ref: entry.ref, tip: entry.tip, format: format.format, sidecar })
+      const fragment = await reachableSidecar(gitDir, entry.tip, subtract, stream, bounds, clock, sidecarDir, deadline)
+      records.push({
+        store,
+        gitDir,
+        ref: entry.ref,
+        tip: entry.tip,
+        format: format.format,
+        fragment,
+        complete: subtract.length === 0,
+      })
+      prior.push({ store, tip: entry.tip, plain: context.plain })
     }
     refGraphMs += clock() - refStarted
   }
   onPhase?.("witnessFsck", witnessFsckMs)
   onPhase?.("refGraph", refGraphMs)
-  return { records, formats, published }
+  return { records, formats, published, unsubtracted }
 }
 
 /**
@@ -676,6 +776,14 @@ async function rebaseWitness(
  * A refused commit whose component store path is unknown is never silently dropped from the report:
  * it stays refused, and the detail says so by name.
  */
+/** #34920: stores whose refs were walked in full because their traversal could not be shown plain. */
+function unsubtractedDetail(stores: ReadonlyArray<string>): string {
+  if (stores.length === 0) return ""
+  const shown = stores.slice(0, 5).join(", ")
+  const more = stores.length > 5 ? ` and ${String(stores.length - 5)} more` : ""
+  return `; witness index walked ${String(stores.length)} store(s) without cross-store subtraction: ${shown}${more}`
+}
+
 function uncheckedDetail(unchecked: ReadonlyArray<string>): string {
   if (unchecked.length === 0) return ""
   const shown = unchecked.slice(0, 5).join(", ")
@@ -755,7 +863,7 @@ async function runCustody(
         ? {}
         : { env: { ...streamOptions.env, GIT_NO_REPLACE_OBJECTS: "1", GIT_NO_LAZY_FETCH: "1" } }),
     })
-  const { records, formats, published } = await indexWitnessStores(
+  const { records, formats, published, unsubtracted } = await indexWitnessStores(
     stores,
     removal,
     proofStream,
@@ -769,12 +877,13 @@ async function runCustody(
   )
   const width = String(Math.max(1, records.length)).length
   const index = await mergeLabeledFiles(
-    records.map((record, rank) => ({ path: record.sidecar.path, label: String(rank).padStart(width, "0") })),
+    records.map((record, rank) => ({ path: record.fragment.path, label: String(rank).padStart(width, "0") })),
     { dir: sidecarDir, deadline, clock },
   )
   const witnessWriter = new SidecarWriter(sidecarDir, "txt")
   const missingWriter = new SidecarWriter(sidecarDir, "txt")
-  const identities = new Map<string, WitnessIdentity>()
+  // The witnesses actually used, in first-use order; only these get a full graph certificate (#34920 A3).
+  const identities = new Map<string, DurableRefRecord>()
   const missing: CustodyTarget[] = []
   const allMissing: Array<CustodyTarget & Readonly<{ gitDir?: string; objectType: string }>> = []
   // 34787: the final un-witnessed set after the rebase subtraction, described per component when gate 5 blocks.
@@ -824,14 +933,7 @@ async function runCustody(
           witnessCount += 1
           witnessWriter.add(`${key}\t${component.component}\t${record.store}\t${record.ref}\t${record.tip}`)
           const identityKey = `${record.store}\t${record.ref}\t${record.tip}`
-          if (!identities.has(identityKey)) {
-            identities.set(identityKey, {
-              store: record.store,
-              ref: record.ref,
-              tip: record.tip,
-              graphDigest: record.sidecar.sha256,
-            })
-          }
+          if (!identities.has(identityKey)) identities.set(identityKey, record)
         },
         { deadline, clock },
       )
@@ -895,14 +997,39 @@ async function runCustody(
   let missingSidecar: SidecarRef | undefined
   if (missingCount > 0) missingSidecar = await missingWriter.finish()
   else missingWriter.abort()
-  const witnesses = [...identities.values()]
+  // #34920 A3: graphDigest keeps its exact meaning, the sha256 of the witness's complete sorted closure. A complete
+  // fragment already is that file; any other used witness is walked once in full here. A ref that was only considered
+  // never gets one.
+  const certificateStarted = clock()
+  const certificates = new Map<string, SidecarRef>()
+  const witnesses: WitnessIdentity[] = []
+  for (const record of identities.values()) {
+    const key = `${record.gitDir}\t${record.tip}`
+    let certificate = record.complete ? record.fragment : certificates.get(key)
+    if (certificate === undefined) {
+      remaining()
+      certificate = await reachableSidecar(
+        record.gitDir,
+        record.tip,
+        [],
+        proofStream,
+        bounds,
+        clock,
+        sidecarDir,
+        deadline,
+      )
+    }
+    certificates.set(key, certificate)
+    witnesses.push({ store: record.store, ref: record.ref, tip: record.tip, graphDigest: certificate.sha256 })
+  }
+  onPhase?.("witnessCertificates", clock() - certificateStarted)
   remaining()
   const first = missing[0]
   if (missingCount > 0 && first !== undefined) {
     const loss = await describeLoss(finalMissing, components, copyRoot, run)
     return {
       status: "blocked",
-      detail: `${missingCount} at-risk OID(s) have no durable witness, e.g. ${first.component} ${first.oid} (${first.source}); first ${missing.length} inline, full list in ${missingSidecar?.path ?? "a sidecar"}${uncheckedDetail(unchecked)}`,
+      detail: `${missingCount} at-risk OID(s) have no durable witness, e.g. ${first.component} ${first.oid} (${first.source}); first ${missing.length} inline, full list in ${missingSidecar?.path ?? "a sidecar"}${uncheckedDetail(unchecked)}${unsubtractedDetail(unsubtracted)}`,
       witnesses,
       witnessCount,
       ...(witnessSidecar === undefined ? {} : { witnessSidecar }),
@@ -915,7 +1042,7 @@ async function runCustody(
   }
   return {
     status: "pass",
-    detail: `${witnessCount} at-risk OID(s) each have a named surviving witness across ${stores.length} store(s), ${witnesses.length} distinct identities${rebased.length === 0 ? "" : `, plus ${String(rebased.length)} rebased commit(s) matched by whitespace-sensitive patch-id to the published main graph`}${uncheckedDetail(unchecked)}`,
+    detail: `${witnessCount} at-risk OID(s) each have a named surviving witness across ${stores.length} store(s), ${witnesses.length} distinct identities${rebased.length === 0 ? "" : `, plus ${String(rebased.length)} rebased commit(s) matched by whitespace-sensitive patch-id to the published main graph`}${uncheckedDetail(unchecked)}${unsubtractedDetail(unsubtracted)}`,
     witnesses,
     witnessCount,
     ...(witnessSidecar === undefined ? {} : { witnessSidecar }),
