@@ -6,7 +6,7 @@
  * @reach fs-walk <fixture-only: isolated mkdtemp Git repositories the test builds and removes itself>
  * @testonly none
  */
-import { existsSync, renameSync, rmSync } from "node:fs"
+import { existsSync, readFileSync, renameSync, rmSync } from "node:fs"
 import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { describe, expect, it } from "vitest"
@@ -263,6 +263,61 @@ describe("git-super worktree remove admits a clean component store proven on its
       const store = join(copied ?? "", "packages/alpha")
       expect(git(fixture.product, "--git-dir", store, "--work-tree", root, "cat-file", "-t", local)).toBe("commit")
       expect(git(fixture.product, "--git-dir", store, "--work-tree", root, "rev-parse", "HEAD")).toBe(local)
+    } finally {
+      // raw-delete-allow: the fixture tree this test made under its own mkdtemp root
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it("records each repository's HEAD and the caller's attribution, as given, in the retained manifest (34787)", async () => {
+    const { root, fixture, linked, alpha, retain } = await linkedWithSubmodules()
+    try {
+      await writeFile(join(alpha, "alpha.ts"), "export const alpha = 4\n")
+      git(alpha, "commit", "-q", "-am", "local only")
+      const local = git(alpha, "rev-parse", "HEAD")
+      const rootHead = git(linked, "rev-parse", "HEAD")
+      stageComponentMove(linked, alpha, local)
+      // 34787 correction 3: GitSuper records the caller's attribution opaquely; the values mean nothing to it.
+      const attribution = { actor: "@seat/one", owner: null, issue: "pm/@x/1-thing.md" }
+
+      const result = await superWorktreeRemove({
+        repo: fixture.product,
+        path: linked,
+        retain,
+        preserved: [],
+        attribution,
+      })
+
+      expect(result.state, result.detail?.message ?? "").toBe("updated")
+      const manifest = JSON.parse(readFileSync(result.proof?.manifest ?? "", "utf8")) as {
+        attribution?: unknown
+        repositoryHeads?: { path: string; head: string }[]
+      }
+      expect(manifest.attribution).toEqual(attribution)
+      expect(manifest.repositoryHeads).toEqual(
+        expect.arrayContaining([
+          { path: linked, head: rootHead },
+          { path: join(linked, "packages/alpha"), head: local },
+        ]),
+      )
+    } finally {
+      // raw-delete-allow: the fixture tree this test made under its own mkdtemp root
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it("refuses attribution that is not string-or-null values before removing anything (34787)", async () => {
+    const { root, fixture, linked, retain } = await linkedWithSubmodules()
+    try {
+      const result = await superWorktreeRemove({
+        repo: fixture.product,
+        path: linked,
+        retain,
+        attribution: { actor: 7 } as unknown as Record<string, string>,
+      })
+      expect(result.state).toBe("failed")
+      expect(result.detail?.message ?? "").toContain("retention attribution 'actor' must be a string or null")
+      expect(existsSync(linked)).toBe(true)
     } finally {
       // raw-delete-allow: the fixture tree this test made under its own mkdtemp root
       await rm(root, { recursive: true, force: true })

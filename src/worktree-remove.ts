@@ -4,7 +4,7 @@ import { runGit } from "./git.ts"
 import { gitSuperResult, type GitSuperResult } from "./result.ts"
 import { createLocalGitWorktreeStore, type ComponentCustodyRefusal } from "./worktree.ts"
 import type { CompactionResult } from "./retention-compact.ts"
-import type { WorktreeRemovalProof } from "./worktree-removal.ts"
+import { checkRetentionAttribution, type RetentionAttribution, type WorktreeRemovalProof } from "./worktree-removal.ts"
 import type { NotCompared } from "./diff.ts"
 
 function within(parent: string, path: string): boolean {
@@ -41,6 +41,11 @@ export type SuperWorktreeRemoveOptions = Readonly<{
    * are verified by the gate; byte equality between the ref and the dirt is the caller's claim.
    */
   preserved?: readonly string[]
+  /**
+   * 34787 (@cto 34787-component-retention-ruling correction 3): the caller's attribution for this retention, recorded
+   * in the manifest as given. Opaque: each value is a string or null; GitSuper interprets none of it.
+   */
+  attribution?: RetentionAttribution
 }>
 
 export type SuperWorktreeRemoveResult = GitSuperResult &
@@ -77,6 +82,7 @@ export async function superWorktreeRemove(options: SuperWorktreeRemoveOptions): 
       ...(options.componentCustody === undefined ? {} : { componentCustody: options.componentCustody }),
       ...(options.preserved === undefined ? {} : { preserved: options.preserved }),
       retention: {
+        ...(options.attribution === undefined ? {} : { attribution: checkRetentionAttribution(options.attribution) }),
         root: options.retain,
         report: (retained) => {
           proof = retained

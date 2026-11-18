@@ -1,4 +1,4 @@
-import type { RetentionEnrollReport } from "./worktree-removal.ts"
+import { checkRetentionAttribution, type RetentionEnrollReport } from "./worktree-removal.ts"
 import type { RetentionEnrollParams } from "./commands.ts"
 import type { CommandNode } from "@silvery/command"
 import { constants as osConstants } from "node:os"
@@ -735,11 +735,16 @@ async function runInvocation(
       (value: string, previous: string[]) => [...previous, ...value.split(",").filter((ref) => ref !== "")],
       [],
     )
+    .option(
+      "--attribution <json>",
+      "record the caller's attribution for this retention in its manifest as given: a JSON object of string or null values, never interpreted by GitSuper",
+    )
     .argument("<path>", "registered clean worktree to remove")
     .action((path, _options, command) => {
       const globals = command.optsWithGlobals() as { repo: string; json?: boolean }
       const options = command.opts() as {
         retain: string
+        attribution?: string
         excludeSubmodule?: string[]
         preserved?: string[]
         rehome: boolean
@@ -760,6 +765,9 @@ async function runInvocation(
               }),
           ...(options.excludeSubmodule?.length ? { excludedSubmodules: options.excludeSubmodule } : {}),
           ...(options.preserved?.length ? { preserved: options.preserved } : {}),
+          ...(options.attribution === undefined
+            ? {}
+            : { attribution: checkRetentionAttribution(JSON.parse(options.attribution) as unknown) }),
         },
         json: globals.json === true,
         nul: false,

@@ -17,7 +17,12 @@ import { isAbsolute, join } from "node:path"
 import { repositoryRoot } from "./git.ts"
 import { ensureCommitObject } from "./objects.ts"
 import { superStatus, type SuperStatusOptions, type SuperStatusResult } from "./status.ts"
-import { admitOnRemoteSelections, enrollRetainedBorrowers, type RetentionEnrollReport } from "./worktree-removal.ts"
+import {
+  admitOnRemoteSelections,
+  checkRetentionAttribution,
+  enrollRetainedBorrowers,
+  type RetentionEnrollReport,
+} from "./worktree-removal.ts"
 import {
   superSubmodulePrepare,
   type SuperSubmodulePrepareOptions,
@@ -571,6 +576,7 @@ const worktreeRemove = commandNode<CommandContext, WorktreeRemoveParams, GitSupe
             excludedSubmodules: stringArray(input.excludedSubmodules, "excludedSubmodules"),
           }),
       ...(input.preserved === undefined ? {} : { preserved: stringArray(input.preserved, "preserved") }),
+      ...(input.attribution === undefined ? {} : { attribution: checkRetentionAttribution(input.attribution) }),
     }
   }),
   run: (context, input) =>

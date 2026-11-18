@@ -176,7 +176,35 @@ export type WorktreeRemovalProof = Readonly<{
   createdWriterLocks: readonly WriterLockProof[]
   notCompared: readonly NotCompared[]
   componentCustody?: ComponentCustodyProof
+  /**
+   * 34787 (@cto 34787-component-retention-ruling correction 3): each repository's HEAD in the verified snapshot the
+   * copy was proved against (root first), so the selected root and component identities outlive the checkout.
+   * Absent on manifests written before it.
+   */
+  repositoryHeads?: readonly Readonly<{ path: string; head: string }>[]
+  /** 34787: the caller's opaque attribution, written as given; GitSuper never interprets it. */
+  attribution?: RetentionAttribution
 }>
+
+/**
+ * 34787 (@cto 34787-component-retention-ruling correction 3): who and what a caller says a retention is for. Opaque to
+ * GitSuper, which neither parses seat names nor issue paths: it only checks that each value is a string or null, and
+ * records the object in the manifest as given (the caller owns attribution, as for archive refs).
+ */
+export type RetentionAttribution = Readonly<Record<string, string | null>>
+
+/** 34787: refuse attribution that is not a flat object of string-or-null values, before any effect. */
+export function checkRetentionAttribution(value: unknown): RetentionAttribution {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("retention attribution must be an object of string or null values")
+  }
+  for (const [key, entry] of Object.entries(value)) {
+    if (entry !== null && typeof entry !== "string") {
+      throw new Error(`retention attribution '${key}' must be a string or null, not ${typeof entry}`)
+    }
+  }
+  return value as RetentionAttribution
+}
 
 export type ComponentCustodyProof = Readonly<{
   targetBranch: string
@@ -206,6 +234,8 @@ export type RemovalWriterLeases = Readonly<{
 export type WorktreeRetention = Readonly<{
   root: string
   report: (proof: WorktreeRemovalProof) => unknown
+  /** 34787: opaque caller attribution, recorded in the manifest as given (checkRetentionAttribution). */
+  attribution?: RetentionAttribution
 }>
 
 function within(parent: string, path: string): boolean {
@@ -2384,6 +2414,15 @@ async function prepareResolvedWorktreeModules(context: {
           createdWriterLocks,
           notCompared,
           ...(componentCustody === undefined ? {} : { componentCustody }),
+          ...(before === undefined
+            ? {}
+            : {
+                repositoryHeads: before.map((entry) => ({
+                  path: join(path, relative(inspectedPath, entry.path)),
+                  head: entry.head,
+                })),
+              }),
+          ...(retention.attribution === undefined ? {} : { attribution: retention.attribution }),
         }
         writeFileSync(
           proof.manifest,
