@@ -382,13 +382,15 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
   const cold = new Map<string, ColdOwner>()
   const coldCache = new Map<string, ColdOwnerRead | undefined>()
   const coldProofFailedOwners: string[] = []
+  const coldProofFailures: string[] = []
   for (const owner of ownerList) {
     const proof = coldOwner(owner, root, common, coldCache)
     if (proof === undefined) continue
     if ("failure" in proof) {
       coldProofFailedOwners.push(owner)
+      coldProofFailures.push(`${owner}: ${proof.failure}`)
       console.warn(
-        `retention: cannot prove cold owner ${owner}: ${proof.failure}; treating it as live, requiring its existing writer lease or keeping its connected stores`,
+        `retention: cannot prove cold owner ${owner}: ${proof.failure}; owner evidence is incomplete, so the batch stops before any deletion`,
       )
     } else cold.set(owner, proof)
   }
@@ -407,12 +409,17 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
     ...(leaseMissing[0] === undefined ? {} : { leaseMissingExample: leaseMissing[0] }),
     ...(unproved[0] === undefined ? {} : { unprovedExample: unproved[0] }),
   }
+  // A failed cold-proof read is incomplete owner evidence: the batch reports and stops before any deletion window,
+  // dry run included (exit 2 through the CLI and Yrd), rather than keeping the owner live inside a green run (#34920,
+  // @cto 34920-retention-calls-r1).
   const ownerStop =
     unproved.length > 0
       ? `identity-unknown: ${unproved.length} object director(ies) have no proved Git owner, e.g. ${unproved[0]}`
-      : leaseMissing.includes(common)
-        ? `lease-missing: common owner ${common} has no existing writer lease`
-        : undefined
+      : coldProofFailures[0] !== undefined
+        ? `@gate/retention-cold-proof: cold-proof-incomplete: ${coldProofFailures.length} owner(s) have unreadable cold evidence (each named on stderr), e.g. ${coldProofFailures[0]}`
+        : leaseMissing.includes(common)
+          ? `lease-missing: common owner ${common} has no existing writer lease`
+          : undefined
   closeOverKeptBorrowers(entries, scan.borrowers, kept)
   const candidates = borrowerOrder(entries, scan.borrowers, kept)
   for (const [entry, reason] of kept) rows.set(entry, { entry, outcome: "kept", reason })

@@ -28,7 +28,7 @@ import { dirname, join } from "node:path"
 import { tryAcquireFlock } from "@bearly/flock"
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest"
 import { runCli } from "../src/cli.ts"
-import { retireRetainedBatch, type RetentionBatchOptions } from "../src/retention-batch.ts"
+import { retireRetainedBatch, type RetentionBatchOptions, type RetentionBatchResult } from "../src/retention-batch.ts"
 import { scanEstate } from "../src/retention-estate.ts"
 
 vi.mock("node:fs", async (importOriginal) => {
@@ -656,6 +656,115 @@ describe("retention retirement batch (#33010)", async () => {
       result.rows.map((row) => row.outcome),
       JSON.stringify(result.rows),
     ).toEqual(["retired", "retired", "retired"])
+  })
+
+  /** Point the third store's manifest under a regular file and drop its lease, so only cold proof can clear it. */
+  function strandThirdStore(): { entries: string[]; ancestor: string; worktree: string } {
+    const names = readdirSync(root).sort()
+    const third = join(root, names[2] as string)
+    const manifest = JSON.parse(readFileSync(join(third, "manifest.json"), "utf8")) as { path: string }
+    rmSync(join(third, "modules", "vendor", "dep", "yrd-worktree-mutations", "writer.lock"))
+    const ancestor = join(fixtureRoot, "blocked-owner-parent")
+    writeFileSync(ancestor, "not a directory\n")
+    manifest.path = join(ancestor, "old-worktree")
+    writeFileSync(join(third, "manifest.json"), JSON.stringify(manifest))
+    return { entries: names.slice(0, 2).map((name) => join(root, name)), ancestor, worktree: manifest.path }
+  }
+
+  // @cto 34920-retention-calls-r1 item 1: ENOTDIR is absence at discovery AND at the held recheck. An ancestor that
+  // becomes a directory proves nothing by itself; only the recorded worktree reappearing ends the batch.
+  it.each(["absent", "ancestor-dir", "revived"])(
+    "rechecks a worktree recorded under a non-directory before deletion (%s)",
+    async (mode) => {
+      const { entries, ancestor, worktree } = strandThirdStore()
+      try {
+        const result = await retireRetainedBatch({
+          ...options({
+            apply: true,
+            afterScan: () => {
+              if (mode === "absent") return
+              rmSync(ancestor)
+              mkdirSync(mode === "revived" ? worktree : ancestor, { recursive: true })
+            },
+          }),
+          entries,
+        })
+        expect(result.owners?.coldProofFailed).toBe(0)
+        expect(result.owners?.liveUnleased).toBe(0)
+        if (mode === "revived") {
+          expect(result.stopped, JSON.stringify(result.rows)).toContain(`absent worktree ${worktree}`)
+          expect(result.rows.every((row) => row.outcome === "kept")).toBe(true)
+          expect(readdirSync(root)).toHaveLength(3)
+        } else {
+          expect(result.stopped, JSON.stringify(result.rows)).toBeUndefined()
+          expect(result.rows.map((row) => row.outcome)).toEqual(["retired", "retired"])
+          expect(readdirSync(root)).toHaveLength(1)
+        }
+      } finally {
+        rmSync(ancestor, { recursive: true, force: true })
+      }
+    },
+  )
+
+  // @cto 34920-retention-calls-r1 item 2: unreadable cold evidence (here a malformed manifest) is incomplete owner
+  // evidence. The dry run still reports but stops, apply deletes nothing, and the CLI exits 2 for both.
+  it.each([false, true])("unreadable cold evidence stops the batch before any deletion (apply=%s)", async (apply) => {
+    const names = readdirSync(root).sort()
+    const third = join(root, names[2] as string)
+    rmSync(join(third, "modules", "vendor", "dep", "yrd-worktree-mutations", "writer.lock"))
+    writeFileSync(join(third, "manifest.json"), "{ not json")
+    const entries = names.slice(0, 2).map((name) => join(root, name))
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined)
+    let output = ""
+    try {
+      // Library at an eligible clock: the stop alone decides, every other gate passes.
+      const direct = await retireRetainedBatch({ ...options({ apply }), entries })
+      expect(direct.stopped).toContain("@gate/retention-cold-proof: cold-proof-incomplete")
+      expect(direct.owners?.coldProofFailed).toBeGreaterThan(0)
+      expect(
+        direct.rows.map((row) => row.outcome),
+        JSON.stringify(direct.rows),
+      ).toEqual(apply ? ["kept", "kept"] : ["would-retire", "would-retire"])
+      expect(direct.windows).toEqual([])
+      expect(readdirSync(root)).toHaveLength(3)
+      expect(warning).toHaveBeenCalledWith(expect.stringContaining("stops before any deletion"))
+      // CLI at the real clock: the same stop reaches the caller as exit 2 with the full report.
+      const code = await runCli(
+        [
+          "--repo",
+          dirname(common),
+          "--json",
+          "worktree",
+          "retention",
+          "retire-batch",
+          "--root",
+          root,
+          "--common",
+          common,
+          "--namespace",
+          fixtureRoot,
+          "--artifact-dir",
+          join(fixtureRoot, "artifacts"),
+          ...(apply ? ["--apply"] : []),
+          ...entries,
+        ],
+        {
+          write: (value) => {
+            output += value
+          },
+        },
+        sink(),
+      )
+      const report = JSON.parse(output) as RetentionBatchResult
+      expect(code, output).toBe(2)
+      expect(report.stopped).toContain("@gate/retention-cold-proof: cold-proof-incomplete")
+      expect(report.owners?.coldProofFailed).toBeGreaterThan(0)
+      expect(report.rows.map((row) => row.entry)).toEqual(entries)
+      expect(report.rows.every((row) => row.outcome !== "retired")).toBe(true)
+      expect(readdirSync(root)).toHaveLength(3)
+    } finally {
+      warning.mockRestore()
+    }
   })
 
   // Accepted requirement: a linked-worktree owner is cold only while its recorded worktree is absent; the
