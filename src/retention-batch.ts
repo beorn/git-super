@@ -111,6 +111,20 @@ function within(root: string, path: string): boolean {
   return part === "" || (part !== ".." && !part.startsWith(`..${sep}`) && !isAbsolute(part))
 }
 
+/**
+ * Proven absent: lstat reports no entry (ENOENT), or a path component is not a directory (ENOTDIR), so the path cannot
+ * exist. Retired namespaces such as hh-dev%23main leave a receipt FILE where the directory was (#34920). Any other
+ * failure throws, keeping the owner live.
+ */
+function provenAbsent(path: string): boolean {
+  try {
+    return lstatSync(path, { throwIfNoEntry: false }) === undefined
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOTDIR") return true
+    throw error
+  }
+}
+
 type ColdOwner = Readonly<{ source: string; bytes: string; absent: string }>
 type ColdOwnerRead = ColdOwner | Readonly<{ failure: string }>
 
@@ -148,9 +162,7 @@ function coldOwner(
       if (isAbsolute(gitdir) && basename(gitdir) === ".git") absent = dirname(gitdir)
     }
     const proof =
-      typeof absent === "string" && isAbsolute(absent) && lstatSync(absent, { throwIfNoEntry: false }) === undefined
-        ? { source, bytes, absent }
-        : undefined
+      typeof absent === "string" && isAbsolute(absent) && provenAbsent(absent) ? { source, bytes, absent } : undefined
     cache.set(source, proof)
     return proof
   } catch (error) {
@@ -166,10 +178,7 @@ function coldOwnerChanged(proofs: ReadonlyMap<string, ColdOwner>): string | unde
   for (const [owner, proof] of proofs) {
     if (checked.has(proof.source)) continue
     checked.add(proof.source)
-    if (
-      readFileSync(proof.source, "utf8") !== proof.bytes ||
-      lstatSync(proof.absent, { throwIfNoEntry: false }) !== undefined
-    ) {
+    if (readFileSync(proof.source, "utf8") !== proof.bytes || !provenAbsent(proof.absent)) {
       return `cold owner ${owner} changed: ${proof.source} or absent worktree ${proof.absent}`
     }
   }

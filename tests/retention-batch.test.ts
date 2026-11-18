@@ -596,8 +596,9 @@ describe("retention retirement batch (#33010)", async () => {
     expect(readdirSync(root)).toEqual(names.slice(2))
   })
 
-  // An unprovable absence must also keep the owner live: historical namespace ancestors can be regular files.
-  it.each(["directory", "ancestor-file"])("a retained-store owner without absence proof is live (%s)", async (kind) => {
+  // A present worktree keeps the owner live. A path under a regular file cannot exist, so ENOTDIR is absence proof
+  // like ENOENT (#34920): historical namespace ancestors such as hh-dev%23main are now retirement-receipt files.
+  it.each(["directory", "ancestor-file"])("a retained-store owner's absence proof (%s)", async (kind) => {
     const names = readdirSync(root).sort()
     const entries = names.slice(0, 2).map((name) => join(root, name))
     const manifest = JSON.parse(readFileSync(join(root, names[2] as string, "manifest.json"), "utf8")) as {
@@ -618,19 +619,14 @@ describe("retention retirement batch (#33010)", async () => {
     const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined)
     try {
       const result = await retireRetainedBatch({ ...options(), entries })
-      expect(result.owners?.liveUnleased).toBeGreaterThan(0)
+      expect(result.owners?.coldProofFailedOwners).toEqual([])
+      expect(result.owners?.coldProofFailed).toBe(0)
       if (kind === "ancestor-file") {
-        expect(warning).toHaveBeenCalledWith(expect.stringContaining("ENOTDIR"))
-        const expected = (await scanEstate([fixtureRoot], [])).objectDirs
-          .filter((objects) => objects.startsWith(join(root, names[2] as string, "modules") + "/"))
-          .map(dirname)
-          .sort()
-        expect(expected).toHaveLength(2)
-        expect(result.owners?.coldProofFailedOwners).toEqual(expected)
-        expect(result.owners?.coldProofFailed).toBe(expected.length)
+        expect(warning).not.toHaveBeenCalledWith(expect.stringContaining("ENOTDIR"))
+        expect(result.owners?.liveUnleased).toBe(0)
+        expect(result.rows.map((row) => row.outcome)).toEqual(["would-retire", "would-retire"])
       } else {
-        expect(result.owners?.coldProofFailedOwners).toEqual([])
-        expect(result.owners?.coldProofFailed).toBe(0)
+        expect(result.owners?.liveUnleased).toBeGreaterThan(0)
       }
     } finally {
       warning.mockRestore()
