@@ -24,10 +24,11 @@ import { spawnSync } from "node:child_process"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
-import { afterEach, describe, expect, it } from "vitest"
+import { afterEach, describe, expect, it, type TestContext } from "vitest"
 import { runCli } from "../src/cli.ts"
 import { acquireExclusive } from "../src/exclusive.ts"
 import { acquireRemovalWriterLeases } from "../src/worktree-removal.ts"
+import { createLocalGitWorktreeStore } from "../src/worktree.ts"
 import { tryAcquireFlock } from "@bearly/flock"
 
 const roots: string[] = []
@@ -646,7 +647,10 @@ describe("git super worktree add", () => {
 
   // Retention must preserve physical payload from removable alternate donors,
   // not merely refs whose objects remain readable while those donors exist.
-  it.each([
+  // The cross-device case needs /dev/shm on another device than tmpdir. Without one it reports a named skip
+  // instead of silently leaving the table (26497, @cto finding 4).
+  const crossDevice = existsSync("/dev/shm") && statSync("/dev/shm").dev !== statSync(tmpdir()).dev
+  it.for([
     "local",
     "alternate",
     "objects-link",
@@ -657,10 +661,14 @@ describe("git super worktree add", () => {
     "invalid-graph",
     // A real cache whose checksum is wrong: `git commit-graph verify` exits 2, not 1 (26497, @cto finding 2).
     "checksum-graph",
-    ...(existsSync("/dev/shm") && statSync("/dev/shm").dev !== statSync(tmpdir()).dev ? ["cross-device"] : []),
+    "cross-device",
   ])(
     "retains complete module stores before removing a clean unlocked populated worktree; removable donor=%s",
-    async (donorKind) => {
+    { timeout: 30_000 },
+    async (donorKind: string, { skip }: TestContext) => {
+      if (donorKind === "cross-device" && !crossDevice) {
+        skip("no second device: /dev/shm is absent or shares tmpdir's device, so retention cannot cross devices")
+      }
       const removableDonor = !["local", "orphan-index", "invalid-graph", "checksum-graph"].includes(donorKind)
       const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-worktree-remove-"))
       roots.push(fixtureRoot)
@@ -865,8 +873,145 @@ describe("git super worktree add", () => {
       expect(git(rescued, ["rev-parse", "refs/heads/spare"])).toBe(spare)
       expect(git(rescued, ["show", `${spare}:dep.ts`])).toBe("export const dep = 42")
     },
-    30_000,
   )
+
+  // The same object stored under different zlib levels has one name and different bytes. Retention compares
+  // payload bytes, so it refuses rather than pick one copy (26497, @cto finding 4: a named refusal path).
+  it("refuses retention when a donor's loose object differs in bytes from the copy's own", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-worktree-retain-differs-"))
+    roots.push(fixtureRoot)
+    const fixture = createSuperproject(fixtureRoot)
+    const worktree = join(fixtureRoot, "candidate")
+    const lender = join(fixtureRoot, "lender")
+    for (const path of [worktree, lender]) {
+      expect(
+        await runCli(["--repo", fixture.product, "worktree", "add", path, "HEAD"], outputSink(), outputSink()),
+      ).toBe(0)
+    }
+    const child = join(worktree, "vendor/dep")
+    const objects = join(git(child, ["rev-parse", "--absolute-git-dir"]), "objects")
+    const donorObjects = join(git(join(lender, "vendor/dep"), ["rev-parse", "--absolute-git-dir"]), "objects")
+    const blob = join(fixtureRoot, "shared.txt")
+    writeFileSync(blob, "one object, two encodings\n")
+    // Write the copy's own object before it borrows, or hash-object finds the donor's and writes nothing.
+    const id = git(child, ["-c", "core.loosecompression=0", "hash-object", "-w", blob])
+    expect(git(join(lender, "vendor/dep"), ["-c", "core.loosecompression=9", "hash-object", "-w", blob])).toBe(id)
+    writeFileSync(join(objects, "info/alternates"), `${donorObjects}\n`)
+    const loose = (store: string): string => join(store, id.slice(0, 2), id.slice(2))
+    const own = readFileSync(loose(objects))
+    expect(own.equals(readFileSync(loose(donorObjects)))).toBe(false)
+
+    const retained = join(fixtureRoot, "retained")
+    const out = outputSink()
+    expect(
+      await runCli(
+        ["--repo", fixture.product, "--json", "worktree", "remove", worktree, "--retain", retained],
+        out,
+        outputSink(),
+      ),
+    ).toBe(2)
+    expect(out.output).toContain(`differs from donor ${loose(donorObjects)}; worktree preserved`)
+    expect(existsSync(worktree)).toBe(true)
+    expect(readFileSync(loose(objects)).equals(own)).toBe(true)
+    expect(git(fixture.product, ["worktree", "list", "--porcelain"])).toContain(worktree)
+  })
+
+  // A writer that lands in the source store after the copy was compared, while donor payload is being retained,
+  // is caught by the final source manifest (26497, @cto finding 4: 9c4f86a1:2033). The removal's own time-budget
+  // callback is the seam: it fires on every metadata step, and writes once the copy holds the donor's object.
+  it("refuses retention when the source store changes after donor payload is retained", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-worktree-retain-late-"))
+    roots.push(fixtureRoot)
+    const fixture = createSuperproject(fixtureRoot)
+    const worktree = join(fixtureRoot, "candidate")
+    const lender = join(fixtureRoot, "lender")
+    for (const path of [worktree, lender]) {
+      expect(
+        await runCli(["--repo", fixture.product, "worktree", "add", path, "HEAD"], outputSink(), outputSink()),
+      ).toBe(0)
+    }
+    const child = join(worktree, "vendor/dep")
+    const source = git(child, ["rev-parse", "--absolute-git-dir"])
+    const donorObjects = join(git(join(lender, "vendor/dep"), ["rev-parse", "--absolute-git-dir"]), "objects")
+    writeFileSync(join(source, "objects/info/alternates"), `${donorObjects}\n`)
+    const blob = join(fixtureRoot, "donor-only.txt")
+    writeFileSync(blob, "only the donor holds this object\n")
+    const id = git(join(lender, "vendor/dep"), ["hash-object", "-w", blob])
+    const donorObject = `${id.slice(0, 2)}/${id.slice(2)}`
+    const retained = join(fixtureRoot, "retained")
+    const late = join(source, "refs/heads/late-writer")
+    let wrote = false
+    const store = createLocalGitWorktreeStore({
+      repo: fixture.product,
+      remainingMs: () => {
+        if (
+          !wrote &&
+          existsSync(retained) &&
+          readdirSync(retained, { recursive: true }).some((entry) => String(entry).endsWith(donorObject))
+        ) {
+          wrote = true
+          writeFileSync(late, `${fixture.pin}\n`)
+        }
+        return 60_000
+      },
+    })
+    await expect(store.remove(worktree, { retention: { root: retained, report: () => {} } })).rejects.toThrow(
+      `Git store ${join(source, "../..")} changed during retention; worktree preserved`,
+    )
+    expect(wrote).toBe(true)
+    expect(existsSync(worktree)).toBe(true)
+    expect(readFileSync(late, "utf8")).toBe(`${fixture.pin}\n`)
+    expect(git(fixture.product, ["worktree", "list", "--porcelain"])).toContain(worktree)
+  })
+
+  // A copy that fails `git fsck` is refused before anything is removed (26497, @cto finding 4: 9c4f86a1:1505).
+  it("refuses retention when the copied store fails fsck", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-worktree-retain-fsck-"))
+    roots.push(fixtureRoot)
+    const fixture = createSuperproject(fixtureRoot)
+    const worktree = join(fixtureRoot, "candidate")
+    expect(
+      await runCli(["--repo", fixture.product, "worktree", "add", worktree, "HEAD"], outputSink(), outputSink()),
+    ).toBe(0)
+    const child = join(worktree, "vendor/dep")
+    const source = git(child, ["rev-parse", "--absolute-git-dir"])
+    const blobFile = join(fixtureRoot, "lost.txt")
+    writeFileSync(blobFile, "this blob goes missing\n")
+    const blob = git(child, ["hash-object", "-w", blobFile])
+    const mktree = spawnSync("git", ["-C", child, "mktree"], {
+      input: `100644 blob ${blob}\tlost.txt\n`,
+      encoding: "utf8",
+      env: environment,
+    })
+    expect(mktree.status, mktree.stderr).toBe(0)
+    const lost = git(child, ["commit-tree", mktree.stdout.trim(), "-m", "names a lost blob"])
+    git(child, ["update-ref", "refs/heads/lost", lost])
+    unlinkSync(join(source, "objects", blob.slice(0, 2), blob.slice(2)))
+
+    const out = outputSink()
+    expect(
+      await runCli(
+        [
+          "--repo",
+          fixture.product,
+          "--json",
+          "worktree",
+          "remove",
+          worktree,
+          "--retain",
+          join(fixtureRoot, "retained"),
+        ],
+        out,
+        outputSink(),
+      ),
+    ).toBe(2)
+    // The copy's own fsck names the lost blob; the source-side custody scan would say "witness store".
+    expect(out.output).toContain(`missing blob ${blob}`)
+    expect(out.output).not.toContain("witness store")
+    expect(existsSync(worktree)).toBe(true)
+    expect(git(child, ["rev-parse", "refs/heads/lost"])).toBe(lost)
+    expect(git(fixture.product, ["worktree", "list", "--porcelain"])).toContain(worktree)
+  })
 
   it("refuses removal when the retention destination cannot be written", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-worktree-retain-fail-"))

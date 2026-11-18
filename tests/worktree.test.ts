@@ -679,6 +679,53 @@ describe("createGitWorktreeStore", () => {
   })
 
   /**
+   * @failure Destroyed-checkout recovery keeps a child store that still borrows from a removable donor, so the
+   * retained copy loses objects when that donor goes (26497, @cto finding 4).
+   * @level l1
+   * @consumer Candidate and integration-root orphan lifecycle
+   * @testonly none
+   */
+  it("retains a destroyed checkout's child payload that lives only in a removable donor", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-destroyed-donor-"))
+    try {
+      const fixture = createProductFixture(root)
+      const store = createLocalGitWorktreeStore({ repo: fixture.product })
+      const { linked, moduleDir, objects } = await addAlphaWorktree(store, root, "destroyed")
+      const lender = await addAlphaWorktree(store, root, "lender")
+      await writeFile(join(objects, "info/alternates"), `${lender.objects}\n`)
+      const author = join(lender.linked, "packages/alpha")
+      git(author, ["checkout", "-qb", "donor-only"])
+      await writeFile(join(author, "donor.txt"), "only the removable donor holds these bytes\n")
+      git(author, ["add", "donor.txt"])
+      git(author, ["commit", "-qm", "donor-only custody"])
+      const tip = git(author, ["rev-parse", "HEAD"]).trim()
+      git(join(linked, "packages/alpha"), ["update-ref", "refs/heads/borrowed", tip])
+      const admin = git(linked, ["rev-parse", "--absolute-git-dir"]).trim()
+      await rename(linked, `${linked}-moved`)
+      let retainedChild: string | undefined
+      await store.recoverDestroyed(linked, "recover destroyed checkout with a removable donor", {
+        root: join(root, "retained"),
+        report(proof: WorktreeRemovalProof) {
+          retainedChild = join(proof.retained!, relative(join(admin, "modules"), moduleDir))
+        },
+      })
+      expect(await store.inspect(linked)).toEqual({ registered: false })
+      if (retainedChild === undefined) throw new Error("recovery published no retention proof")
+      // The donor goes; the retained copy must still read the commit and its blob by itself.
+      await rename(lender.objects, `${lender.objects}-gone`)
+      const read = (...args: string[]): string =>
+        git(fixture.product, ["--git-dir", retainedChild!, "--work-tree", fixture.product, ...args])
+      expect(read("rev-parse", "refs/heads/borrowed").trim()).toBe(tip)
+      expect(read("show", `${tip}:donor.txt`)).toBe("only the removable donor holds these bytes\n")
+      const alternates = join(retainedChild, "objects/info/alternates")
+      expect(existsSync(alternates) ? readFileSync(alternates, "utf8") : "").not.toContain(lender.objects)
+    } finally {
+      // raw-delete-allow: root is this test's fresh mkdtemp fixture, never a caller-supplied worktree.
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  /**
    * @failure Destroyed-checkout recovery erases unique historical child data or releases its hold before custody (#29385).
    * @level l1
    * @consumer Candidate and integration-root orphan lifecycle
