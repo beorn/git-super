@@ -1556,6 +1556,38 @@ function retainedAlternatesDependency(
   return linkedDependency
 }
 
+/**
+ * The private root's native common directory objects: the root store's attested first alternate, or undefined when
+ * it borrows nothing. Child mounts alone never turn an arbitrary external path into custody. Lineage is post-order,
+ * so its first entry is the root's first alternate only while that common borrows no objects itself (26497): refuse
+ * by that name otherwise.
+ */
+function rootCommonObjects(objects: string, readOnlyMounts: readonly string[]): string | undefined {
+  const assumption =
+    "retention takes the root store's first alternate as its native common directory, which holds only while that common borrows no objects"
+  let firstAlternate: string | undefined
+  const lineage = alternatesLineageSync(
+    [objects],
+    "",
+    { allowedObjects: new Set([objects, ...readOnlyMounts]) },
+    {
+      strictReads: true,
+      onEdge: (store, target) => {
+        if (store === objects) firstAlternate ??= target
+      },
+      // With an object-store policy, a missing alternate already throws while it is validated.
+      onDangling: (_store, target) => {
+        throw new Error(`dangling alternate object store: ${target}`)
+      },
+    },
+  )
+  const rootDonor = lineage[0]
+  if (rootDonor !== firstAlternate) {
+    throw new Error(`${assumption}: ${firstAlternate ?? "(none)"} borrows from ${rootDonor}; worktree preserved`)
+  }
+  return rootDonor
+}
+
 /** Copy only physically local Git payload; never follow donor alternates or copy derived caches. */
 async function retainPhysicalObjects(source: string, destination: string): Promise<void> {
   const retain = async (from: string, to: string): Promise<void> => {
@@ -2258,37 +2290,10 @@ async function prepareResolvedWorktreeModules(context: {
     if (retained !== null) {
       let borrowingCommon = common
       if (privateProjection !== undefined) {
-        const objects = join(gitDir, "objects")
-        // The root's attested lineage identifies its native common directory, and child mounts alone never turn an
-        // arbitrary external path into custody. Lineage is post-order, so its first entry is the root's first
-        // alternate only while that common borrows no objects itself (26497): refuse by that name otherwise.
-        const assumption =
-          "retention takes the root store's first alternate as its native common directory, which holds only while that common borrows no objects"
-        let firstAlternate: string | undefined
-        const lineage = alternatesLineageSync(
-          [objects],
-          "",
-          {
-            allowedObjects: new Set([
-              objects,
-              ...privateProjection.mounts.filter((mount) => mount.mode === "ro").map((mount) => mount.source),
-            ]),
-          },
-          {
-            strictReads: true,
-            onEdge: (store, target) => {
-              if (store === objects) firstAlternate ??= target
-            },
-            // With an object-store policy, a missing alternate already throws while it is validated.
-            onDangling: (_store, target) => {
-              throw new Error(`dangling alternate object store: ${target}`)
-            },
-          },
+        const rootDonor = rootCommonObjects(
+          join(gitDir, "objects"),
+          privateProjection.mounts.filter((mount) => mount.mode === "ro").map((mount) => mount.source),
         )
-        const rootDonor = lineage[0]
-        if (rootDonor !== firstAlternate) {
-          throw new Error(`${assumption}: ${firstAlternate ?? "(none)"} borrows from ${rootDonor}; worktree preserved`)
-        }
         if (rootDonor !== undefined) {
           borrowingCommon = realpathSync(
             await git.text(copiedCheckout, [
@@ -2450,11 +2455,6 @@ async function prepareResolvedWorktreeModules(context: {
           `${JSON.stringify({ ...proof, files: finalRetainedManifest.files, entries: finalRetainedManifest.entries, externalObjectStores: finalRetainedManifest.externalObjectStores }, null, 2)}\n`,
           { flag: "wx" },
         )
-        // A private projection never registers here: its source custody check is skipped (linkedDependency is false)
-        // and its borrowed read-only mounts register each lender below (26497).
-        if (retained !== null && finalRetainedManifest.externalObjectStores.length > 0) {
-          registerRetainedBorrower(common, retained, proof.manifest)
-        }
         if (retained !== null && privateProjection !== undefined) {
           for (const mount of privateProjection.mounts.filter(
             (mount) => mount.mode === "ro" && retainedBorrowing.has(mount.source),
