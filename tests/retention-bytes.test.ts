@@ -10,7 +10,8 @@ import { chmodSync, linkSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFil
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, test } from "vitest"
-import { formatRetainedBytes, measureRetainedBytes } from "../src/retention-bytes.ts"
+import { formatRetainedBytes, measureRetainedBytes, rankRetainedEntries } from "../src/retention-bytes.ts"
+import { runCli } from "../src/cli.ts"
 
 const cleanup: string[] = []
 afterEach(() => {
@@ -117,5 +118,129 @@ describe("retained bytes (#34270)", async () => {
     // Removing the store frees nothing of that inode: the outside link keeps the bytes alive.
     expect(measured.bytes).toBe(directories)
     expect(measured.sharedBytes).toBe(inode.blocks * 512)
+  })
+})
+
+// Accepted requirement (#34920, @cto 34920-ranking-and-bare-r2 §1): Yrd plans a size-ranked batch from one
+// measurement per entry. Existing tests measure one aggregate set; none rank, none cover an entry missing or replaced
+// around its walk (the walker reads ENOENT as zero), and none bound the loop.
+describe("retained entry ranking (#34920)", async () => {
+  function entries(sizes: Record<string, number>): { root: string; paths: Record<string, string> } {
+    const root = tmp("git-super-rank-")
+    const paths: Record<string, string> = {}
+    for (const [name, size] of Object.entries(sizes)) {
+      const entry = join(root, name)
+      mkdirSync(entry, { recursive: true })
+      writeFileSync(join(entry, "pack"), "x".repeat(size))
+      paths[name] = entry
+    }
+    return { root, paths }
+  }
+
+  test("orders entries by own bytes, largest first, with the entry path breaking ties", async () => {
+    const { paths } = entries({ small: 10, large: 300_000, mid: 60_000, tie: 60_000 })
+    const ranking = await rankRetainedEntries(Object.values(paths), { deadlineMs: 60_000 })
+    expect(ranking.ranked.map((row) => row.entry)).toEqual([paths.large, paths.mid, paths.tie, paths.small])
+    expect(ranking.unmeasured).toEqual([])
+    expect(ranking.partial).toBe(false)
+    expect(ranking.measuredBytes).toBe(ranking.ranked.reduce((sum, row) => sum + row.bytes, 0))
+  })
+
+  test("a file hard-linked across two entries counts in neither's own bytes and in both shared bytes", async () => {
+    const { paths } = entries({ a: 10, b: 10 })
+    writeFileSync(join(paths.a!, "shared"), "y".repeat(200_000))
+    linkSync(join(paths.a!, "shared"), join(paths.b!, "shared"))
+    const shared = statSync(join(paths.a!, "shared")).blocks * 512
+    const ranking = await rankRetainedEntries([paths.a!, paths.b!], { deadlineMs: 60_000 })
+    for (const row of ranking.ranked) {
+      expect(row.sharedBytes).toBe(shared)
+      expect(row.bytes).toBeLessThan(shared)
+    }
+    // The set reclaims the shared inode too: exclusive scores sum to less than the union, never more.
+    const union = await measureRetainedBytes([paths.a!, paths.b!])
+    expect(ranking.measuredBytes).toBeLessThan(union.bytes)
+  })
+
+  test("an absent entry, or one that disappears or is replaced during its walk, is unmeasured, never ranked zero", async () => {
+    const { root, paths } = entries({ kept: 10, gone: 10, vanishing: 10, swapped: 10 })
+    rmSync(paths.gone!, { recursive: true })
+    const ranking = await rankRetainedEntries(Object.values(paths), {
+      deadlineMs: 60_000,
+      measure: async (roots) => {
+        const measured = await measureRetainedBytes(roots)
+        if (roots[0] === paths.vanishing) rmSync(paths.vanishing!, { recursive: true })
+        if (roots[0] === paths.swapped) {
+          rmSync(paths.swapped!, { recursive: true })
+          mkdirSync(join(root, "elsewhere"))
+          mkdirSync(paths.swapped!)
+        }
+        return measured
+      },
+    })
+    expect(ranking.ranked.map((row) => row.entry)).toEqual([paths.kept])
+    expect(ranking.unmeasured).toEqual(
+      expect.arrayContaining([
+        { entry: paths.gone, reason: "absent" },
+        { entry: paths.vanishing, reason: "disappeared" },
+        { entry: paths.swapped, reason: "replaced" },
+      ]),
+    )
+    expect(ranking.partial).toBe(true)
+  })
+
+  test("the soft deadline keeps what was measured and lists every remaining entry as unmeasured", async () => {
+    const { paths } = entries({ a: 10, b: 10, c: 10 })
+    let now = 0
+    const ranking = await rankRetainedEntries(Object.values(paths), {
+      deadlineMs: 5,
+      monotonic: () => now,
+      measure: async (roots) => {
+        now += 10
+        return measureRetainedBytes(roots)
+      },
+    })
+    expect(ranking.deadlineHit).toBe(true)
+    expect(ranking.partial).toBe(true)
+    expect(ranking.ranked.map((row) => row.entry)).toEqual([paths.a])
+    expect(ranking.unmeasured).toEqual([
+      { entry: paths.b, reason: "deadline" },
+      { entry: paths.c, reason: "deadline" },
+    ])
+  })
+
+  function sinkInto(lines: string[]): { write(chunk: string): boolean } {
+    return {
+      write(chunk: string): boolean {
+        lines.push(chunk)
+        return true
+      },
+    }
+  }
+
+  test("the CLI mode prints its own JSON result, keeps the batch path scope, and refuses --apply", async () => {
+    const { root, paths } = entries({ big: 200_000, small: 10 })
+    const required = ["--common", root, "--artifact-dir", join(root, "artifacts"), "--namespace", root]
+    const out: string[] = []
+    const err: string[] = []
+    const base = ["--json", "worktree", "retention", "retire-batch", "--rank-only", "--root", root, ...required]
+    expect(await runCli([...base, paths.small!, paths.big!, join(root, "missing")], sinkInto(out), sinkInto(err))).toBe(
+      0,
+    )
+    const ranking = JSON.parse(out.join("")) as { ranked: { entry: string }[]; unmeasured: unknown[] }
+    expect(ranking.ranked.map((row) => row.entry)).toEqual([paths.big, paths.small])
+    expect(ranking.unmeasured).toEqual([{ entry: join(root, "missing"), reason: "absent" }])
+
+    const outside = join(tmp("git-super-rank-outside-"), "entry")
+    mkdirSync(outside)
+    const scopeErr: string[] = []
+    expect(await runCli([...base, outside], sinkInto([]), sinkInto(scopeErr))).not.toBe(0)
+    expect(scopeErr.join("")).toContain("is not a direct child of")
+
+    const applyErr: string[] = []
+    expect(await runCli([...base, "--apply", paths.big!], sinkInto([]), sinkInto(applyErr))).not.toBe(0)
+    expect(applyErr.join("")).toContain("refuses --apply")
+
+    const emptyErr: string[] = []
+    expect(await runCli([...base, join(root, "missing")], sinkInto([]), sinkInto(emptyErr))).toBe(2)
   })
 })

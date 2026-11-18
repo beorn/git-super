@@ -13,7 +13,7 @@ import { superPull, type SuperPullOptions } from "./pull.ts"
 import { superPush, type SuperPushOptions } from "./push.ts"
 import type { GitSuperResult } from "./result.ts"
 import { shellQuote } from "./shell-command.ts"
-import { isAbsolute, join } from "node:path"
+import { basename, dirname, isAbsolute, join, resolve } from "node:path"
 import { repositoryRoot } from "./git.ts"
 import { ensureCommitObject } from "./objects.ts"
 import { superStatus, type SuperStatusOptions, type SuperStatusResult } from "./status.ts"
@@ -39,6 +39,8 @@ import { verifyRetainedEntry, type RetentionVerifyOptions, type RetentionVerifyR
 import { auditRetainedEntry, retireRetainedEntry, type RetentionRetireOptions } from "./retention-remove.ts"
 import { compactRetainedRoot, type CompactRetainedRootReport } from "./retention-compact.ts"
 import { retireRetainedBatch, type RetentionBatchOptions, type RetentionBatchResult } from "./retention-batch.ts"
+import { rankRetainedEntries, type RetainedRanking } from "./retention-bytes.ts"
+import { existsSync, realpathSync } from "node:fs"
 import { superWorktreeRemove, type SuperWorktreeRemoveOptions } from "./worktree-remove.ts"
 
 export type CommandContext = Readonly<{ repo: string; report?: (message: string) => void }>
@@ -60,6 +62,7 @@ export type RetentionBatchParams = Pick<
   RetentionBatchOptions,
   "entries" | "root" | "common" | "namespaceRoots" | "artifactDir" | "apply"
 >
+export type RetentionRankParams = Readonly<{ entries: readonly string[]; root: string; deadlineMs: number }>
 export type PrivateStoreVerifyParams = Omit<PrivateStoreCandidateOptions, "git">
 export type PrivateStoreVerifyNode = CommandNode<CommandContext, PrivateStoreVerifyParams, PrivateStoreCandidateResult>
 
@@ -486,6 +489,39 @@ const retentionBatch = commandNode<CommandContext, RetentionBatchParams, Retenti
     }
   }),
   run: (_context, input) => retireRetainedBatch(input),
+})
+
+/**
+ * `retire-batch --rank-only` (#34920, @cto 34920-ranking-and-bare-r2 §1): measure the named entries and order them by
+ * the bytes each holds alone. A mode of the retire-batch verb, deliberately outside the command tree: it runs no scan,
+ * gates, leases or certificates, writes nothing, and its only consumer is Yrd's retained-drain planning.
+ */
+export const retentionRank = commandNode<CommandContext, RetentionRankParams, RetainedRanking>({
+  title: "Rank selected retained entries by the bytes each holds alone",
+  description: "Measures each entry with the retained-bytes walker; scans, proves, leases and deletes nothing.",
+  params: params((value) => {
+    const input = record(value)
+    const entries = stringArray(input.entries, "entries")
+    if (entries.length === 0) throw new Error("retire-batch --rank-only requires at least one selected entry")
+    if (typeof input.root !== "string" || input.root === "") throw new Error("retire-batch --rank-only requires --root")
+    if (typeof input.deadlineMs !== "number" || !Number.isFinite(input.deadlineMs) || input.deadlineMs <= 0) {
+      throw new Error("retire-batch --rank-only requires a positive deadline")
+    }
+    // The batch's own path scope, kept in rank mode: every entry is a direct child of the declared root. An absent
+    // entry is checked through its parent's real path, so it is reported unmeasured rather than refused here.
+    const root = realpathSync(input.root)
+    const scoped = entries.map((entry) => {
+      const resolved = resolve(entry)
+      const real = existsSync(resolved)
+        ? realpathSync(resolved)
+        : join(realpathSync(dirname(resolved)), basename(resolved))
+      if (dirname(real) !== root) throw new Error(`batch entry ${real} is not a direct child of ${root}`)
+      return real
+    })
+    if (new Set(scoped).size !== scoped.length) throw new Error("batch names an entry twice")
+    return { entries: scoped, root, deadlineMs: input.deadlineMs }
+  }),
+  run: (_context, input) => rankRetainedEntries(input.entries, { deadlineMs: input.deadlineMs }),
 })
 
 const retentionAudit = commandNode<CommandContext, RetentionRetireParams, GitSuperResult>({

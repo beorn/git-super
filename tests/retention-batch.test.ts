@@ -24,7 +24,7 @@ import {
   writeFileSync,
 } from "node:fs"
 import { tmpdir } from "node:os"
-import { dirname, join } from "node:path"
+import { basename, dirname, join } from "node:path"
 import { tryAcquireFlock } from "@bearly/flock"
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest"
 import { runCli } from "../src/cli.ts"
@@ -232,6 +232,22 @@ describe("retention retirement batch (#33010)", async () => {
     expect(result.bytesPlanned).toBe(planned)
     // Allocated blocks, not apparent size: the fixture holds directories whose size field is well under their blocks.
     expect(result.bytesPlanned).toBeGreaterThan(planned === 0 ? -1 : 0)
+    // #34920: the receipts this batch wrote are reported beside the reclaim figure, measured, not estimated.
+    // Each inode once: the batch hard-links shared certificate files between the common folder and entries.
+    const inodes = new Map<string, number>()
+    const walk = (path: string): void => {
+      const stat = lstatSync(path)
+      inodes.set(`${stat.dev}:${stat.ino}`, stat.blocks * 512)
+      if (stat.isDirectory()) for (const name of readdirSync(path)) walk(join(path, name))
+    }
+    const evidencePaths = [
+      ...result.rows.map((row) => join(plan.artifactDir, basename(row.entry))),
+      join(plan.artifactDir, "common"),
+    ]
+    for (const path of evidencePaths) if (existsSync(path)) walk(path)
+    const evidence = [...inodes.values()].reduce((total, bytes) => total + bytes, 0)
+    expect(result.bytesEvidence).toBe(evidence)
+    expect(result.bytesEvidence).toBeGreaterThan(0)
   })
 
   // CTO cbd8921c: after successful deletion, an external pointer cleanup failure must say both that the entry
