@@ -24,7 +24,7 @@ import {
   writeFileSync,
 } from "node:fs"
 import { tmpdir } from "node:os"
-import { dirname, join } from "node:path"
+import { dirname, join, relative } from "node:path"
 import { tryAcquireFlock } from "@bearly/flock"
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest"
 import { runCli } from "../src/cli.ts"
@@ -430,6 +430,47 @@ describe("retention retirement batch (#33010)", async () => {
     expect(readdirSync(root)).toHaveLength(3)
     expect(result.windows).toEqual([])
   })
+
+  // Accepted requirement (#34920, @cto 34920-ranking-and-bare-r2 §2): a retained store whose config still names
+  // its removed checkout (production: "../../../../../../var/wt/<env>/ag") is read as a detached store by every
+  // gate, so the batch retires it instead of refusing at candidate contents on "cannot chdir". The existing
+  // tests miss it because the fixture's module stores record no core.worktree.
+  it.each([false, true])(
+    "retires a store whose core.worktree names its removed checkout through every gate (apply %s)",
+    async (apply) => {
+      const checkout = join(fixtureRoot, "worktree-recorded")
+      const previous = readdirSync(root).map((name) => join(root, name))
+      expect(await runCli(["--repo", dirname(common), "worktree", "add", checkout, "HEAD"], sink(), sink())).toBe(0)
+      const store = join(common, "worktrees", "worktree-recorded", "modules", "vendor", "dep")
+      expect(existsSync(join(store, "config")), `module store at ${store}`).toBe(true)
+      // Recorded before retention, as git records it for a live checkout: relative to the store, through
+      // directories the removal deletes.
+      git(fixtureRoot, [
+        "config",
+        "--file",
+        join(store, "config"),
+        "core.worktree",
+        relative(store, join(checkout, "vendor", "dep")),
+      ])
+      expect(
+        await runCli(["--repo", dirname(common), "worktree", "remove", checkout, "--retain", root], sink(), sink()),
+      ).toBe(0)
+      const entry = readdirSync(root)
+        .map((name) => join(root, name))
+        .find((candidate) => !previous.includes(candidate)) as string
+      expect(readFileSync(join(entry, "modules", "vendor", "dep", "config"), "utf8")).toContain("worktree = ")
+      const manifest = JSON.parse(readFileSync(join(entry, "manifest.json"), "utf8")) as { retainUntil: string }
+      const result = await retireRetainedBatch(
+        options({ entries: [entry], apply, clock: new Date(Date.parse(manifest.retainUntil) + 1000) }),
+      )
+      expect(JSON.stringify(result)).not.toContain("cannot chdir")
+      expect(result.stopped, JSON.stringify(result.rows)).toBeUndefined()
+      expect(
+        result.rows.map((row) => row.outcome),
+        JSON.stringify(result.rows),
+      ).toEqual([apply ? "retired" : "would-retire"])
+    },
+  )
 
   it("apply retires every candidate in one measured lease window after an unchanged delta", async () => {
     const result = await retireRetainedBatch(options({ apply: true }))

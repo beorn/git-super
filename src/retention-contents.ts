@@ -304,9 +304,18 @@ async function* rootOidLines(
     readonly deadline: number | undefined
     readonly clock: () => number
     readonly maxEffectiveOids: number
+    /**
+     * Read the gitdir as a detached store: a retained copy still records `core.worktree` for the checkout
+     * its removal deleted, and plain `--git-dir` dies on chdir to that missing path ("cannot chdir"), so
+     * gate 4 refused stores it could read (#34920, @cto 34920-ranking-and-bare-r2 §2). `--bare` selects the
+     * command context only: it rewrites no config and keeps the `core.worktree` evidence. Same seam as
+     * retention-compact's runAtGitDir.
+     */
+    readonly detached: boolean
   },
 ): AsyncGenerator<string> {
-  const refs = await run([`--git-dir=${gitDir}`, "for-each-ref", "--format=%(objectname) %(refname)"])
+  const at = options.detached ? ["--bare", `--git-dir=${gitDir}`] : [`--git-dir=${gitDir}`]
+  const refs = await run([...at, "for-each-ref", "--format=%(objectname) %(refname)"])
   refuseSuccessfulStderr(refs, `for-each-ref in ${gitDir}`)
   if (refs.code !== 0) throw new UnknownError(`for-each-ref failed in ${gitDir}: ${refs.stderr.trim()}`)
   for (const line of refs.stdout.split("\n")) {
@@ -318,7 +327,7 @@ async function* rootOidLines(
     if (name?.startsWith(REMOTE_TRACKING_REFS)) continue
     if (!ZERO_OID.test(oid)) yield `${oid}\tref ${name ?? ""}`.trimEnd()
   }
-  const head = await run([`--git-dir=${gitDir}`, "rev-parse", "HEAD"])
+  const head = await run([...at, "rev-parse", "HEAD"])
   refuseSuccessfulStderr(head, `rev-parse HEAD in ${gitDir}`)
   if (head.code === 0) {
     const oid = head.stdout.trim()
@@ -361,7 +370,7 @@ async function* rootOidLines(
     }
     for (const oid of found) yield `${oid}\tpseudo-ref ${name}`
   }
-  const index = await run([`--git-dir=${gitDir}`, "ls-files", "--stage"])
+  const index = await run([...at, "ls-files", "--stage"])
   refuseSuccessfulStderr(index, `ls-files --stage in ${gitDir}`)
   if (index.code === 0) {
     for (const line of index.stdout.split("\n")) {
@@ -440,6 +449,9 @@ async function scanComponentGitDir(
       deadline,
       clock,
       maxEffectiveOids: bounds.maxEffectiveOids,
+      // Retention mode reads retained copies, whose checkout is gone; complete-commit mode reads live
+      // environment stores during removal and keeps its context unchanged.
+      detached: sourceMode === "retention",
     }),
     {
       dir: sidecarDir,

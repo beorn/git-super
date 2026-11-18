@@ -7,7 +7,7 @@
  * @reach fs-walk <fixture-only: every case builds an mkdtempSync(tmpdir()) Git repo; no repository source tree is walked>
  * @testonly none
  */
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { spawnSync } from "node:child_process"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -159,6 +159,43 @@ describe("retention contents scan — gate 4 (#27443(b))", () => {
     expect(component.atRisk).toBe(rows.length)
   })
 
+  /**
+   * @failure A retained store whose config still names its removed checkout (core.worktree) fails every root read with
+   * "cannot chdir", so gate 4 refuses stores it could read (#34920, @cto 34920-ranking-and-bare-r2 §2).
+   * @level l2
+   * @consumer retire-batch gate 4 on Yrd retained module stores
+   */
+  test("a store whose core.worktree names a removed checkout reads the same roots as before the removal", async () => {
+    const { root, gitDir, head } = repoWithCommit("git-super-contents-detached-")
+    const blob = hashObject(root, "unique-bytes\n")
+    const before = await scan(root, componentEntries(".git"))
+    expect(before.status).toBe("pass")
+    const beforeRows = await atRiskOf(before)
+    // Relative and through missing parents, as the production stores record it ("../../../../../../var/wt/<env>/ag"):
+    // a missing LEAF under an existing parent is tolerated by git and would not reproduce the refusal.
+    const gone = "../../removed-env/nested/checkout"
+    git(root, ["config", "--file", join(gitDir, "config"), "core.worktree", gone])
+    const after = await scan(root, componentEntries(".git"))
+    expect(after.detail ?? "").not.toContain("cannot chdir")
+    expect(after.status).toBe("pass")
+    expect(after.components[0]!.missingRoots).toBe(before.components[0]!.missingRoots)
+    expect(after.components[0]!.atRisk).toBe(before.components[0]!.atRisk)
+    expect(await atRiskOf(after)).toEqual(beforeRows)
+    expect(beforeRows.map((row) => row.oid)).toContain(blob)
+    // The context fix rewrites no config: the core.worktree evidence is still recorded.
+    expect(readFileSync(join(gitDir, "config"), "utf8")).toContain(`worktree = ${gone}`)
+    expect(head).toMatch(/^[0-9a-f]{40}$/)
+  })
+  test("a detached store that lost a root object stays blocked, not passed, after the context fix", async () => {
+    const { root, gitDir } = repoWithCommit("git-super-contents-detached-lost-")
+    const lost = hashObject(root, "index-only-root\n")
+    git(root, ["update-index", "--add", "--cacheinfo", `100644,${lost},only-in-index.txt`])
+    rmSync(join(gitDir, "objects", lost.slice(0, 2), lost.slice(2)))
+    git(root, ["config", "--file", join(gitDir, "config"), "core.worktree", "../../removed-env/nested/checkout"])
+    const result = await scan(root, componentEntries(".git"))
+    expect(result.detail ?? "").not.toContain("cannot chdir")
+    expect(result.status).toBe("blocked")
+  })
   test("a packed-only OID survives a repack and is still enumerated", async () => {
     const { root } = repoWithCommit("git-super-contents-")
     const blob = hashObject(root, "packed-bytes\n")
