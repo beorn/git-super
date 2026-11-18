@@ -868,6 +868,9 @@ export function admitOnRemoteSelections(status: SuperStatusResult): SuperStatusR
   const onRemote = [...(status.onRemote ?? [])]
   const offRemote: { record: string; reason: string }[] = []
   const records: string[] = []
+  // #34883: the answer is the component's, not the record's, and each read is a synchronous `git status` of the
+  // whole component. Read it once per component: per record, 19,459 dirty files held yrd's event loop ~5 min.
+  const selections = new Map<string, ReturnType<typeof componentSelectionOnRemote>>()
   for (const record of status.records) {
     const path = record.slice(3)
     const component = status.consultedRepositories
@@ -875,7 +878,11 @@ export function admitOnRemoteSelections(status: SuperStatusResult): SuperStatusR
       .sort((left, right) => right.path.length - left.path.length)[0]
     const parent = status.consultedRepositories.find((entry) => entry.path === ".")
     if (component !== undefined && component.path !== "." && parent !== undefined) {
-      const selection = componentSelectionOnRemote(parent.root, component.path, component.root)
+      let selection = selections.get(component.root)
+      if (selection === undefined) {
+        selection = componentSelectionOnRemote(parent.root, component.path, component.root)
+        selections.set(component.root, selection)
+      }
       if (selection.onRemote) {
         // 33315: the receipt names the admitted pin move (committed -> staged), so it can be restored from it.
         const label = `on-remote ${component.path} ${selection.headPin} -> ${selection.indexPin}`
