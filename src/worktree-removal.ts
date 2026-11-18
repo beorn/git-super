@@ -901,11 +901,25 @@ async function admitDirtyStore(
   records: readonly string[],
   preserved: readonly string[],
   component: boolean,
+  retainsStore: RetainsStore | undefined,
 ): Promise<void> {
   if (records.length === 0) return
   for (const ref of preserved) {
     const resolved = await git.optionalText(store, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`])
     if (resolved !== undefined && resolved !== "") return
+  }
+  // 34787 (@cto 34787-component-retention-ruling): with no component-custody proof requested, a component whose own
+  // index and worktree are clean holds its selection in its HEAD. When its store is one the retained copy holds, or
+  // one the removal never deletes, that copy (verified before any native mutation) or the store itself keeps the HEAD
+  // and its history, so remote ancestry alone no longer blocks it. An embedded store the removal deletes and the copy
+  // does not hold falls through to the on-target proof (peer @dev/5 r1). Its own changes still block.
+  if (
+    component &&
+    retainsStore !== undefined &&
+    !(await componentHasOwnChanges(git, store)) &&
+    (await retainsStore(store))
+  ) {
+    return
   }
   const offTarget = component ? await componentOffTarget(git, store) : undefined
   if (component && offTarget === undefined) return
@@ -922,9 +936,25 @@ async function admitDirtyStore(
  * clean against HEAD, and HEAD is an ancestor of its remote's default-branch remote-tracking ref. A stale
  * tracking ref fails closed; the cure is to fetch the component.
  */
+/**
+ * 34787: whether a component checkout's store survives the removal: its absolute git dir lies in the set the retained
+ * copy holds, or outside both the checkout and its admin dir, which the native removal deletes. Unreadable is false.
+ */
+type RetainsStore = (componentRoot: string) => Promise<boolean>
+
+async function componentHasOwnChanges(git: Git, store: string): Promise<boolean> {
+  const own = await git.run(store, [
+    "--no-optional-locks",
+    "status",
+    "--porcelain",
+    "--untracked-files=all",
+    "--ignore-submodules=none",
+  ])
+  return own.stdout.trim() !== ""
+}
+
 async function componentOffTarget(git: Git, store: string): Promise<string | undefined> {
-  const own = await git.run(store, ["--no-optional-locks", "status", "--porcelain", "--untracked-files=all"])
-  if (own.stdout.trim() !== "") return "its own index or worktree has changes"
+  if (await componentHasOwnChanges(git, store)) return "its own index or worktree has changes"
   const remote = storeRemote(await git.text(store, ["rev-parse", "--absolute-git-dir"]))
   if (remote === undefined) return "it has no remote"
   const defaultRef = `refs/remotes/${remote}/HEAD`
@@ -949,6 +979,8 @@ async function cleanSnapshot(
   inspect: (repository: string, path: string) => Promise<WorktreeInspection>,
   excludedSubmodules: readonly string[] = [],
   preserved: readonly string[] = [],
+  /** 34787: with no component-custody proof requested, a clean moved selection whose store survives is admitted. */
+  retainsStore?: RetainsStore,
 ): Promise<readonly Readonly<{ path: string; head: string }>[]> {
   const status = await inspectRemovalStatusWithGit(git, path, excludedSubmodules)
   // 29073: attribute every dirty record to the consulted store that owns it (the deepest consulted
@@ -989,12 +1021,19 @@ async function cleanSnapshot(
     for (const line of moved.stdout.split("\n")) {
       if (line === "") continue
       const parentRoot = parent?.root ?? path
+      if (
+        retainsStore !== undefined &&
+        !(await componentHasOwnChanges(git, component.root)) &&
+        (await retainsStore(component.root))
+      ) {
+        continue
+      }
       if (componentSelectionOnRemote(parentRoot, component.path, component.root).onRemote) continue
       own(parent, line)
     }
   }
   for (const group of dirtyByStore.values()) {
-    await admitDirtyStore(git, group.store, group.records, preserved, group.component)
+    await admitDirtyStore(git, group.store, group.records, preserved, group.component, retainsStore)
   }
   const snapshot: { path: string; head: string }[] = []
   for (const entry of status.consultedRepositories) {
@@ -1969,6 +2008,18 @@ async function prepareResolvedWorktreeModules(context: {
   } = context
   checkRemovalExecution(execution)
   const modules = join(gitDir, "modules")
+  // 34787: what the retained copy holds is the modules subtree, or the whole checkout for a private projection; the
+  // native removal deletes the checkout and its admin dir. A component store in neither survives by itself.
+  const retainsStore: RetainsStore | undefined =
+    componentCustody !== undefined
+      ? undefined
+      : async (componentRoot) => {
+          const store = await git.optionalText(componentRoot, ["rev-parse", "--absolute-git-dir"])
+          if (store === undefined || store === "") return false
+          const real = toCanonical(store)
+          if (within(toCanonical(privateProjection === undefined ? modules : path), real)) return true
+          return !within(toCanonical(path), real) && !within(toCanonical(gitDir), real)
+        }
   // The constructor copies removable payload before deletion. Historical readers
   // keep their removal boundaries; this source snapshot may contain local donors.
   const custody = {
@@ -2002,7 +2053,7 @@ async function prepareResolvedWorktreeModules(context: {
   }
   let before =
     privateProjection === undefined && destroyedHead === undefined
-      ? await cleanSnapshot(git, path, inspect, excludedSubmodules, preserved)
+      ? await cleanSnapshot(git, path, inspect, excludedSubmodules, preserved, retainsStore)
       : undefined
   // Check metadata locks before copying. The modules subtree includes every store,
   // even one left by an earlier gitlink that the current tree no longer records.
@@ -2168,7 +2219,7 @@ async function prepareResolvedWorktreeModules(context: {
           [relative(copiedCheckout, pointer)]: { kind: "file", sha256: await metadataFileDigest(pointer, execution) },
         }
       }
-      before = await cleanSnapshot(git, copiedCheckout, inspect, excludedSubmodules)
+      before = await cleanSnapshot(git, copiedCheckout, inspect, excludedSubmodules, [], retainsStore)
     }
     // One transform handles ordinary, destroyed and attested private metadata.
     let finalRetainedManifest = retainedManifest
@@ -2295,6 +2346,7 @@ async function prepareResolvedWorktreeModules(context: {
                 inspect,
                 excludedSubmodules,
                 privateProjection === undefined ? preserved : [],
+                retainsStore,
               )
             : undefined
         await verifyRetainedManifest()

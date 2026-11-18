@@ -6,13 +6,20 @@
  * @reach fs-walk <fixture-only: isolated mkdtemp Git repositories the test builds and removes itself>
  * @testonly none
  */
-import { existsSync } from "node:fs"
+import { existsSync, renameSync, rmSync } from "node:fs"
 import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { describe, expect, it } from "vitest"
 import { createLocalGitWorktreeStore } from "../src/worktree.ts"
 import { superWorktreeRemove } from "../src/worktree-remove.ts"
-import { advanceRepository, canonicalTmpdir, createProductFixture, createRepository, git } from "./fixture.ts"
+import {
+  addNestedAlphaSubmodule,
+  advanceRepository,
+  canonicalTmpdir,
+  createProductFixture,
+  createRepository,
+  git,
+} from "./fixture.ts"
 
 const REF = "refs/heads/wip/preserve-test"
 
@@ -236,20 +243,108 @@ describe("git-super worktree remove admits a clean component store proven on its
     }
   })
 
-  it("refuses a staged gitlink move to a local component commit that is not on its origin main", async () => {
+  it("retains a staged gitlink move to a clean local component commit that is not on its origin main (34787)", async () => {
     const { root, fixture, linked, alpha, retain } = await linkedWithSubmodules()
     try {
       await writeFile(join(alpha, "alpha.ts"), "export const alpha = 3\n")
       git(alpha, "commit", "-q", "-am", "local only")
       const local = git(alpha, "rev-parse", "HEAD")
       stageComponentMove(linked, alpha, local)
-      preserveIndexRef(linked)
 
-      const result = await superWorktreeRemove({ repo: fixture.product, path: linked, retain, preserved: [REF] })
+      // 34787 (@cto 34787-component-retention-ruling): remote ancestry alone no longer blocks a clean component. With
+      // no component-custody proof requested and no preserved ref, the removal succeeds only through its retained
+      // copy, which holds the component HEAD and the commit only this checkout had.
+      const result = await superWorktreeRemove({ repo: fixture.product, path: linked, retain, preserved: [] })
+
+      expect(result.state, result.detail?.message ?? "").toBe("updated")
+      expect(existsSync(linked)).toBe(false)
+      const copied = result.proof?.retained
+      expect(copied).toBeTypeOf("string")
+      const store = join(copied ?? "", "packages/alpha")
+      expect(git(fixture.product, "--git-dir", store, "--work-tree", root, "cat-file", "-t", local)).toBe("commit")
+      expect(git(fixture.product, "--git-dir", store, "--work-tree", root, "rev-parse", "HEAD")).toBe(local)
+    } finally {
+      // raw-delete-allow: the fixture tree this test made under its own mkdtemp root
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it("retains a clean nested component moved to a local-only commit, with its parent left unstaged (34787)", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-preserved-nested-"))
+    try {
+      const fixture = addNestedAlphaSubmodule(createProductFixture(root))
+      const linked = join(root, "linked")
+      await createLocalGitWorktreeStore({ repo: fixture.product }).add({ kind: "detached", path: linked, ref: "HEAD" })
+      git(linked, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
+      const leaf = join(linked, "packages/alpha/apps/maddoc")
+      await writeFile(join(leaf, "leaf.ts"), "export const leaf = 9\n")
+      git(leaf, "commit", "-q", "-am", "nested local only")
+      const local = git(leaf, "rev-parse", "HEAD")
+
+      // 34787: the leaf is clean at a commit no remote has; its parent's only change is that moved gitlink. The
+      // removal retains both stores, and the leaf's commit is in the copy at its nested store path.
+      const result = await superWorktreeRemove({
+        repo: fixture.product,
+        path: linked,
+        retain: join(root, "retained"),
+        preserved: [],
+      })
+
+      expect(result.state, result.detail?.message ?? "").toBe("updated")
+      expect(existsSync(linked)).toBe(false)
+      const store = join(result.proof?.retained ?? "", "packages/alpha/modules/apps/maddoc")
+      expect(git(fixture.product, "--git-dir", store, "--work-tree", root, "cat-file", "-t", local)).toBe("commit")
+    } finally {
+      // raw-delete-allow: the fixture tree this test made under its own mkdtemp root
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it("refuses a clean component whose embedded store the copy does not hold, keeping its only commit (34787)", async () => {
+    // Peer @dev/5 r1 probe: a store embedded in the checkout (packages/alpha/.git a directory) is deleted with the
+    // checkout and is not under the copied modules, so admitting it would free the only copy of a local commit.
+    const { root, fixture, linked, alpha, retain } = await linkedWithSubmodules()
+    try {
+      const store = git(alpha, "rev-parse", "--absolute-git-dir")
+      rmSync(join(alpha, ".git"))
+      renameSync(store, join(alpha, ".git"))
+      git(root, "config", "--file", join(alpha, ".git", "config"), "--unset", "core.worktree")
+      await writeFile(join(alpha, "alpha.ts"), "export const alpha = 42\n")
+      git(alpha, "commit", "-q", "-am", "embedded local only")
+      const local = git(alpha, "rev-parse", "HEAD")
+      git(linked, "add", "packages/alpha")
+
+      const result = await superWorktreeRemove({ repo: fixture.product, path: linked, retain, preserved: [] })
+
+      expect(result.state, result.detail?.message ?? "").toBe("failed")
+      expect(result.detail?.message ?? "").toContain(`HEAD ${local} is not an ancestor of refs/remotes/origin/main`)
+      expect(existsSync(linked)).toBe(true)
+      expect(git(alpha, "cat-file", "-t", local)).toBe("commit")
+    } finally {
+      // raw-delete-allow: the fixture tree this test made under its own mkdtemp root
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it("still refuses a nested component with its own uncommitted edit (34787)", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-preserved-nested-dirty-"))
+    try {
+      const fixture = addNestedAlphaSubmodule(createProductFixture(root))
+      const linked = join(root, "linked")
+      await createLocalGitWorktreeStore({ repo: fixture.product }).add({ kind: "detached", path: linked, ref: "HEAD" })
+      git(linked, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
+      const leaf = join(linked, "packages/alpha/apps/maddoc")
+      await writeFile(join(leaf, "leaf.ts"), "export const leaf = 10\n")
+
+      const result = await superWorktreeRemove({
+        repo: fixture.product,
+        path: linked,
+        retain: join(root, "retained"),
+        preserved: [],
+      })
 
       expect(result.state).toBe("failed")
-      expect(result.detail?.message ?? "").toContain(`worktree ${alpha} is dirty`)
-      expect(result.detail?.message ?? "").toContain(`HEAD ${local} is not an ancestor of refs/remotes/origin/main`)
+      expect(result.detail?.message ?? "").toContain(`worktree ${leaf} is dirty`)
       expect(existsSync(linked)).toBe(true)
     } finally {
       // raw-delete-allow: the fixture tree this test made under its own mkdtemp root
