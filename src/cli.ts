@@ -17,6 +17,8 @@ import {
   type PrivateStoreVerifyParams,
   type RetentionCompactParams,
   type RetentionBatchParams,
+  type RetentionRankParams,
+  retentionRank,
   type RetentionVerifyParams,
   type RetentionRetireParams,
   type StatusParams,
@@ -31,7 +33,7 @@ import type { GitSuperResult } from "./result.ts"
 import type { RetentionVerifyResult } from "./retention-verify.ts"
 import type { CompactRetainedRootReport } from "./retention-compact.ts"
 import type { RetentionBatchResult } from "./retention-batch.ts"
-import { formatRetainedBytes } from "./retention-bytes.ts"
+import { formatRetainedBytes, type RetainedRanking } from "./retention-bytes.ts"
 import type { PrivateStoreCandidateResult } from "./private-store-candidate.ts"
 import type { SuperStatusResult } from "./status.ts"
 import type { SuperSubmodulePrepareResult } from "./submodule-prepare.ts"
@@ -61,6 +63,7 @@ type CapturedInvocation =
       json: boolean
       nul: boolean
     }>
+  | Readonly<{ node: typeof retentionRank; params: RetentionRankParams; json: boolean; nul: boolean }>
   | Readonly<{
       node: typeof commands.worktree.retention.retire | typeof commands.worktree.retention.audit
       params: RetentionRetireParams
@@ -142,6 +145,7 @@ async function commandResult(
   | RetentionEnrollReport
   | CompactRetainedRootReport
   | RetentionBatchResult
+  | RetainedRanking
   | PrivateStoreCandidateResult
   | GitSuperResult
 > {
@@ -158,6 +162,7 @@ async function commandResult(
       | RetentionVerifyResult
       | RetentionEnrollReport
       | RetentionBatchResult
+      | RetainedRanking
       | PrivateStoreCandidateResult
       | GitSuperResult
     >,
@@ -904,6 +909,14 @@ async function runInvocation(
       [],
     )
     .option("--apply", "delete only entries passing preliminary and lease-held proofs; omitted means dry run")
+    .option(
+      "--rank-only",
+      "measure the entries and order them by the bytes each holds alone; runs no scan, gates or leases, deletes nothing",
+    )
+    .option(
+      "--rank-deadline-seconds <seconds>",
+      "soft admission deadline for --rank-only, checked before each entry (default 1080, under Yrd's 1200 s timeout)",
+    )
     .argument("<entries...>", "exact retained entries selected by the caller")
     .action((entries: string[], _options, command) => {
       const globals = command.optsWithGlobals() as { json?: boolean }
@@ -913,6 +926,30 @@ async function runInvocation(
         artifactDir: string
         namespace: string[]
         apply?: boolean
+        rankOnly?: boolean
+        rankDeadlineSeconds?: string
+      }
+      if (options.rankOnly === true) {
+        if (options.apply === true) {
+          usage = "git super worktree retention retire-batch: --rank-only deletes nothing and refuses --apply"
+          return
+        }
+        const seconds = options.rankDeadlineSeconds === undefined ? 1080 : Number(options.rankDeadlineSeconds)
+        if (!Number.isFinite(seconds) || seconds <= 0) {
+          usage = `git super worktree retention retire-batch: --rank-deadline-seconds must be a positive number, got ${options.rankDeadlineSeconds}`
+          return
+        }
+        captured = {
+          node: retentionRank,
+          params: { entries, root: options.root, deadlineMs: seconds * 1000 },
+          json: globals.json === true,
+          nul: false,
+        }
+        return
+      }
+      if (options.rankDeadlineSeconds !== undefined) {
+        usage = "git super worktree retention retire-batch: --rank-deadline-seconds applies only with --rank-only"
+        return
       }
       captured = {
         node: commands.worktree.retention["retire-batch"],
@@ -1137,6 +1174,7 @@ async function runInvocation(
     | RetentionEnrollReport
     | CompactRetainedRootReport
     | RetentionBatchResult
+    | RetainedRanking
     | PrivateStoreCandidateResult
     | GitSuperResult
   try {
@@ -1243,6 +1281,10 @@ async function runInvocation(
       )
     }
     return operation.state === "updated" || operation.state === "unchanged" ? 0 : 2
+  }
+  if (captured.node === retentionRank) {
+    // A ranking that measured nothing chooses nothing: fail rather than hand the caller an empty order.
+    return (result as RetainedRanking).ranked.length > 0 ? 0 : 2
   }
   if (captured.node === commands.worktree.retention["retire-batch"]) {
     const batch = result as RetentionBatchResult
@@ -1402,6 +1444,22 @@ async function writeResult(
     for (const row of operation.repositories) {
       if (row.detail?.code === "audit-stale") stdout.write(`${row.detail.message}\n`)
     }
+  } else if (captured.node === retentionRank) {
+    const ranking = result as RetainedRanking
+    stdout.write(
+      `rank-only: ${ranking.ranked.length} measured, ${ranking.unmeasured.length} unmeasured in ${ranking.ms}ms; ` +
+        `${formatRetainedBytes(ranking.measuredBytes)} summed own bytes${ranking.partial ? " (partial)" : ""}` +
+        `${ranking.deadlineHit ? "; deadline reached before every entry" : ""}\n`,
+    )
+    for (const row of ranking.ranked) {
+      stdout.write(
+        `${formatRetainedBytes(row.bytes)}\t${row.entry}` +
+          (row.sharedBytes > 0 ? `\tshared ${formatRetainedBytes(row.sharedBytes)}` : "") +
+          (row.unreadable > 0 ? `\tunreadable ${row.unreadable}, e.g. ${row.unreadableExample ?? "?"}` : "") +
+          "\n",
+      )
+    }
+    for (const row of ranking.unmeasured) stderr.write(`unmeasured ${row.reason}: ${row.entry}\n`)
   } else if (captured.node === nodes.worktree.retention["retire-batch"]) {
     const batch = result as RetentionBatchResult
     stdout.write(
@@ -1415,6 +1473,9 @@ async function writeResult(
             (batch.bytesUnreadable === undefined || batch.bytesUnreadable === 0
               ? ""
               : ` (${batch.bytesUnreadable} unreadable path(s) NOT counted, so the figure understates the free space)`)) +
+        (batch.bytesEvidence === undefined
+          ? ""
+          : `; this batch's evidence holds ${formatRetainedBytes(batch.bytesEvidence)} under the artifact directory`) +
         "\n",
     )
     for (const row of batch.rows) stdout.write(`${row.outcome} ${row.entry}: ${row.reason}\n`)

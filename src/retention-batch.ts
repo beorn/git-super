@@ -102,6 +102,12 @@ export type RetentionBatchResult = Readonly<{
   bytesSharedLinked?: number
   /** Paths the byte total could not read; non-zero means the figure understates what would be freed. */
   bytesUnreadable?: number
+  /**
+   * Allocated bytes of the evidence this batch's selected entries hold under the artifact directory (per-entry proofs
+   * and the shared common folder), each hard-linked file counted once, measured when the rows are final, so a reclaim figure is read beside what its
+   * receipts cost (#34920, @cto 34920-ranking-and-bare-r2). A report, never a gate.
+   */
+  bytesEvidence?: number
   /** Set when the batch stopped early; every entry not yet deleted is kept. */
   stopped?: string
 }>
@@ -309,11 +315,16 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
   }
   const ownerSummary: { current?: RetentionBatchResult["owners"] } = {}
   const byteSummary: { current?: Awaited<ReturnType<typeof measureRetainedBytes>> } = {}
+  const evidenceSummary: { current?: Awaited<ReturnType<typeof measureRetainedBytes>> } = {}
   // The byte total is a measurement of the trees being removed, taken once the rows are final: it is the number an
   // operator approves a deletion against, so it is never an estimate from the manifests (which carry path -> sha256 and
   // no sizes) and it names any subtree it could not read. A dry run is where that number is read, so it measures there
   // too, not only on the apply path.
   const measurePlannedBytes = async (): Promise<void> => {
+    evidenceSummary.current = await measureRetainedBytes([
+      ...entries.map((entry) => join(options.artifactDir, basename(entry))),
+      join(options.artifactDir, "common"),
+    ])
     byteSummary.current = await measureRetainedBytes(
       entries.filter((entry) => {
         const outcome = rows.get(entry)?.outcome
@@ -335,6 +346,9 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
             ? {}
             : { bytesSharedLinked: byteSummary.current.sharedBytes }),
         }),
+    ...(evidenceSummary.current === undefined
+      ? {}
+      : { bytesEvidence: evidenceSummary.current.bytes + (evidenceSummary.current.sharedBytes ?? 0) }),
     windows,
     rows: entries.map(
       (entry) => rows.get(entry) ?? { entry, outcome: "not-reached", reason: stopped ?? "not evaluated" },

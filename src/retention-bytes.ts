@@ -19,6 +19,7 @@
  */
 import { lstat, readdir } from "node:fs/promises"
 import { join } from "node:path"
+import type { Stats } from "node:fs"
 
 export interface RetainedBytes {
   /** Allocated bytes the removal frees: every single-link entry plus every inode whose links are all inside the set. */
@@ -119,5 +120,120 @@ export async function measureRetainedBytes(roots: readonly string[], workers = 8
     ...(sharedBytes === 0 ? {} : { sharedBytes }),
     unreadable,
     ...(unreadableExample === undefined ? {} : { unreadableExample }),
+  }
+}
+
+/** One measured retained entry, scored by the bytes only it holds. */
+export interface RankedRetainedEntry {
+  readonly entry: string
+  /** Own allocated bytes: single-link files plus inodes whose every link lies inside this entry. */
+  readonly bytes: number
+  /** Allocated bytes in files this entry shares with paths outside it: not freed by removing it alone. */
+  readonly sharedBytes: number
+  /** Unreadable paths inside the entry; their bytes are NOT in `bytes`, so the score is a lower bound. */
+  readonly unreadable: number
+  readonly unreadableExample?: string
+}
+
+export type UnmeasuredReason = "absent" | "not-a-directory" | "disappeared" | "replaced" | "deadline"
+
+export interface RetainedRanking {
+  /** Measured entries, own bytes descending, entry path ascending on ties. */
+  readonly ranked: readonly RankedRetainedEntry[]
+  /** Every requested entry that has no score, with why. Never ranked, never counted as zero. */
+  readonly unmeasured: readonly { readonly entry: string; readonly reason: UnmeasuredReason }[]
+  /**
+   * Sum of the ranked entries' own-byte scores. NOT the bytes a batch frees: links shared only among selected entries
+   * make a selected set's reclaim larger than this sum, and the set figure is the batch dry run's `bytesPlanned`.
+   */
+  readonly measuredBytes: number
+  /** True when the sum is qualified: an entry went unmeasured, or a measured entry had unreadable paths. */
+  readonly partial: boolean
+  /** The soft admission deadline stopped the loop before every entry was measured. */
+  readonly deadlineHit: boolean
+  readonly ms: number
+}
+
+export interface RankRetainedOptions {
+  /**
+   * Soft admission deadline, checked BEFORE each entry: an entry already being walked runs to completion, so a single
+   * stalled walk can still outlast it. The caller keeps its own hard timeout above this, with headroom to serialize.
+   */
+  readonly deadlineMs: number
+  readonly monotonic?: () => number
+  readonly measure?: (roots: readonly string[]) => Promise<RetainedBytes>
+}
+
+async function lstatOrAbsent(path: string): Promise<Stats | undefined> {
+  try {
+    return await lstat(path)
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === "ENOENT" || code === "ENOTDIR") return undefined
+    throw error
+  }
+}
+
+/**
+ * Rank retained entries by the bytes each one holds alone (#34920, @cto 34920-ranking-and-bare-r2 §1), measuring each
+ * with the unchanged walker on its own: entries are directory-disjoint, so a one-root walk is exact for that entry and
+ * no inode map spans the whole candidate set. Ranking only chooses which names a batch dry run examines; the dry run's
+ * set-aware figure is what a deletion is approved against.
+ *
+ * The walker ignores ENOENT, so an entry that is missing, or that disappears or is replaced while it is walked, would
+ * read as a measured zero. Each entry is therefore lstat-ed before and after its walk and listed unmeasured with the
+ * reason unless both name the same directory.
+ */
+export async function rankRetainedEntries(
+  entries: readonly string[],
+  options: RankRetainedOptions,
+): Promise<RetainedRanking> {
+  const monotonic = options.monotonic ?? (() => performance.now())
+  const measure = options.measure ?? ((roots: readonly string[]) => measureRetainedBytes(roots))
+  const started = monotonic()
+  const ranked: RankedRetainedEntry[] = []
+  const unmeasured: { entry: string; reason: UnmeasuredReason }[] = []
+  let deadlineHit = false
+  for (const entry of [...entries].sort()) {
+    if (deadlineHit || monotonic() - started >= options.deadlineMs) {
+      deadlineHit = true
+      unmeasured.push({ entry, reason: "deadline" })
+      continue
+    }
+    const before = await lstatOrAbsent(entry)
+    if (before === undefined) {
+      unmeasured.push({ entry, reason: "absent" })
+      continue
+    }
+    if (!before.isDirectory()) {
+      unmeasured.push({ entry, reason: "not-a-directory" })
+      continue
+    }
+    const measured = await measure([entry])
+    const after = await lstatOrAbsent(entry)
+    if (after === undefined) {
+      unmeasured.push({ entry, reason: "disappeared" })
+      continue
+    }
+    if (!after.isDirectory() || after.dev !== before.dev || after.ino !== before.ino) {
+      unmeasured.push({ entry, reason: "replaced" })
+      continue
+    }
+    ranked.push({
+      entry,
+      bytes: measured.bytes,
+      sharedBytes: measured.sharedBytes ?? 0,
+      unreadable: measured.unreadable,
+      ...(measured.unreadableExample === undefined ? {} : { unreadableExample: measured.unreadableExample }),
+    })
+  }
+  ranked.sort((a, b) => b.bytes - a.bytes || (a.entry < b.entry ? -1 : a.entry > b.entry ? 1 : 0))
+  return {
+    ranked,
+    unmeasured,
+    measuredBytes: ranked.reduce((sum, row) => sum + row.bytes, 0),
+    partial: unmeasured.length > 0 || ranked.some((row) => row.unreadable > 0),
+    deadlineHit,
+    ms: Math.round(monotonic() - started),
   }
 }
