@@ -15,7 +15,7 @@
  * Dry run by default: `apply: false` reports the entries that would be retired and why every other one is kept.
  */
 import { measureRetainedBytes } from "./retention-bytes.ts"
-import { lstatSync, readFileSync, realpathSync, rmSync } from "node:fs"
+import { lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs"
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { acquireFlockWithTimeout, type FlockHandle } from "@bearly/flock"
 import { DEFAULT_MUTATION_LOCK_WAIT_MS } from "./exclusive.ts"
@@ -93,6 +93,10 @@ export type RetentionBatchResult = Readonly<{
     unproved: number
     leaseMissingExample?: string
     unprovedExample?: string
+    /** Every owner object directory with no proved Git owner, one path per line, sorted (#34960). */
+    unprovedList: string
+    /** Every live owner with no existing writer lease, one path per line, sorted (#34960). */
+    leaseMissingList: string
   }>
   windows: readonly BatchWindow[]
   rows: readonly BatchRow[]
@@ -412,6 +416,15 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
   const leaseMissing = liveOwners.filter(
     (owner) => lstatSync(join(owner, "yrd-worktree-mutations", "writer.lock"), { throwIfNoEntry: false }) === undefined,
   )
+  // #34960: the counts below stop a batch, so the owners behind them are written out in full, not one example: an
+  // operator resolves them owner by owner from these lists (@cto: owners first, no new full scan).
+  const ownerListDir = join(options.artifactDir, "owners")
+  mkdirSync(ownerListDir, { recursive: true })
+  const unprovedList = join(ownerListDir, "unproved.txt")
+  const leaseMissingList = join(ownerListDir, "lease-missing.txt")
+  const lines = (paths: readonly string[]): string => (paths.length === 0 ? "" : `${[...paths].sort().join("\n")}\n`)
+  writeFileSync(unprovedList, lines(unproved))
+  writeFileSync(leaseMissingList, lines(leaseMissing))
   ownerSummary.current = {
     total: ownerList.length,
     leaseMissing: leaseMissing.length,
@@ -422,13 +435,15 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
     unproved: unproved.length,
     ...(leaseMissing[0] === undefined ? {} : { leaseMissingExample: leaseMissing[0] }),
     ...(unproved[0] === undefined ? {} : { unprovedExample: unproved[0] }),
+    unprovedList,
+    leaseMissingList,
   }
   // A failed cold-proof read is incomplete owner evidence: the batch reports and stops before any deletion window,
   // dry run included (exit 2 through the CLI and Yrd), rather than keeping the owner live inside a green run (#34920,
   // @cto 34920-retention-calls-r1).
   const ownerStop =
     unproved.length > 0
-      ? `identity-unknown: ${unproved.length} object director(ies) have no proved Git owner, e.g. ${unproved[0]}`
+      ? `identity-unknown: ${unproved.length} object director(ies) have no proved Git owner, e.g. ${unproved[0]}; every one is listed in ${unprovedList}`
       : coldProofFailures[0] !== undefined
         ? `@gate/retention-cold-proof: cold-proof-incomplete: ${coldProofFailures.length} owner(s) have unreadable cold evidence (each named on stderr), e.g. ${coldProofFailures[0]}`
         : leaseMissing.includes(common)

@@ -118,6 +118,9 @@ beforeEach(() => {
   rmSync(join(common, "worktrees", "cold-owner"), { recursive: true, force: true })
   rmSync(join(fixtureRoot, "revived-owner"), { recursive: true, force: true })
   rmSync(join(common, "modules", "retained-batch"), { recursive: true, force: true })
+  for (const name of ["owner-list-a", "owner-list-b", "store-a", "store-b"]) {
+    rmSync(join(fixtureRoot, name), { recursive: true, force: true })
+  }
 })
 
 function options(extra: Partial<RetentionBatchOptions> = {}): RetentionBatchOptions {
@@ -445,6 +448,42 @@ describe("retention retirement batch (#33010)", async () => {
     expect(result.rows.map((row) => row.outcome)).toEqual(["would-retire", "would-retire", "would-retire"])
     expect(readdirSync(root)).toHaveLength(3)
     expect(result.windows).toEqual([])
+    // #34960: a run with no unproved or unleased owner still writes both lists, empty, and names them.
+    expect(readFileSync(result.owners!.unprovedList, "utf8")).toBe("")
+    expect(readFileSync(result.owners!.leaseMissingList, "utf8")).toBe("")
+    expect(dirname(result.owners!.unprovedList)).toBe(join(fixtureRoot, "artifacts", "owners"))
+  })
+
+  // Accepted requirement (#34960, @chief 2a1b5761): the 2026-11-18 production dry run stopped on 221 unproved owners
+  // and 2,104 unleased ones but named one of each, so nobody could resolve them owner by owner. The existing tests
+  // check the counts, never that every owner behind them is written out.
+  it("a dry run that stops on owners writes every unproved and every unleased owner to the artifact dir", async () => {
+    const unproved: string[] = []
+    const unleased: string[] = []
+    for (const suffix of ["a", "b"]) {
+      // A clone with no writer lease is a live owner the batch cannot lease; its alternates name a lender store that
+      // is not any repository's own `objects`, which is an object directory with no proved Git owner.
+      const store = join(fixtureRoot, `store-${suffix}`)
+      mkdirSync(join(store, "pack"), { recursive: true })
+      mkdirSync(join(store, "info"), { recursive: true })
+      const clone = join(fixtureRoot, `owner-list-${suffix}`)
+      mkdirSync(clone, { recursive: true })
+      git(clone, ["init", "-q", "-b", "main"])
+      writeFileSync(join(clone, ".git", "objects", "info", "alternates"), `${store}\n`)
+      unproved.push(store)
+      unleased.push(join(clone, ".git"))
+    }
+
+    const result = await retireRetainedBatch(options())
+
+    expect(result.stopped).toContain("identity-unknown: 2 object director(ies)")
+    expect(result.stopped).toContain(result.owners!.unprovedList)
+    expect(readFileSync(result.owners!.unprovedList, "utf8")).toBe(`${unproved.sort().join("\n")}\n`)
+    const listed = readFileSync(result.owners!.leaseMissingList, "utf8").trimEnd().split("\n")
+    expect(listed).toHaveLength(result.owners!.leaseMissing)
+    expect(listed).toEqual([...listed].sort())
+    expect(listed).toEqual(expect.arrayContaining(unleased))
+    expect(readdirSync(root)).toHaveLength(3)
   })
 
   // Accepted requirement (#34920, @cto 34920-ranking-and-bare-r2 §2): a retained store whose config still names
