@@ -406,27 +406,50 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     const sidecarDir = tmp("git-super-custody-label-sidecars-")
     const component = await componentOf(fixture.atRisk, sidecarDir, "owned")
     const scan = await scanCustody(fixture.root, [component], fixture.stores, [], { sidecarDir })
-    // The old algorithm: stores by realpath, refs by name, each ref's full closure in its own store (honouring that
-    // store's replace refs, as the generic runner does); the first ref whose closure holds an OID is its witness.
+    // The full-closure algorithm: stores by realpath, refs by name, each ref's full closure in its own store (honouring
+    // that store's replace refs, as the generic runner does); the first ref whose closure holds an OID is its witness.
+    // #35062 (@cto 34920-shared-index-ruling-1931 §1): only independent commit tips are ranked (per store, the first
+    // ref by name for each tip no other durable commit tip contains), and every noncommit ref is kept. `all` ranks
+    // every durable ref: the coverage control the reduction must match exactly.
     const ranked: Array<{ store: string; ref: string; tip: string; closure: string[] }> = []
+    const all: Array<{ closure: string[] }> = []
     for (const objects of fixture.stores.map((path) => realpathSync(path)).sort()) {
       const gitDir = join(objects, "..")
-      const refs = git(gitDir, ["--git-dir", gitDir, "for-each-ref", "--format=%(refname)\t%(objectname)"])
+      const refs = git(gitDir, [
+        "--git-dir",
+        gitDir,
+        "for-each-ref",
+        "--format=%(refname)\t%(objectname)\t%(objecttype)",
+      ])
         .split("\n")
         .filter((row) => /^refs\/(?:heads|tags)\//u.test(row))
-        .map((row) => row.split("\t") as [string, string])
+        .map((row) => row.split("\t") as [string, string, string])
         .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
-      for (const [ref, tip] of refs) {
+      const commitRef = new Map<string, string>()
+      for (const [ref, tip, type] of refs) if (type === "commit" && !commitRef.has(tip)) commitRef.set(tip, ref)
+      const independent = new Set(
+        commitRef.size > 1
+          ? git(gitDir, ["--git-dir", gitDir, "merge-base", "--independent", ...commitRef.keys()]).split("\n")
+          : commitRef.keys(),
+      )
+      for (const [ref, tip, type] of refs) {
         const closure = git(gitDir, ["--git-dir", gitDir, "rev-list", "--objects", tip])
           .split("\n")
           .map((line) => line.split(" ")[0]!)
-        ranked.push({ store: objects, ref, tip, closure })
+        all.push({ closure })
+        if (type !== "commit" || (independent.has(tip) && commitRef.get(tip) === ref)) {
+          ranked.push({ store: objects, ref, tip, closure })
+        }
       }
     }
     const witnessed = [...fixture.atRisk].sort().flatMap((oid) => {
       const first = ranked.find((entry) => entry.closure.includes(oid))
       return first === undefined ? [] : [{ oid, first }]
     })
+    // Coverage is unchanged by the reduction: exactly the OIDs some durable ref reaches are witnessed.
+    expect(witnessed.map(({ oid }) => oid)).toEqual(
+      [...fixture.atRisk].sort().filter((oid) => all.some((entry) => entry.closure.includes(oid))),
+    )
     expect(scan.status).toBe(fixture.blocked.length === 0 ? "pass" : "blocked")
     expect(scan.missing.map((target) => target.oid)).toEqual(fixture.blocked)
     expect(await sidecarText(scan, "witness")).toEqual(

@@ -600,8 +600,8 @@ interface WitnessRef {
   readonly objectType: string | undefined
 }
 
-/** Select real refs whose complete graphs cover all admitted policy commits. */
-async function independentPolicyRefs(
+/** Select real refs whose complete graphs cover every admitted durable commit, under either policy (#35062). */
+async function independentRefs(
   durable: readonly WitnessRef[],
   gitDir: string,
   run: GitRun,
@@ -702,9 +702,13 @@ async function indexWitnessStores(
     if (fsck.code !== 0) {
       throw new UnknownError(`fsck --full failed in witness store ${gitDir}: ${fsck.stderr.trim()}`)
     }
-    const refFormat =
-      witnessPolicy === undefined ? "%(refname)%09%(objectname)" : "%(refname)%09%(objectname)%09%(objecttype)"
-    const refs = await storeRun([`--git-dir=${gitDir}`, "for-each-ref", `--format=${refFormat}`])
+    // #35062 (@cto 34920-shared-index-ruling-1931 §1): retention reads object types too, so both policies walk only
+    // independent commit tips plus every noncommit ref.
+    const refs = await storeRun([
+      `--git-dir=${gitDir}`,
+      "for-each-ref",
+      "--format=%(refname)%09%(objectname)%09%(objecttype)",
+    ])
     refuseSuccessfulStderr(refs, `for-each-ref in witness store ${gitDir}`)
     if (refs.code !== 0) {
       throw new UnknownError(`for-each-ref failed in witness store ${gitDir}: ${refs.stderr.trim()}`)
@@ -718,8 +722,9 @@ async function indexWitnessStores(
         ref === undefined ||
         tip === undefined ||
         !HEX40.test(tip) ||
-        (witnessPolicy !== undefined &&
-          (fields.length !== 3 || objectType === undefined || !["commit", "tag", "tree", "blob"].includes(objectType)))
+        fields.length !== 3 ||
+        objectType === undefined ||
+        !["commit", "tag", "tree", "blob"].includes(objectType)
       ) {
         throw new UnknownError(`malformed for-each-ref row in witness store ${gitDir}: ${row.slice(0, 120)}`)
       }
@@ -738,7 +743,7 @@ async function indexWitnessStores(
       }
     }
     durable.sort((left, right) => (left.ref < right.ref ? -1 : left.ref > right.ref ? 1 : 0))
-    const selected = witnessPolicy === undefined ? durable : await independentPolicyRefs(durable, gitDir, storeRun)
+    const selected = await independentRefs(durable, gitDir, storeRun)
     const context = await traversalContext(gitDir, refs.stdout.split("\n"), storeRun, witnessPolicy)
     if (!context.plain && selected.length > 0) {
       unsubtracted.push(`${gitDir} (${context.reason ?? "traversal not plain"})`)
