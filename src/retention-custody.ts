@@ -143,6 +143,7 @@ interface BuiltWitnessIndex {
   readonly formats: ReadonlyMap<string, string>
   readonly published: ReadonlyArray<Readonly<{ store: string; tip: string }>>
   readonly unsubtracted: readonly string[]
+  readonly nonWitnesses: readonly string[]
   readonly index: SidecarRef
 }
 
@@ -167,9 +168,11 @@ export class CustodyIndexScope {
 
   /**
    * The index for `key`, built by `build` on first use. A failed build is kept for the rest of the phase: every later
-   * member with the same key gets the same failure (unknown) at once instead of rebuilding it. The build's inputs are
-   * the key and the batch's shared deadline, so a retry inside one phase meets the same failure; the 2026-11-19 05:12
-   * dry run paid ~3.5 min three times for one fsck refusal (#35062). Keeping a failure can only keep more entries.
+   * member with the same key gets the same named unknown at once instead of rebuilding it (the 2026-11-19 05:12 dry
+   * run paid ~3.5 min three times for one fsck refusal, #35062). This is deliberately conservative failure memoization,
+   * not a claim that a retry would fail alike: refs, objects and graph context can change, so a transient recovery
+   * may still leave the rest of this phase unknown, which only keeps more entries. A fresh scope (the held window, a
+   * later run) builds again and can see the recovery (@cto 35062-empty-witness-go-0606 §2).
    */
   async witnessIndex(key: string, build: () => Promise<BuiltWitnessIndex>): Promise<BuiltWitnessIndex> {
     const existing = this.builds.get(key)
@@ -656,10 +659,12 @@ async function indexWitnessStores(
   published: ReadonlyArray<Readonly<{ store: string; tip: string }>>
   /** Stores whose traversal is not plain, so their refs were walked without cross-store subtraction, and why. */
   unsubtracted: readonly string[]
+  nonWitnesses: readonly string[]
 }> {
   const records: DurableRefRecord[] = []
   const prior: Array<Readonly<{ store: string; tip: string; plain: boolean }>> = []
   const unsubtracted: string[] = []
+  const nonWitnesses: string[] = []
   const formats = new Map<string, string>()
   const published: Array<Readonly<{ store: string; tip: string }>> = []
   let witnessFsckMs = 0
@@ -696,16 +701,6 @@ async function indexWitnessStores(
     }
     const closureResult = alternateClosure(store, removal)
     if (closureResult.status !== "ok") throw new UnknownError(closureResult.detail)
-    // A hung `fsck` is killed at the declared deadline and reported unknown, never blocking.
-    const fsckStarted = clock()
-    const fsck = await storeRun([`--git-dir=${gitDir}`, "fsck", "--full", "--no-progress"], {
-      timeoutMs: bounds.fsckMs,
-    })
-    witnessFsckMs += clock() - fsckStarted
-    refuseSuccessfulStderr(fsck, `fsck --full in witness store ${gitDir}`)
-    if (fsck.code !== 0) {
-      throw new UnknownError(`fsck --full failed in witness store ${gitDir}: ${fsck.stderr.trim()}`)
-    }
     // #35062 (@cto 34920-shared-index-ruling-1931 §1): retention reads object types too, so both policies walk only
     // independent commit tips plus every noncommit ref.
     const refs = await storeRun([
@@ -747,6 +742,25 @@ async function indexWitnessStores(
       }
     }
     durable.sort((left, right) => (left.ref < right.ref ? -1 : left.ref > right.ref ? 1 : 0))
+    // #35062 (@cto 35062-empty-witness-go-0606 §1): the complete ref listing was read and validated above under the
+    // caller's own durable-root policy (a published target tip counts for the policy caller). A store that admits no
+    // durable root can witness nothing, so it is named and skipped before fsck; it supplies no fragment, certificate,
+    // subtraction tip or rebase root, and stays in every estate, owner and delta fact. Every other store is fscked in
+    // full before any of its refs is reduced or walked.
+    if (durable.length === 0) {
+      nonWitnesses.push(gitDir)
+      continue
+    }
+    // A hung `fsck` is killed at the declared deadline and reported unknown, never blocking.
+    const fsckStarted = clock()
+    const fsck = await storeRun([`--git-dir=${gitDir}`, "fsck", "--full", "--no-progress"], {
+      timeoutMs: bounds.fsckMs,
+    })
+    witnessFsckMs += clock() - fsckStarted
+    refuseSuccessfulStderr(fsck, `fsck --full in witness store ${gitDir}`)
+    if (fsck.code !== 0) {
+      throw new UnknownError(`fsck --full failed in witness store ${gitDir}: ${fsck.stderr.trim()}`)
+    }
     const selected = await independentRefs(durable, gitDir, storeRun)
     const context = await traversalContext(gitDir, refs.stdout.split("\n"), storeRun, witnessPolicy)
     if (!context.plain && selected.length > 0) {
@@ -794,7 +808,7 @@ async function indexWitnessStores(
   }
   onPhase?.("witnessFsck", witnessFsckMs)
   onPhase?.("refGraph", refGraphMs)
-  return { records, formats, published, unsubtracted }
+  return { records, formats, published, unsubtracted, nonWitnesses }
 }
 
 /**
@@ -910,6 +924,13 @@ function vanishedDetail(stores: ReadonlyArray<string>): string {
   const shown = stores.slice(0, 5).join(", ")
   const more = stores.length > 5 ? ` and ${String(stores.length - 5)} more` : ""
   return `; ${String(stores.length)} witness store(s) gone since the estate scan, not used as witnesses: ${shown}${more}`
+}
+
+function nonWitnessDetail(stores: ReadonlyArray<string>): string {
+  if (stores.length === 0) return ""
+  const shown = stores.slice(0, 5).join(", ")
+  const more = stores.length > 5 ? ` and ${String(stores.length - 5)} more` : ""
+  return `; ${String(stores.length)} witness store(s) with no admitted durable refs; fsck not run: ${shown}${more}`
 }
 
 function unsubtractedDetail(stores: ReadonlyArray<string>): string {
@@ -1032,7 +1053,7 @@ async function runCustody(
     )
     return { ...indexed, index: merged }
   }
-  const { records, formats, published, unsubtracted, index } =
+  const { records, formats, published, unsubtracted, nonWitnesses, index } =
     indexScope === undefined
       ? await buildIndex()
       : await indexScope.witnessIndex(
@@ -1194,7 +1215,7 @@ async function runCustody(
     const loss = await describeLoss(finalMissing, components, copyRoot, run)
     return {
       status: "blocked",
-      detail: `${missingCount} at-risk OID(s) have no durable witness, e.g. ${first.component} ${first.oid} (${first.source}); first ${missing.length} inline, full list in ${missingSidecar?.path ?? "a sidecar"}${uncheckedDetail(unchecked)}${unsubtractedDetail(unsubtracted)}${vanishedDetail(vanished)}`,
+      detail: `${missingCount} at-risk OID(s) have no durable witness, e.g. ${first.component} ${first.oid} (${first.source}); first ${missing.length} inline, full list in ${missingSidecar?.path ?? "a sidecar"}${uncheckedDetail(unchecked)}${unsubtractedDetail(unsubtracted)}${nonWitnessDetail(nonWitnesses)}${vanishedDetail(vanished)}`,
       witnesses,
       witnessCount,
       ...(witnessSidecar === undefined ? {} : { witnessSidecar }),
@@ -1207,7 +1228,7 @@ async function runCustody(
   }
   return {
     status: "pass",
-    detail: `${witnessCount} at-risk OID(s) each have a named surviving witness across ${stores.length} store(s), ${witnesses.length} distinct identities${rebased.length === 0 ? "" : `, plus ${String(rebased.length)} rebased commit(s) matched by whitespace-sensitive patch-id to the published main graph`}${uncheckedDetail(unchecked)}${unsubtractedDetail(unsubtracted)}${vanishedDetail(vanished)}`,
+    detail: `${witnessCount} at-risk OID(s) each have a named surviving witness across ${stores.length} store(s), ${witnesses.length} distinct identities${rebased.length === 0 ? "" : `, plus ${String(rebased.length)} rebased commit(s) matched by whitespace-sensitive patch-id to the published main graph`}${uncheckedDetail(unchecked)}${unsubtractedDetail(unsubtracted)}${nonWitnessDetail(nonWitnesses)}${vanishedDetail(vanished)}`,
     witnesses,
     witnessCount,
     ...(witnessSidecar === undefined ? {} : { witnessSidecar }),

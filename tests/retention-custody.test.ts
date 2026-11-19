@@ -899,6 +899,79 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     expect(scans[1]!.detail).toBe(scans[0]!.detail)
     expect(scans[0]!.detail).toContain("fsck --full failed")
     expect(fsck).toBe(1)
+    // A fresh scope (the held window, a later run) builds again and sees the recovery (@cto 0606 §2).
+    const recoveredDir = tmp("git-super-custody-failed-build-recovered-")
+    const recovered = await scanCustody(
+      fixture.root,
+      [await componentOf([fixture.atRisk[0]!], recoveredDir)],
+      fixture.stores,
+      [],
+      { sidecarDir: recoveredDir, indexScope: new CustodyIndexScope(tmp("git-super-custody-failed-build-fresh-")) },
+    )
+    expect(recovered.status, recovered.detail).toBe("pass")
+  })
+
+  // AC #35062 (@cto 35062-empty-witness-go-0606 §1): a witness store whose complete, validated ref listing admits no
+  // durable root can witness nothing, so it is named and its fsck is not run. The 05:12 dry run kept every at-risk
+  // entry unknown because one empty scratch bare repo's fsck printed "No default references" on a successful exit.
+  test.each(["a valid survivor witnesses", "only stores without durable refs"])(
+    "a witness store with no admitted durable refs is named, never fscked, never a witness: %s",
+    async (kind) => {
+      const survivor = repoWithCommit("git-super-custody-nonwitness-survivor-")
+      const empty = realpathSync(tmp("git-super-custody-nonwitness-empty-"))
+      git(empty, ["init", "-q", "--bare"])
+      const fsckIn: string[] = []
+      const counting: GitRun = (args, options) => {
+        if (args.includes("fsck")) fsckIn.push(args.find((arg) => arg.startsWith("--git-dir="))!.slice(10))
+        return defaultGitRun(args, options)
+      }
+      const stores = [
+        join(empty, "objects"),
+        ...(kind === "a valid survivor witnesses" ? [join(survivor.root, ".git", "objects")] : []),
+      ]
+      const sidecarDir = tmp("git-super-custody-nonwitness-sidecars-")
+      const component = await componentOf([survivor.head], sidecarDir, "owned", { [survivor.head]: "commit" })
+      const scan = await scanCustody(survivor.root, [component], stores, [], { sidecarDir, run: counting })
+      expect(scan.detail).toContain(`1 witness store(s) with no admitted durable refs; fsck not run: ${empty}`)
+      expect(fsckIn).not.toContain(empty)
+      expect(scan.witnesses.map((witness) => witness.store)).not.toContain(join(empty, "objects"))
+      if (kind === "a valid survivor witnesses") {
+        expect(scan.status, scan.detail).toBe("pass")
+        expect(fsckIn).toEqual([realpathSync(join(survivor.root, ".git"))])
+      } else {
+        // Zero candidates never pass a nonempty risk set.
+        expect(scan.status, scan.detail).toBe("blocked")
+        expect(scan.missing.map((target) => target.oid)).toEqual([survivor.head])
+      }
+    },
+  )
+
+  test("under the publish policy a store with no local refs but a published target tip is still fscked", async () => {
+    const { remote, work, primary } = publishedStores("git-super-custody-nonwitness-published-")
+    writeFileSync(join(work, "b.txt"), "beta\n")
+    git(work, ["add", "b.txt"])
+    git(work, ["commit", "-q", "-m", "second"])
+    const landed = git(work, ["rev-parse", "HEAD"])
+    git(work, ["push", "-q", remote, "main"])
+    git(primary, ["checkout", "-q", "--detach"])
+    git(primary, ["update-ref", "-d", "refs/heads/main"])
+    expect(git(primary, ["for-each-ref", "refs/heads", "refs/tags"])).toBe("")
+    const fsckIn: string[] = []
+    const counting: GitRun = (args, options) => {
+      if (args.includes("fsck")) fsckIn.push(args.find((arg) => arg.startsWith("--git-dir="))!.slice(10))
+      return defaultGitRun(args, options)
+    }
+    const sidecarDir = tmp("git-super-custody-nonwitness-published-sidecars-")
+    const component = { ...(await componentOf([landed], sidecarDir, "reflog logs/HEAD")), gitDir: join(work, ".git") }
+    const scan = await scanCustody(work, [component], [join(primary, ".git", "objects")], [], {
+      sidecarDir,
+      run: counting,
+      witnessPolicy: { targetBranch: "main" },
+    })
+    expect(scan.status, scan.detail).toBe("pass")
+    expect(scan.witnesses[0]).toMatchObject({ ref: "refs/heads/main", tip: landed })
+    expect(fsckIn).toEqual([realpathSync(join(primary, ".git"))])
+    expect(scan.detail).not.toContain("no admitted durable refs")
   })
 
   test("a witness store whose recorded core.worktree is gone is read detached and still witnesses (#34920)", async () => {
