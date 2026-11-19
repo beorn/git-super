@@ -14,7 +14,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, test } from "vitest"
 import { defaultGitRun, defaultGitStream, type ComponentContents, type GitRun } from "../src/retention-contents.ts"
-import { scanCustody, type CustodyScan } from "../src/retention-custody.ts"
+import { DEFAULT_CUSTODY_BOUNDS, scanCustody, type CustodyScan } from "../src/retention-custody.ts"
 import { gitLineStream, RETENTION_STREAM_QUEUE_LINES, readLines, SidecarWriter } from "../src/retention-stream.ts"
 
 const cleanup: string[] = []
@@ -569,6 +569,37 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     })
     expect(scan.status).toBe("unknown")
     expect(scan.detail).toContain("shared proof deadline")
+  })
+
+  // #34920: the walk's timeout is clamped to the shared deadline, so a walk killed there ran out of shared time, not
+  // its own 300 s bound. Two measurement runs ended this way and both reported "exceeded the 300000 ms bound".
+  test.each([
+    { killedBy: "the shared deadline", deadline: 50_000, reachableMs: 300_000, says: "shared proof deadline" },
+    { killedBy: "its own walk bound", deadline: 900_000, reachableMs: 40_000, says: "exceeded the 40000 ms bound" },
+  ])("a ref walk killed by $killedBy names that limit", async ({ deadline, reachableMs, says }) => {
+    const store = repoWithCommit("git-super-custody-walk-limit-")
+    const sidecarDir = tmp("git-super-custody-walk-limit-sidecars-")
+    const component = await componentOf([store.head], sidecarDir)
+    let clock = 0
+    const scan = await scanCustody(store.root, [component], [join(store.root, ".git", "objects")], [], {
+      sidecarDir,
+      witnessPolicy: { targetBranch: "main" },
+      bounds: { ...DEFAULT_CUSTODY_BOUNDS, reachableMs },
+      clock: () => clock,
+      deadline,
+      stream(args, options) {
+        if (!(args.includes("rev-list") && args.includes("--objects"))) return defaultGitStream(args, options)
+        // The child runs until its (clamped) timeout and is killed there.
+        clock += options?.timeoutMs ?? 0
+        return {
+          lines: (async function* () {})(),
+          outcome: Promise.resolve({ code: 1, bytes: 0, lines: 0, stderr: "", timedOut: true, capped: false }),
+        }
+      },
+    })
+    expect(scan.status).toBe("unknown")
+    expect(scan.detail).toContain(says)
+    if (says.startsWith("shared")) expect(scan.detail).not.toContain("300000 ms bound")
   })
 
   test("a shallow witness graph is unknown even when its refs and fsck pass", async () => {

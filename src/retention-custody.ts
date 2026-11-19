@@ -379,6 +379,7 @@ async function* reachableOidLines(
   gitDir: string,
   tip: string,
   bounds: CustodyBounds,
+  deadlinePassed: () => boolean,
 ): AsyncGenerator<string> {
   let malformed: UnknownError | undefined
   for await (const line of stream.lines) {
@@ -393,7 +394,11 @@ async function* reachableOidLines(
   // Await only after draining: the producer can otherwise be paused at its queue bound.
   const outcome = await stream.outcome
   assertStreamComplete(outcome, {
-    timedOut: `rev-list ${tip} in ${gitDir} exceeded the ${bounds.reachableMs} ms bound`,
+    // The proof stream clamps the walk's timeout to the shared deadline: a kill at or past it ran out of shared time,
+    // not this walk's own bound (#34920: two measurement runs reported the 300 s bound for a deadline kill).
+    timedOut: deadlinePassed()
+      ? `shared proof deadline is exhausted during rev-list ${tip} in ${gitDir}`
+      : `rev-list ${tip} in ${gitDir} exceeded the ${bounds.reachableMs} ms bound`,
     capped: `reachable OIDs exceeded the ${bounds.maxReachableOids} cap in ${gitDir}`,
     failed: `rev-list ${tip} failed in witness store ${gitDir}: ${outcome.stderr.trim()}`,
     warned: `rev-list ${tip} in ${gitDir} exited 0 with stderr: ${outcome.stderr.trim()}`,
@@ -515,16 +520,17 @@ async function reachableSidecar(
       ? [`--git-dir=${gitDir}`, "rev-list", "--objects", tip]
       : [`--git-dir=${gitDir}`, "rev-list", "--objects", "--ignore-missing", tip, "--not", ...subtract]
   const lineStream = stream(args, { timeoutMs: bounds.reachableMs, maxLines: bounds.maxReachableOids })
-  const sidecar = await externalSortToSidecar(reachableOidLines(lineStream, gitDir, tip, bounds), {
+  const deadlinePassed = (): boolean => deadline !== undefined && clock() >= deadline
+  const sidecar = await externalSortToSidecar(reachableOidLines(lineStream, gitDir, tip, bounds, deadlinePassed), {
     dir: sidecarDir,
     runLines: DEFAULT_SORT_RUN_LINES,
     deadline,
     clock,
   })
+  if (deadlinePassed()) throw new UnknownError("shared proof deadline is exhausted")
   if (clock() - started > bounds.reachableMs) {
     throw new UnknownError(`rev-list ${tip} in ${gitDir} exceeded the ${bounds.reachableMs} ms bound`)
   }
-  if (deadline !== undefined && clock() >= deadline) throw new UnknownError("shared proof deadline is exhausted")
   return sidecar
 }
 
