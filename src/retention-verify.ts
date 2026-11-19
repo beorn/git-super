@@ -198,6 +198,11 @@ export type RetentionVerifyOptions = Readonly<{
   gitStream?: GitStreamFactory
   monotonic?: () => number
   /**
+   * #35047: absolute proof deadline in the `monotonic` clock domain (Date.now by default). Gate 5 custody stops at it
+   * and reports `unknown`, so a proof cut off by its caller's deadline keeps the entry instead of running on.
+   */
+  deadline?: number
+  /**
    * 34787: an explicit discard of exactly the loss gate 5 finds. It never passes gate 5; a match makes the verdict
    * `discard-candidate` and the loss is reported as `explicitLoss`. A mismatch keeps the entry and names the field.
    */
@@ -1012,6 +1017,7 @@ async function evaluateRetainedEntry(
     ...(options.gitRun === undefined ? {} : { run: options.gitRun }),
     ...(options.gitStream === undefined ? {} : { stream: options.gitStream }),
     ...(options.bounds?.custody === undefined ? {} : { bounds: options.bounds.custody }),
+    ...(options.deadline === undefined ? {} : { deadline: options.deadline }),
     clock: monotonic,
   })
   result.witnesses = custody.witnesses

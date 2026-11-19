@@ -47,6 +47,12 @@ export type RetentionBatchOptions = Readonly<{
   apply?: boolean
   /** A lease window closes before its hold would pass this; default 60 s (@cto dc77f630 condition 2). */
   holdBudgetMs?: number
+  /**
+   * #35047: the whole batch's proof budget, from the call. An entry not started by then, or a custody walk still
+   * running at it, is kept with the cause named, and the batch reports `stopped` instead of running past its caller's
+   * timeout with no report. Absent means unbounded; the CLI sets 1080 s, under Yrd's 1200 s batch timeout.
+   */
+  proofDeadlineMs?: number
   clock?: Date
   monotonic?: () => number
   allowTemporaryArtifactDir?: boolean
@@ -276,6 +282,10 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
   const apply = options.apply === true
   const monotonic = options.monotonic ?? (() => performance.now())
   const budget = options.holdBudgetMs ?? 60_000
+  // In the verifier's default clock domain (Date.now), so the same absolute value bounds both the batch loop and the
+  // custody walks inside each proof.
+  const proofDeadline = options.proofDeadlineMs === undefined ? undefined : Date.now() + options.proofDeadlineMs
+  const proofDeadlinePassed = (): boolean => proofDeadline !== undefined && Date.now() >= proofDeadline
   const root = realpathSync(options.root)
   const common = realpathSync(options.common)
   const entries = options.entries.map((entry) => realpathSync(resolve(entry)))
@@ -295,6 +305,7 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
     artifactDir: join(options.artifactDir, basename(entry), phase),
     commonArtifactDir: join(options.artifactDir, "common"),
     ...(options.clock === undefined ? {} : { clock: options.clock }),
+    ...(proofDeadline === undefined ? {} : { deadline: proofDeadline }),
     ...(options.allowTemporaryArtifactDir === undefined
       ? {}
       : { allowTemporaryArtifactDir: options.allowTemporaryArtifactDir }),
@@ -368,7 +379,16 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
   // ---- Preliminary gates per entry, no lease ----------------------------------------------------
   const preliminary = new Map<string, RetentionVerifyResult>()
   const kept = new Map<string, string>()
+  let notStarted = 0
   for (const entry of entries) {
+    if (proofDeadlinePassed()) {
+      notStarted++
+      kept.set(
+        entry,
+        `unproved: the batch proof deadline (${String(options.proofDeadlineMs)} ms) passed before this entry's proof began; select it again in a later batch`,
+      )
+      continue
+    }
     const proof = await inspectRetainedEntryInBatch(verifyOptions(entry, "pre"), entryView(scan, entry), entries)
     recordWarnings(proof, "pre")
     preliminary.set(entry, proof)
@@ -376,6 +396,10 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
   }
   closeOverKeptBorrowers(entries, scan.borrowers, kept)
   for (const [entry, reason] of kept) rows.set(entry, { entry, outcome: "kept", reason })
+  // A proof the deadline cut short already reads `unknown` in its own row; this names the cut for the whole batch.
+  const deadlineStop = proofDeadlinePassed()
+    ? `proof-deadline: the batch proof deadline (${String(options.proofDeadlineMs)} ms) passed during the preliminary proofs; ${String(notStarted)} entr(ies) were not started and any proof still running was kept unknown`
+    : undefined
 
   // Every Git owner of a reached object directory outside the batch, plus registry holders: their EXISTING writer
   // leases are held for the whole window, as the single-entry retire holds them, so no lender moves mid-delete. A
@@ -468,11 +492,17 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
       })
     }
     await measurePlannedBytes()
-    return result([], ownerStop)
+    const stops = [ownerStop, deadlineStop].filter((stop): stop is string => stop !== undefined)
+    return result([], stops.length === 0 ? undefined : stops.join("; "))
   }
   if (ownerStop !== undefined) {
     for (const entry of candidates) rows.set(entry, { entry, outcome: "kept", reason: ownerStop })
     return result([], ownerStop)
+  }
+  // The held re-verify shares the same deadline: past it every held proof would be unknown, so no lease is taken.
+  if (deadlineStop !== undefined) {
+    for (const entry of candidates) rows.set(entry, { entry, outcome: "kept", reason: deadlineStop })
+    return result([], deadlineStop)
   }
   options.afterScan?.()
 

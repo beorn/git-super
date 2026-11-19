@@ -917,6 +917,10 @@ async function runInvocation(
       "--rank-deadline-seconds <seconds>",
       "soft admission deadline for --rank-only, checked before each entry (default 1080, under Yrd's 1200 s timeout)",
     )
+    .option(
+      "--proof-deadline-seconds <seconds>",
+      "proof budget for the batch: an entry not proved by then is kept with the cause named (default 1080, under Yrd's 1200 s timeout)",
+    )
     .argument("<entries...>", "exact retained entries selected by the caller")
     .action((entries: string[], _options, command) => {
       const globals = command.optsWithGlobals() as { json?: boolean }
@@ -928,8 +932,13 @@ async function runInvocation(
         apply?: boolean
         rankOnly?: boolean
         rankDeadlineSeconds?: string
+        proofDeadlineSeconds?: string
       }
       if (options.rankOnly === true) {
+        if (options.proofDeadlineSeconds !== undefined) {
+          usage = "git super worktree retention retire-batch: --proof-deadline-seconds does not apply with --rank-only"
+          return
+        }
         if (options.apply === true) {
           usage = "git super worktree retention retire-batch: --rank-only deletes nothing and refuses --apply"
           return
@@ -951,6 +960,11 @@ async function runInvocation(
         usage = "git super worktree retention retire-batch: --rank-deadline-seconds applies only with --rank-only"
         return
       }
+      const proofSeconds = options.proofDeadlineSeconds === undefined ? 1080 : Number(options.proofDeadlineSeconds)
+      if (!Number.isFinite(proofSeconds) || proofSeconds <= 0) {
+        usage = `git super worktree retention retire-batch: --proof-deadline-seconds must be a positive number, got ${options.proofDeadlineSeconds}`
+        return
+      }
       captured = {
         node: commands.worktree.retention["retire-batch"],
         params: {
@@ -960,6 +974,7 @@ async function runInvocation(
           artifactDir: options.artifactDir,
           namespaceRoots: options.namespace,
           ...(options.apply === true ? { apply: true } : {}),
+          proofDeadlineMs: proofSeconds * 1000,
         },
         json: globals.json === true,
         nul: false,

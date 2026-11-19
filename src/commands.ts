@@ -60,7 +60,7 @@ export type RetentionEnrollParams = Readonly<{ root: string; common: string; app
 export type RetentionCompactParams = Readonly<{ root: string; dryRun?: boolean; limit?: number }>
 export type RetentionBatchParams = Pick<
   RetentionBatchOptions,
-  "entries" | "root" | "common" | "namespaceRoots" | "artifactDir" | "apply"
+  "entries" | "root" | "common" | "namespaceRoots" | "artifactDir" | "apply" | "proofDeadlineMs"
 >
 export type RetentionRankParams = Readonly<{ entries: readonly string[]; root: string; deadlineMs: number }>
 export type PrivateStoreVerifyParams = Omit<PrivateStoreCandidateOptions, "git">
@@ -478,6 +478,10 @@ const retentionBatch = commandNode<CommandContext, RetentionBatchParams, Retenti
     if (input.apply !== undefined && typeof input.apply !== "boolean") {
       throw new Error("retire-batch apply must be a boolean")
     }
+    const deadline = input.proofDeadlineMs
+    if (deadline !== undefined && (typeof deadline !== "number" || !Number.isFinite(deadline) || deadline <= 0)) {
+      throw new Error("retire-batch proofDeadlineMs must be a positive number of milliseconds")
+    }
     const held = retentionHeldSchema.parse({ ...input, entry: entries[0] })
     return {
       entries,
@@ -486,6 +490,7 @@ const retentionBatch = commandNode<CommandContext, RetentionBatchParams, Retenti
       namespaceRoots: held.namespaceRoots,
       artifactDir: held.artifactDir,
       ...(input.apply === true ? { apply: true } : {}),
+      ...(deadline === undefined ? {} : { proofDeadlineMs: deadline as number }),
     }
   }),
   run: (_context, input) => retireRetainedBatch(input),

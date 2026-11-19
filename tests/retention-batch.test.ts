@@ -440,6 +440,66 @@ describe("retention retirement batch (#33010)", async () => {
     expect(errors).toContain("namespace")
     expect(readdirSync(root)).toHaveLength(3)
   })
+  // #35047: a 20-entry preliminary pass ran past Yrd's 1200 s timeout with no report and its walk still running. Under
+  // the batch proof deadline every unproved entry is kept with the cause, the run reports `stopped` (exit 2), and an
+  // apply takes no lease and deletes nothing. The CLI dry run above is the same fixture under the 1080 s default.
+  it("CLI keeps every entry its proof deadline cuts off, reports the stop, and deletes nothing", async () => {
+    let output = ""
+    let errors = ""
+    const entries = readdirSync(root)
+      .sort()
+      .map((name) => join(root, name))
+    const code = await runCli(
+      [
+        "--repo",
+        dirname(common),
+        "--json",
+        "worktree",
+        "retention",
+        "retire-batch",
+        "--root",
+        root,
+        "--common",
+        common,
+        "--namespace",
+        fixtureRoot,
+        "--artifact-dir",
+        join(fixtureRoot, "artifacts"),
+        "--proof-deadline-seconds",
+        "0.001",
+        "--apply",
+        ...entries,
+      ],
+      {
+        write: (value) => {
+          output += value
+        },
+      },
+      {
+        write: (value) => {
+          errors += value
+        },
+      },
+    )
+    expect(code, errors).toBe(2)
+    const report = JSON.parse(output) as RetentionBatchResult
+    expect(report.stopped).toMatch(/^proof-deadline: the batch proof deadline \(1 ms\) passed/u)
+    expect(report.rows.map((row) => [row.entry, row.outcome])).toEqual(entries.map((entry) => [entry, "kept"]))
+    for (const row of report.rows) expect(row.reason).toContain("proof deadline")
+    expect(report.windows).toEqual([])
+    expect(readdirSync(root)).toHaveLength(3)
+  })
+
+  it("a dry run under an unspent proof deadline is unchanged; a spent one keeps and names every entry", async () => {
+    const unspent = await retireRetainedBatch(options({ proofDeadlineMs: 600_000 }))
+    expect(unspent.stopped).toBeUndefined()
+    expect(unspent.rows.every((row) => row.outcome === "would-retire")).toBe(true)
+    const spent = await retireRetainedBatch(options({ proofDeadlineMs: 1 }))
+    expect(spent.stopped).toContain("3 entr(ies) were not started")
+    expect(spent.rows.map((row) => row.outcome)).toEqual(["kept", "kept", "kept"])
+    expect(spent.rows[0]?.reason).toContain("passed before this entry's proof began")
+  })
+
   it("dry run names every candidate it would retire and deletes nothing", async () => {
     const result = await retireRetainedBatch(options())
     expect(result.apply).toBe(false)

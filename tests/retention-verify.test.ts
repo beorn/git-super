@@ -1233,6 +1233,26 @@ describe("retention verify gates 1-6", async () => {
     expect(retentionRemovalBoundary(result).reason).toContain("preliminary")
   })
 
+  // #35047: a batch caller bounds every proof by one deadline. A custody walk reached at or past it must read unknown and
+  // keep the entry; the same fixture without the deadline is the candidate above, so the deadline alone flips it.
+  it("keeps an entry whose custody proof starts past the caller's deadline", async () => {
+    const result = await verifyRetainedEntry({
+      entry: base.entry,
+      root: base.root,
+      namespaceRoots: [fixtureRoot as string],
+      artifactDir: base.artifactDir,
+      allowTemporaryArtifactDir: true,
+      clock: eligible(),
+      deadline: Date.now() - 1,
+    })
+    expect(result.verdict).toBe("unknown")
+    expect(result.gates.find((gate) => gate.gate === "positive-custody")).toMatchObject({
+      status: "unknown",
+      message: expect.stringContaining("shared proof deadline is exhausted"),
+    })
+    expect(retentionRemovalBoundary(result).authorized).toBe(false)
+  })
+
   // AC #33010: incomplete contents cannot be promoted to empty-risk custody. The custody
   // suite receives completed components; only this real verifier fixture proves its caller
   // preserves failed/partial scans before entering the new empty-risk path.
