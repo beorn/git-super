@@ -946,6 +946,37 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     },
   )
 
+  // review2 REVISE on r4: a noncommit durable root is still an admitted root, so a store whose only ref tags a tree or
+  // blob is fscked and witnesses; judging emptiness by commit roots alone would skip it.
+  test.each(["tree", "blob"])(
+    "a store whose only durable ref tags a %s is fscked and witnesses, never named a non-witness",
+    async (kind) => {
+      const holder = realpathSync(tmp("git-super-custody-noncommit-only-"))
+      git(holder, ["init", "-q", "-b", "main"])
+      writeFileSync(join(holder, "payload.txt"), "noncommit root\n")
+      const blob = git(holder, ["hash-object", "-w", "payload.txt"])
+      git(holder, ["add", "payload.txt"])
+      const root = kind === "blob" ? blob : git(holder, ["write-tree"])
+      git(holder, ["tag", `only-${kind}`, root])
+      expect(git(holder, ["for-each-ref", "--format=%(refname) %(objecttype)"])).toBe(`refs/tags/only-${kind} ${kind}`)
+      const fsckIn: string[] = []
+      const counting: GitRun = (args, options) => {
+        if (args.includes("fsck")) fsckIn.push(args.find((arg) => arg.startsWith("--git-dir="))!.slice(10))
+        return defaultGitRun(args, options)
+      }
+      const sidecarDir = tmp("git-super-custody-noncommit-only-sidecars-")
+      const component = await componentOf([root], sidecarDir, "owned", { [root]: kind })
+      const scan = await scanCustody(holder, [component], [join(holder, ".git", "objects")], [], {
+        sidecarDir,
+        run: counting,
+      })
+      expect(scan.status, scan.detail).toBe("pass")
+      expect(scan.witnesses).toEqual([expect.objectContaining({ ref: `refs/tags/only-${kind}`, tip: root })])
+      expect(fsckIn).toEqual([join(holder, ".git")])
+      expect(scan.detail).not.toContain("no admitted durable refs")
+    },
+  )
+
   test("under the publish policy a store with no local refs but a published target tip is still fscked", async () => {
     const { remote, work, primary } = publishedStores("git-super-custody-nonwitness-published-")
     writeFileSync(join(work, "b.txt"), "beta\n")

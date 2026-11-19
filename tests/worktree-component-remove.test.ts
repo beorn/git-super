@@ -347,7 +347,16 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
               git(witness, "update-ref", "refs/heads/main", otherTip)
               replacedAfterRead = true
             }
-            if (!paused && request.args.includes("fsck") && request.args.includes(`--git-dir=${witnessDir}`)) {
+            // Pause on gate 5's object-format read of the witness, the call just before its ref listing (#35062 reads
+            // refs before fsck), so a ref moved in the gap is what the proof reads. A paused stream has already run
+            // its own git, so the pause must sit on an earlier call. The freshness fingerprint's reads carry
+            // --no-optional-locks; gate 5's do not.
+            if (
+              !paused &&
+              request.args.includes("--show-object-format") &&
+              !request.args.includes("--no-optional-locks") &&
+              request.args.includes(`--git-dir=${witnessDir}`)
+            ) {
               paused = true
               entered.resolve()
               return {
@@ -1626,7 +1635,14 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
         gitProcess: {
           run: local.run,
           stream: (request) => {
-            if (!mutatedDuringProof && request.args.includes("fsck")) {
+            // Gate 5's ref listing, which every witness store reaches (#35062): with target "release" no store admits
+            // a durable root, so fsck never runs. The freshness fingerprint's listing carries --no-optional-locks.
+            if (
+              !mutatedDuringProof &&
+              request.args.includes("for-each-ref") &&
+              request.args.includes("--format=%(refname)%09%(objectname)%09%(objecttype)") &&
+              !request.args.includes("--no-optional-locks")
+            ) {
               writeFileSync(join(alphaGitDir, "ORIG_HEAD"), `${alphaHead}\n`)
               mutatedDuringProof = true
             }
