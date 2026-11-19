@@ -743,6 +743,45 @@ describe("retention retirement batch (#33010)", async () => {
     180_000,
   )
 
+  // AC #35062 (@cto 35062-vanished-witness-go-0445): custody now drops a witness store that is gone by ENOENT, but the
+  // held phase is unchanged. A witness store outside every entry that existed at the scan and is removed before the
+  // lease window still ends the batch through the estate delta, and nothing is deleted.
+  it("a witness store removed after the scan still ends the batch at the held estate delta", async () => {
+    const dependency = join(fixtureRoot, "dependency")
+    const { entries, branches } = await atRiskEntries(["risk-c"])
+    const spare = join(fixtureRoot, "spare-witness")
+    git(fixtureRoot, ["clone", "-q", "--no-local", dependency, spare])
+    const spareStore = join(spare, ".git", "objects")
+    const retainUntil = entries.map((entry) =>
+      Date.parse(
+        (JSON.parse(readFileSync(join(entry, "manifest.json"), "utf8")) as { retainUntil: string }).retainUntil,
+      ),
+    )
+    try {
+      const result = await retireRetainedBatch(
+        options({
+          apply: true,
+          clock: new Date(Math.max(eligible.getTime(), ...retainUntil) + 1000),
+          afterScan: () => rmSync(spare, { recursive: true, force: true }),
+        }),
+      )
+      expect(result.stopped).toContain("census-shifted")
+      expect(result.stopped).toContain("vanished")
+      expect(result.stopped).toContain("spare-witness")
+      expect(
+        result.rows.every((row) => row.outcome === "kept"),
+        JSON.stringify(result.rows),
+      ).toBe(true)
+      for (const entry of entries) expect(existsSync(entry)).toBe(true)
+      expect(existsSync(spareStore)).toBe(false)
+    } finally {
+      rmSync(spare, { recursive: true, force: true })
+      for (const branch of branches) {
+        if (git(dependency, ["branch", "--list", branch]) !== "") git(dependency, ["branch", "-q", "-D", branch])
+      }
+    }
+  }, 180_000)
+
   // Accepted requirement: a bounded lease ends with named remaining entries; the old multi-window loop
   // mistakes its own first deletion for an outsider's estate change when it reuses the original scan.
   it("ends after one lease window when the budget expires, naming the remaining entries", async () => {

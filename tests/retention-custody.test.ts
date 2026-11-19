@@ -7,7 +7,17 @@
  * @testonly none
  * @reach fs-walk <fixture-only: counts lines in the scan's own temporary sidecar directory>
  */
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs"
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs"
 import { spawnSync } from "node:child_process"
 import { createHash } from "node:crypto"
 import { tmpdir } from "node:os"
@@ -543,7 +553,9 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
 
   // AC #35062: a shared index whose file is emptied or removed after its build is unknown for the next member, never
   // a join against a smaller (or no) witness set. A per-scan index is never re-read, so no existing row reaches this.
-  test.each(["emptied", "removed"])(
+  // "altered" keeps the size: one hex digit of an indexed OID flipped in place, so only the digest can tell (review2
+  // REVISE on f2e10d08). Unchecked, the next member could pair an at-risk OID with a witness it never had.
+  test.each(["emptied", "removed", "altered"])(
     "a shared witness index %s after its build is unknown for the next member",
     async (fault) => {
       const fixture = custodyCase("shared history")
@@ -561,10 +573,21 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
         },
       )
       expect(first.status, first.detail).toBe("pass")
+      let altered = 0
       for (const name of readdirSync(indexDir)) {
-        if (fault === "emptied") writeFileSync(join(indexDir, name), "")
-        else rmSync(join(indexDir, name))
+        const path = join(indexDir, name)
+        if (fault === "emptied") writeFileSync(path, "")
+        else if (fault === "removed") rmSync(path)
+        else {
+          const before = readFileSync(path, "utf8")
+          if (!/^[0-9a-f]{40}\t/u.test(before)) continue
+          const after = (before[0] === "0" ? "1" : "0") + before.slice(1)
+          writeFileSync(path, after)
+          expect(statSync(path).size).toBe(Buffer.byteLength(before))
+          altered += 1
+        }
       }
+      if (fault === "altered") expect(altered).toBeGreaterThan(0)
       const secondDir = tmp("git-super-custody-shared-fault-second-")
       const second = await scanCustody(
         fixture.root,
@@ -577,7 +600,7 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
         },
       )
       expect(second.status).toBe("unknown")
-      expect(second.detail).toMatch(fault === "emptied" ? /no longer matches its reference/u : /cannot be re-read/u)
+      expect(second.detail).toMatch(fault === "removed" ? /cannot be re-read/u : /no longer matches its reference/u)
       expect(second.witnesses).toEqual([])
     },
   )
@@ -906,6 +929,104 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     const scan = await scanCustody(store.root, [component], [notAStore], [], { sidecarDir })
     expect(scan.status).toBe("unknown")
     expect(scan.detail).toContain("not a Git object directory")
+  })
+
+  // AC #35062 (@cto 35062-vanished-witness-go-0445): a witness store removed after the estate scan (a worktree another
+  // seat removed) is gone by ENOENT when custody resolves it. It is dropped from witness selection and named; it never
+  // proves custody alone. Before this, every at-risk entry in the batch went unknown on that one ENOENT (04:31 run).
+  test.each(["another witness survives", "the only witness is gone"])(
+    "a witness store gone since the estate scan is named and never a witness: %s",
+    async (kind) => {
+      const lender = repoWithCommit("git-super-custody-vanish-lender-")
+      const survivor = tmp("git-super-custody-vanish-survivor-")
+      if (kind === "another witness survives") git(survivor, ["clone", "-q", "--no-local", lender.root, "copy"])
+      else {
+        git(survivor, ["init", "-q", "-b", "main", "copy"])
+        writeFileSync(join(survivor, "copy", "b.txt"), "unrelated\n")
+        git(join(survivor, "copy"), ["add", "b.txt"])
+        git(join(survivor, "copy"), ["commit", "-q", "-m", "unrelated"])
+      }
+      const survivorStore = realpathSync(join(survivor, "copy", ".git", "objects"))
+      const goneStore = join(lender.root, ".git", "objects")
+      rmSync(lender.root, { recursive: true, force: true })
+      const sidecarDir = tmp("git-super-custody-vanish-sidecars-")
+      const component = await componentOf([lender.head], sidecarDir, "owned", { [lender.head]: "commit" })
+      const scan = await scanCustody(join(survivor, "copy"), [component], [goneStore, survivorStore], [], {
+        sidecarDir,
+      })
+      expect(scan.detail).toContain(
+        `1 witness store(s) gone since the estate scan, not used as witnesses: ${goneStore}`,
+      )
+      expect(scan.witnesses.map((witness) => witness.store)).not.toContain(goneStore)
+      if (kind === "another witness survives") {
+        expect(scan.status, scan.detail).toBe("pass")
+        expect(scan.witnesses).toEqual([
+          expect.objectContaining({ store: survivorStore, ref: "refs/heads/main", tip: lender.head }),
+        ])
+      } else {
+        expect(scan.status, scan.detail).toBe("blocked")
+        expect(scan.missing).toEqual([expect.objectContaining({ oid: lender.head })])
+      }
+    },
+  )
+
+  test("a witness store gone before the next member is never reused from the shared index", async () => {
+    const lender = repoWithCommit("git-super-custody-vanish-shared-")
+    const survivor = tmp("git-super-custody-vanish-shared-survivor-")
+    git(survivor, ["clone", "-q", "--no-local", lender.root, "copy"])
+    const survivorStore = realpathSync(join(survivor, "copy", ".git", "objects"))
+    const lenderStore = realpathSync(join(lender.root, ".git", "objects"))
+    // Only the lender holds the second commit, so before it goes the lender is the sole witness for it.
+    writeFileSync(join(lender.root, "c.txt"), "only here\n")
+    git(lender.root, ["add", "c.txt"])
+    git(lender.root, ["commit", "-q", "-m", "only here"])
+    const onlyLender = git(lender.root, ["rev-parse", "HEAD"])
+    const indexScope = new CustodyIndexScope(tmp("git-super-custody-vanish-shared-index-"))
+    const stores = [lenderStore, survivorStore]
+    const firstDir = tmp("git-super-custody-vanish-shared-first-")
+    const first = await scanCustody(join(survivor, "copy"), [await componentOf([onlyLender], firstDir)], stores, [], {
+      sidecarDir: firstDir,
+      indexScope,
+    })
+    expect(first.status, first.detail).toBe("pass")
+    expect(first.witnesses).toEqual([expect.objectContaining({ store: lenderStore })])
+    rmSync(lender.root, { recursive: true, force: true })
+    const secondDir = tmp("git-super-custody-vanish-shared-second-")
+    const second = await scanCustody(
+      join(survivor, "copy"),
+      [await componentOf([onlyLender, lender.head], secondDir)],
+      stores,
+      [],
+      {
+        sidecarDir: secondDir,
+        indexScope,
+      },
+    )
+    // The surviving set changed, so the index is rebuilt from it: the gone lender's witness does not carry over.
+    expect(second.status, second.detail).toBe("blocked")
+    expect(second.missing.map((target) => target.oid)).toEqual([onlyLender])
+    expect(second.witnesses.map((witness) => witness.store)).toEqual([survivorStore])
+    expect(second.detail).toContain(`not used as witnesses: ${lenderStore}`)
+  })
+
+  test("a witness store that cannot be resolved for any reason but absence stays unknown", async () => {
+    const store = repoWithCommit("git-super-custody-vanish-eacces-")
+    const sidecarDir = tmp("git-super-custody-vanish-eacces-sidecars-")
+    const component = await componentOf([store.head], sidecarDir, "owned")
+    const fence = tmp("git-super-custody-vanish-fence-")
+    git(fence, ["init", "-q", "-b", "main", "inner"])
+    const fenced = join(fence, "inner", ".git", "objects")
+    chmodSync(fence, 0o000)
+    try {
+      const scan = await scanCustody(store.root, [component], [join(store.root, ".git", "objects"), fenced], [], {
+        sidecarDir,
+      })
+      expect(scan.status).toBe("unknown")
+      expect(scan.detail).toMatch(/EACCES/u)
+      expect(scan.detail).not.toContain("gone since the estate scan")
+    } finally {
+      chmodSync(fence, 0o700)
+    }
   })
 
   test("fsck gets the custody bound as a hard child deadline, so a hung git is unknown, not a block", async () => {

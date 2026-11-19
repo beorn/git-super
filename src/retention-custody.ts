@@ -901,6 +901,13 @@ async function rebaseWitness(
  * it stays refused, and the detail says so by name.
  */
 /** #34920: stores whose refs were walked in full because their traversal could not be shown plain. */
+function vanishedDetail(stores: ReadonlyArray<string>): string {
+  if (stores.length === 0) return ""
+  const shown = stores.slice(0, 5).join(", ")
+  const more = stores.length > 5 ? ` and ${String(stores.length - 5)} more` : ""
+  return `; ${String(stores.length)} witness store(s) gone since the estate scan, not used as witnesses: ${shown}${more}`
+}
+
 function unsubtractedDetail(stores: ReadonlyArray<string>): string {
   if (stores.length === 0) return ""
   const shown = stores.slice(0, 5).join(", ")
@@ -956,9 +963,21 @@ async function runCustody(
       missingCount: 0,
     }
   }
-  const stores = [...new Set(witnessStores.map((store) => realpathSync(store)))]
-    .filter((store) => !removal.some((root) => within(root, store)))
-    .sort()
+  // #35062 (@cto 35062-vanished-witness-go-0445): a candidate witness store proven absent by ENOENT when its path is
+  // resolved (a worktree removed after the estate scan) is excluded from witness selection and named. It contributes
+  // no ref, object or index fragment; every at-risk object still needs a surviving witness, so dropping it can only
+  // keep more. Any other failure (EACCES, I/O, a malformed store) stays as before, and the estate facts keep the path.
+  const vanished: string[] = []
+  const canonical: string[] = []
+  for (const store of witnessStores) {
+    try {
+      canonical.push(realpathSync(store))
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException | undefined)?.code !== "ENOENT") throw error
+      vanished.push(store)
+    }
+  }
+  const stores = [...new Set(canonical)].filter((store) => !removal.some((root) => within(root, store))).sort()
   const badStore = stores.find((store) => !isObjectDir(store))
   if (badStore !== undefined) {
     return {
@@ -1171,7 +1190,7 @@ async function runCustody(
     const loss = await describeLoss(finalMissing, components, copyRoot, run)
     return {
       status: "blocked",
-      detail: `${missingCount} at-risk OID(s) have no durable witness, e.g. ${first.component} ${first.oid} (${first.source}); first ${missing.length} inline, full list in ${missingSidecar?.path ?? "a sidecar"}${uncheckedDetail(unchecked)}${unsubtractedDetail(unsubtracted)}`,
+      detail: `${missingCount} at-risk OID(s) have no durable witness, e.g. ${first.component} ${first.oid} (${first.source}); first ${missing.length} inline, full list in ${missingSidecar?.path ?? "a sidecar"}${uncheckedDetail(unchecked)}${unsubtractedDetail(unsubtracted)}${vanishedDetail(vanished)}`,
       witnesses,
       witnessCount,
       ...(witnessSidecar === undefined ? {} : { witnessSidecar }),
@@ -1184,7 +1203,7 @@ async function runCustody(
   }
   return {
     status: "pass",
-    detail: `${witnessCount} at-risk OID(s) each have a named surviving witness across ${stores.length} store(s), ${witnesses.length} distinct identities${rebased.length === 0 ? "" : `, plus ${String(rebased.length)} rebased commit(s) matched by whitespace-sensitive patch-id to the published main graph`}${uncheckedDetail(unchecked)}${unsubtractedDetail(unsubtracted)}`,
+    detail: `${witnessCount} at-risk OID(s) each have a named surviving witness across ${stores.length} store(s), ${witnesses.length} distinct identities${rebased.length === 0 ? "" : `, plus ${String(rebased.length)} rebased commit(s) matched by whitespace-sensitive patch-id to the published main graph`}${uncheckedDetail(unchecked)}${unsubtractedDetail(unsubtracted)}${vanishedDetail(vanished)}`,
     witnesses,
     witnessCount,
     ...(witnessSidecar === undefined ? {} : { witnessSidecar }),
