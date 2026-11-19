@@ -307,14 +307,16 @@ async function* rootOidLines(
     /**
      * Read the gitdir as a detached store: a retained copy still records `core.worktree` for the checkout
      * its removal deleted, and plain `--git-dir` dies on chdir to that missing path ("cannot chdir"), so
-     * gate 4 refused stores it could read (#34920, @cto 34920-ranking-and-bare-r2 §2). `--bare` selects the
-     * command context only: it rewrites no config and keeps the `core.worktree` evidence. Same seam as
-     * retention-compact's runAtGitDir.
+     * gate 4 refused stores it could read (#34920, @cto 34920-ranking-and-bare-r2 §2). `--work-tree=<gitDir>`
+     * selects the command context only: it rewrites no config and keeps the `core.worktree` evidence. Not
+     * `--bare`: git 2.53 (the host's /usr/bin/git) still chdirs to the recorded worktree under `--bare` and dies,
+     * while 2.56 does not, so `--bare` made gate 4 depend on which git a PATH resolves. The same context as gate 5's
+     * atStore and retention-compact's runAtGitDir.
      */
     readonly detached: boolean
   },
 ): AsyncGenerator<string> {
-  const at = options.detached ? ["--bare", `--git-dir=${gitDir}`] : [`--git-dir=${gitDir}`]
+  const at = options.detached ? [`--git-dir=${gitDir}`, `--work-tree=${gitDir}`] : [`--git-dir=${gitDir}`]
   const refs = await run([...at, "for-each-ref", "--format=%(objectname) %(refname)"])
   refuseSuccessfulStderr(refs, `for-each-ref in ${gitDir}`)
   if (refs.code !== 0) throw new UnknownError(`for-each-ref failed in ${gitDir}: ${refs.stderr.trim()}`)

@@ -99,12 +99,13 @@ async function runAtGitDir(
   gitProcess: GitProcess,
   execution?: RemovalExecution,
 ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
-  // --bare: the retained copy still records core.worktree for the checkout native --force just
-  // deleted. Without it, for-each-ref and pack-refs die on chdir to that missing path.
+  // --work-tree=<gitDir>: the retained copy still records core.worktree for the checkout native --force just
+  // deleted. Without it, for-each-ref and pack-refs die on chdir to that missing path. Not --bare: git 2.53 still
+  // chdirs to the recorded worktree under --bare, 2.56 does not (#34920); --work-tree works on both.
   checkRemovalExecution(execution)
   const result = await gitProcess.run({
     repo: dirname(gitDir),
-    args: ["--git-dir", gitDir, "--bare", ...args],
+    args: ["--git-dir", gitDir, "--work-tree", gitDir, ...args],
     env: cleanGitRepositoryEnvironment(),
     ...(execution?.signal === undefined ? {} : { signal: execution.signal }),
     ...(execution?.remainingMs === undefined ? {} : { timeoutMs: Math.max(1, Math.floor(execution.remainingMs())) }),
