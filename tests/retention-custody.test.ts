@@ -874,6 +874,33 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     expect(scan.detail).toContain("fsck --full failed")
   })
 
+  // #35062: the 05:12 dry run rebuilt a failing shared index once per member (~3.5 min each) for one fsck refusal.
+  test("a shared witness index whose build failed fails the next member alike without rebuilding it", async () => {
+    const fixture = custodyCase("shared history")
+    let fsck = 0
+    const broken: GitRun = (args, options) => {
+      if (!args.includes("fsck")) return defaultGitRun(args, options)
+      fsck += 1
+      return { code: 1, stdout: "", stderr: "missing blob" }
+    }
+    const indexScope = new CustodyIndexScope(tmp("git-super-custody-failed-build-"))
+    const scans: CustodyScan[] = []
+    for (const oid of fixture.atRisk.slice(0, 2)) {
+      const sidecarDir = tmp("git-super-custody-failed-build-member-")
+      scans.push(
+        await scanCustody(fixture.root, [await componentOf([oid], sidecarDir)], fixture.stores, [], {
+          sidecarDir,
+          run: broken,
+          indexScope,
+        }),
+      )
+    }
+    expect(scans.map((scan) => scan.status)).toEqual(["unknown", "unknown"])
+    expect(scans[1]!.detail).toBe(scans[0]!.detail)
+    expect(scans[0]!.detail).toContain("fsck --full failed")
+    expect(fsck).toBe(1)
+  })
+
   test("a witness store whose recorded core.worktree is gone is read detached and still witnesses (#34920)", async () => {
     const store = repoWithCommit("git-super-custody-")
     const sidecarDir = tmp("git-super-custody-sidecars-")

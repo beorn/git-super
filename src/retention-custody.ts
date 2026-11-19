@@ -165,15 +165,19 @@ export class CustodyIndexScope {
     this.dir = dir
   }
 
-  /** The index for `key`, built by `build` on first use; a failed build is not kept, so the next scan retries it. */
+  /**
+   * The index for `key`, built by `build` on first use. A failed build is kept for the rest of the phase: every later
+   * member with the same key gets the same failure (unknown) at once instead of rebuilding it. The build's inputs are
+   * the key and the batch's shared deadline, so a retry inside one phase meets the same failure; the 2026-11-19 05:12
+   * dry run paid ~3.5 min three times for one fsck refusal (#35062). Keeping a failure can only keep more entries.
+   */
   async witnessIndex(key: string, build: () => Promise<BuiltWitnessIndex>): Promise<BuiltWitnessIndex> {
     const existing = this.builds.get(key)
     if (existing === undefined) {
       const pending = build()
       this.builds.set(key, pending)
-      pending.catch(() => {
-        if (this.builds.get(key) === pending) this.builds.delete(key)
-      })
+      // Marked handled here; each caller still awaits the same rejection.
+      pending.catch(() => undefined)
       return pending
     }
     const built = await existing
