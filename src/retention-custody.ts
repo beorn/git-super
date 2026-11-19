@@ -13,8 +13,8 @@
  * merge-joined against that index, so peak memory is the sort run buffer plus a line per stream,
  * not a 20,000,000-entry Map.
  */
-import { existsSync, readFileSync, realpathSync, statSync } from "node:fs"
-import { dirname, isAbsolute, join, relative, sep } from "node:path"
+import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from "node:fs"
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { alternateEntries } from "./alternates.ts"
 import { tryGit, withGitTimeout } from "./git.ts"
 import {
@@ -415,6 +415,42 @@ interface DurableRefRecord {
   readonly format: string
   readonly fragment: SidecarRef
   readonly complete: boolean
+  /** Read as a detached gitdir because its recorded core.worktree is gone (#34920). */
+  readonly detached: boolean
+}
+
+/**
+ * #34920 (@cto 34920-ranking-and-bare-r2 §2, the gate 4 class): a store that still records `core.worktree` for a
+ * checkout that is gone dies on chdir to that missing path ("cannot chdir", live: .git/modules/vendor/brain8). Gate 5
+ * reads such a store with `--work-tree=<gitDir>`, not gate 4's `--bare`: `fsck --full` runs `refs verify`,
+ * `multi-pack-index verify` and `commit-graph verify` as children, which do not inherit `--bare` but do inherit the
+ * GIT_WORK_TREE that `--work-tree` exports. It is a command context only: nothing here writes a worktree, no config is
+ * rewritten, and `core.worktree` stays as evidence. A store with no recorded worktree, or one that exists, is read
+ * exactly as before.
+ */
+async function worktreeGone(gitDir: string, run: GitRun): Promise<boolean> {
+  const configured = await run(["config", "--file", join(gitDir, "config"), "--get", "core.worktree"])
+  refuseSuccessfulStderr(configured, `config --get core.worktree in ${gitDir}`)
+  if (configured.code === 1) return false
+  if (configured.code !== 0) {
+    throw new UnknownError(`config --get core.worktree failed in ${gitDir}: ${configured.stderr.trim()}`)
+  }
+  const worktree = resolve(gitDir, configured.stdout.trim())
+  try {
+    return lstatSync(worktree, { throwIfNoEntry: false }) === undefined
+  } catch (error) {
+    // A path component that is a file proves the worktree cannot exist; any other failure is not absence.
+    if ((error as NodeJS.ErrnoException).code === "ENOTDIR") return true
+    throw new UnknownError(`cannot probe recorded core.worktree ${worktree} of ${gitDir}: ${String(error)}`)
+  }
+}
+
+function atStore(run: GitRun, gitDir: string, detached: boolean): GitRun {
+  return detached ? (args, options) => run([`--work-tree=${gitDir}`, ...args], options) : run
+}
+
+function atStoreStream(stream: GitStreamFactory, gitDir: string, detached: boolean): GitStreamFactory {
+  return detached ? (args, options) => stream([`--work-tree=${gitDir}`, ...args], options) : stream
 }
 
 /** #34920: a store's traversal may be subtracted across stores only when nothing rewrites or truncates it. */
@@ -560,12 +596,16 @@ async function indexWitnessStores(
   let refGraphMs = 0
   for (const store of stores) {
     const gitDir = dirname(store)
-    const format = await objectFormat(gitDir, run)
+    // #34920: a witness store whose recorded core.worktree is gone is read detached (see worktreeGone).
+    const detached = await worktreeGone(gitDir, run)
+    const storeRun = atStore(run, gitDir, detached)
+    const storeStream = atStoreStream(stream, gitDir, detached)
+    const format = await objectFormat(gitDir, storeRun)
     if (format.status !== "ok") throw new UnknownError(format.detail)
     formats.set(store, format.format)
     let publishedBranchTip: string | undefined
     if (witnessPolicy !== undefined) {
-      const shallow = await run([`--git-dir=${gitDir}`, "rev-parse", "--is-shallow-repository"])
+      const shallow = await storeRun([`--git-dir=${gitDir}`, "rev-parse", "--is-shallow-repository"])
       refuseSuccessfulStderr(shallow, `rev-parse --is-shallow-repository in ${gitDir}`)
       if (shallow.code !== 0 || !["true", "false"].includes(shallow.stdout.trim())) {
         throw new UnknownError(
@@ -576,6 +616,7 @@ async function indexWitnessStores(
         throw new UnknownError(`witness graph in ${gitDir} is shallow and cannot prove complete custody`)
       }
       // What the remote publishes now, never this store's possibly days-old copy of it.
+      // Remote refresh stays on the plain runner, never the detached one (@cto 34920-residual-existing-scope-1626).
       const remote = await configuredRemote(gitDir, run)
       if (remote !== undefined) {
         const refreshed = await refreshPublishedRefs(gitDir, remote, witnessPolicy.targetBranch, run)
@@ -587,7 +628,9 @@ async function indexWitnessStores(
     if (closureResult.status !== "ok") throw new UnknownError(closureResult.detail)
     // A hung `fsck` is killed at the declared deadline and reported unknown, never blocking.
     const fsckStarted = clock()
-    const fsck = await run([`--git-dir=${gitDir}`, "fsck", "--full", "--no-progress"], { timeoutMs: bounds.fsckMs })
+    const fsck = await storeRun([`--git-dir=${gitDir}`, "fsck", "--full", "--no-progress"], {
+      timeoutMs: bounds.fsckMs,
+    })
     witnessFsckMs += clock() - fsckStarted
     refuseSuccessfulStderr(fsck, `fsck --full in witness store ${gitDir}`)
     if (fsck.code !== 0) {
@@ -595,7 +638,7 @@ async function indexWitnessStores(
     }
     const refFormat =
       witnessPolicy === undefined ? "%(refname)%09%(objectname)" : "%(refname)%09%(objectname)%09%(objecttype)"
-    const refs = await run([`--git-dir=${gitDir}`, "for-each-ref", `--format=${refFormat}`])
+    const refs = await storeRun([`--git-dir=${gitDir}`, "for-each-ref", `--format=${refFormat}`])
     refuseSuccessfulStderr(refs, `for-each-ref in witness store ${gitDir}`)
     if (refs.code !== 0) {
       throw new UnknownError(`for-each-ref failed in witness store ${gitDir}: ${refs.stderr.trim()}`)
@@ -629,8 +672,8 @@ async function indexWitnessStores(
       }
     }
     durable.sort((left, right) => (left.ref < right.ref ? -1 : left.ref > right.ref ? 1 : 0))
-    const selected = witnessPolicy === undefined ? durable : await independentPolicyRefs(durable, gitDir, run)
-    const context = await traversalContext(gitDir, refs.stdout.split("\n"), run, witnessPolicy)
+    const selected = witnessPolicy === undefined ? durable : await independentPolicyRefs(durable, gitDir, storeRun)
+    const context = await traversalContext(gitDir, refs.stdout.split("\n"), storeRun, witnessPolicy)
     if (!context.plain && selected.length > 0) {
       unsubtracted.push(`${gitDir} (${context.reason ?? "traversal not plain"})`)
     }
@@ -650,7 +693,16 @@ async function indexWitnessStores(
         seen.add(earlier.tip)
         subtract.push(earlier.tip)
       }
-      const fragment = await reachableSidecar(gitDir, entry.tip, subtract, stream, bounds, clock, sidecarDir, deadline)
+      const fragment = await reachableSidecar(
+        gitDir,
+        entry.tip,
+        subtract,
+        storeStream,
+        bounds,
+        clock,
+        sidecarDir,
+        deadline,
+      )
       records.push({
         store,
         gitDir,
@@ -659,6 +711,7 @@ async function indexWitnessStores(
         format: format.format,
         fragment,
         complete: subtract.length === 0,
+        detached,
       })
       prior.push({ store, tip: entry.tip, plain: context.plain })
     }
@@ -896,7 +949,11 @@ async function runCustody(
   try {
     for (const component of components) {
       remaining()
-      const format = await objectFormat(component.gitDir ?? join(copyRoot, component.component), proofRun)
+      const componentGitDir = component.gitDir ?? join(copyRoot, component.component)
+      const format = await objectFormat(
+        componentGitDir,
+        atStore(proofRun, componentGitDir, await worktreeGone(componentGitDir, proofRun)),
+      )
       if (format.status !== "ok") throw new UnknownError(format.detail)
       await mergeSorted(
         [
@@ -1012,7 +1069,7 @@ async function runCustody(
         record.gitDir,
         record.tip,
         [],
-        proofStream,
+        atStoreStream(proofStream, record.gitDir, record.detached),
         bounds,
         clock,
         sidecarDir,

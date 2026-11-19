@@ -688,6 +688,53 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     expect(scan.detail).toContain("fsck --full failed")
   })
 
+  test("a witness store whose recorded core.worktree is gone is read detached and still witnesses (#34920)", async () => {
+    const store = repoWithCommit("git-super-custody-")
+    const sidecarDir = tmp("git-super-custody-sidecars-")
+    const component = await componentOf([store.head], sidecarDir, "owned")
+    // A retained module store: its checkout was removed, but its config still names it (live: vendor/brain8).
+    const clone = tmp("git-super-custody-module-")
+    git(clone, ["clone", "-q", "--no-hardlinks", store.root, "work"])
+    const gitDir = join(clone, "work", ".git")
+    git(clone, ["--git-dir", gitDir, "config", "core.worktree", "../../gone-checkout"])
+    const scan = await scanCustody(store.root, [component], [join(gitDir, "objects")], [], { sidecarDir })
+    expect(scan.detail).not.toContain("cannot chdir")
+    expect(scan.status).toBe("pass")
+    expect(scan.witnesses[0]).toMatchObject({ ref: "refs/heads/main", tip: store.head })
+    // Detached is a command context only: the recorded worktree stays as evidence.
+    expect(git(clone, ["config", "--file", join(gitDir, "config"), "core.worktree"])).toBe("../../gone-checkout")
+  })
+
+  test("a detached witness store missing an object is still unknown, never custody (#34920)", async () => {
+    const store = repoWithCommit("git-super-custody-")
+    const sidecarDir = tmp("git-super-custody-sidecars-")
+    const component = await componentOf([store.head], sidecarDir, "owned")
+    const clone = tmp("git-super-custody-module-")
+    git(clone, ["clone", "-q", "--no-hardlinks", store.root, "work"])
+    const gitDir = join(clone, "work", ".git")
+    const blob = git(clone, ["--git-dir", gitDir, "rev-parse", "HEAD:a.txt"])
+    git(clone, ["--git-dir", gitDir, "config", "core.worktree", "../../gone-checkout"])
+    rmSync(join(gitDir, "objects", blob.slice(0, 2), blob.slice(2)), { force: true })
+    const scan = await scanCustody(store.root, [component], [join(gitDir, "objects")], [], { sidecarDir })
+    expect(scan.status).toBe("unknown")
+    expect(scan.detail).toContain("fsck --full failed")
+    expect(scan.detail).not.toContain("cannot chdir")
+  })
+
+  test("a failed core.worktree probe is unknown, never read as absence (#34920)", async () => {
+    const store = repoWithCommit("git-super-custody-")
+    const sidecarDir = tmp("git-super-custody-sidecars-")
+    const component = await componentOf([store.head], sidecarDir, "owned")
+    const broken: GitRun = (args, options) =>
+      args.includes("core.worktree") ? { code: 3, stdout: "", stderr: "bad config" } : defaultGitRun(args, options)
+    const scan = await scanCustody(store.root, [component], [join(store.root, ".git", "objects")], [], {
+      sidecarDir,
+      run: broken,
+    })
+    expect(scan.status).toBe("unknown")
+    expect(scan.detail).toContain("config --get core.worktree failed")
+  })
+
   test("a store that is not a Git object directory is unknown", async () => {
     const store = repoWithCommit("git-super-custody-")
     const sidecarDir = tmp("git-super-custody-sidecars-")
