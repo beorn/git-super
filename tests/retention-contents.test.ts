@@ -186,6 +186,31 @@ describe("retention contents scan — gate 4 (#27443(b))", () => {
     expect(readFileSync(join(gitDir, "config"), "utf8")).toContain(`worktree = ${gone}`)
     expect(head).toMatch(/^[0-9a-f]{40}$/)
   })
+  /**
+   * @failure Gate 4 read detached stores under `--bare`, which git 2.53 (the host's /usr/bin/git) still resolves against
+   * the recorded core.worktree and dies on ("cannot chdir"), while 2.56 does not: the read depended on which git a PATH
+   * resolved, and @dev/brain's runs kept 667 receipts (#34920). The test above passes on either context under 2.56,
+   * so it cannot see a return to `--bare`.
+   * @level l2
+   * @consumer retire-batch gate 4 on Yrd retained module stores
+   */
+  test("a detached store is read with --work-tree on its own gitdir, never --bare", async () => {
+    const { root, gitDir } = repoWithCommit("git-super-contents-detached-context-")
+    git(root, ["config", "--file", join(gitDir, "config"), "core.worktree", "../../removed-env/nested/checkout"])
+    const calls: string[][] = []
+    const run: GitRun = (args, options) => {
+      calls.push([...args])
+      return defaultGitRun(args, options)
+    }
+    const result = await scan(root, componentEntries(".git"), { run })
+    expect(result.status).toBe("pass")
+    const reads = calls.filter((args) => args.includes(`--git-dir=${gitDir}`))
+    expect(reads.map((args) => args.find((arg) => !arg.startsWith("--")))).toEqual(
+      expect.arrayContaining(["for-each-ref", "rev-parse", "ls-files"]),
+    )
+    for (const args of reads) expect(args).toContain(`--work-tree=${gitDir}`)
+    expect(calls.flat()).not.toContain("--bare")
+  })
   test("a detached store that lost a root object stays blocked, not passed, after the context fix", async () => {
     const { root, gitDir } = repoWithCommit("git-super-contents-detached-lost-")
     const lost = hashObject(root, "index-only-root\n")
