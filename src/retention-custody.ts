@@ -26,6 +26,7 @@ import {
   oidKey,
   readLines,
   SidecarWriter,
+  verifySidecar,
   type GitLineStream,
   type SidecarRef,
 } from "./retention-stream.ts"
@@ -129,6 +130,65 @@ export interface CustodyScanOptions {
   readonly witnessPolicy?: Readonly<{ targetBranch: string }>
   /** Records a named span of this scan. The removal caller folds these into its phase log. */
   readonly onPhase?: (name: string, ms: number) => void
+  /**
+   * #35062: the run-owned witness index this scan shares with the other members of its proof phase. Absent, the scan
+   * builds its own index in `sidecarDir`, as a single-entry verify always has.
+   */
+  readonly indexScope?: CustodyIndexScope
+}
+
+/** One built witness index: the ranked durable-ref records and the merged OID -> rank file every scan joins against. */
+interface BuiltWitnessIndex {
+  readonly records: readonly DurableRefRecord[]
+  readonly formats: ReadonlyMap<string, string>
+  readonly published: ReadonlyArray<Readonly<{ store: string; tip: string }>>
+  readonly unsubtracted: readonly string[]
+  readonly index: SidecarRef
+}
+
+/**
+ * #35062 (@cto 34920-shared-index-ruling-1931 §2, 35047-existing-scope-0158 §1-2): one run-owned witness index for one
+ * proof phase or held lease window, so the members of a retirement batch build it once instead of once each. Its key
+ * is what fixes its meaning: the canonical witness stores, the removal set and the caller policy. The refs, tips,
+ * object formats, traversal contexts and fsck results it holds are those its one build read, so a batch makes a new
+ * scope for its held window and a held proof never joins against preliminary reads. Each scan still joins its own
+ * at-risk rows and reports its own witnesses, coverage and loss. The index and certificate sidecars stay
+ * content-addressed in `dir`; reusing the index re-reads its bytes against its digest first, so a missing or altered
+ * file is unknown, never a smaller witness set. Nothing here outlives the run that made it.
+ */
+export class CustodyIndexScope {
+  readonly dir: string
+  private readonly builds = new Map<string, Promise<BuiltWitnessIndex>>()
+  private readonly certificates = new Map<string, SidecarRef>()
+
+  constructor(dir: string) {
+    this.dir = dir
+  }
+
+  /** The index for `key`, built by `build` on first use; a failed build is not kept, so the next scan retries it. */
+  async witnessIndex(key: string, build: () => Promise<BuiltWitnessIndex>): Promise<BuiltWitnessIndex> {
+    const existing = this.builds.get(key)
+    if (existing === undefined) {
+      const pending = build()
+      this.builds.set(key, pending)
+      pending.catch(() => {
+        if (this.builds.get(key) === pending) this.builds.delete(key)
+      })
+      return pending
+    }
+    const built = await existing
+    await verifySidecar(built.index)
+    return built
+  }
+
+  /** A full-closure certificate an earlier scan in this scope already walked, keyed by `gitDir<TAB>tip`. */
+  certificate(key: string): SidecarRef | undefined {
+    return this.certificates.get(key)
+  }
+
+  keepCertificate(key: string, certificate: SidecarRef): void {
+    this.certificates.set(key, certificate)
+  }
 }
 
 const HEX40 = /^[0-9a-f]{40}$/u
@@ -863,6 +923,7 @@ async function runCustody(
   witnessPolicy?: Readonly<{ targetBranch: string }>,
   deadline?: number,
   onPhase?: (name: string, ms: number) => void,
+  indexScope?: CustodyIndexScope,
 ): Promise<CustodyScan> {
   const remaining = (): number => {
     const left = deadline === undefined ? Number.POSITIVE_INFINITY : deadline - clock()
@@ -922,23 +983,35 @@ async function runCustody(
         ? {}
         : { env: { ...streamOptions.env, GIT_NO_REPLACE_OBJECTS: "1", GIT_NO_LAZY_FETCH: "1" } }),
     })
-  const { records, formats, published, unsubtracted } = await indexWitnessStores(
-    stores,
-    removal,
-    proofStream,
-    proofRun,
-    bounds,
-    clock,
-    sidecarDir,
-    witnessPolicy,
-    deadline,
-    onPhase,
-  )
-  const width = String(Math.max(1, records.length)).length
-  const index = await mergeLabeledFiles(
-    records.map((record, rank) => ({ path: record.fragment.path, label: String(rank).padStart(width, "0") })),
-    { dir: sidecarDir, deadline, clock },
-  )
+  const indexDir = indexScope?.dir ?? sidecarDir
+  const buildIndex = async (): Promise<BuiltWitnessIndex> => {
+    const indexed = await indexWitnessStores(
+      stores,
+      removal,
+      proofStream,
+      proofRun,
+      bounds,
+      clock,
+      indexDir,
+      witnessPolicy,
+      deadline,
+      onPhase,
+    )
+    const width = String(Math.max(1, indexed.records.length)).length
+    const merged = await mergeLabeledFiles(
+      indexed.records.map((record, rank) => ({ path: record.fragment.path, label: String(rank).padStart(width, "0") })),
+      { dir: indexDir, deadline, clock },
+    )
+    return { ...indexed, index: merged }
+  }
+  const { records, formats, published, unsubtracted, index } =
+    indexScope === undefined
+      ? await buildIndex()
+      : await indexScope.witnessIndex(
+          JSON.stringify([stores, [...removal].sort(), witnessPolicy?.targetBranch ?? null]),
+          buildIndex,
+        )
+  remaining()
   const witnessWriter = new SidecarWriter(sidecarDir, "txt")
   const missingWriter = new SidecarWriter(sidecarDir, "txt")
   // The witnesses actually used, in first-use order; only these get a full graph certificate (#34920 A3).
@@ -1068,7 +1141,7 @@ async function runCustody(
   const witnesses: WitnessIdentity[] = []
   for (const record of identities.values()) {
     const key = `${record.gitDir}\t${record.tip}`
-    let certificate = record.complete ? record.fragment : certificates.get(key)
+    let certificate = record.complete ? record.fragment : (certificates.get(key) ?? indexScope?.certificate(key))
     if (certificate === undefined) {
       remaining()
       certificate = await reachableSidecar(
@@ -1078,9 +1151,10 @@ async function runCustody(
         atStoreStream(proofStream, record.gitDir, record.detached),
         bounds,
         clock,
-        sidecarDir,
+        indexDir,
         deadline,
       )
+      indexScope?.keepCertificate(key, certificate)
     }
     certificates.set(key, certificate)
     witnesses.push({ store: record.store, ref: record.ref, tip: record.tip, graphDigest: certificate.sha256 })
@@ -1231,6 +1305,7 @@ export async function scanCustody(
       options.witnessPolicy,
       options.deadline,
       options.onPhase,
+      options.indexScope,
     )
   } catch (error) {
     return {

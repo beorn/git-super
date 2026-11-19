@@ -919,7 +919,7 @@ async function runInvocation(
     )
     .option(
       "--proof-deadline-seconds <seconds>",
-      "proof budget for the batch: an entry not proved by then is kept with the cause named (default 1080, under Yrd's 1200 s timeout)",
+      "proof budget for the batch: an entry not proved by then is kept with the cause named (default 960: the report after it took 105 s on the live estate, under Yrd's 1200 s timeout)",
     )
     .argument("<entries...>", "exact retained entries selected by the caller")
     .action((entries: string[], _options, command) => {
@@ -960,7 +960,7 @@ async function runInvocation(
         usage = "git super worktree retention retire-batch: --rank-deadline-seconds applies only with --rank-only"
         return
       }
-      const proofSeconds = options.proofDeadlineSeconds === undefined ? 1080 : Number(options.proofDeadlineSeconds)
+      const proofSeconds = options.proofDeadlineSeconds === undefined ? 960 : Number(options.proofDeadlineSeconds)
       if (!Number.isFinite(proofSeconds) || proofSeconds <= 0) {
         usage = `git super worktree retention retire-batch: --proof-deadline-seconds must be a positive number, got ${options.proofDeadlineSeconds}`
         return

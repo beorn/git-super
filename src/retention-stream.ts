@@ -207,6 +207,26 @@ async function digestFile(path: string): Promise<{ sha256: string; bytes: number
   return { sha256: hash.digest("hex"), bytes }
 }
 
+/**
+ * Re-reads a sidecar written earlier in this run before it is used again (#35062): a missing or altered file is a
+ * {@link SidecarError}, so the caller reports `unknown` rather than joining against a file it no longer has.
+ */
+export async function verifySidecar(ref: SidecarRef): Promise<void> {
+  let actual: { sha256: string; bytes: number }
+  try {
+    actual = await digestFile(ref.path)
+  } catch (error) {
+    throw new SidecarError(
+      `sidecar ${ref.path} cannot be re-read: ${error instanceof Error ? error.message : String(error)}`,
+    )
+  }
+  if (actual.sha256 !== ref.sha256 || actual.bytes !== ref.bytes) {
+    throw new SidecarError(
+      `sidecar ${ref.path} no longer matches its reference: expected ${ref.sha256} (${String(ref.bytes)} bytes), saw ${actual.sha256} (${String(actual.bytes)} bytes)`,
+    )
+  }
+}
+
 /** Iterates the non-empty lines of a file with a bounded read buffer. */
 export interface ReadLinesOptions {
   readonly deadline?: number

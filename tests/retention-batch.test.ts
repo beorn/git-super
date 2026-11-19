@@ -449,7 +449,7 @@ describe("retention retirement batch (#33010)", async () => {
   })
   // #35047: a 20-entry preliminary pass ran past Yrd's 1200 s timeout with no report and its walk still running. Under
   // the batch proof deadline every unproved entry is kept with the cause, the run reports `stopped` (exit 2), and an
-  // apply takes no lease and deletes nothing. The CLI dry run above is the same fixture under the 1080 s default.
+  // apply takes no lease and deletes nothing. The CLI dry run above is the same fixture under the 960 s default.
   it("CLI keeps every entry its proof deadline cuts off, reports the stop, and deletes nothing", async () => {
     let output = ""
     let errors = ""
@@ -627,6 +627,121 @@ describe("retention retirement batch (#33010)", async () => {
     expect(result.windows[0]).toMatchObject({ delta: "unchanged" })
     expect(result.windows[0]?.holdMs).toBeGreaterThanOrEqual(result.windows[0]?.deltaMs ?? 0)
   })
+
+  /**
+   * Retained entries whose own module store holds a commit no other store has, each pushed to its own branch of the
+   * dependency repository so a surviving ref witnesses it. Returns the new entries, their branches and the last
+   * entry's new blob, which the dependency repository keeps as a loose object.
+   */
+  async function atRiskEntries(
+    names: readonly string[],
+  ): Promise<{ entries: string[]; branches: string[]; blob: string }> {
+    const product = dirname(common)
+    const dependency = join(fixtureRoot, "dependency")
+    const entries: string[] = []
+    const branches: string[] = []
+    let blob = ""
+    for (const name of names) {
+      const worktree = join(fixtureRoot, name)
+      expect(await runCli(["--repo", product, "worktree", "add", worktree, "HEAD"], sink(), sink())).toBe(0)
+      const dep = join(worktree, "vendor", "dep")
+      writeFileSync(join(dep, `${name}.ts`), `export const value = "${name}"\n`)
+      git(dep, ["add", "."])
+      git(dep, ["commit", "-q", "-m", name])
+      const branch = `keep-${name}`
+      git(dep, ["push", "-q", dependency, `HEAD:refs/heads/${branch}`])
+      branches.push(branch)
+      blob = git(dependency, ["rev-parse", `${branch}:${name}.ts`])
+      const before = new Set(readdirSync(root))
+      expect(
+        await runCli(["--repo", product, "--json", "worktree", "remove", worktree, "--retain", root], sink(), sink()),
+      ).toBe(0)
+      const made = readdirSync(root).filter((entry) => !before.has(entry))
+      expect(made).toHaveLength(1)
+      entries.push(join(root, made[0] as string))
+    }
+    return { entries, branches, blob }
+  }
+
+  // AC #35062 (@cto 35047-existing-scope-0158 §1-2): members of one proof phase share one witness index, and the held
+  // window joins one built from fresh reads, never the preliminary one. A witness branch deleted, or a witness store
+  // whose fsck now fails, between the two passes keeps the affected entries; with no change every member retires.
+  // The existing apply rows hold no at-risk objects, so custody never builds an index there and stale reuse of the
+  // preliminary index into the held window would pass all of them.
+  it.each(["unchanged", "witness deleted", "witness store corrupt"])(
+    "members with at-risk objects share one index per phase and the held window's is fresh (%s)",
+    async (change) => {
+      const dependency = join(fixtureRoot, "dependency")
+      const { entries, branches, blob } = await atRiskEntries(["risk-a", "risk-b"])
+      const [riskA, riskB] = entries as [string, string]
+      const loose = join(dependency, ".git", "objects", blob.slice(0, 2), blob.slice(2))
+      expect(existsSync(loose)).toBe(true)
+      const looseBytes = readFileSync(loose)
+      // The fixture clock predates these entries; move it past their own retainUntil.
+      const retainUntil = entries.map((entry) =>
+        Date.parse(
+          (JSON.parse(readFileSync(join(entry, "manifest.json"), "utf8")) as { retainUntil: string }).retainUntil,
+        ),
+      )
+      const spy = vi.mocked(inspectRetainedEntryInBatch)
+      spy.mockClear()
+      try {
+        const result = await retireRetainedBatch(
+          options({
+            apply: true,
+            clock: new Date(Math.max(eligible.getTime(), ...retainUntil) + 1000),
+            afterScan: () => {
+              if (change === "witness deleted") git(dependency, ["branch", "-q", "-D", branches[1] as string])
+              if (change === "witness store corrupt") rmSync(loose)
+            },
+          }),
+        )
+        const calls = spy.mock.calls.map((call, at) => ({ call, result: spy.mock.results[at] }))
+        const pre = calls.filter(({ call }) => call[0].artifactDir?.endsWith("/pre") === true)
+        const held = calls.filter(({ call }) => call[0].artifactDir?.endsWith("/held") === true)
+        expect(pre).toHaveLength(5)
+        // Positive control: both new members reached custody and found their own branch in the preliminary pass.
+        for (const [entry, branch] of [
+          [riskA, branches[0]],
+          [riskB, branches[1]],
+        ] as const) {
+          const found = pre.find(({ call }) => call[0].entry === entry)
+          const proof = (await found?.result?.value) as Awaited<ReturnType<typeof inspectRetainedEntryInBatch>>
+          expect(proof.verdict, proof.reasons.join("; ")).toBe("candidate")
+          expect(proof.witnesses).toEqual(
+            expect.arrayContaining([expect.objectContaining({ ref: `refs/heads/${branch}` })]),
+          )
+        }
+        const outcome = (entry: string): string | undefined => result.rows.find((row) => row.entry === entry)?.outcome
+        if (change === "unchanged") {
+          expect(result.rows.map((row) => row.outcome)).toEqual(result.rows.map(() => "retired"))
+          expect(readdirSync(root)).toEqual([])
+        } else if (change === "witness deleted") {
+          expect(outcome(riskA)).toBe("retired")
+          expect(outcome(riskB)).toBe("kept")
+          expect(result.rows.find((row) => row.entry === riskB)?.reason).toContain("preliminary and held proofs differ")
+          expect(existsSync(riskB)).toBe(true)
+        } else {
+          expect(outcome(riskA)).toBe("kept")
+          expect(outcome(riskB)).toBe("kept")
+          expect(existsSync(riskA)).toBe(true)
+          expect(existsSync(riskB)).toBe(true)
+        }
+        // Every preliminary member got one scope, every held member a second, fresh one.
+        expect(new Set(pre.map(({ call }) => call[3])).size).toBe(1)
+        expect(pre[0]?.call[3]).toBeDefined()
+        expect(new Set(held.map(({ call }) => call[3])).size).toBe(1)
+        expect(held[0]?.call[3]).toBeDefined()
+        expect(held[0]?.call[3]).not.toBe(pre[0]?.call[3])
+      } finally {
+        if (!existsSync(loose)) writeFileSync(loose, looseBytes)
+        for (const branch of branches) {
+          if (git(dependency, ["branch", "--list", branch]) !== "") git(dependency, ["branch", "-q", "-D", branch])
+        }
+      }
+    },
+    180_000,
+  )
 
   // Accepted requirement: a bounded lease ends with named remaining entries; the old multi-window loop
   // mistakes its own first deletion for an outsider's estate change when it reuses the original scan.

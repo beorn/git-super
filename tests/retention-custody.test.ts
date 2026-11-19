@@ -14,7 +14,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, test } from "vitest"
 import { defaultGitRun, defaultGitStream, type ComponentContents, type GitRun } from "../src/retention-contents.ts"
-import { DEFAULT_CUSTODY_BOUNDS, scanCustody, type CustodyScan } from "../src/retention-custody.ts"
+import { CustodyIndexScope, DEFAULT_CUSTODY_BOUNDS, scanCustody, type CustodyScan } from "../src/retention-custody.ts"
 import { gitLineStream, RETENTION_STREAM_QUEUE_LINES, readLines, SidecarWriter } from "../src/retention-stream.ts"
 
 const cleanup: string[] = []
@@ -449,6 +449,115 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
       expect(scan.detail).toMatch(/without cross-store subtraction: .*replace refs present/u)
     }
   })
+
+  // AC #35062 (@cto 35047-existing-scope-0158, "required proof"): two batch members sharing one witness index get
+  // the same coverage, witnesses, typed loss and exact graphDigests as two scans that each build their own, the
+  // index is built once, and a zero-risk member never reaches it. The existing rows build one index per scan, so
+  // they cannot show a shared build answering differently for its second member.
+  test.each([
+    "shared history",
+    "earlier tip absent",
+    "shared alternates",
+    "disjoint histories",
+    "tag tree and blob refs",
+    "distinct traversal contexts",
+    "blocked",
+  ])("one shared witness index serves two members exactly as two separate builds do: %s (#35062)", async (kind) => {
+    const fixture = custodyCase(kind)
+    let fsck = 0
+    const run: GitRun = (args, options) => {
+      if (args.includes("fsck")) fsck += 1
+      return defaultGitRun(args, options)
+    }
+    const halves = [fixture.atRisk.filter((_, at) => at % 2 === 0), fixture.atRisk.filter((_, at) => at % 2 === 1)]
+    const separate: CustodyScan[] = []
+    for (const half of halves) {
+      const sidecarDir = tmp("git-super-custody-separate-sidecars-")
+      separate.push(
+        await scanCustody(fixture.root, [await componentOf(half, sidecarDir)], fixture.stores, [], { sidecarDir, run }),
+      )
+    }
+    const separateFsck = fsck
+    fsck = 0
+    const indexScope = new CustodyIndexScope(tmp("git-super-custody-shared-index-"))
+    const shared: CustodyScan[] = []
+    for (const half of halves) {
+      const sidecarDir = tmp("git-super-custody-shared-sidecars-")
+      shared.push(
+        await scanCustody(fixture.root, [await componentOf(half, sidecarDir)], fixture.stores, [], {
+          sidecarDir,
+          run,
+          indexScope,
+        }),
+      )
+    }
+    const zeroDir = tmp("git-super-custody-shared-zero-")
+    const zero = await scanCustody(fixture.root, [await componentOf([], zeroDir)], fixture.stores, [], {
+      sidecarDir: zeroDir,
+      run,
+      indexScope,
+    })
+    const stores = new Set(fixture.stores.map((store) => realpathSync(store))).size
+    expect(separateFsck).toBe(2 * stores)
+    expect(fsck).toBe(stores)
+    expect(zero.status).toBe("pass")
+    expect(zero.detail).toContain("no witness needed")
+    for (const [at, alone] of separate.entries()) {
+      const together = shared[at]!
+      expect(together.status, together.detail).toBe(alone.status)
+      expect(together.witnesses).toEqual(alone.witnesses)
+      expect(together.witnessCount).toBe(alone.witnessCount)
+      expect(together.missing).toEqual(alone.missing)
+      expect(together.missingCount).toBe(alone.missingCount)
+      expect(together.loss).toEqual(alone.loss)
+      expect(await sidecarText(together, "witness")).toEqual(await sidecarText(alone, "witness"))
+      expect(await sidecarText(together, "missing")).toEqual(await sidecarText(alone, "missing"))
+    }
+    expect(shared.flatMap((scan) => scan.missing.map((target) => target.oid)).sort()).toEqual(
+      [...fixture.blocked].sort(),
+    )
+  })
+
+  // AC #35062: a shared index whose file is emptied or removed after its build is unknown for the next member, never
+  // a join against a smaller (or no) witness set. A per-scan index is never re-read, so no existing row reaches this.
+  test.each(["emptied", "removed"])(
+    "a shared witness index %s after its build is unknown for the next member",
+    async (fault) => {
+      const fixture = custodyCase("shared history")
+      const indexDir = tmp("git-super-custody-shared-fault-")
+      const indexScope = new CustodyIndexScope(indexDir)
+      const firstDir = tmp("git-super-custody-shared-fault-first-")
+      const first = await scanCustody(
+        fixture.root,
+        [await componentOf([fixture.atRisk[0]!], firstDir)],
+        fixture.stores,
+        [],
+        {
+          sidecarDir: firstDir,
+          indexScope,
+        },
+      )
+      expect(first.status, first.detail).toBe("pass")
+      for (const name of readdirSync(indexDir)) {
+        if (fault === "emptied") writeFileSync(join(indexDir, name), "")
+        else rmSync(join(indexDir, name))
+      }
+      const secondDir = tmp("git-super-custody-shared-fault-second-")
+      const second = await scanCustody(
+        fixture.root,
+        [await componentOf([fixture.atRisk[1]!], secondDir)],
+        fixture.stores,
+        [],
+        {
+          sidecarDir: secondDir,
+          indexScope,
+        },
+      )
+      expect(second.status).toBe("unknown")
+      expect(second.detail).toMatch(fault === "emptied" ? /no longer matches its reference/u : /cannot be re-read/u)
+      expect(second.witnesses).toEqual([])
+    },
+  )
 
   // AC: redundant policy ancestors must fit the shared proof budget while preserving
   // complete positive custody. The existing small-ref fixtures never spend that budget.

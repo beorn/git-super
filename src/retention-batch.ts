@@ -15,6 +15,7 @@
  * Dry run by default: `apply: false` reports the entries that would be retired and why every other one is kept.
  */
 import { measureRetainedBytes } from "./retention-bytes.ts"
+import { CustodyIndexScope } from "./retention-custody.ts"
 import { lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs"
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { acquireFlockWithTimeout, type FlockHandle } from "@bearly/flock"
@@ -377,6 +378,8 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
   }
 
   // ---- Preliminary gates per entry, no lease ----------------------------------------------------
+  // #35062: one witness index for the whole preliminary pass, built by the first member with at-risk objects.
+  const preliminaryIndex = new CustodyIndexScope(join(options.artifactDir, "common", "custody-index", "pre"))
   const preliminary = new Map<string, RetentionVerifyResult>()
   const kept = new Map<string, string>()
   let notStarted = 0
@@ -389,7 +392,12 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
       )
       continue
     }
-    const proof = await inspectRetainedEntryInBatch(verifyOptions(entry, "pre"), entryView(scan, entry), entries)
+    const proof = await inspectRetainedEntryInBatch(
+      verifyOptions(entry, "pre"),
+      entryView(scan, entry),
+      entries,
+      preliminaryIndex,
+    )
     recordWarnings(proof, "pre")
     preliminary.set(entry, proof)
     if (proof.verdict !== "candidate") kept.set(entry, `${proof.verdict}: ${proof.reasons.join("; ")}`)
@@ -535,6 +543,9 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
       return result(windows, `lease-held: common lease ${commonPath} is held; nothing more deleted`)
     }
     const heldFrom = monotonic()
+    // #35062: the held window builds its own witness index from fresh reads, never the preliminary one, so a ref
+    // that moved or an object that went bad after the preliminary pass keeps its entry.
+    const heldIndex = new CustodyIndexScope(join(options.artifactDir, "common", "custody-index", "held"))
     const ownerLeases: ReturnType<typeof acquireRemovalWriterLeases>[] = []
     const windowEntries: string[] = []
     let deltaStatus: BatchWindow["delta"] = "unchanged"
@@ -583,7 +594,12 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
             break
           }
           const pre = preliminary.get(entry) as RetentionVerifyResult
-          const held = await inspectRetainedEntryInBatch(verifyOptions(entry, "held"), entryView(scan, entry), entries)
+          const held = await inspectRetainedEntryInBatch(
+            verifyOptions(entry, "held"),
+            entryView(scan, entry),
+            entries,
+            heldIndex,
+          )
           recordWarnings(held, "held")
           const before = proofFacts(pre)
           const after = held.verdict === "candidate" ? proofFacts(held) : undefined

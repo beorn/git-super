@@ -29,6 +29,7 @@ import {
 import {
   scanCustody,
   type CustodyBounds,
+  type CustodyIndexScope,
   type MissingComponentLoss,
   type WitnessIdentity,
 } from "./retention-custody.ts"
@@ -353,19 +354,21 @@ export async function inspectRetainedEntryForAudit(
  * Retention-family internal path for a retirement batch (#33010, @cto dc77f630): one entry's gates against the
  * batch's ONE shared estate scan. `estate` is this entry's view of it (survivors into this entry only). Every batch
  * member is excluded from the custody witnesses, so two members never vouch for each other, and none of the audit
- * leniencies apply: a legacy or manifest-less entry stays as kept as an ordinary verify keeps it.
+ * leniencies apply: a legacy or manifest-less entry stays as kept as an ordinary verify keeps it. `index` is the
+ * batch's witness index for this proof phase (#35062): every member of one phase joins the same build.
  */
 export async function inspectRetainedEntryInBatch(
   options: RetentionVerifyOptions,
   estate: EstateScan,
   batch: readonly string[],
+  index?: CustodyIndexScope,
 ): Promise<RetentionVerifyResult> {
-  return evaluateRetainedEntry(options, { audit: false, estate, batch })
+  return evaluateRetainedEntry(options, { audit: false, estate, batch, ...(index === undefined ? {} : { index }) })
 }
 
 type EvaluationContext =
   | Readonly<{ audit: true; estate: EstateScan }>
-  | Readonly<{ audit: false; estate: EstateScan; batch: readonly string[] }>
+  | Readonly<{ audit: false; estate: EstateScan; batch: readonly string[]; index?: CustodyIndexScope }>
 
 async function evaluateRetainedEntry(
   options: RetentionVerifyOptions,
@@ -1018,6 +1021,7 @@ async function evaluateRetainedEntry(
     ...(options.gitStream === undefined ? {} : { stream: options.gitStream }),
     ...(options.bounds?.custody === undefined ? {} : { bounds: options.bounds.custody }),
     ...(options.deadline === undefined ? {} : { deadline: options.deadline }),
+    ...(context?.audit === false && context.index !== undefined ? { indexScope: context.index } : {}),
     clock: monotonic,
   })
   result.witnesses = custody.witnesses
