@@ -30,6 +30,13 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 import { runCli } from "../src/cli.ts"
 import { retireRetainedBatch, type RetentionBatchOptions, type RetentionBatchResult } from "../src/retention-batch.ts"
 import { scanEstate } from "../src/retention-estate.ts"
+import { inspectRetainedEntryInBatch } from "../src/retention-verify.ts"
+
+// A pass-through spy: every test still runs the real verifier; the #35047 deadline row reads its call options.
+vi.mock("../src/retention-verify.ts", async (importOriginal) => {
+  const verify = await importOriginal<typeof import("../src/retention-verify.ts")>()
+  return { ...verify, inspectRetainedEntryInBatch: vi.fn(verify.inspectRetainedEntryInBatch) }
+})
 
 vi.mock("node:fs", async (importOriginal) => {
   const fs = await importOriginal<typeof import("node:fs")>()
@@ -498,6 +505,30 @@ describe("retention retirement batch (#33010)", async () => {
     expect(spent.stopped).toContain("3 entr(ies) were not started")
     expect(spent.rows.map((row) => row.outcome)).toEqual(["kept", "kept", "kept"])
     expect(spent.rows[0]?.reason).toContain("passed before this entry's proof began")
+  })
+
+  // #35047 (@dev/review2 REVISE bf2e0b30): the deadline cuts a custody walk already running only if the batch hands it
+  // to every verifier call. The spent-deadline rows above are decided by the batch loop and pass without that wire.
+  it("hands one batch proof deadline to every preliminary and held verifier call", async () => {
+    const inspect = vi.mocked(inspectRetainedEntryInBatch)
+    inspect.mockClear()
+    const started = Date.now()
+    const result = await retireRetainedBatch(options({ apply: true, proofDeadlineMs: 600_000 }))
+    const finished = Date.now()
+    expect(
+      result.rows.map((row) => row.outcome),
+      JSON.stringify(result.rows),
+    ).toEqual(["retired", "retired", "retired"])
+    const calls = inspect.mock.calls.map(([verify]) => ({
+      phase: basename(verify.artifactDir as string),
+      deadline: verify.deadline,
+    }))
+    expect(calls.map((call) => call.phase).sort()).toEqual(["held", "held", "held", "pre", "pre", "pre"])
+    const deadlines = new Set(calls.map((call) => call.deadline))
+    expect(deadlines.size).toBe(1)
+    const deadline = [...deadlines][0] as number
+    expect(deadline).toBeGreaterThanOrEqual(started + 600_000)
+    expect(deadline).toBeLessThanOrEqual(finished + 600_000)
   })
 
   it("dry run names every candidate it would retire and deletes nothing", async () => {
