@@ -1879,36 +1879,40 @@ describe("git super pull --ff-only", () => {
     })
   })
 
-  test("bounds every Git subprocess through the shared process port", async () => {
-    const fixture = mkdtempSync(join(tmpdir(), "git-super-pull-timeout-"))
-    roots.push(fixture)
-    const upstream = join(fixture, "upstream")
-    const checkout = join(fixture, "checkout")
-    createRepository(upstream, "README.md", "one\n")
-    git(fixture, "clone", "-q", upstream, checkout)
-    advanceRepository(upstream, "README.md", "two\n")
-    const local = createLocalGitProcess()
-    const timeouts: Array<number | undefined> = []
-    const recording: GitProcess = {
-      async run(request) {
-        timeouts.push(request.timeoutMs)
-        return local.run(request)
-      },
-    }
+  // The shared-main latency repair (37214) raises the default; explicit caller budgets must still win.
+  test.each([undefined, 1234])(
+    "bounds every Git subprocess through the shared process port (%s)",
+    async (timeoutMs) => {
+      const fixture = mkdtempSync(join(tmpdir(), "git-super-pull-timeout-"))
+      roots.push(fixture)
+      const upstream = join(fixture, "upstream")
+      const checkout = join(fixture, "checkout")
+      createRepository(upstream, "README.md", "one\n")
+      git(fixture, "clone", "-q", upstream, checkout)
+      advanceRepository(upstream, "README.md", "two\n")
+      const local = createLocalGitProcess()
+      const timeouts: Array<number | undefined> = []
+      const recording: GitProcess = {
+        async run(request) {
+          timeouts.push(request.timeoutMs)
+          return local.run(request)
+        },
+      }
 
-    const result = await superPull({
-      repo: checkout,
-      repository: "origin",
-      refspecs: ["main"],
-      ffOnly: true,
-      timeoutMs: 1234,
-      git: recording,
-    })
+      const result = await superPull({
+        repo: checkout,
+        repository: "origin",
+        refspecs: ["main"],
+        ffOnly: true,
+        ...(timeoutMs === undefined ? {} : { timeoutMs }),
+        git: recording,
+      })
 
-    expect(result.state).toBe("updated")
-    expect(timeouts.length).toBeGreaterThan(0)
-    expect(new Set(timeouts)).toEqual(new Set([1234]))
-  })
+      expect(result.state).toBe("updated")
+      expect(timeouts.length).toBeGreaterThan(0)
+      expect(new Set(timeouts)).toEqual(new Set([timeoutMs ?? 90_000]))
+    },
+  )
 
   test("reports mutation lock contention without moving HEAD", async () => {
     const fixture = mkdtempSync(join(tmpdir(), "git-super-pull-lock-"))

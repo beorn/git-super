@@ -99,7 +99,7 @@ type PullRepositoryPlan = Readonly<{
   added?: Readonly<{ parent: string; path: string }>
 }>
 
-const DEFAULT_GIT_TIMEOUT_MS = 30_000
+const DEFAULT_GIT_TIMEOUT_MS = 90_000
 const OBJECT_ID = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/u
 
 function detail(code: string, phase: string, message: string, extra: Partial<GitResultDetail> = {}): GitResultDetail {
