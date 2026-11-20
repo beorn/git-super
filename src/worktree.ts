@@ -1097,7 +1097,7 @@ export type WorktreeAdd = Readonly<{ hooks?: WorktreeHookPolicy; lockReason?: st
     | Readonly<{ kind: "new-branch"; path: string; branch: string; ref: string }>
     | Readonly<{ kind: "reset-branch"; path: string; branch: string; ref: string }>
     | Readonly<{ kind: "ref"; path: string; ref: string }>
-    | Readonly<{ kind: "detached"; path: string; ref: string }>
+    | Readonly<{ kind: "detached"; path: string; ref: string; noCheckout?: boolean }>
   )
 
 const GIT_TIMEOUT_MS = 30_000
@@ -1599,6 +1599,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
           insertion,
           0,
           ...(input.lockReason === undefined ? [] : ["--lock", "--reason", input.lockReason]),
+          ...(input.kind === "detached" && input.noCheckout === true ? ["--no-checkout"] : []),
         )
         await git.run(repo, withHookPolicy(addArgs, input.hooks))
       })

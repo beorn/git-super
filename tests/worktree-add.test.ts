@@ -1084,6 +1084,50 @@ describe("git super worktree add", () => {
     expect(existsSync(join(worktree, "vendor/dep/dep.ts"))).toBe(true)
   })
 
+  it("omits only the requested checkout directories and keeps the pinned component", async () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-worktree-sparse-"))
+    roots.push(root)
+    const { product } = createSuperproject(root)
+    const child = join(product, "vendor/dep")
+    mkdirSync(join(child, "corpus/artifacts"), { recursive: true })
+    writeFileSync(join(child, "corpus/artifacts/data.txt"), "omit\n")
+    writeFileSync(join(child, "corpus/keep.txt"), "keep\n")
+    git(child, ["add", "corpus"])
+    git(child, ["commit", "-qm", "add corpus"])
+    const pin = git(child, ["rev-parse", "HEAD"])
+    mkdirSync(join(product, "generated"))
+    writeFileSync(join(product, "generated/data.txt"), "omit at root\n")
+    git(product, ["add", "vendor/dep", "generated"])
+    git(product, ["commit", "-qm", "pin corpus"])
+    const tree = join(root, "projected")
+    const out = outputSink()
+    const err = outputSink()
+    const omissions = ["generated", "vendor/dep/corpus/artifacts"]
+
+    const code = await runCli(
+      [
+        "--repo",
+        product,
+        "--json",
+        "worktree",
+        "add",
+        tree,
+        "HEAD",
+        ...omissions.flatMap((path) => ["--omit-checkout-directory", path]),
+      ],
+      out,
+      err,
+    )
+
+    expect({ code, stderr: code === 0 ? "" : err.output }).toEqual({ code: 0, stderr: "" })
+    expect(JSON.parse(out.output)).toMatchObject({ omittedTrackedFiles: 2 })
+    expect(existsSync(join(tree, "generated"))).toBe(false)
+    expect(existsSync(join(tree, "vendor/dep/corpus/artifacts"))).toBe(false)
+    expect(readFileSync(join(tree, "vendor/dep/corpus/keep.txt"), "utf8")).toBe("keep\n")
+    expect(git(join(tree, "vendor/dep"), ["rev-parse", "HEAD"])).toBe(pin)
+    expect(git(tree, ["status", "--porcelain"])).toBe("")
+  })
+
   /**
    * @failure An excluded submodule is initialized, gets a module store or gitfile, or goes unreported (27147).
    * @level l2

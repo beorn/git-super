@@ -16,6 +16,7 @@ import { resolveSubmoduleOrigin } from "./submodule-origin.ts"
 import { hasHostedIdentity } from "./push-intent.ts"
 import { ensureCommitObject } from "./objects.ts"
 import { readCommitSubmodules, type CommitSubmodule, type SelectedCommitSubmodules } from "./commit-graph.ts"
+import { configureSparseCheckout } from "./sparse-checkout.ts"
 
 export const SUBMODULE_ALTERNATE_LOCATION = "superproject"
 export const SUBMODULE_ALTERNATE_ERROR_STRATEGY = "info"
@@ -69,6 +70,8 @@ export type SubmoduleMaterializationOptions = Readonly<{
   paths?: readonly string[]
   /** Literal paths relative to worktree, applied before checkout/reference probes at every depth. */
   excludedSubmodules?: readonly string[]
+  /** Directories omitted in fresh component worktrees, keyed by the component's root-relative path. */
+  checkoutOmissions?: ReadonlyMap<string, readonly string[]>
   /** Read top-level declarations and pins from stage 0 for a staged merge; nested levels use HEAD. */
   source?: "head" | "index"
   /**
@@ -1671,6 +1674,32 @@ export async function materializeSubmodules(
             if (result.code !== 0) return result
           }
         }
+        const componentPath = logicalPath === "" ? path : `${logicalPath}/${path}`
+        const omissions = options.checkoutOmissions?.get(componentPath)
+        if (omissions !== undefined) {
+          if (!freshClone || policy !== "checkout") {
+            return {
+              code: 1,
+              stdout: "",
+              stderr: `checkout omissions for ${componentPath} require a fresh detached checkout`,
+            }
+          }
+          try {
+            await configureSparseCheckout(
+              async (args) => {
+                const result = await git.run(submoduleDir, args, true)
+                if (result.code !== 0 || result.timedOut || result.failure !== undefined) {
+                  throw new Error(result.stderr || result.failure || `git ${args[0]} exited ${result.code}`)
+                }
+                return result.stdout
+              },
+              required,
+              omissions,
+            )
+          } catch (error) {
+            return { code: 1, stdout: "", stderr: error instanceof Error ? error.message : String(error) }
+          }
+        }
         const current = await git.run(submoduleDir, ["rev-parse", "--verify", "HEAD"], true)
         if (freshClone || options.force || current.code !== 0 || current.stdout.trim() !== required) {
           const args =
@@ -2011,6 +2040,7 @@ export async function materializeSubmodulesFromLocalWorktreeParallel(
     ...(referenceWorktree === undefined ? {} : { referenceWorktree: options.referenceWorktree ?? referenceWorktree }),
     ...(options.paths === undefined ? {} : { paths: options.paths }),
     ...(options.excludedSubmodules === undefined ? {} : { excludedSubmodules: options.excludedSubmodules }),
+    ...(options.checkoutOmissions === undefined ? {} : { checkoutOmissions: options.checkoutOmissions }),
     ...(options.log === undefined ? {} : { log: options.log }),
     // Forwarded, not defaulted. This adapter accepted `maxRemoteFallbacks` in
     // its type and dropped it on the floor, so a caller that raised the bound

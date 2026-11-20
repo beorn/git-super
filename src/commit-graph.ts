@@ -62,6 +62,7 @@ export async function readCommitPath(
   repository: string,
   commit: string,
   path: string,
+  onGitlink?: (path: string, checkout: string, pin: string) => void,
 ): Promise<SelectedCommitPath["treeEntry"]> {
   const fail = (code: string, reason: string, cause?: unknown) => {
     const message = `${JSON.stringify(path)} at ${commit} in ${repository}: ${reason}`
@@ -126,6 +127,7 @@ export async function readCommitPath(
       }
       repo = probe.root
       pinned = entry.objectId
+      onGitlink?.(parts.slice(0, index + 1).join("/"), repo, pinned)
       prefix = []
     } else if (entry.type !== "tree") return null
   }

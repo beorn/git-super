@@ -1,9 +1,12 @@
-import { resolve } from "node:path"
+import { lstat } from "node:fs/promises"
+import { resolve, join } from "node:path"
 import type { ConditionalLogger } from "loggily"
 import type { NotCompared } from "./diff.ts"
-import { validateExcludedSubmodules } from "./git.ts"
+import { readCommitPath } from "./commit-graph.ts"
+import { isSubmoduleExcluded, validateExcludedSubmodules } from "./git.ts"
 import { gitSuperResult, type GitResultDetail, type GitSuperResult } from "./result.ts"
 import { materializeSubmodulesFromLocalWorktreeParallel } from "./submodules.ts"
+import { configureSparseCheckout } from "./sparse-checkout.ts"
 import { createLocalGitWorktreeStore, type GitWorktreeStore } from "./worktree.ts"
 
 /**
@@ -142,6 +145,8 @@ export type SuperWorktreeAddOptions = Readonly<{
    * Each one is reported as an `excluded` observation in `notCompared`.
    */
   excludedSubmodules?: readonly string[]
+  /** Literal directories absent from this fresh checkout, without omitting any gitlink. */
+  omitCheckoutDirectories?: readonly string[]
   env?: NodeJS.ProcessEnv
   log?: ConditionalLogger
   report?: (line: string) => void
@@ -159,6 +164,8 @@ export type SuperWorktreeAddResult = GitSuperResult &
     gitlinks?: WorktreeGitlinkCounts
     /** One observation per excluded submodule; empty when the caller excluded nothing. */
     notCompared?: readonly NotCompared[]
+    /** Tracked files below the verified absent directory paths. */
+    omittedTrackedFiles?: number
   }>
 
 const NO_GITLINKS: WorktreeGitlinkCounts = {
@@ -257,9 +264,73 @@ export async function superWorktreeAdd(options: SuperWorktreeAddOptions): Promis
   }
 
   const excludedSubmodules = [...new Set(requestedSubmodules)].sort()
+  const omissions = [...new Set(options.omitCheckoutDirectories ?? [])].sort()
+  const byCheckout = new Map<string, string[]>()
+  let omittedTrackedFiles = 0
+  let frozenCommit = options.commit
+  try {
+    if (omissions.length > 0) {
+      frozenCommit = await store.git.commit(repo, options.commit)
+      const git = {
+        run: (request: { repo: string; args: readonly string[] }) => store.git.run(request.repo, request.args, true),
+      }
+      for (const directory of omissions) {
+        if (isSubmoduleExcluded(directory, excludedSubmodules) || /[*?[\]]/u.test(directory)) {
+          throw new Error(`invalid checkout omission ${JSON.stringify(directory)} at ${frozenCommit}`)
+        }
+        let owner = { component: "", checkout: reference, pin: frozenCommit }
+        const entry = await readCommitPath(git, reference, frozenCommit, directory, (component, checkout, pin) => {
+          owner = { component, checkout, pin }
+        })
+        if (entry?.type !== "tree") {
+          throw new Error(
+            `checkout omission ${JSON.stringify(directory)} is not a directory in the tree at ${frozenCommit}`,
+          )
+        }
+        if (omissions.some((other) => directory.startsWith(`${other}/`))) continue
+        const relative = owner.component === "" ? directory : directory.slice(owner.component.length + 1)
+        const types = (
+          await store.git.text(owner.checkout, [
+            "--literal-pathspecs",
+            "ls-tree",
+            "-r",
+            "--format=%(objecttype)",
+            owner.pin,
+            "--",
+            relative,
+          ])
+        ).split("\n")
+        if (types.includes("commit")) {
+          throw new Error(`checkout omission ${JSON.stringify(directory)} at ${frozenCommit} would omit a gitlink`)
+        }
+        omittedTrackedFiles += types.filter((type) => type === "blob").length
+        const group = byCheckout.get(owner.component)
+        if (group === undefined) byCheckout.set(owner.component, [relative])
+        else group.push(relative)
+      }
+    }
+  } catch (error) {
+    return failed(
+      "failed",
+      detail(
+        "invalid-checkout-omission",
+        "parameters",
+        message(error),
+        "Name only literal tracked directories at the selected commit which contain no gitlinks.",
+      ),
+      frozenCommit,
+    )
+  }
+  const rootOmissions = byCheckout.get("")
 
   try {
-    await store.add({ kind: "detached", path, ref: options.commit, operation: `git super worktree add ${path}` })
+    await store.add({
+      kind: "detached",
+      path,
+      ref: frozenCommit,
+      ...(rootOmissions === undefined ? {} : { noCheckout: true }),
+      operation: `git super worktree add ${path}`,
+    })
   } catch (error) {
     return failed(
       "failed",
@@ -274,8 +345,23 @@ export async function superWorktreeAdd(options: SuperWorktreeAddOptions): Promis
 
   let commit: string | undefined
   let gitmodules: boolean | undefined
+  const verifyOmissions = async () => {
+    for (const directory of omissions) {
+      try {
+        await lstat(join(path, directory))
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue
+        throw error
+      }
+      throw new Error(`checkout omission ${JSON.stringify(directory)} was present after materialization at ${commit}`)
+    }
+  }
   try {
     commit = await store.git.text(path, ["rev-parse", "HEAD"])
+    if (rootOmissions !== undefined) {
+      await configureSparseCheckout((args) => store.git.text(path, args), commit, rootOmissions)
+      await store.git.run(path, ["read-tree", "-mu", commit])
+    }
     // `optionalText` and NOT `run(..., allowFailure)`: an absent `.gitmodules`
     // is a real answer, but a stalled or timed-out repository is not, and
     // `allowFailure` returns both as one non-zero code. That collapse would
@@ -283,7 +369,9 @@ export async function superWorktreeAdd(options: SuperWorktreeAddOptions): Promis
     // never even enumerated — a passing exit for a check that never looked.
     gitmodules = (await store.git.optionalText(path, ["cat-file", "-e", "HEAD:.gitmodules"])) !== undefined
     if (!gitmodules) {
-      const report = `${at(path, options.commit, commit)}: no .gitmodules at this commit; plain worktree add`
+      await verifyOmissions()
+      const mode = omissions.length === 0 ? "plain" : "sparse"
+      const report = `${at(path, options.commit, commit)}: no .gitmodules at this commit; ${mode} worktree add`
       return {
         ...gitSuperResult(
           [{ repository: repo, state: "updated", refs: [] }],
@@ -295,6 +383,7 @@ export async function superWorktreeAdd(options: SuperWorktreeAddOptions): Promis
         gitmodules,
         gitlinks: NO_GITLINKS,
         notCompared: [],
+        ...(omissions.length === 0 ? {} : { omittedTrackedFiles }),
       }
     }
     const materialized = await materializeSubmodulesFromLocalWorktreeParallel({
@@ -302,6 +391,7 @@ export async function superWorktreeAdd(options: SuperWorktreeAddOptions): Promis
       ...(options.reference === undefined ? {} : { referenceWorktree: reference }),
       maxRemoteFallbacks: UNBOUNDED_REMOTE_FALLBACKS,
       ...(excludedSubmodules.length === 0 ? {} : { excludedSubmodules }),
+      ...(byCheckout.size === 0 ? {} : { checkoutOmissions: byCheckout }),
       ...(env === undefined ? {} : { env }),
       ...(options.log === undefined ? {} : { log: options.log }),
     })
@@ -312,6 +402,7 @@ export async function superWorktreeAdd(options: SuperWorktreeAddOptions): Promis
           `git-super: submodule materialization exited ${String(materialized.exitCode)}`,
       )
     }
+    await verifyOmissions()
     const gitlinks: WorktreeGitlinkCounts = {
       considered: materialized.considered,
       borrowed: materialized.borrowed - materialized.warmed,
@@ -334,6 +425,7 @@ export async function superWorktreeAdd(options: SuperWorktreeAddOptions): Promis
       gitmodules,
       gitlinks,
       notCompared: materialized.notCompared,
+      ...(omissions.length === 0 ? {} : { omittedTrackedFiles }),
     }
   } catch (error) {
     const reason = message(error)
