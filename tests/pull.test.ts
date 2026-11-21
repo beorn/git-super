@@ -15,7 +15,7 @@ import {
   writeFileSync,
 } from "node:fs"
 import { join } from "node:path"
-import { fileURLToPath } from "node:url"
+import { fileURLToPath, pathToFileURL } from "node:url"
 import { spawn } from "node:child_process"
 import { runCli } from "../src/cli.ts"
 import { acquireExclusive, createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS, type Exclusive } from "../src/exclusive.ts"
@@ -1776,18 +1776,66 @@ describe("git super pull --ff-only", () => {
     const fixture = mkdtempSync(join(tmpdir(), "git-super-pull-target-race-"))
     roots.push(fixture)
     const upstream = join(fixture, "upstream")
+    const alternate = join(fixture, "alternate")
     const checkout = join(fixture, "checkout")
     const before = createRepository(upstream, "README.md", "one\n")
-    git(fixture, "clone", "-q", upstream, checkout)
+    git(fixture, "clone", "-q", upstream, alternate)
+    git(fixture, "clone", "-q", "--shared", alternate, checkout)
+    git(checkout, "remote", "set-url", "origin", pathToFileURL(upstream).href)
+    git(checkout, "pack-refs", "--all")
+    const gitDir = join(checkout, ".git")
+    writeFileSync(join(gitDir, "FETCH_HEAD"), "existing fetch-head marker\n")
+    git(upstream, "update-ref", "refs/archive/old/heads/main", before)
+    git(upstream, "update-ref", "refs/heads/unrelated", before)
     advanceRepository(upstream, "README.md", "two\n")
+
+    function files(directory: string) {
+      return readdirSync(directory, { recursive: true, withFileTypes: true })
+        .filter((entry) => entry.isFile())
+        .map((entry) => join(entry.parentPath, entry.name))
+        .sort()
+        .map((path) => [path, readFileSync(path)] as const)
+    }
+
+    const alternateObjects = join(alternate, ".git", "objects")
+    const ownObjects = join(gitDir, "objects")
+    const ownState = () => ({
+      refs: files(join(gitDir, "refs")),
+      head: readFileSync(join(gitDir, "HEAD")),
+      packedRefs: readFileSync(join(gitDir, "packed-refs")),
+      fetchHead: readFileSync(join(gitDir, "FETCH_HEAD")),
+      alternates: readFileSync(join(ownObjects, "info", "alternates")),
+    })
+    const protectedAlternate = files(alternateObjects)
+    const observations: {
+      packet: string
+      before: ReturnType<typeof ownState>
+      after: ReturnType<typeof ownState>
+      beforeObjects: ReturnType<typeof files>
+      afterObjects: ReturnType<typeof files>
+    }[] = []
     const local = createLocalGitProcess()
-    let advanced = false
+    let moved: string | undefined
     const racing: GitProcess = {
       async run(request) {
+        const [verb] = request.args
+        if (verb === "ls-remote" || (verb === "fetch" && request.args.includes("--dry-run"))) {
+          const packet = join(fixture, `observation-${observations.length}.packet`)
+          const before = ownState()
+          const beforeObjects = files(ownObjects)
+          const result = await local.run({ ...request, env: { ...request.env, GIT_TRACE_PACKET: packet } })
+          observations.push({
+            packet,
+            before,
+            beforeObjects,
+            after: ownState(),
+            afterObjects: files(ownObjects),
+          })
+          return result
+        }
         const result = await local.run(request)
-        if (!advanced && request.args.join(" ") === "rev-parse --git-common-dir") {
-          advanceRepository(upstream, "README.md", "three\n")
-          advanced = true
+        if (moved === undefined && request.args.join(" ") === "rev-parse --git-common-dir") {
+          moved = advanceRepository(upstream, "README.md", "three\n")
         }
         return result
       },
@@ -1801,13 +1849,25 @@ describe("git super pull --ff-only", () => {
       git: racing,
     })
 
-    expect(advanced).toBe(true)
+    expect(moved).toBeDefined()
     expect(git(checkout, "rev-parse", "HEAD")).toBe(before)
     expect(result).toMatchObject({
       state: "failed",
       partial: false,
       detail: { code: "target-changed", phase: "recheck-root-target" },
     })
+    expect(observations).toHaveLength(2)
+    for (const observation of observations) {
+      const packets = readFileSync(observation.packet, "utf8")
+      expect(packets).toContain("ref-prefix refs/heads/main\n")
+      expect(packets).not.toContain("refs/archive/old/heads/main")
+      expect(packets).not.toContain("refs/heads/unrelated")
+      expect(observation.after).toEqual(observation.before)
+    }
+    const recheck = observations[1]!
+    expect(recheck.afterObjects.length).toBeGreaterThan(recheck.beforeObjects.length)
+    expect(git(checkout, "cat-file", "-t", moved!)).toBe("commit")
+    expect(files(alternateObjects)).toEqual(protectedAlternate)
   })
 
   test("does not rely on process-global FETCH_HEAD after fetching the root target", async () => {

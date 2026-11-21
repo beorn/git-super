@@ -9,6 +9,7 @@ import type { NotCompared } from "./diff.ts"
 import { inspectExcludedCheckout } from "./status.ts"
 import { ensureCommitObject } from "./objects.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
+import { observeRemoteRefs } from "./remote-observation.ts"
 import { materializeSubmodulesWithProcess, type SubmoduleMaterializationResult } from "./submodules.ts"
 import { gitSuperResult, type GitResultDetail, type GitSuperRepositoryResult, type GitSuperResult } from "./result.ts"
 import { shellQuote } from "./shell-command.ts"
@@ -456,22 +457,22 @@ async function observeRemoteTarget(
   remoteRef: string,
   phase: string,
 ): Promise<string> {
-  const observed = await required(git, root, ["ls-remote", "--exit-code", repository, remoteRef], phase)
-  // ls-remote tail-matches a pattern, so "main" also returns refs/archive/.../heads/main (#30615). Keep only the refs
-  // git's own short-name rules can name; two of those that disagree is still an ambiguity, and still refused.
-  const named = new Set(remoteRefCandidates(remoteRef))
-  const objectIds = [
-    ...new Set(
-      observed
-        .split(/\r?\n/u)
-        .filter((line) => line !== "")
-        .map((line) => line.split(/\s+/u))
-        .filter(([, name]) => name !== undefined && named.has(name))
-        .map(([oid]) => oid)
-        .filter((oid): oid is string => oid !== undefined && OBJECT_ID.test(oid)),
-    ),
-  ]
-  if (objectIds.length !== 1 || objectIds[0] === undefined) {
+  // Short names can select several refs, but archive tails never count (#30615).
+  const names = remoteRef.startsWith("refs/") ? { required: remoteRef } : { candidates: remoteRefCandidates(remoteRef) }
+  const observed = await observeRemoteRefs(git, root, repository, names)
+  if (observed.kind === "failed") throw operationError(root, phase, observed.args, observed.result)
+  const objectIds = [...new Set(observed.objectIds)]
+  const [objectId] = objectIds
+  if (observed.kind === "observed" && objectId === undefined) {
+    const message = `Remote ${repository} did not advertise ref ${remoteRef}.`
+    throw Object.assign(new Error(message), {
+      repository: root,
+      resultDetail: detail("git-failed", phase, message, {
+        remedy: "Confirm that the requested ref exists on the remote, then rerun the pull.",
+      }),
+    })
+  }
+  if (observed.kind === "invalid" || objectIds.length !== 1 || objectId === undefined) {
     throw Object.assign(new Error(`remote ref ${remoteRef} did not resolve to exactly one object`), {
       resultDetail: detail(
         "ambiguous-remote-target",
@@ -484,7 +485,7 @@ async function observeRemoteTarget(
       ),
     })
   }
-  return objectIds[0]
+  return objectId
 }
 
 async function refuseUnpublishedDetachedHead(
