@@ -26,6 +26,7 @@ import {
   type FrozenPushIntent,
 } from "./push-intent.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
+import { isSettledGitResult as ancestrySettled, observeRemoteRefs } from "./remote-observation.ts"
 import { resolveSubmoduleOrigin } from "./submodule-origin.ts"
 import {
   nestedStoreMissingDetail,
@@ -231,16 +232,6 @@ function operationError(
   })
 }
 
-function ancestrySettled(result: GitProcessResult): boolean {
-  return (
-    result.failure === undefined &&
-    result.timedOut !== true &&
-    result.stalled !== true &&
-    result.backstop === undefined &&
-    (result.signal === undefined || result.signal === null)
-  )
-}
-
 /** Git's exit 1 from --is-ancestor is a negative answer, not a failed Git invocation. */
 function ancestryAnswerNo(result: GitProcessResult): boolean {
   return result.code === 1 && ancestrySettled(result)
@@ -295,64 +286,31 @@ function isIdenticalSuccess(source: string, observed: ExpectedDestination): bool
   return source === "" ? observed.state === "missing" : observed.state === "oid" && observed.oid === source
 }
 
-/** Where an observation's dry-run fetch NAMES the destination; a dry run writes no ref, here or anywhere. */
-const OBSERVED_NAMESPACE = "refs/git-super/observed/"
-
-/**
- * The destination's remote value, read BY NAME (25570).
- *
- * `ls-remote <remote> <ref>` filters its pattern on the client, so the remote sent its whole advertisement (11,382
- * refs on hh-dev's origin) for every observation. A fetch with an exact refspec is the one read that sends the server
- * an exact ref-prefix; `--dry-run --porcelain` reports the remote tip and writes nothing, so no local ref can go stale
- * and later read as the remote's. Absent is git's "couldn't find remote ref" under LC_ALL=C; any other failure is loud.
- */
+/** The destination's remote value, read by name (25570). */
 async function observeDestination(
   git: GitProcess,
   update: Pick<PlannedUpdate, "repository" | "remote" | "destination">,
   phase: string,
 ): Promise<ExpectedDestination> {
-  const named = `${OBSERVED_NAMESPACE}${update.destination.replace(/^refs\//u, "")}`
-  const args = [
-    "fetch",
-    "--dry-run",
-    "--verbose",
-    "--porcelain",
-    "--no-tags",
-    "--no-recurse-submodules",
-    "--no-write-fetch-head",
-    // No opportunistic remote-tracking row: the one refspec is the one answer.
-    "--refmap=",
-    update.remote,
-    `+${update.destination}:${named}`,
-  ]
-  const observed = await git.run({ repo: update.repository, args, env: { LC_ALL: "C" } })
-  if (observed.code !== 0 || !ancestrySettled(observed)) {
-    if (ancestrySettled(observed) && observed.stderr.includes(`couldn't find remote ref ${update.destination}`)) {
-      return { state: "missing" }
-    }
-    throw operationError(update.repository, args, phase, observed)
+  const observed = await observeRemoteRefs(git, update.repository, update.remote, { required: update.destination })
+  if (observed.kind === "failed") {
+    throw operationError(update.repository, observed.args, phase, observed.result)
   }
-  // `<flag> <old> <new> <local ref>`, one line per refspec. The flag is one character and may itself be a
-  // space (a fast-forward), so the fields start at column 2, as Gitomic reads them.
-  const rows = observed.stdout.split(/\r?\n/u).filter((row) => row !== "")
-  const objectIds = rows.flatMap((row) => {
-    const [, oid, local] = row.slice(2).split(" ")
-    return local === named && oid !== undefined && OBJECT_ID.test(oid) ? [oid] : []
-  })
-  if (rows.length !== 1 || objectIds.length !== 1 || objectIds[0] === undefined) {
+  const [oid] = observed.objectIds
+  if (observed.kind === "invalid") {
     throw Object.assign(new Error(`remote destination ${update.destination} did not resolve unambiguously`), {
       resultDetail: detail(
         "ambiguous-remote-destination",
         phase,
         `Remote ${update.remote} destination ${update.destination} did not resolve to zero or one object.`,
         {
-          objectIds,
+          objectIds: observed.objectIds,
           remedy: "Use one exact destination ref and inspect the remote advertisement before retrying.",
         },
       ),
     })
   }
-  return { state: "oid", oid: objectIds[0] }
+  return oid === undefined ? { state: "missing" } : { state: "oid", oid }
 }
 
 function mismatchDetail(update: PlannedUpdate, observed: ExpectedDestination, phase: string): GitResultDetail {
