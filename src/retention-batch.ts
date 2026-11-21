@@ -104,6 +104,19 @@ export type RetentionBatchResult = Readonly<{
     unprovedList: string
     /** Every live owner with no existing writer lease, one path per line, sorted (#34960). */
     leaseMissingList: string
+    /**
+     * #34127 (@chief 2026-11-21 14:20): an object directory with no proved Git owner is a reported skip, never a batch
+     * stop. This is how many selected entries were kept because they borrow objects from one; none of them is deleted.
+     */
+    identityUnknownEntries: number
+    /** Those kept entries, `entry<TAB>object directory` per line, sorted; written beside the other owner lists. */
+    identityUnknownList: string
+    /** Allocated bytes the unproved directories hold, each measured on its own (a file linked into two counts twice). */
+    identityUnknownBytes?: number
+    /** Paths the byte total could not read; non-zero means `identityUnknownBytes` understates what is held. */
+    identityUnknownUnreadable?: number
+    /** Unproved directories the proof deadline cut off before their measurement, so no bytes were read for them. */
+    identityUnknownUnmeasured?: number
   }>
   windows: readonly BatchWindow[]
   rows: readonly BatchRow[]
@@ -448,15 +461,55 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
   const leaseMissing = liveOwners.filter(
     (owner) => lstatSync(join(owner, "yrd-worktree-mutations", "writer.lock"), { throwIfNoEntry: false }) === undefined,
   )
-  // #34960: the counts below stop a batch, so the owners behind them are written out in full, not one example: an
-  // operator resolves them owner by owner from these lists (@cto: owners first, no new full scan).
+  // #34960: the owners behind a stop are written out in full, not one example: an operator resolves them owner by
+  // owner from these lists (@cto: owners first, no new full scan).
   const ownerListDir = join(options.artifactDir, "owners")
   mkdirSync(ownerListDir, { recursive: true })
   const unprovedList = join(ownerListDir, "unproved.txt")
   const leaseMissingList = join(ownerListDir, "lease-missing.txt")
+  const identityUnknownList = join(ownerListDir, "identity-unknown-entries.txt")
   const lines = (paths: readonly string[]): string => (paths.length === 0 ? "" : `${[...paths].sort().join("\n")}\n`)
   writeFileSync(unprovedList, lines(unproved))
   writeFileSync(leaseMissingList, lines(leaseMissing))
+  // #34127 (@chief 2026-11-21 14:20): an object directory with no proved Git owner is a REPORTED SKIP, never a batch
+  // stop and never deleted. Only the entries that borrow objects from it lose their proof: its owner cannot be leased,
+  // so it could move inside the held window. No other entry is affected — deleting a retained store under this root
+  // cannot create, move or empty an outside object directory, and an outside borrower INTO a removal already blocks
+  // that entry on its own (survivorIntoRemoval) — so the batch continues with the proved ones.
+  const identityUnknown = new Map<string, string[]>()
+  for (const entry of entries) {
+    const lenders = unproved.filter((objects) =>
+      scan.borrowers.some((edge) => within(entry, edge.borrower) && within(objects, edge.target)),
+    )
+    if (lenders.length === 0) continue
+    identityUnknown.set(entry, lenders)
+    kept.set(
+      entry,
+      `identity-unknown: borrows objects from ${String(lenders.length)} object director(ies) with no proved Git owner, e.g. ${lenders[0]}; kept, never deleted (every path in ${unprovedList})`,
+    )
+  }
+  writeFileSync(
+    identityUnknownList,
+    lines([...identityUnknown].flatMap(([entry, lenders]) => lenders.map((objects) => `${entry}\t${objects}`))),
+  )
+  if (unproved.length > 0) {
+    console.warn(
+      `retention: ${String(unproved.length)} object director(ies) have no proved Git owner and cannot be leased; nothing under them is deleted, and ${String(identityUnknown.size)} selected entr(ies) that borrow from them are kept (paths in ${unprovedList}, per-entry skips in ${identityUnknownList})`,
+    )
+  }
+  // @chief asked for the paths AND their bytes: this figure is what an operator resolves owner by owner. Each
+  // directory is measured on its own, so a file hard-linked into two of them is counted in both, and a directory the
+  // proof deadline cut off is counted as unmeasured rather than as zero.
+  const unprovedBytes = { bytes: 0, unreadable: 0, unmeasured: 0 }
+  for (const objects of unproved) {
+    if (proofDeadlinePassed()) {
+      unprovedBytes.unmeasured += 1
+      continue
+    }
+    const measured = await measureRetainedBytes([objects])
+    unprovedBytes.bytes += measured.bytes + (measured.sharedBytes ?? 0)
+    unprovedBytes.unreadable += measured.unreadable
+  }
   ownerSummary.current = {
     total: ownerList.length,
     leaseMissing: leaseMissing.length,
@@ -469,18 +522,21 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
     ...(unproved[0] === undefined ? {} : { unprovedExample: unproved[0] }),
     unprovedList,
     leaseMissingList,
+    identityUnknownEntries: identityUnknown.size,
+    identityUnknownList,
+    ...(unproved.length === 0 ? {} : { identityUnknownBytes: unprovedBytes.bytes }),
+    ...(unprovedBytes.unreadable === 0 ? {} : { identityUnknownUnreadable: unprovedBytes.unreadable }),
+    ...(unprovedBytes.unmeasured === 0 ? {} : { identityUnknownUnmeasured: unprovedBytes.unmeasured }),
   }
   // A failed cold-proof read is incomplete owner evidence: the batch reports and stops before any deletion window,
   // dry run included (exit 2 through the CLI and Yrd), rather than keeping the owner live inside a green run (#34920,
-  // @cto 34920-retention-calls-r1).
+  // @cto 34920-retention-calls-r1). An unproved owner no longer stops it (#34127, above); it keeps only its borrowers.
   const ownerStop =
-    unproved.length > 0
-      ? `identity-unknown: ${unproved.length} object director(ies) have no proved Git owner, e.g. ${unproved[0]}; every one is listed in ${unprovedList}`
-      : coldProofFailures[0] !== undefined
-        ? `@gate/retention-cold-proof: cold-proof-incomplete: ${coldProofFailures.length} owner(s) have unreadable cold evidence (each named on stderr), e.g. ${coldProofFailures[0]}`
-        : leaseMissing.includes(common)
-          ? `lease-missing: common owner ${common} has no existing writer lease`
-          : undefined
+    coldProofFailures[0] !== undefined
+      ? `@gate/retention-cold-proof: cold-proof-incomplete: ${coldProofFailures.length} owner(s) have unreadable cold evidence (each named on stderr), e.g. ${coldProofFailures[0]}`
+      : leaseMissing.includes(common)
+        ? `lease-missing: common owner ${common} has no existing writer lease`
+        : undefined
   closeOverKeptBorrowers(entries, scan.borrowers, kept)
   const candidates = borrowerOrder(entries, scan.borrowers, kept)
   for (const [entry, reason] of kept) rows.set(entry, { entry, outcome: "kept", reason })

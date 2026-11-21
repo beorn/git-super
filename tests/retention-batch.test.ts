@@ -125,7 +125,7 @@ beforeEach(() => {
   rmSync(join(common, "worktrees", "cold-owner"), { recursive: true, force: true })
   rmSync(join(fixtureRoot, "revived-owner"), { recursive: true, force: true })
   rmSync(join(common, "modules", "retained-batch"), { recursive: true, force: true })
-  for (const name of ["owner-list-a", "owner-list-b", "store-a", "store-b"]) {
+  for (const name of ["owner-list-a", "owner-list-b", "store-a", "store-b", "store-x"]) {
     rmSync(join(fixtureRoot, name), { recursive: true, force: true })
   }
 })
@@ -548,7 +548,9 @@ describe("retention retirement batch (#33010)", async () => {
   // Accepted requirement (#34960, @chief 2a1b5761): the 2026-11-18 production dry run stopped on 221 unproved owners
   // and 2,104 unleased ones but named one of each, so nobody could resolve them owner by owner. The existing tests
   // check the counts, never that every owner behind them is written out.
-  it("a dry run that stops on owners writes every unproved and every unleased owner to the artifact dir", async () => {
+  // Amended by #34127 (@chief 2026-11-21 14:20): an unproved owner is REPORTED AND SKIPPED, never a batch stop, so the
+  // run continues with the proved entries; the listing this requirement asked for stays exactly as it was.
+  it("a dry run writes every unproved and every unleased owner and no longer stops on an unproved one", async () => {
     const unproved: string[] = []
     const unleased: string[] = []
     for (const suffix of ["a", "b"]) {
@@ -567,14 +569,56 @@ describe("retention retirement batch (#33010)", async () => {
 
     const result = await retireRetainedBatch(options())
 
-    expect(result.stopped).toContain("identity-unknown: 2 object director(ies)")
-    expect(result.stopped).toContain(result.owners!.unprovedList)
+    // No selected entry borrows from store-a or store-b, so nothing is kept for it and the batch carries on.
+    expect(result.stopped).toBeUndefined()
+    expect(result.rows.map((row) => row.outcome)).toEqual(["would-retire", "would-retire", "would-retire"])
+    expect(result.owners?.unproved).toBe(2)
+    expect(result.owners?.identityUnknownEntries).toBe(0)
     expect(readFileSync(result.owners!.unprovedList, "utf8")).toBe(`${unproved.sort().join("\n")}\n`)
+    expect(readFileSync(result.owners!.identityUnknownList, "utf8")).toBe("")
+    expect(result.owners?.identityUnknownBytes).toBe(
+      allocatedBytes(unproved[0] as string) + allocatedBytes(unproved[1] as string),
+    )
     const listed = readFileSync(result.owners!.leaseMissingList, "utf8").trimEnd().split("\n")
     expect(listed).toHaveLength(result.owners!.leaseMissing)
     expect(listed).toEqual([...listed].sort())
     expect(listed).toEqual(expect.arrayContaining(unleased))
     expect(readdirSync(root)).toHaveLength(3)
+  })
+
+  // @chief 2026-11-21 14:20 (on #34127): an unproved owner keeps the entries that borrow from it, names them, reports
+  // its path and bytes, and the batch still reclaims the proved ones — instead of exiting 2 with 0 B reclaimed. The
+  // never-delete half is proved by the borrowing entry still being on disk after an apply.
+  it("an unproved owner keeps its borrowers and is never deleted, while the proved entries retire", async () => {
+    // A real object store that is not any repository's own `objects`: the production shape of an unproved owner
+    // (fixture `store-a`/`store-b` above are the same shape, named by a clone that is not a batch entry).
+    const store = join(fixtureRoot, "store-x")
+    mkdirSync(join(store, "pack"), { recursive: true })
+    mkdirSync(join(store, "info"), { recursive: true })
+    const borrower = join(root, readdirSync(root).sort()[0] as string)
+    const alternates = join(borrower, "modules", "vendor", "dep", "objects", "info", "alternates")
+    const declared = existsSync(alternates) ? readFileSync(alternates, "utf8") : ""
+    writeFileSync(alternates, `${declared}${declared === "" || declared.endsWith("\n") ? "" : "\n"}${store}\n`)
+
+    const dry = await retireRetainedBatch(options())
+    expect(dry.stopped).toBeUndefined()
+    expect(dry.rows.find((row) => row.entry === borrower)?.outcome).toBe("kept")
+    expect(dry.rows.find((row) => row.entry === borrower)?.reason).toContain("identity-unknown")
+    expect(dry.rows.find((row) => row.entry === borrower)?.reason).toContain(store)
+    expect(
+      dry.rows.filter((row) => row.entry !== borrower).map((row) => row.outcome),
+      JSON.stringify(dry.rows),
+    ).toEqual(["would-retire", "would-retire"])
+    expect(dry.owners?.identityUnknownEntries).toBe(1)
+    expect(readFileSync(dry.owners!.identityUnknownList, "utf8")).toBe(borrower + "\t" + store + "\n")
+    expect(readFileSync(dry.owners!.unprovedList, "utf8")).toBe(store + "\n")
+    expect(dry.owners?.identityUnknownBytes).toBe(allocatedBytes(store))
+
+    const applied = await retireRetainedBatch(options({ apply: true }))
+    expect(applied.stopped).toBeUndefined()
+    expect(applied.rows.find((row) => row.entry === borrower)?.outcome).toBe("kept")
+    expect(readdirSync(root)).toEqual([basename(borrower)])
+    expect(existsSync(join(store, "pack"))).toBe(true)
   })
 
   // Accepted requirement (#34920, @cto 34920-ranking-and-bare-r2 §2): a retained store whose config still names

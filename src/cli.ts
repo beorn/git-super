@@ -1507,6 +1507,22 @@ async function writeResult(
           : `; this batch's evidence holds ${formatRetainedBytes(batch.bytesEvidence)} under the artifact directory`) +
         "\n",
     )
+    if (batch.owners !== undefined && batch.owners.unproved > 0) {
+      stdout.write(
+        `identity-unknown: ${String(batch.owners.unproved)} object director(ies) have no proved Git owner and cannot be leased; nothing under them is deleted` +
+          (batch.owners.identityUnknownBytes === undefined
+            ? ""
+            : `; ${formatRetainedBytes(batch.owners.identityUnknownBytes)} held there` +
+              (batch.owners.identityUnknownUnreadable === undefined || batch.owners.identityUnknownUnreadable === 0
+                ? ""
+                : ` (${String(batch.owners.identityUnknownUnreadable)} unreadable path(s) NOT counted)`)) +
+          (batch.owners.identityUnknownUnmeasured === undefined
+            ? ""
+            : `; ${String(batch.owners.identityUnknownUnmeasured)} director(ies) not measured: the proof deadline came first`) +
+          `; ${String(batch.owners.identityUnknownEntries)} selected entr(ies) kept for borrowing from them; paths in ` +
+          `${batch.owners.unprovedList}, per-entry skips in ${batch.owners.identityUnknownList}\n`,
+      )
+    }
     for (const row of batch.rows) stdout.write(`${row.outcome} ${row.entry}: ${row.reason}\n`)
     for (const window of batch.windows) {
       stdout.write(
