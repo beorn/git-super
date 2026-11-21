@@ -757,8 +757,10 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
     const ran = [first, second].filter((report) => !report.heldByAnotherSweep)
     expect(held).toHaveLength(1)
     expect(ran).toHaveLength(1)
-    expect(ran[0].failed).toBeNull()
-    expect(ran[0].processed).toEqual([entry])
+    const [ranOne] = ran
+    if (ranOne === undefined) throw new Error("#37625: expected exactly one sweep to run")
+    expect(ranOne.failed).toBeNull()
+    expect(ranOne.processed).toEqual([entry])
     expect(existsSync(join(gitDir, "logs/refs/remotes"))).toBe(false)
   })
 
