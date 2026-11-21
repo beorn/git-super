@@ -91,10 +91,17 @@ export async function acquireExclusive(
   }
 }
 
+const BUSY_PREFIX = "git-super: worktree mutation lock is busy after "
+
+/** True for the refusal {@link acquireExclusive} throws when its wait runs out (#37625 callers add a class, not a throw). */
+export function isExclusiveBusy(error: unknown): boolean {
+  return error instanceof Error && error.message.startsWith(BUSY_PREFIX)
+}
+
 function busy(path: string, now: number, waitedMs: number, timeoutMs: number, contender?: string): Error {
   const { owner, holder, age } = describeRecordedLockHolder(path, now)
   return new Error(
-    `git-super: worktree mutation lock is busy after ${waitedMs}ms ` +
+    `${BUSY_PREFIX}${waitedMs}ms ` +
       `(timeout=${timeoutMs}ms; live ${describeLiveLockHolders(path)}; ` +
       `recorded note, not authority: holder=${holder}; age=${age}; owner=${owner}; contender=pid:${process.pid}` +
       `${contender === undefined ? "" : ` operation=${contender}`}; ${path})`,

@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from "node:crypto"
 import { existsSync, lstatSync, readdirSync } from "node:fs"
 import { lstat, readdir, readFile, rename, unlink, writeFile } from "node:fs/promises"
-import { dirname, join, sep } from "node:path"
+import { basename, dirname, join, sep } from "node:path"
+import { acquireExclusive, isExclusiveBusy, type WriterLock } from "./exclusive.ts"
 import { cleanGitRepositoryEnvironment } from "./git.ts"
 import { createLocalGitProcess, type GitProcess } from "./process.ts"
 import {
@@ -484,6 +485,13 @@ export type CompactRetainedRootReport = Readonly<{
    * operator reading `refused` must be able to believe the entry is untouched.
    */
   failed: Readonly<{ entry: string; step: string }> | null
+  /**
+   * #37625: another sweep held this root, so this one wrote nothing and enumerated nothing. Concurrent
+   * sweeps of one root raced here before: one dropped `logs/refs/remotes/**` while the other's gate-2
+   * walk still had those very files open, which surfaced as `compact: ENOENT ... open <reflog>`. The
+   * holding sweep owns the compaction; a duplicate sweep reports the fact instead of racing it.
+   */
+  heldByAnotherSweep: boolean
 }>
 
 /**
@@ -508,6 +516,12 @@ export type CompactRetainedRootOptions = Readonly<{
   limit?: number | null
   /** The retained copy's custody common. `path.sep` (`"/"`) for existing stock, whose lender is gone. */
   common?: string
+  /**
+   * #37625: how long to wait for a concurrent sweep of the same root to finish before reporting
+   * {@link CompactRetainedRootReport.heldByAnotherSweep}. Default 0: a duplicate sweep yields at once,
+   * because a full stock sweep can run for hours and the caller (a worktree close) must not block on it.
+   */
+  lockWaitMs?: number
 }>
 
 /**
@@ -523,7 +537,77 @@ export type CompactRetainedRootOptions = Readonly<{
  * directory and symlink identities were never recorded), and children with no readable manifest are
  * skipped and reported by class. The first eligible child to fail verification stops the run.
  */
+/**
+ * #37625: the exclusive lock lives BESIDE the root, never inside it - a lock file inside the root would
+ * become a manifest entry of every child and break gate 2. One directory per root, so two different
+ * roots in one parent never block each other.
+ */
+function retainedRootLockDir(root: string): string {
+  return join(dirname(root), "." + basename(root) + ".retained-compaction")
+}
+
+/** Every class at zero, for the report a duplicate sweep returns without enumerating anything. */
+function zeroCounts(): Record<RetainedEntryClass, number> {
+  return {
+    eligible: 0,
+    refused: 0,
+    "stopped-partial": 0,
+    "already-compacted": 0,
+    "no-entries-map": 0,
+    "incomplete-proof": 0,
+    "no-manifest": 0,
+  }
+}
+
+/**
+ * #37625 (2026-11-21): compact one declared retained-modules root, at most one sweep at a time.
+ *
+ * Two sweeps of one root used to race: sweep B's `dropRemoteReflogs` deletes `logs/refs/remotes/**`
+ * while sweep A's gate-2 walk is still hashing exactly those files, so A's `open` of a file `readdir`
+ * had just listed fails `ENOENT` and the child is stamped `compact`/failed. Measured on the stock at
+ * `/hh/var/yrd-workdir/.../retained-modules/37455-reaper-R4tS4b`: its own manifest records the winning
+ * compaction at 21:38:45.563Z (2418 -> 408 files, remote reflogs dropped) inside the same window as
+ * the failure that opened `modules/km/logs/refs/remotes/origin/task/20917-s4-prelude-hoist`.
+ *
+ * The lock is per root and a duplicate sweep YIELDS rather than throws: a close must never fail
+ * because maintenance is running elsewhere. `lockWaitMs` lets a caller wait instead, when it genuinely
+ * wants this root compacted before it returns.
+ */
 export async function compactRetainedRoot(
+  root: string,
+  options: CompactRetainedRootOptions = {},
+): Promise<CompactRetainedRootReport> {
+  const dryRun = options.dryRun === true
+  const limit = options.limit ?? null
+  let lock: WriterLock
+  try {
+    lock = await acquireExclusive(
+      retainedRootLockDir(root),
+      { timeoutMs: Math.max(0, options.lockWaitMs ?? 0) },
+      "retained compaction " + root,
+    )
+  } catch (error) {
+    if (!isExclusiveBusy(error)) throw error
+    return {
+      root,
+      dryRun,
+      limit,
+      children: 0,
+      counts: zeroCounts(),
+      entries: [],
+      processed: [],
+      failed: null,
+      heldByAnotherSweep: true,
+    }
+  }
+  try {
+    return await compactRetainedRootLocked(root, options)
+  } finally {
+    lock.release()
+  }
+}
+
+async function compactRetainedRootLocked(
   root: string,
   options: CompactRetainedRootOptions = {},
 ): Promise<CompactRetainedRootReport> {
@@ -633,7 +717,17 @@ export async function compactRetainedRoot(
     processed.push(entry)
   }
 
-  return { root, dryRun, limit, children: children.length, counts, entries: reports, processed, failed }
+  return {
+    root,
+    dryRun,
+    limit,
+    children: children.length,
+    counts,
+    entries: reports,
+    processed,
+    failed,
+    heldByAnotherSweep: false,
+  }
 }
 
 /** C3 dry run: run the existing-stock gate-2 copy verification without compacting anything. */

@@ -21,7 +21,7 @@ import {
   writeFileSync,
 } from "node:fs"
 import { spawnSync } from "node:child_process"
-import { join, relative, sep } from "node:path"
+import { basename, join, relative, sep } from "node:path"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import {
   compactRetainedModules,
@@ -708,6 +708,58 @@ describe("compactRetainedRoot (C3 existing stock)", () => {
       dropped: "logs/refs/remotes/",
       refValuesEqual: true,
     })
+  })
+
+  it("#37625: a duplicate sweep of one root yields while another holds it, and writes nothing", async () => {
+    const scratch = mkdtempSync(join(canonicalTmpdir(), "git-super-c3-37625-held-"))
+    roots.push(scratch)
+    const retainedRoot = join(scratch, "retained-modules")
+    mkdirSync(retainedRoot, { recursive: true })
+    const { entry, gitDir } = await buildRetainedEntry(retainedRoot, "held-entry")
+    const reflog = join(gitDir, "logs/refs/remotes/origin/topic-1")
+    expect(existsSync(reflog)).toBe(true)
+
+    // Exactly where a concurrent sweep holds it: beside the root, never inside it.
+    const holder = await acquireExclusive(
+      join(scratch, "." + basename(retainedRoot) + ".retained-compaction"),
+      { timeoutMs: 0 },
+      "test sweep",
+    )
+    try {
+      const yielded = await compactRetainedRoot(retainedRoot)
+      expect(yielded.heldByAnotherSweep).toBe(true)
+      expect(yielded.processed).toEqual([])
+      expect(yielded.children).toBe(0)
+      expect(yielded.failed).toBeNull()
+      // Nothing was touched: the reflog the racing sweep used to delete mid-walk is still there.
+      expect(existsSync(reflog)).toBe(true)
+      expect(storedProof(entry).compaction).toBeUndefined()
+    } finally {
+      holder.release()
+    }
+
+    const after = await compactRetainedRoot(retainedRoot)
+    expect(after.heldByAnotherSweep).toBe(false)
+    expect(after.processed).toEqual([entry])
+    expect(existsSync(join(gitDir, "logs/refs/remotes"))).toBe(false)
+  })
+
+  it("#37625: two sweeps started together never both write one root", async () => {
+    const scratch = mkdtempSync(join(canonicalTmpdir(), "git-super-c3-37625-pair-"))
+    roots.push(scratch)
+    const retainedRoot = join(scratch, "retained-modules")
+    mkdirSync(retainedRoot, { recursive: true })
+    const { entry, gitDir } = await buildRetainedEntry(retainedRoot, "pair-entry")
+
+    const [first, second] = await Promise.all([compactRetainedRoot(retainedRoot), compactRetainedRoot(retainedRoot)])
+
+    const held = [first, second].filter((report) => report.heldByAnotherSweep)
+    const ran = [first, second].filter((report) => !report.heldByAnotherSweep)
+    expect(held).toHaveLength(1)
+    expect(ran).toHaveLength(1)
+    expect(ran[0].failed).toBeNull()
+    expect(ran[0].processed).toEqual([entry])
+    expect(existsSync(join(gitDir, "logs/refs/remotes"))).toBe(false)
   })
 
   it("rebuilds a stale-root proof from the child's own directory instead of replaying its paths", async () => {
