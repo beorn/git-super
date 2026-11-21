@@ -46,6 +46,8 @@ export type SuperWorktreeRemoveOptions = Readonly<{
    * in the manifest as given. Opaque: each value is a string or null; GitSuper interprets none of it.
    */
   attribution?: RetentionAttribution
+  /** #37579 (@cto condition 4): report the nested component worktree lists and remove nothing. */
+  dryRun?: boolean
 }>
 
 export type SuperWorktreeRemoveResult = GitSuperResult &
@@ -56,6 +58,8 @@ export type SuperWorktreeRemoveResult = GitSuperResult &
     reason?: "borrowed" | "component-custody"
     custody?: ComponentCustodyRefusal
     borrowers?: readonly string[]
+    /** Set when the caller asked for a dry run: nothing was removed. */
+    dryRun?: boolean
     /** Present when a retained copy was compacted after native --force; failure does not fail the removal. */
     compaction?: CompactionResult
     /** Verified target removal left named staged filesystem work. */
@@ -69,7 +73,10 @@ export async function superWorktreeRemove(options: SuperWorktreeRemoveOptions): 
   let proof: WorktreeRemovalProof | undefined
   let removalReturned = false
   try {
-    const store = createLocalGitWorktreeStore({ repo })
+    const store = createLocalGitWorktreeStore({
+      repo,
+      ...(options.report === undefined ? {} : { report: options.report }),
+    })
     if (!(await store.inspect(path)).registered) {
       const owner = owningComponentRepository(repo, path)
       if (owner !== undefined && owner !== repo) {
@@ -81,6 +88,7 @@ export async function superWorktreeRemove(options: SuperWorktreeRemoveOptions): 
       ...(options.noRehome === undefined ? {} : { noRehome: options.noRehome }),
       ...(options.componentCustody === undefined ? {} : { componentCustody: options.componentCustody }),
       ...(options.preserved === undefined ? {} : { preserved: options.preserved }),
+      ...(options.dryRun === true ? { dryRun: true } : {}),
       retention: {
         ...(options.attribution === undefined ? {} : { attribution: checkRetentionAttribution(options.attribution) }),
         root: options.retain,
@@ -113,6 +121,14 @@ export async function superWorktreeRemove(options: SuperWorktreeRemoveOptions): 
         notCompared: [],
         reason: "borrowed",
         borrowers: outcome.borrowers,
+      }
+    }
+    if (options.dryRun === true) {
+      return {
+        ...gitSuperResult([{ repository: repo, state: "unchanged", refs: [] }]),
+        path,
+        notCompared: [],
+        dryRun: true,
       }
     }
     removalReturned = true

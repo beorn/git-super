@@ -755,6 +755,10 @@ async function runInvocation(
       "record the caller's attribution for this retention in its manifest as given: a JSON object of string or null values, never interpreted by GitSuper",
     )
     .argument("<path>", "registered clean worktree to remove")
+    .option(
+      "--dry-run",
+      "report every nested component worktree as 'will remove (clean, contained)' or 'blocks (reason)' and remove nothing",
+    )
     .action((path, _options, command) => {
       const globals = command.optsWithGlobals() as { repo: string; json?: boolean }
       const options = command.opts() as {
@@ -764,12 +768,14 @@ async function runInvocation(
         preserved?: string[]
         rehome: boolean
         componentCustody?: string
+        dryRun?: boolean
       }
       const invocation: Extract<CapturedInvocation, { node: typeof commands.worktree.remove }> = {
         node: commands.worktree.remove,
         params: {
           path,
           retain: options.retain,
+          ...(options.dryRun === true ? { dryRun: true } : {}),
           ...(options.rehome === false ? { noRehome: true } : {}),
           ...(options.componentCustody === undefined
             ? {}

@@ -1402,6 +1402,82 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       stores,
     }
   }
+  /**
+   * #37579 (@cto ruling B): a component worktree registered under this worktree's admin dir may keep its
+   * checkout outside the directory being removed. Native removal deletes the admin dir, so such a checkout is
+   * left with a .git pointing at a gitdir that no longer exists and git can never clean it up again.
+   * Each one is either removed here, through its own component store, or it blocks the whole removal by name.
+   */
+  const nestedComponentCheckouts = async (path: string, gitDir: string) => {
+    const roots: string[] = []
+    const walk = (directory: string, depth: number) => {
+      if (depth > 8 || !existsSync(directory)) return
+      for (const entry of readdirSync(directory, { withFileTypes: true })) {
+        if (!entry.isDirectory() || entry.name === "worktrees") continue
+        const child = join(directory, entry.name)
+        if (existsSync(join(child, "worktrees"))) roots.push(child)
+        walk(child, depth + 1)
+      }
+    }
+    walk(join(gitDir, "modules"), 0)
+    const checkouts: Array<{ checkout: string; store: string; reason?: string }> = []
+    for (const store of roots) {
+      const worktrees = join(store, "worktrees")
+      for (const entry of readdirSync(worktrees, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue
+        const pointer = join(worktrees, entry.name, "gitdir")
+        if (!existsSync(pointer)) continue
+        const gitfile = readFileSync(pointer, "utf8").trim()
+        if (gitfile === "" || !isAbsolute(gitfile)) continue
+        const checkout = dirname(gitfile)
+        // A checkout inside the removed directory dies with it; the existing child cleanup owns that case.
+        const inside = relative(path, checkout)
+        if (inside === "" || (!inside.startsWith("..") && !isAbsolute(inside))) continue
+        if (!existsSync(join(checkout, ".git"))) continue
+        // The checkout's HEAD lives in <store>/worktrees/<entry>/HEAD, never in the store's own HEAD: reading
+        // the store would compare the main worktree's commit and let a detached, unreachable tip through.
+        const head = await git.text(checkout, ["rev-parse", "HEAD"]).catch(() => "")
+        const status = await git
+          .text(checkout, ["status", "--porcelain", "--untracked-files=all"])
+          .catch((cause: unknown) => `ERR ${String(cause)}`)
+        const refs = await git
+          .text(store, [
+            "--git-dir=" + store,
+            "for-each-ref",
+            "--format=%(objectname)",
+            "refs/heads",
+            "refs/remotes",
+            "refs/tags",
+          ])
+          .catch(() => "")
+        let contained = false
+        for (const tip of refs
+          .split("\n")
+          .map((line) => line.trim())
+          .filter((line) => line !== "")) {
+          const ancestry = await git
+            .run(store, ["--git-dir=" + store, "merge-base", "--is-ancestor", head, tip])
+            .catch(() => ({ code: 1 }))
+          if (ancestry.code === 0) {
+            contained = true
+            break
+          }
+        }
+        const reason = status.startsWith("ERR ")
+          ? `status unreadable: ${status.slice(4)}`
+          : status.trim() !== ""
+            ? "dirty or untracked work"
+            : head === ""
+              ? "HEAD unreadable"
+              : !contained
+                ? "HEAD is not reachable from a ref this component store keeps"
+                : undefined
+        checkouts.push({ checkout, store, ...(reason === undefined ? {} : { reason }) })
+      }
+    }
+    return checkouts
+  }
+
   // Reuse removal's consulted population: native children can belong to independent
   // stores even though their checkouts die with the root directory.
   const captureLinkedChildren = async (path: string, rootGitDir: string, excluded: readonly string[]) => {
@@ -1655,6 +1731,8 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         noRehome?: boolean
         preserved?: readonly string[]
         componentCustody?: ComponentCustodyPolicy
+        /** #37579: report the nested component worktree lists and stop before any removal. */
+        dryRun?: boolean
         /** Caller policy, under removal leases before custody changes and again immediately before staging. */
         beforeRemove?: (target: RegisteredWorktree) => Promise<void>
       }> = {},
@@ -1743,6 +1821,43 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         }
         if (rehome === undefined) throw new Error(`worktree ${path} has no prepared borrower custody`)
         markPhase("prepareRemoval", prepareStarted)
+        // #37579: decide every nested component checkout before anything is destroyed.
+        const nestedStarted = Date.now()
+        const nested = await nestedComponentCheckouts(path, gitDir)
+        for (const entry of nested) {
+          options.report?.(
+            `${entry.checkout}: ${entry.reason === undefined ? "will remove (clean, contained)" : `blocks (${entry.reason})`}\n`,
+          )
+        }
+        const blocking = nested.filter((entry) => entry.reason !== undefined)
+        if (blocking.length > 0) {
+          throw new Error(
+            `worktree ${path} removal refused: ${blocking.length} nested component worktree(s) outside it cannot be removed safely — ` +
+              `${blocking.map((entry) => `${entry.checkout} (${entry.reason})`).join("; ")}; the worktree is preserved. ` +
+              `Resolve each one, or remove it with 'git --git-dir=<component store> worktree remove <path>', then retry.`,
+          )
+        }
+        const removedNested: string[] = []
+        if (removeOptions.dryRun === true) return
+        for (const entry of nested) {
+          checkRemovalExecution(execution)
+          const step = await git.run(entry.store, ["--git-dir=" + entry.store, "worktree", "remove", entry.checkout])
+          if (step.code !== 0) {
+            throw new Error(
+              `worktree ${path} removal stopped: nested component worktree ${entry.checkout} could not be removed ` +
+                `(${step.stderr.trim() || step.stdout.trim() || `git exit ${step.code}`}); removed so far: ` +
+                `${removedNested.length === 0 ? "none" : removedNested.join(", ")}; remaining: ` +
+                `${nested
+                  .slice(nested.indexOf(entry))
+                  .map((row) => row.checkout)
+                  .join(", ")}; the worktree is preserved.`,
+            )
+          }
+          await git.run(entry.store, ["--git-dir=" + entry.store, "worktree", "prune"])
+          removedNested.push(entry.checkout)
+          options.report?.(`${entry.checkout}: removed (clean, contained)\n`)
+        }
+        markPhase("nestedComponentWorktrees", nestedStarted)
         // No custody rehome or destruction has run; a value-holding store stays in place.
         const preserveStarted = Date.now()
         preserveModuleStoreValueBeforeDelete(stores)

@@ -603,6 +603,9 @@ const worktreeRemove = commandNode<CommandContext, WorktreeRemoveParams, GitSupe
     if (input.noRehome !== undefined && typeof input.noRehome !== "boolean") {
       throw new Error("worktree remove noRehome must be a boolean")
     }
+    if (input.dryRun !== undefined && typeof input.dryRun !== "boolean") {
+      throw new Error("worktree remove dryRun must be a boolean")
+    }
     let componentCustody: Readonly<{ primaryRoot: string; targetBranch: string }> | undefined
     if (input.componentCustody !== undefined) {
       const custody = record(input.componentCustody)
@@ -619,6 +622,7 @@ const worktreeRemove = commandNode<CommandContext, WorktreeRemoveParams, GitSupe
     return {
       path: input.path,
       retain: input.retain,
+      ...(input.dryRun === true ? { dryRun: true } : {}),
       ...(input.noRehome === true ? { noRehome: true } : {}),
       ...(componentCustody === undefined ? {} : { componentCustody }),
       ...(input.excludedSubmodules === undefined

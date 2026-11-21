@@ -216,7 +216,7 @@ Removes one registered, clean, unlocked linked worktree. Steps:
 2. Copy the submodule Git data outside both deletion paths. Preserve its source manifest, normalize removable object dependencies, then record and verify the final copied bytes.
 3. Print the proof on stderr, then run `git worktree remove --force`. The `--force` only overrides Git's refusal to remove worktrees with submodules; the checks above have already passed.
 4. Compact each copied submodule Git directory: `git pack-refs --all`, drop `logs/refs/remotes/`, keep every local reflog, and rewrite the proof so `worktree retention verify` still matches. Ref values are compared before and after. If compaction fails, the removal still succeeds: refs stay intact, the proof is not rewritten (so a later verify refuses), the copy is kept, and the JSON says `compaction: { status, child, step }`.
-5. Unregister nested linked checkouts that belonged to surviving submodule stores. Branch refs and the copy are not changed.
+5. Unregister nested linked checkouts that belonged to surviving submodule stores. Branch refs and the copy are not changed. A nested component worktree whose checkout sits outside `<path>` is removed through its own component store (then pruned) only when it is clean (untracked files included) and its HEAD is reachable from a ref that store keeps; otherwise the whole removal is refused by name and `<path>` is preserved. Report lines say `will remove (clean, contained)` or `blocks (<reason>)` per checkout.
 
 Copies are never deleted automatically. Keep them at least until the proof's `retainUntil` date. Use a durable directory.
 
@@ -245,6 +245,7 @@ Other options:
 
 - `--no-rehome` keeps a store that other stores borrow from, instead of moving their objects.
 - `--preserved <ref>` lets a dirty store be removed only if `<ref>` resolves to a commit in that store.
+- `--dry-run` reports every nested component worktree as `will remove (clean, contained)` or `blocks (<reason>)` and removes nothing; one blocker still refuses.
 
 ### Retention commands
 
