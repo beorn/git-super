@@ -39,12 +39,7 @@ import {
   type CustodyScan,
 } from "../src/retention-custody.ts"
 import { componentHeads } from "../src/worktree.ts"
-import {
-  gitLineStream,
-  RETENTION_STREAM_QUEUE_LINES,
-  readLines,
-  SidecarWriter,
-} from "../src/retention-stream.ts"
+import { gitLineStream, RETENTION_STREAM_QUEUE_LINES, readLines, SidecarWriter } from "../src/retention-stream.ts"
 
 const cleanup: string[] = []
 afterEach(() => {
@@ -1590,6 +1585,10 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     const refused = git(work, ["rev-parse", "HEAD"])
     git(work, ["switch", "-q", "main"])
     git(work, ["push", "-q", remote, "main"])
+    // 37792 (@cto turn36-retention-ruling): ancestry is asked in the surviving witness store, so the unreadable head
+    // has to live there for the rule to be exercised at all; the injected merge-base failure is what makes it unreadable.
+    git(work, ["push", "-q", remote, "refs/heads/side:refs/heads/side"])
+    git(primary, ["fetch", "-q", "origin"])
     const sidecarDir = tmp("git-super-custody-unreadable-head-sidecars-")
     const component = {
       ...(await componentOf([refused], sidecarDir, "refs/heads/side", { [refused]: "commit" })),
@@ -1894,6 +1893,36 @@ describe("retention custody scan — mirror-head ancestry (#37792)", () => {
     expect(scan.status).toBe("pass")
     expect(scan.reachability).toHaveLength(1)
     expect(scan.reachability?.[0]?.tip).toBe(fixture.head)
+    expect(scan.reachability?.[0]?.confirmedBy).toContain("ls-remote")
+    expect(fscks).toEqual([])
+  })
+
+  // 37792 (@cto turn36-retention-ruling part 2): the retired copy cannot contain a tip published after capture, so
+  // ancestry must be read from the admitted surviving witness store. Requiring the tip in the copy makes every real
+  // entry unprovable by construction, which is exactly what the five retained entries measured.
+  test("a retained copy that predates the published tip proves ancestry from the witness store", async () => {
+    const { remote, work, primary } = publishedStores("git-super-ancestry-stale-")
+    const head = git(primary, ["rev-parse", "HEAD"])
+    writeFileSync(join(work, "later.txt"), "published after the capture\n")
+    git(work, ["add", "later.txt"])
+    git(work, ["commit", "-q", "-m", "later"])
+    git(work, ["push", "-q", remote, "main"])
+    const tip = git(work, ["rev-parse", "HEAD"])
+    const mirror = join(tmp("git-super-ancestry-stale-mirror-"), "mirror.git")
+    git(tmp("git-super-ancestry-stale-mirror-parent-"), ["clone", "-q", "--bare", remote, mirror])
+    // The retained copy never fetched the later commit: this is the stale-copy case, and it must not refuse.
+    expect(() => git(primary, ["cat-file", "-e", tip])).toThrow()
+    const sidecarDir = tmp("git-super-ancestry-stale-sidecars-")
+    const component = await componentOf([head], sidecarDir, "owned", { [head]: "commit" })
+    const { run, fscks } = countingRun()
+    const scan = await scanCustody(primary, [component], [join(mirror, "objects")], [], {
+      sidecarDir,
+      run,
+      witnessPolicy: { targetBranch: "main" },
+      environmentHeads: { ".git": [head] },
+    })
+    expect(scan.status).toBe("pass")
+    expect(scan.reachability?.[0]?.tip).toBe(tip)
     expect(scan.reachability?.[0]?.confirmedBy).toContain("ls-remote")
     expect(fscks).toEqual([])
   })
