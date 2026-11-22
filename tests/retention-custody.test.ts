@@ -25,7 +25,13 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, test } from "vitest"
 import { defaultGitRun, defaultGitStream, type ComponentContents, type GitRun } from "../src/retention-contents.ts"
-import { CustodyIndexScope, DEFAULT_CUSTODY_BOUNDS, scanCustody, type CustodyScan } from "../src/retention-custody.ts"
+import {
+  CustodyIndexScope,
+  CustodyRunScope,
+  DEFAULT_CUSTODY_BOUNDS,
+  scanCustody,
+  type CustodyScan,
+} from "../src/retention-custody.ts"
 import { componentHeads } from "../src/worktree.ts"
 import { gitLineStream, RETENTION_STREAM_QUEUE_LINES, readLines, SidecarWriter } from "../src/retention-stream.ts"
 
@@ -1830,6 +1836,41 @@ describe("retention custody scan — head closure and fetched refs (#37792)", ()
     })
     expect(scan.status).toBe("unknown")
     expect(scan.detail).toContain(blob)
+    void remote
+  })
+
+  // 37854: a five-entry batch shares one proof budget, and re-walking every durable ref of every witness store per
+  // entry spent it. The walk's answer does not depend on the entry, so the second entry must reuse it.
+  test("a second entry in the same run reuses the witness ref walk", async () => {
+    const { remote, primary } = publishedStores("git-super-fragment-cache-")
+    const head = git(primary, ["rev-parse", "HEAD"])
+    const sidecarDir = tmp("git-super-fragment-cache-sidecars-")
+    const component = await componentOf([head], sidecarDir, "owned", { [head]: "commit" })
+    let walks = 0
+    const counting = (args: readonly string[], options: Parameters<typeof defaultGitStream>[1]) => {
+      if (args.includes("rev-list")) walks += 1
+      return defaultGitStream(args, options)
+    }
+    const runScope = new CustodyRunScope(tmp("git-super-fragment-cache-fragments-"))
+    const options = {
+      sidecarDir,
+      stream: counting,
+      witnessPolicy: { targetBranch: "main" },
+      runScope,
+    }
+    const first = await scanCustody(primary, [component], [join(primary, ".git", "objects")], [], options)
+    expect(first.status).toBe("pass")
+    const afterFirst = walks
+    expect(afterFirst).toBeGreaterThan(0)
+    const second = await scanCustody(
+      primary,
+      [component],
+      [join(primary, ".git", "objects")],
+      ["1".repeat(40)],
+      options,
+    )
+    expect(second.status).toBe("pass")
+    expect(walks).toBe(afterFirst)
     void remote
   })
 
