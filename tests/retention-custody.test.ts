@@ -1405,6 +1405,69 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     expect(scan.witnesses[0]).toMatchObject({ ref: "refs/heads/main", tip: landed })
   })
 
+  // 37792 (@cto turn38-retention-remote): the reader used to list eligible refs BEFORE refreshing the pin namespace, so
+  // a pin published since the last fetch was invisible to that read and the same data passed only on a second pass.
+  // This pins the order: populate the pins, then enumerate.
+  test("a pin published after the witness store's last fetch witnesses its commit on the first read", async () => {
+    const { remote, work, primary } = publishedStores("git-super-custody-pin-first-")
+    git(work, ["switch", "-q", "-c", "side"])
+    writeFileSync(join(work, "pin-only.txt"), "pin only\n")
+    git(work, ["add", "pin-only.txt"])
+    git(work, ["commit", "-q", "-m", "pin only"])
+    const pinned = git(work, ["rev-parse", "HEAD"])
+    git(work, ["push", "-q", remote, `${pinned}:refs/git-super/pins/${pinned}`])
+    expect(git(primary, ["for-each-ref", "--format=%(refname)", "refs/git-super/pins"])).toBe("")
+    const sidecarDir = tmp("git-super-custody-pin-first-sidecars-")
+    const component = {
+      ...(await componentOf([pinned], sidecarDir, "reflog logs/HEAD")),
+      gitDir: join(work, ".git"),
+    }
+    const scan = await scanCustody(work, [component], [join(primary, ".git", "objects")], [], {
+      sidecarDir,
+      witnessPolicy: { targetBranch: "main" },
+    })
+    expect(scan.status).toBe("pass")
+    expect(scan.witnessCount).toBe(1)
+    expect(scan.witnesses[0]).toMatchObject({ ref: `refs/git-super/pins/${pinned}`, tip: pinned })
+  })
+
+  // 37792 (@cto turn38-retention-remote): two proofs in one pass share one advertisement per admitted store; the held
+  // pass starts a fresh scope, so it re-reads instead of trusting the preliminary observation.
+  test("one pass reads each store's advertisement once, and a fresh pass reads it again", async () => {
+    const { work, primary } = publishedStores("git-super-custody-advertise-")
+    const sidecarDir = tmp("git-super-custody-advertise-sidecars-")
+    const landed = git(work, ["rev-parse", "HEAD"])
+    const component = {
+      ...(await componentOf([landed], sidecarDir)),
+      gitDir: join(work, ".git"),
+    }
+    let advertisements = 0
+    const counting: GitRun = (args, options) => {
+      if (args.includes("ls-remote") && args.includes("refs/git-super/pins/*")) advertisements += 1
+      return defaultGitRun(args, options)
+    }
+    const scope = new CustodyRunScope()
+    const proof = () =>
+      scanCustody(work, [component], [join(primary, ".git", "objects")], [], {
+        sidecarDir,
+        run: counting,
+        witnessPolicy: { targetBranch: "main" },
+        runScope: scope,
+      })
+    const first = await proof()
+    const second = await proof()
+    expect([first.status, second.status]).toEqual(["pass", "pass"])
+    expect(advertisements).toBe(1)
+    const held = await scanCustody(work, [component], [join(primary, ".git", "objects")], [], {
+      sidecarDir,
+      run: counting,
+      witnessPolicy: { targetBranch: "main" },
+      runScope: new CustodyRunScope(),
+    })
+    expect(held.status).toBe("pass")
+    expect(advertisements).toBe(2)
+  })
+
   test("a remote that cannot be read is unknown and names the remote, never a fallback to local refs", async () => {
     const { work, primary } = publishedStores("git-super-custody-unreachable-")
     writeFileSync(join(work, "b.txt"), "beta\n")

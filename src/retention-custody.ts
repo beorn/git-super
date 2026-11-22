@@ -287,6 +287,13 @@ export class CustodyRunScope {
   readonly fragments = new Map<string, SidecarRef>()
   /** 37854: how many ref walks this pass paid for, and how many a later entry in it reused. */
   readonly fragmentUse = { walked: 0, reused: 0 }
+  /**
+   * 37792 (@cto turn38-retention-remote): remote advertisements reused inside this pass, keyed by the exact store,
+   * configured remote and target branch. The held pass gets its own scope, so a branch that moved is re-read there.
+   */
+  readonly publishedAdvertisements = new Map<string, PublishedAdvertisement>()
+  /** 37792 (@cto turn38-retention-remote): stores whose pin namespace this pass has already populated. */
+  readonly populatedPinNamespaces = new Set<string>()
 }
 
 const HEX40 = /^[0-9a-f]{40}$/u
@@ -474,22 +481,21 @@ async function configuredRemote(gitDir: string, run: GitRun): Promise<string | u
   )
 }
 
+/** One store's remote advertisement, read once: the target branch it publishes and how many pins it names. */
+type PublishedAdvertisement = Readonly<{ branchTip?: string; pinCount: number }>
+
 /**
- * Read what the component's remote publishes NOW for the target branch and its GitSuper pins, then
- * make those commits readable in this witness store. A local remote-tracking ref or branch may be
- * days stale, so it never decides what is published; a remote that cannot be read is unknown, with
- * no fallback to the local copies (operator 2026-10-21, same rule as the value reader).
- *
- * Pins are named by the commit they point at, so fetching them by name is idempotent. The target
- * branch is fetched for its objects only, because a custody check must never move the primary's
- * own branch.
+ * 37792 (@cto turn38-retention-remote): a target-tip advertisement and a populated pin namespace are DIFFERENT facts.
+ * Reading what the remote publishes is one ls-remote; making its pins readable in this store is a fetch, and that
+ * fetch has to happen BEFORE the eligible-ref list is enumerated or a pin published since the last read stays
+ * invisible to this read. Keeping them apart is what lets the ancestry proof pay for the cheap read alone.
  */
-async function refreshPublishedRefs(
+async function advertisePublishedRefs(
   gitDir: string,
   remote: string,
   targetBranch: string,
   run: GitRun,
-): Promise<Readonly<{ branchTip?: string; pinCount: number }>> {
+): Promise<PublishedAdvertisement> {
   const targetRef = `refs/heads/${targetBranch}`
   const listed = await run(
     [`--git-dir=${gitDir}`, "ls-remote", "--symref", remote, targetRef, "refs/git-super/pins/*"],
@@ -513,50 +519,121 @@ async function refreshPublishedRefs(
     if (ref === targetRef) branchTip = sha
     else if (PIN_REF.test(ref)) pinCount += 1
   }
-  if (pinCount > 0) {
-    const fetched = await run(
-      [
-        `--git-dir=${gitDir}`,
-        "fetch",
-        "--quiet",
-        "--no-tags",
-        "--no-recurse-submodules",
-        "--no-write-fetch-head",
-        "--no-auto-maintenance",
-        remote,
-        `+refs/git-super/pins/*:refs/git-super/pins/*`,
-      ],
-      { timeoutMs: PUBLISHED_READ_TIMEOUT_MS },
-    )
-    if (fetched.code !== 0) {
-      throw new UnknownError(
-        `witness store ${gitDir}: fetching the pins ${remote} publishes failed (${fetched.stderr.trim() || `exit ${String(fetched.code)}`}), so their custody is unknown`,
-      )
-    }
-  }
-  if (branchTip !== undefined) {
-    const fetched = await run(
-      [
-        `--git-dir=${gitDir}`,
-        "fetch",
-        "--quiet",
-        "--no-tags",
-        "--no-recurse-submodules",
-        "--no-write-fetch-head",
-        "--no-auto-maintenance",
-        "--refmap=",
-        remote,
-        targetRef,
-      ],
-      { timeoutMs: PUBLISHED_READ_TIMEOUT_MS },
-    )
-    if (fetched.code !== 0) {
-      throw new UnknownError(
-        `witness store ${gitDir}: fetching ${targetRef} from ${remote} failed (${fetched.stderr.trim() || `exit ${String(fetched.code)}`}), so the commits it publishes are unknown`,
-      )
-    }
-  }
   return { ...(branchTip === undefined ? {} : { branchTip }), pinCount }
+}
+
+/**
+ * Pins are named by the commit they point at, so fetching them by name is idempotent. 37792 (@cto turn38-retention-remote):
+ * this runs BEFORE the eligible-ref list, so the first read of a store already sees a pin published since the last one.
+ */
+async function fetchPublishedPins(gitDir: string, remote: string, run: GitRun): Promise<void> {
+  const fetched = await run(
+    [
+      `--git-dir=${gitDir}`,
+      "fetch",
+      "--quiet",
+      "--no-tags",
+      "--no-recurse-submodules",
+      "--no-write-fetch-head",
+      "--no-auto-maintenance",
+      remote,
+      `+refs/git-super/pins/*:refs/git-super/pins/*`,
+    ],
+    { timeoutMs: PUBLISHED_READ_TIMEOUT_MS },
+  )
+  if (fetched.code !== 0) {
+    throw new UnknownError(
+      `witness store ${gitDir}: fetching the pins ${remote} publishes failed (${fetched.stderr.trim() || `exit ${String(fetched.code)}`}), so their custody is unknown`,
+    )
+  }
+}
+
+/** The target branch is fetched for its objects only, because a custody check must never move the store's own branch. */
+async function fetchPublishedTarget(gitDir: string, remote: string, targetBranch: string, run: GitRun): Promise<void> {
+  const targetRef = `refs/heads/${targetBranch}`
+  const fetched = await run(
+    [
+      `--git-dir=${gitDir}`,
+      "fetch",
+      "--quiet",
+      "--no-tags",
+      "--no-recurse-submodules",
+      "--no-write-fetch-head",
+      "--no-auto-maintenance",
+      "--refmap=",
+      remote,
+      targetRef,
+    ],
+    { timeoutMs: PUBLISHED_READ_TIMEOUT_MS },
+  )
+  if (fetched.code !== 0) {
+    throw new UnknownError(
+      `witness store ${gitDir}: fetching ${targetRef} from ${remote} failed (${fetched.stderr.trim() || `exit ${String(fetched.code)}`}), so the commits it publishes are unknown`,
+    )
+  }
+}
+
+/**
+ * 37792 (@cto turn38-retention-remote): an advertisement may be reused only for the same admitted surviving store, the
+ * same configured remote, the same target branch and the same pass. The held pass starts a fresh scope, so a branch
+ * that moved between passes is read again; a refused or deadline-cut read is never stored, so the next entry still
+ * tries with its own budget instead of inheriting the failure.
+ */
+function publishedAdvertisementKey(gitDir: string, remote: string, targetBranch: string): string {
+  return `${gitDir}\u0000${remote}\u0000${targetBranch}`
+}
+
+async function observePublishedAdvertisement(
+  runScope: CustodyRunScope | undefined,
+  gitDir: string,
+  remote: string,
+  targetBranch: string,
+  run: GitRun,
+): Promise<PublishedAdvertisement> {
+  const key = publishedAdvertisementKey(gitDir, remote, targetBranch)
+  const cached = runScope?.publishedAdvertisements.get(key)
+  if (cached !== undefined) return cached
+  const advertisement = await advertisePublishedRefs(gitDir, remote, targetBranch, run)
+  runScope?.publishedAdvertisements.set(key, advertisement)
+  return advertisement
+}
+
+async function populatePublishedPins(
+  runScope: CustodyRunScope | undefined,
+  gitDir: string,
+  remote: string,
+  targetBranch: string,
+  advertisement: PublishedAdvertisement,
+  run: GitRun,
+): Promise<void> {
+  if (advertisement.pinCount === 0) return
+  const key = publishedAdvertisementKey(gitDir, remote, targetBranch)
+  if (runScope?.populatedPinNamespaces.has(key) === true) return
+  await fetchPublishedPins(gitDir, remote, run)
+  runScope?.populatedPinNamespaces.add(key)
+}
+
+/**
+ * 37792 (@cto turn38-retention-remote): an advertisement proves custody only when that exact commit is readable in the
+ * same surviving store. When it is absent, fetch the target branch's objects without moving the branch and verify the
+ * advertised SHA again - a branch that moved between listing and fetching cannot silently substitute a different tip.
+ */
+async function requirePublishedTipReadable(
+  gitDir: string,
+  remote: string,
+  targetBranch: string,
+  tip: string,
+  run: GitRun,
+): Promise<void> {
+  const present = await run([`--git-dir=${gitDir}`, "cat-file", "-e", `${tip}^{commit}`])
+  if (present.code === 0 && present.stderr.trim() === "") return
+  await fetchPublishedTarget(gitDir, remote, targetBranch, run)
+  const verified = await run([`--git-dir=${gitDir}`, "cat-file", "-e", `${tip}^{commit}`])
+  if (verified.code !== 0 || verified.stderr.trim() !== "") {
+    throw new UnknownError(
+      `witness store ${gitDir}: its remote ${remote} advertises ${tip} for refs/heads/${targetBranch}, but that commit is still unreadable after fetching it, so its custody is unknown`,
+    )
+  }
 }
 
 /**
@@ -931,34 +1008,6 @@ async function readWitnessStore(
     if (format.status !== "ok") throw new UnknownError(format.detail)
     const closureResult = alternateClosure(store, removal)
     if (closureResult.status !== "ok") throw new UnknownError(closureResult.detail)
-    // #35062 (@cto 34920-shared-index-ruling-1931 §1): retention reads object types too, so both policies walk only
-    // independent commit tips plus every noncommit ref.
-    const refs = await storeRun([
-      `--git-dir=${gitDir}`,
-      "for-each-ref",
-      "--format=%(refname)%09%(objectname)%09%(objecttype)",
-    ])
-    refuseSuccessfulStderr(refs, `for-each-ref in witness store ${gitDir}`)
-    if (refs.code !== 0) {
-      throw new CorruptStoreError(`for-each-ref failed in witness store ${gitDir}: ${refs.stderr.trim()}`)
-    }
-    const listed: WitnessRef[] = []
-    for (const row of refs.stdout.split("\n")) {
-      if (row === "") continue
-      const fields = row.split("\t")
-      const [ref, tip, objectType] = fields
-      if (
-        ref === undefined ||
-        tip === undefined ||
-        !HEX40.test(tip) ||
-        fields.length !== 3 ||
-        objectType === undefined ||
-        !["commit", "tag", "tree", "blob"].includes(objectType)
-      ) {
-        throw new CorruptStoreError(`malformed for-each-ref row in witness store ${gitDir}: ${row.slice(0, 120)}`)
-      }
-      listed.push({ ref, tip, objectType })
-    }
     // 37792 (@cto 78e96f64 part 4): a store proves custody only for components of the repository it mirrors. A store
     // whose remote names another repository cannot witness any of them, so it is named and skipped BEFORE its
     // connectivity check. Exclusion can only keep more entries, never free one wrongly.
@@ -992,18 +1041,57 @@ async function readWitnessStore(
       }
       const remote = await configuredRemote(gitDir, run)
       if (remote !== undefined) {
-        const refreshed = await refreshPublishedRefs(gitDir, remote, witnessPolicy.targetBranch, run)
-        publishedBranchTip = refreshed.branchTip
-        if (refreshed.branchTip !== undefined) {
+        const advertisement = await observePublishedAdvertisement(
+          runScope,
+          gitDir,
+          remote,
+          witnessPolicy.targetBranch,
+          run,
+        )
+        // 37792 (@cto turn38-retention-remote): populate the pin namespace BEFORE the eligible-ref list below, or a pin
+        // published since the previous read stays invisible to this one.
+        await populatePublishedPins(runScope, gitDir, remote, witnessPolicy.targetBranch, advertisement, run)
+        publishedBranchTip = advertisement.branchTip
+        if (advertisement.branchTip !== undefined) {
+          await requirePublishedTipReadable(gitDir, remote, witnessPolicy.targetBranch, advertisement.branchTip, run)
           publishedEntry = {
             store,
-            tip: refreshed.branchTip,
+            tip: advertisement.branchTip,
             // A store whose own repository is unproved cannot fix which components its tip proves (@cto 78e96f64).
             repo: repo ?? "",
             remote,
           }
         }
       }
+    }
+    // #35062 (@cto 34920-shared-index-ruling-1931 §1): retention reads object types too, so both policies walk only
+    // independent commit tips plus every noncommit ref. 37792 (@cto turn38-retention-remote): this read happens AFTER
+    // the pin namespace is populated, so a freshly published pin is eligible on the same pass.
+    const refs = await storeRun([
+      `--git-dir=${gitDir}`,
+      "for-each-ref",
+      "--format=%(refname)%09%(objectname)%09%(objecttype)",
+    ])
+    refuseSuccessfulStderr(refs, `for-each-ref in witness store ${gitDir}`)
+    if (refs.code !== 0) {
+      throw new CorruptStoreError(`for-each-ref failed in witness store ${gitDir}: ${refs.stderr.trim()}`)
+    }
+    const listed: WitnessRef[] = []
+    for (const row of refs.stdout.split("\n")) {
+      if (row === "") continue
+      const fields = row.split("\t")
+      const [ref, tip, objectType] = fields
+      if (
+        ref === undefined ||
+        tip === undefined ||
+        !HEX40.test(tip) ||
+        fields.length !== 3 ||
+        objectType === undefined ||
+        !["commit", "tag", "tree", "blob"].includes(objectType)
+      ) {
+        throw new CorruptStoreError(`malformed for-each-ref row in witness store ${gitDir}: ${row.slice(0, 120)}`)
+      }
+      listed.push({ ref, tip, objectType })
     }
     // A transient operation ref, remote-tracking ref or detached HEAD is never a durable
     // witness: only a named branch, tag or GitSuper pin qualifies (contract gate 5).
@@ -1746,6 +1834,7 @@ async function ancestryProof(
   heads: Readonly<Record<string, readonly string[]>> | undefined,
   targetBranch: string | undefined,
   run: GitRun,
+  runScope: CustodyRunScope | undefined,
   remaining: () => number,
 ): Promise<Readonly<{ provenRepos: ReadonlySet<string>; allProven: boolean }>> {
   const none = { provenRepos: new Set<string>(), allProven: false }
@@ -1785,7 +1874,11 @@ async function ancestryProof(
         atStore(run, storeGitDir, await worktreeGone(storeGitDir, run)),
       )
       if (remote === undefined) continue
-      tip = (await refreshPublishedRefs(storeGitDir, remote, targetBranch, run)).branchTip
+      // 37792 (@cto turn38-retention-remote): ancestry pays for the target advertisement alone; populating the pin
+      // namespace is the index's fact and happens there, before its eligible-ref list.
+      const advertisement = await observePublishedAdvertisement(runScope, storeGitDir, remote, targetBranch, run)
+      tip = advertisement.branchTip
+      if (tip !== undefined) await requirePublishedTipReadable(storeGitDir, remote, targetBranch, tip, run)
     } catch {
       continue
     }
@@ -1979,6 +2072,7 @@ async function runCustody(
           environmentHeads,
           witnessPolicy.targetBranch,
           proofRun,
+          runScope,
           remaining,
         )
   // A component ancestry already proves needs no witness, so no store that mirrors only proven repositories is
