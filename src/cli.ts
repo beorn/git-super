@@ -1240,7 +1240,12 @@ async function runInvocation(
         }
         return commandResult(
           invocation.node,
-          { repo: globals.repo, report: (message) => stderr.write(message) },
+          {
+            repo: globals.repo,
+            // Every report is one line on the stream: a caller that writes anything after it (yrd's retained removal
+            // proof) must find a line start, and two consecutive reports must not run together.
+            report: (message) => stderr.write(message.endsWith("\n") ? message : `${message}\n`),
+          },
           invocation.params,
         )
       },
