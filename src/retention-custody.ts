@@ -827,6 +827,207 @@ async function independentRefs(
   )
 }
 
+/**
+ * 37792 (@cto 8288868d): one witness store's OWN reads, with nothing shared mutated. Two of these run at once, and the
+ * ordered consumer in `indexWitnessStores` applies the answers in rank order, so subtraction and witness choice stay
+ * deterministic while the per-store subprocess fan-out (config, ref listing, identity, connectivity) overlaps.
+ */
+type WitnessStoreRead =
+  | { readonly kind: "fatal"; readonly error: unknown }
+  | { readonly kind: "corrupt"; readonly gitDir: string; readonly detail: string }
+  | { readonly kind: "foreign"; readonly detail: string }
+  | { readonly kind: "nonWitness"; readonly gitDir: string }
+  | {
+      readonly kind: "ready"
+      readonly gitDir: string
+      readonly detached: boolean
+      readonly format: string
+      readonly selected: readonly WitnessRef[]
+      readonly plain: boolean
+      /** Non-empty when this store's traversal is not plain and it was walked without cross-store subtraction. */
+      readonly unsubtracted: string
+      readonly unscoped?: string
+      readonly published?: Readonly<{ store: string; tip: string; repo: string; remote: string }>
+      /** True when `fsck --connectivity-only` covered this store for the entry. */
+      readonly fsck: boolean
+      readonly fsckMs: number
+    }
+
+async function readWitnessStore(
+  store: string,
+  run: GitRun,
+  bounds: CustodyBounds,
+  removal: readonly string[],
+  witnessPolicy: Readonly<{ targetBranch: string }> | undefined,
+  componentRepos: Readonly<{ ids: ReadonlySet<string>; complete: boolean }> | undefined,
+  skipFsck: boolean,
+  skipFsckRepos: ReadonlySet<string>,
+  runScope: CustodyRunScope | undefined,
+  deadline: number | undefined,
+  clock: () => number,
+): Promise<WitnessStoreRead> {
+  const gitDir = dirname(store)
+  try {
+    // The same invocation deadline bounds a read that is running: a spent budget refuses before another child spawns.
+    if (deadline !== undefined && clock() >= deadline) throw new UnknownError("shared proof deadline is exhausted")
+    // #34920: a witness store whose recorded core.worktree is gone is read detached (see worktreeGone).
+    const detached = await worktreeGone(gitDir, run)
+    const storeRun = atStore(run, gitDir, detached)
+    const format = await objectFormat(gitDir, storeRun)
+    if (format.status !== "ok") throw new UnknownError(format.detail)
+    const closureResult = alternateClosure(store, removal)
+    if (closureResult.status !== "ok") throw new UnknownError(closureResult.detail)
+    // #35062 (@cto 34920-shared-index-ruling-1931 §1): retention reads object types too, so both policies walk only
+    // independent commit tips plus every noncommit ref.
+    const refs = await storeRun([
+      `--git-dir=${gitDir}`,
+      "for-each-ref",
+      "--format=%(refname)%09%(objectname)%09%(objecttype)",
+    ])
+    refuseSuccessfulStderr(refs, `for-each-ref in witness store ${gitDir}`)
+    if (refs.code !== 0) {
+      throw new CorruptStoreError(`for-each-ref failed in witness store ${gitDir}: ${refs.stderr.trim()}`)
+    }
+    const listed: WitnessRef[] = []
+    for (const row of refs.stdout.split("\n")) {
+      if (row === "") continue
+      const fields = row.split("\t")
+      const [ref, tip, objectType] = fields
+      if (
+        ref === undefined ||
+        tip === undefined ||
+        !HEX40.test(tip) ||
+        fields.length !== 3 ||
+        objectType === undefined ||
+        !["commit", "tag", "tree", "blob"].includes(objectType)
+      ) {
+        throw new CorruptStoreError(`malformed for-each-ref row in witness store ${gitDir}: ${row.slice(0, 120)}`)
+      }
+      listed.push({ ref, tip, objectType })
+    }
+    // 37792 (@cto 78e96f64 part 4): a store proves custody only for components of the repository it mirrors. A store
+    // whose remote names another repository cannot witness any of them, so it is named and skipped BEFORE its
+    // connectivity check. Exclusion can only keep more entries, never free one wrongly.
+    const remainingHere = (): number => (deadline === undefined ? Number.POSITIVE_INFINITY : deadline - clock())
+    const identity = await identityOf(runScope, gitDir, storeRun, remainingHere)
+    const repo = identity.status === "known" ? identity.id : undefined
+    if (
+      identity.status === "known" &&
+      componentRepos !== undefined &&
+      componentRepos.complete &&
+      !componentRepos.ids.has(identity.id)
+    ) {
+      return { kind: "foreign", detail: `${gitDir} (mirrors ${identity.id}, which no component belongs to)` }
+    }
+    const unscoped = identity.status === "unknown" ? `${gitDir} (${identity.detail})` : undefined
+    // What the remote publishes now, never this store's possibly days-old copy of it, and never a mirror ref that was
+    // not confirmed against its remote (@cto 78e96f64 part 2). Remote refresh stays on the plain runner, never the
+    // detached one (@cto 34920-residual-existing-scope-1626).
+    let publishedBranchTip: string | undefined
+    let publishedEntry: Readonly<{ store: string; tip: string; repo: string; remote: string }> | undefined
+    if (witnessPolicy !== undefined) {
+      const shallow = await storeRun([`--git-dir=${gitDir}`, "rev-parse", "--is-shallow-repository"])
+      refuseSuccessfulStderr(shallow, `rev-parse --is-shallow-repository in ${gitDir}`)
+      if (shallow.code !== 0 || !["true", "false"].includes(shallow.stdout.trim())) {
+        throw new UnknownError(
+          `rev-parse --is-shallow-repository failed in ${gitDir}: ${shallow.stderr.trim() || shallow.stdout.trim()}`,
+        )
+      }
+      if (shallow.stdout.trim() === "true") {
+        throw new UnknownError(`witness graph in ${gitDir} is shallow and cannot prove complete custody`)
+      }
+      const remote = await configuredRemote(gitDir, run)
+      if (remote !== undefined) {
+        const refreshed = await refreshPublishedRefs(gitDir, remote, witnessPolicy.targetBranch, run)
+        publishedBranchTip = refreshed.branchTip
+        if (refreshed.branchTip !== undefined) {
+          publishedEntry = {
+            store,
+            tip: refreshed.branchTip,
+            // A store whose own repository is unproved cannot fix which components its tip proves (@cto 78e96f64).
+            repo: repo ?? "",
+            remote,
+          }
+        }
+      }
+    }
+    // A transient operation ref, remote-tracking ref or detached HEAD is never a durable
+    // witness: only a named branch, tag or GitSuper pin qualifies (contract gate 5).
+    const durable: WitnessRef[] = listed.filter((entry) =>
+      witnessPolicy === undefined
+        ? isDurableRef(entry.ref)
+        : isPolicyRef(entry.ref, entry.tip, witnessPolicy.targetBranch),
+    )
+    if (witnessPolicy !== undefined && publishedBranchTip !== undefined) {
+      const targetRef = `refs/heads/${witnessPolicy.targetBranch}`
+      if (!durable.some((entry) => entry.ref === targetRef && entry.tip === publishedBranchTip)) {
+        // The published tip is a durable name for the same ref even though no local ref names it yet.
+        durable.push({ ref: targetRef, tip: publishedBranchTip, objectType: "commit" })
+      }
+    }
+    durable.sort((left, right) => (left.ref < right.ref ? -1 : left.ref > right.ref ? 1 : 0))
+    // #35062 (@cto 35062-empty-witness-go-0606 §1): a store that admits no durable root can witness nothing, so it is
+    // named and skipped before its connectivity check; it supplies no fragment, certificate, subtraction tip or rebase
+    // root, and stays in every estate, owner and delta fact.
+    if (durable.length === 0) return { kind: "nonWitness", gitDir }
+    let fsck = false
+    let fsckMs = 0
+    // 37792 (@cto 2026-11-22): the witness proof asks whether this environment's objects survive, not whether every
+    // blob parses, so store health is `fsck --connectivity-only`. The entry-relevant proof is the head closure below.
+    if (!skipFsck && (repo === undefined || !skipFsckRepos.has(repo))) {
+      fsck = true
+      let verdict = runScope?.fscks.get(gitDir)
+      if (verdict === undefined) {
+        // No child outlives the budget the read was started under.
+        if (deadline !== undefined && clock() >= deadline) throw new UnknownError("shared proof deadline is exhausted")
+        const fsckStarted = clock()
+        const result = await storeRun([`--git-dir=${gitDir}`, "fsck", "--connectivity-only", "--no-progress"], {
+          timeoutMs: bounds.fsckMs,
+        })
+        fsckMs = clock() - fsckStarted
+        // 37792 (@cto 2026-11-22): a missing object is named from stdout, where `fsck --connectivity-only` reports it.
+        const broken = result.stdout
+          .split("\n")
+          .filter((line) => /^(?:missing|broken|error)\b/u.test(line))
+          .slice(0, MISSING_INLINE)
+        verdict =
+          result.code === 0 && result.stderr.trim() === ""
+            ? { ok: true }
+            : {
+                ok: false,
+                detail: `fsck --connectivity-only failed in witness store ${gitDir}: ${result.stderr.trim() || broken.join("; ") || "exit " + String(result.code)}`,
+                timedOut: result.timedOut === true,
+              }
+        runScope?.fscks.set(gitDir, verdict)
+      }
+      // A store killed at its own fsck bound is a proof limit, not corruption; only an answer that reports objects it
+      // cannot read excludes the store.
+      if (!verdict.ok) {
+        throw verdict.timedOut === true ? new UnknownError(verdict.detail) : new CorruptStoreError(verdict.detail)
+      }
+    }
+    const selected = await independentRefs(durable, gitDir, storeRun)
+    const context = await traversalContext(gitDir, refs.stdout.split("\n"), storeRun, witnessPolicy)
+    return {
+      kind: "ready",
+      gitDir,
+      detached,
+      format: format.format,
+      selected,
+      plain: context.plain,
+      unsubtracted:
+        !context.plain && selected.length > 0 ? `${gitDir} (${context.reason ?? "traversal not plain"})` : "",
+      ...(unscoped === undefined ? {} : { unscoped }),
+      ...(publishedEntry === undefined ? {} : { published: publishedEntry }),
+      fsck,
+      fsckMs,
+    }
+  } catch (error) {
+    if (error instanceof CorruptStoreError) return { kind: "corrupt", gitDir, detail: error.message }
+    return { kind: "fatal", error }
+  }
+}
+
 async function indexWitnessStores(
   stores: readonly string[],
   removal: readonly string[],
@@ -877,180 +1078,99 @@ async function indexWitnessStores(
   const published: Array<Readonly<{ store: string; tip: string; repo: string; remote: string }>> = []
   let witnessFsckMs = 0
   let refGraphMs = 0
-  for (const store of stores) {
+  // 37792 (@cto 8288868d): two independent witness stores are read at once, and only store-local work runs in
+  // parallel. Rank order, subtraction, fragment publication, witness choice and failure isolation all stay in this
+  // one consumer, so the ordered custody result is the same as a sequential build.
+  // Two stores is the shipped window (@cto 8288868d). The environment override exists so a test can compare one store
+  // in flight with two on the same fixture; production never sets it.
+  const readAheadSetting = Number(process.env.GIT_SUPER_WITNESS_READ_AHEAD ?? "2")
+  const readAhead =
+    Number.isInteger(readAheadSetting) && readAheadSetting >= 1 && readAheadSetting <= 4 ? readAheadSetting : 2
+  const inFlight = new Map<number, Promise<WitnessStoreRead>>()
+  const deadlinePassed = (): boolean => deadline !== undefined && clock() >= deadline
+  const startRead = (index: number): void => {
+    if (index >= stores.length || inFlight.has(index) || deadlinePassed()) return
+    const store = stores[index]
+    if (store === undefined) return
+    inFlight.set(
+      index,
+      readWitnessStore(
+        store,
+        run,
+        bounds,
+        removal,
+        witnessPolicy,
+        componentRepos,
+        skipFsck,
+        skipFsckRepos,
+        runScope,
+        deadline,
+        clock,
+      ).catch((error: unknown): WitnessStoreRead => ({ kind: "fatal", error })),
+    )
+  }
+  startRead(0)
+  startRead(1)
+  for (let index = 0; index < stores.length; index += 1) {
+    const store = stores[index]
+    if (store === undefined) continue
     const gitDir = dirname(store)
-    // 37792 (@cto 2026-11-22 f66720e5): a store that cannot be read is no witness, and refusing the whole entry for it
-    // cost a pass (anc9: one scratch probe store with zero-sha1 refs read all five entries unknown). Excluding a store
-    // can only keep more entries, never free one wrongly: it contributes no ref, fragment, certificate or tip.
+    const waiting = inFlight.get(index)
+    inFlight.delete(index)
+    // An expired budget launches nothing further; the entry keeps a named reason instead of a silent gap.
+    if (waiting === undefined) throw new UnknownError("shared proof deadline is exhausted")
+    const read = await waiting
+    if (read.kind === "fatal") throw read.error
+    if (read.kind === "corrupt") {
+      // 37792 (@cto 2026-11-22 f66720e5): a store that cannot be read is no witness. Excluding it can only keep more
+      // entries, never free one wrongly: it contributes no ref, fragment, certificate or tip.
+      corrupt.push(`${read.gitDir} (${read.detail})`)
+      startRead(index + readAhead)
+      continue
+    }
+    if (read.kind === "foreign") {
+      foreign.push(read.detail)
+      startRead(index + readAhead)
+      continue
+    }
+    if (read.kind === "nonWitness") {
+      nonWitnesses.push(read.gitDir)
+      startRead(index + readAhead)
+      continue
+    }
     const mark = {
       records: records.length,
       prior: prior.length,
       published: published.length,
       unsubtracted: unsubtracted.length,
-      nonWitnesses: nonWitnesses.length,
       fsckStores: fsckStores.length,
       foreign: foreign.length,
       unscoped: unscoped.length,
     }
+    formats.set(store, read.format)
+    if (read.unscoped !== undefined) unscoped.push(read.unscoped)
+    if (read.fsck) fsckStores.push(read.gitDir)
+    if (read.unsubtracted !== "") unsubtracted.push(read.unsubtracted)
+    if (read.published !== undefined) published.push(read.published)
+    witnessFsckMs += read.fsckMs
+    const storeStream = atStoreStream(stream, gitDir, read.detached)
     try {
-      // #34920: a witness store whose recorded core.worktree is gone is read detached (see worktreeGone).
-      const detached = await worktreeGone(gitDir, run)
-      const storeRun = atStore(run, gitDir, detached)
-      const storeStream = atStoreStream(stream, gitDir, detached)
-      const format = await objectFormat(gitDir, storeRun)
-      if (format.status !== "ok") throw new UnknownError(format.detail)
-      formats.set(store, format.format)
-      const closureResult = alternateClosure(store, removal)
-      if (closureResult.status !== "ok") throw new UnknownError(closureResult.detail)
-      // #35062 (@cto 34920-shared-index-ruling-1931 §1): retention reads object types too, so both policies walk only
-      // independent commit tips plus every noncommit ref.
-      const refs = await storeRun([
-        `--git-dir=${gitDir}`,
-        "for-each-ref",
-        "--format=%(refname)%09%(objectname)%09%(objecttype)",
-      ])
-      refuseSuccessfulStderr(refs, `for-each-ref in witness store ${gitDir}`)
-      if (refs.code !== 0) {
-        throw new CorruptStoreError(`for-each-ref failed in witness store ${gitDir}: ${refs.stderr.trim()}`)
-      }
-      const listed: WitnessRef[] = []
-      for (const row of refs.stdout.split("\n")) {
-        if (row === "") continue
-        const fields = row.split("\t")
-        const [ref, tip, objectType] = fields
-        if (
-          ref === undefined ||
-          tip === undefined ||
-          !HEX40.test(tip) ||
-          fields.length !== 3 ||
-          objectType === undefined ||
-          !["commit", "tag", "tree", "blob"].includes(objectType)
-        ) {
-          throw new CorruptStoreError(`malformed for-each-ref row in witness store ${gitDir}: ${row.slice(0, 120)}`)
-        }
-        listed.push({ ref, tip, objectType })
-      }
-      // 37792 (@cto 78e96f64 part 4): a store proves custody only for components of the repository it mirrors. A store
-      // whose remote names another repository cannot witness any of them, so it is named and skipped BEFORE its
-      // `fsck --full`: the 2026-11-21 run spent its whole 300 s budget fscking a root-repo mirror for a dev-repo
-      // environment (#34127). Exclusion can only keep more entries, never free one wrongly.
-      const remainingHere = (): number => (deadline === undefined ? Number.POSITIVE_INFINITY : deadline - clock())
-      const identity = await identityOf(runScope, gitDir, storeRun, remainingHere)
-      const repo = identity.status === "known" ? identity.id : undefined
-      if (
-        identity.status === "known" &&
-        componentRepos !== undefined &&
-        componentRepos.complete &&
-        !componentRepos.ids.has(identity.id)
-      ) {
-        foreign.push(`${gitDir} (mirrors ${identity.id}, which no component belongs to)`)
-        continue
-      }
-      if (identity.status === "unknown") unscoped.push(`${gitDir} (${identity.detail})`)
-      // What the remote publishes now, never this store's possibly days-old copy of it, and never a mirror ref that was
-      // not confirmed against its remote (@cto 78e96f64 part 2). Remote refresh stays on the plain runner, never the
-      // detached one (@cto 34920-residual-existing-scope-1626).
-      let publishedBranchTip: string | undefined
-      if (witnessPolicy !== undefined) {
-        const shallow = await storeRun([`--git-dir=${gitDir}`, "rev-parse", "--is-shallow-repository"])
-        refuseSuccessfulStderr(shallow, `rev-parse --is-shallow-repository in ${gitDir}`)
-        if (shallow.code !== 0 || !["true", "false"].includes(shallow.stdout.trim())) {
-          throw new UnknownError(
-            `rev-parse --is-shallow-repository failed in ${gitDir}: ${shallow.stderr.trim() || shallow.stdout.trim()}`,
-          )
-        }
-        if (shallow.stdout.trim() === "true") {
-          throw new UnknownError(`witness graph in ${gitDir} is shallow and cannot prove complete custody`)
-        }
-        const remote = await configuredRemote(gitDir, run)
-        if (remote !== undefined) {
-          const refreshed = await refreshPublishedRefs(gitDir, remote, witnessPolicy.targetBranch, run)
-          publishedBranchTip = refreshed.branchTip
-          if (refreshed.branchTip !== undefined) {
-            published.push({
-              store,
-              tip: refreshed.branchTip,
-              // A store whose own repository is unproved cannot fix which components its tip proves (@cto 78e96f64).
-              repo: repo ?? "",
-              remote,
-            })
-          }
-        }
-      }
-      // A transient operation ref, remote-tracking ref or detached HEAD is never a durable
-      // witness: only a named branch, tag or GitSuper pin qualifies (contract gate 5).
-      const durable: WitnessRef[] = listed.filter((entry) =>
-        witnessPolicy === undefined
-          ? isDurableRef(entry.ref)
-          : isPolicyRef(entry.ref, entry.tip, witnessPolicy.targetBranch),
-      )
-      if (witnessPolicy !== undefined && publishedBranchTip !== undefined) {
-        const targetRef = `refs/heads/${witnessPolicy.targetBranch}`
-        if (!durable.some((entry) => entry.ref === targetRef && entry.tip === publishedBranchTip)) {
-          // The published tip is a durable name for the same ref even though no local ref names it yet.
-          durable.push({ ref: targetRef, tip: publishedBranchTip, objectType: "commit" })
-        }
-      }
-      durable.sort((left, right) => (left.ref < right.ref ? -1 : left.ref > right.ref ? 1 : 0))
-      // #35062 (@cto 35062-empty-witness-go-0606 §1): the complete ref listing was read and validated above under the
-      // caller's own durable-root policy (a published target tip counts for the policy caller). A store that admits no
-      // durable root can witness nothing, so it is named and skipped before fsck; it supplies no fragment, certificate,
-      // subtraction tip or rebase root, and stays in every estate, owner and delta fact. Every other store is fscked in
-      // full before any of its refs is reduced or walked.
-      if (durable.length === 0) {
-        nonWitnesses.push(gitDir)
-        continue
-      }
-      // A hung `fsck` is killed at the declared deadline and reported unknown, never blocking.
-      // 37792 (@cto 2026-11-22): the witness proof asks whether this environment's objects survive, not whether every
-      // blob parses, so store health is `fsck --connectivity-only`. The entry-relevant proof is the head closure below.
-      if (!skipFsck && (repo === undefined || !skipFsckRepos.has(repo))) {
-        fsckStores.push(gitDir)
-        let verdict = runScope?.fscks.get(gitDir)
-        if (verdict === undefined) {
-          const fsckStarted = clock()
-          const fsck = await storeRun([`--git-dir=${gitDir}`, "fsck", "--connectivity-only", "--no-progress"], {
-            timeoutMs: bounds.fsckMs,
-          })
-          witnessFsckMs += clock() - fsckStarted
-          // 37792 (@cto 2026-11-22): a missing object is named from stdout, where `fsck --connectivity-only` reports it.
-          const broken = fsck.stdout
-            .split("\n")
-            .filter((line) => /^(?:missing|broken|error)\b/u.test(line))
-            .slice(0, MISSING_INLINE)
-          verdict =
-            fsck.code === 0 && fsck.stderr.trim() === ""
-              ? { ok: true }
-              : {
-                  ok: false,
-                  detail: `fsck --connectivity-only failed in witness store ${gitDir}: ${fsck.stderr.trim() || broken.join("; ") || `exit ${String(fsck.code)}`}`,
-                  timedOut: fsck.timedOut === true,
-                }
-          runScope?.fscks.set(gitDir, verdict)
-        }
-        // A store killed at its own fsck bound is a proof limit, not corruption; only an answer that reports objects it
-        // cannot read excludes the store.
-        if (!verdict.ok) {
-          throw verdict.timedOut === true ? new UnknownError(verdict.detail) : new CorruptStoreError(verdict.detail)
-        }
-      }
-      const selected = await independentRefs(durable, gitDir, storeRun)
-      const context = await traversalContext(gitDir, refs.stdout.split("\n"), storeRun, witnessPolicy)
-      if (!context.plain && selected.length > 0) {
-        unsubtracted.push(`${gitDir} (${context.reason ?? "traversal not plain"})`)
-      }
       const refStarted = clock()
-      for (const entry of selected) {
+      for (const entry of read.selected) {
         // #34920 A3: subtract earlier-ranked tips whose closure this store's walk computes exactly as their own store
         // did: always this store's own earlier refs; another store's only when both traversals are plain. The object
         // set each ref emits shrinks, but the minimum-rank ref reaching an OID still emits it (none of its subtracted
         // tips are earlier-ranked reachers), so the labeled merge picks the same witness as a full walk.
         const subtract: string[] = []
         const seen = new Set<string>()
-        for (let index = prior.length - 1; index >= 0 && subtract.length < MAX_SUBTRACTED_TIPS; index -= 1) {
-          const earlier = prior[index]
+        for (
+          let earlierIndex = prior.length - 1;
+          earlierIndex >= 0 && subtract.length < MAX_SUBTRACTED_TIPS;
+          earlierIndex -= 1
+        ) {
+          const earlier = prior[earlierIndex]
           if (earlier === undefined) continue
-          if (earlier.store !== store && !(earlier.plain && context.plain)) continue
+          if (earlier.store !== store && !(earlier.plain && read.plain)) continue
           if (seen.has(earlier.tip)) continue
           seen.add(earlier.tip)
           subtract.push(earlier.tip)
@@ -1084,12 +1204,12 @@ async function indexWitnessStores(
           gitDir,
           ref: entry.ref,
           tip: entry.tip,
-          format: format.format,
+          format: read.format,
           fragment,
           complete: subtract.length === 0,
-          detached,
+          detached: read.detached,
         })
-        prior.push({ store, tip: entry.tip, plain: context.plain })
+        prior.push({ store, tip: entry.tip, plain: read.plain })
       }
       refGraphMs += clock() - refStarted
     } catch (error) {
@@ -1100,13 +1220,13 @@ async function indexWitnessStores(
       prior.length = mark.prior
       published.length = mark.published
       unsubtracted.length = mark.unsubtracted
-      nonWitnesses.length = mark.nonWitnesses
       fsckStores.length = mark.fsckStores
       foreign.length = mark.foreign
       unscoped.length = mark.unscoped
       formats.delete(store)
       corrupt.push(`${gitDir} (${error.message})`)
     }
+    startRead(index + readAhead)
   }
   onPhase?.("witnessFsck", witnessFsckMs)
   onPhase?.("refGraph", refGraphMs)

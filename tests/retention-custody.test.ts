@@ -22,7 +22,7 @@ import {
 import { spawnSync } from "node:child_process"
 import { createHash } from "node:crypto"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 import { afterEach, describe, expect, test } from "vitest"
 import { defaultGitRun, defaultGitStream, type ComponentContents, type GitRun } from "../src/retention-contents.ts"
 import {
@@ -967,6 +967,38 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     expect(recovered.status, recovered.detail).toBe("pass")
   })
 
+  test("two witness stores in flight give the same ordered custody as one", async () => {
+    const fixture = custodyCase("witness order")
+    const brokenStore = fixture.stores[1]
+    expect(brokenStore).toBeDefined()
+    const brokenFlag = "--git-dir=" + dirname(brokenStore as string)
+    const broken: GitRun = (args, options) =>
+      args.includes("fsck") && args.some((arg) => arg.includes(brokenFlag))
+        ? { code: 1, stdout: "", stderr: "missing blob" }
+        : defaultGitRun(args, options)
+    const scanAt = async (ahead: string): Promise<CustodyScan> => {
+      const sidecarDir = tmp("git-super-witness-order-member-")
+      const oid = fixture.atRisk[0]
+      expect(oid).toBeDefined()
+      process.env.GIT_SUPER_WITNESS_READ_AHEAD = ahead
+      try {
+        return await scanCustody(fixture.root, [await componentOf([oid as string], sidecarDir)], fixture.stores, [], {
+          sidecarDir,
+          run: broken,
+          indexScope: new CustodyIndexScope(tmp("git-super-witness-order-index-")),
+        })
+      } finally {
+        delete process.env.GIT_SUPER_WITNESS_READ_AHEAD
+      }
+    }
+    const serial = await scanAt("1")
+    const parallel = await scanAt("2")
+    expect(parallel.status, parallel.detail).toBe(serial.status)
+    expect(parallel.witnesses).toEqual(serial.witnesses)
+    expect(parallel.detail).toBe(serial.detail)
+    expect(parallel.detail).toContain("unreadable witness store(s) excluded")
+  })
+
   // AC #35062 (@cto 35062-empty-witness-go-0606 §1): a witness store whose complete, validated ref listing admits no
   // durable root can witness nothing, so it is named and its fsck is not run. The 05:12 dry run kept every at-risk
   // entry unknown because one empty scratch bare repo's fsck printed "No default references" on a successful exit.
@@ -1887,6 +1919,9 @@ describe("retention custody scan — head closure and fetched refs (#37792)", ()
     void remote
   })
 
+  // 37792 (@cto 8288868d): parallelism is safe only because one consumer applies the per-store answers in rank order.
+  // The same fixture, including a store whose refs are corrupt, must give the same ordered custody at one store in
+  // flight and at two.
   // 37854: a five-entry batch shares one proof budget, and re-walking every durable ref of every witness store per
   // entry spent it. The walk's answer does not depend on the entry, so the second entry must reuse it.
   test("a second entry in the same run reuses the witness ref walk", async () => {
