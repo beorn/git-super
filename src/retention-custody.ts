@@ -142,6 +142,11 @@ export interface CustodyScanOptions {
   /** Records a named span of this scan. The removal caller folds these into its phase log. */
   readonly onPhase?: (name: string, ms: number) => void
   /**
+   * 34127 (@cto e8f6c3b5): the phase this scan is INSIDE, reported when it is entered. A scan cut by the shared
+   * deadline never reaches its completing onPhase, so without this a starved run names no phase at all.
+   */
+  readonly onPhaseEnter?: (name: string) => void
+  /**
    * #35062: the run-owned witness index this scan shares with the other members of its proof phase. Absent, the scan
    * builds its own index in `sidecarDir`, as a single-entry verify always has.
    */
@@ -1196,7 +1201,56 @@ async function readWitnessStore(
   }
 }
 
+/**
+ * 34127 (@cto e8f6c3b5): the phase a store walk is inside is emitted on ENTRY, and both spans are reported from a
+ * finally, so a walk cut by the shared deadline names witnessFsck or refGraph with the time it had spent instead of
+ * reporting nothing. Before this, a starved entry completed no phase and proofPhases came out empty (anc23).
+ */
 async function indexWitnessStores(
+  stores: readonly string[],
+  removal: readonly string[],
+  stream: GitStreamFactory,
+  run: GitRun,
+  bounds: CustodyBounds,
+  clock: () => number,
+  sidecarDir: string,
+  witnessPolicy?: Readonly<{ targetBranch: string }>,
+  deadline?: number,
+  onPhase?: (name: string, ms: number) => void,
+  componentRepos?: Readonly<{ ids: ReadonlySet<string>; complete: boolean }>,
+  skipFsck = false,
+  skipFsckRepos: ReadonlySet<string> = new Set<string>(),
+  runScope?: CustodyRunScope,
+  onPhaseEnter?: (name: string) => void,
+): Promise<Awaited<ReturnType<typeof indexWitnessStoresReported>>> {
+  const phaseStats = { witnessFsckMs: 0, refGraphMs: 0, refGraphEntered: false }
+  onPhaseEnter?.("witnessFsck")
+  try {
+    return await indexWitnessStoresReported(
+      stores,
+      removal,
+      stream,
+      run,
+      bounds,
+      clock,
+      sidecarDir,
+      witnessPolicy,
+      deadline,
+      onPhase,
+      componentRepos,
+      skipFsck,
+      skipFsckRepos,
+      runScope,
+      phaseStats,
+      onPhaseEnter,
+    )
+  } finally {
+    onPhase?.("witnessFsck", phaseStats.witnessFsckMs)
+    if (phaseStats.refGraphEntered) onPhase?.("refGraph", phaseStats.refGraphMs)
+  }
+}
+
+async function indexWitnessStoresReported(
   stores: readonly string[],
   removal: readonly string[],
   stream: GitStreamFactory,
@@ -1218,6 +1272,13 @@ async function indexWitnessStores(
   skipFsckRepos: ReadonlySet<string> = new Set<string>(),
   /** 37792 (@cto 93f4ba37): one fsck verdict per store per run, reused by every entry of a batch. */
   runScope?: CustodyRunScope,
+  /** 34127: the spans this call accumulates, reported by the wrapper even when the walk is cut. */
+  phaseStats: { witnessFsckMs: number; refGraphMs: number; refGraphEntered: boolean } = {
+    witnessFsckMs: 0,
+    refGraphMs: 0,
+    refGraphEntered: false,
+  },
+  onPhaseEnter?: (name: string) => void,
 ): Promise<{
   records: DurableRefRecord[]
   formats: Map<string, string>
@@ -1244,8 +1305,6 @@ async function indexWitnessStores(
   const corrupt: string[] = []
   const formats = new Map<string, string>()
   const published: Array<Readonly<{ store: string; tip: string; repo: string; remote: string }>> = []
-  let witnessFsckMs = 0
-  let refGraphMs = 0
   // 37792 (@cto 8288868d): two independent witness stores are read at once, and only store-local work runs in
   // parallel. Rank order, subtraction, fragment publication, witness choice and failure isolation all stay in this
   // one consumer, so the ordered custody result is the same as a sequential build.
@@ -1320,9 +1379,13 @@ async function indexWitnessStores(
     if (read.fsck) fsckStores.push(read.gitDir)
     if (read.unsubtracted !== "") unsubtracted.push(read.unsubtracted)
     if (read.published !== undefined) published.push(read.published)
-    witnessFsckMs += read.fsckMs
+    phaseStats.witnessFsckMs += read.fsckMs
     const storeStream = atStoreStream(stream, gitDir, read.detached)
     try {
+      if (!phaseStats.refGraphEntered) {
+        phaseStats.refGraphEntered = true
+        onPhaseEnter?.("refGraph")
+      }
       const refStarted = clock()
       for (const entry of read.selected) {
         // #34920 A3: subtract earlier-ranked tips whose closure this store's walk computes exactly as their own store
@@ -1379,7 +1442,7 @@ async function indexWitnessStores(
         })
         prior.push({ store, tip: entry.tip, plain: read.plain })
       }
-      refGraphMs += clock() - refStarted
+      phaseStats.refGraphMs += clock() - refStarted
     } catch (error) {
       // A proof limit that refused the store (policy, remote authority, shallow graph, an expired budget) keeps the
       // entry unknown; only a store that cannot be read is excluded.
@@ -1396,8 +1459,6 @@ async function indexWitnessStores(
     }
     startRead(index + readAhead)
   }
-  onPhase?.("witnessFsck", witnessFsckMs)
-  onPhase?.("refGraph", refGraphMs)
   return {
     records,
     formats,
@@ -1949,6 +2010,8 @@ async function runCustody(
   indexScope?: CustodyIndexScope,
   environmentHeads?: Readonly<Record<string, readonly string[]>>,
   runScope?: CustodyRunScope,
+  /** 34127 (@cto e8f6c3b5): the phase entered, reported before its completed span exists. */
+  onPhaseEnter?: (name: string) => void,
 ): Promise<CustodyScan> {
   const remaining = (): number => {
     const left = deadline === undefined ? Number.POSITIVE_INFINITY : deadline - clock()
@@ -2051,6 +2114,7 @@ async function runCustody(
       skipFsck,
       skipFsckRepos,
       runScope,
+      onPhaseEnter,
     )
     const width = String(Math.max(1, indexed.records.length)).length
     const merged = await asProofDeadline(
@@ -2343,29 +2407,34 @@ async function runCustody(
   // fragment already is that file; any other used witness is walked once in full here. A ref that was only considered
   // never gets one.
   const certificateStarted = clock()
+  onPhaseEnter?.("witnessCertificates")
   const certificates = new Map<string, SidecarRef>()
   const witnesses: WitnessIdentity[] = []
-  for (const record of identities.values()) {
-    const key = `${record.gitDir}\t${record.tip}`
-    let certificate = record.complete ? record.fragment : (certificates.get(key) ?? indexScope?.certificate(key))
-    if (certificate === undefined) {
-      remaining()
-      certificate = await reachableSidecar(
-        record.gitDir,
-        record.tip,
-        [],
-        atStoreStream(proofStream, record.gitDir, record.detached),
-        bounds,
-        clock,
-        indexDir,
-        deadline,
-      )
-      indexScope?.keepCertificate(key, certificate)
+  try {
+    for (const record of identities.values()) {
+      const key = `${record.gitDir}\t${record.tip}`
+      let certificate = record.complete ? record.fragment : (certificates.get(key) ?? indexScope?.certificate(key))
+      if (certificate === undefined) {
+        remaining()
+        certificate = await reachableSidecar(
+          record.gitDir,
+          record.tip,
+          [],
+          atStoreStream(proofStream, record.gitDir, record.detached),
+          bounds,
+          clock,
+          indexDir,
+          deadline,
+        )
+        indexScope?.keepCertificate(key, certificate)
+      }
+      certificates.set(key, certificate)
+      witnesses.push({ store: record.store, ref: record.ref, tip: record.tip, graphDigest: certificate.sha256 })
     }
-    certificates.set(key, certificate)
-    witnesses.push({ store: record.store, ref: record.ref, tip: record.tip, graphDigest: certificate.sha256 })
+  } finally {
+    // 34127 (@cto e8f6c3b5): a certificate walk cut by the deadline still names what it was doing and what it spent.
+    onPhase?.("witnessCertificates", clock() - certificateStarted)
   }
-  onPhase?.("witnessCertificates", clock() - certificateStarted)
   remaining()
   const first = missing[0]
   if (missingCount > 0 && first !== undefined) {
@@ -2516,6 +2585,7 @@ export async function scanCustody(
       options.indexScope,
       options.environmentHeads,
       options.runScope,
+      options.onPhaseEnter,
     )
   } catch (error) {
     return {

@@ -29,6 +29,7 @@ import { tryAcquireFlock } from "@bearly/flock"
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest"
 import { runCli } from "../src/cli.ts"
 import { retireRetainedBatch, type RetentionBatchOptions, type RetentionBatchResult } from "../src/retention-batch.ts"
+import { defaultGitRun } from "../src/retention-contents.ts"
 import { scanEstate } from "../src/retention-estate.ts"
 import { inspectRetainedEntryInBatch } from "../src/retention-verify.ts"
 
@@ -505,6 +506,38 @@ describe("retention retirement batch (#33010)", async () => {
     expect(spent.stopped).toContain("3 entr(ies) were not started")
     expect(spent.rows.map((row) => row.outcome)).toEqual(["kept", "kept", "kept"])
     expect(spent.rows[0]?.reason).toContain("passed before this entry's proof began")
+  })
+
+  // 34127 (@cto e8f6c3b5): every entry carries its own boundaries, so a batch names where its budget went instead of
+  // reporting one proof total. A complete entry ends in drain; the receipt span is what no phase owns.
+  it("records per-entry timing boundaries on an unspent batch", async () => {
+    const result = await retireRetainedBatch(options({ proofDeadlineMs: 600_000 }))
+    expect(result.stopped).toBeUndefined()
+    for (const row of result.rows) {
+      const timing = result.entryTimings?.[row.entry]
+      expect(timing, row.entry).toBeDefined()
+      expect(timing?.lastPhase).toBe("drain")
+      expect(timing?.sliceMs).toBeGreaterThan(0)
+      expect(timing?.endMs).toBeGreaterThanOrEqual(timing?.startMs ?? 0)
+      expect(timing?.phases.setup).toBeGreaterThanOrEqual(0)
+      expect(timing?.phases.child).toBeGreaterThanOrEqual(0)
+      expect(timing?.phases.drain).toBeGreaterThanOrEqual(0)
+      expect(timing?.receiptMs).toBeGreaterThanOrEqual(0)
+    }
+  })
+
+  // 34127 (@cto e8f6c3b5): a walk cut by the shared deadline reports the phase it was INSIDE. This is the case that
+  // produced empty proofPhases in anc23, where no phase completed and the 33 s overrun had no name.
+  it("names the phase a spent deadline cuts an entry inside", async () => {
+    const slow = async (args: readonly string[], runOptions?: Parameters<typeof defaultGitRun>[1]) => {
+      await new Promise((resolve) => setTimeout(resolve, 30))
+      return defaultGitRun(args, runOptions)
+    }
+    const cut = await retireRetainedBatch(options({ proofDeadlineMs: 60, gitRun: slow }))
+    expect(cut.rows.every((row) => row.outcome === "kept")).toBe(true)
+    const timings = Object.values(cut.entryTimings ?? {})
+    expect(timings).toHaveLength(cut.rows.length)
+    expect(timings.some((timing) => timing.lastPhase !== "drain" && timing.lastPhase !== "not-started")).toBe(true)
   })
 
   // #35047 (@dev/review2 REVISE bf2e0b30): the deadline cuts a custody walk already running only if the batch hands it

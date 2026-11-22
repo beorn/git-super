@@ -39,7 +39,7 @@ import type { SuperStatusResult } from "./status.ts"
 import type { SuperSubmodulePrepareResult } from "./submodule-prepare.ts"
 import { delegateNativeGit, readNativeGit, type ProcessOutputSink } from "./process.ts"
 import { openInvocationProtocol, type InvocationProtocol } from "./protocol.ts"
-import { isAbsolute } from "node:path"
+import { basename, isAbsolute } from "node:path"
 import {
   probeRepository,
   repositoryRoot,
@@ -1523,6 +1523,23 @@ async function writeResult(
           : `; this batch's evidence holds ${formatRetainedBytes(batch.bytesEvidence)} under the artifact directory`) +
         "\n",
     )
+    // 34127 (@cto e8f6c3b5): one line per entry, so a starved batch names where its budget went. `lastPhase` survives a
+    // deadline cut, which is the case this exists for; receiptMs is the part no phase owns.
+    if (batch.entryTimings !== undefined) {
+      for (const [entry, timing] of Object.entries(batch.entryTimings)) {
+        const phases = Object.entries(timing.phases)
+          .map(([name, ms]) => `${name} ${String(Math.round(ms))}ms`)
+          .join(", ")
+        stdout.write(
+          `timing ${basename(entry)}: start ${String(Math.round(timing.startMs))}ms, end ${String(Math.round(timing.endMs))}ms, ` +
+            `slice ${String(timing.sliceMs)}ms` +
+            (timing.sliceDeadlineMs === undefined ? "" : ` (deadline +${String(timing.sliceDeadlineMs)}ms)`) +
+            `, last ${timing.lastPhase}, receipt ${String(Math.round(timing.receiptMs))}ms` +
+            (phases === "" ? "" : `; ${phases}`) +
+            "\n",
+        )
+      }
+    }
     if (batch.owners !== undefined && batch.owners.unproved > 0) {
       stdout.write(
         `identity-unknown: ${String(batch.owners.unproved)} object director(ies) have no proved Git owner and cannot be leased; nothing under them is deleted` +

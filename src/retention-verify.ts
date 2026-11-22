@@ -226,6 +226,15 @@ export type RetentionVerifyOptions = Readonly<{
    */
   readonly custodyPhases?: (name: string, ms: number) => void
   /**
+   * 34127 (@cto e8f6c3b5): this entry's own time, as boundaries in the monotonic clock: `enter` when a phase starts
+   * and `end` when it stops, both as elapsed-ms-since-entry-start. A phase cut by the deadline has already emitted
+   * its `enter`, so a starved entry names the phase it died in instead of reporting silence.
+   *
+   * Phases in order: setup (gates 1-4), child (gate 5, including the custody walk's own witnessFsck / refGraph /
+   * witnessCertificates), drain (result assembly). The caller adds its own receipt-writing span.
+   */
+  readonly entryTimings?: (event: Readonly<{ kind: "enter" | "end"; phase: string; ms: number }>) => void
+  /**
    * 34787: an explicit discard of exactly the loss gate 5 finds. It never passes gate 5; a match makes the verdict
    * `discard-candidate` and the loss is reported as `explicitLoss`. A mismatch keeps the entry and names the field.
    */
@@ -449,6 +458,16 @@ async function evaluateRetainedEntry(
   const clock = options.clock ?? new Date()
   const monotonic = options.monotonic ?? Date.now
   const startedAt = monotonic()
+  const elapsed = (): number => monotonic() - startedAt
+  // 34127 (@cto e8f6c3b5): the phase this entry is inside. Emitted on entry, so a deadline cut that never returns
+  // still leaves the caller the last phase entered.
+  let currentPhase = "setup"
+  const enterPhase = (phase: string): void => {
+    options.entryTimings?.({ kind: "end", phase: currentPhase, ms: elapsed() })
+    currentPhase = phase
+    options.entryTimings?.({ kind: "enter", phase, ms: elapsed() })
+  }
+  options.entryTimings?.({ kind: "enter", phase: currentPhase, ms: 0 })
   const gates: RetentionGateResult[] = []
   const reasons: string[] = []
   const declaredNamespaceRoots = [...(options.namespaceRoots ?? [])]
@@ -490,6 +509,7 @@ async function evaluateRetainedEntry(
   }
 
   const finish = (): RetentionVerifyResult => {
+    options.entryTimings?.({ kind: "end", phase: currentPhase, ms: elapsed() })
     const ordered = GATE_ORDER.map((gate) => {
       const found = gates.find((entry) => entry.gate === gate)
       if (found !== undefined) return found
@@ -1097,6 +1117,8 @@ async function evaluateRetainedEntry(
   })
 
   // ---- Gate 5: positive surviving custody ----------------------------------------------
+  // 34127 (@cto e8f6c3b5): setup ends here; everything the custody stage spawns is child execution.
+  enterPhase("child")
   // 37792 (@cto 78e96f64 part 1): the heads each component's store holds, so the existing 37455-A ancestry proof runs
   // on this route too. A component whose heads cannot be read keeps the witness proof and is named, never dropped.
   const headsCensus = await componentHeadCensus(expectedCopyRoot, contents.components, options, refObservations)
@@ -1112,10 +1134,25 @@ async function evaluateRetainedEntry(
       : { witnessPolicy: { targetBranch: options.custodyTargetBranch } }),
     ...(Object.keys(headsCensus.heads).length === 0 ? {} : { environmentHeads: headsCensus.heads }),
     ...(options.custodyRunScope === undefined ? {} : { runScope: options.custodyRunScope }),
-    ...(options.custodyPhases === undefined ? {} : { onPhase: options.custodyPhases }),
+    // 34127: the custody walk's own phases join the entry's boundary stream, so a cut inside one is attributed to it.
+    // The existing phase log still receives its (name, ms) pair unchanged.
+    ...(options.custodyPhases === undefined && options.entryTimings === undefined
+      ? {}
+      : {
+          onPhase: (name: string, ms: number) => {
+            options.custodyPhases?.(name, ms)
+            options.entryTimings?.({ kind: "end", phase: name, ms: elapsed() })
+          },
+          ...(options.entryTimings === undefined
+            ? {}
+            : {
+                onPhaseEnter: (name: string) => options.entryTimings?.({ kind: "enter", phase: name, ms: elapsed() }),
+              }),
+        }),
     clock: monotonic,
   })
   result.witnesses = custody.witnesses
+  enterPhase("drain")
   // 37792 (@cto 8c9ba37e): fetched-copy refs are not heads the ancestry proof must satisfy, and they are counted in
   // the receipt by namespace, never dropped in silence.
   // 37792 (@cto 8c9ba37e): fetched-copy refs are not heads the ancestry proof must satisfy, and an unreadable head

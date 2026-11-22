@@ -108,6 +108,28 @@ export type RetentionBatchResult = Readonly<{
    * a cold store's connectivity check from its ordered ref walk. Absent when no proof reached a witness store.
    */
   proofPhases?: Readonly<Record<string, number>>
+  /**
+   * 34127 (@cto e8f6c3b5): each entry's own time, so a starved batch says where its budget went instead of naming one
+   * proof total. `startMs`/`endMs` are monotonic offsets from the batch start; `sliceMs` is the share the schedule
+   * gave the entry and `sliceDeadlineMs` its offset from the batch proof start. `phases` holds every entered phase's
+   * span (setup, child, the custody walk's own named phases, drain), and `lastPhase` is the deepest phase entered --
+   * present even when the deadline cut the entry, which is the case this exists for. `receiptMs` is what no phase
+   * owns: writing this entry's row and evidence.
+   */
+  entryTimings?: Readonly<
+    Record<
+      string,
+      Readonly<{
+        startMs: number
+        endMs: number
+        sliceMs: number
+        sliceDeadlineMs?: number
+        lastPhase: string
+        phases: Readonly<Record<string, number>>
+        receiptMs: number
+      }>
+    >
+  >
   /** The outside Git owners whose existing writer leases a window holds, and how many cannot be leased. */
   owners?: Readonly<{
     total: number
@@ -315,6 +337,10 @@ function borrowerOrder(
 export async function retireRetainedBatch(options: RetentionBatchOptions): Promise<RetentionBatchResult> {
   const apply = options.apply === true
   const monotonic = options.monotonic ?? (() => performance.now())
+  // 34127 (@cto e8f6c3b5): entry boundaries are monotonic offsets from here; the proof budget below is in the wall clock
+  // frames the verify deadline uses, so the slice offset is taken against this one value.
+  const batchStarted = monotonic()
+  const proofStartWall = Date.now()
   const budget = options.holdBudgetMs ?? 60_000
   // In the verifier's default clock domain (Date.now), so the same absolute value bounds both the batch loop and the
   // custody walks inside each proof.
@@ -359,12 +385,50 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
   const recordPhases = (name: string, ms: number): void => {
     phases[name] = (phases[name] ?? 0) + ms
   }
+  type EntryTimingState = {
+    readonly startMs: number
+    endMs?: number
+    sliceMs: number
+    sliceDeadlineMs?: number
+    lastPhase: string
+    readonly phases: Map<string, number>
+    readonly enteredAt: Map<string, number>
+  }
+  const timings = new Map<string, EntryTimingState>()
+  const timingFor = (entry: string): EntryTimingState => {
+    const existing = timings.get(entry)
+    if (existing !== undefined) return existing
+    const created: EntryTimingState = {
+      startMs: monotonic() - batchStarted,
+      sliceMs: 0,
+      lastPhase: "not-started",
+      phases: new Map<string, number>(),
+      enteredAt: new Map<string, number>(),
+    }
+    timings.set(entry, created)
+    return created
+  }
+  // A phase entered but never ended is the phase the entry died in: its elapsed so far is kept, not dropped.
+  const recordEntryTiming =
+    (entry: string) =>
+    (event: Readonly<{ kind: "enter" | "end"; phase: string; ms: number }>): void => {
+      const state = timingFor(entry)
+      if (event.kind === "enter") {
+        state.lastPhase = event.phase
+        state.enteredAt.set(event.phase, event.ms)
+        return
+      }
+      const started = state.enteredAt.get(event.phase)
+      state.enteredAt.delete(event.phase)
+      state.phases.set(event.phase, (state.phases.get(event.phase) ?? 0) + Math.max(0, event.ms - (started ?? 0)))
+    }
   const verifyOptions = (entry: string, phase: "pre" | "held", sharedDeadline?: number): RetentionVerifyOptions => {
     // exactOptionalPropertyTypes: a shared spread of `number | undefined` is not assignable to `deadline?: number`, so
     // the absence is decided here where the type can narrow (red on the pin before this, TS2375).
     const deadline = sharedDeadline ?? proofDeadline
     return {
       custodyPhases: recordPhases,
+      entryTimings: recordEntryTiming(entry),
       entry,
       root,
       namespaceRoots: options.namespaceRoots,
@@ -422,6 +486,28 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
     apply,
     warnings,
     ...(Object.keys(phases).length === 0 ? {} : { proofPhases: { ...phases } }),
+    ...(timings.size === 0
+      ? {}
+      : {
+          entryTimings: Object.fromEntries(
+            [...timings].map(([entry, state]) => {
+              const endMs = state.endMs ?? monotonic() - batchStarted
+              const accounted = [...state.phases.values()].reduce((sum, ms) => sum + ms, 0)
+              return [
+                entry,
+                {
+                  startMs: state.startMs,
+                  endMs,
+                  sliceMs: state.sliceMs,
+                  ...(state.sliceDeadlineMs === undefined ? {} : { sliceDeadlineMs: state.sliceDeadlineMs }),
+                  lastPhase: state.lastPhase,
+                  phases: Object.fromEntries(state.phases),
+                  receiptMs: Math.max(0, endMs - state.startMs - accounted),
+                },
+              ]
+            }),
+          ),
+        }),
     scan: scanSummary,
     ...(ownerSummary.current === undefined ? {} : { owners: ownerSummary.current }),
     ...(byteSummary.current === undefined
@@ -458,6 +544,9 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
   for (const entry of entries) {
     const share = entryShare(entriesLeft)
     entriesLeft -= 1
+    const entryTiming = timingFor(entry)
+    entryTiming.sliceMs = share.ms
+    if (share.deadline !== undefined) entryTiming.sliceDeadlineMs = share.deadline - proofStartWall
     if (proofDeadlinePassed()) {
       notStarted++
       kept.set(
@@ -488,6 +577,7 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
         : ""
       kept.set(entry, `${proof.verdict}: ${proof.reasons.join("; ")}${slice}`)
     }
+    entryTiming.endMs = monotonic() - batchStarted
   }
   closeOverKeptBorrowers(entries, scan.borrowers, kept)
   for (const [entry, reason] of kept) rows.set(entry, { entry, outcome: "kept", reason })
