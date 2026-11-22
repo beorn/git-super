@@ -1687,6 +1687,54 @@ async function runCustody(
     const candidates = published.filter((entry) => entry.repo === repo)
     return candidates.length === 1 ? candidates[0] : undefined
   }
+  // 37792 (@cto 2026-11-22): head ancestry is cheap, so every component is decided first; the closure read that
+  // answers "would these objects survive" then runs ONCE per witness store over the union of the heads it proves,
+  // instead of once per component (the first version paid a full object walk per component and exhausted the batch).
+  const ancestryByComponent = new Map<string, HeadReachability>()
+  const closureByStore = new Map<string, { heads: string[]; components: string[] }>()
+  for (const component of components) {
+    remaining()
+    const componentGitDir = component.gitDir ?? join(copyRoot, component.component)
+    const heads = environmentHeads?.[component.component]
+    const publishedTip = publishedTipFor(component.component)
+    if (component.missingRoots !== 0 || heads === undefined || heads.length === 0 || publishedTip === undefined) {
+      continue
+    }
+    const ancestry = await headsAreAncestors(
+      componentGitDir,
+      heads,
+      publishedTip.tip,
+      dirname(publishedTip.store),
+      proofRun,
+      remaining,
+    )
+    if (ancestry.status === "unknown") throw new UnknownError(ancestry.detail)
+    if (ancestry.status !== "ancestors") continue
+    ancestryByComponent.set(component.component, {
+      component: component.component,
+      heads: [...heads].sort(),
+      store: publishedTip.store,
+      tip: publishedTip.tip,
+      confirmedBy: `ls-remote ${publishedTip.remote} refs/heads/${witnessPolicy?.targetBranch ?? "?"} in this run`,
+    })
+    const closureStore = dirname(publishedTip.store)
+    const target = closureByStore.get(closureStore) ?? { heads: [], components: [] }
+    target.heads.push(...heads)
+    target.components.push(component.component)
+    closureByStore.set(closureStore, target)
+  }
+  for (const [store, target] of closureByStore) {
+    const heads = [...new Set(target.heads)].sort()
+    const closure = await headsPresentInWitness(store, heads, proofRun, remaining)
+    if (closure.status === "missing") {
+      throw new UnknownError(
+        `head closure missing ${String(closure.missing.length)} object(s) in witness store ${store}: ${closure.missing.slice(0, MISSING_INLINE).join(", ")}${closure.missing.length > MISSING_INLINE ? " ..." : ""}`,
+      )
+    }
+    closureNotes.push(
+      `${String(closure.objects)} object(s) reachable from ${String(heads.length)} head(s) of ${String(target.components.length)} component(s) present in ${store}`,
+    )
+  }
   let witnessCount = 0
   let missingCount = 0
   let merged = 0
@@ -1699,48 +1747,10 @@ async function runCustody(
         atStore(proofRun, componentGitDir, await worktreeGone(componentGitDir, proofRun)),
       )
       if (format.status !== "ok") throw new UnknownError(format.detail)
-      // 37455-A (@cto 29f8631c): reachability first. Every head this environment holds — the component gitlink's
-      // checkout HEAD and its local branch tips — being an ancestor of the published target branch is exact custody
-      // for everything the environment names, and it costs no byte stream. Only a non-ancestor head, or a component
-      // with no readable head, falls through to the witness and patch proofs below, where the patch bound stays.
-      const heads = environmentHeads?.[component.component]
-      const publishedTip = publishedTipFor(component.component)
-      let proven: HeadReachability | undefined
-      if (component.missingRoots === 0 && heads !== undefined && heads.length > 0 && publishedTip !== undefined) {
-        const ancestry = await headsAreAncestors(
-          componentGitDir,
-          heads,
-          publishedTip.tip,
-          dirname(publishedTip.store),
-          proofRun,
-          remaining,
-        )
-        if (ancestry.status === "unknown") throw new UnknownError(ancestry.detail)
-        if (ancestry.status === "ancestors") {
-          proven = {
-            component: component.component,
-            heads: [...heads].sort(),
-            store: publishedTip.store,
-            tip: publishedTip.tip,
-            confirmedBy: `ls-remote ${publishedTip.remote} refs/heads/${witnessPolicy?.targetBranch ?? "?"} in this run`,
-          }
-        }
-      }
-      // 37792 (@cto 2026-11-22): the closure is the entry-relevant half of the proof for a component ancestry just
-      // proved: the store it relies on must hold every object reachable from those heads. A component that fell to the
-      // patch path keeps that path's own proof, because a rebased head is expected to be absent from the witness.
-      if (proven !== undefined && heads !== undefined && heads.length > 0 && publishedTip !== undefined) {
-        const closureStore = dirname(publishedTip.store)
-        const closure = await headsPresentInWitness(closureStore, heads, proofRun, remaining)
-        if (closure.status === "missing") {
-          throw new UnknownError(
-            `head closure missing ${String(closure.missing.length)} object(s) in witness store ${closureStore}: ${closure.missing.slice(0, MISSING_INLINE).join(", ")}${closure.missing.length > MISSING_INLINE ? " ..." : ""}`,
-          )
-        }
-        closureNotes.push(
-          `${String(closure.objects)} object(s) reachable from ${String(heads.length)} head(s) of ${component.component} present in ${closureStore}`,
-        )
-      }
+      // 37455-A (@cto 29f8631c): reachability first. A component whose every head ancestry proved needs no byte
+      // stream; its closure was already read once for its store above. Anything else falls through to the witness and
+      // patch proofs below, where the patch bound stays.
+      const proven = ancestryByComponent.get(component.component)
       const provenUnreferenced: CustodyTarget[] = []
       let provenUnreferencedTotal = 0
       await mergeSorted(
