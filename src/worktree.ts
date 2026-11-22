@@ -47,7 +47,17 @@ import {
   type GitRunResult,
   type GitStreamFactory,
 } from "./retention-contents.ts"
-import { isPolicyRef, scanCustody, type CustodyTarget, type WitnessIdentity } from "./retention-custody.ts"
+import {
+  componentHeads,
+  custodyIdentityError,
+  isPolicyRef,
+  scanCustody,
+  type CustodyTarget,
+  type WitnessIdentity,
+} from "./retention-custody.ts"
+
+/** Kept on this module's surface: the 37455-A head census moved to the custody module (37792) but its callers did not. */
+export { componentHeads }
 import { alternateEntries, alternatesLineage } from "./alternates.ts"
 import { createProgressReporter } from "./progress.ts"
 import { shellQuote } from "./shell-command.ts"
@@ -390,89 +400,6 @@ type ComponentCensus = Readonly<{
   removal: readonly string[]
   fingerprint: string
 }>
-
-function custodyIdentityError(message: string): Error {
-  return new Error(`component custody census unknown: ${message}`)
-}
-
-/**
- * 37455-A (@cto 29f8631c): the heads the environment holds for one component — what its checkout names (the gitlink
- * commit) plus every local branch tip in its own store. A head that cannot be read is not dropped: it is named in the
- * error, because an unreadable ref must refuse rather than leave custody unproven in silence.
- */
-export async function componentHeads(run: GitRun, gitDir: string, deadline: number): Promise<readonly string[]> {
-  const remaining = (): number => {
-    const left = deadline - Date.now()
-    if (left <= 0) throw custodyIdentityError("shared proof deadline is exhausted")
-    return left
-  }
-  const outcome = async (args: readonly string[], what: string): Promise<string> => {
-    const result = await run([`--git-dir=${gitDir}`, ...args], { timeoutMs: remaining() })
-    if (result.timedOut === true || result.code !== 0 || result.stderr.trim() !== "") {
-      throw custodyIdentityError(
-        `${gitDir}: ${what} could not be read (${result.stderr.trim() || `exit ${String(result.code)}`})`,
-      )
-    }
-    remaining()
-    return result.stdout
-  }
-  const heads: string[] = []
-  const named = await run([`--git-dir=${gitDir}`, "rev-parse", "--verify", "HEAD"], { timeoutMs: remaining() })
-  if (named.code === 0 && named.stderr.trim() === "") {
-    const head = named.stdout.trim()
-    if (!/^[0-9a-f]{40,64}$/u.test(head)) {
-      throw custodyIdentityError(`${gitDir}: rev-parse HEAD answered a non-commit ${JSON.stringify(head.slice(0, 80))}`)
-    }
-    heads.push(head)
-  } else if (!/unknown revision|Needed a single revision|ambiguous argument|bad revision/u.test(named.stderr)) {
-    throw custodyIdentityError(
-      `${gitDir}: HEAD could not be read (${named.stderr.trim() || `exit ${String(named.code)}`}); an unreadable head is refused, never dropped`,
-    )
-  }
-  // 37455-A forward (@chief 2026-11-22): the census roots EVERY ref outside refs/remotes/** as a Gate 4 root OID
-  // (CUSTODY_FRESHNESS_INPUT_SPEC component.refs), so the heads handed to the ancestry proof must be that same set.
-  // Taking only refs/heads left a commit held solely by refs/stash, a tag or notes as reachability.unreferenced, and
-  // env close then deleted the environment's private object store with it.
-  for (const row of (
-    await outcome(["for-each-ref", "refs/", "--format=%(refname)%09%(objectname)%09%(objecttype)"], "local refs")
-  ).split("\n")) {
-    if (row.trim() === "") continue
-    const [ref, tip, objectType] = row.split("\t")
-    if (ref === undefined || tip === undefined || objectType === undefined) {
-      throw custodyIdentityError(`${gitDir}: for-each-ref answered a malformed ref row ${JSON.stringify(row.slice(0, 120))}`)
-    }
-    if (ref.startsWith("refs/remotes/")) continue
-    if (!/^[0-9a-f]{40,64}$/u.test(tip)) {
-      throw custodyIdentityError(
-        `${gitDir}: for-each-ref answered a non-commit tip for ${ref} ${JSON.stringify(tip.slice(0, 80))}`,
-      )
-    }
-    if (objectType === "commit") {
-      heads.push(tip)
-      continue
-    }
-    // A ref on a blob or tree is still a Gate 4 root (component.refs), so an ancestry proof over commits cannot speak
-    // for this component: hand back NO heads and let the full census path keep every object it roots (@dev/15
-    // 2026-11-22). A partial head set here is the same defect as reading only refs/heads, one ref type over.
-    if (objectType !== "tag") return []
-    // A tag object names a commit through a peel. A peel that FAILS is either a tag of a tree/blob, which is the case
-    // above, or a read that could not complete, which is refused like an unreadable HEAD.
-    const peeled = await run([`--git-dir=${gitDir}`, "rev-parse", "--verify", `${ref}^{commit}`], {
-      timeoutMs: remaining(),
-    })
-    remaining()
-    const peeledTip = peeled.stdout.trim()
-    if (peeled.code === 0 && peeled.stderr.trim() === "" && /^[0-9a-f]{40,64}$/u.test(peeledTip)) {
-      heads.push(peeledTip)
-      continue
-    }
-    if (/expected commit type|not a commit|is a (blob|tree)\b/iu.test(peeled.stderr)) return []
-    throw custodyIdentityError(
-      `${gitDir}: tag ref ${ref} could not be peeled to a commit (${peeled.stderr.trim() || `exit ${String(peeled.code)}`}); an unreadable head is refused, never dropped`,
-    )
-  }
-  return [...new Set(heads)]
-}
 
 async function buildComponentCensus(
   input: Readonly<{

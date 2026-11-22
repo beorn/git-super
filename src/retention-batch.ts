@@ -57,6 +57,12 @@ export type RetentionBatchOptions = Readonly<{
   clock?: Date
   monotonic?: () => number
   allowTemporaryArtifactDir?: boolean
+  /**
+   * 37792 (@cto 78e96f64): the published branch gate 5 proves component heads against. Set, a component whose heads
+   * are all ancestors of the tip its witness store's remote answered for in this run is proven without fsck. Absent,
+   * every entry keeps the witness and patch proofs exactly as before.
+   */
+  targetBranch?: string
   /** Test seam: the batch scan bounds; production uses {@link BATCH_ESTATE_BOUNDS}. */
   scanBounds?: EstateScanBounds
   /** Test seam: runs between the scan and the first lease window, as a writer with no lease would. */
@@ -318,6 +324,7 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
     namespaceRoots: options.namespaceRoots,
     artifactDir: join(options.artifactDir, basename(entry), phase),
     commonArtifactDir: join(options.artifactDir, "common"),
+    ...(options.targetBranch === undefined ? {} : { custodyTargetBranch: options.targetBranch }),
     ...(options.clock === undefined ? {} : { clock: options.clock }),
     ...(proofDeadline === undefined ? {} : { deadline: proofDeadline }),
     ...(options.allowTemporaryArtifactDir === undefined
