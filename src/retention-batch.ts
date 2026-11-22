@@ -109,9 +109,11 @@ export type RetentionBatchResult = Readonly<{
    */
   proofPhases?: Readonly<Record<string, number>>
   /**
-   * 34127 (@cto e8f6c3b5): each entry's own time, so a starved batch says where its budget went instead of naming one
-   * proof total. `startMs`/`endMs` are monotonic offsets from the batch start; `sliceMs` is the share the schedule
-   * gave the entry and `sliceDeadlineMs` its offset from the batch proof start.
+   * 34127 (@cto e8f6c3b5, turn58 (b)): each entry's own time in the PRELIMINARY pass, so a starved batch says where its
+   * budget went instead of naming one proof total. The held re-verification is not reported here: a no-apply batch
+   * returns before it, and a held pass runs under the existing shared deadline with no per-entry slice to report.
+   * `startMs`/`endMs` are monotonic offsets from the batch start; `sliceMs` is the share the schedule gave the entry
+   * and `sliceDeadlineMs` its offset from the batch proof start.
    *
    * `phases` holds only the entry's own top-level boundaries (setup, child, drain, receipt) and they never overlap;
    * the custody walk's named phases are reported beside them under `subphases`, inclusive inside `child`, because
@@ -121,7 +123,7 @@ export type RetentionBatchResult = Readonly<{
    * at its call site, absent when the entry never reached it. `unattributedMs` is the residual as measured, reported
    * even when negative so overlapping windows stay visible rather than being clamped away.
    */
-  entryTimings?: Readonly<
+  preliminaryEntryTimings?: Readonly<
     Record<
       string,
       Readonly<{
@@ -451,7 +453,10 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
     const deadline = sharedDeadline ?? proofDeadline
     return {
       custodyPhases: recordPhases,
-      entryTimings: recordEntryTiming(entry),
+      // 34127 (@cto turn58 (b)): the timings describe the PRELIMINARY proof only. A no-apply batch returns before the
+      // held re-verification, and a held pass runs under the existing shared deadline with no per-entry slice to report,
+      // so it keeps the existing held/window reporting rather than folding into these boundaries.
+      ...(phase === "pre" ? { entryTimings: recordEntryTiming(entry) } : {}),
       // 34127 (@cto turn58): one clock for the entry's boundaries and the proof deadline it is measured against.
       monotonic,
       entry,
@@ -514,7 +519,7 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
     ...(timings.size === 0
       ? {}
       : {
-          entryTimings: Object.fromEntries(
+          preliminaryEntryTimings: Object.fromEntries(
             [...timings].map(([entry, state]) => {
               const endMs = state.endMs ?? monotonic() - batchStarted
               // 34127 (@cto turn58): only the entry's own top-level buckets count against its slice; the custody walk's

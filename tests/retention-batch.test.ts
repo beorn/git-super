@@ -516,7 +516,7 @@ describe("retention retirement batch (#33010)", async () => {
     expect(result.stopped).toBeUndefined()
     const topLevel = new Set(["setup", "child", "drain", "receipt"])
     for (const row of result.rows) {
-      const timing = result.entryTimings?.[row.entry]
+      const timing = result.preliminaryEntryTimings?.[row.entry]
       expect(timing, row.entry).toBeDefined()
       expect(timing?.lastPhase).toBe("receipt")
       expect(timing?.sliceMs).toBeGreaterThan(0)
@@ -546,7 +546,7 @@ describe("retention retirement batch (#33010)", async () => {
     }
     const cut = await retireRetainedBatch(options({ proofDeadlineMs: 60, gitRun: slowCustody }))
     expect(cut.rows.every((row) => row.outcome === "kept")).toBe(true)
-    const cutTimings = Object.values(cut.entryTimings ?? {}).filter(
+    const cutTimings = Object.values(cut.preliminaryEntryTimings ?? {}).filter(
       (timing) => timing.deadlineCutMs !== undefined,
     )
     expect(cutTimings.length).toBeGreaterThan(0)

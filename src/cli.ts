@@ -1525,8 +1525,8 @@ async function writeResult(
     )
     // 34127 (@cto e8f6c3b5): one line per entry, so a starved batch names where its budget went. `lastPhase` survives a
     // deadline cut, which is the case this exists for; receiptMs is the part no phase owns.
-    if (batch.entryTimings !== undefined) {
-      for (const [entry, timing] of Object.entries(batch.entryTimings)) {
+    if (batch.preliminaryEntryTimings !== undefined) {
+      for (const [entry, timing] of Object.entries(batch.preliminaryEntryTimings)) {
         const phases = Object.entries(timing.phases)
           .map(([name, ms]) => `${name} ${String(Math.round(ms))}ms`)
           .join(", ")
