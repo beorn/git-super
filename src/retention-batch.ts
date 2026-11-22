@@ -30,6 +30,7 @@ import {
   type EstateScanBounds,
 } from "./retention-estate.ts"
 import { pointers, proofFacts } from "./retention-remove.ts"
+import { CustodyRunScope } from "./retention-custody.ts"
 import {
   inspectRetainedEntryInBatch,
   type RetentionVerifyOptions,
@@ -318,6 +319,8 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
   const recordWarnings = (proof: RetentionVerifyResult, phase: "pre" | "held"): void => {
     for (const message of proof.certificate?.warnings ?? []) warnings.push({ entry: proof.entry, phase, message })
   }
+  // 37792 (@cto 93f4ba37): one scope for the whole run, so a batch of five entries fsck /hh/dev/.git once.
+  const runScope = new CustodyRunScope()
   const verifyOptions = (entry: string, phase: "pre" | "held"): RetentionVerifyOptions => ({
     entry,
     root,
@@ -325,6 +328,7 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
     artifactDir: join(options.artifactDir, basename(entry), phase),
     commonArtifactDir: join(options.artifactDir, "common"),
     ...(options.targetBranch === undefined ? {} : { custodyTargetBranch: options.targetBranch }),
+    custodyRunScope: runScope,
     ...(options.clock === undefined ? {} : { clock: options.clock }),
     ...(proofDeadline === undefined ? {} : { deadline: proofDeadline }),
     ...(options.allowTemporaryArtifactDir === undefined

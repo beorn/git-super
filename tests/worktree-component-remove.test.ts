@@ -344,8 +344,7 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
         }
       }
       const survived = holds(alphaGitDir) || holds(alpha)
-      const namedMissing =
-        result.custody?.oid === blob || (result.custody?.detail ?? "").includes(blob.slice(0, 12))
+      const namedMissing = result.custody?.oid === blob || (result.custody?.detail ?? "").includes(blob.slice(0, 12))
       expect(survived || namedMissing, `blob ${blob} dropped: proven=${JSON.stringify(proven)}`).toBe(true)
       // The observable contract: a ref the ancestry proof cannot speak for means the component is NOT proven on the
       // remaining head set. Skipping the ref instead proved packages/alpha and left the blob as unreferenced.
@@ -378,12 +377,12 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
       git(repo, "update-ref", "refs/keep/blob", blob)
       const gitDir = git(repo, "rev-parse", "--absolute-git-dir")
       const local = createLocalGitProcess()
-      const run: GitRun = async (args, options) => local.run({ repo: gitDir, args: [...args], ...(options ?? {}) })
+      const run: GitRun = async (args, options) => local.run({ repo: gitDir, args: [...args], ...options })
       const deadline = Date.now() + 60_000
-      expect(await componentHeads(run, gitDir, deadline)).toEqual([])
+      expect(await componentHeads(run, gitDir, deadline)).toEqual({ heads: [], fetched: [] })
       // Control: the same repository with only commit refs still reports its heads.
       git(repo, "update-ref", "-d", "refs/keep/blob")
-      expect(await componentHeads(run, gitDir, deadline)).toEqual([head])
+      expect(await componentHeads(run, gitDir, deadline)).toEqual({ heads: [head], fetched: [] })
     } finally {
       // raw-delete-allow: this isolated mkdtemp fixture owns every path beneath root
       await rm(root, { recursive: true, force: true })

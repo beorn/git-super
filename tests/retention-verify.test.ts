@@ -31,7 +31,7 @@ import { runCli } from "../src/cli.ts"
 import { digestDirectory, emitCertificate } from "../src/retention-certificate.ts"
 import { alternateEntries } from "../src/alternates.ts"
 import type { GitSuperResult } from "../src/result.ts"
-import { scanContents, type ComponentContents } from "../src/retention-contents.ts"
+import { defaultGitRun, scanContents, type ComponentContents } from "../src/retention-contents.ts"
 import { scanCustody } from "../src/retention-custody.ts"
 import { scanEstate } from "../src/retention-estate.ts"
 import {
@@ -1231,6 +1231,37 @@ describe("retention verify gates 1-6", async () => {
     expect(JSON.parse(readFileSync(result.certificate?.path as string, "utf8"))).toMatchObject({ verdict: "candidate" })
     expect(retentionRemovalBoundary(result).authorized).toBe(false)
     expect(retentionRemovalBoundary(result).reason).toContain("preliminary")
+  })
+
+  // 37792 (@cto 8c9ba37e): fetched-copy refs are not heads the ancestry proof must satisfy, and the
+  // custody receipt counts them by namespace instead of dropping them in silence.
+  it("counts fetched-copy refs it excludes from the head set in the custody receipt", async () => {
+    // The ref is injected at the read seam: writing it into the store would change the entry's bytes, which gate 1
+    // refuses by design, so the census sees the fetched copy without mutating the fixture.
+    const gitDir = join(base.entry, "modules", "vendor", "dep")
+    const head = git(base.entry, [`--git-dir=${gitDir}`, "rev-parse", "HEAD"])
+    const run: typeof defaultGitRun = (args, options) => {
+      const result = defaultGitRun(args, options)
+      if (!args.includes("for-each-ref") || !args.includes("refs/") || result.code !== 0) return result
+      return {
+        ...result,
+        stdout: `${result.stdout}refs/gitomic/fetched/origin/main/tmp\t${head}\tcommit\n`,
+      }
+    }
+    const result = await verifyRetainedEntry({
+      entry: base.entry,
+      root: base.root,
+      namespaceRoots: [fixtureRoot as string],
+      artifactDir: base.artifactDir,
+      allowTemporaryArtifactDir: true,
+      clock: eligible(),
+      gitRun: run,
+    })
+    expect(result.verdict).toBe("candidate")
+    expect(result.gates.find((gate) => gate.gate === "positive-custody")).toMatchObject({
+      status: "pass",
+      message: expect.stringContaining("refs/gitomic/fetched/ 1"),
+    })
   })
 
   // #35047: a batch caller bounds every proof by one deadline. A custody walk reached at or past it must read unknown and
