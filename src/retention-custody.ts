@@ -1490,6 +1490,12 @@ function uncheckedDetail(unchecked: ReadonlyArray<string>): string {
  * 37455-A: are all of this environment's heads ancestors of the published target tip? `ancestors` is custody by
  * reachability; `ahead` keeps the witness and patch proofs; anything unreadable is `unknown` with the exact cause, so
  * a ref this rule cannot read is retained rather than guessed at (@cto 29f8631c).
+ *
+ * 37792 (@cto turn36-retention-ruling part 2): the proof runs in the ADMITTED SURVIVING WITNESS STORE, never in the
+ * retained copy. A copy captured weeks ago cannot contain a tip published after it was captured, so requiring the tip
+ * there would make every real entry unprovable by construction. `gitDir` is the retained copy: it is named in a refusal
+ * so the reader knows what was kept, and it is never read here. The witness store must still answer for the tip and the
+ * heads, and the existing object-closure read stays the second condition.
  */
 async function headsAreAncestors(
   gitDir: string,
@@ -1512,19 +1518,35 @@ async function headsAreAncestors(
       detail: `published target commit ${tip} is not readable in witness store ${storeGitDir} (${inStore.stderr.trim() || `exit ${String(inStore.code)}`}); custody by reachability cannot be proven`,
     }
   }
-  const readable = await run([`--git-dir=${gitDir}`, "cat-file", "-e", `${tip}^{commit}`], budget())
-  if (readable.code !== 0 || readable.stderr.trim() !== "") {
-    return {
-      status: "unknown",
-      detail: `published target commit ${tip} is not readable in ${gitDir} (${readable.stderr.trim() || `exit ${String(readable.code)}`}); custody by reachability cannot be proven`,
-    }
-  }
   for (const head of [...heads].sort()) {
-    const answer = await run([`--git-dir=${gitDir}`, "merge-base", "--is-ancestor", head, tip], budget())
+    // The exact retained head is established in the copy that holds it; a copy that cannot read its own head refuses.
+    // `rev-parse --verify --quiet` separates "absent" (exit 1, no output) from an unreadable store, which `cat-file -e`
+    // cannot: a missing object there exits 128 with stderr, which would read as a store failure.
+    const inCopy = await run([`--git-dir=${gitDir}`, "rev-parse", "--verify", "--quiet", `${head}^{commit}`], budget())
+    if (inCopy.code !== 0 || inCopy.stdout.trim() === "" || inCopy.stderr.trim() !== "") {
+      return {
+        status: "unknown",
+        detail: `component head ${head} in retained copy ${gitDir} answered ${String(inCopy.code)} (${inCopy.stderr.trim() || "no output"}); an unreadable head is retained, never proven`,
+      }
+    }
+    // Ancestry is asked in the witness store, so the head must be readable there. Cleanly absent means this store
+    // simply does not hold the head: reachability cannot certify it, the witness and patch proofs still decide.
+    const inWitness = await run(
+      [`--git-dir=${storeGitDir}`, "rev-parse", "--verify", "--quiet", `${head}^{commit}`],
+      budget(),
+    )
+    if (inWitness.code === 1 && inWitness.stderr.trim() === "") return { status: "ahead" }
+    if (inWitness.code !== 0 || inWitness.stdout.trim() === "" || inWitness.stderr.trim() !== "") {
+      return {
+        status: "unknown",
+        detail: `component head ${head} of retained copy ${gitDir} in witness store ${storeGitDir} answered ${String(inWitness.code)} (${inWitness.stderr.trim() || "no output"}); an unreadable head is retained, never proven`,
+      }
+    }
+    const answer = await run([`--git-dir=${storeGitDir}`, "merge-base", "--is-ancestor", head, tip], budget())
     if (answer.stderr.trim() !== "" || (answer.code !== 0 && answer.code !== 1)) {
       return {
         status: "unknown",
-        detail: `component head ${head}: merge-base --is-ancestor ${head} ${tip} in ${gitDir} answered ${String(answer.code)} (${answer.stderr.trim() || "no stderr"}); an unreadable head is retained, never proven`,
+        detail: `component head ${head} of retained copy ${gitDir}: merge-base --is-ancestor ${head} ${tip} in witness store ${storeGitDir} answered ${String(answer.code)} (${answer.stderr.trim() || "no stderr"}); an unreadable head is retained, never proven`,
       }
     }
     if (answer.code === 1) return { status: "ahead" }
@@ -1769,12 +1791,14 @@ async function ancestryProof(
     }
     if (tip === undefined) continue
     const componentGitDir = component.gitDir ?? join(copyRoot, component.component)
+    // 37792 (@cto turn36-retention-ruling part 2): the ancestry read belongs to the admitted surviving witness store,
+    // so the runner is bound there too; the retained copy is only named in a refusal.
     const ancestry = await headsAreAncestors(
       componentGitDir,
       componentHeads,
       tip,
       storeGitDir,
-      atStore(run, componentGitDir, await worktreeGone(componentGitDir, run)),
+      atStore(run, storeGitDir, await worktreeGone(storeGitDir, run)),
       remaining,
     )
     if (ancestry.status === "ancestors") provenRepos.add(repo)
