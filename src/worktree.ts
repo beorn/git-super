@@ -429,17 +429,37 @@ async function componentHeads(run: GitRun, gitDir: string, deadline: number): Pr
       `${gitDir}: HEAD could not be read (${named.stderr.trim() || `exit ${String(named.code)}`}); an unreadable head is refused, never dropped`,
     )
   }
+  // 37455-A forward (@chief 2026-11-22): the census roots EVERY ref outside refs/remotes/** as a Gate 4 root OID
+  // (CUSTODY_FRESHNESS_INPUT_SPEC component.refs), so the heads handed to the ancestry proof must be that same set.
+  // Taking only refs/heads left a commit held solely by refs/stash, a tag or notes as reachability.unreferenced, and
+  // env close then deleted the environment's private object store with it.
   for (const row of (
-    await outcome(["for-each-ref", "refs/heads", "--format=%(objectname)"], "local branch refs")
+    await outcome(["for-each-ref", "refs/", "--format=%(refname)%09%(objectname)%09%(objecttype)"], "local refs")
   ).split("\n")) {
-    const tip = row.trim()
-    if (tip === "") continue
+    if (row.trim() === "") continue
+    const [ref, tip, objectType] = row.split("\t")
+    if (ref === undefined || tip === undefined || objectType === undefined) {
+      throw custodyIdentityError(`${gitDir}: for-each-ref answered a malformed ref row ${JSON.stringify(row.slice(0, 120))}`)
+    }
+    if (ref.startsWith("refs/remotes/")) continue
     if (!/^[0-9a-f]{40,64}$/u.test(tip)) {
       throw custodyIdentityError(
-        `${gitDir}: for-each-ref answered a non-commit branch tip ${JSON.stringify(tip.slice(0, 80))}`,
+        `${gitDir}: for-each-ref answered a non-commit tip for ${ref} ${JSON.stringify(tip.slice(0, 80))}`,
       )
     }
-    heads.push(tip)
+    if (objectType === "commit") {
+      heads.push(tip)
+      continue
+    }
+    // A tag object names a commit through a peel; a ref on a blob or tree names no commit the ancestry proof can
+    // speak for, and the census still roots that object.
+    if (objectType !== "tag") continue
+    const peeled = await run([`--git-dir=${gitDir}`, "rev-parse", "--verify", `${ref}^{commit}`], {
+      timeoutMs: remaining(),
+    })
+    remaining()
+    const peeledTip = peeled.stdout.trim()
+    if (peeled.code === 0 && peeled.stderr.trim() === "" && /^[0-9a-f]{40,64}$/u.test(peeledTip)) heads.push(peeledTip)
   }
   return [...new Set(heads)]
 }

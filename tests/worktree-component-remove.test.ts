@@ -248,6 +248,64 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
   })
 
   /**
+   * @failure 37455-A forward (@chief 2026-11-22): componentHeads read only HEAD and refs/heads while the census roots
+   *          every ref outside refs/remotes/**, so a commit named only by refs/stash was filed as
+   *          reachability.unreferenced and env close deleted the environment's private object store with it.
+   */
+  it("keeps a component commit named only by refs/stash instead of proving the component by ancestry", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-component-stash-"))
+    try {
+      const fixture = createProductFixture(root)
+      const product = fixture.product
+      const target = join(root, "target")
+      git(product, "worktree", "add", "--detach", target)
+      git(target, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
+      const alphaWt = join(target, "packages/alpha")
+      const alpha = join(product, "packages/alpha")
+      writeFileSync(join(alphaWt, "stashed.txt"), "held only by refs/stash\n")
+      git(alphaWt, "stash", "push", "-u", "-m", "component work the environment keeps")
+      const stashTip = git(alphaWt, "rev-parse", "refs/stash")
+      const alphaGitDir = git(alphaWt, "rev-parse", "--absolute-git-dir")
+      const capture = join(root, "stash-capture")
+      git(product, "worktree", "add", "--detach", capture)
+
+      const result = await superWorktreeRemove({
+        repo: product,
+        path: target,
+        retain: join(root, "retained"),
+        componentCustody: { primaryRoot: product, targetBranch: "main" },
+      })
+
+      const proof = result.proof?.componentCustody
+      const proven = proof?.reachability?.map((entry) => entry.component) ?? []
+      // The stash commit is no ancestor of main, so the component must not be proven by ancestry alone; the commit
+      // survives in the component store or is named missing, never silently dropped with the private store.
+      const holds = (gitDir: string): boolean => {
+        try {
+          git(root, `--git-dir=${gitDir}`, "cat-file", "-e", stashTip)
+          return true
+        } catch {
+          return false
+        }
+      }
+      const survived = holds(alphaGitDir) || holds(alpha)
+      const namedMissing =
+        result.custody?.oid === stashTip || (result.custody?.detail ?? "").includes(stashTip.slice(0, 12))
+      expect(survived || namedMissing, `stash ${stashTip} dropped: proven=${JSON.stringify(proven)}`).toBe(true)
+      if (result.state === "unchanged") {
+        // The safe outcome: the environment is kept and the refusal names custody, not a silent drop.
+        expect(result.reason).toBe("component-custody")
+        expect(existsSync(target)).toBe(true)
+      } else {
+        expect(result.state, result.detail?.message ?? JSON.stringify(result)).toBe("updated")
+      }
+    } finally {
+      // raw-delete-allow: this isolated mkdtemp fixture owns every path beneath root
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  /**
    * @failure Removal diagnostics hide whether slow witness proof or the global writer accounts for the elapsed time.
    * @level l1
    * @consumer worktree remove that keeps retention custody
