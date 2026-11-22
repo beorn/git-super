@@ -48,6 +48,12 @@ export interface GitRunResult {
   readonly stderr: string
   /** True when the runner killed the child at `GitRunOptions.timeoutMs`, not on the child's own exit. */
   readonly timedOut?: boolean
+  /**
+   * 37792 (@cto 2026-11-22 9573ed64): set by a caller whose factory clamped this child's timeout to a SHARED proof
+   * deadline instead of the command's own bound. A kill classified here is a scheduling result, never a store
+   * refusing to be read, so a later entry must not inherit it.
+   */
+  readonly sharedDeadlineCut?: boolean
 }
 
 export interface GitRunOptions {
