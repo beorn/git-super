@@ -509,7 +509,9 @@ describe("retention retirement batch (#33010)", async () => {
 
   // #35047 (@dev/review2 REVISE bf2e0b30): the deadline cuts a custody walk already running only if the batch hands it
   // to every verifier call. The spent-deadline rows above are decided by the batch loop and pass without that wire.
-  it("hands one batch proof deadline to every preliminary and held verifier call", async () => {
+  // 37792 (@cto c1f3a921): the preliminary pass hands each not-yet-started entry a fair share of what is left, so the
+  // preliminary deadlines differ; every share and the held pass stay inside the one batch deadline.
+  it("hands the batch deadline to the held pass and a fair share of it to each preliminary entry", async () => {
     const inspect = vi.mocked(inspectRetainedEntryInBatch)
     inspect.mockClear()
     const started = Date.now()
@@ -524,11 +526,22 @@ describe("retention retirement batch (#33010)", async () => {
       deadline: verify.deadline,
     }))
     expect(calls.map((call) => call.phase).sort()).toEqual(["held", "held", "held", "pre", "pre", "pre"])
-    const deadlines = new Set(calls.map((call) => call.deadline))
-    expect(deadlines.size).toBe(1)
-    const deadline = [...deadlines][0] as number
-    expect(deadline).toBeGreaterThanOrEqual(started + 600_000)
-    expect(deadline).toBeLessThanOrEqual(finished + 600_000)
+    const held = calls.filter((call) => call.phase === "held").map((call) => call.deadline as number)
+    const preliminary = calls.filter((call) => call.phase === "pre").map((call) => call.deadline as number)
+    expect(new Set(held).size).toBe(1)
+    const batchDeadline = held[0] as number
+    expect(batchDeadline).toBeGreaterThanOrEqual(started + 600_000)
+    expect(batchDeadline).toBeLessThanOrEqual(finished + 600_000)
+    // Each entry takes an equal part of what is left when it starts, so a share it does not use returns to the pool and
+    // the slices never shrink below the batch deadline's reach: every one sits inside the batch deadline, and a later
+    // entry may hold the whole remainder.
+    expect(preliminary).toHaveLength(3)
+    for (const deadline of preliminary) {
+      expect(deadline).toBeGreaterThan(started)
+      expect(deadline).toBeLessThanOrEqual(batchDeadline)
+    }
+    expect(preliminary[0] as number).toBeLessThan(preliminary[1] as number)
+    expect(preliminary[1] as number).toBeLessThanOrEqual(preliminary[2] as number)
   })
 
   it("dry run names every candidate it would retire and deletes nothing", async () => {
