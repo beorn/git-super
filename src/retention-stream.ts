@@ -351,6 +351,12 @@ export interface GitStreamOutcome {
   readonly stderr: string
   readonly timedOut: boolean
   readonly capped: boolean
+  /**
+   * 37792 (@cto 2026-11-22 9573ed64): set by a caller whose factory clamped this child's timeout to a SHARED proof
+   * deadline instead of the command's own bound. A timeout classified here is a scheduling result, never evidence
+   * about the store, so a later entry must not inherit it. Absent when the command's own limit set the bound.
+   */
+  readonly sharedDeadlineCut?: boolean
   /** Why writing the child's stdin stopped, when it did; the child was killed and `code` is non-zero. */
   readonly stdinError?: string
 }

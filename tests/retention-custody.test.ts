@@ -24,7 +24,13 @@ import { createHash } from "node:crypto"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { afterEach, describe, expect, test } from "vitest"
-import { defaultGitRun, defaultGitStream, type ComponentContents, type GitRun } from "../src/retention-contents.ts"
+import {
+  defaultGitRun,
+  defaultGitStream,
+  type ComponentContents,
+  type GitRun,
+  type GitStreamFactory,
+} from "../src/retention-contents.ts"
 import {
   CustodyIndexScope,
   CustodyRunScope,
@@ -33,7 +39,12 @@ import {
   type CustodyScan,
 } from "../src/retention-custody.ts"
 import { componentHeads } from "../src/worktree.ts"
-import { gitLineStream, RETENTION_STREAM_QUEUE_LINES, readLines, SidecarWriter } from "../src/retention-stream.ts"
+import {
+  gitLineStream,
+  RETENTION_STREAM_QUEUE_LINES,
+  readLines,
+  SidecarWriter,
+} from "../src/retention-stream.ts"
 
 const cleanup: string[] = []
 afterEach(() => {
@@ -965,6 +976,91 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
       { sidecarDir: recoveredDir, indexScope: new CustodyIndexScope(tmp("git-super-custody-failed-build-fresh-")) },
     )
     expect(recovered.status, recovered.detail).toBe("pass")
+  })
+
+  // 37792 (@cto 2026-11-22 9573ed64): a shared index build the SHARED deadline cut is a scheduling result, not a
+  // verdict about the stores. The member it cut stays unknown; the next member, which has its own remaining time, must
+  // build again and prove. Only a genuine store failure stays memoized (the #35062 test above).
+  test("a shared witness index cut by the shared deadline is rebuilt by the next member", async () => {
+    const fixture = custodyCase("deadline-cut index")
+    let now = 1_000
+    const clock = (): number => now
+    let opened = 0
+    const cutStream: GitStreamFactory = () => {
+      opened += 1
+      return {
+        lines: (async function* () {})(),
+        outcome: Promise.resolve({ code: 0, bytes: 0, lines: 0, stderr: "", timedOut: true, capped: false }),
+      }
+    }
+    const indexScope = new CustodyIndexScope(tmp("git-super-custody-deadline-index-"))
+    const cutDir = tmp("git-super-custody-deadline-cut-")
+    const first = await scanCustody(
+      fixture.root,
+      [await componentOf([fixture.atRisk[0]!], cutDir)],
+      fixture.stores,
+      [],
+      { sidecarDir: cutDir, stream: cutStream, clock, deadline: now + 1_000, indexScope },
+    )
+    expect(first.status).toBe("unknown")
+    expect(first.detail).toContain("shared proof deadline is exhausted")
+    expect(opened).toBeGreaterThan(0)
+    // The next member spends its own budget with the real readers: the released key builds again and proves.
+    now += 2_000
+    const provedDir = tmp("git-super-custody-deadline-proved-")
+    const second = await scanCustody(
+      fixture.root,
+      [await componentOf([fixture.atRisk[0]!], provedDir)],
+      fixture.stores,
+      [],
+      { sidecarDir: provedDir, clock, deadline: now + 600_000, indexScope },
+    )
+    expect(second.status, second.detail).toBe("pass")
+  })
+
+  // 37792 (@cto 2026-11-22 9573ed64): the store-health map is the other cache boundary. An fsck the shared deadline cut
+  // says when the budget ran out, so it is published nowhere; the next member fsck's again rather than inheriting it.
+  test("an fsck cut by the shared deadline is never published as a store verdict", async () => {
+    const fixture = custodyCase("deadline-cut fsck")
+    const stores = [...fixture.stores]
+    let now = 1_000
+    const clock = (): number => now
+    let fscks = 0
+    let cutting = true
+    const cutRun: GitRun = async (args, runOptions) => {
+      if (!args.includes("fsck")) return defaultGitRun(args, runOptions)
+      fscks += 1
+      return cutting ? { code: 0, stdout: "", stderr: "", timedOut: true } : defaultGitRun(args, runOptions)
+    }
+    const indexScope = new CustodyIndexScope(tmp("git-super-custody-fsck-deadline-index-"))
+    const runScope = new CustodyRunScope(tmp("git-super-custody-fsck-deadline-fragments-"))
+    const cutDir = tmp("git-super-custody-fsck-deadline-cut-")
+    const first = await scanCustody(fixture.root, [await componentOf([fixture.atRisk[0]!], cutDir)], stores, [], {
+      sidecarDir: cutDir,
+      run: cutRun,
+      clock,
+      deadline: now + 1_000,
+      indexScope,
+      runScope,
+    })
+    expect(first.status).toBe("unknown")
+    expect(first.detail).toContain("shared proof deadline is exhausted")
+    expect(fscks).toBeGreaterThan(0)
+    // Nothing about a store reached the shared map: the cut said when the budget ran out, not what the store is.
+    expect(runScope.fscks.size).toBe(0)
+    cutting = false
+    now += 2_000
+    const provedDir = tmp("git-super-custody-fsck-deadline-proved-")
+    const second = await scanCustody(fixture.root, [await componentOf([fixture.atRisk[0]!], provedDir)], stores, [], {
+      sidecarDir: provedDir,
+      run: cutRun,
+      clock,
+      deadline: now + 600_000,
+      indexScope,
+      runScope,
+    })
+    expect(second.status, second.detail).toBe("pass")
+    expect(runScope.fscks.size).toBeGreaterThan(0)
   })
 
   test("two witness stores in flight give the same ordered custody as one", async () => {

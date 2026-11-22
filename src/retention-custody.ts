@@ -233,6 +233,13 @@ export class CustodyIndexScope {
       this.builds.set(key, pending)
       // Marked handled here; each caller still awaits the same rejection.
       pending.catch(() => undefined)
+      // 37792 (@cto 2026-11-22 9573ed64): release only a refusal the SHARED deadline cut. That refusal records when the
+      // budget ran out, not anything about the stores it read, and the next eligible entry provokes a new build with
+      // its own remaining time, resuming from the fragments this one already completed. A genuine store failure stays
+      // memoized exactly as before, and no caller retries inside its own slice.
+      pending.catch((error: unknown) => {
+        if (error instanceof ProofDeadlineError && this.builds.get(key) === pending) this.builds.delete(key)
+      })
       return pending
     }
     const built = await existing
@@ -268,7 +275,14 @@ export class CustodyRunScope {
     string,
     Readonly<{ status: "known"; id: string } | { status: "unknown"; detail: string }>
   >()
-  readonly fscks = new Map<string, Readonly<{ ok: true } | { ok: false; detail: string; timedOut?: boolean }>>()
+  /**
+   * 37792 (@cto 2026-11-22 9573ed64): a verdict cut by the SHARED deadline is never published here - it says when the
+   * budget ran out, not what the store is, and the next entry has its own remaining time to spend on it.
+   */
+  readonly fscks = new Map<
+    string,
+    Readonly<{ ok: true } | { ok: false; detail: string; timedOut?: boolean; deadlineCut?: boolean }>
+  >()
   /** 37854: ref fragments by store, format, tip and subtracted set — the walk's result, never a proof decision. */
   readonly fragments = new Map<string, SidecarRef>()
   /** 37854: how many ref walks this pass paid for, and how many a later entry in it reused. */
@@ -289,12 +303,41 @@ class UnknownError extends Error {
 }
 
 /**
+ * 37792 (@cto 2026-11-22 9573ed64): a refusal whose cause was the SHARED proof deadline - the entry's slice or the
+ * batch budget - not the command's own bound and not a store refusing to be read. It is a scheduling result: the entry
+ * it cut stays unknown, and no later entry may inherit it, because a later entry's remaining time is a different
+ * budget. Raised only where the deadline really constrained the read (the dispatch-time clamp, or the throw site's own
+ * check), never inferred from message text after the fact.
+ */
+class ProofDeadlineError extends UnknownError {
+  constructor(message: string) {
+    super(message)
+    this.name = "ProofDeadlineError"
+  }
+}
+
+/**
  * 37792 (@cto 2026-11-22 f66720e5): an exhausted shared budget keeps the entry unknown; it is never read as one
  * corrupt store, which would let a pass run on evidence it never had time to read. Every deadline refusal in this
  * module names the phrase, so one predicate recognises them all wherever they are raised.
  */
 function isDeadlineExhaustion(error: unknown): boolean {
+  if (error instanceof ProofDeadlineError) return true
+  // The sort and merge helpers raise plain Errors from a running reader; their only deadline message is this phrase.
   return error instanceof Error && error.message.includes("shared proof deadline is exhausted")
+}
+
+/**
+ * 37792 (@cto 2026-11-22 9573ed64): give a sort or merge helper's deadline refusal the typed classification, so a memo
+ * holding it knows this is a scheduling result and not a store's verdict. Every other error passes through untouched.
+ */
+async function asProofDeadline<T>(work: Promise<T>): Promise<T> {
+  try {
+    return await work
+  } catch (error) {
+    if (error instanceof ProofDeadlineError) throw error
+    throw isDeadlineExhaustion(error) ? new ProofDeadlineError((error as Error).message) : error
+  }
 }
 
 /**
@@ -619,7 +662,6 @@ async function* reachableOidLines(
   gitDir: string,
   tip: string,
   bounds: CustodyBounds,
-  deadlinePassed: () => boolean,
 ): AsyncGenerator<string> {
   let malformed: UnknownError | undefined
   for await (const line of stream.lines) {
@@ -633,16 +675,24 @@ async function* reachableOidLines(
   }
   // Await only after draining: the producer can otherwise be paused at its queue bound.
   const outcome = await stream.outcome
-  assertStreamComplete(outcome, {
-    // The proof stream clamps the walk's timeout to the shared deadline: a kill at or past it ran out of shared time,
-    // not this walk's own bound (#34920: two measurement runs reported the 300 s bound for a deadline kill).
-    timedOut: deadlinePassed()
-      ? `shared proof deadline is exhausted during rev-list ${tip} in ${gitDir}`
-      : `rev-list ${tip} in ${gitDir} exceeded the ${bounds.reachableMs} ms bound`,
-    capped: `reachable OIDs exceeded the ${bounds.maxReachableOids} cap in ${gitDir}`,
-    failed: `rev-list ${tip} failed in witness store ${gitDir}: ${outcome.stderr.trim()}`,
-    warned: `rev-list ${tip} in ${gitDir} exited 0 with stderr: ${outcome.stderr.trim()}`,
-  })
+  // 37792 (@cto 2026-11-22 9573ed64): which budget killed the child is decided at dispatch, where the proof factory
+  // clamped its timeout, and arrives here as `sharedDeadlineCut` - never re-derived from the clock now (#34920: two
+  // measurement runs reported the 300 s bound for a deadline kill).
+  const deadlineCut = outcome.sharedDeadlineCut === true
+  try {
+    assertStreamComplete(outcome, {
+      timedOut: deadlineCut
+        ? `shared proof deadline is exhausted during rev-list ${tip} in ${gitDir}`
+        : `rev-list ${tip} in ${gitDir} exceeded the ${bounds.reachableMs} ms bound`,
+      capped: `reachable OIDs exceeded the ${bounds.maxReachableOids} cap in ${gitDir}`,
+      failed: `rev-list ${tip} failed in witness store ${gitDir}: ${outcome.stderr.trim()}`,
+      warned: `rev-list ${tip} in ${gitDir} exited 0 with stderr: ${outcome.stderr.trim()}`,
+    })
+  } catch (error) {
+    throw deadlineCut && error instanceof IncompleteStreamError && error.fault === "timedOut"
+      ? new ProofDeadlineError(error.message)
+      : error
+  }
   if (malformed !== undefined) throw malformed
 }
 
@@ -771,14 +821,16 @@ async function reachableSidecar(
       ? [`--git-dir=${gitDir}`, "rev-list", "--objects", tip]
       : [`--git-dir=${gitDir}`, "rev-list", "--objects", "--ignore-missing", tip, "--not", ...subtract]
   const lineStream = stream(args, { timeoutMs: bounds.reachableMs, maxLines: bounds.maxReachableOids })
-  const deadlinePassed = (): boolean => deadline !== undefined && clock() >= deadline
-  const sidecar = await externalSortToSidecar(reachableOidLines(lineStream, gitDir, tip, bounds, deadlinePassed), {
-    dir: runScope?.fragmentDir ?? sidecarDir,
-    runLines: DEFAULT_SORT_RUN_LINES,
-    deadline,
-    clock,
-  })
-  if (deadlinePassed()) throw new UnknownError("shared proof deadline is exhausted")
+  const sidecar = await asProofDeadline(
+    externalSortToSidecar(reachableOidLines(lineStream, gitDir, tip, bounds), {
+      dir: runScope?.fragmentDir ?? sidecarDir,
+      runLines: DEFAULT_SORT_RUN_LINES,
+      deadline,
+      clock,
+    }),
+  )
+  // Only a completed walk is a fragment: a partial one is never cached, so it cannot be reused as custody evidence.
+  if (deadline !== undefined && clock() >= deadline) throw new ProofDeadlineError("shared proof deadline is exhausted")
   if (clock() - started > bounds.reachableMs) {
     throw new UnknownError(`rev-list ${tip} in ${gitDir} exceeded the ${bounds.reachableMs} ms bound`)
   }
@@ -869,7 +921,9 @@ async function readWitnessStore(
   const gitDir = dirname(store)
   try {
     // The same invocation deadline bounds a read that is running: a spent budget refuses before another child spawns.
-    if (deadline !== undefined && clock() >= deadline) throw new UnknownError("shared proof deadline is exhausted")
+    if (deadline !== undefined && clock() >= deadline) {
+      throw new ProofDeadlineError("shared proof deadline is exhausted")
+    }
     // #34920: a witness store whose recorded core.worktree is gone is read detached (see worktreeGone).
     const detached = await worktreeGone(gitDir, run)
     const storeRun = atStore(run, gitDir, detached)
@@ -979,7 +1033,9 @@ async function readWitnessStore(
       let verdict = runScope?.fscks.get(gitDir)
       if (verdict === undefined) {
         // No child outlives the budget the read was started under.
-        if (deadline !== undefined && clock() >= deadline) throw new UnknownError("shared proof deadline is exhausted")
+        if (deadline !== undefined && clock() >= deadline) {
+          throw new ProofDeadlineError("shared proof deadline is exhausted")
+        }
         const fsckStarted = clock()
         const result = await storeRun([`--git-dir=${gitDir}`, "fsck", "--connectivity-only", "--no-progress"], {
           timeoutMs: bounds.fsckMs,
@@ -991,18 +1047,27 @@ async function readWitnessStore(
           .filter((line) => /^(?:missing|broken|error)\b/u.test(line))
           .slice(0, MISSING_INLINE)
         verdict =
-          result.code === 0 && result.stderr.trim() === ""
+          // A child this runner killed did not answer, whatever code it was reported with; only a complete read is ok.
+          result.code === 0 && result.stderr.trim() === "" && result.timedOut !== true
             ? { ok: true }
             : {
                 ok: false,
-                detail: `fsck --connectivity-only failed in witness store ${gitDir}: ${result.stderr.trim() || broken.join("; ") || "exit " + String(result.code)}`,
+                // A kill the shared deadline ordered is named as the schedule, never as a failure of the store.
+                detail:
+                  result.sharedDeadlineCut === true
+                    ? `shared proof deadline is exhausted during fsck --connectivity-only in witness store ${gitDir}`
+                    : `fsck --connectivity-only failed in witness store ${gitDir}: ${result.stderr.trim() || broken.join("; ") || "exit " + String(result.code)}`,
                 timedOut: result.timedOut === true,
+                ...(result.sharedDeadlineCut === true ? { deadlineCut: true } : {}),
               }
-        runScope?.fscks.set(gitDir, verdict)
+        // 37792 (@cto 2026-11-22 9573ed64): publish only an answer about the store. A health check the shared deadline
+        // cut says when the budget ran out, so it is not remembered - the next entry spends its own remaining time.
+        if (!("deadlineCut" in verdict)) runScope?.fscks.set(gitDir, verdict)
       }
       // A store killed at its own fsck bound is a proof limit, not corruption; only an answer that reports objects it
       // cannot read excludes the store.
       if (!verdict.ok) {
+        if (verdict.deadlineCut === true) throw new ProofDeadlineError(verdict.detail)
         throw verdict.timedOut === true ? new UnknownError(verdict.detail) : new CorruptStoreError(verdict.detail)
       }
     }
@@ -1118,7 +1183,7 @@ async function indexWitnessStores(
     const waiting = inFlight.get(index)
     inFlight.delete(index)
     // An expired budget launches nothing further; the entry keeps a named reason instead of a silent gap.
-    if (waiting === undefined) throw new UnknownError("shared proof deadline is exhausted")
+    if (waiting === undefined) throw new ProofDeadlineError("shared proof deadline is exhausted")
     const read = await waiting
     if (read.kind === "fatal") throw read.error
     if (read.kind === "corrupt") {
@@ -1744,7 +1809,7 @@ async function runCustody(
 ): Promise<CustodyScan> {
   const remaining = (): number => {
     const left = deadline === undefined ? Number.POSITIVE_INFINITY : deadline - clock()
-    if (left <= 0) throw new UnknownError("shared proof deadline is exhausted")
+    if (left <= 0) throw new ProofDeadlineError("shared proof deadline is exhausted")
     return left
   }
   remaining()
@@ -1795,23 +1860,37 @@ async function runCustody(
     }
   }
   const proofRun: GitRun = async (args, runOptions = {}) => {
-    const timeoutMs = Math.min(runOptions.timeoutMs ?? Number.POSITIVE_INFINITY, remaining())
-    return run(witnessPolicy === undefined ? args : ["--no-replace-objects", ...args], {
+    const requested = runOptions.timeoutMs ?? Number.POSITIVE_INFINITY
+    const left = remaining()
+    const timeoutMs = Math.min(requested, left)
+    const result = await run(witnessPolicy === undefined ? args : ["--no-replace-objects", ...args], {
       ...runOptions,
       ...(Number.isFinite(timeoutMs) ? { timeoutMs } : {}),
       ...(witnessPolicy === undefined
         ? {}
         : { env: { ...runOptions.env, GIT_NO_REPLACE_OBJECTS: "1", GIT_NO_LAZY_FETCH: "1" } }),
     })
+    // 37792 (@cto 2026-11-22 9573ed64): classify from the bound that was actually in force at dispatch. `left` at or
+    // below the requested bound means the SHARED deadline set it, so a kill here is the schedule, not the store.
+    return left <= requested && result.timedOut === true ? { ...result, sharedDeadlineCut: true } : result
   }
-  const proofStream: GitStreamFactory = (args, streamOptions = {}) =>
-    stream(witnessPolicy === undefined ? args : ["--no-replace-objects", ...args], {
+  const proofStream: GitStreamFactory = (args, streamOptions = {}) => {
+    const requested = streamOptions.timeoutMs ?? Number.POSITIVE_INFINITY
+    const left = remaining()
+    const sharedDeadlineCut = left <= requested
+    const opened = stream(witnessPolicy === undefined ? args : ["--no-replace-objects", ...args], {
       ...streamOptions,
-      timeoutMs: Math.min(streamOptions.timeoutMs ?? Number.POSITIVE_INFINITY, remaining()),
+      timeoutMs: Math.min(requested, left),
       ...(witnessPolicy === undefined
         ? {}
         : { env: { ...streamOptions.env, GIT_NO_REPLACE_OBJECTS: "1", GIT_NO_LAZY_FETCH: "1" } }),
     })
+    if (!sharedDeadlineCut) return opened
+    return {
+      lines: opened.lines,
+      outcome: opened.outcome.then((outcome) => (outcome.timedOut ? { ...outcome, sharedDeadlineCut: true } : outcome)),
+    }
+  }
   const indexDir = indexScope?.dir ?? sidecarDir
   const buildIndex = async (): Promise<BuiltWitnessIndex> => {
     const indexed = await indexWitnessStores(
@@ -1831,9 +1910,14 @@ async function runCustody(
       runScope,
     )
     const width = String(Math.max(1, indexed.records.length)).length
-    const merged = await mergeLabeledFiles(
-      indexed.records.map((record, rank) => ({ path: record.fragment.path, label: String(rank).padStart(width, "0") })),
-      { dir: indexDir, deadline, clock },
+    const merged = await asProofDeadline(
+      mergeLabeledFiles(
+        indexed.records.map((record, rank) => ({
+          path: record.fragment.path,
+          label: String(rank).padStart(width, "0"),
+        })),
+        { dir: indexDir, deadline, clock },
+      ),
     )
     return { ...indexed, index: merged }
   }
