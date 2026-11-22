@@ -1499,6 +1499,11 @@ async function writeResult(
     const batch = result as RetentionBatchResult
     stdout.write(
       `${batch.apply ? "apply" : "dry-run"} retained batch: ${batch.rows.length} selected entries; scan ${batch.scan.status} ${batch.scan.ms}ms` +
+        (batch.proofPhases === undefined
+          ? ""
+          : `; custody phases ${Object.entries(batch.proofPhases)
+              .map(([name, ms]) => `${name} ${String(Math.round(ms))}ms`)
+              .join(", ")}`) +
         (batch.bytesPlanned === undefined
           ? ""
           : `; ${formatRetainedBytes(batch.bytesPlanned)} allocated in the selected stores` +

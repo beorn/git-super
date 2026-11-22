@@ -218,6 +218,11 @@ export type RetentionVerifyOptions = Readonly<{
    */
   readonly custodyRunScope?: CustodyRunScope
   /**
+   * 37792 (@cto c1f3a921): the custody scan's own phase timings (connectivity, ref graph, certificates), handed up so
+   * a batch receipt can separate a cold store's fsck from its ordered ref walk instead of reporting one proof total.
+   */
+  readonly custodyPhases?: (name: string, ms: number) => void
+  /**
    * 34787: an explicit discard of exactly the loss gate 5 finds. It never passes gate 5; a match makes the verdict
    * `discard-candidate` and the loss is reported as `explicitLoss`. A mismatch keeps the entry and names the field.
    */
@@ -1087,6 +1092,7 @@ async function evaluateRetainedEntry(
       : { witnessPolicy: { targetBranch: options.custodyTargetBranch } }),
     ...(Object.keys(headsCensus.heads).length === 0 ? {} : { environmentHeads: headsCensus.heads }),
     ...(options.custodyRunScope === undefined ? {} : { runScope: options.custodyRunScope }),
+    ...(options.custodyPhases === undefined ? {} : { onPhase: options.custodyPhases }),
     clock: monotonic,
   })
   result.witnesses = custody.witnesses

@@ -95,6 +95,11 @@ export type RetentionBatchResult = Readonly<{
     alternatesFiles: number
     excluded: number
   }>
+  /**
+   * 37792 (@cto c1f3a921): the custody scan's phase totals for this run, summed per phase name, so the receipt separates
+   * a cold store's connectivity check from its ordered ref walk. Absent when no proof reached a witness store.
+   */
+  proofPhases?: Readonly<Record<string, number>>
   /** The outside Git owners whose existing writer leases a window holds, and how many cannot be leased. */
   owners?: Readonly<{
     total: number
@@ -330,7 +335,24 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
     scopes.set(phase, scope)
     return scope
   }
-  const verifyOptions = (entry: string, phase: "pre" | "held"): RetentionVerifyOptions => ({
+  // 37792 (@cto c1f3a921): one entry may not spend the whole pass. Each not-yet-started entry is given an equal share
+  // of what is left, and a share it does not use stays in the pool for the entries after it. The batch deadline is
+  // still the hard cap, so this changes when one proof stops, never how long the run may take.
+  const entryShare = (entriesLeft: number): Readonly<{ deadline?: number; ms: number }> => {
+    if (proofDeadline === undefined) return { ms: 0 }
+    const left = proofDeadline - Date.now()
+    if (left <= 0) return { deadline: proofDeadline, ms: 0 }
+    const ms = Math.floor(left / Math.max(1, entriesLeft))
+    return { deadline: Math.min(proofDeadline, Date.now() + ms), ms }
+  }
+  // 37792 (@cto c1f3a921): the custody scan's phase timings, summed per name, so a receipt separates a cold store's
+  // connectivity check from its ordered ref walk instead of reporting one proof total.
+  const phases: Record<string, number> = {}
+  const recordPhases = (name: string, ms: number): void => {
+    phases[name] = (phases[name] ?? 0) + ms
+  }
+  const verifyOptions = (entry: string, phase: "pre" | "held", sharedDeadline?: number): RetentionVerifyOptions => ({
+    custodyPhases: recordPhases,
     entry,
     root,
     namespaceRoots: options.namespaceRoots,
@@ -339,7 +361,9 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
     ...(options.targetBranch === undefined ? {} : { custodyTargetBranch: options.targetBranch }),
     custodyRunScope: runScopeFor(phase),
     ...(options.clock === undefined ? {} : { clock: options.clock }),
-    ...(proofDeadline === undefined ? {} : { deadline: proofDeadline }),
+    ...(sharedDeadline === undefined && proofDeadline === undefined
+      ? {}
+      : { deadline: sharedDeadline ?? proofDeadline }),
     ...(options.allowTemporaryArtifactDir === undefined
       ? {}
       : { allowTemporaryArtifactDir: options.allowTemporaryArtifactDir }),
@@ -384,6 +408,7 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
   const result = (windows: BatchWindow[], stopped?: string): RetentionBatchResult => ({
     apply,
     warnings,
+    ...(Object.keys(phases).length === 0 ? {} : { proofPhases: { ...phases } }),
     scan: scanSummary,
     ...(ownerSummary.current === undefined ? {} : { owners: ownerSummary.current }),
     ...(byteSummary.current === undefined
@@ -416,7 +441,10 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
   const preliminary = new Map<string, RetentionVerifyResult>()
   const kept = new Map<string, string>()
   let notStarted = 0
+  let entriesLeft = entries.length
   for (const entry of entries) {
+    const share = entryShare(entriesLeft)
+    entriesLeft -= 1
     if (proofDeadlinePassed()) {
       notStarted++
       kept.set(
@@ -426,14 +454,27 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
       continue
     }
     const proof = await inspectRetainedEntryInBatch(
-      verifyOptions(entry, "pre"),
+      verifyOptions(entry, "pre", share.deadline),
       entryView(scan, entry),
       entries,
       preliminaryIndex,
     )
     recordWarnings(proof, "pre")
     preliminary.set(entry, proof)
-    if (proof.verdict !== "candidate") kept.set(entry, `${proof.verdict}: ${proof.reasons.join("; ")}`)
+    if (proof.verdict !== "candidate") {
+      // An entry whose own share ran out is unknown because of the schedule, never because its store looked corrupt and
+      // never as a reusable negative custody verdict; the reason names the slice so a later run can tell them apart.
+      const sliced =
+        share.deadline !== undefined &&
+        proofDeadline !== undefined &&
+        share.deadline < proofDeadline &&
+        Date.now() >= share.deadline &&
+        proof.verdict === "unknown"
+      const slice = sliced
+        ? ` (entry proof slice of ${String(share.ms)} ms of the ${String(options.proofDeadlineMs)} ms batch budget)`
+        : ""
+      kept.set(entry, `${proof.verdict}: ${proof.reasons.join("; ")}${slice}`)
+    }
   }
   closeOverKeptBorrowers(entries, scan.borrowers, kept)
   for (const [entry, reason] of kept) rows.set(entry, { entry, outcome: "kept", reason })
