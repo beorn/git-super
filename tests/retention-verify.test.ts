@@ -31,7 +31,13 @@ import { runCli } from "../src/cli.ts"
 import { digestDirectory, emitCertificate } from "../src/retention-certificate.ts"
 import { alternateEntries } from "../src/alternates.ts"
 import type { GitSuperResult } from "../src/result.ts"
-import { defaultGitRun, scanContents, type ComponentContents } from "../src/retention-contents.ts"
+import {
+  defaultGitRun,
+  refObservationKey,
+  scanContents,
+  type ComponentContents,
+  type RefObservations,
+} from "../src/retention-contents.ts"
 import { componentHeads, scanCustody } from "../src/retention-custody.ts"
 import { scanEstate } from "../src/retention-estate.ts"
 import {
@@ -1262,6 +1268,105 @@ describe("retention verify gates 1-6", async () => {
       status: "pass",
       message: expect.stringContaining("refs/gitomic/fetched/ 1"),
     })
+  })
+
+  // 37854 (@cto turn46-ref-observations): contents and the head census root the SAME ref list, so one verified copy
+  // lists its refs ONCE per pass instead of once per gate.
+  it("lists one copy's refs once for both gates in a single pass", async () => {
+    const listings: string[] = []
+    const run: typeof defaultGitRun = (args, options) => {
+      const store = args.find((arg) => arg.startsWith("--git-dir="))
+      // No `refs/` term here: the contents gate used to list without one, and that listing is exactly what this counts.
+      if (args.includes("for-each-ref") && store !== undefined && store.includes("vendor/dep")) {
+        listings.push(args.join(" "))
+      }
+      return defaultGitRun(args, options)
+    }
+    const result = await verifyRetainedEntry({
+      entry: base.entry,
+      root: base.root,
+      namespaceRoots: [fixtureRoot as string],
+      artifactDir: base.artifactDir,
+      allowTemporaryArtifactDir: true,
+      clock: eligible(),
+      gitRun: run,
+    })
+    expect(result.verdict).toBe("candidate")
+    expect(listings).toHaveLength(1)
+  })
+
+  // 37854 (@cto turn46-ref-observations): two copies bearing the SAME component name never share one observation.
+  it("keeps two copies of the same component name on separate ref observations", async () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-two-copies-"))
+    const copies = ["alpha", "beta"].map((name) => {
+      const dir = join(root, name)
+      mkdirSync(dir, { recursive: true })
+      git(dir, ["init", "-q", "-b", "main"])
+      writeFileSync(join(dir, "f.ts"), `export const ${name} = 1\n`)
+      git(dir, ["add", "f.ts"])
+      git(dir, ["commit", "-q", "-m", name])
+      return join(dir, ".git")
+    })
+    const observations: RefObservations = new Map()
+    const deadline = Date.now() + 60_000
+    const first = await componentHeads(defaultGitRun, copies[0] as string, deadline, Date.now, {
+      observations,
+      key: refObservationKey(root, copies[0] as string),
+    })
+    const second = await componentHeads(defaultGitRun, copies[1] as string, deadline, Date.now, {
+      observations,
+      key: refObservationKey(root, copies[1] as string),
+    })
+    expect(first.heads).toHaveLength(1)
+    expect(second.heads).toHaveLength(1)
+    expect(first.heads).not.toEqual(second.heads)
+    expect(observations.size).toBe(2)
+  })
+
+  // 37854 (@cto turn46-ref-observations): the observation belongs to one phase. Reusing it inside that phase is the
+  // saving; the held pass builds a fresh scope and must see a ref that moved and a tag that was re-pointed. HEAD stays
+  // per worktree, so the checkout's own tip is always read live.
+  it("keeps one phase's observation and re-reads moved refs and tags in the next", async () => {
+    const root = mkdtempSync(join(tmpdir(), "git-super-moved-ref-"))
+    const dir = join(root, "copy")
+    mkdirSync(dir)
+    git(dir, ["init", "-q", "-b", "main"])
+    writeFileSync(join(dir, "f.ts"), "one\n")
+    git(dir, ["add", "f.ts"])
+    git(dir, ["commit", "-q", "-m", "one"])
+    const first = git(dir, ["rev-parse", "HEAD"])
+    git(dir, ["tag", "-a", "v1", "-m", "v1"])
+    git(dir, ["branch", "release"])
+    const gitDir = join(dir, ".git")
+    const deadline = Date.now() + 60_000
+    const phaseA: RefObservations = new Map()
+    const before = await componentHeads(defaultGitRun, gitDir, deadline, Date.now, {
+      observations: phaseA,
+      key: refObservationKey(root, gitDir),
+    })
+    // The annotated tag is peeled to the commit it names, from the observed tag object id.
+    expect([...before.heads].sort()).toEqual([first])
+
+    writeFileSync(join(dir, "f.ts"), "two\n")
+    git(dir, ["add", "f.ts"])
+    git(dir, ["commit", "-q", "-m", "two"])
+    const moved = git(dir, ["rev-parse", "HEAD"])
+    git(dir, ["branch", "-f", "release", moved])
+    git(dir, ["tag", "-f", "-a", "v1", "-m", "v1 moved"])
+
+    const reused = await componentHeads(defaultGitRun, gitDir, deadline, Date.now, {
+      observations: phaseA,
+      key: refObservationKey(root, gitDir),
+    })
+    // Same phase keeps what it paid for: the stale `release` and tag tips are still in the set beside the live HEAD.
+    expect([...reused.heads].sort()).toEqual([first, moved].sort())
+
+    const phaseB: RefObservations = new Map()
+    const reread = await componentHeads(defaultGitRun, gitDir, deadline, Date.now, {
+      observations: phaseB,
+      key: refObservationKey(root, gitDir),
+    })
+    expect([...reread.heads].sort()).toEqual([moved])
   })
 
   // #35047 + @cto turn44: a batch caller bounds every proof by one deadline. That deadline now reaches the contents scan

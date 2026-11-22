@@ -125,6 +125,103 @@ export interface ContentsScan {
   readonly components: readonly ComponentContents[]
 }
 
+/**
+ * 37854 (@cto turn46-ref-observations): one row of a complete `for-each-ref` enumeration - the ref, the object it
+ * names, and that object's type. Contents and the head census root the SAME ref list; their own consumers apply their
+ * own validation and namespace rules to these raw rows.
+ */
+export interface RefObservationRow {
+  readonly ref: string
+  readonly oid: string
+  /**
+   * Undefined when the ref's object is gone: `%(objecttype)` is FATAL for the whole listing in that case (measured:
+   * exit 128, "missing object <oid> for refs/<...>"), so the rows then come from the safe listing and a consumer that
+   * needs the type reads again and refuses exactly as it always did.
+   */
+  readonly type?: string
+}
+
+/** Complete raw ref enumerations, keyed by retained copy and worktree Git directory, scoped to ONE verification pass. */
+export type RefObservations = Map<string, readonly RefObservationRow[]>
+
+/** The typed listing both gates want; fatal for a store holding a ref whose object is gone. */
+const TYPED_REF_FORMAT = "%(refname)%09%(objectname)%09%(objecttype)"
+/** The listing that survives a ref whose object is gone, and so is all the contents gate may rely on. */
+const SAFE_REF_FORMAT = "%(refname)%09%(objectname)"
+
+/** The key that keeps two copies bearing the same component name from sharing one enumeration. */
+export function refObservationKey(copyRoot: string, gitDir: string): string {
+  return `${copyRoot}\u0000${gitDir}`
+}
+
+/**
+ * 37854 (@cto turn46-ref-observations): read a component's refs ONCE for both gates of one pass. Only a complete,
+ * successful listing is stored: a partial, timed-out or failed read is never reused, and because the scope belongs to
+ * one pass (a held pass builds its own), a ref that moved is read again there.
+ */
+export async function observeRefs(
+  run: GitRun,
+  gitDir: string,
+  options: Readonly<{
+    readonly observations?: RefObservations
+    readonly key: string
+    readonly runOptions?: GitRunOptions
+    readonly label?: string
+    /** Git context prepended to the read (`--git-dir`/`--work-tree`); absent when the runner is already bound. */
+    readonly context?: readonly string[]
+    /** A consumer that cannot work without the object type: it re-reads strictly rather than accept untyped rows. */
+    readonly requireTypes?: boolean
+  }>,
+): Promise<readonly RefObservationRow[]> {
+  const seen = options.observations?.get(options.key)
+  const label = options.label ?? `for-each-ref in ${gitDir}`
+  const context = options.context ?? []
+  const read = async (format: string): Promise<GitRunResult> =>
+    run([...context, "for-each-ref", "refs/", `--format=${format}`], options.runOptions ?? {})
+  const parse = (text: string, withType: boolean): RefObservationRow[] => {
+    const rows: RefObservationRow[] = []
+    for (const line of text.split("\n")) {
+      if (line === "") continue
+      const [ref, oid, type] = line.split("\t")
+      if (ref === undefined || oid === undefined || (withType && type === undefined)) {
+        throw new UnknownError(`${label}: malformed ref row ${JSON.stringify(line.slice(0, 120))}`)
+      }
+      rows.push(withType ? { ref, oid, type: type as string } : { ref, oid })
+    }
+    return rows
+  }
+  const typed = async (): Promise<readonly RefObservationRow[]> => {
+    const result = await read(TYPED_REF_FORMAT)
+    refuseSuccessfulStderr(result, label)
+    if (result.timedOut === true) throw new UnknownError(`${label}: the listing was cut at its deadline`)
+    if (result.code !== 0) {
+      throw new UnknownError(`${label} failed: ${result.stderr.trim() || `exit ${String(result.code)}`}`)
+    }
+    return parse(result.stdout, true)
+  }
+  if (seen !== undefined) {
+    const untyped = options.requireTypes === true && seen.some((row) => row.type === undefined)
+    return untyped ? await typed() : seen
+  }
+  let rows: readonly RefObservationRow[]
+  try {
+    rows = await typed()
+  } catch (error) {
+    if (options.requireTypes === true) throw error
+    // A ref whose object is gone turns the typed listing fatal for the whole store. The safe listing still names every
+    // ref, which is all the contents gate needs; it never invents a type for a consumer that would need one.
+    const safe = await read(SAFE_REF_FORMAT)
+    refuseSuccessfulStderr(safe, label)
+    if (safe.timedOut === true) throw new UnknownError(`${label}: the listing was cut at its deadline`)
+    if (safe.code !== 0) {
+      throw new UnknownError(`${label} failed: ${safe.stderr.trim() || `exit ${String(safe.code)}`}`)
+    }
+    rows = parse(safe.stdout, false)
+  }
+  options.observations?.set(options.key, rows)
+  return rows
+}
+
 export interface ContentsScanOptions {
   /** Directory for the content-addressed sidecars; must be outside `E` and `R`. */
   readonly sidecarDir: string
@@ -142,6 +239,11 @@ export interface ContentsScanOptions {
   readonly deadline?: number
   readonly bounds?: ContentsBounds
   readonly clock?: () => number
+  /**
+   * 37854 (@cto turn46): complete raw ref enumerations shared with the head census inside one verification pass, so
+   * one copy's refs are listed once instead of once per gate.
+   */
+  readonly refObservations?: RefObservations
 }
 
 export interface ComponentGitSource {
@@ -310,6 +412,9 @@ async function* rootOidLines(
     readonly deadline: number | undefined
     readonly clock: () => number
     readonly maxEffectiveOids: number
+    /** 37854 (@cto turn46): the pass's shared enumerations and this copy's key; absent means read directly. */
+    readonly observations?: RefObservations
+    readonly refKey: string
     /**
      * Read the gitdir as a detached store: a retained copy still records `core.worktree` for the checkout
      * its removal deleted, and plain `--git-dir` dies on chdir to that missing path ("cannot chdir"), so
@@ -323,17 +428,17 @@ async function* rootOidLines(
   },
 ): AsyncGenerator<string> {
   const at = options.detached ? [`--git-dir=${gitDir}`, `--work-tree=${gitDir}`] : [`--git-dir=${gitDir}`]
-  const refs = await run([...at, "for-each-ref", "--format=%(objectname) %(refname)"])
-  refuseSuccessfulStderr(refs, `for-each-ref in ${gitDir}`)
-  if (refs.code !== 0) throw new UnknownError(`for-each-ref failed in ${gitDir}: ${refs.stderr.trim()}`)
-  for (const line of refs.stdout.split("\n")) {
-    if (line === "") continue
-    const [oid, name] = line.split(" ")
-    if (oid === undefined || !HEX40.test(oid)) {
-      throw new UnknownError(`malformed for-each-ref row in ${gitDir}: ${line.slice(0, 120)}`)
+  const refs = await observeRefs(run, gitDir, {
+    ...(options.observations === undefined ? {} : { observations: options.observations }),
+    key: options.refKey,
+    context: at,
+  })
+  for (const { ref: name, oid } of refs) {
+    if (!HEX40.test(oid)) {
+      throw new UnknownError(`malformed for-each-ref row in ${gitDir}: ${name} ${oid.slice(0, 120)}`)
     }
-    if (name?.startsWith(REMOTE_TRACKING_REFS)) continue
-    if (!ZERO_OID.test(oid)) yield `${oid}\tref ${name ?? ""}`.trimEnd()
+    if (name.startsWith(REMOTE_TRACKING_REFS)) continue
+    if (!ZERO_OID.test(oid)) yield `${oid}\tref ${name}`.trimEnd()
   }
   const head = await run([...at, "rev-parse", "HEAD"])
   refuseSuccessfulStderr(head, `rev-parse HEAD in ${gitDir}`)
@@ -432,6 +537,8 @@ async function scanComponentGitDir(
   sourceMode: "retention" | "complete-commit",
   deadline: number | undefined,
   exposeGitDir: boolean,
+  observations: RefObservations | undefined,
+  refKey: string,
 ): Promise<ComponentContents> {
   const { component, gitDir, workTree } = source
   const started = clock()
@@ -457,6 +564,8 @@ async function scanComponentGitDir(
       deadline,
       clock,
       maxEffectiveOids: bounds.maxEffectiveOids,
+      ...(observations === undefined ? {} : { observations }),
+      refKey,
       // Retention mode reads retained copies, whose checkout is gone; complete-commit mode reads live
       // environment stores during removal and keeps its context unchanged.
       detached: sourceMode === "retention",
@@ -722,6 +831,8 @@ export async function scanContents(
           options.sourceMode ?? "retention",
           options.deadline,
           options.sources !== undefined || options.sourceMode === "complete-commit",
+          options.refObservations,
+          refObservationKey(copyRoot, source.gitDir ?? join(copyRoot, source.component)),
         ),
       )
     }

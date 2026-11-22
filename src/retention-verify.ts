@@ -26,6 +26,9 @@ import {
   type ContentsScan,
   type GitRun,
   type GitStreamFactory,
+  type RefObservationRow,
+  type RefObservations,
+  refObservationKey,
 } from "./retention-contents.ts"
 import {
   componentHeads,
@@ -398,6 +401,7 @@ async function componentHeadCensus(
   copyRoot: string,
   components: readonly ComponentContents[],
   options: RetentionVerifyOptions,
+  refObservations: RefObservations,
 ): Promise<
   Readonly<{
     heads: Readonly<Record<string, readonly string[]>>
@@ -416,7 +420,10 @@ async function componentHeadCensus(
     try {
       // 37792 (@cto turn44): the census measures its OWN stage, so it takes the pass's injected clock rather than
       // reading Date.now behind the fixture's back.
-      const found = await componentHeads(run, gitDir, deadline, options.monotonic ?? Date.now)
+      const found = await componentHeads(run, gitDir, deadline, options.monotonic ?? Date.now, {
+        observations: refObservations,
+        key: refObservationKey(copyRoot, gitDir),
+      })
       if (found.heads.length > 0) heads[component.component] = found.heads
       for (const excluded of found.fetched) {
         fetched.set(excluded.namespace, (fetched.get(excluded.namespace) ?? 0) + excluded.count)
@@ -469,6 +476,11 @@ async function evaluateRetainedEntry(
   } = { entry: resolve(options.entry), root: resolve(options.root) }
   if (context !== undefined) result.estate = context.estate
   let witnessStores: readonly string[] = []
+  // 37854 (@cto turn46-ref-observations): ONE raw ref enumeration per copy and worktree Git directory for this pass.
+  // Contents pays it and the head census reuses it. A batch supplies its own per-phase scope, so the held pass reads
+  // refs that moved again; a standalone verify is its own phase and gets the same treatment.
+  const refObservations: RefObservations =
+    options.custodyRunScope?.refObservations ?? new Map<string, readonly RefObservationRow[]>()
 
   const push = (gate: RetentionGateResult): void => {
     gates.push(gate)
@@ -1057,6 +1069,9 @@ async function evaluateRetainedEntry(
     // 37792 (@cto turn44): the entry's own deadline reaches the contents scan. Without it a spent grant still paid a
     // full per-component contents read, and only the head census noticed the deadline had already passed.
     ...(options.deadline === undefined ? {} : { deadline: options.deadline }),
+    // 37854 (@cto turn46-ref-observations): contents lists each copy's refs into this pass's scope; the head census
+    // then reuses that complete raw list instead of paying a second whole-store listing per component.
+    refObservations,
     clock: monotonic,
   })
   result.contents = contents.components
@@ -1084,7 +1099,7 @@ async function evaluateRetainedEntry(
   // ---- Gate 5: positive surviving custody ----------------------------------------------
   // 37792 (@cto 78e96f64 part 1): the heads each component's store holds, so the existing 37455-A ancestry proof runs
   // on this route too. A component whose heads cannot be read keeps the witness proof and is named, never dropped.
-  const headsCensus = await componentHeadCensus(expectedCopyRoot, contents.components, options)
+  const headsCensus = await componentHeadCensus(expectedCopyRoot, contents.components, options, refObservations)
   const custody = await scanCustody(expectedCopyRoot, contents.components, witnessStores, removalSet, {
     sidecarDir,
     ...(options.gitRun === undefined ? {} : { run: options.gitRun }),

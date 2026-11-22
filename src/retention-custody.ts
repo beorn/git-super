@@ -35,10 +35,13 @@ import {
   defaultGitRun,
   defaultGitStream,
   refuseSuccessfulStderr,
+  observeRefs,
   type ComponentContents,
   type GitRun,
   type GitRunOptions,
   type GitStreamFactory,
+  type RefObservationRow,
+  type RefObservations,
 } from "./retention-contents.ts"
 
 export interface CustodyBounds {
@@ -295,6 +298,12 @@ export class CustodyRunScope {
   readonly publishedAdvertisements = new Map<string, PublishedAdvertisement>()
   /** 37792 (@cto turn38-retention-remote): stores whose pin namespace this pass has already populated. */
   readonly populatedPinNamespaces = new Set<string>()
+  /**
+   * 37854 (@cto turn46-ref-observations): one complete raw ref enumeration per retained copy and worktree Git
+   * directory. The scope IS the phase, so the held pass builds a new one and reads refs that moved again; only a
+   * complete, successful listing is ever stored.
+   */
+  readonly refObservations: RefObservations = new Map<string, readonly RefObservationRow[]>()
 }
 
 const HEX40 = /^[0-9a-f]{40}$/u
@@ -1717,6 +1726,7 @@ export async function componentHeads(
   gitDir: string,
   deadline: number,
   clock: () => number = Date.now,
+  shared?: Readonly<{ observations: RefObservations; key: string }>,
 ): Promise<ComponentHeadCensus> {
   const remaining = (): number => {
     const left = deadline - clock()
@@ -1733,16 +1743,6 @@ export async function componentHeads(
   // spent starts no Git child at all -- not even the configuration read that decides how to open the store -- and the
   // first child that does start carries that remaining budget instead of running unbounded.
   const storeRun = atStore(run, gitDir, await worktreeGone(gitDir, run, timing()))
-  const outcome = async (args: readonly string[], what: string): Promise<string> => {
-    const result = await storeRun([`--git-dir=${gitDir}`, ...args], timing())
-    if (result.timedOut === true || result.code !== 0 || result.stderr.trim() !== "") {
-      throw custodyIdentityError(
-        `${gitDir}: ${what} could not be read (${result.stderr.trim() || `exit ${String(result.code)}`})`,
-      )
-    }
-    remaining()
-    return result.stdout
-  }
   const heads: string[] = []
   const fetched = new Map<string, number>()
   const named = await storeRun([`--git-dir=${gitDir}`, "rev-parse", "--verify", "HEAD"], timing())
@@ -1761,16 +1761,26 @@ export async function componentHeads(
   // (CUSTODY_FRESHNESS_INPUT_SPEC component.refs), so the heads handed to the ancestry proof must be that same set.
   // Taking only refs/heads left a commit held solely by refs/stash, a tag or notes as reachability.unreferenced, and
   // env close then deleted the environment's private object store with it.
-  for (const row of (
-    await outcome(["for-each-ref", "refs/", "--format=%(refname)%09%(objectname)%09%(objecttype)"], "local refs")
-  ).split("\n")) {
-    if (row.trim() === "") continue
-    const [ref, tip, objectType] = row.split("\t")
-    if (ref === undefined || tip === undefined || objectType === undefined) {
-      throw custodyIdentityError(
-        `${gitDir}: for-each-ref answered a malformed ref row ${JSON.stringify(row.slice(0, 120))}`,
-      )
-    }
+  // 37854 (@cto turn46-ref-observations): contents already listed this exact copy's refs in this pass, so the census
+  // reuses that complete raw list instead of paying a second whole-store listing. It validates the rows itself, and a
+  // refused, timed-out or changed read is never cached, so no reuse can carry a custody claim it did not observe.
+  let refRows: readonly RefObservationRow[]
+  try {
+    refRows = await observeRefs(storeRun, gitDir, {
+      ...(shared === undefined ? {} : { observations: shared.observations }),
+      key: shared?.key ?? gitDir,
+      // `storeRun` only adds `--work-tree`; the listing must name the store or it reads whatever repo is the cwd.
+      context: [`--git-dir=${gitDir}`],
+      runOptions: timing(),
+      label: `for-each-ref in ${gitDir}`,
+      // The census decides commit / tag / other, so it cannot accept a listing that lost the type to a broken ref:
+      // it re-reads strictly and refuses, exactly as it did before the shared observation existed.
+      requireTypes: true,
+    })
+  } catch (error) {
+    throw custodyIdentityError(error instanceof Error ? error.message : String(error))
+  }
+  for (const { ref, oid: tip, type: objectType } of refRows) {
     const fetchedFrom = fetchedNamespace(ref)
     if (fetchedFrom !== undefined) {
       fetched.set(fetchedFrom, (fetched.get(fetchedFrom) ?? 0) + 1)
@@ -1793,7 +1803,9 @@ export async function componentHeads(
     }
     // A tag object names a commit through a peel. A peel that FAILS is either a tag of a tree/blob, which is the case
     // above, or a read that could not complete, which is refused like an unreadable HEAD.
-    const peeled = await storeRun([`--git-dir=${gitDir}`, "rev-parse", "--verify", `${ref}^{commit}`], timing())
+    // 37854 (@cto turn46): peel the OBSERVED tag object id, never the ref name. A name re-pointed since the
+    // enumeration would otherwise peel to a commit this census never listed.
+    const peeled = await storeRun([`--git-dir=${gitDir}`, "rev-parse", "--verify", `${tip}^{commit}`], timing())
     remaining()
     const peeledTip = peeled.stdout.trim()
     if (peeled.code === 0 && peeled.stderr.trim() === "" && /^[0-9a-f]{40,64}$/u.test(peeledTip)) {
