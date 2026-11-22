@@ -147,6 +147,8 @@ export interface CustodyScanOptions {
    * proven by reachability and no patch stream is read. Absent or empty, the component keeps the witness proof.
    */
   readonly environmentHeads?: Readonly<Record<string, readonly string[]>>
+  /** 37792 (@cto 93f4ba37): this run's shared store verdicts, so a batch fsck each store once. */
+  readonly runScope?: CustodyRunScope
 }
 
 /**
@@ -179,6 +181,8 @@ interface BuiltWitnessIndex {
   readonly published: ReadonlyArray<Readonly<{ store: string; tip: string; repo: string; remote: string }>>
   readonly unsubtracted: readonly string[]
   readonly nonWitnesses: readonly string[]
+  /** 37792 (@cto 8c9ba37e 2): blobs whose only fsck complaint was gitmodulesParse, named for the receipt. */
+  readonly benignGitmodulesBlobs: readonly string[]
   /**
    * 37792 (@cto 78e96f64 part 4): witness stores whose remote names a repository no component belongs to. They cannot
    * witness anything in this pass, so they are named and skipped before their `fsck --full`.
@@ -238,6 +242,53 @@ export class CustodyIndexScope {
   keepCertificate(key: string, certificate: SidecarRef): void {
     this.certificates.set(key, certificate)
   }
+}
+
+/**
+ * 37792 (@cto 93f4ba37): one retirement run's shared verdicts about witness stores. A store's `fsck --full` and the
+ * repository it mirrors are properties of the run, not of the entry being verified, so a batch reads each once and
+ * every entry reuses it instead of paying 5 fscks of /hh/dev/.git for 5 entries. A refusal is remembered too: it is
+ * the same store, the same bytes, and re-running a 300 s timeout per entry only spends the batch's budget.
+ */
+export class CustodyRunScope {
+  readonly identities = new Map<
+    string,
+    Readonly<{ status: "known"; id: string } | { status: "unknown"; detail: string }>
+  >()
+  readonly fscks = new Map<string, FsckVerdict>()
+}
+
+/**
+ * 37792 (@cto 8c9ba37e 2): an `fsck --full` verdict. Exit 0 with only the known-benign gitmodulesParse warnings on
+ * stderr still witnesses the store, and the blobs are named in the receipt; every other stderr line is unknown.
+ */
+export type FsckVerdict =
+  | Readonly<{ ok: true; benignBlobs: readonly string[] }>
+  | Readonly<{ ok: false; detail: string }>
+
+/** Exactly the class @cto admitted: a blob whose parse failed, on an fsck that otherwise exited 0. */
+const BENIGN_FSCK_WARNING = /^warning in blob ([0-9a-f]{40,64}): gitmodulesParse\b/u
+
+export function classifyFsck(
+  result: Readonly<{ code: number | null; stdout: string; stderr: string }>,
+  gitDir: string,
+): FsckVerdict {
+  if (result.code !== 0) {
+    return { ok: false, detail: `fsck --full failed in witness store ${gitDir}: ${result.stderr.trim()}` }
+  }
+  const benignBlobs: string[] = []
+  for (const line of result.stderr.split("\n")) {
+    if (line.trim() === "") continue
+    const blob = BENIGN_FSCK_WARNING.exec(line.trim())
+    if (blob?.[1] === undefined) {
+      return {
+        ok: false,
+        detail: `fsck --full in witness store ${gitDir} exited 0 with unexpected stderr: ${result.stderr.trim()}`,
+      }
+    }
+    benignBlobs.push(blob[1])
+  }
+  return { ok: true, benignBlobs }
 }
 
 const HEX40 = /^[0-9a-f]{40}$/u
@@ -779,6 +830,8 @@ async function indexWitnessStores(
   skipFsck = false,
   /** 37792 part 3: repositories ancestry already proved; a store mirroring only these is not fscked. */
   skipFsckRepos: ReadonlySet<string> = new Set<string>(),
+  /** 37792 (@cto 93f4ba37): one fsck verdict per store per run, reused by every entry of a batch. */
+  runScope?: CustodyRunScope,
 ): Promise<{
   records: DurableRefRecord[]
   formats: Map<string, string>
@@ -786,6 +839,8 @@ async function indexWitnessStores(
   /** Stores whose traversal is not plain, so their refs were walked without cross-store subtraction, and why. */
   unsubtracted: readonly string[]
   nonWitnesses: readonly string[]
+  /** 37792 (@cto 8c9ba37e 2): blobs whose only fsck complaint was gitmodulesParse, named so the receipt can count them. */
+  benignGitmodulesBlobs: readonly string[]
   /** 37792 part 4: stores mirroring no component's repository, skipped before their fsck, and why refused. */
   foreign: readonly string[]
   /** Stores whose repository could not be proved; named, with the cause, because they keep the old proof. */
@@ -797,6 +852,7 @@ async function indexWitnessStores(
   const nonWitnesses: string[] = []
   const foreign: string[] = []
   const unscoped: string[] = []
+  const benignGitmodulesBlobs = new Set<string>()
   const formats = new Map<string, string>()
   const published: Array<Readonly<{ store: string; tip: string; repo: string; remote: string }>> = []
   let witnessFsckMs = 0
@@ -845,7 +901,7 @@ async function indexWitnessStores(
     // `fsck --full`: the 2026-11-21 run spent its whole 300 s budget fscking a root-repo mirror for a dev-repo
     // environment (#34127). Exclusion can only keep more entries, never free one wrongly.
     const remainingHere = (): number => (deadline === undefined ? Number.POSITIVE_INFINITY : deadline - clock())
-    const identity = await storeRepoIdentity(gitDir, storeRun, remainingHere)
+    const identity = await identityOf(runScope, gitDir, storeRun, remainingHere)
     const repo = identity.status === "known" ? identity.id : undefined
     if (
       identity.status === "known" &&
@@ -913,15 +969,18 @@ async function indexWitnessStores(
     }
     // A hung `fsck` is killed at the declared deadline and reported unknown, never blocking.
     if (!skipFsck && (repo === undefined || !skipFsckRepos.has(repo))) {
-      const fsckStarted = clock()
-      const fsck = await storeRun([`--git-dir=${gitDir}`, "fsck", "--full", "--no-progress"], {
-        timeoutMs: bounds.fsckMs,
-      })
-      witnessFsckMs += clock() - fsckStarted
-      refuseSuccessfulStderr(fsck, `fsck --full in witness store ${gitDir}`)
-      if (fsck.code !== 0) {
-        throw new UnknownError(`fsck --full failed in witness store ${gitDir}: ${fsck.stderr.trim()}`)
+      let verdict = runScope?.fscks.get(gitDir)
+      if (verdict === undefined) {
+        const fsckStarted = clock()
+        const fsck = await storeRun([`--git-dir=${gitDir}`, "fsck", "--full", "--no-progress"], {
+          timeoutMs: bounds.fsckMs,
+        })
+        witnessFsckMs += clock() - fsckStarted
+        verdict = classifyFsck(fsck, gitDir)
+        runScope?.fscks.set(gitDir, verdict)
       }
+      if (!verdict.ok) throw new UnknownError(verdict.detail)
+      for (const blob of verdict.benignBlobs) benignGitmodulesBlobs.add(blob)
     }
     const selected = await independentRefs(durable, gitDir, storeRun)
     const context = await traversalContext(gitDir, refs.stdout.split("\n"), storeRun, witnessPolicy)
@@ -970,7 +1029,16 @@ async function indexWitnessStores(
   }
   onPhase?.("witnessFsck", witnessFsckMs)
   onPhase?.("refGraph", refGraphMs)
-  return { records, formats, published, unsubtracted, nonWitnesses, foreign, unscoped }
+  return {
+    records,
+    formats,
+    published,
+    unsubtracted,
+    nonWitnesses,
+    benignGitmodulesBlobs: [...benignGitmodulesBlobs].sort(),
+    foreign,
+    unscoped,
+  }
 }
 
 /**
@@ -1088,6 +1156,14 @@ function vanishedDetail(stores: ReadonlyArray<string>): string {
   return `; ${String(stores.length)} witness store(s) gone since the estate scan, not used as witnesses: ${shown}${more}`
 }
 
+/** 37792 (@cto 8c9ba37e 2): the blobs an exit-0 fsck only warned about, counted and named. */
+function benignFsckDetail(blobs: ReadonlyArray<string>): string {
+  if (blobs.length === 0) return ""
+  const shown = blobs.slice(0, 5).join(", ")
+  const more = blobs.length > 5 ? ` and ${String(blobs.length - 5)} more` : ""
+  return `; ${String(blobs.length)} blob(s) whose only fsck complaint was gitmodulesParse, admitted as witnesses: ${shown}${more}`
+}
+
 /** 37792 part 4: stores skipped because they mirror no component's repository, named with the repository they do. */
 function foreignDetail(stores: ReadonlyArray<string>): string {
   if (stores.length === 0) return ""
@@ -1171,6 +1247,23 @@ async function headsAreAncestors(
   return { status: "ancestors" }
 }
 
+/**
+ * 37792 (@cto 8c9ba37e): the heads an ancestry proof may compare, and the fetched copies it may not. A ref under
+ * refs/remotes/** or refs/gitomic/fetched/** is a copy of what somebody else publishes, so this environment is not its
+ * only custodian and the proof must not depend on it — they are counted by namespace, never dropped in silence.
+ */
+export interface ComponentHeadCensus {
+  readonly heads: readonly string[]
+  readonly fetched: readonly Readonly<{ namespace: string; count: number }>[]
+}
+
+/** The fetched-copy namespaces an ancestry proof excludes, longest prefix first. */
+const FETCHED_NAMESPACES = ["refs/gitomic/fetched/", "refs/remotes/"] as const
+
+function fetchedNamespace(ref: string): string | undefined {
+  return FETCHED_NAMESPACES.find((namespace) => ref.startsWith(namespace))
+}
+
 export function custodyIdentityError(message: string): Error {
   return new Error(`component custody census unknown: ${message}`)
 }
@@ -1180,14 +1273,17 @@ export function custodyIdentityError(message: string): Error {
  * commit) plus every local branch tip in its own store. A head that cannot be read is not dropped: it is named in the
  * error, because an unreadable ref must refuse rather than leave custody unproven in silence.
  */
-export async function componentHeads(run: GitRun, gitDir: string, deadline: number): Promise<readonly string[]> {
+export async function componentHeads(run: GitRun, gitDir: string, deadline: number): Promise<ComponentHeadCensus> {
   const remaining = (): number => {
     const left = deadline - Date.now()
     if (left <= 0) throw custodyIdentityError("shared proof deadline is exhausted")
     return left
   }
+  // No caller deadline is not a deadline at infinity: spawn rejects a non-finite timeout, and the census would then
+  // report every component unreadable (2026-11-22). Omit the timeout instead.
+  const timing = (): { timeoutMs?: number } => (Number.isFinite(deadline) ? { timeoutMs: remaining() } : {})
   const outcome = async (args: readonly string[], what: string): Promise<string> => {
-    const result = await run([`--git-dir=${gitDir}`, ...args], { timeoutMs: remaining() })
+    const result = await run([`--git-dir=${gitDir}`, ...args], timing())
     if (result.timedOut === true || result.code !== 0 || result.stderr.trim() !== "") {
       throw custodyIdentityError(
         `${gitDir}: ${what} could not be read (${result.stderr.trim() || `exit ${String(result.code)}`})`,
@@ -1197,7 +1293,8 @@ export async function componentHeads(run: GitRun, gitDir: string, deadline: numb
     return result.stdout
   }
   const heads: string[] = []
-  const named = await run([`--git-dir=${gitDir}`, "rev-parse", "--verify", "HEAD"], { timeoutMs: remaining() })
+  const fetched = new Map<string, number>()
+  const named = await run([`--git-dir=${gitDir}`, "rev-parse", "--verify", "HEAD"], timing())
   if (named.code === 0 && named.stderr.trim() === "") {
     const head = named.stdout.trim()
     if (!/^[0-9a-f]{40,64}$/u.test(head)) {
@@ -1223,7 +1320,11 @@ export async function componentHeads(run: GitRun, gitDir: string, deadline: numb
         `${gitDir}: for-each-ref answered a malformed ref row ${JSON.stringify(row.slice(0, 120))}`,
       )
     }
-    if (ref.startsWith("refs/remotes/")) continue
+    const fetchedFrom = fetchedNamespace(ref)
+    if (fetchedFrom !== undefined) {
+      fetched.set(fetchedFrom, (fetched.get(fetchedFrom) ?? 0) + 1)
+      continue
+    }
     if (!/^[0-9a-f]{40,64}$/u.test(tip)) {
       throw custodyIdentityError(
         `${gitDir}: for-each-ref answered a non-commit tip for ${ref} ${JSON.stringify(tip.slice(0, 80))}`,
@@ -1236,24 +1337,31 @@ export async function componentHeads(run: GitRun, gitDir: string, deadline: numb
     // A ref on a blob or tree is still a Gate 4 root (component.refs), so an ancestry proof over commits cannot speak
     // for this component: hand back NO heads and let the full census path keep every object it roots (@dev/15
     // 2026-11-22). A partial head set here is the same defect as reading only refs/heads, one ref type over.
-    if (objectType !== "tag") return []
+    if (objectType !== "tag") {
+      return { heads: [], fetched: [...fetched].map(([namespace, count]) => ({ namespace, count })) }
+    }
     // A tag object names a commit through a peel. A peel that FAILS is either a tag of a tree/blob, which is the case
     // above, or a read that could not complete, which is refused like an unreadable HEAD.
-    const peeled = await run([`--git-dir=${gitDir}`, "rev-parse", "--verify", `${ref}^{commit}`], {
-      timeoutMs: remaining(),
-    })
+    const peeled = await run([`--git-dir=${gitDir}`, "rev-parse", "--verify", `${ref}^{commit}`], timing())
     remaining()
     const peeledTip = peeled.stdout.trim()
     if (peeled.code === 0 && peeled.stderr.trim() === "" && /^[0-9a-f]{40,64}$/u.test(peeledTip)) {
       heads.push(peeledTip)
       continue
     }
-    if (/expected commit type|not a commit|is a (blob|tree)\b/iu.test(peeled.stderr)) return []
+    if (/expected commit type|not a commit|is a (blob|tree)\b/iu.test(peeled.stderr)) {
+      return { heads: [], fetched: [...fetched].map(([namespace, count]) => ({ namespace, count })) }
+    }
     throw custodyIdentityError(
       `${gitDir}: tag ref ${ref} could not be peeled to a commit (${peeled.stderr.trim() || `exit ${String(peeled.code)}`}); an unreadable head is refused, never dropped`,
     )
   }
-  return [...new Set(heads)]
+  return {
+    heads: [...new Set(heads)],
+    fetched: [...fetched]
+      .map(([namespace, count]) => ({ namespace, count }))
+      .sort((a, b) => (a.namespace < b.namespace ? -1 : 1)),
+  }
 }
 
 /**
@@ -1267,6 +1375,20 @@ export async function componentHeads(run: GitRun, gitDir: string, deadline: numb
  * The store walk is one pass over the witnesses: identity is read once per store, never once per component, because
  * the live estate holds ~24,000 of them and the first version of this paid that cost five times over (2026-11-22).
  */
+/** 37792 (@cto 93f4ba37): one repository read per store per run, never once per store per entry. */
+async function identityOf(
+  scope: CustodyRunScope | undefined,
+  gitDir: string,
+  run: GitRun,
+  remaining: () => number,
+): Promise<Readonly<{ status: "known"; id: string } | { status: "unknown"; detail: string }>> {
+  const cached = scope?.identities.get(gitDir)
+  if (cached !== undefined) return cached
+  const computed = await storeRepoIdentity(gitDir, run, remaining)
+  scope?.identities.set(gitDir, computed)
+  return computed
+}
+
 async function ancestryProof(
   copyRoot: string,
   components: readonly ComponentContents[],
@@ -1285,7 +1407,11 @@ async function ancestryProof(
     const storeGitDir = dirname(store)
     let identity: Awaited<ReturnType<typeof storeRepoIdentity>>
     try {
-      identity = await storeRepoIdentity(storeGitDir, atStore(run, storeGitDir, await worktreeGone(storeGitDir, run)), remaining)
+      identity = await storeRepoIdentity(
+        storeGitDir,
+        atStore(run, storeGitDir, await worktreeGone(storeGitDir, run)),
+        remaining,
+      )
     } catch {
       continue
     }
@@ -1305,7 +1431,10 @@ async function ancestryProof(
     const storeGitDir = dirname(store)
     let tip: string | undefined
     try {
-      const remote = await configuredRemote(storeGitDir, atStore(run, storeGitDir, await worktreeGone(storeGitDir, run)))
+      const remote = await configuredRemote(
+        storeGitDir,
+        atStore(run, storeGitDir, await worktreeGone(storeGitDir, run)),
+      )
       if (remote === undefined) continue
       tip = (await refreshPublishedRefs(storeGitDir, remote, targetBranch, run)).branchTip
     } catch {
@@ -1323,10 +1452,15 @@ async function ancestryProof(
     )
     if (ancestry.status === "ancestors") provenRepos.add(repo)
   }
-  return { provenRepos, allProven: provenRepos.size > 0 && components.every((component) => {
-    const repo = repoByComponent.get(component.component)
-    return repo !== undefined && provenRepos.has(repo)
-  }) }
+  return {
+    provenRepos,
+    allProven:
+      provenRepos.size > 0 &&
+      components.every((component) => {
+        const repo = repoByComponent.get(component.component)
+        return repo !== undefined && provenRepos.has(repo)
+      }),
+  }
 }
 
 async function runCustody(
@@ -1344,6 +1478,7 @@ async function runCustody(
   onPhase?: (name: string, ms: number) => void,
   indexScope?: CustodyIndexScope,
   environmentHeads?: Readonly<Record<string, readonly string[]>>,
+  runScope?: CustodyRunScope,
 ): Promise<CustodyScan> {
   const remaining = (): number => {
     const left = deadline === undefined ? Number.POSITIVE_INFINITY : deadline - clock()
@@ -1431,6 +1566,7 @@ async function runCustody(
       componentRepos,
       skipFsck,
       skipFsckRepos,
+      runScope,
     )
     const width = String(Math.max(1, indexed.records.length)).length
     const merged = await mergeLabeledFiles(
@@ -1479,7 +1615,7 @@ async function runCustody(
   // fscked on its behalf; a store also serving an unproven component is still fscked, because that component needs it.
   const skipFsck = ancestry.allProven
   const skipFsckRepos = ancestry.provenRepos
-  const { records, formats, published, unsubtracted, nonWitnesses, foreign, unscoped, index } =
+  const { records, formats, published, unsubtracted, nonWitnesses, benignGitmodulesBlobs, foreign, unscoped, index } =
     indexScope === undefined
       ? await buildIndex()
       : await indexScope.witnessIndex(
@@ -1719,7 +1855,7 @@ async function runCustody(
     const loss = await describeLoss(finalMissing, components, copyRoot, run)
     return {
       status: "blocked",
-      detail: `${missingCount} at-risk OID(s) have no durable witness, e.g. ${first.component} ${first.oid} (${first.source}); first ${missing.length} inline, full list in ${missingSidecar?.path ?? "a sidecar"}${uncheckedDetail(unchecked)}${unsubtractedDetail(unsubtracted)}${nonWitnessDetail(nonWitnesses)}${vanishedDetail(vanished)}${foreignDetail(foreign)}${unscopedDetail(unscoped)}`,
+      detail: `${missingCount} at-risk OID(s) have no durable witness, e.g. ${first.component} ${first.oid} (${first.source}); first ${missing.length} inline, full list in ${missingSidecar?.path ?? "a sidecar"}${uncheckedDetail(unchecked)}${unsubtractedDetail(unsubtracted)}${nonWitnessDetail(nonWitnesses)}${vanishedDetail(vanished)}${foreignDetail(foreign)}${unscopedDetail(unscoped)}${benignFsckDetail(benignGitmodulesBlobs)}`,
       witnesses,
       witnessCount,
       ...(witnessSidecar === undefined ? {} : { witnessSidecar }),
@@ -1733,7 +1869,7 @@ async function runCustody(
   }
   return {
     status: "pass",
-    detail: `${witnessCount} at-risk OID(s) each have a named surviving witness across ${stores.length} store(s), ${witnesses.length} distinct identities${rebased.length === 0 ? "" : `, plus ${String(rebased.length)} rebased commit(s) matched by whitespace-sensitive patch-id to the published main graph`}${reachability.length === 0 ? "" : `, plus ${String(reachability.length)} component(s) proven by head ancestry of the published target branch (no patch stream read; ${String(unreferencedCount)} un-witnessed leftover object(s) named, no head reaches them)`}${uncheckedDetail(unchecked)}${unsubtractedDetail(unsubtracted)}${nonWitnessDetail(nonWitnesses)}${vanishedDetail(vanished)}${foreignDetail(foreign)}${unscopedDetail(unscoped)}`,
+    detail: `${witnessCount} at-risk OID(s) each have a named surviving witness across ${stores.length} store(s), ${witnesses.length} distinct identities${rebased.length === 0 ? "" : `, plus ${String(rebased.length)} rebased commit(s) matched by whitespace-sensitive patch-id to the published main graph`}${reachability.length === 0 ? "" : `, plus ${String(reachability.length)} component(s) proven by head ancestry of the published target branch (no patch stream read; ${String(unreferencedCount)} un-witnessed leftover object(s) named, no head reaches them)`}${uncheckedDetail(unchecked)}${unsubtractedDetail(unsubtracted)}${nonWitnessDetail(nonWitnesses)}${vanishedDetail(vanished)}${foreignDetail(foreign)}${unscopedDetail(unscoped)}${benignFsckDetail(benignGitmodulesBlobs)}`,
     witnesses,
     witnessCount,
     ...(witnessSidecar === undefined ? {} : { witnessSidecar }),
@@ -1862,6 +1998,7 @@ export async function scanCustody(
       options.onPhase,
       options.indexScope,
       options.environmentHeads,
+      options.runScope,
     )
   } catch (error) {
     return {

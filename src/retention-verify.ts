@@ -32,6 +32,7 @@ import {
   scanCustody,
   type CustodyBounds,
   type CustodyIndexScope,
+  type CustodyRunScope,
   type MissingComponentLoss,
   type WitnessIdentity,
 } from "./retention-custody.ts"
@@ -212,6 +213,11 @@ export type RetentionVerifyOptions = Readonly<{
    */
   readonly custodyTargetBranch?: string
   /**
+   * 37792 (@cto 93f4ba37): one run's shared witness-store verdicts. A batch passes one scope to every entry so a store
+   * is identified and fscked once per run rather than once per entry.
+   */
+  readonly custodyRunScope?: CustodyRunScope
+  /**
    * 34787: an explicit discard of exactly the loss gate 5 finds. It never passes gate 5; a match makes the verdict
    * `discard-candidate` and the loss is reported as `explicitLoss`. A mismatch keeps the entry and names the field.
    */
@@ -387,21 +393,38 @@ async function componentHeadCensus(
   copyRoot: string,
   components: readonly ComponentContents[],
   options: RetentionVerifyOptions,
-): Promise<Readonly<{ heads: Readonly<Record<string, readonly string[]>>; unreadable: readonly string[] }>> {
+): Promise<
+  Readonly<{
+    heads: Readonly<Record<string, readonly string[]>>
+    unreadable: readonly string[]
+    /** 37792 (@cto 8c9ba37e): fetched refs the ancestry proof does not treat as heads, by namespace. */
+    fetched: readonly Readonly<{ namespace: string; count: number }>[]
+  }>
+> {
   const run = options.gitRun ?? defaultGitRun
   const deadline = options.deadline ?? Number.POSITIVE_INFINITY
   const heads: Record<string, readonly string[]> = {}
   const unreadable: string[] = []
+  const fetched = new Map<string, number>()
   for (const component of components) {
     const gitDir = component.gitDir ?? join(copyRoot, component.component)
     try {
       const found = await componentHeads(run, gitDir, deadline)
-      if (found.length > 0) heads[component.component] = found
+      if (found.heads.length > 0) heads[component.component] = found.heads
+      for (const excluded of found.fetched) {
+        fetched.set(excluded.namespace, (fetched.get(excluded.namespace) ?? 0) + excluded.count)
+      }
     } catch (error) {
       unreadable.push(`${component.component}: ${error instanceof Error ? error.message : String(error)}`)
     }
   }
-  return { heads, unreadable }
+  return {
+    heads,
+    unreadable,
+    fetched: [...fetched]
+      .map(([namespace, count]) => ({ namespace, count }))
+      .sort((a, b) => (a.namespace < b.namespace ? -1 : 1)),
+  }
 }
 
 async function evaluateRetainedEntry(
@@ -1063,9 +1086,25 @@ async function evaluateRetainedEntry(
       ? {}
       : { witnessPolicy: { targetBranch: options.custodyTargetBranch } }),
     ...(Object.keys(headsCensus.heads).length === 0 ? {} : { environmentHeads: headsCensus.heads }),
+    ...(options.custodyRunScope === undefined ? {} : { runScope: options.custodyRunScope }),
     clock: monotonic,
   })
   result.witnesses = custody.witnesses
+  // 37792 (@cto 8c9ba37e): fetched-copy refs are not heads the ancestry proof must satisfy, and they are counted in
+  // the receipt by namespace, never dropped in silence.
+  // 37792 (@cto 8c9ba37e): fetched-copy refs are not heads the ancestry proof must satisfy, and an unreadable head
+  // keeps the witness proof rather than narrowing it. Both are named in the receipt, never dropped in silence.
+  const censusNotes = [
+    headsCensus.fetched.length === 0
+      ? ""
+      : `fetched-copy refs excluded from the head set: ${headsCensus.fetched
+          .map((excluded) => `${excluded.namespace} ${String(excluded.count)}`)
+          .join(", ")}`,
+    headsCensus.unreadable.length === 0
+      ? ""
+      : `head census unreadable, witness proof kept: ${headsCensus.unreadable.join("; ")}`,
+  ].filter((note) => note !== "")
+  const custodyDetail = censusNotes.length === 0 ? custody.detail : `${custody.detail}; ${censusNotes.join("; ")}`
   if (custody.status === "blocked") {
     result.custody = {
       missingCount: custody.missingCount,
@@ -1087,7 +1126,7 @@ async function evaluateRetainedEntry(
       push(
         refusal(
           "positive-custody",
-          `${custody.detail}; the discard disposition does not name this loss: ${mismatch ?? "no missing-object list was written"}`,
+          `${custodyDetail}; the discard disposition does not name this loss: ${mismatch ?? "no missing-object list was written"}`,
           {
             path: expectedCopyRoot,
             remedy: "Keep the entry; preview the discard again and record a new decision for the loss observed now.",
@@ -1109,18 +1148,18 @@ async function evaluateRetainedEntry(
     push(
       refusal(
         "positive-custody",
-        `${custody.detail}; explicit loss accepted by discard disposition ${dispositionSha256}, no witness claimed`,
+        `${custodyDetail}; explicit loss accepted by discard disposition ${dispositionSha256}, no witness claimed`,
         { path: expectedCopyRoot, remedy: "Only a retire given this exact disposition removes the entry." },
       ),
     )
   } else if (custody.status !== "pass") {
     push(
       custody.status === "blocked"
-        ? refusal("positive-custody", custody.detail, {
+        ? refusal("positive-custody", custodyDetail, {
             path: expectedCopyRoot,
             remedy: "No durable witness holds an at-risk object; the entry preserves the last copy.",
           })
-        : incomplete("positive-custody", custody.detail, {
+        : incomplete("positive-custody", custodyDetail, {
             path: expectedCopyRoot,
             remedy: "Prove custody from a durable survivor ref in a clean, empty-of-R store.",
           }),
@@ -1130,7 +1169,7 @@ async function evaluateRetainedEntry(
     push({
       gate: "positive-custody",
       status: "pass",
-      message: custody.detail,
+      message: custodyDetail,
       path: expectedCopyRoot,
     })
   }

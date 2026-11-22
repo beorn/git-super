@@ -25,6 +25,7 @@ import { join } from "node:path"
 import { afterEach, describe, expect, test } from "vitest"
 import { defaultGitRun, defaultGitStream, type ComponentContents, type GitRun } from "../src/retention-contents.ts"
 import { CustodyIndexScope, DEFAULT_CUSTODY_BOUNDS, scanCustody, type CustodyScan } from "../src/retention-custody.ts"
+import { componentHeads } from "../src/worktree.ts"
 import { gitLineStream, RETENTION_STREAM_QUEUE_LINES, readLines, SidecarWriter } from "../src/retention-stream.ts"
 
 const cleanup: string[] = []
@@ -1781,5 +1782,78 @@ describe("retention custody scan — mirror-head ancestry (#37792)", () => {
     expect(scan.status).toBe("pass")
     expect(scan.detail).toContain("mirror no component repository")
     expect(fscks).toEqual([])
+  })
+})
+
+/**
+ * @failure Gate 5 (a) treats an exit-0 fsck whose only stderr is the benign gitmodulesParse class as a failure, so
+ * the shared-main store can never witness; (b) accepts any other stderr line on an exit-0 fsck; (c) counts a fetched
+ * copy ref as a head the ancestry proof must satisfy, or drops it without saying so.
+ * @level l1
+ * @consumer the read-only retention verifier, gate 5; #34127, #37792
+ * @testonly none
+ * @reach fs-walk <fixture-only: local bare remotes under the test's own temporary directory>
+ */
+describe("retention custody scan — fsck warnings and fetched refs (#37792)", () => {
+  test("an exit-0 fsck whose only complaint is gitmodulesParse still witnesses, and the blob is named", async () => {
+    const { remote, primary } = publishedStores("git-super-fsck-benign-")
+    const head = git(primary, ["rev-parse", "HEAD"])
+    const blob = "8b11136d8deae51a8969f787a6fcc6efacf5467c"
+    const sidecarDir = tmp("git-super-fsck-benign-sidecars-")
+    const component = await componentOf([head], sidecarDir)
+    const benign: GitRun = (args, options) =>
+      args.includes("fsck")
+        ? { code: 0, stdout: "", stderr: `warning in blob ${blob}: gitmodulesParse: could not parse gitmodules blob` }
+        : defaultGitRun(args, options)
+    const scan = await scanCustody(primary, [component], [join(primary, ".git", "objects")], [], {
+      sidecarDir,
+      run: benign,
+      witnessPolicy: { targetBranch: "main" },
+    })
+    expect(scan.status).toBe("pass")
+    expect(scan.detail).toContain("only fsck complaint was gitmodulesParse")
+    expect(scan.detail).toContain(blob)
+    void remote
+  })
+
+  test("any other stderr line on an exit-0 fsck is still unknown", async () => {
+    const { primary } = publishedStores("git-super-fsck-other-stderr-")
+    const head = git(primary, ["rev-parse", "HEAD"])
+    const sidecarDir = tmp("git-super-fsck-other-sidecars-")
+    const component = await componentOf([head], sidecarDir)
+    const noisy: GitRun = (args, options) =>
+      args.includes("fsck")
+        ? {
+            code: 0,
+            stdout: "",
+            stderr: "warning in blob 8b11136d8deae51a8969f787a6fcc6efacf5467c: ignored alternate\n",
+          }
+        : defaultGitRun(args, options)
+    const scan = await scanCustody(primary, [component], [join(primary, ".git", "objects")], [], {
+      sidecarDir,
+      run: noisy,
+      witnessPolicy: { targetBranch: "main" },
+    })
+    expect(scan.status).toBe("unknown")
+    expect(scan.detail).toContain("unexpected stderr")
+  })
+
+  test("a fetched copy ref is not a head the ancestry proof must satisfy, and it is counted", async () => {
+    const { remote, work, primary } = publishedStores("git-super-fetched-ref-")
+    // An unlanded commit, held only under a fetched-copy namespace.
+    git(primary, ["switch", "-q", "-c", "side"])
+    writeFileSync(join(primary, "side.txt"), "side\n")
+    git(primary, ["add", "side.txt"])
+    git(primary, ["commit", "-q", "-m", "side work"])
+    const unlanded = git(primary, ["rev-parse", "HEAD"])
+    git(primary, ["switch", "-q", "main"])
+    git(primary, ["branch", "-D", "side"])
+    git(primary, ["update-ref", "refs/gitomic/fetched/origin/yrd/main/changes/task/x", unlanded])
+    const census = await componentHeads(defaultGitRun, join(primary, ".git"), Date.now() + 60_000)
+    expect(census.heads).not.toContain(unlanded)
+    expect(census.fetched).toContainEqual({ namespace: "refs/gitomic/fetched/", count: 1 })
+    // The clone's own remote-tracking refs are the same class and are counted, never silently dropped.
+    expect(census.fetched.find((entry) => entry.namespace === "refs/remotes/")?.count ?? 0).toBeGreaterThan(0)
+    void remote
   })
 })

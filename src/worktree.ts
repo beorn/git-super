@@ -2049,7 +2049,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
                       }
                       break
                     }
-                    const heads = await componentHeads(adapters.run, componentIdentity.gitDir, proofDeadline)
+                    const heads = (await componentHeads(adapters.run, componentIdentity.gitDir, proofDeadline)).heads
                     const custody = await scanCustody(path, [component], [store], initialCensus.removal, {
                       sidecarDir: proofSidecarDir,
                       run: adapters.run,
