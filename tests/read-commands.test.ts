@@ -768,7 +768,8 @@ describe("Phase 1 read commands", () => {
     expect(result.submoduleProblems).toHaveLength(1)
     expect(result.submoduleProblems[0]).toMatchObject({ kind: "unborn-head", path: "packages/alpha" })
     expect(result.submoduleProblems[0]!.reason).toContain("no commit")
-    expect(result.submoduleProblems[0]!.reason).toContain(`git -C ${shellQuote(child)} checkout -f --detach ${pin}`)
+    expect(result.submoduleProblems[0]!.reason).toContain(`git -C ${shellQuote(child)} reset ${pin}`)
+    expect(result.submoduleProblems[0]!.reason).toContain(`git -C ${shellQuote(child)} checkout-index -a`)
   })
 
   test("a checkout that holds no files but keeps its module repository refuses, naming the re-attach (30563 R1)", () => {
