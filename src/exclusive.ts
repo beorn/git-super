@@ -91,7 +91,11 @@ export async function acquireExclusive(
   }
 }
 
-const BUSY_PREFIX = "git-super: worktree mutation lock is busy after "
+/**
+ * The one text a caller may match when the wait crossed a process boundary and only stderr survives
+ * (#37624). The in-process route should prefer {@link isExclusiveBusy}; a CLI caller cannot see the class.
+ */
+export const BUSY_PREFIX = "git-super: worktree mutation lock is busy after "
 
 /** True for the refusal {@link acquireExclusive} throws when its wait runs out (#37625 callers add a class, not a throw). */
 export function isExclusiveBusy(error: unknown): boolean {
