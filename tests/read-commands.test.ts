@@ -772,6 +772,10 @@ describe("Phase 1 read commands", () => {
     expect(result.submoduleProblems[0]!.reason).toContain("overwrites the component's working files")
     expect(result.submoduleProblems[0]!.reason).toContain(`git -C ${shellQuote(child)} reset ${pin}`)
     expect(result.submoduleProblems[0]!.reason).toContain(`git -C ${shellQuote(child)} checkout-index -a`)
+    expect(result.submoduleProblems[0]!.reason).toContain("rewrites tracked paths")
+    expect(result.submoduleProblems[0]!.reason.indexOf("checkout-index -a")).toBeLessThan(
+      result.submoduleProblems[0]!.reason.indexOf("checkout -f --detach"),
+    )
   })
 
   test("a component whose .git cannot be read stays repository-not-consulted, never unborn-head (37775)", () => {

@@ -802,15 +802,15 @@ function* statusRepository(
           path: nestedPrefix,
           reason:
             `${child} holds no commit: HEAD resolves to nothing (an interrupted checkout), so Git records nothing here` +
-            // @cto 37775 ruling A: the remedy is the detach checkout, and it must say what it costs. The second
-            // form is the same recovery with nothing to discard, for callers whose destructive-command guard
-            // refuses `-f` on a tree of untracked files (measured 2026-11-22 on the interrupted bay).
+            // @cto 37775 (8960b1f4, 2026-11-22): lead with the form that restored the real specimen and that an
+            // agent's destructive-command guard allows; the forced checkout follows, and both say what they cost.
             (pin === undefined
               ? ""
-              : `; restore the pinned content: git -C ${shellQuote(child)} checkout -f --detach ${pin} ` +
-                `(this overwrites the component's working files with the pinned commit; if any of them are edits, ` +
-                `copy them out first) — or, without discarding any file: git -C ${shellQuote(child)} reset ${pin} && ` +
-                `git -C ${shellQuote(child)} checkout-index -a`) +
+              : `; restore the pinned content: git -C ${shellQuote(child)} reset ${pin} && ` +
+                `git -C ${shellQuote(child)} checkout-index -a (this rewrites tracked paths with the pinned ` +
+                `content and leaves files the pin does not have; copy out any edits first) — or, with a forced ` +
+                `checkout: git -C ${shellQuote(child)} checkout -f --detach ${pin} (this overwrites the ` +
+                `component's working files with the pinned commit; if any of them are edits, copy them out first)`) +
             `; or move its files out and run: git -C ${shellQuote(root)} submodule update --init ${path}`,
           ...(gitDir === undefined ? {} : { gitDir }),
         })
