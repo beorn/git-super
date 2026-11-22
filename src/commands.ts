@@ -60,7 +60,7 @@ export type RetentionEnrollParams = Readonly<{ root: string; common: string; app
 export type RetentionCompactParams = Readonly<{ root: string; dryRun?: boolean; limit?: number }>
 export type RetentionBatchParams = Pick<
   RetentionBatchOptions,
-  "entries" | "root" | "common" | "namespaceRoots" | "artifactDir" | "apply" | "proofDeadlineMs"
+  "entries" | "root" | "common" | "namespaceRoots" | "artifactDir" | "apply" | "proofDeadlineMs" | "targetBranch"
 >
 export type RetentionRankParams = Readonly<{ entries: readonly string[]; root: string; deadlineMs: number }>
 export type PrivateStoreVerifyParams = Omit<PrivateStoreCandidateOptions, "git">
@@ -418,9 +418,17 @@ const retentionVerifySchema = params<RetentionVerifyParams>((value) => {
   if (input.allowTemporaryArtifactDir !== undefined && typeof input.allowTemporaryArtifactDir !== "boolean") {
     throw new Error("allowTemporaryArtifactDir must be a boolean")
   }
+  if (input.custodyTargetBranch !== undefined && typeof input.custodyTargetBranch !== "string") {
+    throw new Error("custodyTargetBranch must be a string")
+  }
+  if (input.custodyTargetBranch === "") {
+    throw new Error("custodyTargetBranch must be a non-empty branch name")
+  }
   return {
     entry: input.entry,
     root: input.root,
+    ...(input.custodyTargetBranch === undefined ? {} : { custodyTargetBranch: input.custodyTargetBranch }),
+
     ...(input.namespaceRoots === undefined ? {} : { namespaceRoots: input.namespaceRoots as string[] }),
     ...(input.artifactDir === undefined ? {} : { artifactDir: input.artifactDir as string }),
     ...(input.allowTemporaryArtifactDir === undefined
@@ -492,6 +500,7 @@ const retentionBatch = commandNode<CommandContext, RetentionBatchParams, Retenti
       common: held.common,
       namespaceRoots: held.namespaceRoots,
       artifactDir: held.artifactDir,
+      ...(held.custodyTargetBranch === undefined ? {} : { targetBranch: held.custodyTargetBranch }),
       ...(input.apply === true ? { apply: true } : {}),
       ...(deadline === undefined ? {} : { proofDeadlineMs: deadline as number }),
     }

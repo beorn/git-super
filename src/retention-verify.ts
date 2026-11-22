@@ -19,6 +19,7 @@ import {
   RETENTION_CERTIFICATE_SCHEMA,
 } from "./retention-certificate.ts"
 import {
+  defaultGitRun,
   scanContents,
   type ComponentContents,
   type ContentsBounds,
@@ -27,6 +28,7 @@ import {
   type GitStreamFactory,
 } from "./retention-contents.ts"
 import {
+  componentHeads,
   scanCustody,
   type CustodyBounds,
   type CustodyIndexScope,
@@ -204,6 +206,12 @@ export type RetentionVerifyOptions = Readonly<{
    */
   deadline?: number
   /**
+   * 37792 (@cto 78e96f64): the published branch this environment's components are proven against. Set, gate 5 may
+   * prove a component by ancestry of a tip its witness store's remote answered for in this same run; absent, gate 5
+   * keeps the witness and patch proofs exactly as before, so every existing caller is unchanged.
+   */
+  readonly custodyTargetBranch?: string
+  /**
    * 34787: an explicit discard of exactly the loss gate 5 finds. It never passes gate 5; a match makes the verdict
    * `discard-candidate` and the loss is reported as `explicitLoss`. A mismatch keeps the entry and names the field.
    */
@@ -369,6 +377,32 @@ export async function inspectRetainedEntryInBatch(
 type EvaluationContext =
   | Readonly<{ audit: true; estate: EstateScan }>
   | Readonly<{ audit: false; estate: EstateScan; batch: readonly string[]; index?: CustodyIndexScope }>
+
+/**
+ * 37792 (@cto 78e96f64 part 1): every component's heads as one census for the ancestry proof. The entry's own copy is
+ * the store the environment held, so a head it names is a head this environment can lose. A component that answers
+ * unreadable is kept out of the census and named in `unreadable`: an unreadable head is never proven away.
+ */
+async function componentHeadCensus(
+  copyRoot: string,
+  components: readonly ComponentContents[],
+  options: RetentionVerifyOptions,
+): Promise<Readonly<{ heads: Readonly<Record<string, readonly string[]>>; unreadable: readonly string[] }>> {
+  const run = options.gitRun ?? defaultGitRun
+  const deadline = options.deadline ?? Number.POSITIVE_INFINITY
+  const heads: Record<string, readonly string[]> = {}
+  const unreadable: string[] = []
+  for (const component of components) {
+    const gitDir = component.gitDir ?? join(copyRoot, component.component)
+    try {
+      const found = await componentHeads(run, gitDir, deadline)
+      if (found.length > 0) heads[component.component] = found
+    } catch (error) {
+      unreadable.push(`${component.component}: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+  return { heads, unreadable }
+}
 
 async function evaluateRetainedEntry(
   options: RetentionVerifyOptions,
@@ -1015,6 +1049,9 @@ async function evaluateRetainedEntry(
   })
 
   // ---- Gate 5: positive surviving custody ----------------------------------------------
+  // 37792 (@cto 78e96f64 part 1): the heads each component's store holds, so the existing 37455-A ancestry proof runs
+  // on this route too. A component whose heads cannot be read keeps the witness proof and is named, never dropped.
+  const headsCensus = await componentHeadCensus(expectedCopyRoot, contents.components, options)
   const custody = await scanCustody(expectedCopyRoot, contents.components, witnessStores, removalSet, {
     sidecarDir,
     ...(options.gitRun === undefined ? {} : { run: options.gitRun }),
@@ -1022,6 +1059,10 @@ async function evaluateRetainedEntry(
     ...(options.bounds?.custody === undefined ? {} : { bounds: options.bounds.custody }),
     ...(options.deadline === undefined ? {} : { deadline: options.deadline }),
     ...(context?.audit === false && context.index !== undefined ? { indexScope: context.index } : {}),
+    ...(options.custodyTargetBranch === undefined
+      ? {}
+      : { witnessPolicy: { targetBranch: options.custodyTargetBranch } }),
+    ...(Object.keys(headsCensus.heads).length === 0 ? {} : { environmentHeads: headsCensus.heads }),
     clock: monotonic,
   })
   result.witnesses = custody.witnesses

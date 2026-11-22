@@ -1321,6 +1321,7 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
         heads: [published],
         store: join(primary, ".git", "objects"),
         tip: published,
+        confirmedBy: expect.stringContaining("ls-remote"),
         unreferenced: [{ component: ".git", oid: leftover, source: "owned" }],
         unreferencedCount: 1,
       },
@@ -1651,5 +1652,134 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     })
     expect(scan.status).toBe("pass")
     expect(scan.witnesses[0]).toMatchObject({ ref: "refs/heads/main", tip: landed })
+  })
+})
+
+/**
+ * @failure Gate 5 proves custody by ancestry against a mirror's own `refs/heads/main`, or against a tip its remote
+ * never published, or fsck-verifies a store that mirrors no component, or pays a 300 s `fsck --full` for a proof
+ * ancestry already decided.
+ * @level l1
+ * @consumer the read-only retention verifier, gate 5; #34127, #37792
+ * @testonly none
+ * @reach fs-walk <fixture-only: local bare remotes under the test's own temporary directory>
+ */
+describe("retention custody scan — mirror-head ancestry (#37792)", () => {
+  /** A component clone whose origin is the same remote a bare mirror also clones, so both name one repository. */
+  function ancestryFixture(prefix: string): {
+    componentRoot: string
+    head: string
+    mirrorObjects: string
+    mirror: string
+    remote: string
+    work: string
+  } {
+    const { remote, work, primary } = publishedStores(prefix)
+    const mirror = join(tmp(`${prefix}mirror-`), "mirror.git")
+    git(tmp(`${prefix}mirror-parent-`), ["clone", "-q", "--bare", remote, mirror])
+    return {
+      componentRoot: primary,
+      head: git(primary, ["rev-parse", "HEAD"]),
+      mirrorObjects: join(mirror, "objects"),
+      mirror,
+      remote,
+      work,
+    }
+  }
+
+  function countingRun(): { run: GitRun; fscks: string[] } {
+    const fscks: string[] = []
+    const run: GitRun = (args, options = {}) => {
+      if (args.includes("fsck")) fscks.push(args.join(" "))
+      return defaultGitRun(args, options)
+    }
+    return { run, fscks }
+  }
+
+  test("an ancestor head proves custody without fscking the mirror", async () => {
+    const fixture = ancestryFixture("git-super-ancestry-proves-")
+    const sidecarDir = tmp("git-super-ancestry-proves-sidecars-")
+    const component = await componentOf([fixture.head], sidecarDir)
+    const { run, fscks } = countingRun()
+    const scan = await scanCustody(fixture.componentRoot, [component], [fixture.mirrorObjects], [], {
+      sidecarDir,
+      run,
+      witnessPolicy: { targetBranch: "main" },
+      environmentHeads: { [component.component]: [fixture.head] },
+    })
+    expect(scan.status).toBe("pass")
+    expect(scan.reachability).toHaveLength(1)
+    expect(scan.reachability?.[0]?.tip).toBe(fixture.head)
+    expect(scan.reachability?.[0]?.confirmedBy).toContain("ls-remote")
+    expect(fscks).toEqual([])
+  })
+
+  test("a head the published tip does not contain still goes to the witness proof, fsck and all", async () => {
+    const fixture = ancestryFixture("git-super-ancestry-ahead-")
+    writeFileSync(join(fixture.componentRoot, "local.txt"), "only here\n")
+    git(fixture.componentRoot, ["add", "local.txt"])
+    git(fixture.componentRoot, ["commit", "-q", "-m", "unpublished"])
+    const unpublished = git(fixture.componentRoot, ["rev-parse", "HEAD"])
+    const sidecarDir = tmp("git-super-ancestry-ahead-sidecars-")
+    const component = await componentOf([unpublished], sidecarDir)
+    const { run, fscks } = countingRun()
+    const scan = await scanCustody(fixture.componentRoot, [component], [fixture.mirrorObjects], [], {
+      sidecarDir,
+      run,
+      witnessPolicy: { targetBranch: "main" },
+      environmentHeads: { [component.component]: [unpublished] },
+    })
+    expect(scan.status).toBe("blocked")
+    expect(scan.reachability).toBeUndefined()
+    expect(fscks).toHaveLength(1)
+    expect(scan.missing.map((entry) => entry.oid)).toContain(unpublished)
+  })
+
+  test("a mirror whose own main is ahead of the published tip proves nothing through its local commit", async () => {
+    const fixture = ancestryFixture("git-super-ancestry-local-tip-")
+    // A commit pushed into the MIRROR ONLY: its refs/heads/main is ahead of what the remote publishes.
+    const side = join(tmp("git-super-ancestry-local-tip-work-"), "side")
+    git(tmp("git-super-ancestry-local-tip-parent-"), ["clone", "-q", fixture.remote, side])
+    writeFileSync(join(side, "unpushed.txt"), "never published\n")
+    git(side, ["add", "unpushed.txt"])
+    git(side, ["commit", "-q", "-m", "unpushed local commit"])
+    const localTip = git(side, ["rev-parse", "HEAD"])
+    git(side, ["push", "-q", fixture.mirror, "main"])
+    const sidecarDir = tmp("git-super-ancestry-local-tip-sidecars-")
+    // The object exists only in the mirror's local commit, never in what its remote publishes.
+    const component = await componentOf([localTip], sidecarDir)
+    const scan = await scanCustody(fixture.componentRoot, [component], [fixture.mirrorObjects], [], {
+      sidecarDir,
+      witnessPolicy: { targetBranch: "main" },
+      environmentHeads: { [component.component]: [localTip] },
+    })
+    expect(scan.status).not.toBe("pass")
+    expect(scan.reachability).toBeUndefined()
+  })
+
+  test("a store mirroring another repository neither witnesses nor gets fscked", async () => {
+    const fixture = ancestryFixture("git-super-ancestry-foreign-")
+    // A second, unrelated repository: its bare mirror declares a different remote, so it mirrors nothing here.
+    const other = publishedStores("git-super-ancestry-other-")
+    const foreign = join(tmp("git-super-ancestry-foreign-mirror-"), "foreign.git")
+    git(tmp("git-super-ancestry-foreign-parent-"), ["clone", "-q", "--bare", other.remote, foreign])
+    const sidecarDir = tmp("git-super-ancestry-foreign-sidecars-")
+    const component = await componentOf([fixture.head], sidecarDir)
+    const { run, fscks } = countingRun()
+    const scan = await scanCustody(
+      fixture.componentRoot,
+      [component],
+      [join(foreign, "objects"), fixture.mirrorObjects],
+      [],
+      {
+        sidecarDir,
+        run,
+        witnessPolicy: { targetBranch: "main" },
+        environmentHeads: { [component.component]: [fixture.head] },
+      },
+    )
+    expect(scan.status).toBe("pass")
+    expect(scan.detail).toContain("mirror no component repository")
+    expect(fscks).toEqual([])
   })
 })
