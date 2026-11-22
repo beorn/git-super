@@ -14,6 +14,7 @@ import {
   readdirSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -872,7 +873,7 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
       run: broken,
     })
     expect(scan.status).toBe("unknown")
-    expect(scan.detail).toContain("fsck --full failed")
+    expect(scan.detail).toContain("fsck --connectivity-only failed")
   })
 
   // #35062: the 05:12 dry run rebuilt a failing shared index once per member (~3.5 min each) for one fsck refusal.
@@ -898,7 +899,7 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     }
     expect(scans.map((scan) => scan.status)).toEqual(["unknown", "unknown"])
     expect(scans[1]!.detail).toBe(scans[0]!.detail)
-    expect(scans[0]!.detail).toContain("fsck --full failed")
+    expect(scans[0]!.detail).toContain("fsck --connectivity-only failed")
     expect(fsck).toBe(1)
     // A fresh scope (the held window, a later run) builds again and sees the recovery (@cto 0606 §2).
     const recoveredDir = tmp("git-super-custody-failed-build-recovered-")
@@ -1035,7 +1036,7 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     rmSync(join(gitDir, "objects", blob.slice(0, 2), blob.slice(2)), { force: true })
     const scan = await scanCustody(store.root, [component], [join(gitDir, "objects")], [], { sidecarDir })
     expect(scan.status).toBe("unknown")
-    expect(scan.detail).toContain("fsck --full failed")
+    expect(scan.detail).toContain("fsck --connectivity-only failed")
     expect(scan.detail).not.toContain("cannot chdir")
   })
 
@@ -1786,56 +1787,50 @@ describe("retention custody scan — mirror-head ancestry (#37792)", () => {
 })
 
 /**
- * @failure Gate 5 (a) treats an exit-0 fsck whose only stderr is the benign gitmodulesParse class as a failure, so
- * the shared-main store can never witness; (b) accepts any other stderr line on an exit-0 fsck; (c) counts a fetched
- * copy ref as a head the ancestry proof must satisfy, or drops it without saying so.
+ * @failure Gate 5 (a) counts a fetched copy ref as a head the ancestry proof must satisfy, or drops it without saying
+ * so; (b) accepts store-wide connectivity as proof that this entry's objects survive; (c) keeps an entry whose witness
+ * store is missing an object reachable from the entry's heads.
  * @level l1
  * @consumer the read-only retention verifier, gate 5; #34127, #37792
  * @testonly none
  * @reach fs-walk <fixture-only: local bare remotes under the test's own temporary directory>
  */
-describe("retention custody scan — fsck warnings and fetched refs (#37792)", () => {
-  test("an exit-0 fsck whose only complaint is gitmodulesParse still witnesses, and the blob is named", async () => {
-    const { remote, primary } = publishedStores("git-super-fsck-benign-")
+describe("retention custody scan — head closure and fetched refs (#37792)", () => {
+  test("every object reachable from a head is present in the witness store", async () => {
+    const { remote, primary } = publishedStores("git-super-head-closure-")
     const head = git(primary, ["rev-parse", "HEAD"])
-    const blob = "8b11136d8deae51a8969f787a6fcc6efacf5467c"
-    const sidecarDir = tmp("git-super-fsck-benign-sidecars-")
-    const component = await componentOf([head], sidecarDir)
-    const benign: GitRun = (args, options) =>
-      args.includes("fsck")
-        ? { code: 0, stdout: "", stderr: `warning in blob ${blob}: gitmodulesParse: could not parse gitmodules blob` }
-        : defaultGitRun(args, options)
+    const sidecarDir = tmp("git-super-head-closure-sidecars-")
+    const component = await componentOf([head], sidecarDir, "owned", { [head]: "commit" })
     const scan = await scanCustody(primary, [component], [join(primary, ".git", "objects")], [], {
       sidecarDir,
-      run: benign,
       witnessPolicy: { targetBranch: "main" },
+      environmentHeads: { ".git": [head] },
     })
     expect(scan.status).toBe("pass")
-    expect(scan.detail).toContain("only fsck complaint was gitmodulesParse")
-    expect(scan.detail).toContain(blob)
+    expect(scan.detail).toContain("head closure checked with rev-list --objects --missing=print")
+    expect(scan.detail).toContain("present in")
     void remote
   })
 
-  test("any other stderr line on an exit-0 fsck is still unknown", async () => {
-    const { primary } = publishedStores("git-super-fsck-other-stderr-")
+  test("a pruned object keeps the entry and names the oid", async () => {
+    const { remote, primary } = publishedStores("git-super-head-closure-pruned-")
+    writeFileSync(join(primary, "pruned.txt"), "lost\n")
+    git(primary, ["add", "pruned.txt"])
+    git(primary, ["commit", "-q", "-m", "holds a pruned blob"])
     const head = git(primary, ["rev-parse", "HEAD"])
-    const sidecarDir = tmp("git-super-fsck-other-sidecars-")
-    const component = await componentOf([head], sidecarDir)
-    const noisy: GitRun = (args, options) =>
-      args.includes("fsck")
-        ? {
-            code: 0,
-            stdout: "",
-            stderr: "warning in blob 8b11136d8deae51a8969f787a6fcc6efacf5467c: ignored alternate\n",
-          }
-        : defaultGitRun(args, options)
+    const blob = git(primary, ["rev-parse", "HEAD:pruned.txt"])
+    const sidecarDir = tmp("git-super-head-closure-pruned-sidecars-")
+    const component = await componentOf([head], sidecarDir, "owned", { [head]: "commit" })
+    const loose = join(primary, ".git", "objects", blob.slice(0, 2), blob.slice(2))
+    renameSync(loose, join(sidecarDir, "quarantined-blob"))
     const scan = await scanCustody(primary, [component], [join(primary, ".git", "objects")], [], {
       sidecarDir,
-      run: noisy,
       witnessPolicy: { targetBranch: "main" },
+      environmentHeads: { ".git": [head] },
     })
     expect(scan.status).toBe("unknown")
-    expect(scan.detail).toContain("unexpected stderr")
+    expect(scan.detail).toContain(blob)
+    void remote
   })
 
   test("a fetched copy ref is not a head the ancestry proof must satisfy, and it is counted", async () => {
