@@ -782,7 +782,35 @@ function* statusRepository(
         yield* classifyHoldingNothing()
         continue
       }
-      const checkoutPin = (yield* gitText(nestedRoot, ["rev-parse", "HEAD"])).trim()
+      // 37775: an interrupted `yrd env open` leaves a component materialized with files and no commit, so its
+      // HEAD resolves to nothing. That is a named state, never a failed walk: callers must be able to see the
+      // component, the pin it should hold, and the one command that restores it. `--quiet` keeps an unborn HEAD
+      // (exit 1, no stderr) apart from a repository that cannot be read (which still throws).
+      const headProbe = yield* queryGit(nestedRoot, ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
+      if (headProbe.status !== 0) {
+        if (headProbe.stderr.trim() !== "") {
+          throw gitError(
+            nestedRoot,
+            ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+            headProbe.status,
+            headProbe.stderr,
+          )
+        }
+        const pin = indexed.get(path) ?? head.get(path)
+        submoduleProblems.push({
+          kind: "unborn-head",
+          path: nestedPrefix,
+          reason:
+            `${child} holds no commit: HEAD resolves to nothing (an interrupted checkout), so Git records nothing here` +
+            (pin === undefined
+              ? ""
+              : `; restore the pinned content: git -C ${shellQuote(child)} checkout -f --detach ${pin}`) +
+            `; or move its files out and run: git -C ${shellQuote(root)} submodule update --init ${path}`,
+          ...(gitDir === undefined ? {} : { gitDir }),
+        })
+        continue
+      }
+      const checkoutPin = headProbe.stdout.trim()
       const headPin = head.get(path)
       const indexPin = indexed.get(path)
       if (headPin !== undefined && indexPin !== undefined) {

@@ -76,7 +76,7 @@ export type SuperStatusResult = Readonly<{
   uninitializedSubmodules: readonly string[]
   /** Named uncertainty is observable, but never sufficient evidence for worktree removal. */
   submoduleProblems: readonly Readonly<{
-    kind: "repository-not-consulted" | "diff-unreadable"
+    kind: "repository-not-consulted" | "diff-unreadable" | "unborn-head"
     path: string
     reason: string
     gitDir?: string

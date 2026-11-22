@@ -32,6 +32,7 @@ import { commands } from "../src/commands.ts"
 import { runCli } from "../src/cli.ts"
 import { superIsAncestor, type SuperIsAncestorResult } from "../src/merge-base.ts"
 import { superStatus, type SuperStatusResult } from "../src/status.ts"
+import { shellQuote } from "../src/shell-command.ts"
 import { statusWithGit } from "../src/status-traversal.ts"
 import { createGit } from "../src/worktree.ts"
 import { createLocalGitProcess } from "../src/process.ts"
@@ -744,6 +745,30 @@ describe("Phase 1 read commands", () => {
     expect(populated.submoduleProblems[0]!.reason).toContain("is not empty")
     expect(populated.submoduleProblems[0]!.reason).toContain(`git -C ${clone} submodule update --init packages/alpha`)
     expect(populated.submoduleProblems[0]!.reason).toContain("move its files out of it")
+  })
+
+  /**
+   * @failure 37775: a materialized component whose HEAD resolves to no commit (an interrupted checkout) aborts
+   *          the status walk with a raw `rev-parse HEAD` fatal, so `yrd env close` reads the environment as
+   *          dirty and can name neither the component nor the one command that restores it.
+   * @level   l1
+   * @consumer yrd env close, bearly worktree remove
+   * @testonly none
+   */
+  test("a materialized component with no HEAD is named with its pin and the checkout that restores it (37775)", () => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-unborn-head-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const child = join(fixture.product, "packages/alpha")
+    const pin = git(fixture.product, "rev-parse", "HEAD:packages/alpha")
+    git(child, "symbolic-ref", "HEAD", "refs/heads/never-created")
+    expect(() => git(child, "rev-parse", "HEAD")).toThrow()
+
+    const result = superStatus({ repo: fixture.product })
+    expect(result.submoduleProblems).toHaveLength(1)
+    expect(result.submoduleProblems[0]).toMatchObject({ kind: "unborn-head", path: "packages/alpha" })
+    expect(result.submoduleProblems[0]!.reason).toContain("no commit")
+    expect(result.submoduleProblems[0]!.reason).toContain(`git -C ${shellQuote(child)} checkout -f --detach ${pin}`)
   })
 
   test("a checkout that holds no files but keeps its module repository refuses, naming the re-attach (30563 R1)", () => {
