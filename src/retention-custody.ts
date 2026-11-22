@@ -251,11 +251,20 @@ export class CustodyIndexScope {
  * remembered too: it is the same store and the same bytes, and re-running it per entry only spends the budget.
  */
 export class CustodyRunScope {
+  constructor(
+    /**
+     * 37854: where this run keeps its content-addressed ref fragments. A batch passes one directory so entry 2 reuses
+     * the walk entry 1 already paid for instead of re-walking every durable ref of every witness store.
+     */
+    readonly fragmentDir?: string,
+  ) {}
   readonly identities = new Map<
     string,
     Readonly<{ status: "known"; id: string } | { status: "unknown"; detail: string }>
   >()
   readonly fscks = new Map<string, Readonly<{ ok: true } | { ok: false; detail: string }>>()
+  /** 37854: ref fragments by store, format, tip and subtracted set — the walk's result, never a proof decision. */
+  readonly fragments = new Map<string, SidecarRef>()
 }
 
 const HEX40 = /^[0-9a-f]{40}$/u
@@ -714,7 +723,14 @@ async function reachableSidecar(
   clock: () => number,
   sidecarDir: string,
   deadline: number | undefined,
+  runScope?: CustodyRunScope,
 ): Promise<SidecarRef> {
+  // 37854: a walk's answer depends only on the store's bytes, the tip and the subtracted set — never on which entry is
+  // being proved. A batch therefore keeps each fragment once and every later entry reuses it, verifying the file is
+  // still the one this ref names before trusting it.
+  const cacheKey = `${gitDir}\u0000${tip}\u0000${subtract.join(",")}`
+  const cached = runScope?.fragments.get(cacheKey)
+  if (cached !== undefined && statSync(cached.path, { throwIfNoEntry: false })?.size === cached.bytes) return cached
   const started = clock()
   // --ignore-missing drops a subtracted tip this store lacks; dropping one only repeats objects, never loses one.
   const args =
@@ -724,7 +740,7 @@ async function reachableSidecar(
   const lineStream = stream(args, { timeoutMs: bounds.reachableMs, maxLines: bounds.maxReachableOids })
   const deadlinePassed = (): boolean => deadline !== undefined && clock() >= deadline
   const sidecar = await externalSortToSidecar(reachableOidLines(lineStream, gitDir, tip, bounds, deadlinePassed), {
-    dir: sidecarDir,
+    dir: runScope?.fragmentDir ?? sidecarDir,
     runLines: DEFAULT_SORT_RUN_LINES,
     deadline,
     clock,
@@ -733,6 +749,7 @@ async function reachableSidecar(
   if (clock() - started > bounds.reachableMs) {
     throw new UnknownError(`rev-list ${tip} in ${gitDir} exceeded the ${bounds.reachableMs} ms bound`)
   }
+  runScope?.fragments.set(cacheKey, sidecar)
   return sidecar
 }
 
@@ -992,6 +1009,7 @@ async function indexWitnessStores(
         clock,
         sidecarDir,
         deadline,
+        runScope,
       )
       records.push({
         store,

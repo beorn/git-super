@@ -319,8 +319,17 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
   const recordWarnings = (proof: RetentionVerifyResult, phase: "pre" | "held"): void => {
     for (const message of proof.certificate?.warnings ?? []) warnings.push({ entry: proof.entry, phase, message })
   }
-  // 37792 (@cto 93f4ba37): one scope for the whole run, so a batch of five entries fsck /hh/dev/.git once.
-  const runScope = new CustodyRunScope()
+  // 37792 (@cto 93f4ba37): one scope per pass, so five entries fsck /hh/dev/.git once rather than five times.
+  // 37854: the pass's ref-walk fragments are kept too, so entry 2 reuses the walks entry 1 paid for. The scope is per
+  // phase on purpose: the held pass exists because a store may change after the preliminary one, so it must re-walk.
+  const scopes = new Map<"pre" | "held", CustodyRunScope>()
+  const runScopeFor = (phase: "pre" | "held"): CustodyRunScope => {
+    const existing = scopes.get(phase)
+    if (existing !== undefined) return existing
+    const scope = new CustodyRunScope(join(options.artifactDir, "common", "custody-fragments", phase))
+    scopes.set(phase, scope)
+    return scope
+  }
   const verifyOptions = (entry: string, phase: "pre" | "held"): RetentionVerifyOptions => ({
     entry,
     root,
@@ -328,7 +337,7 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
     artifactDir: join(options.artifactDir, basename(entry), phase),
     commonArtifactDir: join(options.artifactDir, "common"),
     ...(options.targetBranch === undefined ? {} : { custodyTargetBranch: options.targetBranch }),
-    custodyRunScope: runScope,
+    custodyRunScope: runScopeFor(phase),
     ...(options.clock === undefined ? {} : { clock: options.clock }),
     ...(proofDeadline === undefined ? {} : { deadline: proofDeadline }),
     ...(options.allowTemporaryArtifactDir === undefined
