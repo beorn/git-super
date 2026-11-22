@@ -29,7 +29,7 @@ import { tryAcquireFlock } from "@bearly/flock"
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest"
 import { runCli } from "../src/cli.ts"
 import { retireRetainedBatch, type RetentionBatchOptions, type RetentionBatchResult } from "../src/retention-batch.ts"
-import { defaultGitRun, defaultGitStream, type GitStreamFactory } from "../src/retention-contents.ts"
+import { defaultGitRun } from "../src/retention-contents.ts"
 import { scanEstate } from "../src/retention-estate.ts"
 import { inspectRetainedEntryInBatch } from "../src/retention-verify.ts"
 
