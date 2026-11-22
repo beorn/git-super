@@ -982,7 +982,11 @@ async function independentRefs(
  * deterministic while the per-store subprocess fan-out (config, ref listing, identity, connectivity) overlaps.
  */
 type WitnessStoreRead =
-  | { readonly kind: "fatal"; readonly error: unknown }
+  /**
+   * 34127 (@cto turn58): `fsckMs` is the span the read had already spent when it died, so a cut inside its fsck is not
+   * reported as 0. Absent when the read died before the fsck started (or outside it).
+   */
+  | { readonly kind: "fatal"; readonly error: unknown; readonly fsckMs?: number }
   | { readonly kind: "corrupt"; readonly gitDir: string; readonly detail: string }
   | { readonly kind: "foreign"; readonly detail: string }
   | { readonly kind: "nonWitness"; readonly gitDir: string }
@@ -1016,6 +1020,8 @@ async function readWitnessStore(
   clock: () => number,
 ): Promise<WitnessStoreRead> {
   const gitDir = dirname(store)
+  // 34127 (@cto turn58): held outside the `try` so the catch can still report the fsck time a cut read had spent.
+  let fsckMs = 0
   try {
     // The same invocation deadline bounds a read that is running: a spent budget refuses before another child spawns.
     if (deadline !== undefined && clock() >= deadline) {
@@ -1133,7 +1139,6 @@ async function readWitnessStore(
     // root, and stays in every estate, owner and delta fact.
     if (durable.length === 0) return { kind: "nonWitness", gitDir }
     let fsck = false
-    let fsckMs = 0
     // 37792 (@cto 2026-11-22): the witness proof asks whether this environment's objects survive, not whether every
     // blob parses, so store health is `fsck --connectivity-only`. The entry-relevant proof is the head closure below.
     if (!skipFsck && (repo === undefined || !skipFsckRepos.has(repo))) {
@@ -1197,7 +1202,7 @@ async function readWitnessStore(
     }
   } catch (error) {
     if (error instanceof CorruptStoreError) return { kind: "corrupt", gitDir, detail: error.message }
-    return { kind: "fatal", error }
+    return { kind: "fatal", error, fsckMs }
   }
 }
 
@@ -1347,7 +1352,12 @@ async function indexWitnessStoresReported(
     // An expired budget launches nothing further; the entry keeps a named reason instead of a silent gap.
     if (waiting === undefined) throw new ProofDeadlineError("shared proof deadline is exhausted")
     const read = await waiting
-    if (read.kind === "fatal") throw read.error
+    if (read.kind === "fatal") {
+      // 34127 (@cto turn58): a read cut inside its fsck still contributes the time that fsck had spent, so the aggregate
+      // proofPhases names a real cost instead of 0 for the very phase the deadline landed in.
+      if (read.fsckMs !== undefined) phaseStats.witnessFsckMs += read.fsckMs
+      throw read.error
+    }
     if (read.kind === "corrupt") {
       // 37792 (@cto 2026-11-22 f66720e5): a store that cannot be read is no witness. Excluding it can only keep more
       // entries, never free one wrongly: it contributes no ref, fragment, certificate or tip.

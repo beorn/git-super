@@ -111,10 +111,15 @@ export type RetentionBatchResult = Readonly<{
   /**
    * 34127 (@cto e8f6c3b5): each entry's own time, so a starved batch says where its budget went instead of naming one
    * proof total. `startMs`/`endMs` are monotonic offsets from the batch start; `sliceMs` is the share the schedule
-   * gave the entry and `sliceDeadlineMs` its offset from the batch proof start. `phases` holds every entered phase's
-   * span (setup, child, the custody walk's own named phases, drain), and `lastPhase` is the deepest phase entered --
-   * present even when the deadline cut the entry, which is the case this exists for. `receiptMs` is what no phase
-   * owns: writing this entry's row and evidence.
+   * gave the entry and `sliceDeadlineMs` its offset from the batch proof start.
+   *
+   * `phases` holds only the entry's own top-level boundaries (setup, child, drain, receipt) and they never overlap;
+   * the custody walk's named phases are reported beside them under `subphases`, inclusive inside `child`, because
+   * their windows can span several stores and must never be subtracted from it. `lastPhase` is the deepest phase that
+   * was LIVE when the entry entered it, so a deadline cut keeps naming the operation that died, not the cleanup that
+   * ran after it; `deadlineCutMs` is where that cut was first observed. `receiptMs` is the measured certificate write
+   * at its call site, absent when the entry never reached it. `unattributedMs` is the residual as measured, reported
+   * even when negative so overlapping windows stay visible rather than being clamped away.
    */
   entryTimings?: Readonly<
     Record<
@@ -125,8 +130,11 @@ export type RetentionBatchResult = Readonly<{
         sliceMs: number
         sliceDeadlineMs?: number
         lastPhase: string
+        deadlineCutMs?: number
         phases: Readonly<Record<string, number>>
-        receiptMs: number
+        subphases?: Readonly<Record<string, number>>
+        receiptMs?: number
+        unattributedMs: number
       }>
     >
   >
@@ -337,15 +345,17 @@ function borrowerOrder(
 export async function retireRetainedBatch(options: RetentionBatchOptions): Promise<RetentionBatchResult> {
   const apply = options.apply === true
   const monotonic = options.monotonic ?? (() => performance.now())
-  // 34127 (@cto e8f6c3b5): entry boundaries are monotonic offsets from here; the proof budget below is in the wall clock
-  // frames the verify deadline uses, so the slice offset is taken against this one value.
+  // 34127 (@cto e8f6c3b5): entry boundaries are monotonic offsets from here.
+  // 34127 (@cto turn58): the proof deadline is expressed in that same monotonic clock and handed to the verifier, so an
+  // entry's own start/end and its phase buckets are one domain. Mixing wall-clock spans with performance.now offsets left
+  // a residual that was negative by fractions of a millisecond and would have hidden a real overlap.
   const batchStarted = monotonic()
-  const proofStartWall = Date.now()
+  const proofStartWall = batchStarted
   const budget = options.holdBudgetMs ?? 60_000
   // In the verifier's default clock domain (Date.now), so the same absolute value bounds both the batch loop and the
   // custody walks inside each proof.
-  const proofDeadline = options.proofDeadlineMs === undefined ? undefined : Date.now() + options.proofDeadlineMs
-  const proofDeadlinePassed = (): boolean => proofDeadline !== undefined && Date.now() >= proofDeadline
+  const proofDeadline = options.proofDeadlineMs === undefined ? undefined : monotonic() + options.proofDeadlineMs
+  const proofDeadlinePassed = (): boolean => proofDeadline !== undefined && monotonic() >= proofDeadline
   const root = realpathSync(options.root)
   const common = realpathSync(options.common)
   const entries = options.entries.map((entry) => realpathSync(resolve(entry)))
@@ -374,10 +384,10 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
   // still the hard cap, so this changes when one proof stops, never how long the run may take.
   const entryShare = (entriesLeft: number): Readonly<{ deadline?: number; ms: number }> => {
     if (proofDeadline === undefined) return { ms: 0 }
-    const left = proofDeadline - Date.now()
+    const left = proofDeadline - monotonic()
     if (left <= 0) return { deadline: proofDeadline, ms: 0 }
     const ms = Math.floor(left / Math.max(1, entriesLeft))
-    return { deadline: Math.min(proofDeadline, Date.now() + ms), ms }
+    return { deadline: Math.min(proofDeadline, monotonic() + ms), ms }
   }
   // 37792 (@cto c1f3a921): the custody scan's phase timings, summed per name, so a receipt separates a cold store's
   // connectivity check from its ordered ref walk instead of reporting one proof total.
@@ -385,13 +395,18 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
   const recordPhases = (name: string, ms: number): void => {
     phases[name] = (phases[name] ?? 0) + ms
   }
+  // 34127 (@cto turn58): the entry's own boundaries are the only non-overlapping buckets. Everything the custody walk
+  // names nests inside `child`, so it is accumulated separately and never subtracted from the parent's span.
+  const TOP_LEVEL_PHASES: ReadonlySet<string> = new Set(["setup", "child", "drain", "receipt"])
   type EntryTimingState = {
     readonly startMs: number
     endMs?: number
     sliceMs: number
     sliceDeadlineMs?: number
     lastPhase: string
+    deadlineCutMs?: number
     readonly phases: Map<string, number>
+    readonly subphases: Map<string, number>
     readonly enteredAt: Map<string, number>
   }
   const timings = new Map<string, EntryTimingState>()
@@ -403,24 +418,32 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
       sliceMs: 0,
       lastPhase: "not-started",
       phases: new Map<string, number>(),
+      subphases: new Map<string, number>(),
       enteredAt: new Map<string, number>(),
     }
     timings.set(entry, created)
     return created
   }
-  // A phase entered but never ended is the phase the entry died in: its elapsed so far is kept, not dropped.
+  // A phase entered but never ended is the phase the entry died in: its elapsed so far is kept, not dropped. A phase
+  // reached only after the cut was observed does not claim lastPhase; it is cleanup spend, recorded as such.
   const recordEntryTiming =
     (entry: string) =>
-    (event: Readonly<{ kind: "enter" | "end"; phase: string; ms: number }>): void => {
+    (event: Readonly<{ kind: "enter" | "end"; phase: string; ms: number; claimsPhase?: boolean }>): void => {
       const state = timingFor(entry)
       if (event.kind === "enter") {
-        state.lastPhase = event.phase
+        if (event.claimsPhase === false) {
+          if (state.deadlineCutMs === undefined) state.deadlineCutMs = event.ms
+        } else {
+          state.lastPhase = event.phase
+        }
         state.enteredAt.set(event.phase, event.ms)
         return
       }
       const started = state.enteredAt.get(event.phase)
       state.enteredAt.delete(event.phase)
-      state.phases.set(event.phase, (state.phases.get(event.phase) ?? 0) + Math.max(0, event.ms - (started ?? 0)))
+      const spend = Math.max(0, event.ms - (started ?? 0))
+      const bucket = TOP_LEVEL_PHASES.has(event.phase) ? state.phases : state.subphases
+      bucket.set(event.phase, (bucket.get(event.phase) ?? 0) + spend)
     }
   const verifyOptions = (entry: string, phase: "pre" | "held", sharedDeadline?: number): RetentionVerifyOptions => {
     // exactOptionalPropertyTypes: a shared spread of `number | undefined` is not assignable to `deadline?: number`, so
@@ -429,6 +452,8 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
     return {
       custodyPhases: recordPhases,
       entryTimings: recordEntryTiming(entry),
+      // 34127 (@cto turn58): one clock for the entry's boundaries and the proof deadline it is measured against.
+      monotonic,
       entry,
       root,
       namespaceRoots: options.namespaceRoots,
@@ -492,7 +517,11 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
           entryTimings: Object.fromEntries(
             [...timings].map(([entry, state]) => {
               const endMs = state.endMs ?? monotonic() - batchStarted
+              // 34127 (@cto turn58): only the entry's own top-level buckets count against its slice; the custody walk's
+              // nested phases sit beside them. The residual is reported as measured and never clamped to zero, so an
+              // overlap or a post-deadline stretch stays visible instead of being absorbed into silence.
               const accounted = [...state.phases.values()].reduce((sum, ms) => sum + ms, 0)
+              const receiptMs = state.phases.get("receipt")
               return [
                 entry,
                 {
@@ -501,8 +530,11 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
                   sliceMs: state.sliceMs,
                   ...(state.sliceDeadlineMs === undefined ? {} : { sliceDeadlineMs: state.sliceDeadlineMs }),
                   lastPhase: state.lastPhase,
+                  ...(state.deadlineCutMs === undefined ? {} : { deadlineCutMs: state.deadlineCutMs }),
                   phases: Object.fromEntries(state.phases),
-                  receiptMs: Math.max(0, endMs - state.startMs - accounted),
+                  ...(state.subphases.size === 0 ? {} : { subphases: Object.fromEntries(state.subphases) }),
+                  ...(receiptMs === undefined ? {} : { receiptMs }),
+                  unattributedMs: endMs - state.startMs - accounted,
                 },
               ]
             }),
@@ -549,6 +581,8 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
     if (share.deadline !== undefined) entryTiming.sliceDeadlineMs = share.deadline - proofStartWall
     if (proofDeadlinePassed()) {
       notStarted++
+      // 34127 (@cto turn58): an entry that never started ends where it was skipped; later batch work is not its spend.
+      entryTiming.endMs = monotonic() - batchStarted
       kept.set(
         entry,
         `unproved: the batch proof deadline (${String(options.proofDeadlineMs)} ms) passed before this entry's proof began; select it again in a later batch`,
@@ -570,7 +604,7 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
         share.deadline !== undefined &&
         proofDeadline !== undefined &&
         share.deadline < proofDeadline &&
-        Date.now() >= share.deadline &&
+        monotonic() >= share.deadline &&
         proof.verdict === "unknown"
       const slice = sliced
         ? ` (entry proof slice of ${String(share.ms)} ms of the ${String(options.proofDeadlineMs)} ms batch budget)`

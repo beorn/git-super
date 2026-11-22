@@ -1530,12 +1530,21 @@ async function writeResult(
         const phases = Object.entries(timing.phases)
           .map(([name, ms]) => `${name} ${String(Math.round(ms))}ms`)
           .join(", ")
+        const subphases = Object.entries(timing.subphases ?? {})
+          .map(([name, ms]) => `${name} ${String(Math.round(ms))}ms`)
+          .join(", ")
         stdout.write(
           `timing ${basename(entry)}: start ${String(Math.round(timing.startMs))}ms, end ${String(Math.round(timing.endMs))}ms, ` +
             `slice ${String(timing.sliceMs)}ms` +
             (timing.sliceDeadlineMs === undefined ? "" : ` (deadline +${String(timing.sliceDeadlineMs)}ms)`) +
-            `, last ${timing.lastPhase}, receipt ${String(Math.round(timing.receiptMs))}ms` +
+            `, last ${timing.lastPhase}` +
+            (timing.deadlineCutMs === undefined ? "" : ` (cut +${String(Math.round(timing.deadlineCutMs))}ms)`) +
+            (timing.receiptMs === undefined
+              ? ", receipt not reached"
+              : `, receipt ${String(Math.round(timing.receiptMs))}ms`) +
+            `, unattributed ${String(Math.round(timing.unattributedMs))}ms` +
             (phases === "" ? "" : `; ${phases}`) +
+            (subphases === "" ? "" : `; in child: ${subphases}`) +
             "\n",
         )
       }

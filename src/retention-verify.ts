@@ -231,9 +231,15 @@ export type RetentionVerifyOptions = Readonly<{
    * its `enter`, so a starved entry names the phase it died in instead of reporting silence.
    *
    * Phases in order: setup (gates 1-4), child (gate 5, including the custody walk's own witnessFsck / refGraph /
-   * witnessCertificates), drain (result assembly). The caller adds its own receipt-writing span.
+   * witnessCertificates), drain (result assembly), receipt (the certificate write at its call site).
+   *
+   * 34127 (@cto turn58): `claimsPhase: false` marks work that began AFTER the deadline was already observed passed.
+   * Its spend is still reported, but it must not name the cut: the phase the entry died in is the last one that was
+   * live when it entered, never the cleanup that ran after the walk gave up.
    */
-  readonly entryTimings?: (event: Readonly<{ kind: "enter" | "end"; phase: string; ms: number }>) => void
+  readonly entryTimings?: (
+    event: Readonly<{ kind: "enter" | "end"; phase: string; ms: number; claimsPhase?: boolean }>,
+  ) => void
   /**
    * 34787: an explicit discard of exactly the loss gate 5 finds. It never passes gate 5; a match makes the verdict
    * `discard-candidate` and the loss is reported as `explicitLoss`. A mismatch keeps the entry and names the field.
@@ -461,13 +467,22 @@ async function evaluateRetainedEntry(
   const elapsed = (): number => monotonic() - startedAt
   // 34127 (@cto e8f6c3b5): the phase this entry is inside. Emitted on entry, so a deadline cut that never returns
   // still leaves the caller the last phase entered.
+  // 34127 (@cto turn58): a pass can carry nested intervals at once (the custody walk opens its own phases inside
+  // `child`), so every interval still open is closed here and not only the last one named. A phase that begins AFTER
+  // the deadline was already observed passed is measured but never claims the cut for itself: the cut stays on the
+  // operation that was live when it happened, not on the cleanup that ran afterwards.
   let currentPhase = "setup"
-  const enterPhase = (phase: string): void => {
-    options.entryTimings?.({ kind: "end", phase: currentPhase, ms: elapsed() })
+  const openPhases = new Set<string>([currentPhase])
+  const deadlinePassed = (): boolean => options.deadline !== undefined && monotonic() >= options.deadline
+  const enterPhase = (phase: string, claimsPhase: boolean = !deadlinePassed()): void => {
+    if (openPhases.delete(currentPhase)) {
+      options.entryTimings?.({ kind: "end", phase: currentPhase, ms: elapsed() })
+    }
     currentPhase = phase
-    options.entryTimings?.({ kind: "enter", phase, ms: elapsed() })
+    openPhases.add(phase)
+    options.entryTimings?.({ kind: "enter", phase, ms: elapsed(), claimsPhase })
   }
-  options.entryTimings?.({ kind: "enter", phase: currentPhase, ms: 0 })
+  options.entryTimings?.({ kind: "enter", phase: currentPhase, ms: 0, claimsPhase: !deadlinePassed() })
   const gates: RetentionGateResult[] = []
   const reasons: string[] = []
   const declaredNamespaceRoots = [...(options.namespaceRoots ?? [])]
@@ -509,7 +524,12 @@ async function evaluateRetainedEntry(
   }
 
   const finish = (): RetentionVerifyResult => {
-    options.entryTimings?.({ kind: "end", phase: currentPhase, ms: elapsed() })
+    // 34127 (@cto turn58): close every interval the pass opened, so an exception or an early refusal cannot leave a
+    // phase's spend stranded on the frame that unwound it.
+    for (const phase of openPhases) {
+      options.entryTimings?.({ kind: "end", phase, ms: elapsed() })
+    }
+    openPhases.clear()
     const ordered = GATE_ORDER.map((gate) => {
       const found = gates.find((entry) => entry.gate === gate)
       if (found !== undefined) return found
@@ -1146,7 +1166,13 @@ async function evaluateRetainedEntry(
           ...(options.entryTimings === undefined
             ? {}
             : {
-                onPhaseEnter: (name: string) => options.entryTimings?.({ kind: "enter", phase: name, ms: elapsed() }),
+                onPhaseEnter: (name: string) =>
+                  options.entryTimings?.({
+                    kind: "enter",
+                    phase: name,
+                    ms: elapsed(),
+                    claimsPhase: !deadlinePassed(),
+                  }),
               }),
         }),
     clock: monotonic,
@@ -1298,6 +1324,9 @@ async function evaluateRetainedEntry(
       artifactDir: result.artifactDir,
     },
   }
+  // 34127 (@cto turn58): the certificate write is measured where it happens, so its cost is a real span in the receipt
+  // and not a clamped remainder; an entry that never reaches here simply has no receipt span.
+  enterPhase("receipt")
   const emission = await emitCertificate(
     { ...certificate, certificateSchema: RETENTION_CERTIFICATE_SCHEMA },
     result.artifactDir,

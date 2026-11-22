@@ -29,7 +29,7 @@ import { tryAcquireFlock } from "@bearly/flock"
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest"
 import { runCli } from "../src/cli.ts"
 import { retireRetainedBatch, type RetentionBatchOptions, type RetentionBatchResult } from "../src/retention-batch.ts"
-import { defaultGitRun } from "../src/retention-contents.ts"
+import { defaultGitRun, defaultGitStream, type GitStreamFactory } from "../src/retention-contents.ts"
 import { scanEstate } from "../src/retention-estate.ts"
 import { inspectRetainedEntryInBatch } from "../src/retention-verify.ts"
 
@@ -509,35 +509,61 @@ describe("retention retirement batch (#33010)", async () => {
   })
 
   // 34127 (@cto e8f6c3b5): every entry carries its own boundaries, so a batch names where its budget went instead of
-  // reporting one proof total. A complete entry ends in drain; the receipt span is what no phase owns.
-  it("records per-entry timing boundaries on an unspent batch", async () => {
+  // reporting one proof total. Turn58: the top-level buckets are the entry's own and cannot overlap, the custody walk's
+  // phases sit beside `child` rather than inside its arithmetic, and the certificate write is measured where it runs.
+  it("records non-overlapping per-entry boundaries and the measured receipt write", async () => {
     const result = await retireRetainedBatch(options({ proofDeadlineMs: 600_000 }))
     expect(result.stopped).toBeUndefined()
+    const topLevel = new Set(["setup", "child", "drain", "receipt"])
     for (const row of result.rows) {
       const timing = result.entryTimings?.[row.entry]
       expect(timing, row.entry).toBeDefined()
-      expect(timing?.lastPhase).toBe("drain")
+      expect(timing?.lastPhase).toBe("receipt")
       expect(timing?.sliceMs).toBeGreaterThan(0)
       expect(timing?.endMs).toBeGreaterThanOrEqual(timing?.startMs ?? 0)
+      expect(Object.keys(timing?.phases ?? {}).every((name) => topLevel.has(name))).toBe(true)
       expect(timing?.phases.setup).toBeGreaterThanOrEqual(0)
       expect(timing?.phases.child).toBeGreaterThanOrEqual(0)
       expect(timing?.phases.drain).toBeGreaterThanOrEqual(0)
+      // The write ran on this path, so its span is measured rather than inferred from what no phase owns.
+      expect(timing?.receiptMs).toBeDefined()
       expect(timing?.receiptMs).toBeGreaterThanOrEqual(0)
+      expect(timing?.deadlineCutMs).toBeUndefined()
+      // Non-overlapping: the top-level buckets cannot exceed the entry's own span, and the residual is reported as
+      // measured instead of being clamped to zero.
+      expect(timing?.unattributedMs).toBeGreaterThanOrEqual(0)
+      expect(timing?.unattributedMs).toBeLessThanOrEqual((timing?.endMs ?? 0) - (timing?.startMs ?? 0))
     }
   })
 
-  // 34127 (@cto e8f6c3b5): a walk cut by the shared deadline reports the phase it was INSIDE. This is the case that
-  // produced empty proofPhases in anc23, where no phase completed and the 33 s overrun had no name.
-  it("names the phase a spent deadline cuts an entry inside", async () => {
-    const slow = async (args: readonly string[], runOptions?: Parameters<typeof defaultGitRun>[1]) => {
-      await new Promise((resolve) => setTimeout(resolve, 30))
+  // 34127 (@cto turn58): a walk cut INSIDE a named custody phase must keep that name and its spend after the caller
+  // enters drain. The reproduced defect reported lastPhase=drain with witnessFsck=1489 ms and proofPhases.witnessFsck=0,
+  // which loses exactly the operation the deadline landed in.
+  it("keeps the custody phase a spent deadline cut, not the drain that ran after it", async () => {
+    const slowCustody = async (args: readonly string[], runOptions?: Parameters<typeof defaultGitRun>[1]) => {
+      if (args.includes("core.worktree")) await new Promise((resolve) => setTimeout(resolve, 200))
       return defaultGitRun(args, runOptions)
     }
-    const cut = await retireRetainedBatch(options({ proofDeadlineMs: 60, gitRun: slow }))
+    const cut = await retireRetainedBatch(options({ proofDeadlineMs: 60, gitRun: slowCustody }))
     expect(cut.rows.every((row) => row.outcome === "kept")).toBe(true)
-    const timings = Object.values(cut.entryTimings ?? {})
-    expect(timings).toHaveLength(cut.rows.length)
-    expect(timings.some((timing) => timing.lastPhase !== "drain" && timing.lastPhase !== "not-started")).toBe(true)
+    const cutTimings = Object.values(cut.entryTimings ?? {}).filter(
+      (timing) => timing.deadlineCutMs !== undefined,
+    )
+    expect(cutTimings.length).toBeGreaterThan(0)
+    for (const timing of cutTimings) {
+      // The entry died in a live phase; the drain that ran after the cut never takes its name.
+      expect(["setup", "child"]).toContain(timing.lastPhase)
+      // Drain was entered after the cut and is measured, but the certificate write was never reached.
+      expect(timing.phases.drain).toBeDefined()
+      expect(timing.phases.receipt).toBeUndefined()
+      expect(timing.receiptMs).toBeUndefined()
+      // Whatever phase died keeps a positive spend instead of being dropped with the frame.
+      expect(Object.values(timing.phases).reduce((sum, ms) => sum + ms, 0)).toBeGreaterThan(0)
+      // A custody subphase, when the run reaches one, carries its own positive spend beside `child`.
+      for (const [name, spend] of Object.entries(timing.subphases ?? {})) {
+        expect(spend, name).toBeGreaterThan(0)
+      }
+    }
   })
 
   // #35047 (@dev/review2 REVISE bf2e0b30): the deadline cuts a custody walk already running only if the batch hands it
@@ -547,9 +573,10 @@ describe("retention retirement batch (#33010)", async () => {
   it("hands the batch deadline to the held pass and a fair share of it to each preliminary entry", async () => {
     const inspect = vi.mocked(inspectRetainedEntryInBatch)
     inspect.mockClear()
-    const started = Date.now()
+    // 34127 (@cto turn58): the batch deadline is expressed in the monotonic clock it measures entries with.
+    const started = performance.now()
     const result = await retireRetainedBatch(options({ apply: true, proofDeadlineMs: 600_000 }))
-    const finished = Date.now()
+    const finished = performance.now()
     expect(
       result.rows.map((row) => row.outcome),
       JSON.stringify(result.rows),
