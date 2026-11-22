@@ -164,9 +164,20 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
 
   // AC: a killed/capped/failed/warning stream outranks its malformed partial row,
   // while a complete malformed stream stays malformed. Existing fixtures only emit valid OIDs.
+  // 37792 (@cto 2026-11-22 f66720e5): a child that could not read the store, or a row git could not have written,
+  // makes the store corrupt: it is excluded by name and the entry is kept (blocked). A deadline, a cap or an exit-0
+  // warning is a proof limit, not corruption, and keeps the entry unknown.
   test.each([
-    { fault: "timeout", code: 1, timedOut: true, capped: false, stderr: "", detail: "ms bound" },
-    { fault: "cap", code: 1, timedOut: false, capped: true, stderr: "", detail: "OIDs exceeded" },
+    { fault: "timeout", code: 1, timedOut: true, capped: false, stderr: "", detail: "ms bound", status: "unknown" },
+    {
+      fault: "cap",
+      code: 1,
+      timedOut: false,
+      capped: true,
+      stderr: "",
+      detail: "OIDs exceeded",
+      status: "unknown",
+    },
     {
       fault: "exit",
       code: 1,
@@ -174,6 +185,7 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
       capped: false,
       stderr: "failed child",
       detail: "failed in witness store",
+      status: "blocked",
     },
     {
       fault: "warning",
@@ -182,6 +194,7 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
       capped: false,
       stderr: "ignored alternate",
       detail: "exited 0 with stderr",
+      status: "unknown",
     },
     {
       fault: "complete malformed",
@@ -190,8 +203,9 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
       capped: false,
       stderr: "",
       detail: "malformed rev-list row",
+      status: "blocked",
     },
-  ])("drains before classifying a $fault rev-list", async ({ detail, fault: _fault, ...outcome }) => {
+  ])("drains before classifying a $fault rev-list", async ({ detail, status, fault: _fault, ...outcome }) => {
     const store = repoWithCommit("git-super-custody-fault-")
     const sidecarDir = tmp("git-super-custody-fault-sidecars-")
     const component = await componentOf([store.head], sidecarDir)
@@ -207,7 +221,7 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
         outcome: Promise.resolve({ ...outcome, bytes: 48, lines: 2 }),
       }),
     })
-    expect(scan.status).toBe("unknown")
+    expect(scan.status).toBe(status)
     expect(scan.detail).toContain(detail)
     expect(drained).toBe(true)
   })
@@ -232,7 +246,7 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
           })(),
         }),
     })
-    expect(scan.status).toBe("unknown")
+    expect(scan.status).toBe("blocked")
     expect(scan.detail).toContain("failed in witness store")
     expect(scan.detail).toContain("stdout read failed")
     expect(highWater).toBe(RETENTION_STREAM_QUEUE_LINES)
@@ -868,7 +882,7 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     expect(scan.detail).toContain("removal set")
   })
 
-  test("an fsck failure in a witness store is unknown, never custody", async () => {
+  test("a corrupt witness store is excluded by name and its only object stays unproven", async () => {
     const store = repoWithCommit("git-super-custody-")
     const sidecarDir = tmp("git-super-custody-sidecars-")
     const component = await componentOf([store.head], sidecarDir, "owned")
@@ -878,12 +892,42 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
       sidecarDir,
       run: broken,
     })
-    expect(scan.status).toBe("unknown")
+    expect(scan.status).toBe("blocked")
     expect(scan.detail).toContain("fsck --connectivity-only failed")
+    expect(scan.detail).toContain("unreadable witness store(s) excluded")
+  })
+
+  // 37792 (@cto 2026-11-22 f66720e5): excluding a corrupt candidate may only keep more entries, never free one wrongly.
+  // The healthy store still covers the head positively, so the entry passes and the receipt names the store it dropped
+  // - the anc9 bug read all five entries unknown because one scratch probe store's refs were unreadable.
+  test("a corrupt witness store is excluded and a healthy store still proves custody", async () => {
+    const store = repoWithCommit("git-super-custody-corrupt-")
+    const sidecarDir = tmp("git-super-custody-corrupt-sidecars-")
+    const component = await componentOf([store.head], sidecarDir, "owned")
+    const clone = tmp("git-super-custody-corrupt-clone-")
+    git(clone, ["clone", "-q", "--no-hardlinks", store.root, "work"])
+    const cloneGitDir = join(clone, "work", ".git")
+    const flag = "--git-dir=" + cloneGitDir
+    const broken: GitRun = (args, options) =>
+      args.includes("fsck") && args.some((arg) => arg.includes(flag))
+        ? { code: 1, stdout: "", stderr: "fatal: not a git repository" }
+        : defaultGitRun(args, options)
+    const scan = await scanCustody(
+      store.root,
+      [component],
+      [join(store.root, ".git", "objects"), join(cloneGitDir, "objects")],
+      [],
+      { sidecarDir, run: broken },
+    )
+    expect(scan.status, scan.detail).toBe("pass")
+    expect(scan.detail).toContain("unreadable witness store(s) excluded")
+    expect(scan.detail).toContain(cloneGitDir)
   })
 
   // #35062: the 05:12 dry run rebuilt a failing shared index once per member (~3.5 min each) for one fsck refusal.
-  test("a shared witness index whose build failed fails the next member alike without rebuilding it", async () => {
+  // 37792 (@cto 2026-11-22 f66720e5): the corrupt stores are excluded inside the one build, so the index succeeds and
+  // the next member reads the same exclusion without a second fsck. Each member's own at-risk OID stays per-entry.
+  test("a shared witness index built once names the same corrupt stores to the next member without re-fscking", async () => {
     const fixture = custodyCase("shared history")
     let fsck = 0
     const broken: GitRun = (args, options) => {
@@ -893,6 +937,7 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     }
     const indexScope = new CustodyIndexScope(tmp("git-super-custody-failed-build-"))
     const scans: CustodyScan[] = []
+    const fscksAfter: number[] = []
     for (const oid of fixture.atRisk.slice(0, 2)) {
       const sidecarDir = tmp("git-super-custody-failed-build-member-")
       scans.push(
@@ -902,11 +947,14 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
           indexScope,
         }),
       )
+      fscksAfter.push(fsck)
     }
-    expect(scans.map((scan) => scan.status)).toEqual(["unknown", "unknown"])
-    expect(scans[1]!.detail).toBe(scans[0]!.detail)
+    expect(scans.map((scan) => scan.status)).toEqual(["blocked", "blocked"])
+    const excluded = (detail: string): string => detail.slice(detail.indexOf("2 unreadable witness store(s)"))
+    expect(excluded(scans[1]!.detail)).toBe(excluded(scans[0]!.detail))
     expect(scans[0]!.detail).toContain("fsck --connectivity-only failed")
-    expect(fsck).toBe(1)
+    expect(fscksAfter[0]).toBeGreaterThan(0)
+    expect(fscksAfter[1]).toBe(fscksAfter[0])
     // A fresh scope (the held window, a later run) builds again and sees the recovery (@cto 0606 §2).
     const recoveredDir = tmp("git-super-custody-failed-build-recovered-")
     const recovered = await scanCustody(
@@ -1030,7 +1078,7 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     expect(git(clone, ["config", "--file", join(gitDir, "config"), "core.worktree"])).toBe("../../gone-checkout")
   })
 
-  test("a detached witness store missing an object is still unknown, never custody (#34920)", async () => {
+  test("a detached witness store missing an object is excluded, never custody (#34920)", async () => {
     const store = repoWithCommit("git-super-custody-")
     const sidecarDir = tmp("git-super-custody-sidecars-")
     const component = await componentOf([store.head], sidecarDir, "owned")
@@ -1041,7 +1089,7 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     git(clone, ["--git-dir", gitDir, "config", "core.worktree", "../../gone-checkout"])
     rmSync(join(gitDir, "objects", blob.slice(0, 2), blob.slice(2)), { force: true })
     const scan = await scanCustody(store.root, [component], [join(gitDir, "objects")], [], { sidecarDir })
-    expect(scan.status).toBe("unknown")
+    expect(scan.status).toBe("blocked")
     expect(scan.detail).toContain("fsck --connectivity-only failed")
     expect(scan.detail).not.toContain("cannot chdir")
   })
@@ -1834,7 +1882,7 @@ describe("retention custody scan — head closure and fetched refs (#37792)", ()
       witnessPolicy: { targetBranch: "main" },
       environmentHeads: { ".git": [head] },
     })
-    expect(scan.status).toBe("unknown")
+    expect(scan.status).toBe("blocked")
     expect(scan.detail).toContain(blob)
     void remote
   })

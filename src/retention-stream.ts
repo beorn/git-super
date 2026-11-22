@@ -378,8 +378,16 @@ export interface StreamFaultMessages {
   readonly warned: string
 }
 
-class IncompleteStreamError extends Error {
-  constructor(message: string) {
+/**
+ * The stream contract's fault type; a caller that classifies a store's unreadability must recognise it. `fault` names
+ * the cause, because they are not the same refusal: a failed child read is a store that cannot be read, while a
+ * deadline, a cap or a warning is a proof limit and keeps the answer `unknown`.
+ */
+export class IncompleteStreamError extends Error {
+  constructor(
+    message: string,
+    readonly fault?: "timedOut" | "capped" | "failed" | "warned",
+  ) {
     super(message)
     this.name = "IncompleteStreamError"
   }
@@ -401,7 +409,7 @@ export function assertStreamComplete(outcome: GitStreamOutcome, messages: Stream
         : outcome.stderr.trim() === ""
           ? undefined
           : "warned"
-  if (fault !== undefined) throw new IncompleteStreamError(messages[fault])
+  if (fault !== undefined) throw new IncompleteStreamError(messages[fault], fault)
 }
 
 export const MAX_LINE_LENGTH = 1 << 20
