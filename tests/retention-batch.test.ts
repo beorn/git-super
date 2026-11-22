@@ -567,8 +567,16 @@ describe("retention retirement batch (#33010)", async () => {
       unleased.push(join(clone, ".git"))
     }
 
-    const result = await retireRetainedBatch(options())
-
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined)
+    let result: Awaited<ReturnType<typeof retireRetainedBatch>>
+    try {
+      result = await retireRetainedBatch(options())
+      // The loud report stays part of the contract: one line naming the count and both lists.
+      expect(warning).toHaveBeenCalledWith(expect.stringContaining("2 object director(ies) have no proved Git owner"))
+      expect(warning).toHaveBeenCalledWith(expect.stringContaining("identity-unknown-entries.txt"))
+    } finally {
+      warning.mockRestore()
+    }
     // No selected entry borrows from store-a or store-b, so nothing is kept for it and the batch carries on.
     expect(result.stopped).toBeUndefined()
     expect(result.rows.map((row) => row.outcome)).toEqual(["would-retire", "would-retire", "would-retire"])
@@ -600,7 +608,16 @@ describe("retention retirement batch (#33010)", async () => {
     const declared = existsSync(alternates) ? readFileSync(alternates, "utf8") : ""
     writeFileSync(alternates, `${declared}${declared === "" || declared.endsWith("\n") ? "" : "\n"}${store}\n`)
 
-    const dry = await retireRetainedBatch(options())
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined)
+    let dry: Awaited<ReturnType<typeof retireRetainedBatch>>
+    let applied: Awaited<ReturnType<typeof retireRetainedBatch>>
+    try {
+      dry = await retireRetainedBatch(options())
+      applied = await retireRetainedBatch(options({ apply: true }))
+      expect(warning).toHaveBeenCalledWith(expect.stringContaining("1 object director(ies) have no proved Git owner"))
+    } finally {
+      warning.mockRestore()
+    }
     expect(dry.stopped).toBeUndefined()
     expect(dry.rows.find((row) => row.entry === borrower)?.outcome).toBe("kept")
     expect(dry.rows.find((row) => row.entry === borrower)?.reason).toContain("identity-unknown")
@@ -614,7 +631,6 @@ describe("retention retirement batch (#33010)", async () => {
     expect(readFileSync(dry.owners!.unprovedList, "utf8")).toBe(store + "\n")
     expect(dry.owners?.identityUnknownBytes).toBe(allocatedBytes(store))
 
-    const applied = await retireRetainedBatch(options({ apply: true }))
     expect(applied.stopped).toBeUndefined()
     expect(applied.rows.find((row) => row.entry === borrower)?.outcome).toBe("kept")
     expect(readdirSync(root)).toEqual([basename(borrower)])
