@@ -83,6 +83,12 @@ export interface CustodyScan {
   /** At-risk commits a rebase removed that the published main graph still holds by patch-id. */
   readonly rebased?: readonly RebaseWitness[] | undefined
   /**
+   * 37455-A: components whose custody was proven by ancestry instead of by witness or patch-id. Every head the
+   * environment holds (the component gitlink's checkout HEAD and its local branch tips) is an ancestor of the
+   * published target branch, so nothing this environment names can be lost and no patch stream was read.
+   */
+  readonly reachability?: readonly HeadReachability[] | undefined
+  /**
    * 34787 (@cto 34787-component-retention-ruling correction 4): when blocked, the exact loss per component: the
    * un-witnessed object count by type and the commit roots (the missing commits no other missing commit reaches),
    * each with its subject. It describes the complete `missingSidecar`; it never stands in for it.
@@ -135,6 +141,30 @@ export interface CustodyScanOptions {
    * builds its own index in `sidecarDir`, as a single-entry verify always has.
    */
   readonly indexScope?: CustodyIndexScope
+  /**
+   * 37455-A (@cto 29f8631c): the heads this environment holds per component — the component gitlink's checkout HEAD
+   * and its local branch tips. When every one of them is an ancestor of the published target branch, custody is
+   * proven by reachability and no patch stream is read. Absent or empty, the component keeps the witness proof.
+   */
+  readonly environmentHeads?: Readonly<Record<string, readonly string[]>>
+}
+
+/**
+ * 37455-A: one component's custody proven without a witness or a patch read. `store`/`tip` are the published target
+ * branch the heads were compared against, so a receipt can re-run the exact check.
+ */
+export interface HeadReachability {
+  readonly component: string
+  readonly heads: readonly string[]
+  readonly store: string
+  readonly tip: string
+  /**
+   * At-risk OIDs no head and no durable witness reaches. They are named here (first 100) instead of read as patches:
+   * with every head an ancestor of the published target branch, the environment holds no unpublished work, so these
+   * are leftover objects the removal drops. `unreferencedCount` carries the full number.
+   */
+  readonly unreferenced?: readonly CustodyTarget[]
+  readonly unreferencedCount?: number
 }
 
 /** One built witness index: the ranked durable-ref records and the merged OID -> rank file every scan joins against. */
@@ -947,6 +977,42 @@ function uncheckedDetail(unchecked: ReadonlyArray<string>): string {
   return `; ${String(unchecked.length)} refused OID(s) not patch-id checked because their component store path is unknown: ${shown}${more}`
 }
 
+/**
+ * 37455-A: are all of this environment's heads ancestors of the published target tip? `ancestors` is custody by
+ * reachability; `ahead` keeps the witness and patch proofs; anything unreadable is `unknown` with the exact cause, so
+ * a ref this rule cannot read is retained rather than guessed at (@cto 29f8631c).
+ */
+async function headsAreAncestors(
+  gitDir: string,
+  heads: readonly string[],
+  tip: string,
+  run: GitRun,
+  remaining: () => number,
+): Promise<Readonly<{ status: "ancestors" | "ahead" }> | Readonly<{ status: "unknown"; detail: string }>> {
+  const budget = (): Readonly<{ timeoutMs?: number }> => {
+    const left = remaining()
+    return Number.isFinite(left) ? { timeoutMs: left } : {}
+  }
+  const readable = await run([`--git-dir=${gitDir}`, "cat-file", "-e", `${tip}^{commit}`], budget())
+  if (readable.code !== 0 || readable.stderr.trim() !== "") {
+    return {
+      status: "unknown",
+      detail: `published target commit ${tip} is not readable in ${gitDir} (${readable.stderr.trim() || `exit ${String(readable.code)}`}); custody by reachability cannot be proven`,
+    }
+  }
+  for (const head of [...heads].sort()) {
+    const answer = await run([`--git-dir=${gitDir}`, "merge-base", "--is-ancestor", head, tip], budget())
+    if (answer.stderr.trim() !== "" || (answer.code !== 0 && answer.code !== 1)) {
+      return {
+        status: "unknown",
+        detail: `component head ${head}: merge-base --is-ancestor ${head} ${tip} in ${gitDir} answered ${String(answer.code)} (${answer.stderr.trim() || "no stderr"}); an unreadable head is retained, never proven`,
+      }
+    }
+    if (answer.code === 1) return { status: "ahead" }
+  }
+  return { status: "ancestors" }
+}
+
 async function runCustody(
   copyRoot: string,
   components: readonly ComponentContents[],
@@ -961,6 +1027,7 @@ async function runCustody(
   deadline?: number,
   onPhase?: (name: string, ms: number) => void,
   indexScope?: CustodyIndexScope,
+  environmentHeads?: Readonly<Record<string, readonly string[]>>,
 ): Promise<CustodyScan> {
   const remaining = (): number => {
     const left = deadline === undefined ? Number.POSITIVE_INFINITY : deadline - clock()
@@ -1071,6 +1138,12 @@ async function runCustody(
   let finalMissing: readonly (CustodyTarget & Readonly<{ gitDir?: string; objectType: string }>)[] = allMissing
   const rebased: RebaseWitness[] = []
   const unchecked: string[] = []
+  const reachability: HeadReachability[] = []
+  const unreferenced: CustodyTarget[] = []
+  let unreferencedCount = 0
+  // 37455-A: the published target tip a component's heads must be ancestors of. Only an unambiguous single witness
+  // store supplies one; a scan over several stores keeps the witness and patch proofs for every component.
+  const publishedTip = published.length === 1 ? published[0] : undefined
   let witnessCount = 0
   let missingCount = 0
   let merged = 0
@@ -1083,6 +1156,26 @@ async function runCustody(
         atStore(proofRun, componentGitDir, await worktreeGone(componentGitDir, proofRun)),
       )
       if (format.status !== "ok") throw new UnknownError(format.detail)
+      // 37455-A (@cto 29f8631c): reachability first. Every head this environment holds — the component gitlink's
+      // checkout HEAD and its local branch tips — being an ancestor of the published target branch is exact custody
+      // for everything the environment names, and it costs no byte stream. Only a non-ancestor head, or a component
+      // with no readable head, falls through to the witness and patch proofs below, where the patch bound stays.
+      const heads = environmentHeads?.[component.component]
+      let proven: HeadReachability | undefined
+      if (component.missingRoots === 0 && heads !== undefined && heads.length > 0 && publishedTip !== undefined) {
+        const ancestry = await headsAreAncestors(componentGitDir, heads, publishedTip.tip, proofRun, remaining)
+        if (ancestry.status === "unknown") throw new UnknownError(ancestry.detail)
+        if (ancestry.status === "ancestors") {
+          proven = {
+            component: component.component,
+            heads: [...heads].sort(),
+            store: publishedTip.store,
+            tip: publishedTip.tip,
+          }
+        }
+      }
+      const provenUnreferenced: CustodyTarget[] = []
+      let provenUnreferencedTotal = 0
       await mergeSorted(
         [
           { label: "at-risk", lines: readLines(component.atRiskSidecar.path), keyOf: oidKey },
@@ -1096,6 +1189,19 @@ async function runCustody(
           const objectType = atRiskLines[0]?.split("\t")[1] ?? "unknown"
           const indexLines = groups.find((group) => group.label === "witness-index")?.lines
           if (indexLines === undefined || indexLines.length === 0) {
+            // 37455-A: a proven component keeps every un-witnessed object named here rather than silent. No head
+            // reaches it, no patch stream is read for it, and the proof says exactly which objects the removal drops.
+            if (proven !== undefined) {
+              provenUnreferencedTotal += 1
+              unreferencedCount += 1
+              if (unreferenced.length < MISSING_INLINE) {
+                unreferenced.push({ component: component.component, oid: key, source })
+              }
+              if (provenUnreferenced.length < MISSING_INLINE) {
+                provenUnreferenced.push({ component: component.component, oid: key, source })
+              }
+              return
+            }
             missingCount += 1
             if (missing.length < MISSING_INLINE) missing.push({ component: component.component, oid: key, source })
             allMissing.push({
@@ -1122,6 +1228,14 @@ async function runCustody(
         },
         { deadline, clock },
       )
+      if (proven !== undefined) {
+        reachability.push({
+          ...proven,
+          ...(provenUnreferenced.length === 0
+            ? {}
+            : { unreferenced: provenUnreferenced, unreferencedCount: provenUnreferencedTotal }),
+        })
+      }
       remaining()
     }
     // Second witness, rebase only: a refused commit whose stable patch-id the published main graph
@@ -1223,18 +1337,20 @@ async function runCustody(
       missingCount,
       ...(missingSidecar === undefined ? {} : { missingSidecar }),
       rebased,
+      ...(reachability.length === 0 ? {} : { reachability }),
       loss,
     }
   }
   return {
     status: "pass",
-    detail: `${witnessCount} at-risk OID(s) each have a named surviving witness across ${stores.length} store(s), ${witnesses.length} distinct identities${rebased.length === 0 ? "" : `, plus ${String(rebased.length)} rebased commit(s) matched by whitespace-sensitive patch-id to the published main graph`}${uncheckedDetail(unchecked)}${unsubtractedDetail(unsubtracted)}${nonWitnessDetail(nonWitnesses)}${vanishedDetail(vanished)}`,
+    detail: `${witnessCount} at-risk OID(s) each have a named surviving witness across ${stores.length} store(s), ${witnesses.length} distinct identities${rebased.length === 0 ? "" : `, plus ${String(rebased.length)} rebased commit(s) matched by whitespace-sensitive patch-id to the published main graph`}${reachability.length === 0 ? "" : `, plus ${String(reachability.length)} component(s) proven by head ancestry of the published target branch (no patch stream read; ${String(unreferencedCount)} un-witnessed leftover object(s) named, no head reaches them)`}${uncheckedDetail(unchecked)}${unsubtractedDetail(unsubtracted)}${nonWitnessDetail(nonWitnesses)}${vanishedDetail(vanished)}`,
     witnesses,
     witnessCount,
     ...(witnessSidecar === undefined ? {} : { witnessSidecar }),
     missing: [],
     missingCount: 0,
     rebased,
+    ...(reachability.length === 0 ? {} : { reachability }),
   }
 }
 
@@ -1355,6 +1471,7 @@ export async function scanCustody(
       options.deadline,
       options.onPhase,
       options.indexScope,
+      options.environmentHeads,
     )
   } catch (error) {
     return {

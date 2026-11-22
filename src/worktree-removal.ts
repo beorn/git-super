@@ -215,6 +215,11 @@ export type ComponentCustodyProof = Readonly<{
    * A pass by patch-id is only auditable as a pair, so the receipt carries every pair that earned it.
    */
   rebased?: readonly Readonly<{ component: string; oid: string; landedOid: string; ref: string; tip: string }>[]
+  /**
+   * 37455-A: components whose custody was proven by head ancestry of the published target branch, with the exact
+   * heads compared and the store/tip they were compared against, so a receipt can re-run the check.
+   */
+  reachability?: readonly Readonly<{ component: string; heads: readonly string[]; store: string; tip: string }>[]
   componentCount: number
   effectiveCommitCount: number
   witnessCount: number

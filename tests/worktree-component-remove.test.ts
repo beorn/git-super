@@ -227,12 +227,19 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
       })
 
       expect(result.state, result.detail?.message ?? JSON.stringify(result)).toBe("updated")
-      expect(result.proof?.componentCustody).toMatchObject({
+      const proof = result.proof?.componentCustody
+      expect(proof).toMatchObject({
         targetBranch: "main",
         componentCount: 2,
         effectiveCommitCount: 2,
-        witnessCount: 2,
       })
+      // 37455-A (@cto 29f8631c): a component whose checkout heads are all ancestors of the published branch is
+      // proven by reachability and reads no patch stream, so its commits are covered by that proof, not a witness.
+      const proven = proof?.reachability?.map((entry) => entry.component) ?? []
+      expect(proven.length + (proof?.witnessCount ?? 0)).toBeGreaterThanOrEqual(2)
+      for (const component of proven) {
+        expect(proof?.reachability?.find((entry) => entry.component === component)?.heads.length).toBeGreaterThan(0)
+      }
       expect(existsSync(target)).toBe(false)
     } finally {
       // raw-delete-allow: this isolated mkdtemp fixture owns every path beneath root

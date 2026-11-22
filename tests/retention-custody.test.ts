@@ -1282,6 +1282,150 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     expect(await sidecarText(scan, "missing")).toEqual([])
   })
 
+  // 37455-A (@cto 29f8631c): reachability first. Every head the environment holds — the component gitlink's checkout
+  // HEAD and its local branch tips — being an ancestor of the published branch is exact custody for what the
+  // environment names, and it costs no byte stream. The 2026-11-21 estate refused five landed trees because the patch
+  // search below ran on leftover commits: 547 to 1,326 candidates on published main against the 500 bound.
+  test("37455-A: an ancestor head proves custody with no patch read, even beside a leftover commit", async () => {
+    const { remote, work, primary } = publishedStores("git-super-custody-ancestor-")
+    const published = git(work, ["rev-parse", "HEAD"])
+    // A commit the environment still carries and the published branch does not: the 37514 leftover shape.
+    git(work, ["switch", "-q", "-c", "leftover"])
+    writeFileSync(join(work, "leftover.txt"), "debris\n")
+    git(work, ["add", "leftover.txt"])
+    git(work, ["commit", "-q", "-m", "leftover landing projection"])
+    const leftover = git(work, ["rev-parse", "HEAD"])
+    git(work, ["switch", "-q", "main"])
+    expect(git(work, ["rev-parse", "HEAD"])).toBe(published)
+    const sidecarDir = tmp("git-super-custody-ancestor-sidecars-")
+    const component = {
+      ...(await componentOf([leftover], sidecarDir, "owned", { [leftover]: "commit" })),
+      gitDir: join(work, ".git"),
+    }
+    const seen: string[][] = []
+    const recorded: GitRun = (args, options) => {
+      seen.push([...args])
+      return defaultGitRun(args, options)
+    }
+    const scan = await scanCustody(work, [component], [join(primary, ".git", "objects")], [], {
+      sidecarDir,
+      run: recorded,
+      witnessPolicy: { targetBranch: "main" },
+      environmentHeads: { ".git": [published] },
+    })
+    expect(scan.status).toBe("pass")
+    // The proof names what it will drop instead of refusing on it: no head and no witness reaches the leftover.
+    expect(scan.reachability).toEqual([
+      {
+        component: ".git",
+        heads: [published],
+        store: join(primary, ".git", "objects"),
+        tip: published,
+        unreferenced: [{ component: ".git", oid: leftover, source: "owned" }],
+        unreferencedCount: 1,
+      },
+    ])
+    expect(scan.missing).toEqual([])
+    // No byte stream was read: no candidate listing and no patch-id hashing ran for this component.
+    expect(seen.filter((args) => args.includes("patch-id"))).toEqual([])
+    expect(seen.filter((args) => args.includes("--no-notes"))).toEqual([])
+  })
+
+  test("37455-A: a head that is not an ancestor keeps the rebased patch-id proof", async () => {
+    const { remote, work, primary } = publishedStores("git-super-custody-rebased-head-")
+    git(work, ["switch", "-q", "-c", "side"])
+    writeFileSync(join(work, "b.txt"), "beta\n")
+    git(work, ["add", "b.txt"])
+    git(work, ["commit", "-q", "-m", "side work"])
+    const refused = git(work, ["rev-parse", "HEAD"])
+    git(work, ["switch", "-q", "main"])
+    writeFileSync(join(work, "a.txt"), "alpha\nmore\n")
+    git(work, ["add", "a.txt"])
+    git(work, ["commit", "-q", "-m", "main moves"])
+    git(work, ["cherry-pick", refused])
+    const landed = git(work, ["rev-parse", "HEAD"])
+    git(work, ["push", "-q", remote, "main"])
+    const sidecarDir = tmp("git-super-custody-rebased-head-sidecars-")
+    const component = {
+      ...(await componentOf([refused], sidecarDir, "refs/heads/side", { [refused]: "commit" })),
+      gitDir: join(work, ".git"),
+    }
+    const scan = await scanCustody(work, [component], [join(primary, ".git", "objects")], [], {
+      sidecarDir,
+      witnessPolicy: { targetBranch: "main" },
+      environmentHeads: { ".git": [refused] },
+    })
+    expect(scan.status).toBe("pass")
+    expect(scan.reachability).toBeUndefined()
+    expect(scan.rebased).toEqual([
+      { component: ".git", oid: refused, landedOid: landed, ref: "refs/heads/main", tip: landed },
+    ])
+  })
+
+  test("37455-A: a non-ancestor head over the patch bound is retained with today's text", async () => {
+    const { remote, work, primary } = publishedStores("git-super-custody-rebased-over-")
+    git(work, ["switch", "-q", "-c", "side"])
+    writeFileSync(join(work, "b.txt"), "beta\n")
+    git(work, ["add", "b.txt"])
+    git(work, ["commit", "-q", "-m", "side work"])
+    const refused = git(work, ["rev-parse", "HEAD"])
+    git(work, ["switch", "-q", "main"])
+    // Published main must touch the same path, or the search finds no candidate and never reads a patch at all.
+    writeFileSync(join(work, "b.txt"), "published beta\n")
+    git(work, ["add", "b.txt"])
+    git(work, ["commit", "-q", "-m", "main takes the same path"])
+    git(work, ["push", "-q", remote, "main"])
+    const sidecarDir = tmp("git-super-custody-rebased-over-sidecars-")
+    const component = {
+      ...(await componentOf([refused], sidecarDir, "refs/heads/side", { [refused]: "commit" })),
+      gitDir: join(work, ".git"),
+    }
+    const huge = "x".repeat(8 * 1024 * 1024 + 1)
+    const overBound: GitRun = (args, options) =>
+      args.includes("--no-notes") && args.includes("show")
+        ? { code: 0, stdout: huge, stderr: "" }
+        : defaultGitRun(args, options)
+    const scan = await scanCustody(work, [component], [join(primary, ".git", "objects")], [], {
+      sidecarDir,
+      run: overBound,
+      witnessPolicy: { targetBranch: "main" },
+      environmentHeads: { ".git": [refused] },
+    })
+    expect(scan.status).toBe("unknown")
+    expect(scan.detail).toContain("exceed 8388608 bytes")
+    expect(scan.reachability).toBeUndefined()
+  })
+
+  test("37455-A: an unreadable head refuses by name instead of being dropped", async () => {
+    const { remote, work, primary } = publishedStores("git-super-custody-unreadable-head-")
+    git(work, ["switch", "-q", "-c", "side"])
+    writeFileSync(join(work, "b.txt"), "beta\n")
+    git(work, ["add", "b.txt"])
+    git(work, ["commit", "-q", "-m", "side work"])
+    const refused = git(work, ["rev-parse", "HEAD"])
+    git(work, ["switch", "-q", "main"])
+    git(work, ["push", "-q", remote, "main"])
+    const sidecarDir = tmp("git-super-custody-unreadable-head-sidecars-")
+    const component = {
+      ...(await componentOf([refused], sidecarDir, "refs/heads/side", { [refused]: "commit" })),
+      gitDir: join(work, ".git"),
+    }
+    const unreadable: GitRun = (args, options) =>
+      args.includes("merge-base") && args.includes("--is-ancestor")
+        ? { code: 128, stdout: "", stderr: `fatal: bad object ${refused}` }
+        : defaultGitRun(args, options)
+    const scan = await scanCustody(work, [component], [join(primary, ".git", "objects")], [], {
+      sidecarDir,
+      run: unreadable,
+      witnessPolicy: { targetBranch: "main" },
+      environmentHeads: { ".git": [refused] },
+    })
+    expect(scan.status).toBe("unknown")
+    expect(scan.detail).toContain(refused)
+    expect(scan.detail).toContain("unreadable head is retained")
+    expect(scan.reachability).toBeUndefined()
+  })
+
   test("a patch that is nowhere on published main stays refused", async () => {
     const { remote, work, primary } = publishedStores("git-super-custody-unlanded-")
     git(work, ["switch", "-q", "-c", "side"])

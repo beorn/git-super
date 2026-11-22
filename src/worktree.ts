@@ -395,6 +395,55 @@ function custodyIdentityError(message: string): Error {
   return new Error(`component custody census unknown: ${message}`)
 }
 
+/**
+ * 37455-A (@cto 29f8631c): the heads the environment holds for one component — what its checkout names (the gitlink
+ * commit) plus every local branch tip in its own store. A head that cannot be read is not dropped: it is named in the
+ * error, because an unreadable ref must refuse rather than leave custody unproven in silence.
+ */
+async function componentHeads(run: GitRun, gitDir: string, deadline: number): Promise<readonly string[]> {
+  const remaining = (): number => {
+    const left = deadline - Date.now()
+    if (left <= 0) throw custodyIdentityError("shared proof deadline is exhausted")
+    return left
+  }
+  const outcome = async (args: readonly string[], what: string): Promise<string> => {
+    const result = await run([`--git-dir=${gitDir}`, ...args], { timeoutMs: remaining() })
+    if (result.timedOut === true || result.code !== 0 || result.stderr.trim() !== "") {
+      throw custodyIdentityError(
+        `${gitDir}: ${what} could not be read (${result.stderr.trim() || `exit ${String(result.code)}`})`,
+      )
+    }
+    remaining()
+    return result.stdout
+  }
+  const heads: string[] = []
+  const named = await run([`--git-dir=${gitDir}`, "rev-parse", "--verify", "HEAD"], { timeoutMs: remaining() })
+  if (named.code === 0 && named.stderr.trim() === "") {
+    const head = named.stdout.trim()
+    if (!/^[0-9a-f]{40,64}$/u.test(head)) {
+      throw custodyIdentityError(`${gitDir}: rev-parse HEAD answered a non-commit ${JSON.stringify(head.slice(0, 80))}`)
+    }
+    heads.push(head)
+  } else if (!/unknown revision|Needed a single revision|ambiguous argument|bad revision/u.test(named.stderr)) {
+    throw custodyIdentityError(
+      `${gitDir}: HEAD could not be read (${named.stderr.trim() || `exit ${String(named.code)}`}); an unreadable head is refused, never dropped`,
+    )
+  }
+  for (const row of (
+    await outcome(["for-each-ref", "refs/heads", "--format=%(objectname)"], "local branch refs")
+  ).split("\n")) {
+    const tip = row.trim()
+    if (tip === "") continue
+    if (!/^[0-9a-f]{40,64}$/u.test(tip)) {
+      throw custodyIdentityError(
+        `${gitDir}: for-each-ref answered a non-commit branch tip ${JSON.stringify(tip.slice(0, 80))}`,
+      )
+    }
+    heads.push(tip)
+  }
+  return [...new Set(heads)]
+}
+
 async function buildComponentCensus(
   input: Readonly<{
     git: Git
@@ -2008,6 +2057,9 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
                   const rebased: Array<
                     Readonly<{ component: string; oid: string; landedOid: string; ref: string; tip: string }>
                   > = []
+                  const reachability: Array<
+                    Readonly<{ component: string; heads: readonly string[]; store: string; tip: string }>
+                  > = []
                   const witnessKeys = new Set<string>()
                   let witnessCount = 0
                   let custodyFailure: ComponentCustodyRefusal | undefined
@@ -2024,12 +2076,30 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
                       }
                       break
                     }
+                    // 37455-A (@cto 29f8631c): the heads this environment holds for the component — the gitlink's
+                    // checkout HEAD plus its local branch tips — are checked against the published target branch
+                    // before any patch stream is read. Unreadable heads stay unknown, so the scan refuses rather than
+                    // guessing; no heads at all keeps the witness proof this close always had.
+                    const componentIdentity = initialCensus.identities.find(
+                      (entry) => entry.component === component.component,
+                    )
+                    if (componentIdentity === undefined) {
+                      custodyFailure = {
+                        status: "unknown",
+                        component: component.component,
+                        source: "component head ancestry",
+                        detail: `no census identity was resolved for component ${component.component}`,
+                      }
+                      break
+                    }
+                    const heads = await componentHeads(adapters.run, componentIdentity.gitDir, proofDeadline)
                     const custody = await scanCustody(path, [component], [store], initialCensus.removal, {
                       sidecarDir: proofSidecarDir,
                       run: adapters.run,
                       stream: adapters.stream,
                       deadline: proofDeadline,
                       witnessPolicy: { targetBranch: removeOptions.componentCustody.targetBranch },
+                      ...(heads.length === 0 ? {} : { environmentHeads: { [component.component]: heads } }),
                       onPhase: (name, ms) => {
                         phases[name] = (phases[name] ?? 0) + ms
                       },
@@ -2047,6 +2117,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
                     }
                     witnessCount += custody.witnessCount
                     rebased.push(...(custody.rebased ?? []))
+                    reachability.push(...(custody.reachability ?? []))
                     for (const witness of custody.witnesses) {
                       const key = `${witness.store}\0${witness.ref}\0${witness.tip}`
                       if (witnessKeys.has(key)) continue
@@ -2079,6 +2150,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
                           atRiskDigest,
                           witnesses,
                           rebased,
+                          reachability,
                           witnessCount,
                         }),
                       )
@@ -2088,6 +2160,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
                       sources: sourceSummary,
                       witnesses,
                       rebased,
+                      ...(reachability.length === 0 ? {} : { reachability }),
                       componentCount: contentComponents.length,
                       effectiveCommitCount: contentComponents.reduce((count, entry) => count + entry.atRisk, 0),
                       witnessCount,
@@ -2156,7 +2229,27 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
                     JSON.stringify(preFreshness.material.components) !==
                     JSON.stringify(postFreshness.material.components)
                   ) {
-                    throw new Error(`${path}: component state changed during unlocked custody proof; worktree kept`)
+                    // Name the component that moved, and the exact object it gained when one was added to a private
+                    // store: a change found here is often what a head-ancestry proof did not have to read, and a bare
+                    // "." would leave its owner without the commit to inspect (37455-A).
+                    const index = postFreshness.material.components.findIndex(
+                      (entry, position) =>
+                        JSON.stringify(entry) !== JSON.stringify(preFreshness.material.components[position]),
+                    )
+                    const before = preFreshness.material.components[index]
+                    const after = postFreshness.material.components[index]
+                    const added = (after?.privateObjectStore?.looseObjects ?? []).filter(
+                      (object) => !(before?.privateObjectStore?.looseObjects ?? []).includes(object),
+                    )
+                    const oid = added[0]?.replace("/", "").slice(0, 64)
+                    const changed = new Error(
+                      `${path}: component ${after?.component ?? "."} changed during unlocked custody proof${oid === undefined ? "" : `; it gained ${oid}`}; worktree kept`,
+                    )
+                    Object.assign(changed, {
+                      ...(after?.component === undefined ? {} : { component: after.component }),
+                      ...(oid === undefined || !/^[0-9a-f]{40,64}$/u.test(oid) ? {} : { oid }),
+                    })
+                    throw changed
                   }
                   for (const before of preFreshness.material.witnessStores) {
                     const after = postFreshness.material.witnessStores.find((entry) => entry.store === before.store)
@@ -2230,12 +2323,14 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
               }
             } catch (error) {
               const prior = custodyRefusal
+              const named = error as { component?: string; oid?: string } | undefined
+              const oid = prior?.oid ?? named?.oid
               custodyRefusal = {
                 status: "unknown",
-                component: prior?.component ?? ".",
+                component: prior?.component ?? named?.component ?? ".",
                 source: "component custody proof",
                 detail: `${prior?.detail ? `${prior.detail}; ` : ""}${error instanceof Error ? error.message : String(error)}`,
-                ...(prior?.oid === undefined ? {} : { oid: prior.oid }),
+                ...(oid === undefined ? {} : { oid }),
               }
             } finally {
               if (sidecarDir !== undefined) {
