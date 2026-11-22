@@ -802,12 +802,15 @@ function* statusRepository(
           path: nestedPrefix,
           reason:
             `${child} holds no commit: HEAD resolves to nothing (an interrupted checkout), so Git records nothing here` +
-            // The remedy must be a command the house guard lets an agent run: `checkout -f` is refused, and a
-            // partial checkout leaves untracked files that a plain checkout aborts on. Reset is a ref/index move
-            // that keeps every file, and checkout-index only fills in what the interrupted checkout never wrote.
+            // @cto 37775 ruling A: the remedy is the detach checkout, and it must say what it costs. The second
+            // form is the same recovery with nothing to discard, for callers whose destructive-command guard
+            // refuses `-f` on a tree of untracked files (measured 2026-11-22 on the interrupted bay).
             (pin === undefined
               ? ""
-              : `; restore the pinned content without discarding files: git -C ${shellQuote(child)} reset ${pin} && git -C ${shellQuote(child)} checkout-index -a`) +
+              : `; restore the pinned content: git -C ${shellQuote(child)} checkout -f --detach ${pin} ` +
+                `(this overwrites the component's working files with the pinned commit; if any of them are edits, ` +
+                `copy them out first) — or, without discarding any file: git -C ${shellQuote(child)} reset ${pin} && ` +
+                `git -C ${shellQuote(child)} checkout-index -a`) +
             `; or move its files out and run: git -C ${shellQuote(root)} submodule update --init ${path}`,
           ...(gitDir === undefined ? {} : { gitDir }),
         })

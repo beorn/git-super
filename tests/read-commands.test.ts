@@ -768,8 +768,23 @@ describe("Phase 1 read commands", () => {
     expect(result.submoduleProblems).toHaveLength(1)
     expect(result.submoduleProblems[0]).toMatchObject({ kind: "unborn-head", path: "packages/alpha" })
     expect(result.submoduleProblems[0]!.reason).toContain("no commit")
+    expect(result.submoduleProblems[0]!.reason).toContain(`git -C ${shellQuote(child)} checkout -f --detach ${pin}`)
+    expect(result.submoduleProblems[0]!.reason).toContain("overwrites the component's working files")
     expect(result.submoduleProblems[0]!.reason).toContain(`git -C ${shellQuote(child)} reset ${pin}`)
     expect(result.submoduleProblems[0]!.reason).toContain(`git -C ${shellQuote(child)} checkout-index -a`)
+  })
+
+  test("a component whose .git cannot be read stays repository-not-consulted, never unborn-head (37775)", () => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-broken-gitdir-"))
+    roots.push(root)
+    const fixture = createProductFixture(root)
+    const child = join(fixture.product, "packages/alpha")
+    writeFileSync(join(child, ".git"), `gitdir: ${join(root, "absent-gitdir")}\n`)
+
+    const result = superStatus({ repo: fixture.product })
+    expect(result.submoduleProblems).toHaveLength(1)
+    expect(result.submoduleProblems[0]).toMatchObject({ kind: "repository-not-consulted", path: "packages/alpha" })
+    expect(result.submoduleProblems.some(({ kind }) => kind === "unborn-head")).toBe(false)
   })
 
   test("a checkout that holds no files but keeps its module repository refuses, naming the re-attach (30563 R1)", () => {
