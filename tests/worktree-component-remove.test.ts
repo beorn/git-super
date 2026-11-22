@@ -389,6 +389,24 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
     }
   })
 
+  // 37792 (@cto 93f4ba37): a retained module's store still records core.worktree for a checkout that is gone, so a
+  // plain --git-dir read dies with "cannot chdir" and every component census came back unreadable.
+  it("componentHeads reads a store whose recorded worktree is gone", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-heads-gone-worktree-"))
+    try {
+      const repo = join(root, "repo")
+      const head = createRepository(repo, "a.txt", "a\n")
+      const gitDir = git(repo, "rev-parse", "--absolute-git-dir")
+      git(repo, "config", "core.worktree", join(root, "gone"))
+      const local = createLocalGitProcess()
+      const run: GitRun = async (args, options) => local.run({ repo: gitDir, args: [...args], ...options })
+      expect(await componentHeads(run, gitDir, Date.now() + 60_000)).toEqual({ heads: [head], fetched: [] })
+    } finally {
+      // raw-delete-allow: this isolated mkdtemp fixture owns every path beneath root
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   /**
    * @failure Removal diagnostics hide whether slow witness proof or the global writer accounts for the elapsed time.
    * @level l1

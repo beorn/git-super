@@ -1282,8 +1282,12 @@ export async function componentHeads(run: GitRun, gitDir: string, deadline: numb
   // No caller deadline is not a deadline at infinity: spawn rejects a non-finite timeout, and the census would then
   // report every component unreadable (2026-11-22). Omit the timeout instead.
   const timing = (): { timeoutMs?: number } => (Number.isFinite(deadline) ? { timeoutMs: remaining() } : {})
+  // 37792 (@cto 93f4ba37): a retained module's store still records core.worktree for a checkout that is gone, so a plain
+  // --git-dir read dies with "cannot chdir" and every component census came back unreadable. Read it detached, exactly
+  // as the witness walk does (#34920).
+  const storeRun = atStore(run, gitDir, await worktreeGone(gitDir, run))
   const outcome = async (args: readonly string[], what: string): Promise<string> => {
-    const result = await run([`--git-dir=${gitDir}`, ...args], timing())
+    const result = await storeRun([`--git-dir=${gitDir}`, ...args], timing())
     if (result.timedOut === true || result.code !== 0 || result.stderr.trim() !== "") {
       throw custodyIdentityError(
         `${gitDir}: ${what} could not be read (${result.stderr.trim() || `exit ${String(result.code)}`})`,
@@ -1294,7 +1298,7 @@ export async function componentHeads(run: GitRun, gitDir: string, deadline: numb
   }
   const heads: string[] = []
   const fetched = new Map<string, number>()
-  const named = await run([`--git-dir=${gitDir}`, "rev-parse", "--verify", "HEAD"], timing())
+  const named = await storeRun([`--git-dir=${gitDir}`, "rev-parse", "--verify", "HEAD"], timing())
   if (named.code === 0 && named.stderr.trim() === "") {
     const head = named.stdout.trim()
     if (!/^[0-9a-f]{40,64}$/u.test(head)) {
@@ -1342,7 +1346,7 @@ export async function componentHeads(run: GitRun, gitDir: string, deadline: numb
     }
     // A tag object names a commit through a peel. A peel that FAILS is either a tag of a tree/blob, which is the case
     // above, or a read that could not complete, which is refused like an unreadable HEAD.
-    const peeled = await run([`--git-dir=${gitDir}`, "rev-parse", "--verify", `${ref}^{commit}`], timing())
+    const peeled = await storeRun([`--git-dir=${gitDir}`, "rev-parse", "--verify", `${ref}^{commit}`], timing())
     remaining()
     const peeledTip = peeled.stdout.trim()
     if (peeled.code === 0 && peeled.stderr.trim() === "" && /^[0-9a-f]{40,64}$/u.test(peeledTip)) {
