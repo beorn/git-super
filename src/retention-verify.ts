@@ -414,7 +414,9 @@ async function componentHeadCensus(
   for (const component of components) {
     const gitDir = component.gitDir ?? join(copyRoot, component.component)
     try {
-      const found = await componentHeads(run, gitDir, deadline)
+      // 37792 (@cto turn44): the census measures its OWN stage, so it takes the pass's injected clock rather than
+      // reading Date.now behind the fixture's back.
+      const found = await componentHeads(run, gitDir, deadline, options.monotonic ?? Date.now)
       if (found.heads.length > 0) heads[component.component] = found.heads
       for (const excluded of found.fetched) {
         fetched.set(excluded.namespace, (fetched.get(excluded.namespace) ?? 0) + excluded.count)
@@ -1052,6 +1054,9 @@ async function evaluateRetainedEntry(
     ...(options.gitRun === undefined ? {} : { run: options.gitRun }),
     ...(options.gitStream === undefined ? {} : { stream: options.gitStream }),
     ...(options.bounds?.contents === undefined ? {} : { bounds: options.bounds.contents }),
+    // 37792 (@cto turn44): the entry's own deadline reaches the contents scan. Without it a spent grant still paid a
+    // full per-component contents read, and only the head census noticed the deadline had already passed.
+    ...(options.deadline === undefined ? {} : { deadline: options.deadline }),
     clock: monotonic,
   })
   result.contents = contents.components

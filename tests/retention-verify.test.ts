@@ -32,7 +32,7 @@ import { digestDirectory, emitCertificate } from "../src/retention-certificate.t
 import { alternateEntries } from "../src/alternates.ts"
 import type { GitSuperResult } from "../src/result.ts"
 import { defaultGitRun, scanContents, type ComponentContents } from "../src/retention-contents.ts"
-import { scanCustody } from "../src/retention-custody.ts"
+import { componentHeads, scanCustody } from "../src/retention-custody.ts"
 import { scanEstate } from "../src/retention-estate.ts"
 import {
   readRetentionAudits,
@@ -1264,9 +1264,15 @@ describe("retention verify gates 1-6", async () => {
     })
   })
 
-  // #35047: a batch caller bounds every proof by one deadline. A custody walk reached at or past it must read unknown and
-  // keep the entry; the same fixture without the deadline is the candidate above, so the deadline alone flips it.
-  it("keeps an entry whose custody proof starts past the caller's deadline", async () => {
+  // #35047 + @cto turn44: a batch caller bounds every proof by one deadline. That deadline now reaches the contents scan
+  // too, so an already-spent grant refuses THERE instead of paying a full contents read and leaving only the head census
+  // to notice. No contents-only or census-only Git child may start once the grant is spent.
+  it("keeps an entry whose proof starts past the caller's deadline, starting no contents or census Git", async () => {
+    const started: string[] = []
+    const run: typeof defaultGitRun = (args, options) => {
+      started.push(args.join(" "))
+      return defaultGitRun(args, options)
+    }
     const result = await verifyRetainedEntry({
       entry: base.entry,
       root: base.root,
@@ -1275,12 +1281,96 @@ describe("retention verify gates 1-6", async () => {
       allowTemporaryArtifactDir: true,
       clock: eligible(),
       deadline: Date.now() - 1,
+      gitRun: run,
     })
     expect(result.verdict).toBe("unknown")
-    expect(result.gates.find((gate) => gate.gate === "positive-custody")).toMatchObject({
+    expect(result.gates.find((gate) => gate.gate === "candidate-contents")).toMatchObject({
       status: "unknown",
       message: expect.stringContaining("shared proof deadline is exhausted"),
     })
+    expect(result.gates.find((gate) => gate.gate === "positive-custody")).toMatchObject({
+      status: "unknown",
+      message: "not evaluated: an earlier gate ended the pass before this one ran",
+    })
+    // `--batch-all-objects` is contents-only and `config --get core.worktree` is census-only: neither stage may spawn.
+    expect(started.filter((call) => call.includes("--batch-all-objects"))).toEqual([])
+    expect(started.filter((call) => call.startsWith("config"))).toEqual([])
+    expect(retentionRemovalBoundary(result).authorized).toBe(false)
+  })
+
+  // @cto turn44: the head census is bounded from its FIRST command, on the pass's own injected clock. The grant here is
+  // live through contents and is spent the moment the census opens the component store, so exactly one census child
+  // starts -- the configuration read, carrying the remaining budget -- and nothing spawns after it.
+  it("bounds the head census from its first command and stops when the grant is spent inside it", async () => {
+    const budgetMs = 60_000
+    let now = Date.now()
+    const deadline = now + budgetMs
+    const calls: { call: string; timeoutMs: number | undefined }[] = []
+    let spent = false
+    const run: typeof defaultGitRun = (args, options) => {
+      calls.push({ call: args.join(" "), timeoutMs: options?.timeoutMs })
+      if (spent) throw new Error(`a Git child started after the shared deadline: ${args.join(" ")}`)
+      const result = defaultGitRun(args, options)
+      if (args[0] === "config" && args.includes("core.worktree")) {
+        spent = true
+        now = deadline + 1
+      }
+      return result
+    }
+    const result = await verifyRetainedEntry({
+      entry: base.entry,
+      root: base.root,
+      namespaceRoots: [fixtureRoot as string],
+      artifactDir: base.artifactDir,
+      allowTemporaryArtifactDir: true,
+      clock: eligible(),
+      deadline,
+      monotonic: () => now,
+      gitRun: run,
+    })
+    const census = calls.filter((entry) => entry.call.startsWith("config"))
+    expect(census).toHaveLength(1)
+    expect(census[0]?.timeoutMs).toBe(budgetMs)
+    expect(calls[calls.length - 1]?.call).toContain("core.worktree")
+    expect(result.verdict).toBe("unknown")
+    expect(result.gates.find((gate) => gate.gate === "positive-custody")).toMatchObject({
+      status: "unknown",
+      message: expect.stringContaining("head census unreadable"),
+    })
+    expect(retentionRemovalBoundary(result).authorized).toBe(false)
+  })
+
+  // @cto turn44: a census entered after the grant is spent starts NO Git child at all, and the refusal names the deadline
+  // rather than a store that refused to be read.
+  it("starts no Git child in a head census whose grant is already spent", async () => {
+    const gitDir = join(base.entry, "modules", "vendor", "dep")
+    const started: string[] = []
+    const run: typeof defaultGitRun = (args, options) => {
+      started.push(args.join(" "))
+      return defaultGitRun(args, options)
+    }
+    await expect(componentHeads(run, gitDir, 1_000, () => 2_000)).rejects.toThrow(
+      "component custody census unknown: shared proof deadline is exhausted",
+    )
+    expect(started).toEqual([])
+  })
+
+  // @cto turn44 positive control: an unexpired injected clock and deadline keep the existing candidate result and every
+  // gate pass, so the new clock plumbing changes nothing on a live grant.
+  it("keeps the candidate verdict on an unexpired injected clock and deadline", async () => {
+    const now = Date.now()
+    const result = await verifyRetainedEntry({
+      entry: base.entry,
+      root: base.root,
+      namespaceRoots: [fixtureRoot as string],
+      artifactDir: base.artifactDir,
+      allowTemporaryArtifactDir: true,
+      clock: eligible(),
+      deadline: now + 600_000,
+      monotonic: () => now,
+    })
+    expect(result.verdict).toBe("candidate")
+    expect(result.gates.map((gate) => gate.status)).toEqual(["pass", "pass", "pass", "pass", "pass", "pass"])
     expect(retentionRemovalBoundary(result).authorized).toBe(false)
   })
 

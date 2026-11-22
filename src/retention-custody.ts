@@ -37,6 +37,7 @@ import {
   refuseSuccessfulStderr,
   type ComponentContents,
   type GitRun,
+  type GitRunOptions,
   type GitStreamFactory,
 } from "./retention-contents.ts"
 
@@ -800,9 +801,14 @@ interface DurableRefRecord {
  * rewritten, and `core.worktree` stays as evidence. A store with no recorded worktree, or one that exists, is read
  * exactly as before.
  */
-async function worktreeGone(gitDir: string, run: GitRun): Promise<boolean> {
-  const configured = await run(["config", "--file", join(gitDir, "config"), "--get", "core.worktree"])
+async function worktreeGone(gitDir: string, run: GitRun, options: GitRunOptions = {}): Promise<boolean> {
+  const configured = await run(["config", "--file", join(gitDir, "config"), "--get", "core.worktree"], options)
   refuseSuccessfulStderr(configured, `config --get core.worktree in ${gitDir}`)
+  // 37792 (@cto turn44): this is the first command of a head census. A child the caller's shared budget killed is a
+  // scheduling result named as the deadline, never a store that refused to be read.
+  if (configured.timedOut === true) {
+    throw new UnknownError(`core.worktree read in ${gitDir} was cut by the shared proof deadline`)
+  }
   if (configured.code === 1) return false
   if (configured.code !== 0) {
     throw new UnknownError(`config --get core.worktree failed in ${gitDir}: ${configured.stderr.trim()}`)
@@ -1706,9 +1712,14 @@ export function custodyIdentityError(message: string): Error {
  * commit) plus every local branch tip in its own store. A head that cannot be read is not dropped: it is named in the
  * error, because an unreadable ref must refuse rather than leave custody unproven in silence.
  */
-export async function componentHeads(run: GitRun, gitDir: string, deadline: number): Promise<ComponentHeadCensus> {
+export async function componentHeads(
+  run: GitRun,
+  gitDir: string,
+  deadline: number,
+  clock: () => number = Date.now,
+): Promise<ComponentHeadCensus> {
   const remaining = (): number => {
-    const left = deadline - Date.now()
+    const left = deadline - clock()
     if (left <= 0) throw custodyIdentityError("shared proof deadline is exhausted")
     return left
   }
@@ -1718,7 +1729,10 @@ export async function componentHeads(run: GitRun, gitDir: string, deadline: numb
   // 37792 (@cto 93f4ba37): a retained module's store still records core.worktree for a checkout that is gone, so a plain
   // --git-dir read dies with "cannot chdir" and every component census came back unreadable. Read it detached, exactly
   // as the witness walk does (#34920).
-  const storeRun = atStore(run, gitDir, await worktreeGone(gitDir, run))
+  // 37792 (@cto turn44): `timing()` reads the remaining budget first, so an entry whose shared deadline is already
+  // spent starts no Git child at all -- not even the configuration read that decides how to open the store -- and the
+  // first child that does start carries that remaining budget instead of running unbounded.
+  const storeRun = atStore(run, gitDir, await worktreeGone(gitDir, run, timing()))
   const outcome = async (args: readonly string[], what: string): Promise<string> => {
     const result = await storeRun([`--git-dir=${gitDir}`, ...args], timing())
     if (result.timedOut === true || result.code !== 0 || result.stderr.trim() !== "") {

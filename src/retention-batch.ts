@@ -359,25 +359,28 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
   const recordPhases = (name: string, ms: number): void => {
     phases[name] = (phases[name] ?? 0) + ms
   }
-  const verifyOptions = (entry: string, phase: "pre" | "held", sharedDeadline?: number): RetentionVerifyOptions => ({
-    custodyPhases: recordPhases,
-    entry,
-    root,
-    namespaceRoots: options.namespaceRoots,
-    artifactDir: join(options.artifactDir, basename(entry), phase),
-    commonArtifactDir: join(options.artifactDir, "common"),
-    ...(options.gitRun === undefined ? {} : { gitRun: options.gitRun }),
-    ...(options.gitStream === undefined ? {} : { gitStream: options.gitStream }),
-    ...(options.targetBranch === undefined ? {} : { custodyTargetBranch: options.targetBranch }),
-    custodyRunScope: runScopeFor(phase),
-    ...(options.clock === undefined ? {} : { clock: options.clock }),
-    ...(sharedDeadline === undefined && proofDeadline === undefined
-      ? {}
-      : { deadline: sharedDeadline ?? proofDeadline }),
-    ...(options.allowTemporaryArtifactDir === undefined
-      ? {}
-      : { allowTemporaryArtifactDir: options.allowTemporaryArtifactDir }),
-  })
+  const verifyOptions = (entry: string, phase: "pre" | "held", sharedDeadline?: number): RetentionVerifyOptions => {
+    // exactOptionalPropertyTypes: a shared spread of `number | undefined` is not assignable to `deadline?: number`, so
+    // the absence is decided here where the type can narrow (red on the pin before this, TS2375).
+    const deadline = sharedDeadline ?? proofDeadline
+    return {
+      custodyPhases: recordPhases,
+      entry,
+      root,
+      namespaceRoots: options.namespaceRoots,
+      artifactDir: join(options.artifactDir, basename(entry), phase),
+      commonArtifactDir: join(options.artifactDir, "common"),
+      ...(options.gitRun === undefined ? {} : { gitRun: options.gitRun }),
+      ...(options.gitStream === undefined ? {} : { gitStream: options.gitStream }),
+      ...(options.targetBranch === undefined ? {} : { custodyTargetBranch: options.targetBranch }),
+      custodyRunScope: runScopeFor(phase),
+      ...(options.clock === undefined ? {} : { clock: options.clock }),
+      ...(deadline === undefined ? {} : { deadline }),
+      ...(options.allowTemporaryArtifactDir === undefined
+        ? {}
+        : { allowTemporaryArtifactDir: options.allowTemporaryArtifactDir }),
+    }
+  }
 
   // ---- One shared scan, recorded for the delta ------------------------------------------------
   const record = newEstateWalkRecord()
