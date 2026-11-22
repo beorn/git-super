@@ -583,7 +583,9 @@ describe("retention retirement batch (#33010)", async () => {
   // 34127 (@cto turn60 defect 1): a slow `rev-list --objects` was charged to `witnessFsck` (1501 ms for a 5.27 ms fsck)
   // and the graph walk that actually spent it reported 0. The operation that ran must own its time.
   it("attributes a slow witness graph walk to refGraph, never to the fsck window left open above it", async () => {
-    const graphDelayMs = 300
+    // @dev/5 saw this test flake once at host load 45: the absolute `fsck < delay` bound is the load-sensitive half. The
+    // delay is 800 ms so a real fsck on these tiny stores (~5-20 ms, ~30 ms under contention) cannot reach it.
+    const graphDelayMs = 800
     const slowGraph: GitStreamFactory = (args, streamOptions = {}) => {
       const inner = defaultGitStream(args, streamOptions)
       if (!(args.includes("rev-list") && args.includes("--objects"))) return inner
@@ -635,6 +637,10 @@ describe("retention retirement batch (#33010)", async () => {
     expect(fsck).toBeGreaterThanOrEqual(0)
     expect(fsck).toBeLessThan(spent ?? 0)
     expect(fsck).toBeLessThan(graphDelayMs)
+    // Every nested operation the walk names keeps its own number; the certificate stage is the one that would silently
+    // lose its spend if only fsck and the graph were wired to the entry record.
+    expect(timing?.subphases?.witnessCertificates).toBeDefined()
+    expect(timing?.subphases?.witnessCertificates ?? 0).toBeLessThanOrEqual(timing?.phases.child ?? 0)
   })
 
   // #35047 (@dev/review2 REVISE bf2e0b30): the deadline cuts a custody walk already running only if the batch hands it

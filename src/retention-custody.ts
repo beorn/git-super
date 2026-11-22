@@ -2460,7 +2460,11 @@ async function runCustody(
     }
   } finally {
     // 34127 (@cto e8f6c3b5): a certificate walk cut by the deadline still names what it was doing and what it spent.
-    onPhase?.("witnessCertificates", clock() - certificateStarted)
+    // 34127 (@cto turn60): the same measured duration is what the entry's own subphase record takes, so this phase is
+    // not the one nested operation left without a number beside `child`.
+    const certificateMs = clock() - certificateStarted
+    onPhase?.("witnessCertificates", certificateMs)
+    onPhaseSpend?.("witnessCertificates", certificateMs)
   }
   remaining()
   const first = missing[0]
