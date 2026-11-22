@@ -777,6 +777,8 @@ async function indexWitnessStores(
    * graph cannot be read then contributes no ref rather than an unknown, because nothing joins against it.
    */
   skipFsck = false,
+  /** 37792 part 3: repositories ancestry already proved; a store mirroring only these is not fscked. */
+  skipFsckRepos: ReadonlySet<string> = new Set<string>(),
 ): Promise<{
   records: DurableRefRecord[]
   formats: Map<string, string>
@@ -910,7 +912,7 @@ async function indexWitnessStores(
       continue
     }
     // A hung `fsck` is killed at the declared deadline and reported unknown, never blocking.
-    if (!skipFsck) {
+    if (!skipFsck && (repo === undefined || !skipFsckRepos.has(repo))) {
       const fsckStarted = clock()
       const fsck = await storeRun([`--git-dir=${gitDir}`, "fsck", "--full", "--no-progress"], {
         timeoutMs: bounds.fsckMs,
@@ -1255,13 +1257,17 @@ export async function componentHeads(run: GitRun, gitDir: string, deadline: numb
 }
 
 /**
- * 37792 (@cto 78e96f64 part 2): does head ancestry already prove every component? Asked BEFORE any witness store is
- * fscked, because a proof that needs no witness must not pay for one: the 2026-11-21 run spent its whole 300 s budget
- * fscking a 14 GB mirror it did not need (#34127). Each component is proven against the tip its own mirror's remote
- * answered with in this same run, and the tip must exist in that mirror first. Any missing head, unreadable remote,
- * absent tip or non-ancestor head answers false, which keeps the witness and patch proofs exactly as they were.
+ * 37792 (@cto 78e96f64 part 2): which components does head ancestry already prove, and does it prove them all? Asked
+ * BEFORE any witness store is fscked, because a proof that needs no witness must not pay for one — and because a
+ * proven component needs no store fscked on its behalf at all. Each component is proven against the tip its own
+ * mirror's remote answered with in this same run, after that tip is proved present in the mirror, and only when every
+ * head the component holds is an ancestor of it. Any missing head, unreadable remote, absent tip or non-ancestor head
+ * leaves that component out, which keeps the witness and patch proofs for it exactly as they were.
+ *
+ * The store walk is one pass over the witnesses: identity is read once per store, never once per component, because
+ * the live estate holds ~24,000 of them and the first version of this paid that cost five times over (2026-11-22).
  */
-async function ancestryCoversEveryComponent(
+async function ancestryProof(
   copyRoot: string,
   components: readonly ComponentContents[],
   repoByComponent: ReadonlyMap<string, string>,
@@ -1270,47 +1276,57 @@ async function ancestryCoversEveryComponent(
   targetBranch: string | undefined,
   run: GitRun,
   remaining: () => number,
-): Promise<boolean> {
-  if (targetBranch === undefined || heads === undefined || components.length === 0) return false
+): Promise<Readonly<{ provenRepos: ReadonlySet<string>; allProven: boolean }>> {
+  const none = { provenRepos: new Set<string>(), allProven: false }
+  if (targetBranch === undefined || heads === undefined || components.length === 0) return none
+  // One identity read per store; the first matching store per repository is the one allowed to fix that tip.
+  const storesByRepo = new Map<string, string[]>()
+  for (const store of stores) {
+    const storeGitDir = dirname(store)
+    let identity: Awaited<ReturnType<typeof storeRepoIdentity>>
+    try {
+      identity = await storeRepoIdentity(storeGitDir, atStore(run, storeGitDir, await worktreeGone(storeGitDir, run)), remaining)
+    } catch {
+      continue
+    }
+    if (identity.status !== "known") continue
+    const list = storesByRepo.get(identity.id)
+    if (list === undefined) storesByRepo.set(identity.id, [store])
+    else list.push(store)
+  }
+  const provenRepos = new Set<string>()
   for (const component of components) {
     const repo = repoByComponent.get(component.component)
     const componentHeads = heads[component.component]
-    if (repo === undefined || componentHeads === undefined || componentHeads.length === 0) return false
-    let proven = false
-    for (const store of stores) {
-      const storeGitDir = dirname(store)
-      const storeRun = atStore(run, storeGitDir, await worktreeGone(storeGitDir, run))
-      let identity: Awaited<ReturnType<typeof storeRepoIdentity>>
-      try {
-        identity = await storeRepoIdentity(storeGitDir, storeRun, remaining)
-      } catch {
-        continue
-      }
-      if (identity.status !== "known" || identity.id !== repo) continue
-      let tip: string | undefined
-      try {
-        const remote = await configuredRemote(storeGitDir, storeRun)
-        if (remote === undefined) return false
-        tip = (await refreshPublishedRefs(storeGitDir, remote, targetBranch, run)).branchTip
-      } catch {
-        return false
-      }
-      if (tip === undefined) return false
-      const componentGitDir = component.gitDir ?? join(copyRoot, component.component)
-      const ancestry = await headsAreAncestors(
-        componentGitDir,
-        componentHeads,
-        tip,
-        storeGitDir,
-        atStore(run, componentGitDir, await worktreeGone(componentGitDir, run)),
-        remaining,
-      )
-      if (ancestry.status === "ancestors") proven = true
-      break
+    if (repo === undefined || componentHeads === undefined || componentHeads.length === 0) continue
+    const candidates = storesByRepo.get(repo)
+    if (candidates === undefined || candidates.length === 0) continue
+    const store = candidates[0] as string
+    const storeGitDir = dirname(store)
+    let tip: string | undefined
+    try {
+      const remote = await configuredRemote(storeGitDir, atStore(run, storeGitDir, await worktreeGone(storeGitDir, run)))
+      if (remote === undefined) continue
+      tip = (await refreshPublishedRefs(storeGitDir, remote, targetBranch, run)).branchTip
+    } catch {
+      continue
     }
-    if (!proven) return false
+    if (tip === undefined) continue
+    const componentGitDir = component.gitDir ?? join(copyRoot, component.component)
+    const ancestry = await headsAreAncestors(
+      componentGitDir,
+      componentHeads,
+      tip,
+      storeGitDir,
+      atStore(run, componentGitDir, await worktreeGone(componentGitDir, run)),
+      remaining,
+    )
+    if (ancestry.status === "ancestors") provenRepos.add(repo)
   }
-  return true
+  return { provenRepos, allProven: provenRepos.size > 0 && components.every((component) => {
+    const repo = repoByComponent.get(component.component)
+    return repo !== undefined && provenRepos.has(repo)
+  }) }
 }
 
 async function runCustody(
@@ -1414,6 +1430,7 @@ async function runCustody(
       onPhase,
       componentRepos,
       skipFsck,
+      skipFsckRepos,
     )
     const width = String(Math.max(1, indexed.records.length)).length
     const merged = await mergeLabeledFiles(
@@ -1445,18 +1462,23 @@ async function runCustody(
   const componentRepos = { ids: componentRepoIds, complete: componentReposComplete }
   // 37792 (@cto 78e96f64 part 2): when ancestry proves every component no witness is needed, so no store-wide
   // `fsck --full` runs at all; the index is still built, because it is what names the leftover objects.
-  const skipFsck =
-    witnessPolicy !== undefined &&
-    (await ancestryCoversEveryComponent(
-      copyRoot,
-      components,
-      componentRepoByComponent,
-      stores,
-      environmentHeads,
-      witnessPolicy.targetBranch,
-      proofRun,
-      remaining,
-    ))
+  const ancestry =
+    witnessPolicy === undefined
+      ? { provenRepos: new Set<string>(), allProven: false }
+      : await ancestryProof(
+          copyRoot,
+          components,
+          componentRepoByComponent,
+          stores,
+          environmentHeads,
+          witnessPolicy.targetBranch,
+          proofRun,
+          remaining,
+        )
+  // A component ancestry already proves needs no witness, so no store that mirrors only proven repositories is
+  // fscked on its behalf; a store also serving an unproven component is still fscked, because that component needs it.
+  const skipFsck = ancestry.allProven
+  const skipFsckRepos = ancestry.provenRepos
   const { records, formats, published, unsubtracted, nonWitnesses, foreign, unscoped, index } =
     indexScope === undefined
       ? await buildIndex()
@@ -1468,6 +1490,7 @@ async function runCustody(
             [...componentRepoIds].sort(),
             componentReposComplete,
             skipFsck,
+            [...skipFsckRepos].sort(),
           ]),
           buildIndex,
         )
