@@ -29,7 +29,7 @@ import { tryAcquireFlock } from "@bearly/flock"
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest"
 import { runCli } from "../src/cli.ts"
 import { retireRetainedBatch, type RetentionBatchOptions, type RetentionBatchResult } from "../src/retention-batch.ts"
-import { defaultGitRun } from "../src/retention-contents.ts"
+import { defaultGitRun, defaultGitStream, type GitStreamFactory } from "../src/retention-contents.ts"
 import { scanEstate } from "../src/retention-estate.ts"
 import { inspectRetainedEntryInBatch } from "../src/retention-verify.ts"
 
@@ -126,6 +126,7 @@ beforeEach(() => {
   rmSync(join(common, "worktrees", "cold-owner"), { recursive: true, force: true })
   rmSync(join(fixtureRoot, "revived-owner"), { recursive: true, force: true })
   rmSync(join(common, "modules", "retained-batch"), { recursive: true, force: true })
+  rmSync(join(fixtureRoot, "graph-witness"), { recursive: true, force: true })
   for (const name of ["owner-list-a", "owner-list-b", "store-a", "store-b", "store-x"]) {
     rmSync(join(fixtureRoot, name), { recursive: true, force: true })
   }
@@ -529,6 +530,13 @@ describe("retention retirement batch (#33010)", async () => {
       expect(timing?.receiptMs).toBeDefined()
       expect(timing?.receiptMs).toBeGreaterThanOrEqual(0)
       expect(timing?.deadlineCutMs).toBeUndefined()
+      // Every subphase is a nested custody operation, measured on its own; none of them may be a top-level bucket.
+      expect(Object.keys(timing?.subphases ?? {}).every((name) => !topLevel.has(name))).toBe(true)
+      for (const [name, spend] of Object.entries(timing?.subphases ?? {})) {
+        expect(spend, name).toBeGreaterThanOrEqual(0)
+        // A nested operation is inclusive inside `child`, so it can never exceed it.
+        expect(spend, name).toBeLessThanOrEqual(timing?.phases.child ?? 0)
+      }
       // Non-overlapping: the top-level buckets cannot exceed the entry's own span, and the residual is reported as
       // measured instead of being clamped to zero.
       expect(timing?.unattributedMs).toBeGreaterThanOrEqual(0)
@@ -553,17 +561,80 @@ describe("retention retirement batch (#33010)", async () => {
     for (const timing of cutTimings) {
       // The entry died in a live phase; the drain that ran after the cut never takes its name.
       expect(["setup", "child"]).toContain(timing.lastPhase)
+      // 34127 (@cto turn60): the cut time is published in the entry's own (batch-relative) coordinates, so it can be
+      // checked against the boundaries beside it instead of against a different clock.
+      expect(timing.deadlineCutMs).toBeGreaterThanOrEqual(timing.startMs)
+      expect(timing.deadlineCutMs).toBeLessThanOrEqual(timing.endMs)
       // Drain was entered after the cut and is measured, but the certificate write was never reached.
       expect(timing.phases.drain).toBeDefined()
       expect(timing.phases.receipt).toBeUndefined()
       expect(timing.receiptMs).toBeUndefined()
       // Whatever phase died keeps a positive spend instead of being dropped with the frame.
       expect(Object.values(timing.phases).reduce((sum, ms) => sum + ms, 0)).toBeGreaterThan(0)
-      // A custody subphase, when the run reaches one, carries its own positive spend beside `child`.
+      // A custody subphase, when the run reaches one, carries its own measured spend beside `child` - never a negative
+      // or window-derived one.
       for (const [name, spend] of Object.entries(timing.subphases ?? {})) {
-        expect(spend, name).toBeGreaterThan(0)
+        expect(spend, name).toBeGreaterThanOrEqual(0)
+        expect(spend, name).toBeLessThanOrEqual(timing.phases.child ?? Number.POSITIVE_INFINITY)
       }
     }
+  })
+
+  // 34127 (@cto turn60 defect 1): a slow `rev-list --objects` was charged to `witnessFsck` (1501 ms for a 5.27 ms fsck)
+  // and the graph walk that actually spent it reported 0. The operation that ran must own its time.
+  it("attributes a slow witness graph walk to refGraph, never to the fsck window left open above it", async () => {
+    const graphDelayMs = 300
+    const slowGraph: GitStreamFactory = (args, streamOptions = {}) => {
+      const inner = defaultGitStream(args, streamOptions)
+      if (!(args.includes("rev-list") && args.includes("--objects"))) return inner
+      return {
+        lines: (async function* () {
+          await new Promise((resolve) => setTimeout(resolve, graphDelayMs))
+          yield* inner.lines
+        })(),
+        outcome: inner.outcome,
+      }
+    }
+    // The witness walk only runs for an entry holding at-risk objects, so one owned blob is written into the shared
+    // submodule store before its checkout is retained: the copy carries an object no ref reaches, and the surviving
+    // store is a witness that already holds it.
+    const worktree = join(fixtureRoot, "graph-witness")
+    const before = new Set(readdirSync(root))
+    expect(await runCli(["--repo", dirname(common), "worktree", "add", worktree, "HEAD"], sink(), sink())).toBe(0)
+    const submodule = join(worktree, "vendor", "dep")
+    execFileSync("git", ["-C", submodule, "hash-object", "-w", "--stdin"], {
+      env: environment,
+      input: "owned by no ref\n",
+    })
+    expect(
+      await runCli(["--repo", dirname(common), "worktree", "remove", worktree, "--retain", root], sink(), sink()),
+    ).toBe(0)
+    const name = readdirSync(root).find((candidate) => !before.has(candidate)) as string
+    const entry = join(root, name)
+    const manifest = JSON.parse(readFileSync(join(entry, "manifest.json"), "utf8")) as { retainUntil: string }
+    const result = await retireRetainedBatch(
+      options({
+        entries: [entry],
+        proofDeadlineMs: 600_000,
+        gitStream: slowGraph,
+        clock: new Date(Date.parse(manifest.retainUntil) + 1000),
+      }),
+    )
+    expect(result.stopped).toBeUndefined()
+    const refGraph = result.proofPhases?.refGraph
+    expect(refGraph, JSON.stringify({ phases: result.proofPhases, rows: result.rows })).toBeDefined()
+    expect(refGraph ?? 0).toBeGreaterThanOrEqual(graphDelayMs)
+    const timing = result.preliminaryEntryTimings?.[entry]
+    expect(timing, entry).toBeDefined()
+    const spent = timing?.subphases?.refGraph
+    expect(spent).toBeDefined()
+    expect(spent ?? 0).toBeGreaterThanOrEqual(graphDelayMs)
+    // The graph walk is the only slow operation here, so the fsck figure must stay below both the graph's spend and the
+    // injected delay - the defect reported the graph's 1501 ms as fsck on a store whose fsck took 5 ms.
+    const fsck = timing?.subphases?.witnessFsck ?? 0
+    expect(fsck).toBeGreaterThanOrEqual(0)
+    expect(fsck).toBeLessThan(spent ?? 0)
+    expect(fsck).toBeLessThan(graphDelayMs)
   })
 
   // #35047 (@dev/review2 REVISE bf2e0b30): the deadline cuts a custody walk already running only if the batch hands it

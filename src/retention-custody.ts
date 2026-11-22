@@ -147,6 +147,12 @@ export interface CustodyScanOptions {
    */
   readonly onPhaseEnter?: (name: string) => void
   /**
+   * 34127 (@cto turn60): the REAL time a named operation spent, reported once per phase when the walk ends — including an
+   * exceptional exit. Enter windows overlap by construction (the fsck window runs under the graph walk), so only these
+   * durations are arithmetic; the windows only carry the phase name.
+   */
+  readonly onPhaseSpend?: (name: string, ms: number) => void
+  /**
    * #35062: the run-owned witness index this scan shares with the other members of its proof phase. Absent, the scan
    * builds its own index in `sidecarDir`, as a single-entry verify always has.
    */
@@ -1227,6 +1233,7 @@ async function indexWitnessStores(
   skipFsckRepos: ReadonlySet<string> = new Set<string>(),
   runScope?: CustodyRunScope,
   onPhaseEnter?: (name: string) => void,
+  onPhaseSpend?: (name: string, ms: number) => void,
 ): Promise<Awaited<ReturnType<typeof indexWitnessStoresReported>>> {
   const phaseStats = { witnessFsckMs: 0, refGraphMs: 0, refGraphEntered: false }
   onPhaseEnter?.("witnessFsck")
@@ -1252,6 +1259,10 @@ async function indexWitnessStores(
   } finally {
     onPhase?.("witnessFsck", phaseStats.witnessFsckMs)
     if (phaseStats.refGraphEntered) onPhase?.("refGraph", phaseStats.refGraphMs)
+    // 34127 (@cto turn60): the durations, not the windows, are what a reader can add up: the fsck window stays open
+    // under the graph walk, so reporting both windows would count the graph twice.
+    onPhaseSpend?.("witnessFsck", phaseStats.witnessFsckMs)
+    if (phaseStats.refGraphEntered) onPhaseSpend?.("refGraph", phaseStats.refGraphMs)
   }
 }
 
@@ -1391,12 +1402,14 @@ async function indexWitnessStoresReported(
     if (read.published !== undefined) published.push(read.published)
     phaseStats.witnessFsckMs += read.fsckMs
     const storeStream = atStoreStream(stream, gitDir, read.detached)
+    // 34127 (@cto turn60): anchored outside the try so a walk cut mid-way still reports the time it spent.
+    let graphStarted: number | undefined
     try {
       if (!phaseStats.refGraphEntered) {
         phaseStats.refGraphEntered = true
         onPhaseEnter?.("refGraph")
       }
-      const refStarted = clock()
+      graphStarted = clock()
       for (const entry of read.selected) {
         // #34920 A3: subtract earlier-ranked tips whose closure this store's walk computes exactly as their own store
         // did: always this store's own earlier refs; another store's only when both traversals are plain. The object
@@ -1452,7 +1465,6 @@ async function indexWitnessStoresReported(
         })
         prior.push({ store, tip: entry.tip, plain: read.plain })
       }
-      phaseStats.refGraphMs += clock() - refStarted
     } catch (error) {
       // A proof limit that refused the store (policy, remote authority, shallow graph, an expired budget) keeps the
       // entry unknown; only a store that cannot be read is excluded.
@@ -1466,6 +1478,8 @@ async function indexWitnessStoresReported(
       unscoped.length = mark.unscoped
       formats.delete(store)
       corrupt.push(`${gitDir} (${error.message})`)
+    } finally {
+      if (graphStarted !== undefined) phaseStats.refGraphMs += clock() - graphStarted
     }
     startRead(index + readAhead)
   }
@@ -2022,6 +2036,8 @@ async function runCustody(
   runScope?: CustodyRunScope,
   /** 34127 (@cto e8f6c3b5): the phase entered, reported before its completed span exists. */
   onPhaseEnter?: (name: string) => void,
+  /** 34127 (@cto turn60): the real duration of each named operation, including one cut by the deadline. */
+  onPhaseSpend?: (name: string, ms: number) => void,
 ): Promise<CustodyScan> {
   const remaining = (): number => {
     const left = deadline === undefined ? Number.POSITIVE_INFINITY : deadline - clock()
@@ -2125,6 +2141,7 @@ async function runCustody(
       skipFsckRepos,
       runScope,
       onPhaseEnter,
+      onPhaseSpend,
     )
     const width = String(Math.max(1, indexed.records.length)).length
     const merged = await asProofDeadline(
@@ -2596,6 +2613,7 @@ export async function scanCustody(
       options.environmentHeads,
       options.runScope,
       options.onPhaseEnter,
+      options.onPhaseSpend,
     )
   } catch (error) {
     return {

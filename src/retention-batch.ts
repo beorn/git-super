@@ -119,9 +119,10 @@ export type RetentionBatchResult = Readonly<{
    * the custody walk's named phases are reported beside them under `subphases`, inclusive inside `child`, because
    * their windows can span several stores and must never be subtracted from it. `lastPhase` is the deepest phase that
    * was LIVE when the entry entered it, so a deadline cut keeps naming the operation that died, not the cleanup that
-   * ran after it; `deadlineCutMs` is where that cut was first observed. `receiptMs` is the measured certificate write
-   * at its call site, absent when the entry never reached it. `unattributedMs` is the residual as measured, reported
-   * even when negative so overlapping windows stay visible rather than being clamped away.
+   * ran after it; `deadlineCutMs` is where that cut was first observed, in the same batch-relative coordinates as
+   * `startMs`/`endMs`, so it always satisfies `startMs <= deadlineCutMs <= endMs`. `receiptMs` is the measured
+   * certificate write at its call site, absent when the entry never reached it. `unattributedMs` is the residual as
+   * measured, reported even when negative so overlapping windows stay visible rather than being clamped away.
    */
   preliminaryEntryTimings?: Readonly<
     Record<
@@ -428,13 +429,22 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
   }
   // A phase entered but never ended is the phase the entry died in: its elapsed so far is kept, not dropped. A phase
   // reached only after the cut was observed does not claim lastPhase; it is cleanup spend, recorded as such.
+  // 34127 (@cto turn60): every instant published here is converted to batch coordinates on arrival, because the verify
+  // clock starts at the entry and the receipt is read next to the batch's own boundaries. The custody walk's nested
+  // phases arrive as `spend` events carrying the measured duration of the operation that ran, so the `witnessFsck`
+  // window staying open under `refGraph` can never charge the graph's time to fsck.
   const recordEntryTiming =
     (entry: string) =>
-    (event: Readonly<{ kind: "enter" | "end"; phase: string; ms: number; claimsPhase?: boolean }>): void => {
+    (event: Readonly<{ kind: "enter" | "end" | "spend"; phase: string; ms: number; claimsPhase?: boolean }>): void => {
       const state = timingFor(entry)
+      if (event.kind === "spend") {
+        state.subphases.set(event.phase, (state.subphases.get(event.phase) ?? 0) + Math.max(0, event.ms))
+        return
+      }
+      const atBatchMs = state.startMs + event.ms
       if (event.kind === "enter") {
         if (event.claimsPhase === false) {
-          if (state.deadlineCutMs === undefined) state.deadlineCutMs = event.ms
+          if (state.deadlineCutMs === undefined) state.deadlineCutMs = atBatchMs
         } else {
           state.lastPhase = event.phase
         }
@@ -443,9 +453,12 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
       }
       const started = state.enteredAt.get(event.phase)
       state.enteredAt.delete(event.phase)
-      const spend = Math.max(0, event.ms - (started ?? 0))
-      const bucket = TOP_LEVEL_PHASES.has(event.phase) ? state.phases : state.subphases
-      bucket.set(event.phase, (bucket.get(event.phase) ?? 0) + spend)
+      // Only the entry's own top-level intervals are read from their window: they never overlap. A nested custody phase
+      // that ever reported an `end` instead would still take its number from `spend`, never from window arithmetic.
+      if (TOP_LEVEL_PHASES.has(event.phase)) {
+        const spend = Math.max(0, event.ms - (started ?? 0))
+        state.phases.set(event.phase, (state.phases.get(event.phase) ?? 0) + spend)
+      }
     }
   const verifyOptions = (entry: string, phase: "pre" | "held", sharedDeadline?: number): RetentionVerifyOptions => {
     // exactOptionalPropertyTypes: a shared spread of `number | undefined` is not assignable to `deadline?: number`, so

@@ -233,12 +233,16 @@ export type RetentionVerifyOptions = Readonly<{
    * Phases in order: setup (gates 1-4), child (gate 5, including the custody walk's own witnessFsck / refGraph /
    * witnessCertificates), drain (result assembly), receipt (the certificate write at its call site).
    *
+   * 34127 (@cto turn60): the custody walk's nested phases also arrive as `spend`, carrying the measured duration of the
+   * operation itself rather than a window. Their windows nest (`witnessFsck` stays open under `refGraph`), so only the
+   * operation duration can be added up without charging one phase's time to another.
+   *
    * 34127 (@cto turn58): `claimsPhase: false` marks work that began AFTER the deadline was already observed passed.
    * Its spend is still reported, but it must not name the cut: the phase the entry died in is the last one that was
    * live when it entered, never the cleanup that ran after the walk gave up.
    */
   readonly entryTimings?: (
-    event: Readonly<{ kind: "enter" | "end"; phase: string; ms: number; claimsPhase?: boolean }>,
+    event: Readonly<{ kind: "enter" | "end" | "spend"; phase: string; ms: number; claimsPhase?: boolean }>,
   ) => void
   /**
    * 34787: an explicit discard of exactly the loss gate 5 finds. It never passes gate 5; a match makes the verdict
@@ -1161,7 +1165,6 @@ async function evaluateRetainedEntry(
       : {
           onPhase: (name: string, ms: number) => {
             options.custodyPhases?.(name, ms)
-            options.entryTimings?.({ kind: "end", phase: name, ms: elapsed() })
           },
           ...(options.entryTimings === undefined
             ? {}
@@ -1173,6 +1176,9 @@ async function evaluateRetainedEntry(
                     ms: elapsed(),
                     claimsPhase: !deadlinePassed(),
                   }),
+                // 34127 (@cto turn60): only the operations' real durations are added up. The fsck window stays open
+                // under the graph walk, so window arithmetic would charge the graph time to fsck.
+                onPhaseSpend: (name: string, ms: number) => options.entryTimings?.({ kind: "spend", phase: name, ms }),
               }),
         }),
     clock: monotonic,
