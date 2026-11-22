@@ -31,6 +31,7 @@ import {
 } from "./retention-estate.ts"
 import { pointers, proofFacts } from "./retention-remove.ts"
 import { CustodyRunScope } from "./retention-custody.ts"
+import type { GitRun, GitStreamFactory } from "./retention-contents.ts"
 import {
   inspectRetainedEntryInBatch,
   type RetentionVerifyOptions,
@@ -68,6 +69,13 @@ export type RetentionBatchOptions = Readonly<{
   scanBounds?: EstateScanBounds
   /** Test seam: runs between the scan and the first lease window, as a writer with no lease would. */
   afterScan?: () => void
+  /**
+   * 37792 (@cto 2026-11-22 9f716dad): the two readers a measurement harness wraps - the same hooks a custody scan
+   * takes - so an owned harness can record each child's argv, start, result and duration without a production flag.
+   * Absent, the batch uses the shipped readers exactly as before.
+   */
+  gitRun?: GitRun
+  gitStream?: GitStreamFactory
 }>
 
 export type BatchRow = Readonly<{
@@ -358,6 +366,8 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
     namespaceRoots: options.namespaceRoots,
     artifactDir: join(options.artifactDir, basename(entry), phase),
     commonArtifactDir: join(options.artifactDir, "common"),
+    ...(options.gitRun === undefined ? {} : { gitRun: options.gitRun }),
+    ...(options.gitStream === undefined ? {} : { gitStream: options.gitStream }),
     ...(options.targetBranch === undefined ? {} : { custodyTargetBranch: options.targetBranch }),
     custodyRunScope: runScopeFor(phase),
     ...(options.clock === undefined ? {} : { clock: options.clock }),
