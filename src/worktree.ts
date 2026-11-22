@@ -400,7 +400,7 @@ function custodyIdentityError(message: string): Error {
  * commit) plus every local branch tip in its own store. A head that cannot be read is not dropped: it is named in the
  * error, because an unreadable ref must refuse rather than leave custody unproven in silence.
  */
-async function componentHeads(run: GitRun, gitDir: string, deadline: number): Promise<readonly string[]> {
+export async function componentHeads(run: GitRun, gitDir: string, deadline: number): Promise<readonly string[]> {
   const remaining = (): number => {
     const left = deadline - Date.now()
     if (left <= 0) throw custodyIdentityError("shared proof deadline is exhausted")
@@ -451,15 +451,25 @@ async function componentHeads(run: GitRun, gitDir: string, deadline: number): Pr
       heads.push(tip)
       continue
     }
-    // A tag object names a commit through a peel; a ref on a blob or tree names no commit the ancestry proof can
-    // speak for, and the census still roots that object.
-    if (objectType !== "tag") continue
+    // A ref on a blob or tree is still a Gate 4 root (component.refs), so an ancestry proof over commits cannot speak
+    // for this component: hand back NO heads and let the full census path keep every object it roots (@dev/15
+    // 2026-11-22). A partial head set here is the same defect as reading only refs/heads, one ref type over.
+    if (objectType !== "tag") return []
+    // A tag object names a commit through a peel. A peel that FAILS is either a tag of a tree/blob, which is the case
+    // above, or a read that could not complete, which is refused like an unreadable HEAD.
     const peeled = await run([`--git-dir=${gitDir}`, "rev-parse", "--verify", `${ref}^{commit}`], {
       timeoutMs: remaining(),
     })
     remaining()
     const peeledTip = peeled.stdout.trim()
-    if (peeled.code === 0 && peeled.stderr.trim() === "" && /^[0-9a-f]{40,64}$/u.test(peeledTip)) heads.push(peeledTip)
+    if (peeled.code === 0 && peeled.stderr.trim() === "" && /^[0-9a-f]{40,64}$/u.test(peeledTip)) {
+      heads.push(peeledTip)
+      continue
+    }
+    if (/expected commit type|not a commit|is a (blob|tree)\b/iu.test(peeled.stderr)) return []
+    throw custodyIdentityError(
+      `${gitDir}: tag ref ${ref} could not be peeled to a commit (${peeled.stderr.trim() || `exit ${String(peeled.code)}`}); an unreadable head is refused, never dropped`,
+    )
   }
   return [...new Set(heads)]
 }

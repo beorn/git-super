@@ -13,6 +13,7 @@ import { tryAcquireFlock } from "@bearly/flock"
 import {
   CUSTODY_FRESHNESS_INPUT_SPEC,
   CUSTODY_FRESHNESS_SCHEMA_VERSION,
+  componentHeads,
   createGitWorktreeStore,
   hashCustodyFreshnessMaterial,
   scopeCustodyFreshnessMaterial,
@@ -20,6 +21,7 @@ import {
 } from "../src/worktree.ts"
 import { createLocalGitProcess } from "../src/process.ts"
 import { gitLineStream, MAX_LINE_LENGTH, type GitStreamOutcome } from "../src/retention-stream.ts"
+import type { GitRun } from "../src/retention-contents.ts"
 import { superWorktreeRemove } from "../src/worktree-remove.ts"
 import { addNestedAlphaSubmodule, canonicalTmpdir, createProductFixture, createRepository, git } from "./fixture.ts"
 
@@ -299,6 +301,89 @@ describe("git-super worktree remove of a vendor component worktree (28393)", () 
       } else {
         expect(result.state, result.detail?.message ?? JSON.stringify(result)).toBe("updated")
       }
+    } finally {
+      // raw-delete-allow: this isolated mkdtemp fixture owns every path beneath root
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  /**
+   * @failure 37455-A forward (@dev/15 2026-11-22): a ref on a blob is a Gate 4 root, so an ancestry proof over
+   *          commits cannot speak for the component — skipping that ref proved the component and dropped the blob.
+   */
+  it("keeps a blob named only by a ref instead of proving the component on a partial ref set", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-component-blob-"))
+    try {
+      const fixture = createProductFixture(root)
+      const product = fixture.product
+      const target = join(root, "target")
+      git(product, "worktree", "add", "--detach", target)
+      git(target, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
+      const alphaWt = join(target, "packages/alpha")
+      const alpha = join(product, "packages/alpha")
+      writeFileSync(join(alphaWt, "blob-only.txt"), "held only by refs/keep/blob\n")
+      const blob = git(alphaWt, "hash-object", "-w", join(alphaWt, "blob-only.txt"))
+      git(alphaWt, "update-ref", "refs/keep/blob", blob)
+      const alphaGitDir = git(alphaWt, "rev-parse", "--absolute-git-dir")
+
+      const result = await superWorktreeRemove({
+        repo: product,
+        path: target,
+        retain: join(root, "retained"),
+        componentCustody: { primaryRoot: product, targetBranch: "main" },
+      })
+
+      const proof = result.proof?.componentCustody
+      const proven = proof?.reachability?.map((entry) => entry.component) ?? []
+      const holds = (gitDir: string): boolean => {
+        try {
+          git(root, `--git-dir=${gitDir}`, "cat-file", "-e", blob)
+          return true
+        } catch {
+          return false
+        }
+      }
+      const survived = holds(alphaGitDir) || holds(alpha)
+      const namedMissing =
+        result.custody?.oid === blob || (result.custody?.detail ?? "").includes(blob.slice(0, 12))
+      expect(survived || namedMissing, `blob ${blob} dropped: proven=${JSON.stringify(proven)}`).toBe(true)
+      // The observable contract: a ref the ancestry proof cannot speak for means the component is NOT proven on the
+      // remaining head set. Skipping the ref instead proved packages/alpha and left the blob as unreferenced.
+      expect(proven, `proven=${JSON.stringify(proven)}`).not.toContain("packages/alpha")
+      if (result.state === "unchanged") {
+        expect(result.reason).toBe("component-custody")
+        expect(existsSync(target)).toBe(true)
+      } else {
+        expect(result.state, result.detail?.message ?? JSON.stringify(result)).toBe("updated")
+      }
+    } finally {
+      // raw-delete-allow: this isolated mkdtemp fixture owns every path beneath root
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  /**
+   * @failure 37455-A forward (@dev/15 2026-11-22): componentHeads must hand back NO heads when a census-rooted ref
+   *          names a non-commit. A partial head set is what lets the ancestry proof pass and still drop the object
+   *          that ref holds — the same defect as reading only refs/heads, one ref type over.
+   */
+  it("componentHeads yields no heads when a census-rooted ref is not a commit", async () => {
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-heads-"))
+    try {
+      const repo = join(root, "repo")
+      const head = createRepository(repo, "a.txt", "a\n")
+      const blobFile = join(root, "blob.txt")
+      writeFileSync(blobFile, "held only by refs/keep/blob\n")
+      const blob = git(repo, "hash-object", "-w", blobFile)
+      git(repo, "update-ref", "refs/keep/blob", blob)
+      const gitDir = git(repo, "rev-parse", "--absolute-git-dir")
+      const local = createLocalGitProcess()
+      const run: GitRun = async (args, options) => local.run({ repo: gitDir, args: [...args], ...(options ?? {}) })
+      const deadline = Date.now() + 60_000
+      expect(await componentHeads(run, gitDir, deadline)).toEqual([])
+      // Control: the same repository with only commit refs still reports its heads.
+      git(repo, "update-ref", "-d", "refs/keep/blob")
+      expect(await componentHeads(run, gitDir, deadline)).toEqual([head])
     } finally {
       // raw-delete-allow: this isolated mkdtemp fixture owns every path beneath root
       await rm(root, { recursive: true, force: true })
