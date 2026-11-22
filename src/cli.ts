@@ -935,6 +935,10 @@ async function runInvocation(
       "--proof-deadline-seconds <seconds>",
       "proof budget for the batch: an entry not proved by then is kept with the cause named (default 960: the report after it took 105 s on the live estate, under Yrd's 1200 s timeout)",
     )
+    .option(
+      "--custody-target-branch <branch>",
+      "published branch gate 5 proves component heads against (37792); omitted keeps the witness and patch proofs",
+    )
     .argument("<entries...>", "exact retained entries selected by the caller")
     .action((entries: string[], _options, command) => {
       const globals = command.optsWithGlobals() as { json?: boolean }
@@ -947,6 +951,7 @@ async function runInvocation(
         rankOnly?: boolean
         rankDeadlineSeconds?: string
         proofDeadlineSeconds?: string
+        custodyTargetBranch?: string
       }
       if (options.rankOnly === true) {
         if (options.proofDeadlineSeconds !== undefined) {
@@ -988,6 +993,7 @@ async function runInvocation(
           artifactDir: options.artifactDir,
           namespaceRoots: options.namespace,
           ...(options.apply === true ? { apply: true } : {}),
+          ...(options.custodyTargetBranch === undefined ? {} : { targetBranch: options.custodyTargetBranch }),
           proofDeadlineMs: proofSeconds * 1000,
         },
         json: globals.json === true,
