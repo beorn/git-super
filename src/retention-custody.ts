@@ -1279,28 +1279,30 @@ async function ancestryCoversEveryComponent(
     let proven = false
     for (const store of stores) {
       const storeGitDir = dirname(store)
+      const storeRun = atStore(run, storeGitDir, await worktreeGone(storeGitDir, run))
       let identity: Awaited<ReturnType<typeof storeRepoIdentity>>
       try {
-        identity = await storeRepoIdentity(storeGitDir, run, remaining)
+        identity = await storeRepoIdentity(storeGitDir, storeRun, remaining)
       } catch {
         continue
       }
       if (identity.status !== "known" || identity.id !== repo) continue
       let tip: string | undefined
       try {
-        const remote = await configuredRemote(storeGitDir, run)
+        const remote = await configuredRemote(storeGitDir, storeRun)
         if (remote === undefined) return false
         tip = (await refreshPublishedRefs(storeGitDir, remote, targetBranch, run)).branchTip
       } catch {
         return false
       }
       if (tip === undefined) return false
+      const componentGitDir = component.gitDir ?? join(copyRoot, component.component)
       const ancestry = await headsAreAncestors(
-        component.gitDir ?? join(copyRoot, component.component),
+        componentGitDir,
         componentHeads,
         tip,
         storeGitDir,
-        run,
+        atStore(run, componentGitDir, await worktreeGone(componentGitDir, run)),
         remaining,
       )
       if (ancestry.status === "ancestors") proven = true
@@ -1427,9 +1429,12 @@ async function runCustody(
   const componentRepoByComponent = new Map<string, string>()
   let componentReposComplete = components.length > 0
   for (const component of components) {
+    // #34920: a retained module records core.worktree for a checkout that is gone, so its config is read detached or
+    // git refuses to answer at all — which read as an unproved repository and cost the whole run its scoping (#37792).
+    const componentGitDir = component.gitDir ?? join(copyRoot, component.component)
     const identity = await storeRepoIdentity(
-      component.gitDir ?? join(copyRoot, component.component),
-      proofRun,
+      componentGitDir,
+      atStore(proofRun, componentGitDir, await worktreeGone(componentGitDir, proofRun)),
       remaining,
     )
     if (identity.status === "known") {
