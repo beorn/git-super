@@ -32,7 +32,7 @@ import type { SuperMergeResult } from "./merge.ts"
 import type { GitSuperResult } from "./result.ts"
 import type { RetentionVerifyResult } from "./retention-verify.ts"
 import type { CompactRetainedRootReport } from "./retention-compact.ts"
-import type { RetentionBatchResult } from "./retention-batch.ts"
+import { fragmentUseText, type RetentionBatchResult } from "./retention-batch.ts"
 import { formatRetainedBytes, type RetainedRanking } from "./retention-bytes.ts"
 import type { PrivateStoreCandidateResult } from "./private-store-candidate.ts"
 import type { SuperStatusResult } from "./status.ts"
@@ -1533,6 +1533,8 @@ async function writeResult(
         const subphases = Object.entries(timing.subphases ?? {})
           .map(([name, ms]) => `${name} ${String(Math.round(ms))}ms`)
           .join(", ")
+        // 37854 (@cto 7debe1c0): absolute counts and the ratio, so the diagnostic can be read without the JSON.
+        const fragmentText = fragmentUseText(timing.fragments)
         stdout.write(
           `timing ${basename(entry)}: start ${String(Math.round(timing.startMs))}ms, end ${String(Math.round(timing.endMs))}ms, ` +
             `slice ${String(timing.sliceMs)}ms` +
@@ -1543,6 +1545,7 @@ async function writeResult(
               ? ", receipt not reached"
               : `, receipt ${String(Math.round(timing.receiptMs))}ms`) +
             `, unattributed ${String(Math.round(timing.unattributedMs))}ms` +
+            `, ${fragmentText}` +
             (phases === "" ? "" : `; ${phases}`) +
             (subphases === "" ? "" : `; in child: ${subphases}`) +
             "\n",

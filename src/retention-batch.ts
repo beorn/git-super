@@ -138,9 +138,20 @@ export type RetentionBatchResult = Readonly<{
         subphases?: Readonly<Record<string, number>>
         receiptMs?: number
         unattributedMs: number
+        /**
+         * 37854 (@cto 7debe1c0): the ref walks this entry itself paid for and the ones it reused from earlier entries
+         * in the same preliminary pass. Always present; `0`/`0` means this entry observed no eligible walk (it never
+         * reached one, or was not started), never "not measured". Diagnostic only: it changes no deadline or decision.
+         */
+        fragments: Readonly<{ walked: number; reused: number }>
       }>
     >
   >
+  /**
+   * 37854 (@cto 7debe1c0): the preliminary pass's own totals for the same counters, so the per-entry deltas can be
+   * checked against them. Absent only when no entry in the pass ever reached the custody walk.
+   */
+  preliminaryFragments?: Readonly<{ walked: number; reused: number }>
   /** The outside Git owners whose existing writer leases a window holds, and how many cannot be leased. */
   owners?: Readonly<{
     total: number
@@ -188,6 +199,18 @@ export type RetentionBatchResult = Readonly<{
   /** Set when the batch stopped early; every entry not yet deleted is kept. */
   stopped?: string
 }>
+
+/**
+ * 37854 (@cto 7debe1c0): the per-entry ref-walk counters as the CLI prints them. `0`/`0` says no eligible walk was
+ * observed - it never reached one, or was not started - which is not the same as "not measured". Diagnostic only.
+ */
+export function fragmentUseText(fragments: Readonly<{ walked: number; reused: number }>): string {
+  const total = fragments.walked + fragments.reused
+  if (total === 0) return "fragments 0 walked / 0 reused (no eligible walk observed)"
+  return `fragments ${String(fragments.walked)} walked / ${String(fragments.reused)} reused (${String(
+    Math.round((fragments.reused / total) * 100),
+  )}% reuse)`
+}
 
 function within(root: string, path: string): boolean {
   const part = relative(root, path)
@@ -411,6 +434,12 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
     readonly phases: Map<string, number>
     readonly subphases: Map<string, number>
     readonly enteredAt: Map<string, number>
+    /**
+     * 37854 (@cto 7debe1c0): this entry's own ref-walk deltas, from the shared preliminary scope. Created at `0`/`0`
+     * and replaced by the measured delta, so it is never absent: `0`/`0` means no eligible walk was observed, not
+     * "not measured".
+     */
+    fragments: Readonly<{ walked: number; reused: number }>
   }
   const timings = new Map<string, EntryTimingState>()
   const timingFor = (entry: string): EntryTimingState => {
@@ -423,6 +452,7 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
       phases: new Map<string, number>(),
       subphases: new Map<string, number>(),
       enteredAt: new Map<string, number>(),
+      fragments: { walked: 0, reused: 0 },
     }
     timings.set(entry, created)
     return created
@@ -553,10 +583,21 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
                   ...(state.subphases.size === 0 ? {} : { subphases: Object.fromEntries(state.subphases) }),
                   ...(receiptMs === undefined ? {} : { receiptMs }),
                   unattributedMs: endMs - state.startMs - accounted,
+                  fragments: state.fragments,
                 },
               ]
             }),
           ),
+        }),
+    // 37854 (@cto 7debe1c0): the pass's own counters, so a reader can check that the per-entry deltas add up and see
+    // the ratio the next design must move. Absent when no entry in the pass ever reached the walk.
+    ...(scopes.get("pre") === undefined
+      ? {}
+      : {
+          preliminaryFragments: {
+            walked: scopes.get("pre")?.fragmentUse.walked ?? 0,
+            reused: scopes.get("pre")?.fragmentUse.reused ?? 0,
+          },
         }),
     scan: scanSummary,
     ...(ownerSummary.current === undefined ? {} : { owners: ownerSummary.current }),
@@ -607,12 +648,20 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
       )
       continue
     }
+    // 37854 (@cto 7debe1c0): the counters live on the pass scope, so each entry's own share of them is the delta across
+    // its proof. Read before and after the call, and set even when the entry is cut inside the walk.
+    const preScope = runScopeFor("pre")
+    const fragmentsBefore = { walked: preScope.fragmentUse.walked, reused: preScope.fragmentUse.reused }
     const proof = await inspectRetainedEntryInBatch(
       verifyOptions(entry, "pre", share.deadline),
       entryView(scan, entry),
       entries,
       preliminaryIndex,
     )
+    entryTiming.fragments = {
+      walked: preScope.fragmentUse.walked - fragmentsBefore.walked,
+      reused: preScope.fragmentUse.reused - fragmentsBefore.reused,
+    }
     recordWarnings(proof, "pre")
     preliminary.set(entry, proof)
     if (proof.verdict !== "candidate") {

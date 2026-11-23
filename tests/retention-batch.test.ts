@@ -28,7 +28,12 @@ import { basename, dirname, join, relative } from "node:path"
 import { tryAcquireFlock } from "@bearly/flock"
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest"
 import { runCli } from "../src/cli.ts"
-import { retireRetainedBatch, type RetentionBatchOptions, type RetentionBatchResult } from "../src/retention-batch.ts"
+import {
+  fragmentUseText,
+  retireRetainedBatch,
+  type RetentionBatchOptions,
+  type RetentionBatchResult,
+} from "../src/retention-batch.ts"
 import { defaultGitRun, defaultGitStream, type GitStreamFactory } from "../src/retention-contents.ts"
 import { scanEstate } from "../src/retention-estate.ts"
 import { inspectRetainedEntryInBatch } from "../src/retention-verify.ts"
@@ -542,6 +547,146 @@ describe("retention retirement batch (#33010)", async () => {
       expect(timing?.unattributedMs).toBeGreaterThanOrEqual(0)
       expect(timing?.unattributedMs).toBeLessThanOrEqual((timing?.endMs ?? 0) - (timing?.startMs ?? 0))
     }
+  })
+
+  // 37854 (@cto 7debe1c0): a retained entry holding an object no ref reaches is the shape where the witness ref walk
+  // runs at all, so it is the only one whose `walked`/`reused` can be nonzero. The object goes into the shared submodule
+  // store before the checkout is retained, exactly as the refGraph attribution test above builds its witness.
+  async function witnessEntry(label: string): Promise<string> {
+    const worktree = join(fixtureRoot, label)
+    const before = new Set(readdirSync(root))
+    expect(await runCli(["--repo", dirname(common), "worktree", "add", worktree, "HEAD"], sink(), sink())).toBe(0)
+    execFileSync("git", ["-C", join(worktree, "vendor", "dep"), "hash-object", "-w", "--stdin"], {
+      env: environment,
+      input: `owned by no ref (${label})\n`,
+    })
+    expect(
+      await runCli(["--repo", dirname(common), "worktree", "remove", worktree, "--retain", root], sink(), sink()),
+    ).toBe(0)
+    return join(root, readdirSync(root).find((candidate) => !before.has(candidate)) as string)
+  }
+
+  function retainedUntil(entries: readonly string[]): Date {
+    let latest = 0
+    for (const entry of entries) {
+      const manifest = JSON.parse(readFileSync(join(entry, "manifest.json"), "utf8")) as { retainUntil: string }
+      latest = Math.max(latest, Date.parse(manifest.retainUntil))
+    }
+    return new Date(latest + 1000)
+  }
+
+  // 37854 (@cto 7debe1c0): the diagnostic must be readable per entry, not only as a pass total, and the pass total must
+  // be checkable against the rows. `walked` is a ref walk this entry paid for; `reused` is one it took from the pass's
+  // fragment cache. Neither may change a deadline or a decision.
+  it("publishes each entry's own ref-walk counters and a pass total equal to their sum", async () => {
+    const result = await retireRetainedBatch(options({ proofDeadlineMs: 600_000 }))
+    expect(result.stopped).toBeUndefined()
+    const timings = result.preliminaryEntryTimings ?? {}
+    let walked = 0
+    let reused = 0
+    for (const row of result.rows) {
+      const fragments = timings[row.entry]?.fragments
+      expect(fragments, row.entry).toBeDefined()
+      expect(fragments?.walked, row.entry).toBeGreaterThanOrEqual(0)
+      expect(fragments?.reused, row.entry).toBeGreaterThanOrEqual(0)
+      walked += fragments?.walked ?? 0
+      reused += fragments?.reused ?? 0
+    }
+    // These entries hold no at-risk object, so they reach no witness walk: the honest reading is `0`/`0`, published
+    // rather than omitted, and the pass total says the same.
+    expect({ walked, reused }).toEqual({ walked: 0, reused: 0 })
+    expect(result.preliminaryFragments).toEqual({ walked, reused })
+  })
+
+  // 37854 (@cto 7debe1c0): `0`/`0` is published, never omitted, so a reader cannot mistake "no eligible walk observed"
+  // for "not measured" - and a pass that never reached the walk reports no pass total at all.
+  it("gives every not-started entry a 0/0 counter instead of dropping the field", async () => {
+    const spent = await retireRetainedBatch(options({ proofDeadlineMs: 1 }))
+    expect(spent.rows.every((row) => row.outcome === "kept")).toBe(true)
+    for (const row of spent.rows) {
+      expect(spent.preliminaryEntryTimings?.[row.entry]?.fragments, row.entry).toEqual({ walked: 0, reused: 0 })
+    }
+    expect(spent.preliminaryFragments).toBeUndefined()
+  })
+
+  // A walk a later entry finds in the pass's fragment cache is counted under `reused` instead of `walked`; whether one
+  // entry's walk is repeated by another is what the live five-entry dry run must answer. Here the pass total must still
+  // be exactly the rows' own deltas, so the live figure can be checked against the rows that produced it.
+  it("counts the witness walk an entry pays for and reports the pass total the rows add up to", async () => {
+    const entry = await witnessEntry("fragment-witness-a")
+    const result = await retireRetainedBatch(
+      options({ entries: [entry], proofDeadlineMs: 600_000, clock: retainedUntil([entry]) }),
+    )
+    expect(result.stopped).toBeUndefined()
+    const fragments = result.preliminaryEntryTimings?.[entry]?.fragments
+    expect(fragments?.walked ?? 0).toBeGreaterThan(0)
+    expect(result.preliminaryFragments).toEqual({
+      walked: fragments?.walked ?? 0,
+      reused: fragments?.reused ?? 0,
+    })
+  }, 60_000)
+
+  // 37854 (@cto 7debe1c0): a walk cut by the proof deadline is still a walk this entry paid for. The counter is read
+  // around the proof, so the delta survives a partial walk that is never cached and never becomes custody evidence.
+  it("reports the walk an entry paid for even when the deadline cut it inside that walk", async () => {
+    const entry = await witnessEntry("fragment-witness-cut")
+    const slowWalk: GitStreamFactory = (args, streamOptions = {}) => {
+      const inner = defaultGitStream(args, streamOptions)
+      if (!(args.includes("rev-list") && args.includes("--objects"))) return inner
+      return {
+        lines: (async function* () {
+          await new Promise((resolve) => setTimeout(resolve, 4000))
+          yield* inner.lines
+        })(),
+        outcome: inner.outcome,
+      }
+    }
+    const cut = await retireRetainedBatch(
+      options({ entries: [entry], proofDeadlineMs: 3000, gitStream: slowWalk, clock: retainedUntil([entry]) }),
+    )
+    expect(
+      cut.rows.every((row) => row.outcome === "kept"),
+      JSON.stringify(cut.rows),
+    ).toBe(true)
+    const timing = cut.preliminaryEntryTimings?.[entry]
+    expect(timing?.deadlineCutMs).toBeDefined()
+    expect(timing?.fragments.walked).toBeGreaterThan(0)
+  }, 30_000)
+
+  it("renders both counter readings, and the CLI's per-entry line carries the wording", async () => {
+    // `0`/`0` is a reading, not a missing value; a real ratio is rendered from the same counts.
+    expect(fragmentUseText({ walked: 0, reused: 0 })).toBe("fragments 0 walked / 0 reused (no eligible walk observed)")
+    expect(fragmentUseText({ walked: 3, reused: 9 })).toBe("fragments 3 walked / 9 reused (75% reuse)")
+    expect(fragmentUseText({ walked: 1, reused: 2 })).toBe("fragments 1 walked / 2 reused (67% reuse)")
+    let output = ""
+    let errors = ""
+    const entries = readdirSync(root)
+      .sort()
+      .map((name) => join(root, name))
+    const code = await runCli(
+      [
+        "--repo",
+        dirname(common),
+        "worktree",
+        "retention",
+        "retire-batch",
+        "--root",
+        root,
+        "--common",
+        common,
+        "--namespace",
+        fixtureRoot,
+        "--artifact-dir",
+        join(fixtureRoot, "artifacts"),
+        "--proof-deadline-seconds",
+        "0.001",
+        ...entries,
+      ],
+      { write: (value) => void (output += value) },
+      { write: (value) => void (errors += value) },
+    )
+    expect(code, errors).toBe(2)
+    expect(output).toContain("fragments 0 walked / 0 reused (no eligible walk observed)")
   })
 
   // 34127 (@cto turn58): a walk cut INSIDE a named custody phase must keep that name and its spend after the caller
