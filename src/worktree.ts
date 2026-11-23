@@ -1847,7 +1847,17 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         if (removeOptions.dryRun === true) return
         for (const entry of nested) {
           checkRemovalExecution(execution)
-          const step = await git.run(entry.store, ["--git-dir=" + entry.store, "worktree", "remove", entry.checkout])
+          // A component whose own checkout carries initialized submodules (km and its vendors) makes plain
+          // `git worktree remove` refuse with "working trees containing submodules cannot be moved or removed".
+          // Every entry here is already proven clean and contained above, so --force bypasses only that rule;
+          // without it a landing with materialized components leaks forever (37970, 95283a71).
+          const step = await git.run(entry.store, [
+            "--git-dir=" + entry.store,
+            "worktree",
+            "remove",
+            "--force",
+            entry.checkout,
+          ])
           if (step.code !== 0) {
             throw new Error(
               `worktree ${path} removal stopped: nested component worktree ${entry.checkout} could not be removed ` +

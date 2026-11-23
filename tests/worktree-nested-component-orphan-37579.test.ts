@@ -13,7 +13,7 @@ import { describe, expect, it } from "vitest"
 import { createGitWorktreeStore } from "../src/worktree.ts"
 import { createLocalGitProcess } from "../src/process.ts"
 import { runCli } from "../src/cli.ts"
-import { canonicalTmpdir, createProductFixture, git } from "./fixture.ts"
+import { addNestedAlphaSubmodule, canonicalTmpdir, createProductFixture, git } from "./fixture.ts"
 
 /** One super worktree holding a component worktree whose checkout sits outside it, registered under its admin dir. */
 function nestedFixture(root: string) {
@@ -34,6 +34,36 @@ describe("#37579 nested component worktree outside the removed parent", () => {
     const root = await mkdtemp(join(canonicalTmpdir(), "git-super-37579-clean-"))
     try {
       const { fixture, target, external } = nestedFixture(root)
+      const lines: string[] = []
+      const store = createGitWorktreeStore({
+        repo: fixture.product,
+        gitProcess: createLocalGitProcess(),
+        report: (line) => lines.push(line),
+      })
+      await store.remove(target)
+      expect(existsSync(target)).toBe(false)
+      expect(existsSync(external)).toBe(false)
+      expect(lines.join("")).toContain(`${external}: will remove (clean, contained)`)
+      expect(lines.join("")).toContain(`${external}: removed (clean, contained)`)
+    } finally {
+      // raw-delete-allow: this isolated mkdtemp fixture owns every path beneath root
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it("removes a clean component worktree whose own checkout carries an initialized submodule", async () => {
+    // 37970 / 95283a71: km and its vendors are submodules, so a km worktree registered under a landing's store
+    // refuses plain `git worktree remove` with "working trees containing submodules cannot be moved or removed".
+    // The landing then never reaps and deferred never reaches 0.
+    const root = await mkdtemp(join(canonicalTmpdir(), "git-super-37579-submodule-component-"))
+    try {
+      const fixture = addNestedAlphaSubmodule(createProductFixture(root))
+      const target = join(root, "target")
+      git(fixture.product, "worktree", "add", "--detach", target)
+      git(target, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
+      const external = join(root, "alpha-external")
+      git(join(target, "packages/alpha"), "worktree", "add", "-b", "task/external", external, "HEAD")
+      git(external, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
       const lines: string[] = []
       const store = createGitWorktreeStore({
         repo: fixture.product,
