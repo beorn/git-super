@@ -169,7 +169,8 @@ export interface CustodyScanOptions {
    * 37854 (@cto 3706925a): TEST SEAM for the subtraction-bound experiment only, never a production setting. The walk
    * subtracts at most this many earlier-ranked tips; absent, it uses {@link MAX_SUBTRACTED_TIPS}. A smaller value only
    * re-emits objects an earlier-ranked ref already emitted, which the labeled merge still resolves to that earlier
-   * witness; the experiment must prove that on the fixture before any default changes.
+   * witness — the object set grows, the witness set does not. It can still cross a walk's OID or time bound, which
+   * keeps the entry unknown rather than mis-retiring it; {@link MAX_SUBTRACTED_TIPS} states that limit in full.
    */
   readonly maxSubtractedTips?: number
 }
@@ -866,12 +867,16 @@ interface TraversalContext {
 }
 
 /**
- * 37854 (@cto 283fabfc): the most earlier-ranked tips one walk subtracts before it stops subtracting. It bounds the
- * `--not` list and nothing else — a tip past the bound is simply not excluded, so the emitted fragment can only grow,
- * never lose an object: every object still arrives from some ref, and the labeled merge attributes it to the
- * earliest-ranked witness that reached it. A smaller bound therefore buys time without ever dropping custody evidence.
- * Measured over all 2,057 recorded km/ag walks: 1024 changed 0 of 2,057 emitted sets on two runs (4096->256 changed 12)
- * for 16-18% of child time, inside a ~3% run-to-run spread.
+ * 37854 (@cto 283fabfc, @dev/6 46063009): the most earlier-ranked tips one walk subtracts before it stops subtracting.
+ * It bounds the `--not` list and nothing else: a tip past the bound is simply not excluded, so the emitted OBJECT SET
+ * can only grow, never shrink. Every object still arrives from some ref, and the labeled merge attributes it to the
+ * earliest-ranked witness that reached it, so witness set and missing set are unchanged.
+ *
+ * A larger fragment is not free, and this comment previously overclaimed that it was. A wider walk can cross
+ * `maxReachableOids` or `reachableMs` where a narrower one would not; that walk is then refused, the entry is kept as
+ * unknown, and nothing is mis-retired. That is the honest bound: 1024 changed 0 of 2,057 recorded emitted sets on two
+ * runs (4096->256 changed 12) for 16-18% of child time inside a ~3% run-to-run spread, and no walk in the recording
+ * crossed either bound. A larger fragment costs proof margin, not correctness.
  */
 const MAX_SUBTRACTED_TIPS = 1024
 

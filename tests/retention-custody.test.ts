@@ -2267,4 +2267,66 @@ describe("retention custody scan — head closure and fetched refs (#37792)", ()
     expect(census.fetched.find((entry) => entry.namespace === "refs/remotes/")?.count ?? 0).toBeGreaterThan(0)
     void remote
   })
+
+  // 37854 (@dev/6 46063009): the case the other cap test cannot discriminate. A cap BELOW both readings refuses
+  // both, so it proves nothing about the bound; the honest behaviour to pin is a cap between the two fragment
+  // sizes, where the narrower walk still passes and the wider one is refused. A wider fragment costs proof margin,
+  // never correctness: the entry is kept unknown, never mis-retired.
+  test("a cap between the two fragment sizes refuses the wider walk and keeps the narrower", async () => {
+    const { remote, primary } = publishedStores("git-super-subtract-cap-between-")
+    const head = git(primary, ["rev-parse", "HEAD"])
+    for (const name of ["alpha", "beta", "gamma"]) {
+      git(primary, ["switch", "-q", "-c", name, "main"])
+      writeFileSync(join(primary, `${name}.txt`), `${name}\n`)
+      git(primary, ["add", `${name}.txt`])
+      git(primary, ["commit", "-q", "-m", `${name} work`])
+    }
+    git(primary, ["switch", "-q", "main"])
+    const sidecarDir = tmp("git-super-subtract-cap-between-sidecars-")
+    const component = await componentOf([head], sidecarDir, "owned", { [head]: "commit" })
+    const stores = [join(primary, ".git", "objects")]
+    // Measure the widest single walk under each reading, so the cap below is a measured number, not a guess.
+    const peak = { full: 0, none: 0 }
+    const measuring = (key: "full" | "none"): GitStreamFactory => {
+      return (args, streamOptions) => {
+        const inner = defaultGitStream(args, streamOptions)
+        if (!(args.includes("rev-list") && args.includes("--objects"))) return inner
+        return {
+          lines: (async function* () {
+            let count = 0
+            for await (const line of inner.lines) {
+              count += 1
+              yield line
+            }
+            peak[key] = Math.max(peak[key], count)
+          })(),
+          outcome: inner.outcome,
+        }
+      }
+    }
+    const full = await scanCustody(primary, [component], stores, [], { sidecarDir, stream: measuring("full") })
+    const none = await scanCustody(primary, [component], stores, [], {
+      sidecarDir: tmp("git-super-subtract-cap-between-sidecars-2-"),
+      stream: measuring("none"),
+      maxSubtractedTips: 0,
+    })
+    expect(full.status).toBe("pass")
+    expect(none.status).toBe("pass")
+    // The comparison bites first: subtracting nothing really does emit a wider fragment.
+    expect(peak.none).toBeGreaterThan(peak.full)
+    const between = { ...DEFAULT_CUSTODY_BOUNDS, maxReachableOids: peak.full, reachableMs: 60_000, fsckMs: 60_000 }
+    const fullCut = await scanCustody(primary, [component], stores, [], {
+      sidecarDir: tmp("git-super-subtract-cap-between-sidecars-3-"),
+      bounds: between,
+    })
+    const noneCut = await scanCustody(primary, [component], stores, [], {
+      sidecarDir: tmp("git-super-subtract-cap-between-sidecars-4-"),
+      bounds: between,
+      maxSubtractedTips: 0,
+    })
+    expect(fullCut.status).toBe("pass")
+    expect(noneCut.status).toBe("unknown")
+    expect(noneCut.status).not.toBe(fullCut.status)
+    void remote
+  })
 })
