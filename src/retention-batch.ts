@@ -76,6 +76,11 @@ export type RetentionBatchOptions = Readonly<{
    */
   gitRun?: GitRun
   gitStream?: GitStreamFactory
+  /**
+   * 37792 (@cto 1a773179): set false to force every entry's witness walk, for a caller or case that proves the walk
+   * itself. Default: gate 5 answers from one timestamped live remote snapshot per component when the copy is redundant.
+   */
+  remoteRedundancy?: boolean
 }>
 
 export type BatchRow = Readonly<{
@@ -521,6 +526,7 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
       ...(options.gitRun === undefined ? {} : { gitRun: options.gitRun }),
       ...(options.gitStream === undefined ? {} : { gitStream: options.gitStream }),
       ...(options.targetBranch === undefined ? {} : { custodyTargetBranch: options.targetBranch }),
+      ...(options.remoteRedundancy === undefined ? {} : { remoteRedundancy: options.remoteRedundancy }),
       custodyRunScope: rescan ?? runScopeFor(phase),
       ...(options.clock === undefined ? {} : { clock: options.clock }),
       ...(deadline === undefined ? {} : { deadline }),

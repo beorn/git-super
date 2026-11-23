@@ -32,11 +32,13 @@ import {
 } from "./retention-contents.ts"
 import {
   componentHeads,
+  proveRemoteRedundancy,
   scanCustody,
   type CustodyBounds,
   type CustodyIndexScope,
   type CustodyRunScope,
   type MissingComponentLoss,
+  type RemoteRedundancyProof,
   type WitnessIdentity,
 } from "./retention-custody.ts"
 import { scanEstate, type EstateScan, type EstateScanBounds } from "./retention-estate.ts"
@@ -137,6 +139,12 @@ export type RetentionVerifyResult = Readonly<{
   contents?: readonly ComponentContents[] | undefined
   witnesses?: readonly WitnessIdentity[] | undefined
   /**
+   * 37792 (@cto 1a773179): present when gate 5 proved every component redundant against one timestamped live remote
+   * snapshot per component, so no witness store was read. Per component: the remote, the snapshot time, and every
+   * non-remote ref tip with the advertised ref that reaches it.
+   */
+  redundancy?: readonly Readonly<{ component: string; proof: RemoteRedundancyProof }>[] | undefined
+  /**
    * 34787 (@cto 34787-component-retention-ruling correction 4): when gate 5 blocks, the exact un-witnessed set: its
    * count, the complete sidecar (path and sha256), and per component the count by type and the commit roots. An owner
    * discard binds to this; it is evidence, never removal authority.
@@ -226,6 +234,12 @@ export type RetentionVerifyOptions = Readonly<{
    * is identified and fscked once per run rather than once per entry.
    */
   readonly custodyRunScope?: CustodyRunScope
+  /**
+   * 37792 (@cto 1a773179): set false to force the witness walk. The redundancy fast path is the default because a copy
+   * whose every non-remote ref tip a live advertisement reaches needs no witness; a caller that needs a witness — or a
+   * case that proves the walk's own bounds — turns it off. The production CLI never sets it.
+   */
+  readonly remoteRedundancy?: boolean | undefined
   /**
    * 37792 (@cto c1f3a921): the custody scan's own phase timings (connectivity, ref graph, certificates), handed up so
    * a batch receipt can separate a cold store's fsck from its ordered ref walk instead of reporting one proof total.
@@ -466,6 +480,55 @@ async function componentHeadCensus(
   }
 }
 
+/**
+ * 37792 (@cto 1a773179): prove EVERY component's copy redundant against one timestamped live remote snapshot per
+ * remote. The proofs come back only when every component proved; one unproven component returns `unproven` with that
+ * component's reason, and the entry then keeps exactly the witness walk it had before.
+ */
+async function redundancyCensus(
+  copyRoot: string,
+  components: readonly ComponentContents[],
+  options: RetentionVerifyOptions,
+  refObservations: RefObservations,
+): Promise<
+  | Readonly<{
+      status: "redundant"
+      proofs: readonly Readonly<{ component: string; proof: RemoteRedundancyProof }>[]
+      detail: string
+    }>
+  | Readonly<{ status: "unproven"; detail: string }>
+> {
+  if (components.length === 0) return { status: "unproven", detail: "the entry names no component" }
+  const run = options.gitRun ?? defaultGitRun
+  const deadline = options.deadline ?? Number.POSITIVE_INFINITY
+  const clock = options.monotonic ?? Date.now
+  const remaining = (): number => deadline - clock()
+  const proofs: Array<Readonly<{ component: string; proof: RemoteRedundancyProof }>> = []
+  for (const component of components) {
+    const outcome = await proveRemoteRedundancy({
+      copyRoot,
+      component,
+      run,
+      remaining,
+      observations: refObservations,
+      ...(options.custodyRunScope === undefined ? {} : { scope: options.custodyRunScope }),
+      clock,
+    })
+    if (outcome.status !== "redundant") return { status: "unproven", detail: outcome.detail }
+    proofs.push({ component: component.component, proof: outcome.proof })
+  }
+  return {
+    status: "redundant",
+    proofs,
+    detail: `every non-remote ref tip reached by one timestamped live remote advertisement per component (${proofs
+      .map(
+        (entry) =>
+          `${entry.component}: ${entry.proof.remote} at ${entry.proof.snapshotAt}, ${String(entry.proof.reached.length)} ref tip(s) of ${String(entry.proof.advertisedRefs)} advertised`,
+      )
+      .join("; ")}); no witness store was read`,
+  }
+}
+
 async function evaluateRetainedEntry(
   options: RetentionVerifyOptions,
   context?: EvaluationContext,
@@ -509,6 +572,7 @@ async function evaluateRetainedEntry(
     estate?: EstateScan | undefined
     contents?: readonly ComponentContents[] | undefined
     witnesses?: readonly WitnessIdentity[] | undefined
+    redundancy?: RetentionVerifyResult["redundancy"]
     custody?: RetentionVerifyResult["custody"]
     vanishedAtRead?: RetentionVerifyResult["vanishedAtRead"]
     explicitLoss?: RetentionExplicitLoss | undefined
@@ -1150,134 +1214,174 @@ async function evaluateRetainedEntry(
   // ---- Gate 5: positive surviving custody ----------------------------------------------
   // 34127 (@cto e8f6c3b5): setup ends here; everything the custody stage spawns is child execution.
   enterPhase("child")
-  // 37792 (@cto 78e96f64 part 1): the heads each component's store holds, so the existing 37455-A ancestry proof runs
-  // on this route too. A component whose heads cannot be read keeps the witness proof and is named, never dropped.
-  const headsCensus = await componentHeadCensus(expectedCopyRoot, contents.components, options, refObservations)
-  const custody = await scanCustody(expectedCopyRoot, contents.components, witnessStores, removalSet, {
-    sidecarDir,
-    ...(options.gitRun === undefined ? {} : { run: options.gitRun }),
-    ...(options.gitStream === undefined ? {} : { stream: options.gitStream }),
-    ...(options.bounds?.custody === undefined ? {} : { bounds: options.bounds.custody }),
-    ...(options.deadline === undefined ? {} : { deadline: options.deadline }),
-    ...(context?.audit === false && context.index !== undefined ? { indexScope: context.index } : {}),
-    ...(options.custodyTargetBranch === undefined
-      ? {}
-      : { witnessPolicy: { targetBranch: options.custodyTargetBranch } }),
-    ...(Object.keys(headsCensus.heads).length === 0 ? {} : { environmentHeads: headsCensus.heads }),
-    ...(options.custodyRunScope === undefined ? {} : { runScope: options.custodyRunScope }),
-    // 34127: the custody walk's own phases join the entry's boundary stream, so a cut inside one is attributed to it.
-    // The existing phase log still receives its (name, ms) pair unchanged.
-    ...(options.custodyPhases === undefined && options.entryTimings === undefined
-      ? {}
-      : {
-          onPhase: (name: string, ms: number) => {
-            options.custodyPhases?.(name, ms)
-          },
-          ...(options.entryTimings === undefined
-            ? {}
-            : {
-                onPhaseEnter: (name: string) =>
-                  options.entryTimings?.({
-                    kind: "enter",
-                    phase: name,
-                    ms: elapsed(),
-                    claimsPhase: !deadlinePassed(),
-                  }),
-                // 34127 (@cto turn60): only the operations' real durations are added up. The fsck window stays open
-                // under the graph walk, so window arithmetic would charge the graph time to fsck.
-                onPhaseSpend: (name: string, ms: number) => options.entryTimings?.({ kind: "spend", phase: name, ms }),
-              }),
-        }),
-    clock: monotonic,
-  })
-  result.witnesses = custody.witnesses
-  enterPhase("drain")
-  // 37792 (@cto 8c9ba37e): fetched-copy refs are not heads the ancestry proof must satisfy, and they are counted in
-  // the receipt by namespace, never dropped in silence.
-  // 37792 (@cto 8c9ba37e): fetched-copy refs are not heads the ancestry proof must satisfy, and an unreadable head
-  // keeps the witness proof rather than narrowing it. Both are named in the receipt, never dropped in silence.
-  const censusNotes = [
-    headsCensus.fetched.length === 0
+  // 37792 (@cto 1a773179): the gate-5 facts the certificate names, from the witness walk or from a redundancy proof.
+  // A redundancy proof reads no witness store, so its witness count is honestly zero.
+  let custodyFacts: Readonly<{
+    witnessCount: number
+    witnessSidecar?: SidecarRef | undefined
+    missingSidecar?: SidecarRef | undefined
+  }> = { witnessCount: 0 }
+  // 37792 (@cto 1a773179): a redundant copy is one whose every NON-remote ref tip a TIMESTAMPED LIVE remote
+  // advertisement reaches: the durable copy is then the remote itself, and no witness store has to reproduce it.
+  // Only an entry whose EVERY component proves redundant takes this path; one unproven component keeps the witness
+  // walk for the whole entry, and `redundancyNote` names what the fast path could not prove.
+  const redundantCustody =
+    options.discard !== undefined
+      ? ({ status: "unproven", detail: "a discard disposition was supplied, so the witness walk decides" } as const)
+      : options.remoteRedundancy === false
+        ? ({ status: "unproven", detail: "the caller forced the witness walk" } as const)
+        : await redundancyCensus(expectedCopyRoot, contents.components, options, refObservations)
+  const redundancyNote =
+    redundantCustody.status === "redundant"
       ? ""
-      : `fetched-copy refs excluded from the head set: ${headsCensus.fetched
-          .map((excluded) => `${excluded.namespace} ${String(excluded.count)}`)
-          .join(", ")}`,
-    headsCensus.unreadable.length === 0
-      ? ""
-      : `head census unreadable, witness proof kept: ${headsCensus.unreadable.join("; ")}`,
-  ].filter((note) => note !== "")
-  // 34127 (@cto 536e2c15): name a moving-estate race so the caller can re-inventory instead of reading it as unprovable.
-  if (custody.status === "unknown" && custody.vanishedAtRead !== undefined) {
-    result.vanishedAtRead = custody.vanishedAtRead
-  }
-  const custodyDetail = censusNotes.length === 0 ? custody.detail : `${custody.detail}; ${censusNotes.join("; ")}`
-  if (custody.status === "blocked") {
-    result.custody = {
-      missingCount: custody.missingCount,
-      ...(custody.missingSidecar === undefined ? {} : { missingSidecar: custody.missingSidecar }),
-      loss: custody.loss ?? [],
-    }
-  }
-  if (custody.status === "blocked" && options.discard !== undefined) {
-    const discard = options.discard
-    const mismatch = retentionDiscardMismatch(discard, {
-      entry: entryReal,
-      entryDevIno: result.entryDevIno,
-      manifestSha256: result.manifestSha256,
-      missingCount: custody.missingCount,
-      missingSidecarSha256: custody.missingSidecar?.sha256,
-      loss: custody.loss ?? [],
-    })
-    if (mismatch !== undefined || custody.missingSidecar === undefined) {
-      push(
-        refusal(
-          "positive-custody",
-          `${custodyDetail}; the discard disposition does not name this loss: ${mismatch ?? "no missing-object list was written"}`,
-          {
-            path: expectedCopyRoot,
-            remedy: "Keep the entry; preview the discard again and record a new decision for the loss observed now.",
-          },
-        ),
-      )
-      return finish()
-    }
-    const dispositionSha256 = retentionDiscardDigest(discard)
-    result.explicitLoss = {
-      dispositionSha256,
-      missingCount: custody.missingCount,
-      missingSidecarSha256: custody.missingSidecar.sha256,
-      loss: custody.loss ?? [],
-      reason: discard.reason,
-      attribution: discard.attribution,
-    }
-    // Gate 5 stays blocked: no witness exists. The pass continues so every later gate still runs.
-    push(
-      refusal(
-        "positive-custody",
-        `${custodyDetail}; explicit loss accepted by discard disposition ${dispositionSha256}, no witness claimed`,
-        { path: expectedCopyRoot, remedy: "Only a retire given this exact disposition removes the entry." },
-      ),
-    )
-  } else if (custody.status !== "pass") {
-    push(
-      custody.status === "blocked"
-        ? refusal("positive-custody", custodyDetail, {
-            path: expectedCopyRoot,
-            remedy: "No durable witness holds an at-risk object; the entry preserves the last copy.",
-          })
-        : incomplete("positive-custody", custodyDetail, {
-            path: expectedCopyRoot,
-            remedy: "Prove custody from a durable survivor ref in a clean, empty-of-R store.",
-          }),
-    )
-    return finish()
-  } else {
+      : `redundancy fast path unproven, witness walk kept: ${redundantCustody.detail}`
+  if (redundantCustody.status === "redundant") {
+    result.witnesses = []
+    result.redundancy = redundantCustody.proofs
     push({
       gate: "positive-custody",
       status: "pass",
-      message: custodyDetail,
+      message: redundantCustody.detail,
       path: expectedCopyRoot,
     })
+  } else {
+    // 37792 (@cto 78e96f64 part 1): the heads each component's store holds, so the existing 37455-A ancestry proof runs
+    // on this route too. A component whose heads cannot be read keeps the witness proof and is named, never dropped.
+    const headsCensus = await componentHeadCensus(expectedCopyRoot, contents.components, options, refObservations)
+    const custody = await scanCustody(expectedCopyRoot, contents.components, witnessStores, removalSet, {
+      sidecarDir,
+      ...(options.gitRun === undefined ? {} : { run: options.gitRun }),
+      ...(options.gitStream === undefined ? {} : { stream: options.gitStream }),
+      ...(options.bounds?.custody === undefined ? {} : { bounds: options.bounds.custody }),
+      ...(options.deadline === undefined ? {} : { deadline: options.deadline }),
+      ...(context?.audit === false && context.index !== undefined ? { indexScope: context.index } : {}),
+      ...(options.custodyTargetBranch === undefined
+        ? {}
+        : { witnessPolicy: { targetBranch: options.custodyTargetBranch } }),
+      ...(Object.keys(headsCensus.heads).length === 0 ? {} : { environmentHeads: headsCensus.heads }),
+      ...(options.custodyRunScope === undefined ? {} : { runScope: options.custodyRunScope }),
+      // 34127: the custody walk's own phases join the entry's boundary stream, so a cut inside one is attributed to it.
+      // The existing phase log still receives its (name, ms) pair unchanged.
+      ...(options.custodyPhases === undefined && options.entryTimings === undefined
+        ? {}
+        : {
+            onPhase: (name: string, ms: number) => {
+              options.custodyPhases?.(name, ms)
+            },
+            ...(options.entryTimings === undefined
+              ? {}
+              : {
+                  onPhaseEnter: (name: string) =>
+                    options.entryTimings?.({
+                      kind: "enter",
+                      phase: name,
+                      ms: elapsed(),
+                      claimsPhase: !deadlinePassed(),
+                    }),
+                  // 34127 (@cto turn60): only the operations' real durations are added up. The fsck window stays open
+                  // under the graph walk, so window arithmetic would charge the graph time to fsck.
+                  onPhaseSpend: (name: string, ms: number) =>
+                    options.entryTimings?.({ kind: "spend", phase: name, ms }),
+                }),
+          }),
+      clock: monotonic,
+    })
+    // 37792 (@cto 1a773179): the certificate names these facts whichever way gate 5 was decided.
+    custodyFacts = {
+      witnessCount: custody.witnessCount,
+      ...(custody.witnessSidecar === undefined ? {} : { witnessSidecar: custody.witnessSidecar }),
+      ...(custody.missingSidecar === undefined ? {} : { missingSidecar: custody.missingSidecar }),
+    }
+    result.witnesses = custody.witnesses
+    enterPhase("drain")
+    // 37792 (@cto 8c9ba37e): fetched-copy refs are not heads the ancestry proof must satisfy, and they are counted in
+    // the receipt by namespace, never dropped in silence.
+    // 37792 (@cto 8c9ba37e): fetched-copy refs are not heads the ancestry proof must satisfy, and an unreadable head
+    // keeps the witness proof rather than narrowing it. Both are named in the receipt, never dropped in silence.
+    const censusNotes = [
+      redundancyNote,
+      headsCensus.fetched.length === 0
+        ? ""
+        : `fetched-copy refs excluded from the head set: ${headsCensus.fetched
+            .map((excluded) => `${excluded.namespace} ${String(excluded.count)}`)
+            .join(", ")}`,
+      headsCensus.unreadable.length === 0
+        ? ""
+        : `head census unreadable, witness proof kept: ${headsCensus.unreadable.join("; ")}`,
+    ].filter((note) => note !== "")
+    // 34127 (@cto 536e2c15): name a moving-estate race so the caller can re-inventory instead of reading it as unprovable.
+    if (custody.status === "unknown" && custody.vanishedAtRead !== undefined) {
+      result.vanishedAtRead = custody.vanishedAtRead
+    }
+    const custodyDetail = censusNotes.length === 0 ? custody.detail : `${custody.detail}; ${censusNotes.join("; ")}`
+    if (custody.status === "blocked") {
+      result.custody = {
+        missingCount: custody.missingCount,
+        ...(custody.missingSidecar === undefined ? {} : { missingSidecar: custody.missingSidecar }),
+        loss: custody.loss ?? [],
+      }
+    }
+    if (custody.status === "blocked" && options.discard !== undefined) {
+      const discard = options.discard
+      const mismatch = retentionDiscardMismatch(discard, {
+        entry: entryReal,
+        entryDevIno: result.entryDevIno,
+        manifestSha256: result.manifestSha256,
+        missingCount: custody.missingCount,
+        missingSidecarSha256: custody.missingSidecar?.sha256,
+        loss: custody.loss ?? [],
+      })
+      if (mismatch !== undefined || custody.missingSidecar === undefined) {
+        push(
+          refusal(
+            "positive-custody",
+            `${custodyDetail}; the discard disposition does not name this loss: ${mismatch ?? "no missing-object list was written"}`,
+            {
+              path: expectedCopyRoot,
+              remedy: "Keep the entry; preview the discard again and record a new decision for the loss observed now.",
+            },
+          ),
+        )
+        return finish()
+      }
+      const dispositionSha256 = retentionDiscardDigest(discard)
+      result.explicitLoss = {
+        dispositionSha256,
+        missingCount: custody.missingCount,
+        missingSidecarSha256: custody.missingSidecar.sha256,
+        loss: custody.loss ?? [],
+        reason: discard.reason,
+        attribution: discard.attribution,
+      }
+      // Gate 5 stays blocked: no witness exists. The pass continues so every later gate still runs.
+      push(
+        refusal(
+          "positive-custody",
+          `${custodyDetail}; explicit loss accepted by discard disposition ${dispositionSha256}, no witness claimed`,
+          { path: expectedCopyRoot, remedy: "Only a retire given this exact disposition removes the entry." },
+        ),
+      )
+    } else if (custody.status !== "pass") {
+      push(
+        custody.status === "blocked"
+          ? refusal("positive-custody", custodyDetail, {
+              path: expectedCopyRoot,
+              remedy: "No durable witness holds an at-risk object; the entry preserves the last copy.",
+            })
+          : incomplete("positive-custody", custodyDetail, {
+              path: expectedCopyRoot,
+              remedy: "Prove custody from a durable survivor ref in a clean, empty-of-R store.",
+            }),
+      )
+      return finish()
+    } else {
+      push({
+        gate: "positive-custody",
+        status: "pass",
+        message: custodyDetail,
+        path: expectedCopyRoot,
+      })
+    }
   }
 
   // ---- Gate 6: preliminary certificate -------------------------------------------------
@@ -1319,10 +1423,11 @@ async function evaluateRetainedEntry(
         : { missingRootsSidecar: component.missingRootsSidecar.path }),
     })),
     estate: certificateEstate(estate),
-    witnesses: custody.witnesses,
-    witnessCount: custody.witnessCount,
-    ...(custody.witnessSidecar === undefined ? {} : { witnessSidecar: custody.witnessSidecar.path }),
-    ...(custody.missingSidecar === undefined ? {} : { missingSidecar: custody.missingSidecar.path }),
+    witnesses: result.witnesses ?? [],
+    witnessCount: custodyFacts.witnessCount,
+    ...(result.redundancy === undefined ? {} : { redundancy: result.redundancy }),
+    ...(custodyFacts.witnessSidecar === undefined ? {} : { witnessSidecar: custodyFacts.witnessSidecar.path }),
+    ...(custodyFacts.missingSidecar === undefined ? {} : { missingSidecar: custodyFacts.missingSidecar.path }),
     tool: RETENTION_TOOL,
     bounds: {
       estate: options.bounds?.estate ?? null,

@@ -1262,11 +1262,61 @@ describe("retention verify gates 1-6", async () => {
       allowTemporaryArtifactDir: true,
       clock: eligible(),
       gitRun: run,
+      // 37792 (@cto 1a773179): this case reads the head census's own receipt, so it forces the witness walk.
+      remoteRedundancy: false,
     })
     expect(result.verdict).toBe("candidate")
     expect(result.gates.find((gate) => gate.gate === "positive-custody")).toMatchObject({
       status: "pass",
       message: expect.stringContaining("refs/gitomic/fetched/ 1"),
+    })
+  })
+
+  // 37792 (@cto 1a773179): a copy whose every ref tip a timestamped live advertisement reaches needs no witness store,
+  // so gate 5 answers from the snapshot and pays no custody phase at all.
+  it("answers gate 5 from one live remote snapshot when the copy holds no local ref", async () => {
+    const gitDir = join(base.entry, "modules", "vendor", "dep")
+    const head = git(base.entry, [`--git-dir=${gitDir}`, "rev-parse", "HEAD"])
+    const run: typeof defaultGitRun = (args, options) => {
+      const result = defaultGitRun(args, options)
+      if (!args.includes("for-each-ref") || !args.includes("refs/") || result.code !== 0) return result
+      // The component store answers fetched refs only: nothing it holds is local to it.
+      return { ...result, stdout: `refs/remotes/origin/main\t${head}\tcommit\n` }
+    }
+    const phases: string[] = []
+    const result = await verifyRetainedEntry({
+      entry: base.entry,
+      root: base.root,
+      namespaceRoots: [fixtureRoot as string],
+      artifactDir: base.artifactDir,
+      allowTemporaryArtifactDir: true,
+      clock: eligible(),
+      gitRun: run,
+      custodyPhases: (name) => phases.push(name),
+    })
+    expect(result.verdict).toBe("candidate")
+    expect(result.gates.find((gate) => gate.gate === "positive-custody")).toMatchObject({
+      status: "pass",
+      message: expect.stringContaining("no witness store was read"),
+    })
+    // No connectivity check, no ref graph walk, no witness fsck: the fast path spawned none of them.
+    expect(phases).toEqual([])
+    expect(result.witnesses).toEqual([])
+    // The module mirror's HEAD is detached at the gitlink commit, so that commit is the one tip the snapshot must
+    // reach; no local branch is claimed, and the receipt names heads/main as what reaches it.
+    expect(result.redundancy).toEqual([
+      {
+        component: "vendor/dep",
+        proof: expect.objectContaining({
+          remote: "origin",
+          snapshotAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/u),
+          reached: [{ ref: "HEAD", tip: head, remoteRef: "refs/heads/main" }],
+        }),
+      },
+    ])
+    expect(JSON.parse(readFileSync(result.certificate?.path as string, "utf8"))).toMatchObject({
+      verdict: "candidate",
+      redundancy: [expect.objectContaining({ component: "vendor/dep" })],
     })
   })
 
@@ -1432,6 +1482,8 @@ describe("retention verify gates 1-6", async () => {
       deadline,
       monotonic: () => now,
       gitRun: run,
+      // 37792 (@cto 1a773179): this case bounds the head census itself, so it forces the witness walk.
+      remoteRedundancy: false,
     })
     const census = calls.filter((entry) => entry.call.startsWith("config"))
     expect(census).toHaveLength(1)

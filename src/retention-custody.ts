@@ -36,6 +36,7 @@ import {
   defaultGitStream,
   refuseSuccessfulStderr,
   observeRefs,
+  refObservationKey,
   type ComponentContents,
   type GitRun,
   type GitRunOptions,
@@ -331,6 +332,13 @@ export class CustodyRunScope {
    * complete, successful listing is ever stored.
    */
   readonly refObservations: RefObservations = new Map<string, readonly RefObservationRow[]>()
+  /**
+   * 37792 (@cto 1a773179): one timestamped live remote snapshot per remote per pass. A redundant-copy decision is asked
+   * of what the remote advertises NOW, never of a store's frozen refs/remotes, and the same remote is read once for
+   * the whole batch. A failed read is remembered too, so an unreachable remote cannot spend the batch budget on the
+   * same timeout for every entry; it stays `failed` and never passes for a snapshot.
+   */
+  readonly remoteSnapshots = new Map<string, RemoteSnapshot>()
 }
 
 const HEX40 = /^[0-9a-f]{40}$/u
@@ -1961,6 +1969,256 @@ export async function componentHeads(
     fetched: [...fetched]
       .map(([namespace, count]) => ({ namespace, count }))
       .sort((a, b) => (a.namespace < b.namespace ? -1 : 1)),
+  }
+}
+
+/**
+ * 37792 (@cto 1a773179): a redundant copy is one whose every non-remote ref tip a live remote advertisement reaches.
+ * The durable copy is then the remote itself, which no witness store has to reproduce, so gate 5 needs no fsck walk.
+ * The snapshot is ONE timestamped `ls-remote --refs` read per remote per pass: the store's own frozen `refs/remotes`
+ * is never consulted, because a frozen ref says what was fetched once, not what survives now.
+ */
+export type RemoteSnapshot =
+  | Readonly<{ status: "read"; takenAt: string; refs: ReadonlyMap<string, string> }>
+  | Readonly<{ status: "failed"; detail: string }>
+
+/** The exact receipt of one component's redundancy proof: the snapshot it was asked of, and what reached each tip. */
+export type RemoteRedundancyProof = Readonly<{
+  readonly remote: string
+  readonly snapshotAt: string
+  /** How many refs the advertisement carried; recorded so a reader knows the snapshot's size, never inferred. */
+  readonly advertisedRefs: number
+  /** Every non-remote ref and the advertised ref that reaches its tip. Empty when the copy holds no local ref. */
+  readonly reached: readonly Readonly<{ ref: string; tip: string; remoteRef: string }>[]
+}>
+
+export type RemoteRedundancyOutcome =
+  | Readonly<{ status: "redundant"; proof: RemoteRedundancyProof }>
+  | Readonly<{ status: "unproven"; detail: string }>
+
+/**
+ * The most advertised refs one tip's ancestry is asked of before the fast path gives up. A tip past the bound falls
+ * back to the witness and fsck proof it had before, so the bound can only cost time, never correctness.
+ */
+const MAX_ANCESTRY_CANDIDATES = 16
+
+/**
+ * A remote configured as a path is relative to the store that configures it, so two stores naming the same remote
+ * differently still share one snapshot; a scheme or scp-style URL is already absolute.
+ */
+function remoteUrlIdentity(gitDir: string, remote: string): string {
+  if (/^[a-z][a-z0-9+.-]*:\/\//iu.test(remote)) return remote
+  if (/^[^/\s]+@[^/\s]+:/u.test(remote)) return remote
+  return resolve(gitDir, remote)
+}
+
+async function liveRemoteSnapshot(
+  scope: CustodyRunScope | undefined,
+  gitDir: string,
+  remote: string,
+  run: GitRun,
+  budget: () => Readonly<{ timeoutMs?: number }>,
+  clock: () => number,
+): Promise<RemoteSnapshot> {
+  const key = remoteUrlIdentity(gitDir, remote)
+  const cached = scope?.remoteSnapshots.get(key)
+  if (cached !== undefined) return cached
+  const listed = await run([`--git-dir=${gitDir}`, "ls-remote", "--refs", remote], budget())
+  let snapshot: RemoteSnapshot
+  if (listed.timedOut === true) {
+    snapshot = { status: "failed", detail: `ls-remote ${remote} was cut by the shared proof deadline` }
+  } else if (listed.code !== 0 || listed.stderr.trim() !== "") {
+    snapshot = {
+      status: "failed",
+      detail: `ls-remote ${remote} answered ${String(listed.code)} (${listed.stderr.trim() || "no stderr"})`,
+    }
+  } else {
+    const refs = new Map<string, string>()
+    let invalid: string | undefined
+    for (const line of listed.stdout.split("\n")) {
+      if (line === "") continue
+      const match = /^([0-9a-f]{40}|[0-9a-f]{64})\t(refs\/\S+)$/u.exec(line)
+      if (match?.[1] === undefined || match[2] === undefined || refs.has(match[2])) {
+        invalid = line
+        break
+      }
+      refs.set(match[2], match[1])
+    }
+    snapshot =
+      invalid === undefined
+        ? { status: "read", takenAt: new Date(clock()).toISOString(), refs }
+        : {
+            status: "failed",
+            detail: `ls-remote ${remote} answered an invalid or duplicate ref ${JSON.stringify(invalid.slice(0, 120))}`,
+          }
+  }
+  scope?.remoteSnapshots.set(key, snapshot)
+  return snapshot
+}
+
+/**
+ * 37792 (@cto 1a773179): prove one component's copy redundant against ONE timestamped live remote snapshot, or say
+ * exactly why it was not proven. The rules the ruling fixes:
+ *  - reachability is asked of the snapshot (or the close proof's target head), never of the store's frozen refs;
+ *  - every NON-remote ref tip must be reachable from that snapshot;
+ *  - a copy with no local ref at all is trivially redundant;
+ *  - a tip that is unproven, unreadable, or named by a non-commit ref keeps the entry on the fsck path, unchanged;
+ *  - one entry is proven against its remote only, never reusing another entry's or another copy's proof.
+ */
+export async function proveRemoteRedundancy(
+  args: Readonly<{
+    copyRoot: string
+    component: ComponentContents
+    run: GitRun
+    remaining: () => number
+    observations: RefObservations
+    scope?: CustodyRunScope | undefined
+    clock?: (() => number) | undefined
+  }>,
+): Promise<RemoteRedundancyOutcome> {
+  const { copyRoot, component, run, remaining, observations } = args
+  const clock = args.clock ?? Date.now
+  const budget = (): Readonly<{ timeoutMs?: number }> => {
+    const left = remaining()
+    return Number.isFinite(left) ? { timeoutMs: Math.max(1, left) } : {}
+  }
+  const unproven = (detail: string): RemoteRedundancyOutcome => ({ status: "unproven", detail })
+  const gitDir = component.gitDir ?? join(copyRoot, component.component)
+  const label = component.component
+  let storeRun: GitRun
+  let remote: string | undefined
+  let refRows: readonly RefObservationRow[]
+  try {
+    storeRun = atStore(run, gitDir, await worktreeGone(gitDir, run, budget()))
+    remote = await configuredRemote(gitDir, storeRun)
+    if (remote === undefined) {
+      return unproven(`${label}: its store configures no remote, so no live advertisement can vouch for it`)
+    }
+    // The same complete enumeration the contents gate already paid for; this never adds a listing of its own.
+    refRows = await observeRefs(storeRun, gitDir, {
+      observations,
+      key: refObservationKey(copyRoot, gitDir),
+      context: [`--git-dir=${gitDir}`],
+      runOptions: budget(),
+      label: `for-each-ref in ${gitDir}`,
+      requireTypes: true,
+    })
+  } catch (error) {
+    return unproven(`${label}: ${error instanceof Error ? error.message : String(error)}`)
+  }
+  // Every tip the copy holds outside the fetched namespaces, with the refs that name it.
+  const named = new Map<string, string[]>()
+  const addTip = (tip: string, ref: string): void => {
+    const known = named.get(tip)
+    if (known === undefined) named.set(tip, [ref])
+    else known.push(ref)
+  }
+  try {
+    for (const row of refRows) {
+      if (fetchedNamespace(row.ref) !== undefined) continue
+      if (row.type === undefined) {
+        return unproven(
+          `${label}: ref ${row.ref} was listed without an object type, so no advertisement can be read for it`,
+        )
+      }
+      if (row.type !== "commit" && row.type !== "tag") {
+        return unproven(`${label}: ref ${row.ref} names a ${row.type}, which no advertised commit reaches`)
+      }
+      if (row.type === "commit") {
+        addTip(row.oid, row.ref)
+        continue
+      }
+      // The observed tag OBJECT id is peeled, never the ref name: a name re-pointed since the listing would otherwise
+      // peel to a commit this proof never read.
+      const peeled = await storeRun(
+        [`--git-dir=${gitDir}`, "rev-parse", "--verify", "--quiet", `${row.oid}^{commit}`],
+        budget(),
+      )
+      const peeledTip = peeled.stdout.trim()
+      if (peeled.code !== 0 || peeled.stderr.trim() !== "" || !/^[0-9a-f]{40,64}$/u.test(peeledTip)) {
+        return unproven(
+          `${label}: tag ref ${row.ref} does not peel to a readable commit (${peeled.stderr.trim() || `exit ${String(peeled.code)}`}), so ancestry cannot speak for it`,
+        )
+      }
+      addTip(peeledTip, row.ref)
+    }
+    // A detached HEAD holds a commit no ref names; an attached HEAD is its branch, already in the set above.
+    const symbolic = await storeRun([`--git-dir=${gitDir}`, "symbolic-ref", "-q", "HEAD"], budget())
+    if (symbolic.code === 1 && symbolic.stderr.trim() === "") {
+      const head = await storeRun([`--git-dir=${gitDir}`, "rev-parse", "--verify", "--quiet", "HEAD"], budget())
+      const headTip = head.stdout.trim()
+      if (head.code !== 0 || head.stderr.trim() !== "" || !/^[0-9a-f]{40,64}$/u.test(headTip)) {
+        return unproven(
+          `${label}: HEAD is detached but unreadable (${head.stderr.trim() || `exit ${String(head.code)}`}); an unreadable head is kept, never proven`,
+        )
+      }
+      addTip(headTip, "HEAD")
+    } else if (symbolic.code !== 0 || symbolic.stderr.trim() !== "") {
+      return unproven(
+        `${label}: HEAD could not be resolved to a branch or a commit (${symbolic.stderr.trim() || `exit ${String(symbolic.code)}`})`,
+      )
+    }
+  } catch (error) {
+    return unproven(`${label}: ${error instanceof Error ? error.message : String(error)}`)
+  }
+  const snapshot = await liveRemoteSnapshot(args.scope, gitDir, remote, storeRun, budget, clock)
+  if (snapshot.status !== "read") return unproven(`${label}: ${snapshot.detail}`)
+  const advertised = [...snapshot.refs].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+  // The default branch is where a published tip is most likely to be found, so it is asked first.
+  const ranked = [
+    ...advertised.filter(([ref]) => ref === "refs/heads/main" || ref === "refs/heads/master"),
+    ...advertised.filter(([ref]) => ref !== "refs/heads/main" && ref !== "refs/heads/master"),
+  ]
+  const exact = new Map<string, string>()
+  for (const [ref, tip] of advertised) if (!exact.has(tip)) exact.set(tip, ref)
+  try {
+    const reached: Array<Readonly<{ ref: string; tip: string; remoteRef: string }>> = []
+    for (const [tip, refs] of [...named].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+      let remoteRef = exact.get(tip)
+      if (remoteRef === undefined) {
+        let asked = 0
+        for (const [candidateRef, candidateTip] of ranked) {
+          if (asked >= MAX_ANCESTRY_CANDIDATES) break
+          // A tip the advertisement reaches is ancestry of the advertised commit; the object has to be here to ask.
+          const present = await storeRun(
+            [`--git-dir=${gitDir}`, "cat-file", "-e", `${candidateTip}^{commit}`],
+            budget(),
+          )
+          if (present.code !== 0 || present.stderr.trim() !== "") continue
+          asked += 1
+          const answer = await storeRun(
+            [`--git-dir=${gitDir}`, "merge-base", "--is-ancestor", tip, candidateTip],
+            budget(),
+          )
+          if (answer.stderr.trim() === "" && answer.code === 0) {
+            remoteRef = candidateRef
+            break
+          }
+          if (answer.stderr.trim() !== "" || answer.code !== 1) {
+            return unproven(
+              `${label}: merge-base --is-ancestor ${tip} ${candidateTip} answered ${String(answer.code)} (${answer.stderr.trim() || "no stderr"}); the tip is kept, never proven`,
+            )
+          }
+        }
+        if (remoteRef === undefined && ranked.length > MAX_ANCESTRY_CANDIDATES) {
+          return unproven(
+            `${label}: ${refs.join(", ")} at ${tip} was asked of the first ${String(MAX_ANCESTRY_CANDIDATES)} of ${String(ranked.length)} advertised ref(s) only; the entry keeps its witness proof`,
+          )
+        }
+      }
+      if (remoteRef === undefined) {
+        return unproven(
+          `${label}: ${refs.join(", ")} at ${tip} is reachable from none of the ${String(advertised.length)} ref(s) ${remote} advertised at ${snapshot.takenAt}`,
+        )
+      }
+      for (const ref of refs) reached.push({ ref, tip, remoteRef })
+    }
+    return {
+      status: "redundant",
+      proof: { remote, snapshotAt: snapshot.takenAt, advertisedRefs: advertised.length, reached },
+    }
+  } catch (error) {
+    return unproven(`${label}: ${error instanceof Error ? error.message : String(error)}`)
   }
 }
 

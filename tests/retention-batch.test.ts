@@ -150,6 +150,9 @@ function options(extra: Partial<RetentionBatchOptions> = {}): RetentionBatchOpti
     artifactDir: join(fixtureRoot, "artifacts"),
     allowTemporaryArtifactDir: true,
     clock: eligible,
+    // 37792 (@cto 1a773179): every case in this file proves the WITNESS WALK's own machinery, so each entry is forced
+    // through it; the redundancy fast path has its own cases.
+    remoteRedundancy: false,
     ...extra,
   }
 }
@@ -598,6 +601,27 @@ describe("retention retirement batch (#33010)", async () => {
     // rather than omitted, and the pass total says the same.
     expect({ walked, reused }).toEqual({ walked: 0, reused: 0 })
     expect(result.preliminaryFragments).toEqual({ walked, reused })
+  })
+
+  // 37792 (@cto 1a773179): the fast path is what makes a 12,000-entry sweep affordable, so the batch proves it too: an
+  // entry whose every ref tip the live remote reaches lands would-retire with NO custody phase and no witness.
+  it("decides a redundant entry in the batch without paying a custody phase", async () => {
+    const first = options().entries[0] as string
+    const result = await retireRetainedBatch(
+      options({ entries: [first], clock: retainedUntil([first]), remoteRedundancy: true }),
+    )
+    expect(result.stopped).toBeUndefined()
+    expect(result.rows.map((row) => row.outcome)).toEqual(["would-retire"])
+    // No connectivity check, no ref graph walk, no witness fsck: the entry's child phase holds no custody subphase.
+    expect(result.proofPhases).toBeUndefined()
+    expect(result.preliminaryEntryTimings?.[first]?.subphases).toBeUndefined()
+    const evidence = result.rows[0]?.evidence as string
+    const certificate = JSON.parse(readFileSync(evidence, "utf8")) as {
+      witnesses?: unknown[]
+      redundancy?: readonly Readonly<{ component: string }>[]
+    }
+    expect(certificate.witnesses).toEqual([])
+    expect(certificate.redundancy?.map((entry) => entry.component)).toEqual(["vendor/dep"])
   })
 
   // 37854 (@cto 7debe1c0): `0`/`0` is published, never omitted, so a reader cannot mistake "no eligible walk observed"

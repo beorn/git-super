@@ -107,6 +107,13 @@ export function proofFacts(proof: RetentionVerifyResult): { facts: string; path:
     const entries: [string, unknown][] = []
     for (const [key, item] of Object.entries(value).sort(([a], [b]) => a.localeCompare(b))) {
       if (depth === 0 && (key === "clock" || key === "elapsedMs")) continue
+      // 37792 (@cto 1a773179): a redundancy proof's snapshot time is when THAT pass read the remote, so it differs by
+      // construction. What the snapshot witnessed - its ref count and every reached tip - still compares, so a remote
+      // that moved between the two reads is still caught.
+      if (key === "snapshotAt") {
+        entries.push([key, "snapshot"])
+        continue
+      }
       const estate: unknown = item
       if (depth === 0 && key === "estate" && estate !== null && typeof estate === "object" && !Array.isArray(estate)) {
         entries.push([key, canonicalEstateScan(estate)])
