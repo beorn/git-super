@@ -9,6 +9,7 @@
  */
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -23,7 +24,14 @@ import { spawnSync } from "node:child_process"
 import { createHash } from "node:crypto"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
-import { afterEach, describe, expect, test } from "vitest"
+import { afterEach, describe, expect, test, vi } from "vitest"
+
+// 34127: existsSync alone is wrapped, so one test can stage the race the live estate actually hit — a witness store
+// that resolved a moment ago and is gone by the time the selection checks it. Everything else passes through.
+vi.mock("node:fs", async (importOriginal) => {
+  const fs = await importOriginal<typeof import("node:fs")>()
+  return { ...fs, existsSync: vi.fn(fs.existsSync) }
+})
 import {
   defaultGitRun,
   defaultGitStream,
@@ -1280,6 +1288,35 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     },
   )
 
+  // 34127 (@dev/11 kick 2026-11-23): on the live estate the race lands one step later than ENOENT — the path resolved,
+  // then the worktree went away before the selection could check it, and every entry went unknown on "is not a Git
+  // object directory". A store that is GONE there is the same moving estate as the ENOENT case and is dropped and
+  // named; a store that is still present and is not an object directory stays the hard unknown it always was.
+  test("a witness store gone after it resolved is dropped and named, never a hard unknown", async () => {
+    const lender = repoWithCommit("git-super-custody-vanish-after-resolve-")
+    const survivor = tmp("git-super-custody-vanish-after-resolve-survivor-")
+    git(survivor, ["clone", "-q", "--no-local", lender.root, "copy"])
+    const survivorStore = realpathSync(join(survivor, "copy", ".git", "objects"))
+    const ghostStore = join(tmp("git-super-custody-vanish-after-resolve-ghost-"), "modules", "ag", "objects")
+    mkdirSync(ghostStore, { recursive: true })
+    const sidecarDir = tmp("git-super-custody-vanish-after-resolve-sidecars-")
+    const component = await componentOf([lender.head], sidecarDir, "owned", { [lender.head]: "commit" })
+    const realExists = vi.mocked(existsSync).getMockImplementation()!
+    vi.mocked(existsSync).mockImplementation((path) =>
+      String(path) === ghostStore ? false : realExists(path as Parameters<typeof existsSync>[0]),
+    )
+    try {
+      const scan = await scanCustody(join(survivor, "copy"), [component], [ghostStore, survivorStore], [], {
+        sidecarDir,
+      })
+      expect(scan.status, scan.detail).toBe("pass")
+      expect(scan.detail).toContain(ghostStore)
+      expect(scan.witnesses.map((witness) => witness.store)).not.toContain(ghostStore)
+    } finally {
+      vi.mocked(existsSync).mockImplementation(realExists)
+    }
+  })
+
   test("a witness store gone before the next member is never reused from the shared index", async () => {
     const lender = repoWithCommit("git-super-custody-vanish-shared-")
     const survivor = tmp("git-super-custody-vanish-shared-survivor-")
@@ -2283,6 +2320,25 @@ describe("retention custody scan — head closure and fetched refs (#37792)", ()
     expect(scan.vanishedAtRead).toEqual([gone])
     // The detail still says what was read and what failed; the structure is additive, never a replacement.
     expect(scan.detail).toContain(gone)
+  })
+
+  // 34127 (@dev/6 15090410 peer read): git prints "not a git repository" just as readily for a store that still exists
+  // and cannot be read. Calling THAT vanished would pay three rescans and then label a real proof failure "the estate
+  // vanished under it", so a corrupt store stays a plain unknown with no vanishedAtRead.
+  test("an existing store that cannot be read stays a plain unknown, never vanished", async () => {
+    const { primary } = publishedStores("git-super-corrupt-at-read-")
+    const head = git(primary, ["rev-parse", "HEAD"])
+    const sidecarDir = tmp("git-super-corrupt-at-read-sidecars-")
+    const real = await componentOf([head], sidecarDir, "owned", { [head]: "commit" })
+    const corrupt = join(tmp("git-super-corrupt-at-read-store-"), "modules", "ag")
+    mkdirSync(corrupt, { recursive: true })
+    writeFileSync(join(corrupt, "HEAD"), "not a ref and not a sha\n")
+    const scan = await scanCustody(primary, [{ ...real, gitDir: corrupt }], [join(primary, ".git", "objects")], [], {
+      sidecarDir,
+    })
+    expect(scan.status).toBe("unknown")
+    expect(scan.vanishedAtRead).toBeUndefined()
+    expect(scan.detail).toContain(corrupt)
   })
 
   // 37854 (@dev/6 46063009): the case the other cap test cannot discriminate. A cap BELOW both readings refuses

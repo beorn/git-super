@@ -20,6 +20,7 @@ import {
   readdirSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -1538,14 +1539,27 @@ describe("retention retirement batch (#33010)", async () => {
   it("a store gone at read time recovers on one rescan", async () => {
     const dependencyGitDir = realpathSync(join(fixtureRoot, "dependency", ".git"))
     const { entries } = await atRiskEntries(["vanish-once"])
+    // The race is real, not a faked string: the store's HEAD is off disk while the format read runs, and back before
+    // the rescan reads the estate. A store that merely *fails* is a different case and must stay a plain unknown.
+    const raceHead = (): (() => void) => {
+      const head = join(dependencyGitDir, "HEAD")
+      const away = head + ".raced"
+      renameSync(head, away)
+      return () => renameSync(away, head)
+    }
     let vanishedOnce = false
     const raceOnce: GitRun = (args, gitOptions) => {
       const gitDir = args.find((arg) => arg.startsWith("--git-dir="))?.slice("--git-dir=".length) ?? ""
-      if (!vanishedOnce && args.includes("--show-object-format") && gitDir === dependencyGitDir) {
-        vanishedOnce = true
-        return { code: 128, stdout: "", stderr: `fatal: not a git repository: '${gitDir}'` }
+      if (vanishedOnce || !args.includes("--show-object-format") || gitDir !== dependencyGitDir) {
+        return defaultGitRun(args, gitOptions)
       }
-      return defaultGitRun(args, gitOptions)
+      vanishedOnce = true
+      const restore = raceHead()
+      const result = defaultGitRun(args, gitOptions)
+      // The store comes back after the format read has been classified: the restore is a macrotask, so every
+      // microtask the caller runs on this result (including the vanished decision) still sees HEAD gone.
+      setTimeout(restore, 0)
+      return result
     }
     const result = await retireRetainedBatch(
       options({ entries, gitRun: raceOnce, clock: clockAfter(entries, eligible) }),
@@ -1561,14 +1575,23 @@ describe("retention retirement batch (#33010)", async () => {
   it("an estate that keeps moving is unknown after three rescans, naming each round", async () => {
     const dependencyGitDir = realpathSync(join(fixtureRoot, "dependency", ".git"))
     const { entries } = await atRiskEntries(["keeps-moving"])
+    const movingHead = (): (() => void) => {
+      const head = join(dependencyGitDir, "HEAD")
+      const away = head + ".raced"
+      renameSync(head, away)
+      return () => renameSync(away, head)
+    }
     let rounds = 0
     const alwaysMoving: GitRun = (args, gitOptions) => {
       const gitDir = args.find((arg) => arg.startsWith("--git-dir="))?.slice("--git-dir=".length) ?? ""
-      if (args.includes("--show-object-format") && gitDir === dependencyGitDir) {
-        rounds += 1
-        return { code: 128, stdout: "", stderr: `fatal: not a git repository: '${gitDir}'` }
+      if (!args.includes("--show-object-format") || gitDir !== dependencyGitDir) {
+        return defaultGitRun(args, gitOptions)
       }
-      return defaultGitRun(args, gitOptions)
+      rounds += 1
+      const restore = movingHead()
+      const result = defaultGitRun(args, gitOptions)
+      setTimeout(restore, 0)
+      return result
     }
     const result = await retireRetainedBatch(
       options({ entries, gitRun: alwaysMoving, clock: clockAfter(entries, eligible) }),

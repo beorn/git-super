@@ -773,10 +773,12 @@ async function objectFormat(
   refuseSuccessfulStderr(result, `rev-parse --show-object-format in ${gitDir}`)
   if (result.code !== 0) {
     const detail = `rev-parse --show-object-format failed in ${gitDir}: ${result.stderr.trim()}`
-    // 34127 (@cto 536e2c15): the inventory listed this store and it is gone now. That is a moving estate, not a verdict.
-    const gone =
-      !existsSync(gitDir) || /not a git repository|does not exist|No such file or directory/u.test(result.stderr)
-    return gone ? { status: "unknown", detail, vanished: gitDir } : { status: "unknown", detail }
+    // 34127 (@cto 536e2c15, @dev/6 15090410 peer read): the inventory listed this store and it is gone now. That is a
+    // moving estate, not a verdict. Decided from the filesystem ALONE: git prints "not a git repository" just as
+    // readily for a store that still exists and is unreadable (objects/ chmod 000, refs/ missing, corrupt HEAD), and
+    // calling that vanished would pay three rescans and then label a real proof failure "the estate vanished under it".
+    const vanished = !existsSync(gitDir) || !existsSync(join(gitDir, "HEAD"))
+    return vanished ? { status: "unknown", detail, vanished: gitDir } : { status: "unknown", detail }
   }
   const format = result.stdout.trim()
   if (format !== "sha1" && format !== "sha256") {
@@ -2131,7 +2133,16 @@ async function runCustody(
       vanished.push(store)
     }
   }
-  const stores = [...new Set(canonical)].filter((store) => !removal.some((root) => within(root, store))).sort()
+  const candidates = [...new Set(canonical)].filter((store) => !removal.some((root) => within(root, store))).sort()
+  // 34127 (@dev/11 2026-11-23 live kick): the same race lands HERE when the path resolved a moment ago and is gone
+  // before it can be checked. A store that is gone joins the vanished list above — dropped, never a verdict. A store
+  // that is still there and is not an object directory stays the hard unknown it always was: that is corruption, not
+  // a moving estate, and calling it vanished would pay three rescans and then mislabel a real proof failure.
+  const stores = candidates.filter((store) => {
+    if (existsSync(store)) return true
+    vanished.push(store)
+    return false
+  })
   const badStore = stores.find((store) => !isObjectDir(store))
   if (badStore !== undefined) {
     return {
