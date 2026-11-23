@@ -682,6 +682,15 @@ async function rehomeBorrowerCandidates(
  */
 export const DEFAULT_REMOVAL_STATUS_TIMEOUT_MS = 30_000
 
+/**
+ * How long a retained copy stays eligible for a rebuild after its environment closes. It exists to bridge the
+ * minutes-to-hours between a close and the moment its owner notices it needs the tree back, not to archive the env:
+ * every store is a full 18-repository copy (mean 7.5 MB, ~230 closes a day on hab1), and past this window the
+ * sweeper may retire it. Two days keeps a working-day-plus recovery margin at a quarter of the previous seven-day
+ * steady state (34127).
+ */
+export const RETAINED_COPY_FLOOR_MS = 48 * 60 * 60 * 1000
+
 /** Removal never treats an unreadable included repository as an absent population member. */
 export function inspectRemovalStatus(
   path: string,
@@ -2446,7 +2455,7 @@ async function prepareResolvedWorktreeModules(context: {
           retained,
           manifest: join(retainedRoot, "manifest.json"),
           createdAt: new Date().toISOString(),
-          retainUntil: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+          retainUntil: new Date(Date.now() + RETAINED_COPY_FLOOR_MS).toISOString(),
           ...(rehomedBorrowers.length === 0 ? {} : { rehomedBorrowers }),
           writerLocks,
           createdWriterLocks,
