@@ -2145,6 +2145,110 @@ describe("retention custody scan — head closure and fetched refs (#37792)", ()
     void remote
   })
 
+  // 37854 (@cto 3706925a): a smaller subtraction bound is a cost lever only if it changes nothing else. The strongest
+  // truncation is none at all -- every ref walks its complete closure, so objects an earlier ref already emitted are
+  // emitted again -- and the labeled merge must still select the same witness, with the same outcome and bounds.
+  test("a smaller subtraction bound keeps every selected witness and outcome", async () => {
+    const { remote, primary } = publishedStores("git-super-subtract-bound-")
+    const head = git(primary, ["rev-parse", "HEAD"])
+    // Two INDEPENDENT refs (independentRefs collapses a ref that is an ancestor or the same commit), so the second
+    // walk would subtract the first, and shares its base objects with it: exactly the re-emission the bound controls.
+    git(primary, ["branch", "side"])
+    writeFileSync(join(primary, "main.txt"), "main\n")
+    git(primary, ["add", "main.txt"])
+    git(primary, ["commit", "-q", "-m", "main work"])
+    git(primary, ["switch", "-q", "side"])
+    writeFileSync(join(primary, "side.txt"), "side\n")
+    git(primary, ["add", "side.txt"])
+    git(primary, ["commit", "-q", "-m", "side work"])
+    git(primary, ["switch", "-q", "main"])
+    const sidecarDir = tmp("git-super-subtract-bound-sidecars-")
+    const component = await componentOf([head], sidecarDir, "owned", { [head]: "commit" })
+    const stores = [join(primary, ".git", "objects")]
+    // Proves the comparison bites: the default reading subtracts tips, the truncated one subtracts none.
+    const subtractSizes = { full: 0, none: 0 }
+    const counting = (key: "full" | "none"): GitStreamFactory => {
+      return (args, streamOptions) => {
+        if (args.includes("rev-list") && args.includes("--objects")) {
+          const at = args.indexOf("--not")
+          subtractSizes[key] = Math.max(subtractSizes[key], at === -1 ? 0 : args.length - at - 1)
+        }
+        return defaultGitStream(args, streamOptions)
+      }
+    }
+    const full = await scanCustody(primary, [component], stores, [], { sidecarDir, stream: counting("full") })
+    expect(full.status).toBe("pass")
+    expect(full.witnessCount).toBeGreaterThan(0)
+    const none = await scanCustody(primary, [component], stores, [], {
+      sidecarDir,
+      stream: counting("none"),
+      maxSubtractedTips: 0,
+    })
+    expect(subtractSizes.full).toBeGreaterThan(0)
+    expect(subtractSizes.none).toBe(0)
+    expect(none.status).toBe(full.status)
+    expect(none.witnessCount).toBe(full.witnessCount)
+    expect(none.witnesses).toEqual(full.witnesses)
+    expect(none.missingCount).toBe(full.missingCount)
+    expect(none.missing).toEqual(full.missing)
+    // The same cap refuses both readings rather than letting the wider walk pass silently.
+    const cap = { maxReachableOids: 2, reachableMs: 60_000, fsckMs: 60_000 }
+    const fullCut = await scanCustody(primary, [component], stores, [], { sidecarDir, bounds: cap })
+    const noneCut = await scanCustody(primary, [component], stores, [], {
+      sidecarDir,
+      bounds: cap,
+      maxSubtractedTips: 0,
+    })
+    expect(fullCut.status).toBe("unknown")
+    expect(noneCut.status).toBe("unknown")
+    expect(noneCut.detail).toBe(fullCut.detail)
+    void remote
+  })
+
+  // 37854 (@cto 3706925a): the bound that actually ships is a PARTIAL subset, not none at all, so this pins the
+  // intermediate shape: three independent refs mean the last walk subtracts two earlier tips by default and only
+  // one under a bound of 1, and the labeled merge must still select the same witness with the same outcome.
+  test("a partial subtraction bound keeps every selected witness and outcome", async () => {
+    const { remote, primary } = publishedStores("git-super-subtract-partial-")
+    const head = git(primary, ["rev-parse", "HEAD"])
+    for (const name of ["alpha", "beta", "gamma"]) {
+      git(primary, ["switch", "-q", "-c", name, "main"])
+      writeFileSync(join(primary, `${name}.txt`), `${name}\n`)
+      git(primary, ["add", `${name}.txt`])
+      git(primary, ["commit", "-q", "-m", `${name} work`])
+    }
+    git(primary, ["switch", "-q", "main"])
+    const sidecarDir = tmp("git-super-subtract-partial-sidecars-")
+    const component = await componentOf([head], sidecarDir, "owned", { [head]: "commit" })
+    const stores = [join(primary, ".git", "objects")]
+    const subtractSizes = { full: 0, partial: 0 }
+    const counting = (key: "full" | "partial"): GitStreamFactory => {
+      return (args, streamOptions) => {
+        if (args.includes("rev-list") && args.includes("--objects")) {
+          const at = args.indexOf("--not")
+          subtractSizes[key] = Math.max(subtractSizes[key], at === -1 ? 0 : args.length - at - 1)
+        }
+        return defaultGitStream(args, streamOptions)
+      }
+    }
+    const full = await scanCustody(primary, [component], stores, [], { sidecarDir, stream: counting("full") })
+    const partial = await scanCustody(primary, [component], stores, [], {
+      sidecarDir: tmp("git-super-subtract-partial-sidecars-2-"),
+      stream: counting("partial"),
+      maxSubtractedTips: 1,
+    })
+    // The comparison bites: the default subtracts more than one earlier tip, the partial bound subtracts one.
+    expect(subtractSizes.full).toBeGreaterThan(1)
+    expect(subtractSizes.partial).toBe(1)
+    expect(full.status).toBe("pass")
+    expect(partial.status).toBe(full.status)
+    expect(partial.witnessCount).toBe(full.witnessCount)
+    expect(partial.witnesses).toEqual(full.witnesses)
+    expect(partial.missingCount).toBe(full.missingCount)
+    expect(partial.missing).toEqual(full.missing)
+    void remote
+  })
+
   test("a fetched copy ref is not a head the ancestry proof must satisfy, and it is counted", async () => {
     const { remote, work, primary } = publishedStores("git-super-fetched-ref-")
     // An unlanded commit, held only under a fetched-copy namespace.

@@ -165,6 +165,13 @@ export interface CustodyScanOptions {
   readonly environmentHeads?: Readonly<Record<string, readonly string[]>>
   /** 37792 (@cto 93f4ba37): this run's shared store verdicts, so a batch fsck each store once. */
   readonly runScope?: CustodyRunScope
+  /**
+   * 37854 (@cto 3706925a): TEST SEAM for the subtraction-bound experiment only, never a production setting. The walk
+   * subtracts at most this many earlier-ranked tips; absent, it uses {@link MAX_SUBTRACTED_TIPS}. A smaller value only
+   * re-emits objects an earlier-ranked ref already emitted, which the labeled merge still resolves to that earlier
+   * witness; the experiment must prove that on the fixture before any default changes.
+   */
+  readonly maxSubtractedTips?: number
 }
 
 /**
@@ -858,8 +865,15 @@ interface TraversalContext {
   readonly reason?: string
 }
 
-/** At most this many earlier tips are subtracted per walk; any subset is correct, fewer only repeats more objects. */
-const MAX_SUBTRACTED_TIPS = 4096
+/**
+ * 37854 (@cto 283fabfc): the most earlier-ranked tips one walk subtracts before it stops subtracting. It bounds the
+ * `--not` list and nothing else — a tip past the bound is simply not excluded, so the emitted fragment can only grow,
+ * never lose an object: every object still arrives from some ref, and the labeled merge attributes it to the
+ * earliest-ranked witness that reached it. A smaller bound therefore buys time without ever dropping custody evidence.
+ * Measured over all 2,057 recorded km/ag walks: 1024 changed 0 of 2,057 emitted sets on two runs (4096->256 changed 12)
+ * for 16-18% of child time, inside a ~3% run-to-run spread.
+ */
+const MAX_SUBTRACTED_TIPS = 1024
 
 async function traversalContext(
   gitDir: string,
@@ -896,7 +910,7 @@ async function traversalContext(
  * Sorted reachable OIDs of `tip` minus those reachable from `subtract`. With nothing subtracted this is the complete
  * closure: the canonical graph certificate whose sha256 is a witness's graphDigest.
  */
-async function reachableSidecar(
+export async function reachableSidecar(
   gitDir: string,
   tip: string,
   subtract: readonly string[],
@@ -1234,6 +1248,8 @@ async function indexWitnessStores(
   runScope?: CustodyRunScope,
   onPhaseEnter?: (name: string) => void,
   onPhaseSpend?: (name: string, ms: number) => void,
+  /** 37854: the subtraction bound, threaded from {@link CustodyScanOptions.maxSubtractedTips}. */
+  maxSubtractedTips = MAX_SUBTRACTED_TIPS,
 ): Promise<Awaited<ReturnType<typeof indexWitnessStoresReported>>> {
   const phaseStats = { witnessFsckMs: 0, refGraphMs: 0, refGraphEntered: false }
   onPhaseEnter?.("witnessFsck")
@@ -1255,6 +1271,7 @@ async function indexWitnessStores(
       runScope,
       phaseStats,
       onPhaseEnter,
+      maxSubtractedTips,
     )
   } finally {
     onPhase?.("witnessFsck", phaseStats.witnessFsckMs)
@@ -1295,6 +1312,8 @@ async function indexWitnessStoresReported(
     refGraphEntered: false,
   },
   onPhaseEnter?: (name: string) => void,
+  /** 37854: how many earlier-ranked tips one walk may subtract; the fixture proves a smaller bound keeps the witnesses. */
+  maxSubtractedTips = MAX_SUBTRACTED_TIPS,
 ): Promise<{
   records: DurableRefRecord[]
   formats: Map<string, string>
@@ -1419,7 +1438,7 @@ async function indexWitnessStoresReported(
         const seen = new Set<string>()
         for (
           let earlierIndex = prior.length - 1;
-          earlierIndex >= 0 && subtract.length < MAX_SUBTRACTED_TIPS;
+          earlierIndex >= 0 && subtract.length < maxSubtractedTips;
           earlierIndex -= 1
         ) {
           const earlier = prior[earlierIndex]
@@ -2038,6 +2057,8 @@ async function runCustody(
   onPhaseEnter?: (name: string) => void,
   /** 34127 (@cto turn60): the real duration of each named operation, including one cut by the deadline. */
   onPhaseSpend?: (name: string, ms: number) => void,
+  /** 37854: the subtraction bound this scan walks with; see {@link CustodyScanOptions.maxSubtractedTips}. */
+  maxSubtractedTips = MAX_SUBTRACTED_TIPS,
 ): Promise<CustodyScan> {
   const remaining = (): number => {
     const left = deadline === undefined ? Number.POSITIVE_INFINITY : deadline - clock()
@@ -2142,6 +2163,7 @@ async function runCustody(
       runScope,
       onPhaseEnter,
       onPhaseSpend,
+      maxSubtractedTips,
     )
     const width = String(Math.max(1, indexed.records.length)).length
     const merged = await asProofDeadline(
@@ -2618,6 +2640,7 @@ export async function scanCustody(
       options.runScope,
       options.onPhaseEnter,
       options.onPhaseSpend,
+      options.maxSubtractedTips ?? MAX_SUBTRACTED_TIPS,
     )
   } catch (error) {
     return {
