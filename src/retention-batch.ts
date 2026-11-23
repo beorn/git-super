@@ -490,7 +490,18 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
         state.phases.set(event.phase, (state.phases.get(event.phase) ?? 0) + spend)
       }
     }
-  const verifyOptions = (entry: string, phase: "pre" | "held", sharedDeadline?: number): RetentionVerifyOptions => {
+  const verifyOptions = (
+    entry: string,
+    phase: "pre" | "held",
+    sharedDeadline?: number,
+    /**
+     * 34127 (@cto 536e2c15): a vanish rescan must not join the pass scopes. Both memoize what they read — the index
+     * keeps a failed build for the rest of the phase, the run scope keeps per-store verdicts — so a store that came
+     * back would be replayed as still gone. Each round gets its own pair, and it reports no entry timings: those
+     * describe the preliminary proof, which already ended.
+     */
+    rescan?: CustodyRunScope,
+  ): RetentionVerifyOptions => {
     // exactOptionalPropertyTypes: a shared spread of `number | undefined` is not assignable to `deadline?: number`, so
     // the absence is decided here where the type can narrow (red on the pin before this, TS2375).
     const deadline = sharedDeadline ?? proofDeadline
@@ -499,7 +510,7 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
       // 34127 (@cto turn58 (b)): the timings describe the PRELIMINARY proof only. A no-apply batch returns before the
       // held re-verification, and a held pass runs under the existing shared deadline with no per-entry slice to report,
       // so it keeps the existing held/window reporting rather than folding into these boundaries.
-      ...(phase === "pre" ? { entryTimings: recordEntryTiming(entry) } : {}),
+      ...(phase === "pre" && rescan === undefined ? { entryTimings: recordEntryTiming(entry) } : {}),
       // 34127 (@cto turn58): one clock for the entry's boundaries and the proof deadline it is measured against.
       monotonic,
       entry,
@@ -510,7 +521,7 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
       ...(options.gitRun === undefined ? {} : { gitRun: options.gitRun }),
       ...(options.gitStream === undefined ? {} : { gitStream: options.gitStream }),
       ...(options.targetBranch === undefined ? {} : { custodyTargetBranch: options.targetBranch }),
-      custodyRunScope: runScopeFor(phase),
+      custodyRunScope: rescan ?? runScopeFor(phase),
       ...(options.clock === undefined ? {} : { clock: options.clock }),
       ...(deadline === undefined ? {} : { deadline }),
       ...(options.allowTemporaryArtifactDir === undefined
@@ -680,7 +691,64 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
     }
     entryTiming.endMs = monotonic() - batchStarted
   }
-  closeOverKeptBorrowers(entries, scan.borrowers, kept)
+  // 34127 (@cto 536e2c15): a store the inventory recorded but that was gone when custody read it is a moving estate,
+  // not a verdict. Re-inventory and re-evaluate only the entries that hit that race, at most 3 rounds. Custody is
+  // recomputed from the new set and never patched, and a path still vanishing after the third round keeps the entry
+  // unknown with every round's paths named.
+  const vanishRounds: string[][] = []
+  let passScan = scan
+  for (let round = 1; round <= 3; round += 1) {
+    const hit = entries.filter((entry) => {
+      const proof = preliminary.get(entry)
+      return proof !== undefined && proof.verdict === "unknown" && (proof.vanishedAtRead?.length ?? 0) > 0
+    })
+    if (hit.length === 0) break
+    // One fresh index and run scope per round, for the same reason the held window builds its own: both memoize what
+    // they read, so replaying a round through the preliminary pair would report the very store that came back as gone.
+    const roundIndex = new CustodyIndexScope(join(options.artifactDir, "common", "custody-index", `vanish-${round}`))
+    const roundScope = new CustodyRunScope(join(options.artifactDir, "common", "custody-fragments", `vanish-${round}`))
+    vanishRounds.push([...new Set(hit.flatMap((entry) => preliminary.get(entry)?.vanishedAtRead ?? []))].sort())
+    passScan = await scanEstate(
+      options.namespaceRoots,
+      entries,
+      options.scanBounds ?? BATCH_ESTATE_BOUNDS,
+      Date.now,
+      newEstateWalkRecord(),
+    )
+    let hitLeft = hit.length
+    for (const entry of hit) {
+      const share = entryShare(hitLeft)
+      hitLeft -= 1
+      // A spent budget cannot buy a re-proof. The preliminary verdict stands, so the row still names the paths it lost
+      // instead of replacing that evidence with a deadline cut.
+      if (share.deadline !== undefined && share.ms === 0) continue
+      const proof = await inspectRetainedEntryInBatch(
+        verifyOptions(entry, "pre", share.deadline, roundScope),
+        entryView(passScan, entry),
+        entries,
+        roundIndex,
+      )
+      recordWarnings(proof, "pre")
+      preliminary.set(entry, proof)
+      if (proof.verdict === "candidate") {
+        kept.delete(entry)
+      } else {
+        kept.set(entry, `${proof.verdict}: ${proof.reasons.join("; ")}`)
+      }
+    }
+  }
+  // A path that survived all three rounds marks the entry's reason, so a reader can tell "the estate kept moving" from
+  // "the store is genuinely unprovable" without re-reading the evidence directory.
+  if (vanishRounds.length > 0) {
+    const named = vanishRounds.map((paths, index) => `round ${String(index + 1)}: ${paths.join(", ")}`).join("; ")
+    for (const entry of entries) {
+      const proof = preliminary.get(entry)
+      const still = proof?.verdict === "unknown" && (proof.vanishedAtRead?.length ?? 0) > 0
+      if (!still) continue
+      kept.set(entry, `${kept.get(entry) ?? "unknown"}; the estate vanished under it (${named})`)
+    }
+  }
+  closeOverKeptBorrowers(entries, passScan.borrowers, kept)
   for (const [entry, reason] of kept) rows.set(entry, { entry, outcome: "kept", reason })
   // A proof the deadline cut short already reads `unknown` in its own row; this names the cut for the whole batch.
   const deadlineStop = proofDeadlinePassed()
@@ -693,8 +761,8 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
   const owners = new Set<string>([common])
   const unproved: string[] = []
   for (const objects of [
-    ...scan.objectDirs,
-    ...scan.borrowers.filter((edge) => basename(edge.borrower) === "objects").map((edge) => edge.borrower),
+    ...passScan.objectDirs,
+    ...passScan.borrowers.filter((edge) => basename(edge.borrower) === "objects").map((edge) => edge.borrower),
   ]) {
     if (entries.some((entry) => within(entry, objects))) continue
     const owner = dirname(objects)

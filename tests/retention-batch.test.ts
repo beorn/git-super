@@ -19,6 +19,7 @@ import {
   lstatSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -34,7 +35,7 @@ import {
   type RetentionBatchOptions,
   type RetentionBatchResult,
 } from "../src/retention-batch.ts"
-import { defaultGitRun, defaultGitStream, type GitStreamFactory } from "../src/retention-contents.ts"
+import { defaultGitRun, defaultGitStream, type GitRun, type GitStreamFactory } from "../src/retention-contents.ts"
 import { scanEstate } from "../src/retention-estate.ts"
 import { inspectRetainedEntryInBatch } from "../src/retention-verify.ts"
 
@@ -1519,5 +1520,65 @@ describe("retention retirement batch (#33010)", async () => {
     expect(rows.get(first as string)?.outcome).toBe("kept")
     expect(rows.get(second as string)?.outcome).toBe("kept")
     expect(rows.get(second as string)?.reason).toContain(`kept batch member ${first} still borrows from it`)
+  })
+
+  /** The fixture clock predates entries made after `beforeAll`; move it past their own retainUntil. */
+  function clockAfter(entries: readonly string[], base: Date): Date {
+    const retainUntil = entries.map((entry) =>
+      Date.parse(
+        (JSON.parse(readFileSync(join(entry, "manifest.json"), "utf8")) as { retainUntil: string }).retainUntil,
+      ),
+    )
+    return new Date(Math.max(base.getTime(), ...retainUntil) + 1000)
+  }
+
+  // 34127 (@cto 536e2c15): a store the pass recorded that is gone when custody reads it is a moving estate, not a
+  // verdict. One re-inventory must recover the entry; the object set is never patched and the entry is not kept for a
+  // race that has already stopped.
+  it("a store gone at read time recovers on one rescan", async () => {
+    const dependencyGitDir = realpathSync(join(fixtureRoot, "dependency", ".git"))
+    const { entries } = await atRiskEntries(["vanish-once"])
+    let vanishedOnce = false
+    const raceOnce: GitRun = (args, gitOptions) => {
+      const gitDir = args.find((arg) => arg.startsWith("--git-dir="))?.slice("--git-dir=".length) ?? ""
+      if (!vanishedOnce && args.includes("--show-object-format") && gitDir === dependencyGitDir) {
+        vanishedOnce = true
+        return { code: 128, stdout: "", stderr: `fatal: not a git repository: '${gitDir}'` }
+      }
+      return defaultGitRun(args, gitOptions)
+    }
+    const result = await retireRetainedBatch(
+      options({ entries, gitRun: raceOnce, clock: clockAfter(entries, eligible) }),
+    )
+    const row = result.rows.find((candidate) => candidate.entry === entries[0])
+    expect(vanishedOnce).toBe(true)
+    expect(row?.outcome, row?.reason).toBe("would-retire")
+    expect(row?.reason ?? "").not.toContain("vanished under it")
+  })
+
+  // 34127 (@cto 536e2c15): a set that keeps moving is refused after the third rescan, and the reason names the paths
+  // every round lost, so "the estate never settled" is never confused with "the store cannot be proven".
+  it("an estate that keeps moving is unknown after three rescans, naming each round", async () => {
+    const dependencyGitDir = realpathSync(join(fixtureRoot, "dependency", ".git"))
+    const { entries } = await atRiskEntries(["keeps-moving"])
+    let rounds = 0
+    const alwaysMoving: GitRun = (args, gitOptions) => {
+      const gitDir = args.find((arg) => arg.startsWith("--git-dir="))?.slice("--git-dir=".length) ?? ""
+      if (args.includes("--show-object-format") && gitDir === dependencyGitDir) {
+        rounds += 1
+        return { code: 128, stdout: "", stderr: `fatal: not a git repository: '${gitDir}'` }
+      }
+      return defaultGitRun(args, gitOptions)
+    }
+    const result = await retireRetainedBatch(
+      options({ entries, gitRun: alwaysMoving, clock: clockAfter(entries, eligible) }),
+    )
+    const row = result.rows.find((candidate) => candidate.entry === entries[0])
+    expect(rounds).toBeGreaterThanOrEqual(4)
+    expect(row?.outcome, row?.reason).toBe("kept")
+    expect(row?.reason).toContain("the estate vanished under it")
+    expect(row?.reason).toContain("round 1:")
+    expect(row?.reason).toContain("round 2:")
+    expect(row?.reason).toContain("round 3:")
   })
 })

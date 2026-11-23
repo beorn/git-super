@@ -384,11 +384,6 @@ async function asProofDeadline<T>(work: Promise<T>): Promise<T> {
   }
 }
 
-/**
- * 37792 (@cto 2026-11-22 f66720e5): a witness store whose own refs or objects cannot be read. It is not evidence that
- * the environment lost anything, and it proves nothing, so it is excluded by name. A proof limit that refused the
- * store (policy, remote authority, shallow graph) is NOT this class: that keeps the entry unknown as it always did.
- */
 /** 34127 (@cto 536e2c15): a store the inventory recorded, gone or no longer a repository when custody read it. */
 class VanishedStoreError extends UnknownError {
   constructor(
@@ -400,6 +395,11 @@ class VanishedStoreError extends UnknownError {
   }
 }
 
+/**
+ * 37792 (@cto 2026-11-22 f66720e5): a witness store whose own refs or objects cannot be read. It is not evidence that
+ * the environment lost anything, and it proves nothing, so it is excluded by name. A proof limit that refused the
+ * store (policy, remote authority, shallow graph) is NOT this class: that keeps the entry unknown as it always did.
+ */
 class CorruptStoreError extends UnknownError {
   constructor(message: string) {
     super(message)
