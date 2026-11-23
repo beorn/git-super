@@ -1272,6 +1272,45 @@ describe("retention verify gates 1-6", async () => {
     })
   })
 
+  // 37792 (@cto 1a773179): the first live apply showed 4 of 20 entries kept as "preliminary and held proofs differ"
+  // because the redundancy BLOCK compares two live reads. It records how gate 5 was answered, not what the entry
+  // holds, so it must not decide the pre/held comparison; the held pass re-proves gate 5 from its own read instead.
+  it("keeps the pre/held comparison on the entry, not on the redundancy receipt", async () => {
+    const proof = await verifyRetainedEntry({
+      entry: base.entry,
+      root: base.root,
+      namespaceRoots: [fixtureRoot as string],
+      artifactDir: base.artifactDir,
+      allowTemporaryArtifactDir: true,
+      clock: eligible(),
+    })
+    expect(proof.verdict).toBe("candidate")
+    const path = proof.certificate?.path as string
+    const certificate = JSON.parse(readFileSync(path, "utf8")) as {
+      redundancy?: readonly Readonly<{ proof: Readonly<{ snapshotAt: string; advertisedRefs: number }> }>[]
+    }
+    expect(certificate.redundancy?.[0]?.proof.advertisedRefs).toEqual(expect.any(Number))
+    // The same pass read the remote at another instant and saw another advertisement: everything else is identical.
+    certificate.redundancy = [
+      {
+        component: "vendor/dep",
+        proof: { remote: "origin", snapshotAt: "2026-11-23T00:00:00.000Z", advertisedRefs: 99, reached: [] },
+      },
+    ]
+    const moved = join(base.artifactDir, "retirement-certificate-moved.json")
+    const bytes = `${JSON.stringify(certificate)}\n`
+    writeFileSync(moved, bytes)
+    const movedProof = {
+      ...proof,
+      certificate: {
+        ...(proof.certificate as object),
+        path: moved,
+        digest: createHash("sha256").update(bytes).digest("hex"),
+      },
+    } as typeof proof
+    expect(proofFacts(movedProof).facts).toBe(proofFacts(proof).facts)
+  })
+
   // 37792 (@cto 1a773179): a copy whose every ref tip a timestamped live advertisement reaches needs no witness store,
   // so gate 5 answers from the snapshot and pays no custody phase at all.
   it("answers gate 5 from one live remote snapshot when the copy holds no local ref", async () => {

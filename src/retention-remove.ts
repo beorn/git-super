@@ -107,13 +107,13 @@ export function proofFacts(proof: RetentionVerifyResult): { facts: string; path:
     const entries: [string, unknown][] = []
     for (const [key, item] of Object.entries(value).sort(([a], [b]) => a.localeCompare(b))) {
       if (depth === 0 && (key === "clock" || key === "elapsedMs")) continue
-      // 37792 (@cto 1a773179): a redundancy proof's snapshot time is when THAT pass read the remote, so it differs by
-      // construction. What the snapshot witnessed - its ref count and every reached tip - still compares, so a remote
-      // that moved between the two reads is still caught.
-      if (key === "snapshotAt") {
-        entries.push([key, "snapshot"])
-        continue
-      }
+      // 37792 (@cto 1a773179, corrected by the first live apply 2026-11-23): the redundancy block records HOW this
+      // pass answered gate 5, and both of its inputs move on their own - the snapshot time by construction, and the
+      // advertisement itself as any merge pushes to the remote. Comparing it made the pre/held check report
+      // "census-shifted" for entries whose bytes never changed (4 of 20 on the first live window). The entry's own
+      // facts - components, at-risk digests, manifest, estate - still compare, and the held pass re-proves gate 5 from
+      // its own live read, so a copy that stopped being redundant there keeps the entry on that proof, not on this one.
+      if (depth === 0 && key === "redundancy") continue
       const estate: unknown = item
       if (depth === 0 && key === "estate" && estate !== null && typeof estate === "object" && !Array.isArray(estate)) {
         entries.push([key, canonicalEstateScan(estate)])
