@@ -66,6 +66,7 @@ import type { SuperStatusResult } from "./status.ts"
 import { statusWithGit } from "./status-traversal.ts"
 import { removalBorrowers } from "./worktree-administration.ts"
 import {
+  assertModuleRefsRecoverable,
   describeModuleStores,
   inspectDestroyedModuleStores,
   inspectModuleStores,
@@ -1827,6 +1828,13 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         }
         if (rehome === undefined) throw new Error(`worktree ${path} has no prepared borrower custody`)
         markPhase("prepareRemoval", prepareStarted)
+        // #37970: a slot's module stores die with it, so every ref they keep is proven recoverable first. A caller
+        // that already owns the decision — component custody, or retention keeping a copy — is not second-guessed.
+        if (removeOptions.componentCustody === undefined && removeOptions.retention === undefined) {
+          const recoverableStarted = Date.now()
+          assertModuleRefsRecoverable(path, gitDir)
+          markPhase("moduleStoreRecoverability", recoverableStarted)
+        }
         // #37579: decide every nested component checkout before anything is destroyed.
         const nestedStarted = Date.now()
         const nested = await nestedComponentCheckouts(path, gitDir)

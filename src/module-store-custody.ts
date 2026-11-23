@@ -1,5 +1,5 @@
 import { existsSync, lstatSync, readdirSync, type Dirent } from "node:fs"
-import { isAbsolute, join, relative, sep } from "node:path"
+import { basename, dirname, isAbsolute, join, relative, sep } from "node:path"
 import { tryGit, withGitTimeout } from "./git.ts"
 
 /**
@@ -441,6 +441,77 @@ export function inspectModuleStores(
 export function inspectDestroyedModuleStores(gitDir: string): ModuleInventory {
   const modules = modulesDirectory(gitDir)
   return modules === undefined ? { stores: [] } : judgeStores(modules, [], [])
+}
+
+/**
+ * #37970: a slot's own `modules/` stores are destroyed with the slot, and a ref a seat created inside the slot (a km
+ * worktree branch, a tmpx branch) can exist nowhere else. Before anything is removed, every ref a declared module
+ * store keeps must be readable from the surviving store the projection keeps for that module. A ref that is not is
+ * named and refuses the removal: refusing is recoverable, deleting the only copy is not.
+ *
+ * The survivor is derived from git's own layout, never guessed: a linked worktree's slot sits at
+ * `<repo>/.git/worktrees/<slot>`, and the projection's stores at `<repo>/.git/modules`, so module `name` pairs with
+ * `modules/<name>`. A slot outside that layout has no derivable survivor and is left to its caller.
+ */
+export function assertModuleRefsRecoverable(checkout: string, gitDir: string): void {
+  if (!existsSync(checkout)) return
+  const modules = modulesDirectory(gitDir)
+  if (modules === undefined || basename(dirname(gitDir)) !== "worktrees") return
+  const survivors = join(dirname(dirname(gitDir)), "modules")
+  const unrecoverable: string[] = []
+  for (const store of referencedModuleStores(checkout)) {
+    const surviving = join(survivors, relative(modules, store))
+    const listing = readGit(
+      checkout,
+      [`--git-dir=${store}`, "for-each-ref", "--format=%(objectname) %(refname)"],
+      `the refs of module store ${store}`,
+    )
+    if (listing.status !== 0) {
+      throw new Error(
+        `${checkout} removal refused: the refs of its module store ${store} could not be read ` +
+          `(${listing.stderr.trim() || `git exited ${listing.status}`}); the worktree is preserved.`,
+      )
+    }
+    const refs = listing.stdout
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line !== "")
+      .map((line) => ({ sha: line.slice(0, line.indexOf(" ")), ref: line.slice(line.indexOf(" ") + 1) }))
+    if (refs.length === 0) continue
+    if (!existsSync(surviving)) {
+      for (const { sha, ref } of refs) unrecoverable.push(`${ref} ${sha} (surviving store ${surviving} does not exist)`)
+      continue
+    }
+    const probe = readGit(
+      checkout,
+      [`--git-dir=${surviving}`, "cat-file", "--batch-check=%(objectname)"],
+      `the objects of surviving module store ${surviving}`,
+      STORE_TIMEOUT_MS,
+      `${refs.map(({ sha }) => sha).join("\n")}\n`,
+    )
+    if (probe.status !== 0) {
+      throw new Error(
+        `${checkout} removal refused: surviving module store ${surviving} could not be read ` +
+          `(${probe.stderr.trim() || `git exited ${probe.status}`}); the worktree is preserved.`,
+      )
+    }
+    const present = new Set(
+      probe.stdout
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line !== "" && !line.endsWith(" missing")),
+    )
+    for (const { sha, ref } of refs) {
+      if (!present.has(sha)) unrecoverable.push(`${ref} ${sha} (not in ${surviving})`)
+    }
+  }
+  if (unrecoverable.length === 0) return
+  const shown = unrecoverable.slice(0, 8).join("; ")
+  const more = unrecoverable.length > 8 ? `; and ${unrecoverable.length - 8} more` : ""
+  throw new Error(
+    `${checkout} removal refused: ${unrecoverable.length} ref(s) in its own module stores exist in no surviving ` +
+      `store — ${shown}${more}; the worktree is preserved. Fetch them into the projection's store, then retry.`,
+  )
 }
 
 function modulesDirectory(gitDir: string): string | undefined {
