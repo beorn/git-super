@@ -38,7 +38,7 @@ import {
   type ComponentContents,
   type RefObservations,
 } from "../src/retention-contents.ts"
-import { componentHeads, scanCustody } from "../src/retention-custody.ts"
+import { componentHeads, scanCustody, type RemoteRedundancyProof } from "../src/retention-custody.ts"
 import { scanEstate } from "../src/retention-estate.ts"
 import {
   readRetentionAudits,
@@ -1287,7 +1287,7 @@ describe("retention verify gates 1-6", async () => {
     expect(proof.verdict).toBe("candidate")
     const path = proof.certificate?.path as string
     const certificate = JSON.parse(readFileSync(path, "utf8")) as {
-      redundancy?: readonly Readonly<{ proof: Readonly<{ snapshotAt: string; advertisedRefs: number }> }>[]
+      redundancy?: readonly Readonly<{ component: string; proof: RemoteRedundancyProof }>[]
     }
     expect(certificate.redundancy?.[0]?.proof.advertisedRefs).toEqual(expect.any(Number))
     // The same pass read the remote at another instant and saw another advertisement: everything else is identical.
