@@ -547,12 +547,20 @@ describe("retention retirement batch (#33010)", async () => {
   // 34127 (@cto turn58): a walk cut INSIDE a named custody phase must keep that name and its spend after the caller
   // enters drain. The reproduced defect reported lastPhase=drain with witnessFsck=1489 ms and proofPhases.witnessFsck=0,
   // which loses exactly the operation the deadline landed in.
+  // The budget is a whole second, not tens of milliseconds: the deadline runs from the BATCH start, so a budget the cold
+  // scan can outlast under host load leaves every entry "not started" with no timings at all, which is the wrong test.
+  // One entry holds the whole remainder and the injected call is longer than it, so the cut must land inside that call.
   it("keeps the custody phase a spent deadline cut, not the drain that ran after it", async () => {
     const slowCustody = async (args: readonly string[], runOptions?: Parameters<typeof defaultGitRun>[1]) => {
-      if (args.includes("core.worktree")) await new Promise((resolve) => setTimeout(resolve, 200))
+      if (args.includes("core.worktree")) await new Promise((resolve) => setTimeout(resolve, 4000))
       return defaultGitRun(args, runOptions)
     }
-    const cut = await retireRetainedBatch(options({ proofDeadlineMs: 60, gitRun: slowCustody }))
+    const all = readdirSync(root)
+      .sort()
+      .map((name) => join(root, name))
+    const cut = await retireRetainedBatch(
+      options({ entries: all.slice(0, 1), proofDeadlineMs: 3000, gitRun: slowCustody }),
+    )
     expect(cut.rows.every((row) => row.outcome === "kept")).toBe(true)
     const cutTimings = Object.values(cut.preliminaryEntryTimings ?? {}).filter(
       (timing) => timing.deadlineCutMs !== undefined,
@@ -578,7 +586,7 @@ describe("retention retirement batch (#33010)", async () => {
         expect(spend, name).toBeLessThanOrEqual(timing.phases.child ?? Number.POSITIVE_INFINITY)
       }
     }
-  })
+  }, 30_000)
 
   // 34127 (@cto turn60 defect 1): a slow `rev-list --objects` was charged to `witnessFsck` (1501 ms for a 5.27 ms fsck)
   // and the graph walk that actually spent it reported 0. The operation that ran must own its time.
@@ -641,7 +649,7 @@ describe("retention retirement batch (#33010)", async () => {
     // lose its spend if only fsck and the graph were wired to the entry record.
     expect(timing?.subphases?.witnessCertificates).toBeDefined()
     expect(timing?.subphases?.witnessCertificates ?? 0).toBeLessThanOrEqual(timing?.phases.child ?? 0)
-  })
+  }, 30_000)
 
   // #35047 (@dev/review2 REVISE bf2e0b30): the deadline cuts a custody walk already running only if the batch hands it
   // to every verifier call. The spent-deadline rows above are decided by the batch loop and pass without that wire.
