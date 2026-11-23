@@ -1998,9 +1998,11 @@ export type RemoteRedundancyOutcome =
 
 /**
  * The most advertised refs one tip's ancestry is asked of before the fast path gives up. A tip past the bound falls
- * back to the witness and fsck proof it had before, so the bound can only cost time, never correctness.
+ * back to the witness and fsck proof it had before, so the bound can only cost time, never correctness. Measured
+ * 2026-11-23: a store can advertise thousands of archive refs (terminfo.dev answered 4,458), so the bound is generous
+ * and the candidates are ranked - a same-named branch is asked first, which is where a moved tip is published.
  */
-const MAX_ANCESTRY_CANDIDATES = 16
+const MAX_ANCESTRY_CANDIDATES = 64
 
 /**
  * A remote configured as a path is relative to the store that configures it, so two stores naming the same remote
@@ -2165,10 +2167,17 @@ export async function proveRemoteRedundancy(
   if (snapshot.status !== "read") return unproven(`${label}: ${snapshot.detail}`)
   const advertised = [...snapshot.refs].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
   // The default branch is where a published tip is most likely to be found, so it is asked first.
-  const ranked = [
-    ...advertised.filter(([ref]) => ref === "refs/heads/main" || ref === "refs/heads/master"),
-    ...advertised.filter(([ref]) => ref !== "refs/heads/main" && ref !== "refs/heads/master"),
-  ]
+  // Ranked so the answer is usually found early: an advertised ref bearing the SAME NAME as a local ref is asked
+  // first (a branch pushed under its own name has merely moved), then the default branches, then branches, tags and
+  // every other namespace. The order decides only how many refs are tried, never which ones may prove.
+  const rank = (ref: string): number => {
+    if (ref === "refs/heads/main" || ref === "refs/heads/master") return 0
+    if (ref.startsWith("refs/heads/")) return 1
+    if (ref.startsWith("refs/tags/")) return 2
+    return 3
+  }
+  const ranked = [...advertised].sort((a, b) => rank(a[0]) - rank(b[0]) || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+  const advertisedByName = new Map(advertised)
   const exact = new Map<string, string>()
   for (const [ref, tip] of advertised) if (!exact.has(tip)) exact.set(tip, ref)
   try {
@@ -2177,7 +2186,12 @@ export async function proveRemoteRedundancy(
       let remoteRef = exact.get(tip)
       if (remoteRef === undefined) {
         let asked = 0
-        for (const [candidateRef, candidateTip] of ranked) {
+        // The same-named advertised ref first, then the ranked list, each asked at most once.
+        const sameName = refs
+          .map((ref) => [ref, advertisedByName.get(ref)] as const)
+          .filter((entry): entry is readonly [string, string] => entry[1] !== undefined)
+        const order = [...sameName, ...ranked.filter(([ref]) => !refs.includes(ref))]
+        for (const [candidateRef, candidateTip] of order) {
           if (asked >= MAX_ANCESTRY_CANDIDATES) break
           // A tip the advertisement reaches is ancestry of the advertised commit; the object has to be here to ask.
           const present = await storeRun(

@@ -123,6 +123,27 @@ describe("retention redundancy against a live remote snapshot (#37792)", () => {
     )
   })
 
+  // A branch pushed under its OWN name has merely moved; the same-named advertised ref is asked first, so a remote
+  // carrying thousands of unrelated refs still finds the answer without walking the whole advertisement.
+  it("finds a branch pushed under its own name in an advertisement with many unrelated refs", async () => {
+    const fixture = storeFor("redundant-samename")
+    git(fixture.remote, ["branch", "topic", fixture.second])
+    for (let index = 0; index < 80; index += 1) {
+      // Every unrelated ref points at the LATER commit, so exact equality cannot answer: only ancestry can.
+      git(fixture.remote, ["branch", `side-${String(index)}`, fixture.second])
+    }
+    // The store's only local ref is its own branch, still at the tip it had before the push.
+    git(fixture.store, ["update-ref", "refs/heads/topic", fixture.first])
+    git(fixture.store, ["update-ref", "-d", "refs/heads/main"])
+    const outcome = await prove(fixture.store)
+    expect(outcome).toMatchObject({ status: "redundant" })
+    if (outcome.status !== "redundant") return
+    expect(outcome.proof.reached).toEqual([
+      { ref: "refs/heads/topic", tip: fixture.first, remoteRef: "refs/heads/topic" },
+    ])
+    expect(outcome.proof.advertisedRefs).toBeGreaterThan(80)
+  })
+
   // The tip is not published anywhere the snapshot names, so the entry keeps the witness walk it had before.
   it("leaves a tip the snapshot never advertised unproven", async () => {
     const fixture = storeFor("redundant-unpublished")
