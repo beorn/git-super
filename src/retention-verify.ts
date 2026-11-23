@@ -144,6 +144,12 @@ export type RetentionVerifyResult = Readonly<{
   custody?:
     | Readonly<{ missingCount: number; missingSidecar?: SidecarRef | undefined; loss: readonly MissingComponentLoss[] }>
     | undefined
+  /**
+   * 34127 (@cto 536e2c15): stores recorded by this pass's inventory that were gone, or no longer a git repository,
+   * when gate 5 read them. Present only on a gate-5 `unknown`, and the reason a caller may re-inventory and re-evaluate
+   * rather than treat the entry as unprovable. Never set when custody was actually decided (`pass` or `blocked`).
+   */
+  vanishedAtRead?: readonly string[] | undefined
   explicitLoss?: RetentionExplicitLoss | undefined
   certificate?:
     | Readonly<{ path: string; digest: string; commonArtifactDir: string; warnings?: readonly string[] }>
@@ -504,6 +510,7 @@ async function evaluateRetainedEntry(
     contents?: readonly ComponentContents[] | undefined
     witnesses?: readonly WitnessIdentity[] | undefined
     custody?: RetentionVerifyResult["custody"]
+    vanishedAtRead?: RetentionVerifyResult["vanishedAtRead"]
     explicitLoss?: RetentionExplicitLoss | undefined
     certificate?:
       | Readonly<{ path: string; digest: string; commonArtifactDir: string; warnings?: readonly string[] }>
@@ -1199,6 +1206,10 @@ async function evaluateRetainedEntry(
       ? ""
       : `head census unreadable, witness proof kept: ${headsCensus.unreadable.join("; ")}`,
   ].filter((note) => note !== "")
+  // 34127 (@cto 536e2c15): name a moving-estate race so the caller can re-inventory instead of reading it as unprovable.
+  if (custody.status === "unknown" && custody.vanishedAtRead !== undefined) {
+    result.vanishedAtRead = custody.vanishedAtRead
+  }
   const custodyDetail = censusNotes.length === 0 ? custody.detail : `${custody.detail}; ${censusNotes.join("; ")}`
   if (custody.status === "blocked") {
     result.custody = {

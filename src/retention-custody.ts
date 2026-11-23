@@ -85,6 +85,14 @@ export interface CustodyScan {
   readonly missing: readonly CustodyTarget[]
   readonly missingCount: number
   readonly missingSidecar?: SidecarRef | undefined
+  /**
+   * 34127 (@cto 536e2c15): stores the pass recorded during inventory but could not read because the path was gone, or
+   * was no longer a git repository, by the time custody reached it. That is a race with a moving estate, not a verdict
+   * about the entry: a caller may re-inventory and re-evaluate, and only the caller knows how many rescans it allows.
+   * Named here so no caller string-matches a git error, and so a pass that keeps moving can report which paths it lost
+   * on which round.
+   */
+  readonly vanishedAtRead?: readonly string[] | undefined
   /** At-risk commits a rebase removed that the published main graph still holds by patch-id. */
   readonly rebased?: readonly RebaseWitness[] | undefined
   /**
@@ -381,6 +389,17 @@ async function asProofDeadline<T>(work: Promise<T>): Promise<T> {
  * the environment lost anything, and it proves nothing, so it is excluded by name. A proof limit that refused the
  * store (policy, remote authority, shallow graph) is NOT this class: that keeps the entry unknown as it always did.
  */
+/** 34127 (@cto 536e2c15): a store the inventory recorded, gone or no longer a repository when custody read it. */
+class VanishedStoreError extends UnknownError {
+  constructor(
+    readonly gitDir: string,
+    message: string,
+  ) {
+    super(message)
+    this.name = "VanishedStoreError"
+  }
+}
+
 class CorruptStoreError extends UnknownError {
   constructor(message: string) {
     super(message)
@@ -749,11 +768,15 @@ function alternateClosure(
 async function objectFormat(
   gitDir: string,
   run: GitRun,
-): Promise<{ status: "ok"; format: string } | { status: "unknown"; detail: string }> {
+): Promise<{ status: "ok"; format: string } | { status: "unknown"; detail: string; vanished?: string }> {
   const result = await run([`--git-dir=${gitDir}`, "rev-parse", "--show-object-format"])
   refuseSuccessfulStderr(result, `rev-parse --show-object-format in ${gitDir}`)
   if (result.code !== 0) {
-    return { status: "unknown", detail: `rev-parse --show-object-format failed in ${gitDir}: ${result.stderr.trim()}` }
+    const detail = `rev-parse --show-object-format failed in ${gitDir}: ${result.stderr.trim()}`
+    // 34127 (@cto 536e2c15): the inventory listed this store and it is gone now. That is a moving estate, not a verdict.
+    const gone =
+      !existsSync(gitDir) || /not a git repository|does not exist|No such file or directory/u.test(result.stderr)
+    return gone ? { status: "unknown", detail, vanished: gitDir } : { status: "unknown", detail }
   }
   const format = result.stdout.trim()
   if (format !== "sha1" && format !== "sha256") {
@@ -1056,7 +1079,10 @@ async function readWitnessStore(
     const detached = await worktreeGone(gitDir, run)
     const storeRun = atStore(run, gitDir, detached)
     const format = await objectFormat(gitDir, storeRun)
-    if (format.status !== "ok") throw new UnknownError(format.detail)
+    if (format.status !== "ok") {
+      if (format.vanished !== undefined) throw new VanishedStoreError(format.vanished, format.detail)
+      throw new UnknownError(format.detail)
+    }
     const closureResult = alternateClosure(store, removal)
     if (closureResult.status !== "ok") throw new UnknownError(closureResult.detail)
     // 37792 (@cto 78e96f64 part 4): a store proves custody only for components of the repository it mirrors. A store
@@ -2330,7 +2356,10 @@ async function runCustody(
         componentGitDir,
         atStore(proofRun, componentGitDir, await worktreeGone(componentGitDir, proofRun)),
       )
-      if (format.status !== "ok") throw new UnknownError(format.detail)
+      if (format.status !== "ok") {
+        if (format.vanished !== undefined) throw new VanishedStoreError(format.vanished, format.detail)
+        throw new UnknownError(format.detail)
+      }
       // 37455-A (@cto 29f8631c): reachability first. A component whose every head ancestry proved needs no byte
       // stream; its closure was already read once for its store above. Anything else falls through to the witness and
       // patch proofs below, where the patch bound stays.
@@ -2655,6 +2684,7 @@ export async function scanCustody(
       witnessCount: 0,
       missing: [],
       missingCount: 0,
+      ...(error instanceof VanishedStoreError ? { vanishedAtRead: [error.gitDir] } : {}),
     }
   }
 }

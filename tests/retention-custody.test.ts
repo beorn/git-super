@@ -2268,6 +2268,23 @@ describe("retention custody scan — head closure and fetched refs (#37792)", ()
     void remote
   })
 
+  // 34127 (@cto 536e2c15): a store the inventory recorded, gone by the time custody reads it, is a moving estate
+  // rather than a verdict. It must be named structurally, so a caller can re-inventory instead of string-matching a
+  // git error, and so a pass that keeps moving can report which paths it lost.
+  test("a store gone between inventory and custody is named, not reported as a plain unknown", async () => {
+    const { primary } = publishedStores("git-super-vanished-at-read-")
+    const head = git(primary, ["rev-parse", "HEAD"])
+    const sidecarDir = tmp("git-super-vanished-at-read-sidecars-")
+    const real = await componentOf([head], sidecarDir, "owned", { [head]: "commit" })
+    const gone = join(tmp("git-super-vanished-at-read-gone-"), "modules", "ag")
+    const vanished = { ...real, gitDir: gone }
+    const scan = await scanCustody(primary, [vanished], [join(primary, ".git", "objects")], [], { sidecarDir })
+    expect(scan.status).toBe("unknown")
+    expect(scan.vanishedAtRead).toEqual([gone])
+    // The detail still says what was read and what failed; the structure is additive, never a replacement.
+    expect(scan.detail).toContain(gone)
+  })
+
   // 37854 (@dev/6 46063009): the case the other cap test cannot discriminate. A cap BELOW both readings refuses
   // both, so it proves nothing about the bound; the honest behaviour to pin is a cap between the two fragment
   // sizes, where the narrower walk still passes and the wider one is refused. A wider fragment costs proof margin,
