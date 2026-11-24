@@ -58,6 +58,13 @@ export interface NothingUnpublishedInput {
   /** The environment (worktree) root to read. */
   readonly path: string
   /**
+   * Whether a clean working tree is part of the proof. True for a live environment (creation): an uncommitted edit or an
+   * untracked file is work that exists nowhere else. False for a retained copy (the sweep): the copy holds stores, not a
+   * checkout, so its heads against the remote refs are the whole question and running `status` there would prove
+   * nothing while costing a store walk per entry.
+   */
+  readonly checkWorktree?: boolean
+  /**
    * Refresh remote-tracking refs. The sweep passes one that fetches the shared dev repository once for the run; the
    * creation path passes one that fetches this environment. A rejection is `unknown`, never a clean verdict.
    */
@@ -93,6 +100,7 @@ async function submodulesOf(git: PredicateGit, cwd: string): Promise<string[]> {
 
 export async function nothingUnpublished(input: NothingUnpublishedInput): Promise<NothingUnpublishedVerdict> {
   const { git, path } = input
+  const checkWorktree = input.checkWorktree ?? true
   const heads: string[] = []
   try {
     if (input.refreshRemotes !== undefined) await input.refreshRemotes()
@@ -108,12 +116,14 @@ export async function nothingUnpublished(input: NothingUnpublishedInput): Promis
           reason: `${repository} has no remote-tracking refs, so publication cannot be proved`,
         }
       }
-      const dirty = lines(await git.text(repository, ["status", "--porcelain", "--untracked-files=all"]))
-      if (dirty.length > 0) {
-        return {
-          state: "unpublished",
-          heads,
-          reason: `${repository} is not clean: ${dirty[0] as string}${dirty.length > 1 ? ` (and ${String(dirty.length - 1)} more)` : ""}`,
+      if (checkWorktree) {
+        const dirty = lines(await git.text(repository, ["status", "--porcelain", "--untracked-files=all"]))
+        if (dirty.length > 0) {
+          return {
+            state: "unpublished",
+            heads,
+            reason: `${repository} is not clean: ${dirty[0] as string}${dirty.length > 1 ? ` (and ${String(dirty.length - 1)} more)` : ""}`,
+          }
         }
       }
       if (here.length > 0) {

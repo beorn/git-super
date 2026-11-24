@@ -107,6 +107,15 @@ describe("nothingUnpublished", () => {
     expect(verdict.state).toBe("unknown")
   })
 
+  // A retained copy holds stores, not a checkout: the sweep asks only the heads question, and never pays for a walk
+  // that would answer about a working tree the copy does not have.
+  test("copy mode proves heads only and never reads a working tree", async () => {
+    const git = fakeGit({ ...base, [`${ENV} :: status --porcelain --untracked-files=all`]: new Error("no status") })
+    const verdict = await nothingUnpublished({ git, path: ENV, checkWorktree: false })
+    expect(verdict.state).toBe("published")
+    expect(git.calls.some((call) => call.includes("status --porcelain"))).toBe(false)
+  })
+
   test("a detached HEAD is checked as a head of its own", async () => {
     const verdict = await verdictOf({
       [`${ENV} :: rev-parse --abbrev-ref HEAD`]: "HEAD\n",
