@@ -1249,6 +1249,10 @@ async function evaluateRetainedEntry(
     const headsCensus = await componentHeadCensus(expectedCopyRoot, contents.components, options, refObservations)
     const custody = await scanCustody(expectedCopyRoot, contents.components, witnessStores, removalSet, {
       sidecarDir,
+      // 38234 (@cto b0d99f29): `removalSet` is the whole batch when this proof is a batch member, but only a witness
+      // that borrows into THIS entry's own removal refuses the entry; a borrow into another member's store is a
+      // non-witness for that one record.
+      ownRemoval: [entryReal],
       ...(options.gitRun === undefined ? {} : { run: options.gitRun }),
       ...(options.gitStream === undefined ? {} : { stream: options.gitStream }),
       ...(options.bounds?.custody === undefined ? {} : { bounds: options.bounds.custody }),
