@@ -182,6 +182,12 @@ export interface CustodyScanOptions {
    * keeps the entry unknown rather than mis-retiring it; {@link MAX_SUBTRACTED_TIPS} states that limit in full.
    */
   readonly maxSubtractedTips?: number
+  /**
+   * 38234 (@cto b0d99f29): the entries THIS scan is retiring, as opposed to the removal superset a batch hands every
+   * member. A witness whose alternate closure reaches into this set refuses the entry, exactly as a single run
+   * refuses it (#27443(b)); a borrow into another member's store is only a non-witness. Absent, it is `removal`.
+   */
+  readonly ownRemoval?: readonly string[]
 }
 
 /**
@@ -471,19 +477,37 @@ async function storeRepoIdentity(
   gitDir: string,
   run: GitRun,
   remaining: () => number,
-): Promise<Readonly<{ status: "known"; id: string }> | Readonly<{ status: "unknown"; detail: string }>> {
+): Promise<
+  | Readonly<{ status: "known"; id: string; own?: string }>
+  | Readonly<{ status: "unknown"; detail: string; own?: string }>
+> {
   const timeoutMs = remaining()
+  // 38234 (@cto b0d99f29): the repository's OWN identity on this filesystem — the common directory every worktree of
+  // it shares, and the path a local clone's remote names. A remote identity can only be compared with a remote; the
+  // own identity is what makes "this store IS the component's repository" provable when one side declares no remote.
+  const own = await run(
+    [`--git-dir=${gitDir}`, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+    Number.isFinite(timeoutMs) ? { timeoutMs } : {},
+  )
+  // The trailing slash is stripped AFTER normalization: it drops a `.git` suffix, which leaves one behind.
+  const ownText = own.code === 0 ? own.stdout.trim() : ""
+  const ownId = ownText === "" ? undefined : normalizeRepoUrl(ownText).replace(/\/+$/u, "")
   const config = await run(
     [`--git-dir=${gitDir}`, "config", "--get-regexp", String.raw`^remote\..*\.url$`],
     Number.isFinite(timeoutMs) ? { timeoutMs } : {},
   )
   if (config.code === 1 && config.stderr.trim() === "") {
-    return { status: "unknown", detail: `${gitDir} declares no remote URL` }
+    return {
+      status: "unknown",
+      detail: `${gitDir} declares no remote URL`,
+      ...(ownId === undefined ? {} : { own: ownId }),
+    }
   }
   if (config.code !== 0) {
     return {
       status: "unknown",
       detail: `${gitDir}: its remote URLs could not be read (${config.stderr.trim() || `exit ${String(config.code)}`})`,
+      ...(ownId === undefined ? {} : { own: ownId }),
     }
   }
   const ids = new Set<string>()
@@ -494,6 +518,7 @@ async function storeRepoIdentity(
       return {
         status: "unknown",
         detail: `${gitDir}: unreadable remote config line ${JSON.stringify(line.slice(0, 120))}`,
+        ...(ownId === undefined ? {} : { own: ownId }),
       }
     }
     ids.add(normalizeRepoUrl(match[2]))
@@ -502,9 +527,10 @@ async function storeRepoIdentity(
     return {
       status: "unknown",
       detail: `${gitDir} declares ${String(ids.size)} distinct remote repositories (${[...ids].sort().join(", ")}), so the repository it mirrors is unknown`,
+      ...(ownId === undefined ? {} : { own: ownId }),
     }
   }
-  return { status: "known", id: [...ids][0] as string }
+  return { status: "known", id: [...ids][0] as string, ...(ownId === undefined ? {} : { own: ownId }) }
 }
 
 /**
@@ -851,6 +877,12 @@ interface DurableRefRecord {
   readonly complete: boolean
   /** Read as a detached gitdir because its recorded core.worktree is gone (#34920). */
   readonly detached: boolean
+  /** 38234: the repository this witness's own remote names; absent when the identity could not be read. */
+  readonly repo?: string
+  /** 38234 (@cto b0d99f29): this store's OWN repository on this filesystem, matched against a component's own. */
+  readonly own?: string
+  /** 38234: the store's alternate object directories, for the per-entry removal filter. */
+  readonly alternateStores: readonly string[]
 }
 
 /**
@@ -1062,6 +1094,20 @@ type WitnessStoreRead =
       /** True when `fsck --connectivity-only` covered this store for the entry. */
       readonly fsck: boolean
       readonly fsckMs: number
+      /**
+       * 38234 (@cto c1f22351): the custody authority this witness belongs to — the repository its own remote names.
+       * A commit proves custody only against a witness of its own remote, so a batch index built once is read per
+       * partition, never as one pooled set of shas.
+       */
+      readonly repo?: string
+      /** 38234 (@cto b0d99f29): this store's OWN repository on this filesystem, matched against a component's own. */
+      readonly own?: string
+      /**
+       * 38234 (@cto 418fe620 condition 1): this store's alternate object directories, read with no exclusion. A
+       * shared index cannot know an entry's removal set, so the per-entry filter asks whether any of these (or the
+       * store itself) sits inside that entry's removal, or inside one an earlier entry of the batch already executed.
+       */
+      readonly alternateStores: readonly string[]
     }
 
 async function readWitnessStore(
@@ -1101,6 +1147,7 @@ async function readWitnessStore(
     const remainingHere = (): number => (deadline === undefined ? Number.POSITIVE_INFINITY : deadline - clock())
     const identity = await identityOf(runScope, gitDir, storeRun, remainingHere)
     const repo = identity.status === "known" ? identity.id : undefined
+    const own = identity.own
     if (
       identity.status === "known" &&
       componentRepos !== undefined &&
@@ -1260,6 +1307,9 @@ async function readWitnessStore(
       ...(publishedEntry === undefined ? {} : { published: publishedEntry }),
       fsck,
       fsckMs,
+      ...(repo === undefined ? {} : { repo }),
+      ...(own === undefined ? {} : { own }),
+      alternateStores: closureResult.stores,
     }
   } catch (error) {
     if (error instanceof CorruptStoreError) return { kind: "corrupt", gitDir, detail: error.message }
@@ -1522,6 +1572,9 @@ async function indexWitnessStoresReported(
           fragment,
           complete: subtract.length === 0,
           detached: read.detached,
+          ...(read.repo === undefined ? {} : { repo: read.repo }),
+          ...(read.own === undefined ? {} : { own: read.own }),
+          alternateStores: read.alternateStores,
         })
         prior.push({ store, tip: entry.tip, plain: read.plain })
       }
@@ -2253,7 +2306,10 @@ async function identityOf(
   gitDir: string,
   run: GitRun,
   remaining: () => number,
-): Promise<Readonly<{ status: "known"; id: string } | { status: "unknown"; detail: string }>> {
+): Promise<
+  | Readonly<{ status: "known"; id: string; own?: string }>
+  | Readonly<{ status: "unknown"; detail: string; own?: string }>
+> {
   const cached = scope?.identities.get(gitDir)
   if (cached !== undefined) return cached
   const computed = await storeRepoIdentity(gitDir, run, remaining)
@@ -2342,11 +2398,76 @@ async function ancestryProof(
   }
 }
 
+/**
+ * 38234 (@cto c1f22351 + 418fe620 conditions 1 and 2, b0d99f29): a batch builds ONE witness index, so membership in it
+ * is no longer proof for any particular entry. Returns the reason this record may not witness, or `undefined` when it
+ * may. Dropping a witness can only keep more, so no arm here can free an entry wrongly.
+ */
+function witnessOutOfBounds(
+  record: DurableRefRecord,
+  component: Readonly<{ repo?: string; own?: string; headRef?: string }>,
+  exclusions: readonly string[],
+  ownRemoval: readonly string[],
+): string | undefined {
+  // #27443(b): a store whose alternate closure reaches into the entry BEING PROVED is refused outright, never read —
+  // a single run throws from the closure before it asks which repository the store mirrors. `alternateStores` starts
+  // with the store itself, so the root is excluded here and falls through to the per-record arms below.
+  const refused = record.alternateStores.find(
+    (store) => store !== record.store && ownRemoval.some((root) => within(root, store)),
+  )
+  if (refused !== undefined) {
+    throw new UnknownError(`witness store ${record.store} borrows ${refused} inside the removal set`)
+  }
+  // @cto b0d99f29 (2): a borrow into ANOTHER batch member's store is a non-witness for this record only. Throwing
+  // here let one borrower stop a whole batch, which is the 0-of-1000 failure by another route.
+  const borrowed = record.alternateStores.find(
+    (store) => store !== record.store && exclusions.some((root) => within(root, store)),
+  )
+  if (borrowed !== undefined) {
+    return `witness store ${record.store} borrows ${borrowed} inside the removal set`
+  }
+  // A witness inside the removal set can prove nothing about objects that outlive it: the entry keeps them, by name.
+  if (exclusions.some((root) => within(root, record.store))) {
+    return `witness store ${record.store} sits inside the removal set`
+  }
+  const same = (a: string | undefined, b: string | undefined): boolean => a !== undefined && b !== undefined && a === b
+  // @cto b3adf206: matching on the OWN identity can make a store's repository the component's OWN repository — a
+  // worktree and its main checkout share one common directory — so the store's refs ARE the entry's own refs. The
+  // branch this entry has checked out is its own state, never independent proof: objects only it holds are kept.
+  if (
+    ownRemoval.length > 0 &&
+    same(component.own, record.own) &&
+    component.headRef !== undefined &&
+    record.ref === component.headRef
+  ) {
+    return `witness ref ${record.ref} is this entry's own branch in its own repository`
+  }
+  // @cto b0d99f29 (1): fail CLOSED, never open. A witness stands in only when a readable identity on each side names
+  // the same repository — the component's remote or its own common directory against the store's remote or its own.
+  // Nothing is accepted by default because an identity could not be read: an unreadable remote is a non-witness, which
+  // is the hole this closes.
+  const matched =
+    same(component.repo, record.repo) ||
+    same(component.repo, record.own) ||
+    same(component.own, record.repo) ||
+    same(component.own, record.own)
+  if (!matched) {
+    const witness = record.repo ?? record.own
+    const target = component.repo ?? component.own
+    if (witness === undefined || target === undefined) {
+      return `witness identity unknown: ${witness === undefined ? `${record.store} names no readable repository` : `this component names no readable repository, so ${record.store} cannot be shown to mirror it`}`
+    }
+    return `witness store ${record.store} mirrors ${witness}, not this component's ${target}`
+  }
+  return undefined
+}
+
 async function runCustody(
   copyRoot: string,
   components: readonly ComponentContents[],
   witnessStores: readonly string[],
   removal: readonly string[],
+  ownRemoval: readonly string[],
   run: GitRun,
   stream: GitStreamFactory,
   bounds: CustodyBounds,
@@ -2459,10 +2580,22 @@ async function runCustody(
     }
   }
   const indexDir = indexScope?.dir ?? sidecarDir
+  // 38234 (@cto 418fe620): a batch builds one witness index for every entry, so the index is built with NO store
+  // exclusion — the walk's cost is the same either way — and the per-entry filter below removes the witnesses that
+  // entry's removal set (plus every removal already executed in this batch) puts out of bounds. Passing `removal`
+  // here is what made one batch walk the estate once per entry.
+  const indexExclusion: readonly string[] = []
+  // 38234 (@cto 418fe620 condition 1): the batch hands every entry the WHOLE batch as its removal set, so this is
+  // already the superset of "this entry's own removal plus every removal an earlier entry executed" — and
+  // conservative is the only direction allowed. The removal arm matters because the shared index now admits alternate
+  // closures the per-entry removal set never excluded.
+  const custodyExclusions: readonly string[] = removal
+  // 38234 (@cto b0d99f29): the entry's OWN removal, the only set whose borrower refuses the entry itself.
+  const custodyOwnRemoval: readonly string[] = ownRemoval
   const buildIndex = async (): Promise<BuiltWitnessIndex> => {
     const indexed = await indexWitnessStores(
       stores,
-      removal,
+      indexExclusion,
       proofStream,
       proofRun,
       bounds,
@@ -2496,20 +2629,33 @@ async function runCustody(
   // matching none of them can be skipped rather than fscked.
   const componentRepoIds = new Set<string>()
   const componentRepoByComponent = new Map<string, string>()
+  /** 38234 (@cto b0d99f29): each component's OWN repository, so a store can be its own repository by path too. */
+  const componentOwnByComponent = new Map<string, string>()
+  /** 38234 (@cto b3adf206): the branch this entry has checked out, which its own repository must never witness through. */
+  const componentHeadRefByComponent = new Map<string, string>()
   let componentReposComplete = components.length > 0
   for (const component of components) {
     // #34920: a retained module records core.worktree for a checkout that is gone, so its config is read detached or
     // git refuses to answer at all — which read as an unproved repository and cost the whole run its scoping (#37792).
     const componentGitDir = component.gitDir ?? join(copyRoot, component.component)
-    const identity = await storeRepoIdentity(
-      componentGitDir,
-      atStore(proofRun, componentGitDir, await worktreeGone(componentGitDir, proofRun)),
-      remaining,
-    )
+    const componentRun = atStore(proofRun, componentGitDir, await worktreeGone(componentGitDir, proofRun))
+    const identity = await storeRepoIdentity(componentGitDir, componentRun, remaining)
     if (identity.status === "known") {
       componentRepoIds.add(identity.id)
       componentRepoByComponent.set(component.component, identity.id)
     } else componentReposComplete = false
+    if (identity.own !== undefined) componentOwnByComponent.set(component.component, identity.own)
+    const head = await componentRun([`--git-dir=${componentGitDir}`, "symbolic-ref", "-q", "HEAD"], {})
+    // Exit 1 is a detached HEAD: no branch is checked out, and no branch can be this entry's own proof anyway.
+    if (head.code === 0 && head.stdout.trim() !== "")
+      componentHeadRefByComponent.set(component.component, head.stdout.trim())
+    else if (head.code !== 1 && identity.own !== undefined) {
+      // A repository that answered its own identity but not its HEAD is a store to name, never one to guess about. A
+      // store that answered NEITHER is unreadable, and the vanished/corrupt paths below name it with its structure.
+      throw new UnknownError(
+        `symbolic-ref HEAD in ${componentGitDir} failed (exit ${String(head.code)}): ${head.stderr.trim()}`,
+      )
+    }
   }
   const componentRepos = { ids: componentRepoIds, complete: componentReposComplete }
   // 37792 (@cto 78e96f64 part 2): when ancestry proves every component no witness is needed, so no store-wide
@@ -2538,7 +2684,6 @@ async function runCustody(
       : await indexScope.witnessIndex(
           JSON.stringify([
             stores,
-            [...removal].sort(),
             witnessPolicy?.targetBranch ?? null,
             [...componentRepoIds].sort(),
             componentReposComplete,
@@ -2649,6 +2794,31 @@ async function runCustody(
       const proven = ancestryByComponent.get(component.component)
       const provenUnreferenced: CustodyTarget[] = []
       let provenUnreferencedTotal = 0
+      // 38234: one object with no eligible witness, by exactly the path a run with no index line takes.
+      const withoutWitness = (key: string, source: string, objectType: string): void => {
+        // 37455-A: a proven component keeps every un-witnessed object named here rather than silent. No head
+        // reaches it, no patch stream is read for it, and the proof says exactly which objects the removal drops.
+        if (proven !== undefined) {
+          provenUnreferencedTotal += 1
+          unreferencedCount += 1
+          if (unreferenced.length < MISSING_INLINE) {
+            unreferenced.push({ component: component.component, oid: key, source })
+          }
+          if (provenUnreferenced.length < MISSING_INLINE) {
+            provenUnreferenced.push({ component: component.component, oid: key, source })
+          }
+          return
+        }
+        missingCount += 1
+        if (missing.length < MISSING_INLINE) missing.push({ component: component.component, oid: key, source })
+        allMissing.push({
+          component: component.component,
+          oid: key,
+          source,
+          objectType,
+          ...(component.gitDir === undefined ? {} : { gitDir: component.gitDir }),
+        })
+      }
       await mergeSorted(
         [
           { label: "at-risk", lines: readLines(component.atRiskSidecar.path), keyOf: oidKey },
@@ -2662,28 +2832,7 @@ async function runCustody(
           const objectType = atRiskLines[0]?.split("\t")[1] ?? "unknown"
           const indexLines = groups.find((group) => group.label === "witness-index")?.lines
           if (indexLines === undefined || indexLines.length === 0) {
-            // 37455-A: a proven component keeps every un-witnessed object named here rather than silent. No head
-            // reaches it, no patch stream is read for it, and the proof says exactly which objects the removal drops.
-            if (proven !== undefined) {
-              provenUnreferencedTotal += 1
-              unreferencedCount += 1
-              if (unreferenced.length < MISSING_INLINE) {
-                unreferenced.push({ component: component.component, oid: key, source })
-              }
-              if (provenUnreferenced.length < MISSING_INLINE) {
-                provenUnreferenced.push({ component: component.component, oid: key, source })
-              }
-              return
-            }
-            missingCount += 1
-            if (missing.length < MISSING_INLINE) missing.push({ component: component.component, oid: key, source })
-            allMissing.push({
-              component: component.component,
-              oid: key,
-              source,
-              objectType,
-              ...(component.gitDir === undefined ? {} : { gitDir: component.gitDir }),
-            })
+            withoutWitness(key, source, objectType)
             return
           }
           const rank = indexLines[0]?.split("\t")[1]
@@ -2693,6 +2842,29 @@ async function runCustody(
             throw new UnknownError(
               `witness store ${record.store} object format does not match component ${component.component}`,
             )
+          }
+          // 38234 (@cto c1f22351 + 418fe620): a shared index holds every store's witnesses, so membership alone is
+          // not proof. The witness must belong to this component's own remote, and neither it nor an alternate it
+          // borrows from may sit inside this entry's removal or one an earlier entry of this batch executed.
+          const outOfBounds = witnessOutOfBounds(
+            record,
+            {
+              ...(componentRepoByComponent.get(component.component) === undefined
+                ? {}
+                : { repo: componentRepoByComponent.get(component.component) as string }),
+              ...(componentOwnByComponent.get(component.component) === undefined
+                ? {}
+                : { own: componentOwnByComponent.get(component.component) as string }),
+              ...(componentHeadRefByComponent.get(component.component) === undefined
+                ? {}
+                : { headRef: componentHeadRefByComponent.get(component.component) as string }),
+            },
+            custodyExclusions,
+            custodyOwnRemoval,
+          )
+          if (outOfBounds !== undefined) {
+            withoutWitness(key, source, objectType)
+            return
           }
           witnessCount += 1
           witnessWriter.add(`${key}\t${component.component}\t${record.store}\t${record.ref}\t${record.tip}`)
@@ -2944,6 +3116,7 @@ export async function scanCustody(
       components,
       witnessStores,
       removal,
+      options.ownRemoval ?? removal,
       run,
       stream,
       bounds,

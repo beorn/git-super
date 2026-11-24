@@ -124,6 +124,9 @@ function publishedStores(prefix: string, remoteName = "origin.git"): { remote: s
   git(work, ["add", "a.txt"])
   git(work, ["commit", "-q", "-m", "first"])
   git(work, ["push", "-q", remote, "main"])
+  // 38234 (@cto b0d99f29): the component must DECLARE the repository its witness mirrors, or a fail-closed partition
+  // cannot tell this working copy from a stranger's.
+  git(work, ["remote", "add", "origin", remote])
   const parent = tmp(`${prefix}clone-`)
   git(parent, ["clone", "-q", remote, join(parent, "primary")])
   const primary = join(parent, "primary")
@@ -390,13 +393,20 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
   }
 
   /** Each case is two or more witness stores and an at-risk set; `blocked` names OIDs no durable ref reaches. */
-  function custodyCase(kind: string): { root: string; stores: string[]; atRisk: string[]; blocked: string[] } {
+  function custodyCase(kind: string): {
+    root: string
+    stores: string[]
+    atRisk: string[]
+    blocked: string[]
+    foreign?: string
+  } {
     const fixture = sharedHistoryWitnesses(`git-super-custody-case-${kind}-`, 5)
     const a = fixture.store.root
     const b = fixture.clone
     const atRisk = [fixture.base, ...fixture.tips, fixture.store.tree]
     const stores = [...fixture.stores]
     const blocked: string[] = []
+    let foreign: string | undefined
     if (kind === "earlier tip absent") {
       atRisk.push(commitOn(a, "only-a", "only-a.txt"), commitOn(b, "only-b", "only-b.txt"))
     } else if (kind === "shared alternates") {
@@ -407,9 +417,21 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
       atRisk.push(commitOn(shared, "alt-only", "alt-only.txt"))
       stores.push(join(shared, ".git", "objects"))
     } else if (kind === "disjoint histories") {
+      // 38234 (@cto c1f22351): a store mirroring another repository proves nothing for this component, so the objects
+      // only it reaches are kept BY NAME and the store stays in `stores` (the production code must see it and refuse
+      // it, not have it filtered out of the input).
       const other = repoWithCommit("git-super-custody-case-disjoint-")
-      atRisk.push(other.head, other.tree, commitOn(other.root, "other-topic", "other.txt"))
+      // A commit whose objects exist ONLY here: `repoWithCommit` is deterministic enough that two fixtures made in the
+      // same second can share a base commit and tree, so the disjoint history has to diverge to be disjoint at all.
+      writeFileSync(join(other.root, "distinct.txt"), "other repository\n")
+      git(other.root, ["add", "distinct.txt"])
+      git(other.root, ["commit", "-q", "-m", "distinct root"])
+      const otherHead = git(other.root, ["rev-parse", "HEAD"])
+      const otherTopic = commitOn(other.root, "other-topic", "other.txt")
+      atRisk.push(otherHead, otherTopic)
+      blocked.push(otherHead, otherTopic)
       stores.push(join(other.root, ".git", "objects"))
+      foreign = join(other.root, ".git", "objects")
     } else if (kind === "tag tree and blob refs") {
       git(a, ["tag", "-a", "-m", "annotated", "v1", fixture.tips[2]!])
       const lonely = spawnSync("git", ["hash-object", "-w", "--stdin"], {
@@ -434,7 +456,13 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
       atRisk.push(dangling)
       blocked.push(dangling)
     }
-    return { root: a, stores, atRisk: [...new Set(atRisk)], blocked }
+    return {
+      root: a,
+      stores,
+      atRisk: [...new Set(atRisk)],
+      blocked: [...blocked].sort(),
+      ...(foreign === undefined ? {} : { foreign }),
+    }
   }
 
   // AC (@cto 34920-witness-index-direction item 4): every at-risk object's chosen store/ref/tip, the emitted
@@ -452,6 +480,7 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     const sidecarDir = tmp("git-super-custody-label-sidecars-")
     const component = await componentOf(fixture.atRisk, sidecarDir, "owned")
     const scan = await scanCustody(fixture.root, [component], fixture.stores, [], { sidecarDir })
+    if (kind === "disjoint histories") console.error("DETAIL " + scan.detail)
     // The full-closure algorithm: stores by realpath, refs by name, each ref's full closure in its own store (honouring
     // that store's replace refs, as the generic runner does); the first ref whose closure holds an OID is its witness.
     // #35062 (@cto 34920-shared-index-ruling-1931 §1): only independent commit tips are ranked (per store, the first
@@ -459,7 +488,10 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     // every durable ref: the coverage control the reduction must match exactly.
     const ranked: Array<{ store: string; ref: string; tip: string; closure: string[] }> = []
     const all: Array<{ closure: string[] }> = []
-    for (const objects of fixture.stores.map((path) => realpathSync(path)).sort()) {
+    for (const objects of fixture.stores
+      .map((path) => realpathSync(path))
+      .filter((path) => path !== fixture.foreign)
+      .sort()) {
       const gitDir = join(objects, "..")
       const refs = git(gitDir, [
         "--git-dir",
@@ -1513,6 +1545,9 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     const landed = git(work, ["rev-parse", "HEAD"])
     const gone = join(tmp("git-super-custody-gone-"), "absent.git")
     git(primary, ["remote", "set-url", "origin", gone])
+    // 38234 (@cto b0d99f29): both sides must name the SAME unreadable repository, or a fail-closed partition simply
+    // skips the store as foreign instead of reading it and naming the failure.
+    git(work, ["remote", "set-url", "origin", gone])
     const sidecarDir = tmp("git-super-custody-unreachable-sidecars-")
     const component = {
       ...(await componentOf([landed], sidecarDir)),
@@ -1990,6 +2025,7 @@ describe("retention custody scan — mirror-head ancestry (#37792)", () => {
       witnessPolicy: { targetBranch: "main" },
       environmentHeads: { [component.component]: [fixture.head] },
     })
+    console.error("DETAIL " + scan.detail)
     expect(scan.status).toBe("pass")
     expect(scan.reachability).toHaveLength(1)
     expect(scan.reachability?.[0]?.tip).toBe(fixture.head)
@@ -2068,6 +2104,107 @@ describe("retention custody scan — mirror-head ancestry (#37792)", () => {
     })
     expect(scan.status).not.toBe("pass")
     expect(scan.reachability).toBeUndefined()
+  })
+
+  // 38234 (@cto c1f22351 + 418fe620 condition 2): a batch shares ONE witness index across every store, so membership
+  // in it is no longer proof for any particular entry. A commit proves custody only against a witness of its own
+  // remote, even when alternates would make the object locally present. The exclusive read-time skip cannot answer
+  // this shape: an unreadable second component leaves the repository set incomplete (#37792), which is exactly when
+  // every store is read and the foreign record reaches the shared index.
+  test("a witness of another repository proves nothing when the repository set is incomplete", async () => {
+    const own = publishedStores("git-super-partition-own-")
+    const other = publishedStores("git-super-partition-other-")
+    const foreignHead = git(other.primary, ["rev-parse", "HEAD"])
+    const localOnly = repoWithCommit("git-super-partition-local-")
+    const sidecarDir = tmp("git-super-partition-sidecars-")
+    const alpha: ComponentContents = {
+      ...(await componentOf([foreignHead], sidecarDir, "owned", { [foreignHead]: "commit" })),
+      component: "alpha",
+      gitDir: join(own.primary, ".git"),
+    }
+    const beta: ComponentContents = {
+      ...(await componentOf([], sidecarDir)),
+      component: "beta",
+      gitDir: join(localOnly.root, ".git"),
+    }
+    const scan = await scanCustody(own.primary, [alpha, beta], [join(other.primary, ".git", "objects")], [], {
+      sidecarDir,
+    })
+    // The foreign store holds the object and is read; it is still never THIS component's witness.
+    expect(scan.witnessCount).toBe(0)
+    expect(scan.missing.map((entry) => entry.oid)).toEqual([foreignHead])
+    expect(scan.status).toBe("blocked")
+  })
+
+  // 38234 (@cto 418fe620 condition 1): a batch hands every entry the whole batch as its removal set, so the candidate
+  // list already excludes every member — the superset of "this entry's removal plus every removal already executed".
+  // An object whose only copy lives in a store this entry removes is kept, by name, never witnessed by it.
+  test("a store this entry removes never witnesses, so its only copy is kept by name", async () => {
+    const lender = publishedStores("git-super-removal-lender-")
+    const head = git(lender.primary, ["rev-parse", "HEAD"])
+    const borrower = repoWithCommit("git-super-removal-borrower-")
+    const sidecarDir = tmp("git-super-removal-sidecars-")
+    const component = await componentOf([head], sidecarDir)
+    const scan = await scanCustody(
+      borrower.root,
+      [component],
+      [join(lender.primary, ".git", "objects")],
+      [lender.primary],
+      {
+        sidecarDir,
+      },
+    )
+    expect(scan.status).toBe("blocked")
+    expect(scan.witnessCount).toBe(0)
+    expect(scan.missing.map((entry) => entry.oid)).toEqual([head])
+  })
+
+  // 38234 acceptance (cumulative): the same rule must hold when the witness sits in ANOTHER batch member's store. The
+  // batch hands every entry the whole batch as its removal set, so a lens that only excluded the entry being proved
+  // would accept a store the next entries delete. The object stays, named, exactly as in the single-entry case.
+  test("a witness in another member's store proves nothing for a later member", async () => {
+    const lender = publishedStores("git-super-cumulative-lender-")
+    const head = git(lender.primary, ["rev-parse", "HEAD"])
+    const borrower = repoWithCommit("git-super-cumulative-borrower-")
+    const earlier = repoWithCommit("git-super-cumulative-earlier-")
+    const sidecarDir = tmp("git-super-cumulative-sidecars-")
+    const component = await componentOf([head], sidecarDir)
+    const scan = await scanCustody(
+      borrower.root,
+      [component],
+      [join(lender.primary, ".git", "objects")],
+      [earlier.root, lender.primary, borrower.root],
+      { sidecarDir },
+    )
+    expect(scan.status).toBe("blocked")
+    expect(scan.witnessCount).toBe(0)
+    expect(scan.missing.map((entry) => entry.oid)).toEqual([head])
+  })
+
+  // 38234 (@cto b3adf206): own-identity matching is new, so pin the shape it must not open. A worktree and its main
+  // repository share ONE common directory, so a store of that repository compares as the SAME repository by identity
+  // rather than by remote. Custody still has to come from a durable ref outside this entry: the entry's own branch is
+  // the entry's own state, so the objects only it holds are kept, by name.
+  test("a worktree's own branch never witnesses it, even when the store shares its common directory", async () => {
+    const main = repoWithCommit("git-super-own-branch-main-")
+    const worktree = join(tmp("git-super-own-branch-wt-"), "entry")
+    git(main.root, ["worktree", "add", "-q", "-b", "entry-only", worktree])
+    writeFileSync(join(worktree, "only-here.txt"), "only here\n")
+    git(worktree, ["add", "only-here.txt"])
+    git(worktree, ["commit", "-q", "-m", "only on the entry's own branch"])
+    const head = git(worktree, ["rev-parse", "HEAD"])
+    const sidecarDir = tmp("git-super-own-branch-sidecars-")
+    const component: ComponentContents = {
+      ...(await componentOf([head], sidecarDir, "owned", { [head]: "commit" })),
+      component: "entry",
+      gitDir: git(worktree, ["rev-parse", "--path-format=absolute", "--git-dir"]),
+    }
+    const scan = await scanCustody(worktree, [component], [join(main.root, ".git", "objects")], [worktree], {
+      sidecarDir,
+    })
+    expect(scan.witnessCount).toBe(0)
+    expect(scan.missing.map((entry) => entry.oid)).toEqual([head])
+    expect(scan.status).toBe("blocked")
   })
 
   test("a store mirroring another repository neither witnesses nor gets fscked", async () => {
