@@ -7,11 +7,20 @@ import { createLocalGitProcess, type GitProcess, type GitProcessRequest } from "
 
 export type GitlinkCarrierPin = Readonly<{ path: string; commit: string }>
 
+/**
+ * One root file the carrier writes beside its pins, as an exact existing blob (hh 38155: a regenerated root
+ * lockfile must ride the same carrier that raises the pin it describes, or the carrier's tree pairs a new pin with
+ * the base's old lock).
+ */
+export type GitlinkCarrierFile = Readonly<{ path: string; mode: "100644" | "100755" | "120000"; blob: string }>
+
 export type ComposeGitlinkCarrierOptions = Readonly<{
   repo: string
   /** Exact, locally held queue tip. This is the carrier's sole parent. */
   base: string
   pins: readonly GitlinkCarrierPin[]
+  /** Root files to write beside the pins; an empty list is the pin-only carrier every earlier caller builds. */
+  files?: readonly GitlinkCarrierFile[]
   message: string
   git?: GitProcess
   /**
@@ -26,15 +35,22 @@ export type GitlinkCarrier = Readonly<{ commit: string; tree: string; base: stri
 
 const OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu
 
-/** Create a one-parent root commit containing only exact existing gitlink updates. */
+/** Create a one-parent root commit containing only exact existing gitlink updates and the named root files. */
 export async function composeGitlinkCarrier(options: ComposeGitlinkCarrierOptions): Promise<GitlinkCarrier> {
   if (!OBJECT_ID.test(options.base)) throw new Error(`carrier base ${options.base} is not a full commit object ID`)
-  if (options.pins.length === 0) throw new Error("carrier needs at least one gitlink pin")
+  const files = options.files ?? []
+  if (options.pins.length === 0 && files.length === 0) throw new Error("carrier needs at least one gitlink pin")
   if (options.message.trim() === "") throw new Error("carrier commit message is empty")
   const seen = new Set<string>()
   for (const pin of options.pins) {
     if (seen.has(pin.path)) throw new Error(`carrier has duplicate gitlink path ${pin.path}`)
     seen.add(pin.path)
+  }
+  for (const file of files) {
+    if (file.path.trim() === "" || file.path.startsWith("/")) throw new Error(`carrier file path ${file.path} is not relative`)
+    if (seen.has(file.path)) throw new Error(`carrier has duplicate path ${file.path}`)
+    if (!OBJECT_ID.test(file.blob)) throw new Error(`carrier file ${file.path} names no blob object ID`)
+    seen.add(file.path)
   }
 
   const process = options.git ?? createLocalGitProcess()
@@ -75,6 +91,13 @@ export async function composeGitlinkCarrier(options: ComposeGitlinkCarrierOption
           `git-super carrier: ${pin.path}@${pin.commit} ${written.state}: ${written.detail?.message ?? "no diagnostic"}`,
         )
       }
+    }
+    if (files.length > 0) {
+      const records = [...files]
+        .sort((a, b) => a.path.localeCompare(b.path))
+        .map((file) => `${file.mode} ${file.blob}\t${file.path}\0`)
+        .join("")
+      await required(["update-index", "-z", "--index-info"], records)
     }
     const tree = await required(["write-tree"])
     const baseTree = await required(["rev-parse", `${options.base}^{tree}`])

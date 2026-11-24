@@ -118,6 +118,50 @@ describe("policy-free gitlink writes", () => {
     expect(git(product.product, "status", "--porcelain")).toBe(statusBefore)
   })
 
+  test("writes a named root file beside the pin it describes, in the same one-parent carrier", async () => {
+    const product = fixture("carrier-root-file")
+    const alphaNext = advanceRepository(product.alpha, "alpha.ts", "export const alpha = 9\n")
+    fetchWithoutCheckout(product.product, "packages/alpha", alphaNext)
+    const lock = join(product.product, "..", "carrier-root-file.lock")
+    writeFileSync(lock, "alpha 9.0.0\n")
+    const blob = git(product.product, "hash-object", "-w", lock)
+
+    const carrier = await composeGitlinkCarrier({
+      repo: product.product,
+      base: product.productBase,
+      pins: [{ path: "packages/alpha", commit: alphaNext }],
+      files: [{ path: "bun.lock", mode: "100644", blob }],
+      message: "carry a pin and the lock that describes it\n",
+    })
+
+    expect(git(product.product, "rev-list", "--parents", "-n", "1", carrier.commit)).toBe(
+      `${carrier.commit} ${product.productBase}`,
+    )
+    expect(git(product.product, "ls-tree", carrier.commit, "packages/alpha")).toBe(
+      `160000 commit ${alphaNext}\tpackages/alpha`,
+    )
+    expect(git(product.product, "ls-tree", carrier.commit, "bun.lock")).toBe(`100644 blob ${blob}\tbun.lock`)
+  })
+
+  test("names a duplicated root file path instead of overwriting the pin it collides with", async () => {
+    const product = fixture("carrier-duplicate-path")
+    const alphaNext = advanceRepository(product.alpha, "alpha.ts", "export const alpha = 10\n")
+    fetchWithoutCheckout(product.product, "packages/alpha", alphaNext)
+    const loose = join(product.product, "..", "carrier-duplicate-path.lock")
+    writeFileSync(loose, "x\n")
+    const blob = git(product.product, "hash-object", "-w", loose)
+
+    await expect(
+      composeGitlinkCarrier({
+        repo: product.product,
+        base: product.productBase,
+        pins: [{ path: "packages/alpha", commit: alphaNext }],
+        files: [{ path: "packages/alpha", mode: "100644", blob }],
+        message: "duplicate\n",
+      }),
+    ).rejects.toThrow("carrier has duplicate path packages/alpha")
+  })
+
   test("keeps malformed index records visible without changing the established error prefix", async () => {
     const product = fixture("malformed-index-record")
     const path = "packages/alpha"
