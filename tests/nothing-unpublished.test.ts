@@ -292,3 +292,70 @@ describe("nothingUnpublished custody refs (#38246)", () => {
     expect(verdict.state === "unknown" && verdict.reason).toMatch(/no head to prove/u)
   })
 })
+
+/**
+ * @cto 2026-11-24T22:12Z: `confirmRemoteRefs` — the sweep's answer is judged against the copy's own refs/remotes, which
+ * is the snapshot retention wrote. A branch deleted or force-moved since still reads as published there, so before a
+ * copy may be skipped the remote must still advertise each proving ref, and that ref must still reach the head.
+ */
+describe("nothingUnpublished remote confirmation (#38246)", () => {
+  const HEAD_SHA = "a".repeat(40)
+
+  const confirming = (store: string, extra: Answers): Answers => ({
+    ...storeAnswers(store),
+    [storeArgs(store, "remote get-url origin")]: "https://example.test/hh-dev.git\n",
+    [storeArgs(store, "rev-parse refs/heads/main")]: `${HEAD_SHA}\n`,
+    ...extra,
+  })
+
+  const confirm = async (answers: Answers, store: string) =>
+    await nothingUnpublished({
+      git: fakeGit(answers),
+      modulesRoot: join(store, ".."),
+      checkWorktree: false,
+      confirmRemoteRefs: true,
+    }).then((verdict) => ({ verdict, storePath: store }))
+
+  test("a proving ref the remote still advertises at the head is published", async () => {
+    const root = modulesRoot()
+    const store = storeUnder(root, "dep")
+    const { verdict } = await confirm(
+      confirming(store, { [storeArgs(store, "ls-remote origin")]: `${HEAD_SHA}\trefs/heads/main\n` }),
+      store,
+    )
+    expect(verdict.state).toBe("published")
+    expect(verdict.state === "published" && verdict.provedBy).toEqual(["refs/remotes/origin/main"])
+  })
+
+  test("a proving ref the remote no longer advertises is unknown, never published on the snapshot", async () => {
+    const root = modulesRoot()
+    const store = storeUnder(root, "dep")
+    const { verdict } = await confirm(confirming(store, { [storeArgs(store, "ls-remote origin")]: "" }), store)
+    expect(verdict.state).toBe("unknown")
+    expect(verdict.state === "unknown" && verdict.reason).toMatch(/no longer advertises refs\/heads\/main/u)
+  })
+
+  test("a proving ref the remote has moved away from the head is unknown", async () => {
+    const root = modulesRoot()
+    const store = storeUnder(root, "dep")
+    const { verdict } = await confirm(
+      confirming(store, { [storeArgs(store, "ls-remote origin")]: `${"f".repeat(40)}\trefs/heads/main\n` }),
+      store,
+    )
+    expect(verdict.state).toBe("unknown")
+    expect(verdict.state === "unknown" && verdict.reason).toMatch(/does not reach/u)
+  })
+
+  test("a proving ref the remote moved forward past still is published", async () => {
+    const root = modulesRoot()
+    const store = storeUnder(root, "dep")
+    const { verdict } = await confirm(
+      confirming(store, {
+        [storeArgs(store, "ls-remote origin")]: `${"f".repeat(40)}\trefs/heads/main\n`,
+        [storeArgs(store, `merge-base --is-ancestor ${HEAD_SHA} ${"f".repeat(40)}`)]: "",
+      }),
+      store,
+    )
+    expect(verdict.state).toBe("published")
+  })
+})

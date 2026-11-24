@@ -2200,7 +2200,11 @@ describe("native retirement alongside supported materialization", async () => {
 // nothing unique is retired without paying for the content and custody gates; a copy that holds a stash falls through
 // to the full gate set exactly as before. A retirement batch is the only context that asks it.
 describe("retention verify cheap gate (#38246)", () => {
-  /** A published copy: every head on a remote-tracking ref. The fixture has no remote, so the seam answers as one. */
+  /**
+   * A published copy: every head on a remote-tracking ref, and the remote still advertising it. The fixture has no
+   * remote, so the seam answers for one — including the sweep's confirmation that the proving ref is still there.
+   */
+  let lastHead = ""
   const published: typeof defaultGitRun = (args, options) => {
     const result = defaultGitRun(args, options)
     if (result.code !== 0) return result
@@ -2209,6 +2213,15 @@ describe("retention verify cheap gate (#38246)", () => {
     }
     if (args.includes("rev-list") && args.includes("--not") && args.includes("--remotes")) {
       return { ...result, stdout: "" }
+    }
+    if (args.includes("remote") && args.includes("get-url")) {
+      return { ...result, stdout: "https://example.test/hh-dev.git\n" }
+    }
+    // The predicate resolves each head before it asks the remote about it; remember the answer for ls-remote. A copy's
+    // store is usually on a detached HEAD, so the head resolved is `HEAD`, not a branch name.
+    if (args.includes("rev-parse") && !args.includes("--abbrev-ref")) lastHead = result.stdout.trim()
+    if (args.includes("ls-remote")) {
+      return { ...result, stdout: lastHead === "" ? "" : `${lastHead}\trefs/heads/main\n` }
     }
     return result
   }
@@ -2258,5 +2271,36 @@ describe("retention verify cheap gate (#38246)", () => {
     // The full gate set still ran and still decided: the copy is proved, not skipped on a guess.
     expect(proof.gates.find((gate) => gate.gate === "positive-custody")?.status).toBe("pass")
     expect(proof.certificate).toBeDefined()
+  })
+
+  it("falls back to the full gates when the remote no longer advertises the proving ref", async () => {
+    // @cto 2026-11-24T22:12Z: the copy's refs/remotes are the snapshot retention wrote. A branch deleted since still
+    // reads as published on it, and its commits may now exist nowhere, so the sweep confirms each proving ref first.
+    const run: typeof defaultGitRun = (args, options) => {
+      const result = published(args, options)
+      if (result.code === 0 && args.includes("ls-remote")) return { ...result, stdout: "" }
+      return result
+    }
+    const proof = await batch(run)
+    expect(proof.cheapGate?.state).toBe("unknown")
+    expect(proof.cheapGate?.reason).toMatch(/no longer advertises/u)
+    // The full gate set ran and decided the entry, so a stale snapshot changes the cost and never the decision.
+    expect(proof.gates.find((gate) => gate.gate === "positive-custody")?.status).toBe("pass")
+    expect(proof.certificate).toBeDefined()
+  })
+
+  it("accepts a proving ref the remote has moved forward, because it still reaches the head", async () => {
+    const run: typeof defaultGitRun = (args, options) => {
+      const result = published(args, options)
+      if (result.code === 0 && args.includes("ls-remote")) {
+        return { ...result, stdout: `${"f".repeat(40)}\trefs/heads/main\n` }
+      }
+      // The advertised commit is a descendant of the head: merge-base --is-ancestor exits 0.
+      if (args.includes("merge-base") && args.includes("--is-ancestor")) return { ...result, code: 0, stdout: "" }
+      return result
+    }
+    const proof = await batch(run)
+    expect(proof.cheapGate?.state).toBe("published")
+    expect(proof.verdict).toBe("candidate")
   })
 })

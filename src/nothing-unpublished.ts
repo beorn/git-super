@@ -86,6 +86,14 @@ export interface NothingUnpublishedInput {
    */
   readonly refreshRemotes?: () => Promise<void>
   /**
+   * Confirm every proving ref on its remote with one `ls-remote` per remote URL, before answering `published`
+   * (@cto 2026-11-24T22:12Z, #38246). The sweep sets it: its `refs/remotes` were written when the copy was made, so a
+   * branch deleted or force-moved since still reads as published on that snapshot and the commits it held may now
+   * exist nowhere. A proving ref the remote no longer advertises, or no longer reaches, answers `unknown` and the entry
+   * takes the full gates. The creation path leaves it off: its remotes were fetched at removal time.
+   */
+  readonly confirmRemoteRefs?: boolean
+  /**
    * The modules root of every Git store the removal deletes, in Git's own layout: `<git-dir>/modules` of a live
    * worktree (Git resolves the per-worktree one, so a slot's own stores are included) and the retained copy's
    * `modules/` for the sweep. Every store under it is read, named or not, because removal deletes it either way.
@@ -220,7 +228,9 @@ export async function nothingUnpublished(input: NothingUnpublishedInput): Promis
         reason: `${path ?? input.modulesRoot ?? "the input"} holds no head to prove`,
       }
     }
-    return { state: "published", heads, provedBy: await provedBy(read, readHeads) }
+    const proved = await provedBy(read, readHeads)
+    if (input.confirmRemoteRefs === true) await confirmRemoteRefs(read, proved.pairs)
+    return { state: "published", heads, provedBy: proved.refs }
   } catch (error) {
     return { state: "unknown", heads, reason: error instanceof Error ? error.message : String(error) }
   }
@@ -234,8 +244,11 @@ export async function nothingUnpublished(input: NothingUnpublishedInput): Promis
 async function provedBy(
   read: ReadRefs,
   readHeads: readonly Readonly<{ repository: string; head: string }>[],
-): Promise<string[]> {
+): Promise<
+  Readonly<{ refs: string[]; pairs: readonly Readonly<{ repository: string; head: string; ref: string }>[] }>
+> {
   const proved = new Set<string>()
+  const pairs: { repository: string; head: string; ref: string }[] = []
   for (const { repository, head } of readHeads) {
     const refs = lines(
       // `--exclude` drops the symbolic `origin/HEAD` alias: naming it in a receipt names a pointer, not the ref that
@@ -249,9 +262,68 @@ async function provedBy(
         "refs/remotes",
       ]),
     )
-    if (refs.length > 0) proved.add(refs[0] as string)
+    if (refs.length > 0) {
+      proved.add(refs[0] as string)
+      pairs.push({ repository, head, ref: refs[0] as string })
+    }
   }
-  return [...proved].sort()
+  return { refs: [...proved].sort(), pairs }
+}
+
+/**
+ * Every proving ref must still be advertised by its remote, and the commit it advertises must still reach the head
+ * (@cto 2026-11-24T22:12Z, #38246). One `ls-remote` per distinct remote URL: a copy's stores usually share one remote,
+ * so eighteen components still cost one network read. A ref that is gone, or moved to a commit that no longer contains
+ * the head, throws, and the caller answers `unknown` — never `published` on a stale snapshot. The ancestry check runs in
+ * the store that holds the head; objects missing from the copy is an unknown too, which keeps the entry.
+ */
+async function confirmRemoteRefs(
+  read: ReadRefs,
+  pairs: readonly Readonly<{ repository: string; head: string; ref: string }>[],
+): Promise<void> {
+  const advertised = new Map<string, Map<string, string>>()
+  const headOids = new Map<string, string>()
+  for (const { repository, head, ref } of pairs) {
+    const parsed = /^refs\/remotes\/([^/]+)\/(.+)$/u.exec(ref)
+    if (parsed === null) {
+      throw new Error(
+        `${repository}: ${ref} proves ${head} and is not a remote-tracking ref, so no remote can confirm it`,
+      )
+    }
+    const remote = parsed[1] as string
+    const branch = parsed[2] as string
+    const url = (await read(repository, ["remote", "get-url", remote])).trim()
+    if (url === "") throw new Error(`${repository}: remote ${remote} has no URL, so ${ref} cannot be confirmed`)
+    // The head's own commit first: it is a local read, and it is what the remote answer is compared against.
+    const key = `${repository}\u0000${head}`
+    let oid = headOids.get(key)
+    if (oid === undefined) {
+      oid = (await read(repository, ["rev-parse", head])).trim()
+      headOids.set(key, oid)
+    }
+    let refs = advertised.get(url)
+    if (refs === undefined) {
+      refs = new Map<string, string>()
+      for (const line of lines(await read(repository, ["ls-remote", remote]))) {
+        const [sha, name] = line.split("\t")
+        if (sha !== undefined && name !== undefined) refs.set(name, sha)
+      }
+      advertised.set(url, refs)
+    }
+    const branchRef = `refs/heads/${branch}`
+    const at = refs.get(branchRef)
+    if (at === undefined) {
+      throw new Error(`${remote} no longer advertises ${branchRef}, so ${repository}:${head} is not proved published`)
+    }
+    if (at === oid) continue
+    try {
+      await read(repository, ["merge-base", "--is-ancestor", oid, at])
+    } catch {
+      throw new Error(
+        `${remote} ${branchRef} now points at ${at}, which does not reach ${repository}:${head} (${oid}); the copy cannot be proved published`,
+      )
+    }
+  }
 }
 
 /** One line for a skip (creation) or a cheap-pass retirement (sweep); the same words answer "where did my work go". */

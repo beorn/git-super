@@ -849,6 +849,10 @@ async function evaluateRetainedEntry(
       git: predicateGit(options.gitRun ?? defaultGitRun),
       modulesRoot: proof.retained,
       checkWorktree: false,
+      // #38246 (@cto 2026-11-24T22:12Z): a copy's refs/remotes are the snapshot retention wrote; a branch deleted or
+      // force-moved since still reads as published there. Each proving ref must still be advertised, and reach the
+      // head, or the entry takes the full gates.
+      confirmRemoteRefs: true,
     })
     result.cheapGate = {
       state: verdict.state,
