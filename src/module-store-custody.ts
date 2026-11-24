@@ -444,10 +444,29 @@ export function inspectDestroyedModuleStores(gitDir: string): ModuleInventory {
 }
 
 /**
+ * Refs whose commit another repository already owns, so a slot's copy is never the only one and its loss loses
+ * nothing. Only these two namespaces are exempt; every other namespace stays judged, including any other
+ * `refs/git-super/*` ref.
+ */
+const MIRROR_REF_PREFIXES = [
+  // The remote is the authority for refs it advertises; this namespace caches them and any consumer refetches.
+  "refs/remotes/",
+  // `preparePinCarrier` publishes a pin to the component's remote before it can be carried, so the remote owns it.
+  "refs/git-super/pins/",
+] as const
+
+function isMirrorRef(ref: string): boolean {
+  return MIRROR_REF_PREFIXES.some((prefix) => ref.startsWith(prefix))
+}
+
+/**
  * #37970: a slot's own `modules/` stores are destroyed with the slot, and a ref a seat created inside the slot (a km
  * worktree branch, a tmpx branch) can exist nowhere else. Before anything is removed, every ref a declared module
  * store keeps must be readable from the surviving store the projection keeps for that module. A ref that is not is
  * named and refuses the removal: refusing is recoverable, deleting the only copy is not.
+ *
+ * Refs that only mirror another repository's authority are skipped, counted, and named in every refusal:
+ * a remote-tracking ref and a published pin are copies, and their loss loses nothing.
  *
  * The survivor is derived from git's own layout, never guessed: a linked worktree's slot sits at
  * `<repo>/.git/worktrees/<slot>`, and the projection's stores at `<repo>/.git/modules`, so module `name` pairs with
@@ -459,6 +478,8 @@ export function assertModuleRefsRecoverable(checkout: string, gitDir: string): v
   if (modules === undefined || basename(dirname(gitDir)) !== "worktrees") return
   const survivors = join(dirname(dirname(gitDir)), "modules")
   const unrecoverable: string[] = []
+  let judged = 0
+  let mirrors = 0
   for (const store of referencedModuleStores(checkout)) {
     const surviving = join(survivors, relative(modules, store))
     const listing = readGit(
@@ -478,8 +499,14 @@ export function assertModuleRefsRecoverable(checkout: string, gitDir: string): v
       .filter((line) => line !== "")
       .map((line) => ({ sha: line.slice(0, line.indexOf(" ")), ref: line.slice(line.indexOf(" ") + 1) }))
     if (refs.length === 0) continue
+    const candidates = refs.filter(({ ref }) => !isMirrorRef(ref))
+    mirrors += refs.length - candidates.length
+    judged += candidates.length
+    if (candidates.length === 0) continue
     if (!existsSync(surviving)) {
-      for (const { sha, ref } of refs) unrecoverable.push(`${ref} ${sha} (surviving store ${surviving} does not exist)`)
+      for (const { sha, ref } of candidates) {
+        unrecoverable.push(`${ref} ${sha} (surviving store ${surviving} does not exist)`)
+      }
       continue
     }
     const probe = readGit(
@@ -487,7 +514,7 @@ export function assertModuleRefsRecoverable(checkout: string, gitDir: string): v
       [`--git-dir=${surviving}`, "cat-file", "--batch-check=%(objectname)"],
       `the objects of surviving module store ${surviving}`,
       STORE_TIMEOUT_MS,
-      `${refs.map(({ sha }) => sha).join("\n")}\n`,
+      `${candidates.map(({ sha }) => sha).join("\n")}\n`,
     )
     if (probe.status !== 0) {
       throw new Error(
@@ -501,7 +528,7 @@ export function assertModuleRefsRecoverable(checkout: string, gitDir: string): v
         .map((line) => line.trim())
         .filter((line) => line !== "" && !line.endsWith(" missing")),
     )
-    for (const { sha, ref } of refs) {
+    for (const { sha, ref } of candidates) {
       if (!present.has(sha)) unrecoverable.push(`${ref} ${sha} (not in ${surviving})`)
     }
   }
@@ -510,7 +537,8 @@ export function assertModuleRefsRecoverable(checkout: string, gitDir: string): v
   const more = unrecoverable.length > 8 ? `; and ${unrecoverable.length - 8} more` : ""
   throw new Error(
     `${checkout} removal refused: ${unrecoverable.length} ref(s) in its own module stores exist in no surviving ` +
-      `store — ${shown}${more}; the worktree is preserved. Fetch them into the projection's store, then retry.`,
+      `store — ${judged} refs judged, ${mirrors} mirrors skipped (remotes, pins) — ${shown}${more}; the worktree ` +
+      `is preserved. Fetch them into the projection's store, then retry.`,
   )
 }
 
