@@ -2405,7 +2405,7 @@ async function ancestryProof(
  */
 function witnessOutOfBounds(
   record: DurableRefRecord,
-  component: Readonly<{ repo?: string; own?: string }>,
+  component: Readonly<{ repo?: string; own?: string; headRef?: string }>,
   exclusions: readonly string[],
   ownRemoval: readonly string[],
 ): string | undefined {
@@ -2430,11 +2430,22 @@ function witnessOutOfBounds(
   if (exclusions.some((root) => within(root, record.store))) {
     return `witness store ${record.store} sits inside the removal set`
   }
+  const same = (a: string | undefined, b: string | undefined): boolean => a !== undefined && b !== undefined && a === b
+  // @cto b3adf206: matching on the OWN identity can make a store's repository the component's OWN repository — a
+  // worktree and its main checkout share one common directory — so the store's refs ARE the entry's own refs. The
+  // branch this entry has checked out is its own state, never independent proof: objects only it holds are kept.
+  if (
+    ownRemoval.length > 0 &&
+    same(component.own, record.own) &&
+    component.headRef !== undefined &&
+    record.ref === component.headRef
+  ) {
+    return `witness ref ${record.ref} is this entry's own branch in its own repository`
+  }
   // @cto b0d99f29 (1): fail CLOSED, never open. A witness stands in only when a readable identity on each side names
   // the same repository — the component's remote or its own common directory against the store's remote or its own.
   // Nothing is accepted by default because an identity could not be read: an unreadable remote is a non-witness, which
   // is the hole this closes.
-  const same = (a: string | undefined, b: string | undefined): boolean => a !== undefined && b !== undefined && a === b
   const matched =
     same(component.repo, record.repo) ||
     same(component.repo, record.own) ||
@@ -2620,21 +2631,31 @@ async function runCustody(
   const componentRepoByComponent = new Map<string, string>()
   /** 38234 (@cto b0d99f29): each component's OWN repository, so a store can be its own repository by path too. */
   const componentOwnByComponent = new Map<string, string>()
+  /** 38234 (@cto b3adf206): the branch this entry has checked out, which its own repository must never witness through. */
+  const componentHeadRefByComponent = new Map<string, string>()
   let componentReposComplete = components.length > 0
   for (const component of components) {
     // #34920: a retained module records core.worktree for a checkout that is gone, so its config is read detached or
     // git refuses to answer at all — which read as an unproved repository and cost the whole run its scoping (#37792).
     const componentGitDir = component.gitDir ?? join(copyRoot, component.component)
-    const identity = await storeRepoIdentity(
-      componentGitDir,
-      atStore(proofRun, componentGitDir, await worktreeGone(componentGitDir, proofRun)),
-      remaining,
-    )
+    const componentRun = atStore(proofRun, componentGitDir, await worktreeGone(componentGitDir, proofRun))
+    const identity = await storeRepoIdentity(componentGitDir, componentRun, remaining)
     if (identity.status === "known") {
       componentRepoIds.add(identity.id)
       componentRepoByComponent.set(component.component, identity.id)
     } else componentReposComplete = false
     if (identity.own !== undefined) componentOwnByComponent.set(component.component, identity.own)
+    const head = await componentRun([`--git-dir=${componentGitDir}`, "symbolic-ref", "-q", "HEAD"], {})
+    // Exit 1 is a detached HEAD: no branch is checked out, and no branch can be this entry's own proof anyway.
+    if (head.code === 0 && head.stdout.trim() !== "")
+      componentHeadRefByComponent.set(component.component, head.stdout.trim())
+    else if (head.code !== 1 && identity.own !== undefined) {
+      // A repository that answered its own identity but not its HEAD is a store to name, never one to guess about. A
+      // store that answered NEITHER is unreadable, and the vanished/corrupt paths below name it with its structure.
+      throw new UnknownError(
+        `symbolic-ref HEAD in ${componentGitDir} failed (exit ${String(head.code)}): ${head.stderr.trim()}`,
+      )
+    }
   }
   const componentRepos = { ids: componentRepoIds, complete: componentReposComplete }
   // 37792 (@cto 78e96f64 part 2): when ancestry proves every component no witness is needed, so no store-wide
@@ -2834,6 +2855,9 @@ async function runCustody(
               ...(componentOwnByComponent.get(component.component) === undefined
                 ? {}
                 : { own: componentOwnByComponent.get(component.component) as string }),
+              ...(componentHeadRefByComponent.get(component.component) === undefined
+                ? {}
+                : { headRef: componentHeadRefByComponent.get(component.component) as string }),
             },
             custodyExclusions,
             custodyOwnRemoval,

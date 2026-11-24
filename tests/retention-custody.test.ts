@@ -2159,6 +2159,54 @@ describe("retention custody scan — mirror-head ancestry (#37792)", () => {
     expect(scan.missing.map((entry) => entry.oid)).toEqual([head])
   })
 
+  // 38234 acceptance (cumulative): the same rule must hold when the witness sits in ANOTHER batch member's store. The
+  // batch hands every entry the whole batch as its removal set, so a lens that only excluded the entry being proved
+  // would accept a store the next entries delete. The object stays, named, exactly as in the single-entry case.
+  test("a witness in another member's store proves nothing for a later member", async () => {
+    const lender = publishedStores("git-super-cumulative-lender-")
+    const head = git(lender.primary, ["rev-parse", "HEAD"])
+    const borrower = repoWithCommit("git-super-cumulative-borrower-")
+    const earlier = repoWithCommit("git-super-cumulative-earlier-")
+    const sidecarDir = tmp("git-super-cumulative-sidecars-")
+    const component = await componentOf([head], sidecarDir)
+    const scan = await scanCustody(
+      borrower.root,
+      [component],
+      [join(lender.primary, ".git", "objects")],
+      [earlier.root, lender.primary, borrower.root],
+      { sidecarDir },
+    )
+    expect(scan.status).toBe("blocked")
+    expect(scan.witnessCount).toBe(0)
+    expect(scan.missing.map((entry) => entry.oid)).toEqual([head])
+  })
+
+  // 38234 (@cto b3adf206): own-identity matching is new, so pin the shape it must not open. A worktree and its main
+  // repository share ONE common directory, so a store of that repository compares as the SAME repository by identity
+  // rather than by remote. Custody still has to come from a durable ref outside this entry: the entry's own branch is
+  // the entry's own state, so the objects only it holds are kept, by name.
+  test("a worktree's own branch never witnesses it, even when the store shares its common directory", async () => {
+    const main = repoWithCommit("git-super-own-branch-main-")
+    const worktree = join(tmp("git-super-own-branch-wt-"), "entry")
+    git(main.root, ["worktree", "add", "-q", "-b", "entry-only", worktree])
+    writeFileSync(join(worktree, "only-here.txt"), "only here\n")
+    git(worktree, ["add", "only-here.txt"])
+    git(worktree, ["commit", "-q", "-m", "only on the entry's own branch"])
+    const head = git(worktree, ["rev-parse", "HEAD"])
+    const sidecarDir = tmp("git-super-own-branch-sidecars-")
+    const component: ComponentContents = {
+      ...(await componentOf([head], sidecarDir, "owned", { [head]: "commit" })),
+      component: "entry",
+      gitDir: git(worktree, ["rev-parse", "--path-format=absolute", "--git-dir"]),
+    }
+    const scan = await scanCustody(worktree, [component], [join(main.root, ".git", "objects")], [worktree], {
+      sidecarDir,
+    })
+    expect(scan.witnessCount).toBe(0)
+    expect(scan.missing.map((entry) => entry.oid)).toEqual([head])
+    expect(scan.status).toBe("blocked")
+  })
+
   test("a store mirroring another repository neither witnesses nor gets fscked", async () => {
     const fixture = ancestryFixture("git-super-ancestry-foreign-")
     // A second, unrelated repository: its bare mirror declares a different remote, so it mirrors nothing here.
