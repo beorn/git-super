@@ -1842,11 +1842,9 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         // A skipped retained copy destroys the module stores with the slot, so it needs the same inventory and
         // ref-recoverability proof a plain removal gets.
         let retentionCopy = removeOptions.retention !== undefined && retentionSkip === undefined
-        let { gitDir, rehome, notCompared, stores } = await prepareRemoval(
-          path,
-          removeOptions.excludedSubmodules,
-          retentionCopy,
-        )
+        const prepared = await prepareRemoval(path, removeOptions.excludedSubmodules, retentionCopy)
+        const { gitDir, rehome, notCompared } = prepared
+        let stores = prepared.stores
         if (notCompared.some((entry) => entry.reason !== "excluded")) {
           throw Object.assign(
             new Error(
@@ -1862,12 +1860,10 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         markPhase("prepareRemoval", prepareStarted)
         // #37970: a slot's module stores die with it, so every ref they keep is proven recoverable first. A caller
         // that already owns the decision — component custody, or retention keeping a copy — is not second-guessed.
-        let moduleRefsChecked = false
         if (removeOptions.componentCustody === undefined && !retentionCopy) {
           const recoverableStarted = Date.now()
           try {
             assertModuleRefsRecoverable(path, gitDir)
-            moduleRefsChecked = true
           } catch (error) {
             if (retentionSkip === undefined) throw error
             // #38198: every HEAD is published and the worktree is clean, but a module store still keeps refs that die
@@ -1877,7 +1873,6 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
               `${path}: retained copy kept — ${error instanceof Error ? error.message : String(error)}\n`,
             )
             retentionSkip = undefined
-            retentionCopy = true
             // Retention copies every store, so the value-preservation pass a plain removal runs must not also run.
             stores = []
             retentionCopy = true
