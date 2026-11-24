@@ -199,7 +199,7 @@ async function preserveProjection(
       retainedPaths: retire
         ? retainedPaths.filter((path) => path !== checkout && !path.startsWith(`${checkout}${sep}`))
         : retainedPaths,
-      manifest: proof.manifest,
+      ...(proof.retention?.kind === "retained" ? { manifest: proof.retention.manifest } : {}),
     }
   } catch (error) {
     return {

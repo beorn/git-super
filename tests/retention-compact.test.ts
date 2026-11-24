@@ -34,6 +34,8 @@ import { createLocalGitProcess } from "../src/process.ts"
 import { verifyRetainedEntry } from "../src/retention-verify.ts"
 import {
   rebuildRetainedCopyProof,
+  retainedCopyOf,
+  retainedManifestOf,
   type RetentionEnrollReport,
   manifest,
   metadataFileDigest,
@@ -154,22 +156,35 @@ function writeProof(
   files: Readonly<Record<string, string>>,
   entries: unknown,
 ): WorktreeRemovalProof {
+  const manifestPath = join(entry, "manifest.json")
   const proof: WorktreeRemovalProof = {
     path: join(entry, "checkout"),
     head: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     repositories: [],
     modules: join(entry, "original-modules"),
     retained: modulesCopy,
-    manifest: join(entry, "manifest.json"),
     createdAt: "2026-10-11T00:00:00.000Z",
-    retainUntil: "2020-01-01T00:00:00.000Z",
+    retention: { kind: "retained", manifest: manifestPath, retainUntil: "2020-01-01T00:00:00.000Z" },
     writerLocks: [],
     createdWriterLocks: [],
     notCompared: [],
   }
+  // The STORE file keeps the long-standing top-level shape (the census and sweep read `manifest`/`retainUntil` from
+  // it); only the returned proof carries the #38198 union.
   writeFileSync(
-    proof.manifest,
-    `${JSON.stringify({ ...proof, files, entries, externalObjectStores: [] }, null, 2)}\n`,
+    manifestPath,
+    `${JSON.stringify(
+      {
+        ...proof,
+        manifest: manifestPath,
+        retainUntil: "2020-01-01T00:00:00.000Z",
+        files,
+        entries,
+        externalObjectStores: [],
+      },
+      null,
+      2,
+    )}\n`,
     { flag: "wx" },
   )
   return proof
@@ -236,7 +251,7 @@ it("exposes native removal head and createdAt under the consumer field names (30
     },
   })
   if (captured === undefined) throw new Error("native remove returned no proof")
-  const rebuilt = readPublicRetainedProof(join(captured.manifest, ".."), retainedRoot)
+  const rebuilt = readPublicRetainedProof(join(retainedManifestOf(captured), ".."), retainedRoot)
   if (typeof rebuilt === "string") throw new Error(rebuilt)
   expect(rebuilt.path).toBe(worktree)
   expect(rebuilt.stored).toMatchObject({ head, createdAt: captured.createdAt })
@@ -247,7 +262,7 @@ describe("compactRetainedModules", () => {
   // Existing ref-preservation cases do not prove that cancellation stops the NEXT unit of work.
   it("keeps the proof and remote reflogs when the shared signal expires after pack-refs", async () => {
     const { proof, gitDir } = await buildSyntheticEntry(2)
-    const originalProof = readFileSync(proof.manifest)
+    const originalProof = readFileSync(retainedManifestOf(proof))
     const controller = new AbortController()
     const runner = createLocalGitProcess(environment)
     const run = vi.fn(async (request: Parameters<typeof runner.run>[0]) => {
@@ -258,7 +273,7 @@ describe("compactRetainedModules", () => {
     const warned = vi.spyOn(console, "warn").mockImplementation(() => {})
     try {
       expect(
-        await compactRetainedModules(proof, {
+        await compactRetainedModules(retainedCopyOf(proof), {
           ...inRun(),
           gitProcess: { run },
           execution: { signal: controller.signal, remainingMs: () => 10_000 },
@@ -269,7 +284,7 @@ describe("compactRetainedModules", () => {
         run.mock.calls.every(([request]) => request.signal === controller.signal && request.timeoutMs! <= 10_000),
       ).toBe(true)
       expect(existsSync(join(gitDir, "logs/refs/remotes"))).toBe(true)
-      expect(readFileSync(proof.manifest)).toEqual(originalProof)
+      expect(readFileSync(retainedManifestOf(proof))).toEqual(originalProof)
       expect(existsSync(proof.retained!)).toBe(true)
       expect(warned).toHaveBeenCalledWith(expect.stringContaining("shared work cutoff"))
     } finally {
@@ -279,7 +294,7 @@ describe("compactRetainedModules", () => {
 
   it.each(["signal", "allowance"])("starts no compaction I/O after an exhausted %s", async (expired) => {
     const { proof } = await buildSyntheticEntry(2)
-    const originalProof = readFileSync(proof.manifest)
+    const originalProof = readFileSync(retainedManifestOf(proof))
     const controller = new AbortController()
     if (expired === "signal") controller.abort(new Error("shared work cutoff"))
     const run = vi.fn(async () => {
@@ -290,7 +305,7 @@ describe("compactRetainedModules", () => {
     vi.mocked(fs.readdirSync).mockClear()
     try {
       expect(
-        await compactRetainedModules(proof, {
+        await compactRetainedModules(retainedCopyOf(proof), {
           ...inRun(),
           gitProcess: { run },
           execution: { signal: controller.signal, remainingMs: () => (expired === "allowance" ? 0 : 10_000) },
@@ -299,7 +314,7 @@ describe("compactRetainedModules", () => {
       expect(run).not.toHaveBeenCalled()
       expect(fs.lstatSync).not.toHaveBeenCalled()
       expect(fs.readdirSync).not.toHaveBeenCalled()
-      expect(readFileSync(proof.manifest)).toEqual(originalProof)
+      expect(readFileSync(retainedManifestOf(proof))).toEqual(originalProof)
       expect(warned).toHaveBeenCalled()
     } finally {
       warned.mockRestore()
@@ -321,7 +336,7 @@ describe("compactRetainedModules", () => {
       child: vi.mocked(childProcess.spawnSync),
     }
     for (const operation of Object.values(blockingOperations)) operation.mockClear()
-    expect(await compactRetainedModules(proof, inRun())).toEqual({ status: "ok" })
+    expect(await compactRetainedModules(retainedCopyOf(proof), inRun())).toEqual({ status: "ok" })
     expect(
       Object.fromEntries(
         Object.entries(blockingOperations).map(([name, operation]) => [name, operation.mock.calls.length]),
@@ -352,7 +367,7 @@ describe("compactRetainedModules", () => {
     expect(existsSync(join(gitDir, "logs/refs/remotes/origin/topic-1"))).toBe(true)
     expect(existsSync(join(nested, "refs/remotes/origin/topic-1"))).toBe(true)
 
-    expect(await compactRetainedModules(proof, inRun())).toEqual({ status: "ok" })
+    expect(await compactRetainedModules(retainedCopyOf(proof), inRun())).toEqual({ status: "ok" })
 
     expect(gitAt(gitDir, ["for-each-ref", "--format=%(refname) %(objectname)"])).toBe(before.refs)
     expect(gitAt(nested, ["for-each-ref", "--format=%(refname) %(objectname)"])).toBe(before.nestedRefs)
@@ -370,14 +385,14 @@ describe("compactRetainedModules", () => {
 
   it("keeps the at-close proof and rewrites files/entries atomically with a compaction record", async () => {
     const { entry, proof } = await buildSyntheticEntry()
-    const beforeBytes = readFileSync(proof.manifest, "utf8")
+    const beforeBytes = readFileSync(retainedManifestOf(proof), "utf8")
     const before = JSON.parse(beforeBytes) as {
       createdAt: string
       retainUntil: string
       files: Record<string, string>
     }
-    expect(await compactRetainedModules(proof, inRun())).toEqual({ status: "ok" })
-    const afterBytes = readFileSync(proof.manifest, "utf8")
+    expect(await compactRetainedModules(retainedCopyOf(proof), inRun())).toEqual({ status: "ok" })
+    const afterBytes = readFileSync(retainedManifestOf(proof), "utf8")
     const after = JSON.parse(afterBytes) as {
       createdAt: string
       retainUntil: string
@@ -415,15 +430,15 @@ describe("compactRetainedModules", () => {
   it("does not rewrite the proof or delete the copy when pack-refs fails", async () => {
     const { gitDir, proof } = await buildSyntheticEntry()
     mkdirSync(join(gitDir, "packed-refs.lock"))
-    const before = readFileSync(proof.manifest)
+    const before = readFileSync(retainedManifestOf(proof))
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
     try {
-      expect(await compactRetainedModules(proof, inRun())).toEqual({
+      expect(await compactRetainedModules(retainedCopyOf(proof), inRun())).toEqual({
         status: "failed",
         child: gitDir,
         step: "pack-refs",
       })
-      expect(readFileSync(proof.manifest)).toEqual(before)
+      expect(readFileSync(retainedManifestOf(proof))).toEqual(before)
       expect(existsSync(proof.retained as string)).toBe(true)
       expect(existsSync(join(gitDir, "HEAD"))).toBe(true)
       expect(
@@ -447,19 +462,19 @@ describe("compactRetainedModules", () => {
       gitDir: join(entry, "original-modules", ".."),
       modules: proof.retained as string,
     })
-    const stored = JSON.parse(readFileSync(proof.manifest, "utf8")) as Record<string, unknown>
+    const stored = JSON.parse(readFileSync(retainedManifestOf(proof), "utf8")) as Record<string, unknown>
     writeFileSync(
-      proof.manifest,
+      retainedManifestOf(proof),
       `${JSON.stringify({ ...stored, files: recorded.files, entries: recorded.entries }, null, 2)}\n`,
     )
-    const before = readFileSync(proof.manifest)
+    const before = readFileSync(retainedManifestOf(proof))
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
     try {
-      const result = await compactRetainedModules(proof, inRun(join(entry, "not-the-common")))
+      const result = await compactRetainedModules(retainedCopyOf(proof), inRun(join(entry, "not-the-common")))
       expect(result.status).toBe("failed")
       if (result.status !== "failed") throw new Error("expected failed compaction")
       expect(result.step).toBe("rewrite-proof")
-      expect(readFileSync(proof.manifest)).toEqual(before)
+      expect(readFileSync(retainedManifestOf(proof))).toEqual(before)
       expect(existsSync(proof.retained as string)).toBe(true)
     } finally {
       warn.mockRestore()
@@ -469,16 +484,18 @@ describe("compactRetainedModules", () => {
   it("gate-2 refuses a damaged child before packing and does not rewrite the proof", async () => {
     const { gitDir, proof } = await buildSyntheticEntry()
     writeFileSync(join(gitDir, "config"), `${readFileSync(join(gitDir, "config"), "utf8")}\n# damaged\n`)
-    const before = readFileSync(proof.manifest)
+    const before = readFileSync(retainedManifestOf(proof))
     const packedBefore = existsSync(join(gitDir, "packed-refs"))
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
     try {
-      expect(await compactRetainedModules(proof, { common: sep, preState: { kind: "gate-2" } })).toEqual({
+      expect(
+        await compactRetainedModules(retainedCopyOf(proof), { common: sep, preState: { kind: "gate-2" } }),
+      ).toEqual({
         status: "failed",
         child: proof.retained,
         step: "gate-2",
       })
-      expect(readFileSync(proof.manifest)).toEqual(before)
+      expect(readFileSync(retainedManifestOf(proof))).toEqual(before)
       expect(existsSync(join(gitDir, "refs/remotes/origin/topic-1"))).toBe(true)
       expect(existsSync(join(gitDir, "packed-refs"))).toBe(packedBefore)
     } finally {
@@ -524,7 +541,9 @@ describe("compactRetainedModules", () => {
       expect(existsSync(worktree)).toBe(false)
       expect(outcome).toMatchObject({ compaction: { status: "failed", step: "pack-refs" } })
       expect(captured?.retained).toEqual(expect.any(String))
-      const recordedManifest = JSON.parse(readFileSync(captured!.manifest, "utf8")) as { compaction?: unknown }
+      const recordedManifest = JSON.parse(readFileSync(retainedManifestOf(captured!), "utf8")) as {
+        compaction?: unknown
+      }
       expect(recordedManifest.compaction).toBeUndefined()
       expect(existsSync(captured!.retained as string)).toBe(true)
     } finally {
@@ -570,7 +589,9 @@ describe("compactRetainedModules", () => {
       expect(existsSync(worktree)).toBe(false)
       expect(outcome).toMatchObject({ compaction: { status: "failed", child: locked, step: "discovery" } })
       expect(captured?.retained).toEqual(locked)
-      const recordedManifest = JSON.parse(readFileSync(captured!.manifest, "utf8")) as { compaction?: unknown }
+      const recordedManifest = JSON.parse(readFileSync(retainedManifestOf(captured!), "utf8")) as {
+        compaction?: unknown
+      }
       expect(recordedManifest.compaction).toBeUndefined()
       expect(existsSync(captured!.retained as string)).toBe(true)
     } finally {

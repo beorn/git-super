@@ -167,9 +167,14 @@ export type WorktreeRemovalProof = Readonly<{
   repositories: readonly string[]
   modules: string
   retained: string | null
-  manifest: string
   createdAt: string
-  retainUntil: string
+  /**
+   * #38198 (@cto 2026-11-24T18:22Z): what the caller gets for its `--retain`. A discriminated union rather than
+   * nullable fields, so every reader has to say what it does when no copy was written instead of printing an empty
+   * path. `not-retained` is only ever the nothing-unpublished predicate's answer, with the refs that proved it; a
+   * caller that passed no `--retain` produces no `retention` at all, which is a different fact and stays absent.
+   */
+  retention?: RetentionOutcome
   rehomedBorrowers?: readonly string[]
   writerLocks: readonly WriterLockProof[]
   createdWriterLocks: readonly WriterLockProof[]
@@ -184,6 +189,30 @@ export type WorktreeRemovalProof = Readonly<{
   /** 34787: the caller's opaque attribution, written as given; GitSuper never interprets it. */
   attribution?: RetentionAttribution
 }>
+
+export type RetentionOutcome =
+  | Readonly<{ kind: "retained"; manifest: string; retainUntil: string }>
+  | Readonly<{ kind: "not-retained"; reason: string; provedBy: readonly string[] }>
+
+/**
+ * The manifest path of the copy this proof retained (#38198). A proof that recorded no copy has no path: the union
+ * makes "not retained" a shape rather than an empty string, so every reader that opens a manifest comes through here
+ * and fails loudly instead of reading `""` (a bare `undefined` manifest would silently verify nothing).
+ */
+export function retainedManifestOf(proof: WorktreeRemovalProof): string {
+  if (proof.retention?.kind !== "retained") {
+    throw new Error(`${proof.path}: this removal proof records no retained copy`)
+  }
+  return proof.retention.manifest
+}
+
+/**
+ * The same copy as a caller that must REWRITE its manifest consumes it (compaction). The proof keeps its union; this
+ * adds the resolved path, so one adapter — not every call site — decides what a missing copy means.
+ */
+export function retainedCopyOf(proof: WorktreeRemovalProof): WorktreeRemovalProof & Readonly<{ manifest: string }> {
+  return { ...proof, manifest: retainedManifestOf(proof) }
+}
 
 /**
  * 34787 (@cto 34787-component-retention-ruling correction 3): who and what a caller says a retention is for. Opaque to
@@ -2452,9 +2481,12 @@ async function prepareResolvedWorktreeModules(context: {
             before === undefined ? [] : before.map((entry) => join(path, relative(inspectedPath, entry.path))),
           modules,
           retained,
-          manifest: join(retainedRoot, "manifest.json"),
           createdAt: new Date().toISOString(),
-          retainUntil: new Date(Date.now() + RETAINED_COPY_FLOOR_MS).toISOString(),
+          retention: {
+            kind: "retained",
+            manifest: join(retainedRoot, "manifest.json"),
+            retainUntil: new Date(Date.now() + RETAINED_COPY_FLOOR_MS).toISOString(),
+          },
           ...(rehomedBorrowers.length === 0 ? {} : { rehomedBorrowers }),
           writerLocks,
           createdWriterLocks,
@@ -2470,16 +2502,20 @@ async function prepareResolvedWorktreeModules(context: {
               }),
           ...(retention.attribution === undefined ? {} : { attribution: retention.attribution }),
         }
+        // The STORE manifest keeps its long-standing on-disk shape: `manifest` and `retainUntil` at the top level are
+        // read by the retained census and the sweep from every existing store, so the union lives in the returned proof
+        // and not in the file those readers parse.
+        const retainedOutcome = proof.retention as Extract<RetentionOutcome, { kind: "retained" }>
         writeFileSync(
-          proof.manifest,
-          `${JSON.stringify({ ...proof, files: finalRetainedManifest.files, entries: finalRetainedManifest.entries, externalObjectStores: finalRetainedManifest.externalObjectStores }, null, 2)}\n`,
+          retainedOutcome.manifest,
+          `${JSON.stringify({ ...proof, manifest: retainedOutcome.manifest, retainUntil: retainedOutcome.retainUntil, files: finalRetainedManifest.files, entries: finalRetainedManifest.entries, externalObjectStores: finalRetainedManifest.externalObjectStores }, null, 2)}\n`,
           { flag: "wx" },
         )
         if (retained !== null && privateProjection !== undefined) {
           for (const mount of privateProjection.mounts.filter(
             (mount) => mount.mode === "ro" && retainedBorrowing.has(mount.source),
           )) {
-            registerRetainedBorrower(dirname(mount.source), retained, proof.manifest)
+            registerRetainedBorrower(dirname(mount.source), retained, retainedOutcome.manifest)
           }
         }
         // The existing void callback can return async work; join it before native mutation.

@@ -28,7 +28,12 @@ import { createExclusive } from "../src/exclusive.ts"
 import { cleanGitEnvironment, withGitEnvironment } from "../src/git.ts"
 import { createLocalGitProcess } from "../src/process.ts"
 import { createGit, createGitWorktreeStore } from "../src/worktree.ts"
-import { acquireRemovalWriterLeases, manifest, retainWorktreeModules } from "../src/worktree-removal.ts"
+import {
+  acquireRemovalWriterLeases,
+  manifest,
+  retainedManifestOf,
+  retainWorktreeModules,
+} from "../src/worktree-removal.ts"
 import { shellQuote } from "../src/shell-command.ts"
 import { addNestedAlphaSubmodule, advanceRepository, canonicalTmpdir, createProductFixture, git } from "./fixture.ts"
 
@@ -555,7 +560,7 @@ it.each([
           store.remove(source, {
             retention: {
               root: join(root, "retained-donor"),
-              report: (removed) => expect(existsSync(removed.manifest)).toBe(true),
+              report: (removed) => expect(existsSync(retainedManifestOf(removed))).toBe(true),
             },
             excludedSubmodules,
           })
@@ -712,7 +717,7 @@ it("keeps the original when another process writes after custody proof publicati
           {
             root: join(root, "retained"),
             report: (proof) => {
-              manifestPath = proof.manifest
+              manifestPath = retainedManifestOf(proof)
               const writer = spawnSync(
                 process.execPath,
                 [

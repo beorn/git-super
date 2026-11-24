@@ -29,6 +29,7 @@ import {
   prepareWorktreeModulesRetention,
   rehomeBorrowers,
   checkRemovalExecution,
+  retainedCopyOf,
   deleteStagedTree,
   type ComponentCustodyProof,
   type WorktreeRemovalProof,
@@ -2507,9 +2508,11 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         // so a throw would record a failed close for a worktree that is gone (R2). On failure every
         // ref value stays intact, the proof is not rewritten (later retention verify refuses), and
         // the copy is never deleted.
-        if (removalProof?.retained != null) {
+        // The union, not a bare `retained` string, says whether a copy exists: compaction rewrites that copy's
+        // manifest, so it must name the one the retention preparation actually wrote (#38198).
+        if (removalProof?.retention?.kind === "retained") {
           options.report?.(`${path}: retained compaction in flight at ${removalProof.retained}`)
-          compaction = await compactRetainedModules(removalProof, {
+          compaction = await compactRetainedModules(retainedCopyOf(removalProof), {
             common: removalRepo,
             preState: { kind: "in-run" },
             gitProcess: options.gitProcess,

@@ -19,6 +19,7 @@ import { auditRetainedEntry, retireRetainedEntry } from "../src/retention-remove
 import { verifyRetainedEntry, type RetentionVerifyResult } from "../src/retention-verify.ts"
 import { createLocalGitWorktreeStore } from "../src/worktree.ts"
 import { superWorktreeRemove } from "../src/worktree-remove.ts"
+import { retainedManifestOf } from "../src/worktree-removal.ts"
 import { canonicalTmpdir, createProductFixture, git } from "./fixture.ts"
 
 type Fixture = Readonly<{
@@ -49,7 +50,8 @@ async function retainedLocalCommit(): Promise<Fixture> {
   const retain = join(root, "retained")
   const removed = await superWorktreeRemove({ repo: fixture.product, path: linked, retain, preserved: [] })
   expect(removed.state, removed.detail?.message ?? "").toBe("updated")
-  const entry = dirname(removed.proof?.manifest ?? "")
+  if (removed.proof === undefined) throw new Error("removal returned no proof")
+  const entry = dirname(retainedManifestOf(removed.proof))
   const manifestPath = join(entry, "manifest.json")
   const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, unknown>
   manifest["retainUntil"] = new Date(Date.now() - 1000).toISOString()

@@ -12,6 +12,7 @@ import { join } from "node:path"
 import { describe, expect, it } from "vitest"
 import { createLocalGitWorktreeStore } from "../src/worktree.ts"
 import { superWorktreeRemove } from "../src/worktree-remove.ts"
+import { retainedManifestOf } from "../src/worktree-removal.ts"
 import {
   addNestedAlphaSubmodule,
   advanceRepository,
@@ -72,8 +73,8 @@ describe("git-super worktree remove --preserved admits dirt only against a ref i
       expect(result.state, result.detail?.message ?? "").toBe("updated")
       expect(existsSync(linked)).toBe(false)
       // Retention ran and left its durable proof for the component store it copied.
-      expect(result.proof?.manifest).toBeDefined()
-      expect(existsSync(result.proof!.manifest)).toBe(true)
+      expect(result.proof).toBeDefined()
+      expect(existsSync(retainedManifestOf(result.proof!))).toBe(true)
     } finally {
       // raw-delete-allow: the fixture tree this test made under its own mkdtemp root
       await rm(root, { recursive: true, force: true })
@@ -289,7 +290,7 @@ describe("git-super worktree remove admits a clean component store proven on its
       })
 
       expect(result.state, result.detail?.message ?? "").toBe("updated")
-      const manifest = JSON.parse(readFileSync(result.proof?.manifest ?? "", "utf8")) as {
+      const manifest = JSON.parse(readFileSync(retainedManifestOf(result.proof!), "utf8")) as {
         attribution?: unknown
         repositoryHeads?: { path: string; head: string }[]
       }

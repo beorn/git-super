@@ -85,7 +85,8 @@ export type CompactionOptions = Readonly<{
  * `manifest.json` because a stored proof's `retained` records the root it was written under, which
  * is no longer where the entry lives.
  */
-export type RetainedCopyProof = Pick<WorktreeRemovalProof, "path" | "modules" | "retained" | "manifest">
+export type RetainedCopyProof = Pick<WorktreeRemovalProof, "path" | "modules" | "retained"> &
+  Readonly<{ manifest: string }>
 
 type RefSnapshot = Readonly<{
   refs: string

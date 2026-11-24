@@ -31,7 +31,7 @@ import {
   runLocalGitWorktreeMutationSync,
   type GitWorktreeStoreOptions,
 } from "../src/worktree.ts"
-import { manifest, rehomeBorrowers, type WorktreeRemovalProof } from "../src/worktree-removal.ts"
+import { manifest, rehomeBorrowers, retainedManifestOf, type WorktreeRemovalProof } from "../src/worktree-removal.ts"
 import type { GitProcessRequest } from "../src/process.ts"
 import { canonicalTmpdir, createProductFixture, createRepository, NO_BACKGROUND_MAINTENANCE } from "./fixture.ts"
 import { runCli } from "../src/cli.ts"
@@ -119,14 +119,19 @@ async function historicalRetainedBorrower(
     modules: proof.retained,
   })
   writeFileSync(
-    proof.manifest,
-    JSON.stringify({ ...(JSON.parse(readFileSync(proof.manifest, "utf8")) as Record<string, unknown>), ...snapshot }) +
-      "\n",
+    retainedManifestOf(proof),
+    JSON.stringify({
+      ...(JSON.parse(readFileSync(retainedManifestOf(proof), "utf8")) as Record<string, unknown>),
+      ...snapshot,
+    }) + "\n",
   )
   const registry = join(common, "git-super-retained-borrowers")
   mkdirSync(registry, { recursive: true })
-  const name = createHash("sha256").update(proof.manifest).digest("hex") + ".json"
-  writeFileSync(join(registry, name), JSON.stringify({ retained: proof.retained, manifest: proof.manifest }) + "\n")
+  const name = createHash("sha256").update(retainedManifestOf(proof)).digest("hex") + ".json"
+  writeFileSync(
+    join(registry, name),
+    JSON.stringify({ retained: proof.retained, manifest: retainedManifestOf(proof) }) + "\n",
+  )
 }
 
 describe("createGitWorktreeStore", () => {
@@ -886,7 +891,7 @@ describe("createGitWorktreeStore", () => {
         expect(readdirSync(retention.root)).toEqual([])
       } else {
         expect(proofs).toHaveLength(1)
-        const manifest = JSON.parse(await readFile(proofs[0]!.manifest, "utf8")) as { checkout?: string }
+        const manifest = JSON.parse(await readFile(retainedManifestOf(proofs[0]!), "utf8")) as { checkout?: string }
         expect(manifest.checkout).toBe("absent")
       }
     } finally {
@@ -1619,7 +1624,7 @@ describe("createGitWorktreeStore", () => {
         expect(git(root, ["--git-dir", retained, "--work-tree", root, "show", ":alpha.ts"])).toBe(
           "export const alpha = 1\n",
         )
-        const manifest = JSON.parse(await readFile(proof.manifest, "utf8")) as {
+        const manifest = JSON.parse(await readFile(retainedManifestOf(proof), "utf8")) as {
           externalObjectStores: readonly { path: string; declaration: string; target: string }[]
         }
         expect(manifest.externalObjectStores).toEqual([])
@@ -1897,17 +1902,17 @@ describe("createGitWorktreeStore", () => {
       }
       await store.remove(borrower.linked, { retention })
       const proof = proofs[0]!
-      const stored = JSON.parse(await readFile(proof.manifest, "utf8")) as Record<string, unknown>
-      const oldEntry = join(root, "old", dirname(proof.manifest).split("/").at(-1)!)
+      const stored = JSON.parse(await readFile(retainedManifestOf(proof), "utf8")) as Record<string, unknown>
+      const oldEntry = join(root, "old", dirname(retainedManifestOf(proof)).split("/").at(-1)!)
       await writeFile(
-        proof.manifest,
+        retainedManifestOf(proof),
         JSON.stringify({
           ...stored,
           retained: join(oldEntry, "modules"),
           manifest: join(oldEntry, "manifest.json"),
         }) + "\n",
       )
-      const relocatedProof = await readFile(proof.manifest)
+      const relocatedProof = await readFile(retainedManifestOf(proof))
       const common = git(fixture.product, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim()
       const registry = join(common, "git-super-retained-borrowers")
       expect(existsSync(registry)).toBe(true)
@@ -1919,7 +1924,7 @@ describe("createGitWorktreeStore", () => {
       await expect(store.remove(owner.linked, { retention })).rejects.toThrow(proof.retained!)
       expect(existsSync(owner.linked)).toBe(true)
       expect(existsSync(owner.objects)).toBe(true)
-      expect(await readFile(proof.manifest)).toEqual(relocatedProof)
+      expect(await readFile(retainedManifestOf(proof))).toEqual(relocatedProof)
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -2018,7 +2023,7 @@ describe("createGitWorktreeStore", () => {
       })
       const proof = proofs[0]!
       const common = git(fixture.product, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim()
-      const manifestPath = proof.manifest
+      const manifestPath = retainedManifestOf(proof)
       const writerDir = join(common, "yrd-worktree-mutations")
       const writerBefore = readdirSync(writerDir)
         .sort()
@@ -2120,7 +2125,7 @@ describe("createGitWorktreeStore", () => {
         expect(proofs).toHaveLength(1)
         if (shape === "objects-link-alias" || shape === "relative-objects-link") {
           const retainedObjects = join(proofs[0]!.retained!, "packages/alpha/objects")
-          const manifestBytes = await readFile(proofs[0]!.manifest)
+          const manifestBytes = await readFile(retainedManifestOf(proofs[0]!))
           const stored = JSON.parse(manifestBytes.toString()) as {
             externalObjectStores: readonly { path: string; target: string }[]
           }
@@ -2136,7 +2141,7 @@ describe("createGitWorktreeStore", () => {
             proofTarget: proofTarget!,
           }
           expect(objectsAliasTopology).toEqual({ declaration, canonical: durable, proofTarget: durable })
-          expect(await readFile(proofs[0]!.manifest)).toEqual(manifestBytes)
+          expect(await readFile(retainedManifestOf(proofs[0]!))).toEqual(manifestBytes)
         }
         const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true)
         try {
@@ -2194,13 +2199,13 @@ describe("createGitWorktreeStore", () => {
       await store.remove(borrower.linked, { retention })
       const proof = proofs[0]!
       const alternate = join(proof.retained!, "packages/alpha/objects/info/alternates")
-      const manifestBytes = await readFile(proof.manifest)
+      const manifestBytes = await readFile(retainedManifestOf(proof))
       const alternateBytes = await readFile(alternate)
       const legacyProof = JSON.parse(manifestBytes.toString()) as Record<string, unknown>
       delete legacyProof.entries
       delete legacyProof.externalObjectStores
-      await writeFile(proof.manifest, JSON.stringify(legacyProof) + "\n")
-      const legacyBytes = await readFile(proof.manifest)
+      await writeFile(retainedManifestOf(proof), JSON.stringify(legacyProof) + "\n")
+      const legacyBytes = await readFile(retainedManifestOf(proof))
       const commonForLegacy = git(fixture.product, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim()
       const pointerRoot = join(commonForLegacy, "git-super-retained-borrowers")
       const pointerPath = join(
@@ -2218,14 +2223,14 @@ describe("createGitWorktreeStore", () => {
       }
       expect(existsSync(pointerPath)).toBe(true)
       expect(await readFile(pointerPath)).toEqual(pointerBytes)
-      expect(await readFile(proof.manifest)).toEqual(legacyBytes)
-      await writeFile(proof.manifest, manifestBytes)
+      expect(await readFile(retainedManifestOf(proof))).toEqual(legacyBytes)
+      await writeFile(retainedManifestOf(proof), manifestBytes)
       await writeFile(alternate, alternateBytes)
-      await rm(proof.manifest)
+      await rm(retainedManifestOf(proof))
       await expect(store.remove(owner.linked, { retention })).rejects.toThrow(proof.retained!)
       expect(existsSync(owner.objects)).toBe(true)
       await writeFile(
-        proof.manifest,
+        retainedManifestOf(proof),
         JSON.stringify({
           ...(JSON.parse(manifestBytes.toString()) as Record<string, unknown>),
           externalObjectStores: [{ path: "packages/alpha/objects", target: 42 }],
@@ -2233,7 +2238,7 @@ describe("createGitWorktreeStore", () => {
       )
       await expect(store.remove(owner.linked, { retention })).rejects.toThrow("invalid retained objects dependency")
       expect(existsSync(owner.objects)).toBe(true)
-      await writeFile(proof.manifest, manifestBytes)
+      await writeFile(retainedManifestOf(proof), manifestBytes)
       const originalProof = JSON.parse(manifestBytes.toString()) as Record<string, unknown>
       await writeFile(alternate, join(commonForLegacy, "modules/packages/alpha/objects") + "\n")
       const retainedChildren = readdirSync(retention.root).sort()
@@ -2241,13 +2246,13 @@ describe("createGitWorktreeStore", () => {
         const asymmetric = { ...originalProof, ...partial }
         if (!("entries" in partial)) delete asymmetric.entries
         if (!("externalObjectStores" in partial)) delete asymmetric.externalObjectStores
-        await writeFile(proof.manifest, JSON.stringify(asymmetric) + "\n")
+        await writeFile(retainedManifestOf(proof), JSON.stringify(asymmetric) + "\n")
         await expect(store.remove(owner.linked, { retention })).rejects.toThrow("invalid retained dependency manifest")
         expect(existsSync(owner.objects)).toBe(true)
         expect(await readFile(pointerPath)).toEqual(pointerBytes)
         expect(readdirSync(retention.root).sort()).toEqual(retainedChildren)
       }
-      await writeFile(proof.manifest, manifestBytes)
+      await writeFile(retainedManifestOf(proof), manifestBytes)
       await writeFile(alternate, alternateBytes)
       const realRead = vi.mocked(readFileSync).getMockImplementation()!
       vi.mocked(readFileSync).mockImplementation((...args: Parameters<typeof readFileSync>) => {
@@ -2479,7 +2484,7 @@ describe("createGitWorktreeStore", () => {
           await expect(store.remove(owner.linked, { retention })).rejects.toThrow(entry)
           expect(existsSync(owner.linked)).toBe(true)
           await writeFile(entry, registered)
-          await rm(dirname(proof.manifest), { recursive: true, force: true })
+          await rm(dirname(retainedManifestOf(proof)), { recursive: true, force: true })
         } else {
           const replacement = join(common, "modules/packages/alpha/objects")
           await rm(join(proof.retained!, "packages/alpha/objects"))
@@ -2585,7 +2590,7 @@ describe("createGitWorktreeStore", () => {
       expect(existsSync(entry)).toBe(true)
       expect(JSON.parse(await readFile(entry, "utf8"))).toMatchObject({
         retained: proof.retained,
-        manifest: proof.manifest,
+        manifest: retainedManifestOf(proof),
       })
       await expect(store.remove(nextOwner.linked, { retention })).rejects.toThrow(proof.retained!)
       expect(existsSync(nextOwner.linked)).toBe(true)
@@ -2655,7 +2660,7 @@ describe("createGitWorktreeStore", () => {
       const first = proofs.find((proof) => (failure as Error).message.includes(proof.retained!))
       expect(first, "owner refusal names one of the two registered retained copies").toBeDefined()
       const remaining = proofs.find((proof) => proof !== first)!
-      await rm(dirname(first!.manifest), { recursive: true, force: true })
+      await rm(dirname(retainedManifestOf(first!)), { recursive: true, force: true })
       const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true)
       try {
         await expect(store.remove(owner.linked, { retention })).rejects.toThrow(remaining.retained!)
