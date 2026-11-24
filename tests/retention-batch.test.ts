@@ -1653,6 +1653,14 @@ describe("retention retirement batch (#33010)", async () => {
     expect(result.cheapGate?.ms).toBeGreaterThanOrEqual(0)
     // No certificate was written for this entry: the cheap pass paid no receipt, which is the spend it saves.
     expect(existsSync(join(fixtureRoot, "artifacts", basename(entries[0] as string), "pre"))).toBe(false)
+    // The retirement's own row is the only record it leaves, so it names the environment, its heads and the remote
+    // refs that proved them — not only the fact that something was deleted.
+    const applied = await retireRetainedBatch(options({ entries, fullProof: false, apply: true }))
+    const retired = applied.rows[0]
+    expect(retired?.outcome).toBe("retired")
+    expect(retired?.reason).toContain(entries[0] as string)
+    expect(retired?.reason).toContain("refs/remotes/")
+    expect(existsSync(entries[0] as string)).toBe(false)
   })
 
   it("holds a copy back to the full gates when its stores cannot be proved cheaply", async () => {

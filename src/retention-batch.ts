@@ -1113,10 +1113,12 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
             rows.set(entry, {
               entry,
               outcome: "retired",
+              // #38246: with no certificate, this row is the only record of why the copy was deletable, so it carries
+              // the whole answer: the environment, its heads and the remote refs that proved them, plus what it cost.
               reason:
                 held.cheapGate === undefined
                   ? "absence verified"
-                  : `absence verified; retired on the nothing-unpublished predicate (${String(held.cheapGate.ms)} ms), no content or custody gate paid`,
+                  : `absence verified; retired with no content or custody gate: ${held.cheapGate.reason} (${String(held.cheapGate.ms)} ms)`,
               evidence: after.path,
             })
           }
