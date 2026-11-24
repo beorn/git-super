@@ -89,13 +89,19 @@ async function headsOf(git: PredicateGit, cwd: string): Promise<string[]> {
   return detached ? [...heads, "HEAD"] : heads
 }
 
-/** Initialized submodules, deepest first, as absolute paths; a submodule that cannot be listed is named by the throw. */
+/**
+ * Every initialized submodule, all depths, as absolute paths. `--quiet` suppresses Git's "Entering '<path>'" notes, so
+ * stdout is the `pwd` of each submodule, one per line — the note form is accepted too because an unquiet Git prints it
+ * and a parser that only understood one of the two shapes would silently see NO submodule, which is the one answer that
+ * must never be silent here: it would let the copy be skipped while a component held unpublished work.
+ */
 async function submodulesOf(git: PredicateGit, cwd: string): Promise<string[]> {
   const text = await git.text(cwd, ["submodule", "foreach", "--recursive", "--quiet", "pwd"])
-  return lines(text)
-    .map((line) => /^Entering '(.+)'$/u.exec(line.trim())?.[1])
-    .filter((path): path is string => path !== undefined)
-    .map((path) => (path.startsWith("/") ? path : `${cwd}/${path}`))
+  const paths = lines(text).map((line) => {
+    const trimmed = line.trim()
+    return /^Entering '(.+)'$/u.exec(trimmed)?.[1] ?? trimmed
+  })
+  return [...new Set(paths.map((path) => (path.startsWith("/") ? path : `${cwd}/${path}`)))]
 }
 
 export async function nothingUnpublished(input: NothingUnpublishedInput): Promise<NothingUnpublishedVerdict> {

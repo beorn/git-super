@@ -126,10 +126,12 @@ describe("nothingUnpublished", () => {
     expect(verdict.heads).toEqual(["HEAD"])
   })
 
+  // The real shape: `--quiet` suppresses Git's "Entering '<path>'" notes, so stdout is the bare `pwd` of each
+  // submodule. Reading only the note form made every environment look submodule-free.
   test("an unpublished head inside an initialized submodule keeps the whole environment", async () => {
     const sub = "/env/wt/vendor/component"
     const verdict = await verdictOf({
-      [`${ENV} :: submodule foreach --recursive --quiet pwd`]: `Entering '${sub}'\n`,
+      [`${ENV} :: submodule foreach --recursive --quiet pwd`]: `${sub}\n`,
       [`${sub} :: for-each-ref --format=%(refname) refs/heads`]: "refs/heads/main\n",
       [`${sub} :: rev-parse --abbrev-ref HEAD`]: "main\n",
       [`${sub} :: for-each-ref --format=%(refname) refs/remotes`]: "refs/remotes/origin/main\n",
@@ -138,5 +140,19 @@ describe("nothingUnpublished", () => {
     })
     expect(verdict.state).toBe("unpublished")
     expect(verdict.heads).toContain(`${sub}:refs/heads/main`)
+  })
+  test("an unquiet git's Entering note is read as the same submodule", async () => {
+    const sub = "/env/wt/vendor/component"
+    const verdict = await verdictOf({
+      [`${ENV} :: submodule foreach --recursive --quiet pwd`]: `Entering '${sub}'\n${sub}\n`,
+      [`${sub} :: for-each-ref --format=%(refname) refs/heads`]: "refs/heads/main\n",
+      [`${sub} :: rev-parse --abbrev-ref HEAD`]: "main\n",
+      [`${sub} :: for-each-ref --format=%(refname) refs/remotes`]: "refs/remotes/origin/main\n",
+      [`${sub} :: status --porcelain --untracked-files=all`]: "",
+      [`${sub} :: rev-list refs/heads/main --not --remotes`]: "c".repeat(40) + "\n",
+    })
+    expect(verdict.state).toBe("unpublished")
+    // The note and the path name one submodule, so its head is listed once, not twice.
+    expect(verdict.heads.filter((head) => head.startsWith(`${sub}:`))).toEqual([`${sub}:refs/heads/main`])
   })
 })

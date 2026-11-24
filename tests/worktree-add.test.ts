@@ -27,7 +27,7 @@ import { fileURLToPath } from "node:url"
 import { afterEach, describe, expect, it, type TestContext } from "vitest"
 import { runCli } from "../src/cli.ts"
 import { acquireExclusive } from "../src/exclusive.ts"
-import { acquireRemovalWriterLeases, retainedManifestOf } from "../src/worktree-removal.ts"
+import { acquireRemovalWriterLeases, retainedManifestOf, type WorktreeRemovalProof } from "../src/worktree-removal.ts"
 import { createLocalGitWorktreeStore } from "../src/worktree.ts"
 import { tryAcquireFlock } from "@bearly/flock"
 
@@ -834,13 +834,16 @@ describe("git super worktree add", () => {
           diagnostic,
         ),
       ).toBe(0)
-      const result = JSON.parse(output.output) as { state: string; proof: { retained: string; manifest: string } }
+      // #38198: the proof is the union shape, so the manifest is read through the shared reader rather than assumed.
+      const result = JSON.parse(output.output) as { state: string; proof: WorktreeRemovalProof }
       expect(result.state).toBe("updated")
       expect(proofBeforeRemoval).toBe(true)
       expect(existsSync(worktree)).toBe(false)
       expect(existsSync(source)).toBe(false)
       expect(git(fixture.product, ["worktree", "list", "--porcelain"])).not.toContain(worktree)
-      const store = join(result.proof.retained, "vendor/dep")
+      const retainedCopy = result.proof.retained
+      if (retainedCopy === null) throw new Error(`--retain kept no copy: ${JSON.stringify(result.proof)}`)
+      const store = join(retainedCopy, "vendor/dep")
       if (invalidGraph !== undefined) expect(existsSync(join(store, "objects/info/commit-graph"))).toBe(false)
       expect(readFileSync(join(store, "logs/HEAD"), "utf8")).toBe(beforeLog)
       expect(readFileSync(retainedManifestOf(result.proof), "utf8")).toContain("vendor/dep/packed-refs")
