@@ -851,6 +851,10 @@ interface DurableRefRecord {
   readonly complete: boolean
   /** Read as a detached gitdir because its recorded core.worktree is gone (#34920). */
   readonly detached: boolean
+  /** 38234: the repository this witness's own remote names; absent when the identity could not be read. */
+  readonly repo?: string
+  /** 38234: the store's alternate object directories, for the per-entry removal filter. */
+  readonly alternateStores: readonly string[]
 }
 
 /**
@@ -1062,6 +1066,18 @@ type WitnessStoreRead =
       /** True when `fsck --connectivity-only` covered this store for the entry. */
       readonly fsck: boolean
       readonly fsckMs: number
+      /**
+       * 38234 (@cto c1f22351): the custody authority this witness belongs to — the repository its own remote names.
+       * A commit proves custody only against a witness of its own remote, so a batch index built once is read per
+       * partition, never as one pooled set of shas.
+       */
+      readonly repo?: string
+      /**
+       * 38234 (@cto 418fe620 condition 1): this store's alternate object directories, read with no exclusion. A
+       * shared index cannot know an entry's removal set, so the per-entry filter asks whether any of these (or the
+       * store itself) sits inside that entry's removal, or inside one an earlier entry of the batch already executed.
+       */
+      readonly alternateStores: readonly string[]
     }
 
 async function readWitnessStore(
@@ -1260,6 +1276,8 @@ async function readWitnessStore(
       ...(publishedEntry === undefined ? {} : { published: publishedEntry }),
       fsck,
       fsckMs,
+      ...(repo === undefined ? {} : { repo }),
+      alternateStores: closureResult.stores,
     }
   } catch (error) {
     if (error instanceof CorruptStoreError) return { kind: "corrupt", gitDir, detail: error.message }
@@ -1522,6 +1540,8 @@ async function indexWitnessStoresReported(
           fragment,
           complete: subtract.length === 0,
           detached: read.detached,
+          ...(read.repo === undefined ? {} : { repo: read.repo }),
+          alternateStores: read.alternateStores,
         })
         prior.push({ store, tip: entry.tip, plain: read.plain })
       }
@@ -2342,6 +2362,40 @@ async function ancestryProof(
   }
 }
 
+/**
+ * 38234 (@cto c1f22351 + 418fe620 conditions 1 and 2): a batch builds ONE witness index, so membership in it is no
+ * longer proof for any particular entry. A witness may prove custody only when it belongs to this component's own
+ * custody authority — the repository its own remote names — and neither it nor an alternate object directory it
+ * borrows from sits inside this entry's removal set. Returns the reason it is out of bounds, or `undefined` when it
+ * may prove custody. Dropping a witness can only keep more, so neither arm can free an entry wrongly.
+ */
+function witnessOutOfBounds(
+  record: DurableRefRecord,
+  repo: string | undefined,
+  exclusions: readonly string[],
+): string | undefined {
+  // #27443(b): a store whose alternate closure reaches into the removal set is refused outright, never read — a
+  // single run throws from the closure before it even asks which repository the store mirrors, and a batch must not
+  // become the more permissive of the two. `alternateStores` starts with the store itself, so the root is excluded
+  // here and falls through to the keep below, exactly as a run that never listed it would.
+  const borrowed = record.alternateStores.find(
+    (store) => store !== record.store && exclusions.some((root) => within(root, store)),
+  )
+  if (borrowed !== undefined) {
+    throw new UnknownError(`witness store ${record.store} borrows ${borrowed} inside the removal set`)
+  }
+  // A witness inside the removal set can prove nothing about objects that outlive it: the entry keeps them, by name.
+  if (exclusions.some((root) => within(root, record.store))) {
+    return `witness store ${record.store} sits inside the removal set`
+  }
+  // A store whose identity was unreadable is not provably foreign, and a single run never skips it as a non-witness
+  // either (#37792), so it stays eligible. Only a store KNOWN to mirror another repository is partitioned away.
+  if (repo !== undefined && record.repo !== undefined && record.repo !== repo) {
+    return `witness store ${record.store} mirrors ${record.repo}, not this component's ${repo}`
+  }
+  return undefined
+}
+
 async function runCustody(
   copyRoot: string,
   components: readonly ComponentContents[],
@@ -2459,10 +2513,20 @@ async function runCustody(
     }
   }
   const indexDir = indexScope?.dir ?? sidecarDir
+  // 38234 (@cto 418fe620): a batch builds one witness index for every entry, so the index is built with NO store
+  // exclusion — the walk's cost is the same either way — and the per-entry filter below removes the witnesses that
+  // entry's removal set (plus every removal already executed in this batch) puts out of bounds. Passing `removal`
+  // here is what made one batch walk the estate once per entry.
+  const indexExclusion: readonly string[] = []
+  // 38234 (@cto 418fe620 condition 1): the batch hands every entry the WHOLE batch as its removal set, so this is
+  // already the superset of "this entry's own removal plus every removal an earlier entry executed" — and
+  // conservative is the only direction allowed. The removal arm matters because the shared index now admits alternate
+  // closures the per-entry removal set never excluded.
+  const custodyExclusions: readonly string[] = removal
   const buildIndex = async (): Promise<BuiltWitnessIndex> => {
     const indexed = await indexWitnessStores(
       stores,
-      removal,
+      indexExclusion,
       proofStream,
       proofRun,
       bounds,
@@ -2538,7 +2602,6 @@ async function runCustody(
       : await indexScope.witnessIndex(
           JSON.stringify([
             stores,
-            [...removal].sort(),
             witnessPolicy?.targetBranch ?? null,
             [...componentRepoIds].sort(),
             componentReposComplete,
@@ -2649,6 +2712,31 @@ async function runCustody(
       const proven = ancestryByComponent.get(component.component)
       const provenUnreferenced: CustodyTarget[] = []
       let provenUnreferencedTotal = 0
+      // 38234: one object with no eligible witness, by exactly the path a run with no index line takes.
+      const withoutWitness = (key: string, source: string, objectType: string): void => {
+        // 37455-A: a proven component keeps every un-witnessed object named here rather than silent. No head
+        // reaches it, no patch stream is read for it, and the proof says exactly which objects the removal drops.
+        if (proven !== undefined) {
+          provenUnreferencedTotal += 1
+          unreferencedCount += 1
+          if (unreferenced.length < MISSING_INLINE) {
+            unreferenced.push({ component: component.component, oid: key, source })
+          }
+          if (provenUnreferenced.length < MISSING_INLINE) {
+            provenUnreferenced.push({ component: component.component, oid: key, source })
+          }
+          return
+        }
+        missingCount += 1
+        if (missing.length < MISSING_INLINE) missing.push({ component: component.component, oid: key, source })
+        allMissing.push({
+          component: component.component,
+          oid: key,
+          source,
+          objectType,
+          ...(component.gitDir === undefined ? {} : { gitDir: component.gitDir }),
+        })
+      }
       await mergeSorted(
         [
           { label: "at-risk", lines: readLines(component.atRiskSidecar.path), keyOf: oidKey },
@@ -2662,28 +2750,7 @@ async function runCustody(
           const objectType = atRiskLines[0]?.split("\t")[1] ?? "unknown"
           const indexLines = groups.find((group) => group.label === "witness-index")?.lines
           if (indexLines === undefined || indexLines.length === 0) {
-            // 37455-A: a proven component keeps every un-witnessed object named here rather than silent. No head
-            // reaches it, no patch stream is read for it, and the proof says exactly which objects the removal drops.
-            if (proven !== undefined) {
-              provenUnreferencedTotal += 1
-              unreferencedCount += 1
-              if (unreferenced.length < MISSING_INLINE) {
-                unreferenced.push({ component: component.component, oid: key, source })
-              }
-              if (provenUnreferenced.length < MISSING_INLINE) {
-                provenUnreferenced.push({ component: component.component, oid: key, source })
-              }
-              return
-            }
-            missingCount += 1
-            if (missing.length < MISSING_INLINE) missing.push({ component: component.component, oid: key, source })
-            allMissing.push({
-              component: component.component,
-              oid: key,
-              source,
-              objectType,
-              ...(component.gitDir === undefined ? {} : { gitDir: component.gitDir }),
-            })
+            withoutWitness(key, source, objectType)
             return
           }
           const rank = indexLines[0]?.split("\t")[1]
@@ -2693,6 +2760,18 @@ async function runCustody(
             throw new UnknownError(
               `witness store ${record.store} object format does not match component ${component.component}`,
             )
+          }
+          // 38234 (@cto c1f22351 + 418fe620): a shared index holds every store's witnesses, so membership alone is
+          // not proof. The witness must belong to this component's own remote, and neither it nor an alternate it
+          // borrows from may sit inside this entry's removal or one an earlier entry of this batch executed.
+          const outOfBounds = witnessOutOfBounds(
+            record,
+            componentRepoByComponent.get(component.component),
+            custodyExclusions,
+          )
+          if (outOfBounds !== undefined) {
+            withoutWitness(key, source, objectType)
+            return
           }
           witnessCount += 1
           witnessWriter.add(`${key}\t${component.component}\t${record.store}\t${record.ref}\t${record.tip}`)

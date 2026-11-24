@@ -2070,6 +2070,59 @@ describe("retention custody scan — mirror-head ancestry (#37792)", () => {
     expect(scan.reachability).toBeUndefined()
   })
 
+  // 38234 (@cto c1f22351 + 418fe620 condition 2): a batch shares ONE witness index across every store, so membership
+  // in it is no longer proof for any particular entry. A commit proves custody only against a witness of its own
+  // remote, even when alternates would make the object locally present. The exclusive read-time skip cannot answer
+  // this shape: an unreadable second component leaves the repository set incomplete (#37792), which is exactly when
+  // every store is read and the foreign record reaches the shared index.
+  test("a witness of another repository proves nothing when the repository set is incomplete", async () => {
+    const own = publishedStores("git-super-partition-own-")
+    const other = publishedStores("git-super-partition-other-")
+    const foreignHead = git(other.primary, ["rev-parse", "HEAD"])
+    const localOnly = repoWithCommit("git-super-partition-local-")
+    const sidecarDir = tmp("git-super-partition-sidecars-")
+    const alpha: ComponentContents = {
+      ...(await componentOf([foreignHead], sidecarDir, "owned", { [foreignHead]: "commit" })),
+      component: "alpha",
+      gitDir: join(own.primary, ".git"),
+    }
+    const beta: ComponentContents = {
+      ...(await componentOf([], sidecarDir)),
+      component: "beta",
+      gitDir: join(localOnly.root, ".git"),
+    }
+    const scan = await scanCustody(own.primary, [alpha, beta], [join(other.primary, ".git", "objects")], [], {
+      sidecarDir,
+    })
+    // The foreign store holds the object and is read; it is still never THIS component's witness.
+    expect(scan.witnessCount).toBe(0)
+    expect(scan.missing.map((entry) => entry.oid)).toEqual([foreignHead])
+    expect(scan.status).toBe("blocked")
+  })
+
+  // 38234 (@cto 418fe620 condition 1): a batch hands every entry the whole batch as its removal set, so the candidate
+  // list already excludes every member — the superset of "this entry's removal plus every removal already executed".
+  // An object whose only copy lives in a store this entry removes is kept, by name, never witnessed by it.
+  test("a store this entry removes never witnesses, so its only copy is kept by name", async () => {
+    const lender = publishedStores("git-super-removal-lender-")
+    const head = git(lender.primary, ["rev-parse", "HEAD"])
+    const borrower = repoWithCommit("git-super-removal-borrower-")
+    const sidecarDir = tmp("git-super-removal-sidecars-")
+    const component = await componentOf([head], sidecarDir)
+    const scan = await scanCustody(
+      borrower.root,
+      [component],
+      [join(lender.primary, ".git", "objects")],
+      [lender.primary],
+      {
+        sidecarDir,
+      },
+    )
+    expect(scan.status).toBe("blocked")
+    expect(scan.witnessCount).toBe(0)
+    expect(scan.missing.map((entry) => entry.oid)).toEqual([head])
+  })
+
   test("a store mirroring another repository neither witnesses nor gets fscked", async () => {
     const fixture = ancestryFixture("git-super-ancestry-foreign-")
     // A second, unrelated repository: its bare mirror declares a different remote, so it mirrors nothing here.

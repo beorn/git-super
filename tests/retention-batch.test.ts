@@ -655,6 +655,42 @@ describe("retention retirement batch (#33010)", async () => {
     })
   }, 60_000)
 
+  // 38234 (@cto 418fe620 condition 3): the memo key must not carry the entry's own removal set, or the shared index is
+  // rebuilt once per entry and the class's "one walk per batch" claim is only stated, never enforced. Three witness
+  // entries over one submodule store are exactly the shape that rebuilt N times.
+  it("builds one witness index for the whole preliminary pass, not one per entry", async () => {
+    const entries = [
+      await witnessEntry("index-once-a"),
+      await witnessEntry("index-once-b"),
+      await witnessEntry("index-once-c"),
+    ]
+    const indexWalks: string[] = []
+    const result = await retireRetainedBatch(
+      options({
+        entries,
+        proofDeadlineMs: 600_000,
+        clock: retainedUntil(entries),
+        gitRun: (args, runOptions = {}) => {
+          // The witness index's own read: `observeRefs` also lists refs, but always names the `refs/` prefix.
+          if (args.includes("for-each-ref") && !args.includes("refs/")) {
+            indexWalks.push(args.filter((arg) => arg.startsWith("--git-dir=")).join(" "))
+          }
+          return defaultGitRun(args, runOptions)
+        },
+      }),
+    )
+    expect(result.stopped).toBeUndefined()
+    // These entries hold a ref-less object and the fixture's stores declare no durable remote, so all three are kept by
+    // name — the point here is the walk they share, not their verdict.
+    for (const row of result.rows) {
+      expect(row.outcome, row.entry).toBe("kept")
+      expect(row.reason, row.entry).toContain("no durable witness")
+    }
+    // ONE build for the whole pass: a rebuild for a later entry would read the same store a second time.
+    expect(indexWalks.length).toBeGreaterThan(1)
+    expect(new Set(indexWalks).size).toBe(indexWalks.length)
+  }, 120_000)
+
   // 37854 (@cto 7debe1c0): a walk cut by the proof deadline is still a walk this entry paid for. The counter is read
   // around the proof, so the delta survives a partial walk that is never cached and never becomes custody evidence.
   it("reports the walk an entry paid for even when the deadline cut it inside that walk", async () => {
