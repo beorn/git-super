@@ -13,6 +13,14 @@
  * measured; the command stops once its hold would pass the budget (about 60 s). A subsequent invocation scans afresh.
  *
  * Dry run by default: `apply: false` reports the entries that would be retired and why every other one is kept.
+ *
+ * THE INVARIANT, and the one place it is stated (#34127, @cto 2026-11-24): **no entry is deleted on a stale or unknown
+ * proof.** Each entry's proof must be fresh, re-verified inside its lease, at the moment its delete runs. The time
+ * budget governs NEW work — which entry is proved next and where the run stops — and it never voids a proof that was
+ * already re-verified under its lease, and never lets an unverified entry through. So a `deadline`/`budget` stop is a
+ * time stop (`stoppedKind`), a success with a named remainder, and only a condition stop (a shifted census, a held
+ * lease, a partial retirement) or a failed row fails the run. The chunked driver that turns this into progress across
+ * nights is `retention-chunks.ts`; it changes when the run stops, never what a delete is allowed to rest on.
  */
 import { measureRetainedBytes } from "./retention-bytes.ts"
 import { CustodyIndexScope } from "./retention-custody.ts"
@@ -203,6 +211,18 @@ export type RetentionBatchResult = Readonly<{
   bytesEvidence?: number
   /** Set when the batch stopped early; every entry not yet deleted is kept. */
   stopped?: string
+  /**
+   * 34127 (@cto 2026-11-24, chunk ruling): why the batch stopped, and whether a reader must treat it as a failure.
+   * `deadline` and `budget` are TIME stops: the work that finished is real, the remainder is named, and the run is a
+   * success with a remainder. `stop` is a condition that must be acted on — a shifted census, a held lease, a partial
+   * retirement, an unreadable estate — and a batch that ends that way fails. Read beside `stopped`, never instead of it.
+   */
+  stoppedKind?: "deadline" | "budget" | "stop"
+  /**
+   * 34127 (@cto 2026-11-24): the entries this batch's preliminary pass proved ready to retire, in borrower order. The
+   * chunk driver subtracts what it retired to report "proved but unreached", so a deadline cut names the work it cost.
+   */
+  candidates?: readonly string[]
 }>
 
 /**
@@ -396,6 +416,8 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
   if (new Set(entries).size !== entries.length) throw new Error("batch names an entry twice")
   const rows = new Map<string, BatchRow>()
   const warnings: { entry: string; phase: "pre" | "held"; message: string }[] = []
+  // 34127 (@cto 2026-11-24): set once the preliminary pass has ordered its proved entries; absent until then.
+  let candidatesForResult: readonly string[] | undefined
   const recordWarnings = (proof: RetentionVerifyResult, phase: "pre" | "held"): void => {
     for (const message of proof.certificate?.warnings ?? []) warnings.push({ entry: proof.entry, phase, message })
   }
@@ -572,6 +594,14 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
       }),
     )
   }
+  // 34127 (@cto 2026-11-24): one place decides whether a stop is a time stop or a condition, so every return site gets
+  // the same reading and a new stop cannot be added without landing in one of the three kinds.
+  const stopKind = (message: string | undefined): RetentionBatchResult["stoppedKind"] => {
+    if (message === undefined) return undefined
+    if (message.startsWith("proof-deadline")) return "deadline"
+    if (message.startsWith("lease budget")) return "budget"
+    return "stop"
+  }
   const result = (windows: BatchWindow[], stopped?: string): RetentionBatchResult => ({
     apply,
     warnings,
@@ -634,7 +664,10 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
     rows: entries.map(
       (entry) => rows.get(entry) ?? { entry, outcome: "not-reached", reason: stopped ?? "not evaluated" },
     ),
-    ...(stopped === undefined ? {} : { stopped }),
+    ...(candidatesForResult === undefined ? {} : { candidates: candidatesForResult }),
+    ...(stopped === undefined || stopKind(stopped) === undefined
+      ? {}
+      : { stopped, stoppedKind: stopKind(stopped) as NonNullable<RetentionBatchResult["stoppedKind"]> }),
   })
   if (scan.status === "unknown") {
     const reason = `incomplete: the batch estate scan is unknown: ${scan.detail}`
@@ -878,6 +911,7 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
         : undefined
   closeOverKeptBorrowers(entries, scan.borrowers, kept)
   const candidates = borrowerOrder(entries, scan.borrowers, kept)
+  candidatesForResult = candidates
   for (const [entry, reason] of kept) rows.set(entry, { entry, outcome: "kept", reason })
   const leasedOwners = liveOwners.filter((owner) => !leaseMissing.includes(owner))
 

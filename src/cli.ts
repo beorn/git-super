@@ -18,6 +18,8 @@ import {
   type RetentionCompactParams,
   type RetentionBatchParams,
   type RetentionRankParams,
+  type RetentionChunksParams,
+  retentionChunks,
   retentionRank,
   type RetentionVerifyParams,
   type RetentionRetireParams,
@@ -33,6 +35,7 @@ import type { GitSuperResult } from "./result.ts"
 import type { RetentionVerifyResult } from "./retention-verify.ts"
 import type { CompactRetainedRootReport } from "./retention-compact.ts"
 import { fragmentUseText, type RetentionBatchResult } from "./retention-batch.ts"
+import type { RetentionChunkResult } from "./retention-chunks.ts"
 import { formatRetainedBytes, type RetainedRanking } from "./retention-bytes.ts"
 import type { PrivateStoreCandidateResult } from "./private-store-candidate.ts"
 import type { SuperStatusResult } from "./status.ts"
@@ -64,6 +67,7 @@ type CapturedInvocation =
       nul: boolean
     }>
   | Readonly<{ node: typeof retentionRank; params: RetentionRankParams; json: boolean; nul: boolean }>
+  | Readonly<{ node: typeof retentionChunks; params: RetentionChunksParams; json: boolean; nul: boolean }>
   | Readonly<{
       node: typeof commands.worktree.retention.retire | typeof commands.worktree.retention.audit
       params: RetentionRetireParams
@@ -145,6 +149,7 @@ async function commandResult(
   | RetentionEnrollReport
   | CompactRetainedRootReport
   | RetentionBatchResult
+  | RetentionChunkResult
   | RetainedRanking
   | PrivateStoreCandidateResult
   | GitSuperResult
@@ -162,6 +167,7 @@ async function commandResult(
       | RetentionVerifyResult
       | RetentionEnrollReport
       | RetentionBatchResult
+      | RetentionChunkResult
       | RetainedRanking
       | PrivateStoreCandidateResult
       | GitSuperResult
@@ -936,6 +942,18 @@ async function runInvocation(
       "proof budget for the batch: an entry not proved by then is kept with the cause named (default 960: the report after it took 105 s on the live estate, under Yrd's 1200 s timeout)",
     )
     .option(
+      "--chunk-size <count>",
+      "prove and retire this many entries per chunk, resuming after the cursor; a deadline stop is then a success with a named remainder (34127)",
+    )
+    .option(
+      "--cursor-file <path>",
+      "rotating start for chunked runs (default <artifact-dir>/cursor.json); rewritten after each chunk",
+    )
+    .option(
+      "--batch-deadline-seconds <seconds>",
+      "total time across every chunk; each chunk gets a fair share, never more than the remainder (default: the proof budget)",
+    )
+    .option(
       "--custody-target-branch <branch>",
       "published branch gate 5 proves component heads against (37792); omitted keeps the witness and patch proofs",
     )
@@ -951,6 +969,9 @@ async function runInvocation(
         rankOnly?: boolean
         rankDeadlineSeconds?: string
         proofDeadlineSeconds?: string
+        chunkSize?: string
+        cursorFile?: string
+        batchDeadlineSeconds?: string
         custodyTargetBranch?: string
       }
       if (options.rankOnly === true) {
@@ -982,6 +1003,37 @@ async function runInvocation(
       const proofSeconds = options.proofDeadlineSeconds === undefined ? 960 : Number(options.proofDeadlineSeconds)
       if (!Number.isFinite(proofSeconds) || proofSeconds <= 0) {
         usage = `git super worktree retention retire-batch: --proof-deadline-seconds must be a positive number, got ${options.proofDeadlineSeconds}`
+        return
+      }
+      if (options.chunkSize !== undefined || options.cursorFile !== undefined) {
+        const chunkSize = options.chunkSize === undefined ? undefined : Number(options.chunkSize)
+        if (chunkSize !== undefined && (!Number.isSafeInteger(chunkSize) || chunkSize < 1)) {
+          usage = `git super worktree retention retire-batch: --chunk-size must be a positive integer, got ${String(options.chunkSize)}`
+          return
+        }
+        const totalSeconds =
+          options.batchDeadlineSeconds === undefined ? proofSeconds : Number(options.batchDeadlineSeconds)
+        if (!Number.isFinite(totalSeconds) || totalSeconds <= 0) {
+          usage = `git super worktree retention retire-batch: --batch-deadline-seconds must be a positive number, got ${String(options.batchDeadlineSeconds)}`
+          return
+        }
+        captured = {
+          node: retentionChunks,
+          params: {
+            entries,
+            root: options.root,
+            common: options.common,
+            artifactDir: options.artifactDir,
+            namespaceRoots: options.namespace,
+            ...(options.apply === true ? { apply: true } : {}),
+            ...(options.custodyTargetBranch === undefined ? {} : { targetBranch: options.custodyTargetBranch }),
+            ...(chunkSize === undefined ? {} : { chunkSize }),
+            ...(options.cursorFile === undefined ? {} : { cursorFile: options.cursorFile }),
+            deadlineMs: totalSeconds * 1000,
+          },
+          json: globals.json === true,
+          nul: false,
+        }
         return
       }
       captured = {
@@ -1209,6 +1261,7 @@ async function runInvocation(
     | RetentionEnrollReport
     | CompactRetainedRootReport
     | RetentionBatchResult
+    | RetentionChunkResult
     | RetainedRanking
     | PrivateStoreCandidateResult
     | GitSuperResult
@@ -1328,7 +1381,17 @@ async function runInvocation(
   }
   if (captured.node === commands.worktree.retention["retire-batch"]) {
     const batch = result as RetentionBatchResult
-    return batch.stopped === undefined && !batch.rows.some((row) => row.outcome === "failed") ? 0 : 2
+    // 34127 (@cto 2026-11-24 chunk ruling): a time stop is a success with a remainder. Only a condition stop (a shifted
+    // census, a held lease, a partial retirement) or a failed row is a failure.
+    return (batch.stoppedKind === undefined || batch.stoppedKind === "deadline" || batch.stoppedKind === "budget") &&
+      !batch.rows.some((row) => row.outcome === "failed")
+      ? 0
+      : 2
+  }
+  if (captured.node === retentionChunks) {
+    const chunks = result as RetentionChunkResult
+    const hardStop = chunks.chunks.some((chunk) => chunk.stoppedKind === "stop")
+    return !hardStop && !chunks.rows.some((row) => row.outcome === "failed") ? 0 : 2
   }
   if (captured.node === commands.worktree.retention.retire) {
     const operation = result as GitSuperResult
@@ -1575,6 +1638,24 @@ async function writeResult(
       )
     }
     if (batch.stopped !== undefined) stderr.write(`${batch.stopped}\n`)
+  } else if (captured.node === retentionChunks) {
+    const chunks = result as RetentionChunkResult
+    stdout.write(
+      `retained chunks: ${chunks.rows.some((row) => row.outcome === "retired") ? "apply" : "dry-run"} ${String(chunks.retired)} retired, ` +
+        `${String(chunks.provedButUnreached)} proved but unreached, examined ${String(chunks.examined)} of ${String(chunks.total)}, ` +
+        `outcome ${chunks.outcome}` +
+        (chunks.nextCursor === null ? "" : `; next run starts after ${basename(chunks.nextCursor)}`) +
+        "\n",
+    )
+    for (const row of chunks.rows) stdout.write(`${row.outcome} ${row.entry}: ${row.reason}\n`)
+    for (const chunk of chunks.chunks) {
+      for (const window of chunk.windows) {
+        stdout.write(
+          `lease hold ${String(window.holdMs)}ms; delta ${window.delta} ${String(window.deltaMs)}ms; entries ${String(window.entries.length)}\n`,
+        )
+      }
+    }
+    if (chunks.stopped !== undefined) stderr.write(`${chunks.stopped}\n`)
   } else if (captured.node === nodes.worktree.retention.enroll) {
     const report = result as RetentionEnrollReport
     stdout.write(`${report.apply ? "apply" : "dry-run"} enroll ${report.root} common ${report.common}\n`)

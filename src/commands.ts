@@ -39,6 +39,11 @@ import { verifyRetainedEntry, type RetentionVerifyOptions, type RetentionVerifyR
 import { auditRetainedEntry, retireRetainedEntry, type RetentionRetireOptions } from "./retention-remove.ts"
 import { compactRetainedRoot, type CompactRetainedRootReport } from "./retention-compact.ts"
 import { retireRetainedBatch, type RetentionBatchOptions, type RetentionBatchResult } from "./retention-batch.ts"
+import {
+  retireRetainedBatchInChunks,
+  type RetentionChunkOptions,
+  type RetentionChunkResult,
+} from "./retention-chunks.ts"
 import { rankRetainedEntries, type RetainedRanking } from "./retention-bytes.ts"
 import { existsSync, realpathSync } from "node:fs"
 import { superWorktreeRemove, type SuperWorktreeRemoveOptions } from "./worktree-remove.ts"
@@ -63,6 +68,19 @@ export type RetentionBatchParams = Pick<
   "entries" | "root" | "common" | "namespaceRoots" | "artifactDir" | "apply" | "proofDeadlineMs" | "targetBranch"
 >
 export type RetentionRankParams = Readonly<{ entries: readonly string[]; root: string; deadlineMs: number }>
+export type RetentionChunksParams = Pick<
+  RetentionChunkOptions,
+  | "entries"
+  | "root"
+  | "common"
+  | "namespaceRoots"
+  | "artifactDir"
+  | "apply"
+  | "chunkSize"
+  | "cursorFile"
+  | "deadlineMs"
+  | "targetBranch"
+>
 export type PrivateStoreVerifyParams = Omit<PrivateStoreCandidateOptions, "git">
 export type PrivateStoreVerifyNode = CommandNode<CommandContext, PrivateStoreVerifyParams, PrivateStoreCandidateResult>
 
@@ -506,6 +524,53 @@ const retentionBatch = commandNode<CommandContext, RetentionBatchParams, Retenti
     }
   }),
   run: (_context, input) => retireRetainedBatch(input),
+})
+
+/**
+ * `retire-batch --chunk-size` (34127, @cto 2026-11-24 chunk ruling): the same verb, proving and retiring a chunk at a
+ * time with a rotating start, so a deadline ends the run with real retirements behind it instead of discarding the
+ * entries it proved. The per-entry invariant is unchanged and is stated in `retention-chunks.ts`.
+ */
+export const retentionChunks = commandNode<CommandContext, RetentionChunksParams, RetentionChunkResult>({
+  title: "Retire selected retained entries in chunks, resuming from a cursor",
+  description:
+    "Dry run by default; --apply proves a chunk and retires it under existing writer leases before the next chunk. A deadline stop is a success with a named remainder.",
+  params: params((value) => {
+    const input = record(value)
+    const entries = stringArray(input.entries, "entries")
+    if (entries.length === 0) throw new Error("retire-batch --chunk-size requires at least one selected entry")
+    if (input.apply !== undefined && typeof input.apply !== "boolean") {
+      throw new Error("retire-batch apply must be a boolean")
+    }
+    const chunkSize = input.chunkSize
+    if (
+      chunkSize !== undefined &&
+      (typeof chunkSize !== "number" || !Number.isSafeInteger(chunkSize) || chunkSize < 1)
+    ) {
+      throw new Error("retire-batch chunkSize must be a positive integer")
+    }
+    if (input.cursorFile !== undefined && (typeof input.cursorFile !== "string" || input.cursorFile === "")) {
+      throw new Error("retire-batch cursorFile must be a nonempty path")
+    }
+    const deadline = input.deadlineMs
+    if (deadline !== undefined && (typeof deadline !== "number" || !Number.isFinite(deadline) || deadline <= 0)) {
+      throw new Error("retire-batch deadlineMs must be a positive number of milliseconds")
+    }
+    const held = retentionHeldSchema.parse({ ...input, entry: entries[0] })
+    return {
+      entries,
+      root: held.root,
+      common: held.common,
+      namespaceRoots: held.namespaceRoots,
+      artifactDir: held.artifactDir,
+      ...(held.custodyTargetBranch === undefined ? {} : { targetBranch: held.custodyTargetBranch }),
+      ...(input.apply === true ? { apply: true } : {}),
+      ...(chunkSize === undefined ? {} : { chunkSize: chunkSize as number }),
+      ...(input.cursorFile === undefined ? {} : { cursorFile: input.cursorFile as string }),
+      ...(deadline === undefined ? {} : { deadlineMs: deadline as number }),
+    }
+  }),
+  run: (_context, input) => retireRetainedBatchInChunks(input),
 })
 
 /**

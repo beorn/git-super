@@ -460,9 +460,11 @@ describe("retention retirement batch (#33010)", async () => {
     expect(readdirSync(root)).toHaveLength(3)
   })
   // #35047: a 20-entry preliminary pass ran past Yrd's 1200 s timeout with no report and its walk still running. Under
-  // the batch proof deadline every unproved entry is kept with the cause, the run reports `stopped` (exit 2), and an
-  // apply takes no lease and deletes nothing. The CLI dry run above is the same fixture under the 960 s default.
-  it("CLI keeps every entry its proof deadline cuts off, reports the stop, and deletes nothing", async () => {
+  // the batch proof deadline every unproved entry is kept with the cause and the run reports its stop. 34127 (@cto
+  // 2026-11-24 chunk ruling): that stop is a TIME stop, so the run exits 0 with its remainder named; only a condition
+  // stop or a failed row exits 2. An apply takes no lease and deletes nothing. The CLI dry run above is the same
+  // fixture under the 960 s default.
+  it("CLI keeps every entry its proof deadline cuts off, reports the time stop, and deletes nothing", async () => {
     let output = ""
     let errors = ""
     const entries = readdirSync(root)
@@ -500,9 +502,10 @@ describe("retention retirement batch (#33010)", async () => {
         },
       },
     )
-    expect(code, errors).toBe(2)
+    expect(code, errors).toBe(0)
     const report = JSON.parse(output) as RetentionBatchResult
     expect(report.stopped).toMatch(/^proof-deadline: the batch proof deadline \(1 ms\) passed/u)
+    expect(report.stoppedKind).toBe("deadline")
     expect(report.rows.map((row) => [row.entry, row.outcome])).toEqual(entries.map((entry) => [entry, "kept"]))
     for (const row of report.rows) expect(row.reason).toContain("proof deadline")
     expect(report.windows).toEqual([])
@@ -711,7 +714,8 @@ describe("retention retirement batch (#33010)", async () => {
       { write: (value) => void (output += value) },
       { write: (value) => void (errors += value) },
     )
-    expect(code, errors).toBe(2)
+    // 34127 (@cto 2026-11-24): a proof-deadline stop is a time stop, so the CLI reports it and exits 0.
+    expect(code, errors).toBe(0)
     expect(output).toContain("fragments 0 walked / 0 reused (no eligible walk observed)")
   })
 
