@@ -89,6 +89,12 @@ export type RetentionBatchOptions = Readonly<{
    * itself. Default: gate 5 answers from one timestamped live remote snapshot per component when the copy is redundant.
    */
   remoteRedundancy?: boolean
+  /**
+   * #38246 (@cto 2026-11-24T21:28Z): by default every entry asks the cheap nothing-unpublished gate first, so a copy
+   * that holds nothing unique retires without the content and custody gates. `true` demands the full gates for every
+   * entry; the production CLI never sets it, and a case proving the expensive path does.
+   */
+  fullProof?: boolean
 }>
 
 export type BatchRow = Readonly<{
@@ -223,6 +229,12 @@ export type RetentionBatchResult = Readonly<{
    * chunk driver subtracts what it retired to report "proved but unreached", so a deadline cut names the work it cost.
    */
   candidates?: readonly string[]
+  /**
+   * #38246 (@cto 2026-11-24T21:28Z): the cheap gate's spend across this run. The `live` count is the entries it
+   * retired on its own answer (no content or custody gate paid for), `fallThrough` the ones it sent to the full
+   * gates, and `ms` the sum of each entry's own cost — the figure #38198's acceptance asks for per entry.
+   */
+  cheapGate?: Readonly<{ live: number; fallThrough: number; ms: number }>
 }>
 
 /**
@@ -549,6 +561,7 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
       ...(options.gitStream === undefined ? {} : { gitStream: options.gitStream }),
       ...(options.targetBranch === undefined ? {} : { custodyTargetBranch: options.targetBranch }),
       ...(options.remoteRedundancy === undefined ? {} : { remoteRedundancy: options.remoteRedundancy }),
+      ...(options.fullProof === undefined ? {} : { fullProof: options.fullProof }),
       custodyRunScope: rescan ?? runScopeFor(phase),
       ...(options.clock === undefined ? {} : { clock: options.clock }),
       ...(deadline === undefined ? {} : { deadline }),
@@ -602,8 +615,16 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
     if (message.startsWith("lease budget")) return "budget"
     return "stop"
   }
+  const cheapTotals = { live: 0, fallThrough: 0, ms: 0 }
+  const cheapTally = (proof: RetentionVerifyResult | undefined): void => {
+    if (proof?.cheapGate === undefined) return
+    if (proof.cheapGate.state === "published" && proof.verdict === "candidate") cheapTotals.live += 1
+    else cheapTotals.fallThrough += 1
+    cheapTotals.ms += proof.cheapGate.ms
+  }
   const result = (windows: BatchWindow[], stopped?: string): RetentionBatchResult => ({
     apply,
+    ...(cheapTotals.live + cheapTotals.fallThrough === 0 ? {} : { cheapGate: { ...cheapTotals } }),
     warnings,
     ...(Object.keys(phases).length === 0 ? {} : { proofPhases: { ...phases } }),
     ...(timings.size === 0
@@ -714,6 +735,7 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
     }
     recordWarnings(proof, "pre")
     preliminary.set(entry, proof)
+    cheapTally(proof)
     if (proof.verdict !== "candidate") {
       // An entry whose own share ran out is unknown because of the schedule, never because its store looked corrupt and
       // never as a reusable negative custody verdict; the reason names the slice so a later run can tell them apart.
@@ -917,14 +939,18 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
 
   if (!apply) {
     for (const entry of candidates) {
-      const evidence = preliminary.get(entry)?.certificate?.path
+      const proof = preliminary.get(entry)
+      const evidence = proof?.certificate?.path
+      const cheap = proof?.cheapGate
       rows.set(entry, {
         entry,
         outcome: "would-retire",
         reason:
-          ownerStop === undefined
-            ? "every gate passed against the shared scan; a held re-verify runs at delete time"
-            : `every gate passed, but apply would stop first: ${ownerStop}`,
+          cheap?.state === "published"
+            ? `nothing-unpublished: ${cheap.reason} (${String(cheap.ms)} ms); a held re-verify answers the same question at delete time`
+            : ownerStop === undefined
+              ? "every gate passed against the shared scan; a held re-verify runs at delete time"
+              : `every gate passed, but apply would stop first: ${ownerStop}`,
         ...(evidence === undefined ? {} : { evidence }),
       })
     }
@@ -1084,7 +1110,17 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
               stopped = `retirement-partial at ${entry}; the batch deleted nothing more`
               break
             }
-            rows.set(entry, { entry, outcome: "retired", reason: "absence verified", evidence: after.path })
+            rows.set(entry, {
+              entry,
+              outcome: "retired",
+              // #38246: with no certificate, this row is the only record of why the copy was deletable, so it carries
+              // the whole answer: the environment, its heads and the remote refs that proved them, plus what it cost.
+              reason:
+                held.cheapGate === undefined
+                  ? "absence verified"
+                  : `absence verified; retired with no content or custody gate: ${held.cheapGate.reason} (${String(held.cheapGate.ms)} ms)`,
+              evidence: after.path,
+            })
           }
           lastEntryMs = monotonic() - entryStarted
         }

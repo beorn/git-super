@@ -153,6 +153,9 @@ function options(extra: Partial<RetentionBatchOptions> = {}): RetentionBatchOpti
     // 37792 (@cto 1a773179): every case in this file proves the WITNESS WALK's own machinery, so each entry is forced
     // through it; the redundancy fast path has its own cases.
     remoteRedundancy: false,
+    // #38246: for the same reason, every case here proves the FULL gate path (certificates, custody phases, witnesses,
+    // borrowers), so the cheap nothing-unpublished gate is turned off; its own cases set `fullProof: false`.
+    fullProof: true,
     ...extra,
   }
 }
@@ -1667,5 +1670,55 @@ describe("retention retirement batch (#33010)", async () => {
     expect(row?.reason).toContain("round 1:")
     expect(row?.reason).toContain("round 2:")
     expect(row?.reason).toContain("round 3:")
+  })
+
+  // #38246 (@cto 2026-11-24T21:28Z): the other side of #38198's trade. A copy whose every head is on a remote-tracking
+  // ref and whose stores hold no stash or note is retired on that answer, without the content and custody gates, and
+  // the run reports what that cost — the figure #38198's acceptance asks for per entry.
+  it("retires a provably redundant copy on the cheap gate and reports its cost", async () => {
+    const entries = readdirSync(root)
+      .sort()
+      .slice(0, 1)
+      .map((name) => join(root, name))
+    const result = await retireRetainedBatch(options({ entries, fullProof: false }))
+    const row = result.rows[0]
+    expect(row?.outcome).toBe("would-retire")
+    expect(row?.reason).toContain("nothing-unpublished")
+    expect(row?.evidence).toBeUndefined()
+    expect(result.cheapGate).toMatchObject({ live: 1, fallThrough: 0 })
+    expect(result.cheapGate?.ms).toBeGreaterThanOrEqual(0)
+    // No certificate was written for this entry: the cheap pass paid no receipt, which is the spend it saves.
+    expect(existsSync(join(fixtureRoot, "artifacts", basename(entries[0] as string), "pre"))).toBe(false)
+    // The retirement's own row is the only record it leaves, so it names the environment, its heads and the remote
+    // refs that proved them — not only the fact that something was deleted.
+    const applied = await retireRetainedBatch(options({ entries, fullProof: false, apply: true }))
+    const retired = applied.rows[0]
+    expect(retired?.outcome).toBe("retired")
+    expect(retired?.reason).toContain(entries[0] as string)
+    expect(retired?.reason).toContain("refs/remotes/")
+    expect(existsSync(entries[0] as string)).toBe(false)
+  })
+
+  it("holds a copy back to the full gates when its stores cannot be proved cheaply", async () => {
+    const entries = readdirSync(root)
+      .sort()
+      .slice(0, 1)
+      .map((name) => join(root, name))
+    const result = await retireRetainedBatch(
+      options({
+        entries,
+        fullProof: false,
+        // A git that cannot answer the predicate's ref reads is `unknown`, never a clean answer: the entry goes to the
+        // full gates, which still prove it, so a broken cheap read changes the cost and never the decision.
+        gitRun: (args, options) => {
+          if (args.includes("refs/stash")) return { code: 128, stdout: "", stderr: "fatal: unreadable store" }
+          return defaultGitRun(args, options)
+        },
+      }),
+    )
+    const row = result.rows[0]
+    expect(row?.outcome).toBe("would-retire")
+    expect(row?.reason).not.toContain("nothing-unpublished")
+    expect(result.cheapGate).toMatchObject({ live: 0, fallThrough: 1 })
   })
 })

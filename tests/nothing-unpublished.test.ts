@@ -9,6 +9,9 @@
  * #38198 (@cto 2026-11-24T18:14Z): the four cases the ruling names, plus the unknown paths that must never read as
  * "nothing to keep".
  */
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { describe, expect, test } from "vitest"
 import {
   describeVerdict,
@@ -161,5 +164,198 @@ describe("nothingUnpublished", () => {
     expect(verdict.state).toBe("unpublished")
     // The note and the path name one submodule, so its head is listed once, not twice.
     expect(verdict.heads.filter((head) => head.startsWith(`${sub}:`))).toEqual([`${sub}:refs/heads/main`])
+  })
+})
+
+/**
+ * #38246 (@cto 2026-11-24T21:28Z): the custody rule. A store the removal deletes that holds a stash or a note is not
+ * eligible, so the copy is written (creation) or kept (sweep). A store holding only reflogs IS eligible: work must be
+ * committed and pushed to count, and a reflog is not custody. These cases use a real modules directory, because the
+ * store walk is the filesystem's answer, and a fake git for the refs themselves.
+ */
+function modulesRoot(): string {
+  return mkdtempSync(join(tmpdir(), "nothing-unpublished-modules-"))
+}
+
+/** A directory with Git's store signature, so the walk finds it without a real repository behind it. */
+function storeUnder(root: string, name: string): string {
+  const dir = join(root, name)
+  mkdirSync(join(dir, "objects"), { recursive: true })
+  writeFileSync(join(dir, "HEAD"), "ref: refs/heads/main\n")
+  writeFileSync(join(dir, "config"), "[core]\n\trepositoryformatversion = 0\n")
+  return dir
+}
+
+/**
+ * One published store's answers, keyed exactly as the predicate reads a store: through an explicit --git-dir and
+ * --work-tree, because a copy's config still names the removed checkout as its work tree.
+ */
+function storeArgs(store: string, args: string): string {
+  return `${store} :: --git-dir=${store} --work-tree=${store} ${args}`
+}
+
+function storeAnswers(store: string, extra: Answers = {}): Answers {
+  return {
+    [storeArgs(store, "for-each-ref --format=%(refname) refs/stash refs/notes")]: "",
+    [storeArgs(store, "for-each-ref --format=%(refname) refs/heads")]: "refs/heads/main\n",
+    [storeArgs(store, "rev-parse --abbrev-ref HEAD")]: "main\n",
+    [storeArgs(store, "for-each-ref --format=%(refname) refs/remotes")]: "refs/remotes/origin/main\n",
+    [storeArgs(store, "rev-list refs/heads/main --not --remotes")]: "",
+    [storeArgs(
+      store,
+      "for-each-ref --contains refs/heads/main --exclude=refs/remotes/*/HEAD --format=%(refname) refs/remotes",
+    )]: "refs/remotes/origin/main\n",
+    ...extra,
+  }
+}
+
+describe("nothingUnpublished custody refs (#38246)", () => {
+  test("a store holding a stash is not eligible and names the store and the ref", async () => {
+    const root = modulesRoot()
+    const store = storeUnder(root, "vendor/dep")
+    const verdict = await nothingUnpublished({
+      git: fakeGit(
+        storeAnswers(store, {
+          [storeArgs(store, "for-each-ref --format=%(refname) refs/stash refs/notes")]: "refs/stash\n",
+        }),
+      ),
+      modulesRoot: root,
+      checkWorktree: false,
+    })
+    expect(verdict.state).toBe("unpublished")
+    expect(verdict.state === "unpublished" && verdict.reason).toBe(`${store} holds refs/stash`)
+  })
+
+  test("a store holding a note is not eligible", async () => {
+    const root = modulesRoot()
+    const store = storeUnder(root, "dep")
+    const verdict = await nothingUnpublished({
+      git: fakeGit(
+        storeAnswers(store, {
+          [storeArgs(store, "for-each-ref --format=%(refname) refs/stash refs/notes")]: "refs/notes/commits\n",
+        }),
+      ),
+      modulesRoot: root,
+      checkWorktree: false,
+    })
+    expect(verdict.state).toBe("unpublished")
+    expect(verdict.state === "unpublished" && verdict.reason).toBe(`${store} holds refs/notes/commits`)
+  })
+
+  test("a store holding only a reflog stays eligible: a reflog is not custody", async () => {
+    const root = modulesRoot()
+    const store = storeUnder(root, "dep")
+    mkdirSync(join(store, "logs", "refs", "heads"), { recursive: true })
+    writeFileSync(
+      join(store, "logs", "refs", "heads", "main"),
+      `${"a".repeat(40)} ${"b".repeat(40)} Probe <p@example.test> 1795000000 +0000\tcommit\n`,
+    )
+    const verdict = await nothingUnpublished({
+      git: fakeGit(storeAnswers(store)),
+      modulesRoot: root,
+      checkWorktree: false,
+    })
+    expect(verdict.state).toBe("published")
+    expect(verdict.heads).toEqual([`${store}:refs/heads/main`])
+  })
+
+  test("a non-store entry under the modules root is unknown, naming it, and never skips the copy", async () => {
+    const root = modulesRoot()
+    const store = storeUnder(root, "dep")
+    writeFileSync(join(root, "stray.txt"), "work nobody recorded\n")
+    const verdict = await nothingUnpublished({
+      git: fakeGit(storeAnswers(store)),
+      modulesRoot: root,
+      checkWorktree: false,
+    })
+    expect(verdict.state).toBe("unknown")
+    expect(verdict.state === "unknown" && verdict.reason).toMatch(/stray\.txt.*not a Git store/u)
+  })
+
+  test("a copy is proved from its stores alone, with no worktree to read", async () => {
+    const root = modulesRoot()
+    const store = storeUnder(root, "vendor/dep")
+    const git = fakeGit(storeAnswers(store))
+    const verdict = await nothingUnpublished({ git, modulesRoot: root, checkWorktree: false })
+    expect(verdict.state).toBe("published")
+    expect(git.calls.some((call) => call.includes("status --porcelain"))).toBe(false)
+    expect(git.calls.some((call) => call.includes("submodule foreach"))).toBe(false)
+  })
+
+  test("an empty census proves nothing: no stores and no heads is unknown, never published", async () => {
+    const verdict = await nothingUnpublished({
+      git: fakeGit({}),
+      modulesRoot: modulesRoot(),
+      checkWorktree: false,
+    })
+    expect(verdict.state).toBe("unknown")
+    expect(verdict.state === "unknown" && verdict.reason).toMatch(/no head to prove/u)
+  })
+})
+
+/**
+ * @cto 2026-11-24T22:12Z: `confirmRemoteRefs` — the sweep's answer is judged against the copy's own refs/remotes, which
+ * is the snapshot retention wrote. A branch deleted or force-moved since still reads as published there, so before a
+ * copy may be skipped the remote must still advertise each proving ref, and that ref must still reach the head.
+ */
+describe("nothingUnpublished remote confirmation (#38246)", () => {
+  const HEAD_SHA = "a".repeat(40)
+
+  const confirming = (store: string, extra: Answers): Answers => ({
+    ...storeAnswers(store),
+    [storeArgs(store, "remote get-url origin")]: "https://example.test/hh-dev.git\n",
+    [storeArgs(store, "rev-parse refs/heads/main")]: `${HEAD_SHA}\n`,
+    ...extra,
+  })
+
+  const confirm = async (answers: Answers, store: string) =>
+    await nothingUnpublished({
+      git: fakeGit(answers),
+      modulesRoot: join(store, ".."),
+      checkWorktree: false,
+      confirmRemoteRefs: true,
+    }).then((verdict) => ({ verdict, storePath: store }))
+
+  test("a proving ref the remote still advertises at the head is published", async () => {
+    const root = modulesRoot()
+    const store = storeUnder(root, "dep")
+    const { verdict } = await confirm(
+      confirming(store, { [storeArgs(store, "ls-remote origin")]: `${HEAD_SHA}\trefs/heads/main\n` }),
+      store,
+    )
+    expect(verdict.state).toBe("published")
+    expect(verdict.state === "published" && verdict.provedBy).toEqual(["refs/remotes/origin/main"])
+  })
+
+  test("a proving ref the remote no longer advertises is unknown, never published on the snapshot", async () => {
+    const root = modulesRoot()
+    const store = storeUnder(root, "dep")
+    const { verdict } = await confirm(confirming(store, { [storeArgs(store, "ls-remote origin")]: "" }), store)
+    expect(verdict.state).toBe("unknown")
+    expect(verdict.state === "unknown" && verdict.reason).toMatch(/no longer advertises refs\/heads\/main/u)
+  })
+
+  test("a proving ref the remote has moved away from the head is unknown", async () => {
+    const root = modulesRoot()
+    const store = storeUnder(root, "dep")
+    const { verdict } = await confirm(
+      confirming(store, { [storeArgs(store, "ls-remote origin")]: `${"f".repeat(40)}\trefs/heads/main\n` }),
+      store,
+    )
+    expect(verdict.state).toBe("unknown")
+    expect(verdict.state === "unknown" && verdict.reason).toMatch(/does not reach/u)
+  })
+
+  test("a proving ref the remote moved forward past still is published", async () => {
+    const root = modulesRoot()
+    const store = storeUnder(root, "dep")
+    const { verdict } = await confirm(
+      confirming(store, {
+        [storeArgs(store, "ls-remote origin")]: `${"f".repeat(40)}\trefs/heads/main\n`,
+        [storeArgs(store, `merge-base --is-ancestor ${HEAD_SHA} ${"f".repeat(40)}`)]: "",
+      }),
+      store,
+    )
+    expect(verdict.state).toBe("published")
   })
 })
