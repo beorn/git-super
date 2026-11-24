@@ -14,7 +14,13 @@
  */
 import { createHash } from "node:crypto"
 import { existsSync, lstatSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs"
-import { lstat as lstatAsync, readdir, readFile as readFileAsync, realpath as realpathAsync, stat as statAsync } from "node:fs/promises"
+import {
+  lstat as lstatAsync,
+  readdir,
+  readFile as readFileAsync,
+  realpath as realpathAsync,
+  stat as statAsync,
+} from "node:fs/promises"
 import { cpus } from "node:os"
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { alternateEntries } from "./alternates.ts"
