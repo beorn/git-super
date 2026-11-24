@@ -20,11 +20,20 @@
  * - clean: `status --porcelain --untracked-files=all` prints nothing, so an uncommitted edit, a staged change, or an
  *   untracked file keeps the copy. The clean requirement is what makes "nothing unpublished" also mean "nothing to
  *   keep": with everything committed AND published, the environment holds no work that exists nowhere else.
+ * - custody refs: in every store the removal deletes — the module stores of a worktree (per-worktree ones included)
+ *   and, for the sweep, every store of the retained copy — `refs/stash` or any `refs/notes/*` means the store is NOT
+ *   eligible, named as "<store> holds <ref>" (#38246, @cto 2026-11-24T21:28Z). A stash and a note are commits no
+ *   branch and no remote names, so a copy-less removal would lose them. Reflogs stay OUT of this rule by decision:
+ *   work must be committed and pushed to count, and a reflog is not custody — it records where a ref has been, not
+ *   work that a remote holds.
  *
  * Unknown is never "nothing to keep". A failed fetch, absent remote-tracking refs, an unreadable submodule, or any
  * error the git calls raise all return `unknown` with the reason, and both callers retain on unknown. A predicate that
  * guessed on a broken read would delete the one copy of somebody's work.
  */
+
+import { lstatSync } from "node:fs"
+import { moduleStorePaths } from "./module-store-custody.ts"
 
 /** The slice of git this module needs: run one git command in one directory and return its stdout. */
 export interface PredicateGit {
@@ -34,7 +43,10 @@ export interface PredicateGit {
 /** What the predicate decides, and the evidence behind it, so a caller can log one honest line either way. */
 export type NothingUnpublishedVerdict =
   | {
-      /** Every head is on a remote and the worktree is clean: a retained copy would hold nothing unique. */
+      /**
+       * Every head is on a remote, the worktree is clean, and no store the removal deletes holds a stash or a note:
+       * a retained copy would hold nothing unique.
+       */
       readonly state: "published"
       readonly heads: readonly string[]
       /** The remote-tracking refs that contain the heads, named so "where did my work go" has an answer. */
@@ -55,8 +67,11 @@ export type NothingUnpublishedVerdict =
 
 export interface NothingUnpublishedInput {
   readonly git: PredicateGit
-  /** The environment (worktree) root to read. */
-  readonly path: string
+  /**
+   * The environment (worktree) root to read. Absent for a retained copy, which holds stores and no checkout; at
+   * least one of `path` and `modulesRoot` must be given, and neither default is an empty census.
+   */
+  readonly path?: string
   /**
    * Whether a clean working tree is part of the proof. True for a live environment (creation): an uncommitted edit or an
    * untracked file is work that exists nowhere else. False for a retained copy (the sweep): the copy holds stores, not a
@@ -65,10 +80,17 @@ export interface NothingUnpublishedInput {
    */
   readonly checkWorktree?: boolean
   /**
-   * Refresh remote-tracking refs. The sweep passes one that fetches the shared dev repository once for the run; the
-   * creation path passes one that fetches this environment. A rejection is `unknown`, never a clean verdict.
+   * Refresh remote-tracking refs. The creation path passes one that fetches this environment. A rejection is
+   * `unknown`, never a clean verdict. The sweep passes none: a copy's own `refs/remotes` are the snapshot the
+   * retention wrote, and a store without them answers `unknown` rather than paying one fetch per entry.
    */
   readonly refreshRemotes?: () => Promise<void>
+  /**
+   * The modules root of every Git store the removal deletes, in Git's own layout: `<git-dir>/modules` of a live
+   * worktree (Git resolves the per-worktree one, so a slot's own stores are included) and the retained copy's
+   * `modules/` for the sweep. Every store under it is read, named or not, because removal deletes it either way.
+   */
+  readonly modulesRoot?: string
 }
 
 const nonEmpty = (line: string): boolean => line.trim() !== ""
@@ -82,10 +104,13 @@ export function fetchRemotesIn(git: PredicateGit, cwd: string): () => Promise<vo
   }
 }
 
+/** One repository's own refs read, with a store's arguments already shaped by the caller. */
+type ReadRefs = (repository: string, args: readonly string[]) => Promise<string>
+
 /** One repository's own heads, including the detached HEAD when the worktree is on one. */
-async function headsOf(git: PredicateGit, cwd: string): Promise<string[]> {
-  const heads = lines(await git.text(cwd, ["for-each-ref", "--format=%(refname)", "refs/heads"]))
-  const detached = (await git.text(cwd, ["rev-parse", "--abbrev-ref", "HEAD"])).trim() === "HEAD"
+async function headsOf(read: ReadRefs, repository: string): Promise<string[]> {
+  const heads = lines(await read(repository, ["for-each-ref", "--format=%(refname)", "refs/heads"]))
+  const detached = (await read(repository, ["rev-parse", "--abbrev-ref", "HEAD"])).trim() === "HEAD"
   return detached ? [...heads, "HEAD"] : heads
 }
 
@@ -104,18 +129,61 @@ async function submodulesOf(git: PredicateGit, cwd: string): Promise<string[]> {
   return [...new Set(paths.map((path) => (path.startsWith("/") ? path : `${cwd}/${path}`)))]
 }
 
+/**
+ * Every store under one modules root, or none when the root does not exist. A root that is not a plain directory, a
+ * non-store entry inside it, or an unreadable directory throws, and the caller answers `unknown`: a walk that lost a
+ * store would let the copy holding it be skipped.
+ */
+function storesUnder(modulesRoot: string): string[] {
+  const state = lstatSync(modulesRoot, { throwIfNoEntry: false })
+  if (state === undefined) return []
+  if (!state.isDirectory() || state.isSymbolicLink()) {
+    throw new Error(`modules root ${modulesRoot} is not a plain directory`)
+  }
+  return moduleStorePaths(modulesRoot)
+}
+
 export async function nothingUnpublished(input: NothingUnpublishedInput): Promise<NothingUnpublishedVerdict> {
   const { git, path } = input
   const checkWorktree = input.checkWorktree ?? true
   const heads: string[] = []
+  const readHeads: { repository: string; head: string }[] = []
   try {
+    if (path === undefined && input.modulesRoot === undefined) {
+      throw new Error("neither an environment to read nor a modules root was given")
+    }
     if (input.refreshRemotes !== undefined) await input.refreshRemotes()
-    const repositories = [path, ...(await submodulesOf(git, path))]
+    // The worktree and its submodule checkouts answer the publication question; the module stores are read on their
+    // own as well, because a store with no checkout (a submodule never initialized) is deleted with the slot too.
+    const stores = input.modulesRoot === undefined ? [] : storesUnder(input.modulesRoot)
+    const storeSet = new Set(stores)
+    // A store is read through an explicit --git-dir and --work-tree, never `-C alone`: a copy's own config still names
+    // the removed checkout as `core.worktree`, and git chdir's there before running anything (a real retained entry
+    // failed exactly that way: "cannot chdir to .../34127-runtime-root/ag"). Naming both makes the read answer about
+    // the store on disk, whatever its config remembers.
+    const read: ReadRefs = async (repository, args) =>
+      storeSet.has(repository)
+        ? git.text(repository, [`--git-dir=${repository}`, `--work-tree=${repository}`, ...args])
+        : git.text(repository, args)
+    const repositories = [...(path === undefined ? [] : [path, ...(await submodulesOf(git, path))]), ...stores]
     for (const repository of repositories) {
-      const here = await headsOf(git, repository)
-      for (const head of here) heads.push(repository === path ? head : `${repository}:${head}`)
+      // #38246: a stash or a note is a commit no branch and no remote names. Reflogs are excluded by rule (see the
+      // module doc): work must be committed and pushed to count, and a reflog is not custody.
+      if (storeSet.has(repository)) {
+        const custodyRef = lines(
+          await read(repository, ["for-each-ref", "--format=%(refname)", "refs/stash", "refs/notes"]),
+        )[0]
+        if (custodyRef !== undefined) {
+          return { state: "unpublished", heads, reason: `${repository} holds ${custodyRef}` }
+        }
+      }
+      const here = await headsOf(read, repository)
+      for (const head of here) {
+        heads.push(repository === path ? head : `${repository}:${head}`)
+        readHeads.push({ repository, head })
+      }
       // A stale or absent refs/remotes cannot witness anything; absent is unknown, never "nothing to keep".
-      if (lines(await git.text(repository, ["for-each-ref", "--format=%(refname)", "refs/remotes"])).length === 0) {
+      if (lines(await read(repository, ["for-each-ref", "--format=%(refname)", "refs/remotes"])).length === 0) {
         return {
           state: "unknown",
           heads,
@@ -123,7 +191,7 @@ export async function nothingUnpublished(input: NothingUnpublishedInput): Promis
         }
       }
       if (checkWorktree) {
-        const dirty = lines(await git.text(repository, ["status", "--porcelain", "--untracked-files=all"]))
+        const dirty = lines(await read(repository, ["status", "--porcelain", "--untracked-files=all"]))
         if (dirty.length > 0) {
           return {
             state: "unpublished",
@@ -133,7 +201,7 @@ export async function nothingUnpublished(input: NothingUnpublishedInput): Promis
         }
       }
       if (here.length > 0) {
-        const unpublished = lines(await git.text(repository, ["rev-list", ...here, "--not", "--remotes"]))
+        const unpublished = lines(await read(repository, ["rev-list", ...here, "--not", "--remotes"]))
         if (unpublished.length > 0) {
           return {
             state: "unpublished",
@@ -143,24 +211,36 @@ export async function nothingUnpublished(input: NothingUnpublishedInput): Promis
         }
       }
     }
-    return { state: "published", heads, provedBy: await provedBy(git, path) }
+    // An empty census proves nothing, so it is never a clean verdict: no head anywhere means there is no question to
+    // answer here, and both callers keep the copy.
+    if (heads.length === 0) {
+      return {
+        state: "unknown",
+        heads,
+        reason: `${path ?? input.modulesRoot ?? "the input"} holds no head to prove`,
+      }
+    }
+    return { state: "published", heads, provedBy: await provedBy(read, readHeads) }
   } catch (error) {
     return { state: "unknown", heads, reason: error instanceof Error ? error.message : String(error) }
   }
 }
 
 /**
- * The remote-tracking refs that contain the worktree's heads, for the one line each skip or retirement logs. Symbolic
+ * The remote-tracking refs that contain each head read, for the one line each skip or retirement logs. Symbolic
  * aliases (`origin/HEAD` -> `origin/main`) are skipped: a receipt that says "proved by origin/HEAD" names a pointer,
  * not the ref that actually holds the work.
  */
-async function provedBy(git: PredicateGit, path: string): Promise<string[]> {
+async function provedBy(
+  read: ReadRefs,
+  readHeads: readonly Readonly<{ repository: string; head: string }>[],
+): Promise<string[]> {
   const proved = new Set<string>()
-  for (const head of await headsOf(git, path)) {
+  for (const { repository, head } of readHeads) {
     const refs = lines(
       // `--exclude` drops the symbolic `origin/HEAD` alias: naming it in a receipt names a pointer, not the ref that
       // actually holds the work.
-      await git.text(path, [
+      await read(repository, [
         "for-each-ref",
         "--contains",
         head,
@@ -175,10 +255,11 @@ async function provedBy(git: PredicateGit, path: string): Promise<string[]> {
 }
 
 /** One line for a skip (creation) or a cheap-pass retirement (sweep); the same words answer "where did my work go". */
-export function describeVerdict(env: string, verdict: NothingUnpublishedVerdict): string {
+export function describeVerdict(env: string, verdict: NothingUnpublishedVerdict, checkWorktree = true): string {
   const heads = verdict.heads.length === 0 ? "no heads" : verdict.heads.join(", ")
   if (verdict.state === "published") {
-    return `nothing-unpublished: ${env} heads ${heads} are on ${verdict.provedBy.join(", ") || "remote refs"} and the worktree is clean`
+    const clean = checkWorktree ? " and the worktree is clean" : ""
+    return `nothing-unpublished: ${env} heads ${heads} are on ${verdict.provedBy.join(", ") || "remote refs"}${clean}, and no store it deletes holds a stash or a note`
   }
   return `nothing-unpublished: ${env} ${verdict.state} (${verdict.reason}); heads ${heads}`
 }

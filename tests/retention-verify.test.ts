@@ -50,6 +50,7 @@ import { readLines, SidecarWriter } from "../src/retention-stream.ts"
 import {
   DEFAULT_NON_OBJECT_METADATA_BOUNDS,
   GATE_ORDER,
+  inspectRetainedEntryInBatch,
   type RetentionVerifyResult,
   retentionRemovalBoundary,
   verifyRetainedEntry,
@@ -2193,4 +2194,69 @@ describe("native retirement alongside supported materialization", async () => {
       rmSync(artifactDir, { recursive: true, force: true })
     }
   }, 90_000)
+})
+
+// #38246 (@cto 2026-11-24T21:28Z): the sweep's cheap gate. A copy the nothing-unpublished predicate proves holds
+// nothing unique is retired without paying for the content and custody gates; a copy that holds a stash falls through
+// to the full gate set exactly as before. A retirement batch is the only context that asks it.
+describe("retention verify cheap gate (#38246)", () => {
+  /** A published copy: every head on a remote-tracking ref. The fixture has no remote, so the seam answers as one. */
+  const published: typeof defaultGitRun = (args, options) => {
+    const result = defaultGitRun(args, options)
+    if (result.code !== 0) return result
+    if (args.includes("for-each-ref") && args.at(-1) === "refs/remotes") {
+      return { ...result, stdout: "refs/remotes/origin/main\n" }
+    }
+    if (args.includes("rev-list") && args.includes("--not") && args.includes("--remotes")) {
+      return { ...result, stdout: "" }
+    }
+    return result
+  }
+
+  const batch = async (run: typeof defaultGitRun): Promise<RetentionVerifyResult> => {
+    const estate = await scanEstate([fixtureRoot as string], [base.entry], undefined, Date.now)
+    return await inspectRetainedEntryInBatch(
+      {
+        entry: base.entry,
+        root: base.root,
+        namespaceRoots: [fixtureRoot as string],
+        artifactDir: base.artifactDir,
+        allowTemporaryArtifactDir: true,
+        clock: eligible(),
+        gitRun: run,
+      },
+      estate,
+      [base.entry],
+    )
+  }
+
+  it("retires a provably redundant copy without the content or custody gates", async () => {
+    const proof = await batch(published)
+    expect(proof.verdict).toBe("candidate")
+    expect(proof.cheapGate).toMatchObject({ state: "published" })
+    expect(proof.cheapGate?.ms).toBeGreaterThanOrEqual(0)
+    expect(proof.certificate).toBeUndefined()
+    const skipped = proof.gates.filter((gate) => gate.gate !== "identity-eligibility")
+    expect(skipped).toHaveLength(GATE_ORDER.length - 1)
+    for (const gate of skipped) {
+      expect(gate.status).toBe("unknown")
+      expect(gate.message).toContain("not evaluated")
+    }
+    expect(proof.reasons).toHaveLength(1)
+    expect(proof.reasons[0]).toContain("gates 2-6 skipped")
+  })
+
+  it("falls through to the full gates when a store holds a stash", async () => {
+    const run: typeof defaultGitRun = (args, options) => {
+      const result = published(args, options)
+      if (result.code === 0 && args.includes("refs/stash")) return { ...result, stdout: "refs/stash\n" }
+      return result
+    }
+    const proof = await batch(run)
+    expect(proof.cheapGate?.state).toBe("unpublished")
+    expect(proof.cheapGate?.reason).toMatch(/holds refs\/stash/u)
+    // The full gate set still ran and still decided: the copy is proved, not skipped on a guess.
+    expect(proof.gates.find((gate) => gate.gate === "positive-custody")?.status).toBe("pass")
+    expect(proof.certificate).toBeDefined()
+  })
 })

@@ -77,6 +77,20 @@ function keepReason(proof: RetentionVerifyResult): KeepReason {
 
 /** Compare actual, hash-checked proof contents, not hashes derived from differing pass clocks. */
 export function proofFacts(proof: RetentionVerifyResult): { facts: string; path: string } {
+  // #38246: a cheap candidate has no certificate by design — the nothing-unpublished predicate is its evidence, and
+  // the copy holds nothing unique. Its stable facts are the answer itself, so a held pass that answers differently
+  // (a head moved, a stash appeared, a store became unreadable) shifts the facts exactly as a certificate difference
+  // would, and the entry is kept.
+  if (proof.cheapGate !== undefined && proof.verdict === "candidate") {
+    return {
+      facts: JSON.stringify({
+        cheapGate: proof.cheapGate.state,
+        heads: [...proof.cheapGate.heads].sort(),
+        provedBy: [...proof.cheapGate.provedBy].sort(),
+      }),
+      path: proof.entry,
+    }
+  }
   if (proof.certificate === undefined || proof.artifactDir === undefined) {
     throw new Error(`candidate ${proof.entry} has no certificate or artifact directory`)
   }

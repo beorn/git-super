@@ -600,3 +600,19 @@ export function describeModuleStores(stores: readonly ModuleStore[]): string[] {
     return `module store ${store.name} at ${store.gitDir} holds ${String(store.valueCommits)} commit(s) outside compared refs (${compared})${head}`
   })
 }
+
+/**
+ * Every Git store under one modules root, in Git's own layout, whether or not a checkout names it: a store left by
+ * a slot whose submodule was never initialized is still deleted with the slot. Namespace directories between the
+ * root and a store are transparent, and the walk never descends into a store (nested stores live at
+ * `<store>/modules/` and ride with it). A non-store file, or a directory that cannot be read, throws: the caller
+ * must answer `unknown`, never "no stores" (#38246, @cto 2026-11-24T21:28Z).
+ */
+export function moduleStorePaths(modulesRoot: string): string[] {
+  const stores: string[] = []
+  for (const entry of moduleEntries(modulesRoot)) {
+    if (!entry.store) throw new Error(`module entry ${entry.path} under ${modulesRoot} is not a Git store`)
+    stores.push(entry.path)
+  }
+  return stores
+}

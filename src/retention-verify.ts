@@ -54,6 +54,12 @@ import {
   type StoreCustody,
 } from "./worktree-removal.ts"
 import { retentionDiscardDigest, retentionDiscardMismatch, type RetentionDiscard } from "./retention-discard.ts"
+import {
+  describeVerdict,
+  nothingUnpublished,
+  type NothingUnpublishedVerdict,
+  type PredicateGit,
+} from "./nothing-unpublished.ts"
 
 /** The emitting tool's own name and version, read loudly (an unreadable package.json is fatal). */
 const RETENTION_PACKAGE = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
@@ -159,6 +165,21 @@ export type RetentionVerifyResult = Readonly<{
    */
   vanishedAtRead?: readonly string[] | undefined
   explicitLoss?: RetentionExplicitLoss | undefined
+  /**
+   * #38246 (@cto 2026-11-24T21:28Z): the cheap gate's answer for this entry, present whenever a retirement batch
+   * asked it. `published` means every head is on a remote-tracking ref and no store the entry holds has a stash or a
+   * note, so the content and custody gates were not paid for; `unpublished` and `unknown` fall through to the full
+   * gates exactly as before. `ms` is this entry's own cost, which is what the batch's budget is spent on.
+   */
+  cheapGate?:
+    | Readonly<{
+        state: NothingUnpublishedVerdict["state"]
+        reason: string
+        heads: readonly string[]
+        provedBy: readonly string[]
+        ms: number
+      }>
+    | undefined
   certificate?:
     | Readonly<{ path: string; digest: string; commonArtifactDir: string; warnings?: readonly string[] }>
     | undefined
@@ -264,6 +285,12 @@ export type RetentionVerifyOptions = Readonly<{
   readonly entryTimings?: (
     event: Readonly<{ kind: "enter" | "end" | "spend"; phase: string; ms: number; claimsPhase?: boolean }>,
   ) => void
+  /**
+   * #38246 (@cto 2026-11-24T21:28Z): a retirement batch asks the cheap gate first; `true` demands the full gates 2-6
+   * even when that gate answers `published`. For a caller or a case that proves the full path itself — the production
+   * CLI never sets it.
+   */
+  fullProof?: boolean
   /**
    * 34787: an explicit discard of exactly the loss gate 5 finds. It never passes gate 5; a match makes the verdict
    * `discard-candidate` and the loss is reported as `explicitLoss`. A mismatch keeps the entry and names the field.
@@ -528,6 +555,49 @@ async function redundancyCensus(
   }
 }
 
+/** A `GitRun` as the predicate's one-call-per-directory reader: a non-zero exit is an error, never an empty answer. */
+function predicateGit(run: GitRun): PredicateGit {
+  return {
+    text: async (cwd, args) => {
+      const result = await run(["-C", cwd, ...args], { timeoutMs: PREDICATE_GIT_TIMEOUT_MS })
+      if (result.code !== 0) {
+        throw new Error(
+          `git ${args.join(" ")} in ${cwd} exited ${String(result.code)}: ${result.stderr.trim() || "no stderr"}`,
+        )
+      }
+      return result.stdout
+    },
+  }
+}
+
+/** A hung cheap read would cost the batch its whole budget, so each call carries this bound and answers `unknown`. */
+const PREDICATE_GIT_TIMEOUT_MS = 60_000
+
+/**
+ * The wrapper directory holds exactly its manifest, the audits that matched it and its copied modules; anything else
+ * is a file removal would delete with no record of it. One implementation, used by gate 2 and by the cheap gate.
+ */
+function wrapperTopLevelRefusal(
+  entryReal: string,
+  proof: RetainedManifest,
+  audits: ReturnType<typeof readRetentionAudits>,
+): RetentionGateResult | undefined {
+  const expectedTop = [
+    ...(proof.retained === null ? ["manifest.json"] : ["manifest.json", "modules"]),
+    ...audits.map((audit) => basename(audit.binding.path)),
+  ].sort()
+  const actualTop = readdirSync(entryReal).sort()
+  if (JSON.stringify(actualTop) === JSON.stringify(expectedTop)) return undefined
+  return refusal(
+    "copy-manifest",
+    `wrapper ${entryReal} holds [${actualTop.join(", ")}]; expected [${expectedTop.join(", ")}]`,
+    {
+      path: entryReal,
+      remedy: "Remove unexplained wrapper files, or preserve the entry and investigate.",
+    },
+  )
+}
+
 async function evaluateRetainedEntry(
   options: RetentionVerifyOptions,
   context?: EvaluationContext,
@@ -575,6 +645,7 @@ async function evaluateRetainedEntry(
     custody?: RetentionVerifyResult["custody"]
     vanishedAtRead?: RetentionVerifyResult["vanishedAtRead"]
     explicitLoss?: RetentionExplicitLoss | undefined
+    cheapGate?: RetentionVerifyResult["cheapGate"]
     certificate?:
       | Readonly<{ path: string; digest: string; commonArtifactDir: string; warnings?: readonly string[] }>
       | undefined
@@ -589,6 +660,10 @@ async function evaluateRetainedEntry(
   // refs that moved again; a standalone verify is its own phase and gets the same treatment.
   const refObservations: RefObservations =
     options.custodyRunScope?.refObservations ?? new Map<string, readonly RefObservationRow[]>()
+
+  // #38246: set only by the cheap gate, which proves a batch entry needs no copy without paying for the content
+  // gates. It never relaxes a gate that ran; it is how the pass says the gates it skipped were not needed.
+  let cheapPass = false
 
   const push = (gate: RetentionGateResult): void => {
     gates.push(gate)
@@ -616,9 +691,11 @@ async function evaluateRetainedEntry(
       ? "discard-candidate"
       : ordered.some((gate) => gate.status === "blocked")
         ? "blocked"
-        : ordered.some((gate) => gate.status === "unknown")
-          ? "unknown"
-          : "candidate"
+        : cheapPass
+          ? "candidate"
+          : ordered.some((gate) => gate.status === "unknown")
+            ? "unknown"
+            : "candidate"
     return {
       schema: RETENTION_CERTIFICATE_SCHEMA,
       verdict,
@@ -758,6 +835,44 @@ async function evaluateRetainedEntry(
     path: manifestPath,
   })
 
+  // ---- #38246: the cheap gate, retirement batches only ----------------------------------
+  // #38198 measured the sweep spending its whole proof budget (960 s) on about seven entries while roughly 230 copies a
+  // day were created; #38246 is the other side of that trade. Before the byte-evidence and custody gates, ask the same
+  // predicate the creation path asks: is every head in this copy already on a remote-tracking ref, and does no store it
+  // holds have a stash or a note? A positive answer means the copy holds nothing unique, so those gates buy nothing and
+  // are not paid for. `unpublished` and `unknown` fall through to the full gates exactly as before, which keeps the
+  // byte-evidence path for every store the predicate cannot read. One answer, one implementation: the rule itself lives
+  // in nothing-unpublished.ts with its tests, not here.
+  if (context !== undefined && !context.audit && !legacy && options.fullProof !== true && proof.retained !== null) {
+    const cheapStarted = monotonic()
+    const verdict = await nothingUnpublished({
+      git: predicateGit(options.gitRun ?? defaultGitRun),
+      modulesRoot: proof.retained,
+      checkWorktree: false,
+    })
+    result.cheapGate = {
+      state: verdict.state,
+      reason: verdict.state === "published" ? describeVerdict(entryReal, verdict, false) : verdict.reason,
+      heads: verdict.heads,
+      provedBy: verdict.state === "published" ? verdict.provedBy : [],
+      ms: Math.round(monotonic() - cheapStarted),
+    }
+    if (verdict.state === "published") {
+      // The wrapper's own top level is nearly free to read and is the one thing the predicate never looks at: a file
+      // beside the manifest would be deleted with no record of it. Gate 2 owns that check, so it keeps it here too.
+      const wrongTopLevel = wrapperTopLevelRefusal(entryReal, proof, audits)
+      if (wrongTopLevel !== undefined) {
+        push(wrongTopLevel)
+        return finish()
+      }
+      cheapPass = true
+      const cheapReason = result.cheapGate?.reason ?? "the cheap gate passed"
+      for (const gate of GATE_ORDER.slice(1)) gates.push(incomplete(gate, `not evaluated: ${cheapReason}`))
+      reasons.push(`gates 2-6 skipped: ${cheapReason}`)
+      return finish()
+    }
+  }
+
   if (legacy) {
     const estate =
       context?.estate ?? (await scanEstate(declaredNamespaceRoots, [entryReal], options.bounds?.estate, monotonic))
@@ -786,22 +901,9 @@ async function evaluateRetainedEntry(
   let metadataBundleDigest: string | undefined
   let sidecarDir: string | undefined
   try {
-    const expectedTop = [
-      ...(proof.retained === null ? ["manifest.json"] : ["manifest.json", "modules"]),
-      ...audits.map((audit) => basename(audit.binding.path)),
-    ].sort()
-    const actualTop = readdirSync(entryReal).sort()
-    if (JSON.stringify(actualTop) !== JSON.stringify(expectedTop)) {
-      push(
-        refusal(
-          "copy-manifest",
-          `wrapper ${entryReal} holds [${actualTop.join(", ")}]; expected [${expectedTop.join(", ")}]`,
-          {
-            path: entryReal,
-            remedy: "Remove unexplained wrapper files, or preserve the entry and investigate.",
-          },
-        ),
-      )
+    const wrongTopLevel = wrapperTopLevelRefusal(entryReal, proof, audits)
+    if (wrongTopLevel !== undefined) {
+      push(wrongTopLevel)
       return finish()
     }
     if (proof.retained === null) {

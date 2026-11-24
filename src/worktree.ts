@@ -1771,10 +1771,16 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       // network time never blocks other root writers; every verdict is logged so a skipped copy is never silent.
       let retentionVerdict: NothingUnpublishedVerdict | undefined
       if (removeOptions.retention !== undefined) {
+        // #38246: the module stores are read too, because removal deletes them with the slot whether or not a
+        // submodule checkout names them. Git resolves the per-worktree modules root, so a slot's own stores count.
+        const modulesRoot = (
+          await git.text(path, ["rev-parse", "--path-format=absolute", "--git-path", "modules"])
+        ).trim()
         retentionVerdict = await nothingUnpublished({
           git,
           path,
           checkWorktree: true,
+          ...(modulesRoot === "" ? {} : { modulesRoot }),
           refreshRemotes: fetchRemotesIn(git, path),
         })
       }
