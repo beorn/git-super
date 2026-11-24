@@ -60,16 +60,15 @@ export type PrivateStoreRefusal = Readonly<{ name: string; path: string; head: s
  * anything else still stops the round. Same message, same named stores — only the type is new (@cto C4).
  */
 export class PrivateStoreRefusalError extends Error {
-  constructor(
-    message: string,
-    /**
-     * The refused stores, structured. A caller that must NAME the route (yrd's env close, 27120) reads the
-     * guard's own answer from here rather than re-deriving `modules/<name>` or parsing this message.
-     */
-    readonly refusals: readonly PrivateStoreRefusal[] = [],
-  ) {
+  /**
+   * The refused stores, structured. A caller that must NAME the route (yrd's env close, 27120) reads the
+   * guard's own answer from here rather than re-deriving `modules/<name>` or parsing this message.
+   */
+  readonly refusals: readonly PrivateStoreRefusal[]
+  constructor(message: string, refusals: readonly PrivateStoreRefusal[] = []) {
     super(message)
     this.name = "PrivateStoreRefusalError"
+    this.refusals = refusals
   }
 }
 

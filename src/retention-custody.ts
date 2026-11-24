@@ -296,13 +296,14 @@ export class CustodyIndexScope {
  * remembered too: it is the same store and the same bytes, and re-running it per entry only spends the budget.
  */
 export class CustodyRunScope {
-  constructor(
-    /**
-     * 37854: where this run keeps its content-addressed ref fragments. A batch passes one directory so entry 2 reuses
-     * the walk entry 1 already paid for instead of re-walking every durable ref of every witness store.
-     */
-    readonly fragmentDir?: string,
-  ) {}
+  /**
+   * 37854: where this run keeps its content-addressed ref fragments. A batch passes one directory so entry 2 reuses
+   * the walk entry 1 already paid for instead of re-walking every durable ref of every witness store.
+   */
+  readonly fragmentDir: string | undefined
+  constructor(fragmentDir?: string) {
+    this.fragmentDir = fragmentDir
+  }
   readonly identities = new Map<
     string,
     Readonly<{ status: "known"; id: string } | { status: "unknown"; detail: string }>
@@ -394,12 +395,11 @@ async function asProofDeadline<T>(work: Promise<T>): Promise<T> {
 
 /** 34127 (@cto 536e2c15): a store the inventory recorded, gone or no longer a repository when custody read it. */
 class VanishedStoreError extends UnknownError {
-  constructor(
-    readonly gitDir: string,
-    message: string,
-  ) {
+  readonly gitDir: string
+  constructor(gitDir: string, message: string) {
     super(message)
     this.name = "VanishedStoreError"
+    this.gitDir = gitDir
   }
 }
 

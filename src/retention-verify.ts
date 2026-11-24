@@ -333,11 +333,10 @@ function isStringArray(value: unknown): value is readonly string[] {
  * condition (`blocked`). The distinction is reader-facing only; both preserve the entry.
  */
 class ManifestShapeError extends Error {
-  constructor(
-    message: string,
-    readonly kind: "absent" | "invalid",
-  ) {
+  readonly kind: "absent" | "invalid"
+  constructor(message: string, kind: "absent" | "invalid") {
     super(message)
+    this.kind = kind
   }
 }
 

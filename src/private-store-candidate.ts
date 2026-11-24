@@ -89,12 +89,12 @@ export type PrivateStoreCandidateResult = Readonly<{
 }>
 
 class PrivateStoreFailure extends Error {
-  constructor(
-    readonly verdict: "unproven" | "invalid",
-    readonly code: string,
-    message: string,
-  ) {
+  readonly verdict: "unproven" | "invalid"
+  readonly code: string
+  constructor(verdict: "unproven" | "invalid", code: string, message: string) {
     super(message)
+    this.verdict = verdict
+    this.code = code
   }
 }
 

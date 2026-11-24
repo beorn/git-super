@@ -30,11 +30,10 @@ const OID = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/u
 const READ_TIMEOUT_MS = 30_000
 
 class ObservationFailure extends Error {
-  constructor(
-    readonly outcome: "unavailable-transport" | "invalid",
-    message: string,
-  ) {
+  readonly outcome: "unavailable-transport" | "invalid"
+  constructor(outcome: "unavailable-transport" | "invalid", message: string) {
     super(message)
+    this.outcome = outcome
   }
 }
 

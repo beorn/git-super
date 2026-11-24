@@ -8,6 +8,7 @@
     "jsx": "react-jsx",
     "skipLibCheck": true,
     "strict": true,
+    "erasableSyntaxOnly": true,
     "noUncheckedIndexedAccess": true,
     "exactOptionalPropertyTypes": true,
     "types": ["bun"]
