@@ -1,6 +1,13 @@
 /**
+ * @failure An environment whose only copy of some work is its retained store reads as "nothing unpublished", so the
+ *          removal skips the copy and the work is destroyed. The predicate's answer must never be a guess: a broken or
+ *          absent read is `unknown`, and both callers retain on unknown.
+ * @level l1 - a fake git, so the predicate's own decisions are under test, not git itself
+ * @consumer every `worktree remove --retain` and every retention-batch entry that asks whether a copy is needed
+ * @testonly none
+ *
  * #38198 (@cto 2026-11-24T18:14Z): the four cases the ruling names, plus the unknown paths that must never read as
- * "nothing to keep". Every case is a fake git, so the predicate's own decisions are what is under test — not git.
+ * "nothing to keep".
  */
 import { describe, expect, test } from "vitest"
 import {
