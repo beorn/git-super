@@ -27,7 +27,7 @@ import { fileURLToPath } from "node:url"
 import { afterEach, describe, expect, it, type TestContext } from "vitest"
 import { runCli } from "../src/cli.ts"
 import { acquireExclusive } from "../src/exclusive.ts"
-import { acquireRemovalWriterLeases } from "../src/worktree-removal.ts"
+import { acquireRemovalWriterLeases, retainedManifestOf } from "../src/worktree-removal.ts"
 import { createLocalGitWorktreeStore } from "../src/worktree.ts"
 import { tryAcquireFlock } from "@bearly/flock"
 
@@ -843,7 +843,7 @@ describe("git super worktree add", () => {
       const store = join(result.proof.retained, "vendor/dep")
       if (invalidGraph !== undefined) expect(existsSync(join(store, "objects/info/commit-graph"))).toBe(false)
       expect(readFileSync(join(store, "logs/HEAD"), "utf8")).toBe(beforeLog)
-      expect(readFileSync(result.proof.manifest, "utf8")).toContain("vendor/dep/packed-refs")
+      expect(readFileSync(retainedManifestOf(result.proof), "utf8")).toContain("vendor/dep/packed-refs")
       // The self-linked donor was removed together with the source modules tree.
       const removableObjects = donorKind === "self-link" ? undefined : donorObjects
       const disconnected = removableObjects === undefined ? undefined : `${removableObjects}.disconnected`

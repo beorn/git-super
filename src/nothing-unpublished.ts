@@ -143,12 +143,25 @@ export async function nothingUnpublished(input: NothingUnpublishedInput): Promis
   }
 }
 
-/** The remote-tracking refs that contain the worktree's heads, for the one line each skip or retirement logs. */
+/**
+ * The remote-tracking refs that contain the worktree's heads, for the one line each skip or retirement logs. Symbolic
+ * aliases (`origin/HEAD` -> `origin/main`) are skipped: a receipt that says "proved by origin/HEAD" names a pointer,
+ * not the ref that actually holds the work.
+ */
 async function provedBy(git: PredicateGit, path: string): Promise<string[]> {
   const proved = new Set<string>()
   for (const head of await headsOf(git, path)) {
     const refs = lines(
-      await git.text(path, ["for-each-ref", "--contains", head, "--format=%(refname)", "refs/remotes"]),
+      // `--exclude` drops the symbolic `origin/HEAD` alias: naming it in a receipt names a pointer, not the ref that
+      // actually holds the work.
+      await git.text(path, [
+        "for-each-ref",
+        "--contains",
+        head,
+        "--exclude=refs/remotes/*/HEAD",
+        "--format=%(refname)",
+        "refs/remotes",
+      ]),
     )
     if (refs.length > 0) proved.add(refs[0] as string)
   }

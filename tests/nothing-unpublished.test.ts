@@ -38,7 +38,7 @@ const base: Answers = {
   [`${ENV} :: for-each-ref --format=%(refname) refs/remotes`]: "refs/remotes/origin/main\n",
   [`${ENV} :: status --porcelain --untracked-files=all`]: "",
   [`${ENV} :: rev-list refs/heads/task/x --not --remotes`]: "",
-  [`${ENV} :: for-each-ref --contains refs/heads/task/x --format=%(refname) refs/remotes`]:
+  [`${ENV} :: for-each-ref --contains refs/heads/task/x --exclude=refs/remotes/*/HEAD --format=%(refname) refs/remotes`]:
     "refs/remotes/origin/task/x\n",
 }
 

@@ -29,6 +29,7 @@ import {
   prepareWorktreeModulesRetention,
   rehomeBorrowers,
   checkRemovalExecution,
+  notRetainedRemovalProof,
   retainedCopyOf,
   deleteStagedTree,
   type ComponentCustodyProof,
@@ -37,6 +38,12 @@ import {
 } from "./worktree-removal.ts"
 export { inspectRemovalStatus } from "./worktree-removal.ts"
 import { compactRetainedModules, type CompactionResult } from "./retention-compact.ts"
+import {
+  describeVerdict,
+  fetchRemotesIn,
+  nothingUnpublished,
+  type NothingUnpublishedVerdict,
+} from "./nothing-unpublished.ts"
 import { cleanGitEnvironment, cleanGitRepositoryEnvironment, probeRepository } from "./git.ts"
 import { createLocalGitProcess, type GitProcess, type GitProcessResult } from "./process.ts"
 import {
@@ -1757,6 +1764,27 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       if (removeOptions.componentCustody !== undefined && removeOptions.retention === undefined) {
         throw new Error("component custody requires the existing retention proof on worktree removal")
       }
+      // #38198: before writing the retained copy, ask whether it would hold anything that exists nowhere else. Only a
+      // positive `published` answer skips the copy; `unpublished` and every broken read (`unknown`: a failed fetch, no
+      // remote-tracking refs, an unreadable submodule) retain exactly as before, because a predicate that guessed on a
+      // failed read would delete the one copy of somebody's work. The fetch runs here, before the root writer lease, so
+      // network time never blocks other root writers; every verdict is logged so a skipped copy is never silent.
+      let retentionVerdict: NothingUnpublishedVerdict | undefined
+      if (removeOptions.retention !== undefined) {
+        retentionVerdict = await nothingUnpublished({
+          git,
+          path,
+          checkWorktree: true,
+          refreshRemotes: fetchRemotesIn(git, path),
+        })
+      }
+      let retentionSkip =
+        retentionVerdict?.state === "published"
+          ? {
+              reason: `every head is on ${retentionVerdict.provedBy.join(", ") || "a remote ref"} and the worktree is clean`,
+              provedBy: retentionVerdict.provedBy,
+            }
+          : undefined
       // The selected checkout can be the removal target. Its registry outlives it.
       const removalRepo = await git.text(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"])
       const admitCaller = async () => {
@@ -1811,10 +1839,13 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
           throw new Error(`retained worktree removal cannot unlock ${path}; resolve its holder first`)
         }
         const prepareStarted = Date.now()
-        const { gitDir, rehome, notCompared, stores } = await prepareRemoval(
+        // A skipped retained copy destroys the module stores with the slot, so it needs the same inventory and
+        // ref-recoverability proof a plain removal gets.
+        let retentionCopy = removeOptions.retention !== undefined && retentionSkip === undefined
+        let { gitDir, rehome, notCompared, stores } = await prepareRemoval(
           path,
           removeOptions.excludedSubmodules,
-          removeOptions.retention !== undefined,
+          retentionCopy,
         )
         if (notCompared.some((entry) => entry.reason !== "excluded")) {
           throw Object.assign(
@@ -1831,11 +1862,31 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         markPhase("prepareRemoval", prepareStarted)
         // #37970: a slot's module stores die with it, so every ref they keep is proven recoverable first. A caller
         // that already owns the decision — component custody, or retention keeping a copy — is not second-guessed.
-        if (removeOptions.componentCustody === undefined && removeOptions.retention === undefined) {
+        let moduleRefsChecked = false
+        if (removeOptions.componentCustody === undefined && !retentionCopy) {
           const recoverableStarted = Date.now()
-          assertModuleRefsRecoverable(path, gitDir)
+          try {
+            assertModuleRefsRecoverable(path, gitDir)
+            moduleRefsChecked = true
+          } catch (error) {
+            if (retentionSkip === undefined) throw error
+            // #38198: every HEAD is published and the worktree is clean, but a module store still keeps refs that die
+            // with the slot. The copy is the only thing that keeps them, so the predicate cannot skip it: retain, and
+            // say why the cheaper path was refused rather than silently destroying the refs.
+            options.report?.(
+              `${path}: retained copy kept — ${error instanceof Error ? error.message : String(error)}\n`,
+            )
+            retentionSkip = undefined
+            retentionCopy = true
+            // Retention copies every store, so the value-preservation pass a plain removal runs must not also run.
+            stores = []
+            retentionCopy = true
+          }
           markPhase("moduleStoreRecoverability", recoverableStarted)
         }
+        // The copy this removal will actually write, or undefined when none is needed: the sites below pass this
+        // binding, so "retention was requested" and "a copy will be written" can never drift apart again.
+        const retention = removeOptions.retention !== undefined && retentionCopy ? removeOptions.retention : undefined
         // #37579: decide every nested component checkout before anything is destroyed.
         const nestedStarted = Date.now()
         const nested = await nestedComponentCheckouts(path, gitDir)
@@ -2145,7 +2196,10 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
                     }
                   }
                 }
-                if (custodyRefusal === undefined && removeOptions.retention !== undefined) {
+                if (custodyRefusal === undefined && retention !== undefined) {
+                  if (retentionVerdict?.state === "unknown") {
+                    options.report?.(`${path}: ${describeVerdict(path, retentionVerdict)}\n`)
+                  }
                   mutationLease = await acquireMutationLock(mutationDirectory, holder)
                   heldFrom = Date.now()
                   const preparationStarted = Date.now()
@@ -2153,7 +2207,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
                     git,
                     repo,
                     path,
-                    removeOptions.retention,
+                    retention,
                     (repository, target) => inspectWorktree(git, repository, target),
                     writerLeases.proof,
                     writerLeases.created,
@@ -2324,7 +2378,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
             }
             if (custodyRefusal !== undefined) return
           }
-          if (removeOptions.retention !== undefined && preparedRetention === undefined) {
+          if (retention !== undefined && preparedRetention === undefined) {
             // An already-borrowed lender must refuse before creating any retained directory.
             // Check again below after preparation, since other root writers may add borrowers meanwhile.
             if (removeOptions.noRehome === true) {
@@ -2334,13 +2388,18 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
                 return
               }
             }
+            // Fail-safe: a broken read (a failed fetch, no remote-tracking refs) retains, and says so. Logged only
+            // once the removal is really going to write the copy, so a refusal before this line stays silent.
+            if (retentionVerdict?.state === "unknown") {
+              options.report?.(`${path}: ${describeVerdict(path, retentionVerdict)}\n`)
+            }
             // Donor-dependent copying/normalization stays under the root writer.
             const preparationStarted = Date.now()
             preparedRetention = await prepareWorktreeModulesRetention(
               git,
               repo,
               path,
-              removeOptions.retention,
+              retention,
               (repository, target) => inspectWorktree(git, repository, target),
               writerLeases.proof,
               writerLeases.created,
@@ -2381,7 +2440,31 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
             phases.retainedCopy = Date.now() - retainedCopyStarted
           } else {
             if (removeOptions.unlock === true) await unlockWorktree(git, repo, path)
-            if (removeOptions.noRehome !== true) await rehome.run()
+            const rehomed = removeOptions.noRehome !== true ? await rehome.run() : []
+            // #38198: the caller asked for `--retain` and the predicate proved no copy is needed. The proof still
+            // reaches the caller with `retention: { kind: "not-retained" }`, so the absence of a copy is a recorded
+            // fact with its evidence rather than a missing manifest.
+            if (retentionSkip !== undefined && removeOptions.retention !== undefined) {
+              if (retentionVerdict !== undefined) {
+                options.report?.(`${path}: ${describeVerdict(path, retentionVerdict)}\n`)
+              }
+              removalProof = notRetainedRemovalProof({
+                path,
+                head: await git.commit(path, "HEAD"),
+                modules: join(gitDir, "modules"),
+                rehomedBorrowers: rehomed,
+                writerLocks: writerLeases.proof,
+                createdWriterLocks: writerLeases.created,
+                notCompared,
+                reason: retentionSkip.reason,
+                provedBy: retentionSkip.provedBy,
+                ...(componentCustodyProof === undefined ? {} : { componentCustody: componentCustodyProof }),
+                ...(removeOptions.retention.attribution === undefined
+                  ? {}
+                  : { attribution: removeOptions.retention.attribution }),
+              })
+              await Promise.resolve(removeOptions.retention.report(removalProof))
+            }
           }
           children = await captureLinkedChildren(resolvedPath, gitDir, removeOptions.excludedSubmodules ?? [])
           await admitCaller()

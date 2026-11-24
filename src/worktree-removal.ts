@@ -215,6 +215,45 @@ export function retainedCopyOf(proof: WorktreeRemovalProof): WorktreeRemovalProo
 }
 
 /**
+ * The proof for a `--retain` the nothing-unpublished predicate proved unnecessary (#38198). No copy exists, so there is
+ * no manifest and no retention window: the reason and the remote refs behind it ARE the record, and `retention` says
+ * `not-retained` so nothing has to interpret an empty path as "nothing was kept".
+ */
+export function notRetainedRemovalProof(
+  input: Readonly<{
+    path: string
+    head: string
+    modules: string
+    writerLocks: readonly WriterLockProof[]
+    createdWriterLocks: readonly WriterLockProof[]
+    notCompared: readonly NotCompared[]
+    rehomedBorrowers?: readonly string[]
+    reason: string
+    provedBy: readonly string[]
+    componentCustody?: ComponentCustodyProof
+    attribution?: RetentionAttribution
+  }>,
+): WorktreeRemovalProof {
+  return {
+    path: input.path,
+    head: input.head,
+    repositories: [],
+    modules: input.modules,
+    retained: null,
+    createdAt: new Date().toISOString(),
+    retention: { kind: "not-retained", reason: input.reason, provedBy: [...input.provedBy] },
+    ...(input.rehomedBorrowers === undefined || input.rehomedBorrowers.length === 0
+      ? {}
+      : { rehomedBorrowers: input.rehomedBorrowers }),
+    writerLocks: input.writerLocks,
+    createdWriterLocks: input.createdWriterLocks,
+    notCompared: input.notCompared,
+    ...(input.componentCustody === undefined ? {} : { componentCustody: input.componentCustody }),
+    ...(input.attribution === undefined ? {} : { attribution: checkRetentionAttribution(input.attribution) }),
+  }
+}
+
+/**
  * 34787 (@cto 34787-component-retention-ruling correction 3): who and what a caller says a retention is for. Opaque to
  * GitSuper, which neither parses seat names nor issue paths: it only checks that each value is a string or null, and
  * records the object in the manifest as given (the caller owns attribution, as for archive refs).
