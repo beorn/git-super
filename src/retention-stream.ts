@@ -390,12 +390,14 @@ export interface StreamFaultMessages {
  * deadline, a cap or a warning is a proof limit and keeps the answer `unknown`.
  */
 export class IncompleteStreamError extends Error {
-  constructor(
-    message: string,
-    readonly fault?: "timedOut" | "capped" | "failed" | "warned",
-  ) {
+  // An explicit field, never a parameter property: the brain connector runs this file under node, whose type
+  // stripping refuses non-erasable syntax (#35120, #38148; km contacts-brain-launch went red on it).
+  readonly fault: "timedOut" | "capped" | "failed" | "warned" | undefined
+
+  constructor(message: string, fault?: "timedOut" | "capped" | "failed" | "warned") {
     super(message)
     this.name = "IncompleteStreamError"
+    this.fault = fault
   }
 }
 
