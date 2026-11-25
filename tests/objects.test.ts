@@ -135,7 +135,7 @@ describe("danglingRefs", () => {
       },
     }
     await expect(danglingRefs(stub, repository)).rejects.toThrow(
-      `git cat-file --batch-check=%(objectname) %(objecttype) --buffer failed (1) in ${repository}: object database unavailable`,
+      `git cat-file --batch-check=%(objectname) %(objecttype) failed (1) in ${repository}: object database unavailable`,
     )
   })
 })

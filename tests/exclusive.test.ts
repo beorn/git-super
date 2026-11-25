@@ -339,7 +339,10 @@ describe("exclusive writer policy", () => {
       try {
         if (process.platform !== "linux") {
           // The flock is real, but only procfs can show it; the contract on this platform is the same refusal.
-          expect(reapStaleWriterLease(path)).toMatchObject({ reaped: false, why: expect.stringContaining("kernel holder") })
+          expect(reapStaleWriterLease(path)).toMatchObject({
+            reaped: false,
+            why: expect.stringContaining("kernel holder"),
+          })
           expect(existsSync(path)).toBe(true)
           return
         }

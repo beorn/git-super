@@ -53,10 +53,7 @@ describe("#37970 module stores are proven recoverable before a slot is removed",
   it("proceeds when the store's only refs are mirrors: a remote-tracking ref and a published pin", async () => {
     const root = await mkdtemp(join(canonicalTmpdir(), "git-super-37970-mirrors-"))
     try {
-      const { fixture, target, alpha, scratch, sha } = slotWithStoreRef(
-        root,
-        () => "refs/remotes/origin/landing-only",
-      )
+      const { fixture, target, alpha, scratch, sha } = slotWithStoreRef(root, () => "refs/remotes/origin/landing-only")
       git(alpha, "fetch", "-q", scratch, `refs/heads/main:refs/git-super/pins/${sha}`)
       const store = createGitWorktreeStore({ repo: fixture.product, gitProcess: createLocalGitProcess() })
       await store.remove(target)

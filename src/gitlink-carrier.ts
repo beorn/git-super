@@ -47,7 +47,8 @@ export async function composeGitlinkCarrier(options: ComposeGitlinkCarrierOption
     seen.add(pin.path)
   }
   for (const file of files) {
-    if (file.path.trim() === "" || file.path.startsWith("/")) throw new Error(`carrier file path ${file.path} is not relative`)
+    if (file.path.trim() === "" || file.path.startsWith("/"))
+      throw new Error(`carrier file path ${file.path} is not relative`)
     if (seen.has(file.path)) throw new Error(`carrier has duplicate path ${file.path}`)
     if (!OBJECT_ID.test(file.blob)) throw new Error(`carrier file ${file.path} names no blob object ID`)
     seen.add(file.path)
