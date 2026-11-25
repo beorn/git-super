@@ -1056,6 +1056,14 @@ export type GitWorktreeTimeouts = Readonly<{
   operation: number
   cleanup: number
   mutationLock: number
+  /**
+   * The per-command budget while a worktree's submodules are materialized (a `git checkout --detach` per submodule
+   * in its own store). A landing tree is materialized while the host is busy by definition, and at load 67 a single
+   * vendored submodule checkout outlived the 30 s operation bound every run, so a landing looked stuck while its
+   * tree was still being built (2026-11-25, dev-rev/current 40 min behind main). It shares the load-sized bound the
+   * cleanup path already carries; a timeout inside it names itself as load-bound (see `adaptGitProcess`).
+   */
+  materialize: number
 }>
 
 export type WorktreeHookPolicy = "inherit" | "quarantine"
@@ -1118,6 +1126,8 @@ export type WorktreeAdd = Readonly<{ hooks?: WorktreeHookPolicy; lockReason?: st
 const GIT_TIMEOUT_MS = 30_000
 /** Worktree removal is correctness-critical and can exceed an interactive timeout under host load. */
 const GIT_CLEANUP_TIMEOUT_MS = 120_000
+/** Submodule materialization is load-bound like removal: a busy host must not read as a broken landing tree. */
+const GIT_MATERIALIZE_TIMEOUT_MS = 120_000
 
 export type LocalGitWorktreeStoreOptions = Omit<GitWorktreeStoreOptions, "gitProcess">
 
@@ -1176,7 +1186,15 @@ export function createGit(
    */
   const unsettledReason = (result: GitProcessResult, timeoutMs: number): string | undefined => {
     if (result.stalled === true) return "stalled"
-    if (result.timedOut === true) return `timed out after ${String(timeoutMs)}ms`
+    if (result.timedOut === true) {
+      // Keeps the asserted `timed out after <n>ms` shape, and says what a timeout here IS: these mutations run while
+      // the host is busy by construction (2026-11-25: one submodule checkout outlived its bound at load 67, and a
+      // landing tree still being built read as a stuck landing).
+      return (
+        `timed out after ${String(timeoutMs)}ms - the host was under load and the operation was still running: ` +
+        `a LOAD-BOUND timeout, not a broken tree; retry once the load falls`
+      )
+    }
     return result.failure ?? result.signal ?? undefined
   }
 
@@ -1346,6 +1364,7 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
     operation: options.timeouts?.operation ?? GIT_TIMEOUT_MS,
     cleanup: options.timeouts?.cleanup ?? GIT_CLEANUP_TIMEOUT_MS,
     mutationLock: options.timeouts?.mutationLock ?? DEFAULT_MUTATION_LOCK_WAIT_MS,
+    materialize: options.timeouts?.materialize ?? GIT_MATERIALIZE_TIMEOUT_MS,
   }
   // Still checked at run time: TypeScript cannot speak for a JavaScript caller,
   // and a missing capability must fail here rather than as a null dereference
@@ -1354,12 +1373,18 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
     throw new Error("git-super: Git worktree capability requires one injected GitProcess")
   }
   const git = createGit(options.gitProcess, options.env ?? process.env, timeouts.operation, options.signal)
-  const configuredProcess = (hooks?: WorktreeHookPolicy): GitProcess => ({
+  const configuredProcess = (hooks?: WorktreeHookPolicy, defaultTimeoutMs?: number): GitProcess => ({
     async run(request) {
-      const result = await git.run(request.repo, withHookPolicy(request.args, hooks), true, request.timeoutMs, {
-        ...(request.stdin === undefined ? {} : { stdin: request.stdin }),
-        ...(request.env === undefined ? {} : { env: request.env }),
-      })
+      const result = await git.run(
+        request.repo,
+        withHookPolicy(request.args, hooks),
+        true,
+        request.timeoutMs ?? defaultTimeoutMs,
+        {
+          ...(request.stdin === undefined ? {} : { stdin: request.stdin }),
+          ...(request.env === undefined ? {} : { env: request.env }),
+        },
+      )
       return { code: result.code, stdout: result.stdout, stderr: result.stderr }
     },
   })
@@ -1705,14 +1730,18 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
       }> = {},
     ): Promise<void> {
       const materializeProcess = configuredProcess(materializeOptions.hooks)
-      const result = await materializeSubmodulesWithProcess(materializeProcess, {
-        worktree: path,
-        referenceWorktree: repo,
-        ...(materializeOptions.force === true ? { force: true } : {}),
-        ...(materializeOptions.excludedSubmodules === undefined
-          ? {}
-          : { excludedSubmodules: materializeOptions.excludedSubmodules }),
-      })
+      const result = await materializeSubmodulesWithProcess(
+        materializeProcess,
+        {
+          worktree: path,
+          referenceWorktree: repo,
+          ...(materializeOptions.force === true ? { force: true } : {}),
+          ...(materializeOptions.excludedSubmodules === undefined
+            ? {}
+            : { excludedSubmodules: materializeOptions.excludedSubmodules }),
+        },
+        { timeoutMs: timeouts.materialize },
+      )
       if (result.code !== 0) {
         throw new Error(result.stderr || result.stdout || "could not materialize worktree submodules")
       }

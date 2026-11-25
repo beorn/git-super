@@ -3637,3 +3637,85 @@ describe("createGitWorktreeStore", () => {
     }
   })
 })
+
+describe("submodule materialization under host load", () => {
+  /**
+   * @failure 2026-11-25: a landing tree materialized its submodules under the store's 30 s operation bound, and at
+   *          load 67 one vendored checkout outlived it every run, so /hh/dev-rev/current sat 40 minutes behind main
+   *          while the tree was still being built and the promote step reported a stuck landing.
+   * @level l1
+   * @consumer the shared-main updater's landing trees and every worktree store that materializes submodules.
+   */
+  async function repositoryWithSubmodule(root: string): Promise<string> {
+    const subRemote = join(root, "sub-remote.git")
+    const repo = join(root, "owner")
+    const subWork = join(root, "sub-work")
+    git(root, ["init", "-q", "--bare", "-b", "main", subRemote])
+    git(root, ["clone", "-q", subRemote, subWork])
+    git(subWork, ["config", "user.email", "test@example.com"])
+    git(subWork, ["config", "user.name", "Test"])
+    writeFileSync(join(subWork, "sub.txt"), "sub content\n")
+    git(subWork, ["add", "sub.txt"])
+    git(subWork, ["commit", "-q", "-m", "init sub"])
+    git(subWork, ["push", "-q", "origin", "main"])
+    git(root, ["init", "-q", "-b", "main", repo])
+    git(repo, ["config", "user.email", "test@example.com"])
+    git(repo, ["config", "user.name", "Test"])
+    writeFileSync(join(repo, "root.txt"), "root\n")
+    git(repo, ["add", "root.txt"])
+    git(repo, ["commit", "-q", "-m", "init root"])
+    git(repo, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", subRemote, "vendor/sub"])
+    git(repo, ["commit", "-q", "-m", "add submodule"])
+    return repo
+  }
+
+  it("runs its checkouts on the materialize bound, never the interactive operation bound", async () => {
+    const root = await mkdtemp(join(tmpdir(), "git-super-materialize-bound-"))
+    try {
+      const repo = await repositoryWithSubmodule(root)
+      const real = createLocalGitProcess()
+      const checkoutTimeouts: (number | undefined)[] = []
+      const store = createGitWorktreeStore({
+        repo,
+        timeouts: { materialize: 7_000 },
+        gitProcess: {
+          async run(request) {
+            if (request.args[0] === "checkout") checkoutTimeouts.push(request.timeoutMs)
+            return real.run(request)
+          },
+        },
+      })
+      const tree = join(root, "tree")
+      await store.add({ kind: "detached", path: tree, ref: "HEAD" })
+      await store.materializeSubmodules(tree)
+      expect(checkoutTimeouts.length).toBeGreaterThan(0)
+      expect(new Set(checkoutTimeouts)).toEqual(new Set([7_000]))
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it("names a killed checkout as a LOAD-BOUND timeout instead of a broken tree", async () => {
+    const root = await mkdtemp(join(tmpdir(), "git-super-materialize-load-"))
+    try {
+      const repo = await repositoryWithSubmodule(root)
+      const real = createLocalGitProcess()
+      const store = createGitWorktreeStore({
+        repo,
+        gitProcess: {
+          async run(request) {
+            const result = await real.run(request)
+            return request.args[0] === "checkout" ? { ...result, timedOut: true } : result
+          },
+        },
+      })
+      const tree = join(root, "tree")
+      await store.add({ kind: "detached", path: tree, ref: "HEAD" })
+      await expect(store.materializeSubmodules(tree)).rejects.toThrow(
+        /LOAD-BOUND timeout, not a broken tree; retry once the load falls/u,
+      )
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+})

@@ -1805,12 +1805,27 @@ function adaptGitProcess(
   processOptions: Pick<GitProcessRequest, "timeoutMs" | "detached"> = {},
 ): SubmoduleGit {
   const run: SubmoduleGit["run"] = async (repo, args, _allowFailure, options) => {
-    return process.run({
+    const result = await process.run({
       ...processOptions,
       repo,
       args,
       ...(options?.stdin === undefined ? {} : { stdin: options.stdin }),
     })
+    // NO SILENT ERRORS: a killed command is indistinguishable from a refused one in the counts a caller reads, so
+    // the bound says what it was. Materialization runs while the host is busy by construction; a checkout that
+    // outlived its bound is a LOAD-BOUND timeout, never evidence that the tree being built is broken.
+    if (result.timedOut !== true) return result
+    const bound = processOptions.timeoutMs === undefined ? "its bound" : `${String(processOptions.timeoutMs)}ms`
+    return {
+      ...result,
+      stderr: [
+        result.stderr,
+        `git ${args.join(" ")} in ${repo} did not finish within ${bound}: the host was under load and the checkout ` +
+          `was still running - a LOAD-BOUND timeout, not a broken tree; retry once the load falls`,
+      ]
+        .filter((line) => line !== "")
+        .join("\n"),
+    }
   }
   const mutateConfig: NonNullable<SubmoduleGit["mutateConfig"]> = async (repo, args) => {
     let result = await run(repo, args, true)
