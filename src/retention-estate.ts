@@ -52,7 +52,11 @@ export const BATCH_ESTATE_BOUNDS: EstateScanBounds = { maxAlternatesFiles: 300_0
  * alone, which any writer can set back.
  */
 export interface EstateWalkRecord {
-  /** Every directory the walk read, by path: `ino:mtimeMs:ctimeMs`, taken before it was read. */
+  /**
+   * Every directory the walk read, by path: `ino:mtimeMs:ctimeMs`, taken before it was read. The lease window no
+   * longer re-stats this set (#33010: 10,132,305 directories cost 560 s), but it is still the walk's own proof that
+   * a bounded pool visited exactly the nodes a serial walk does.
+   */
   readonly dirs: Map<string, string>
   /** Every reached object directory's `info/alternates`, by path: `ino:size:ctimeMs`, or `absent`. */
   readonly alternates: Map<string, string>
@@ -64,11 +68,6 @@ export interface EstateWalkRecord {
 
 export function newEstateWalkRecord(): EstateWalkRecord {
   return { dirs: new Map(), alternates: new Map(), objectLinks: new Map(), registries: new Map() }
-}
-
-function dirStamp(path: string): string {
-  const stat = lstatSync(path)
-  return `${stat.ino}:${stat.mtimeMs}:${stat.ctimeMs}`
 }
 
 function fileStamp(path: string): string {
@@ -572,88 +571,302 @@ export async function scanEstate(
   }
 }
 
-export type EstateDelta =
-  | Readonly<{ status: "unchanged"; changedDirs: number }>
-  | Readonly<{ status: "changed"; detail: string }>
-
-/** The first object directory, `objects` link or borrower registry under a directory the scan never read. */
-function storeUnder(root: string): string | undefined {
-  const stack = [root]
-  while (stack.length > 0) {
-    const current = stack.pop() as string
-    for (const entry of readdirSync(current, { withFileTypes: true })) {
-      const path = join(current, entry.name)
-      if (entry.isSymbolicLink()) {
-        if (entry.name === "objects") return `objects link ${path}`
-        continue
-      }
-      if (!entry.isDirectory()) continue
-      if (entry.name === "objects" && isObjectDir(path)) return `object directory ${path}`
-      if (entry.name === "git-super-retained-borrowers") return `borrower registry ${path}`
-      stack.push(path)
-    }
-  }
-  return undefined
-}
+/**
+ * How deep below a namespace root the lease window looks for a store the census never saw (#33010). Measured on the
+ * live estate 2026-11-25: 4 levels = 161,218 directories in 4.1 s, 5 = 283,657 in 16.3 s, 6 = 429,434 in 28.7 s, and
+ * the window's whole budget is 10 s. Every directory beyond this depth is COUNTED in `prunedDirs`, never skipped
+ * silently. The gap is a store FIRST created deeper than this below a root; a store that existed at the scan is
+ * covered by its own alternates stamp however deep it sits.
+ */
+export const DELTA_DISCOVERY_DEPTH = 4
 
 /**
- * The lease-held check a retirement batch runs before it deletes anything (#33010, @cto dc77f630 conditions 1 and 3):
- * is the estate's SET of object directories, alternates files, `objects` links and borrower registries still what
- * `scan` (recorded into `record`) saw? Writers that never take the lease exist — a hand-run clone or `git worktree
- * add` writes an alternates file with no lease — so this comparison, not the lease, is what catches them between the
- * scan and the delete. It re-stats every directory the scan read and re-reads only the ones whose stamp moved: a
- * changed directory that only gained files is unchanged for the estate; one that gained a store, a link or a
- * registry, at any depth, is a change. Any read failure is a change: the batch then deletes nothing.
+ * Directories a window never descends into while it looks for a store it never census'd (#33010). A clone that
+ * borrows a selected entry is a repository someone created; a build output or a package tree is not where one is
+ * born, and descending into every one of them is what made the old location-scoped delta cost 560 s on 10,132,305
+ * directories. Every pruned directory is COUNTED in the window (`prunedDirs`), never silently dropped.
  */
-export function estateDelta(record: EstateWalkRecord, scan: EstateScan): EstateDelta {
-  const changed = (detail: string): EstateDelta => ({ status: "changed", detail })
+const DELTA_DISCOVERY_PRUNED = new Set([
+  "node_modules",
+  ".cache",
+  ".turbo",
+  ".vite",
+  ".venv",
+  "__pycache__",
+  "coverage",
+  "dist",
+  "build",
+  "target",
+])
+
+/** What the lease window is checked against; see {@link estateDelta}. */
+export interface EstateDeltaWindow {
+  /** Every entry this batch still holds a lease to delete: a changed or new alternates file naming one ends it. */
+  readonly selected: readonly string[]
+  /** Test seam: how deep below a namespace root discovery walks; production uses {@link DELTA_DISCOVERY_DEPTH}. */
+  readonly discoveryDepth?: number
+}
+
+export type EstateDelta =
+  | Readonly<{
+      status: "unchanged"
+      /** Directories outside the census that the window met (a store, a link or a registry): counted, not stopped. */
+      changedDirs: number
+      /** Alternates files the window stat'd. */
+      filesStatted: number
+      /** Alternates files the window read, because their stamp moved or the scan never saw them. */
+      filesRead: number
+      /** Stores the scan never saw that the window found and classified as churn. */
+      discoveredStores: number
+      /** Directories past the discovery depth or inside a pruned build output: not visited, and said so. */
+      prunedDirs: number
+      /** Directories the discovery walk read. */
+      walkedDirs: number
+    }>
+  | Readonly<{ status: "changed"; detail: string }>
+
+/**
+ * The lease-held check a retirement batch runs before it deletes anything (#33010): has any alternates declaration
+ * moved since `scan` (recorded into `record`) so that it now borrows from an entry this window will delete?
+ *
+ * Scoped BY REFERENCE, not by location (@cto 2026-11-25): today's borrower list is not enough, because the delta
+ * exists to catch a NEW borrower, which can appear anywhere. So every alternates file the scan recorded is stat'd
+ * (cheap, and concurrently: 241,824 serial `lstat`s measured 99,815 ms on this estate on 2026-11-25), only a file
+ * whose stamp moved — or a path that was absent at the scan — is read, and the batch stops only when a changed or
+ * new file names a selected entry. A new object directory whose alternates name nothing selected is churn and is
+ * ignored: that is the queue-worktree and ghostty build clone that used to stop the batch for a 560 s walk of
+ * 10,132,305 directories.
+ *
+ * Writers that never take the lease exist (a hand-run clone, `git worktree add`), so this comparison, not the lease,
+ * is what catches them between the scan and the delete. A stat or read that fails stops by the file's name, never a
+ * skip. New stores are found by walking each namespace root to {@link DELTA_DISCOVERY_DEPTH} and skipping the build
+ * outputs in {@link DELTA_DISCOVERY_PRUNED}; every directory that walk does not visit is counted in `prunedDirs`.
+ * Stops are chosen from the first reported detail in sorted order, so the same estate always yields the same message
+ * whatever order the pool finished in.
+ */
+export async function estateDelta(
+  record: EstateWalkRecord,
+  scan: EstateScan,
+  window: EstateDeltaWindow,
+): Promise<EstateDelta> {
+  const selected = window.selected.map((entry) => resolve(entry))
+  const borrowerInsideSelection = (store: string): boolean => selected.some((entry) => within(entry, store))
+  const namingSelected = (content: string, store: string): string | undefined =>
+    alternateEntries(content, store, true).find((target) => selected.some((entry) => within(entry, target)))
+  const stops: string[] = []
+  const stop = (detail: string): void => {
+    stops.push(detail)
+  }
+  const reason = (error: unknown): string => (error instanceof Error ? error.message : String(error))
+  const unreadable = (what: string, error: unknown): void => {
+    stop(`${what} could not be read at the delta: ${reason(error)}`)
+  }
+  const workers = Math.max(4, Math.min(32, cpus().length))
+  const inPool = async <Item>(items: readonly Item[], each: (item: Item) => Promise<void>): Promise<void> => {
+    let next = 0
+    const runners = Array.from({ length: Math.min(workers, items.length) }, async () => {
+      for (;;) {
+        const at = next
+        next += 1
+        const item = items[at]
+        if (item === undefined || stops.length > 0) return
+        await each(item)
+      }
+    })
+    await Promise.all(runners)
+  }
+  const settled = (): EstateDelta | undefined =>
+    stops.length === 0 ? undefined : { status: "changed", detail: [...stops].sort()[0] as string }
   try {
-    for (const [file, stamp] of record.alternates) {
-      const now = fileStamp(file)
-      if (now !== stamp) return changed(`alternates file ${file} changed since the scan (${stamp} -> ${now})`)
-    }
-    const known = new Set(scan.objectDirs)
-    for (const dir of scan.objectDirs) {
-      // Scan object directories are walked plain directories or canonical alternate targets, never links.
-      if (lstatSync(dir, { throwIfNoEntry: false })?.isDirectory() !== true) {
-        return changed(`object directory ${dir} vanished or is no longer a directory since the scan`)
-      }
-    }
-    for (const [link, target] of record.objectLinks) {
-      const now = existsSync(link) ? realpathSync(link) : "absent"
-      if (now !== target) return changed(`objects link ${link} now resolves to ${now}, not ${target}`)
-    }
-    for (const [dir, digest] of record.registries) {
-      if (registryDigest(dir) !== digest) return changed(`borrower registry ${dir} changed since the scan`)
-    }
+    let filesStatted = 0
+    let filesRead = 0
     let changedDirs = 0
-    for (const [dir, stamp] of record.dirs) {
-      const now = lstatSync(dir, { throwIfNoEntry: false })
-      // A vanished directory removed nothing the estate counts unless a store or registry under it went too, and
-      // those were checked by path above.
-      if (now === undefined || `${now.ino}:${now.mtimeMs}:${now.ctimeMs}` === stamp) continue
+    let discoveredStores = 0
+    let prunedDirs = 0
+    let walkedDirs = 0
+    const absentNow = new Set<string>()
+    // 1. Every alternates file the scan recorded: one stat each, and a read only when its stamp moved or it
+    //    appeared after the scan. A changed line that names nothing selected is churn (#33010 @cto).
+    await inPool([...record.alternates], async ([file, stamp]) => {
+      let now: string
+      try {
+        now = await fileStampAsync(file)
+      } catch (error) {
+        unreadable(`alternates file ${file}`, error)
+        return
+      }
+      filesStatted += 1
+      if (now === "absent") {
+        absentNow.add(dirname(dirname(file)))
+        return
+      }
+      if (now === stamp) return
+      const store = dirname(dirname(file))
+      // A borrower inside a selected entry is deleted with it: only an OUTSIDE borrower can be left broken.
+      if (borrowerInsideSelection(store)) return
+      filesRead += 1
+      let content: string
+      try {
+        content = await readFileAsync(file, "utf8")
+      } catch (error) {
+        unreadable(`alternates file ${file}`, error)
+        return
+      }
+      const named = namingSelected(content, store)
+      if (named !== undefined) stop(`alternates file ${file} now names selected entry ${named}`)
+    })
+    if (settled() !== undefined) return settled() as EstateDelta
+    // 2. A recorded store that is gone. Every store whose alternates file exists now was proved to exist by that
+    //    stat; the rest get one lstat, so a lender or witness store that vanished between the scan and the window
+    //    still ends the batch by name.
+    await inPool([...absentNow], async (store) => {
+      const now = await lstatAsync(store).catch((error: unknown) => {
+        if (absent(error)) return undefined
+        throw error
+      })
+      if (now?.isDirectory() !== true) {
+        stop(`object directory ${store} vanished or is no longer a directory since the scan`)
+      }
+    })
+    if (settled() !== undefined) return settled() as EstateDelta
+    // 3. `objects` links and borrower registries: a few thousand at most, and a redirect or a new registration is a
+    //    stop exactly as before.
+    await inPool([...record.objectLinks], async ([link, target]) => {
+      let now: string
+      try {
+        now = await realpathAsync(link)
+      } catch (error) {
+        if (!absent(error)) unreadable(`objects link ${link}`, error)
+        now = "absent"
+      }
+      if (now !== target) stop(`objects link ${link} now resolves to ${now}, not ${target}`)
+    })
+    if (settled() !== undefined) return settled() as EstateDelta
+    await inPool([...record.registries], async ([dir, digest]) => {
+      let now: string
+      try {
+        now = await registryDigestAsync(dir)
+      } catch (error) {
+        unreadable(`borrower registry ${dir}`, error)
+        return
+      }
+      if (now !== digest) stop(`borrower registry ${dir} changed since the scan`)
+    })
+    if (settled() !== undefined) return settled() as EstateDelta
+    // 4. Stores the scan never saw. A fresh walk, depth-bounded and pruned, reads only alternates files the census
+    //    does not carry, so a clone that appeared after the scan is classified by what it borrows, not by existing.
+    const depthLimit = window.discoveryDepth ?? DELTA_DISCOVERY_DEPTH
+    const classify = async (store: string, alternatesFile: string): Promise<void> => {
+      discoveredStores += 1
+      filesStatted += 1
+      let now: string
+      try {
+        now = await fileStampAsync(alternatesFile)
+      } catch (error) {
+        unreadable(`alternates file ${alternatesFile}`, error)
+        return
+      }
+      if (now === "absent") return
+      filesRead += 1
+      let content: string
+      try {
+        content = await readFileAsync(alternatesFile, "utf8")
+      } catch (error) {
+        unreadable(`alternates file ${alternatesFile}`, error)
+        return
+      }
+      const named = namingSelected(content, store)
+      if (named !== undefined) stop(`new alternates file ${alternatesFile} names selected entry ${named}`)
+    }
+    const classifyRegistry = async (registry: string): Promise<void> => {
       changedDirs += 1
-      for (const entry of readdirSync(dir, { withFileTypes: true })) {
-        const path = join(dir, entry.name)
-        if (entry.isSymbolicLink()) {
-          if (entry.name === "objects" && !record.objectLinks.has(path)) return changed(`new objects link ${path}`)
-          continue
+      let names: string[]
+      try {
+        names = (await readdir(registry)).filter((name) => name.endsWith(".json")).sort()
+      } catch (error) {
+        unreadable(`borrower registry ${registry}`, error)
+        return
+      }
+      for (const name of names) {
+        let row: unknown
+        try {
+          row = JSON.parse(await readFileAsync(join(registry, name), "utf8"))
+        } catch (error) {
+          unreadable(`borrower registry record ${join(registry, name)}`, error)
+          return
         }
-        if (!entry.isDirectory() || record.dirs.has(path)) continue
-        if (entry.name === "objects" && isObjectDir(path)) {
-          if (!known.has(path)) return changed(`new object directory ${path}`)
-          continue
+        const retained = (row as { retained?: unknown } | null)?.retained
+        if (typeof retained !== "string") continue
+        const held = resolve(retained)
+        if (selected.some((entry) => within(entry, held))) {
+          stop(`new borrower registry record ${join(registry, name)} names selected entry ${held}`)
         }
-        if (entry.name === "git-super-retained-borrowers") {
-          if (!record.registries.has(path)) return changed(`new borrower registry ${path}`)
-          continue
-        }
-        const found = storeUnder(path)
-        if (found !== undefined) return changed(`new ${found} under ${dir}`)
       }
     }
-    return { status: "unchanged", changedDirs }
+    const pending: { path: string; depth: number }[] = scan.roots.map((root) => ({ path: root, depth: 0 }))
+    const visit = async ({ path, depth }: { path: string; depth: number }): Promise<void> => {
+      walkedDirs += 1
+      let children
+      try {
+        children = await readdir(path, { withFileTypes: true })
+      } catch (error) {
+        // A directory that vanished mid-walk lends nothing now; a directory that cannot be read at all is a stop.
+        const now = await lstatAsync(path).catch((statError: unknown) => {
+          if (absent(statError)) return undefined
+          throw statError
+        })
+        if (now === undefined) return
+        stop(`estate delta could not read ${path}: ${reason(error)}`)
+        return
+      }
+      const queue: { path: string; depth: number }[] = []
+      for (const child of children) {
+        if (stops.length > 0) return
+        const childPath = join(path, child.name)
+        if (child.name === "objects") {
+          const alternatesFile = join(childPath, "info", "alternates")
+          if (record.alternates.has(alternatesFile)) continue
+          if (child.isSymbolicLink()) {
+            let store: string
+            try {
+              store = await realpathAsync(childPath)
+            } catch {
+              stop(`new objects link ${childPath} has an unavailable or redirected target`)
+              return
+            }
+            changedDirs += 1
+            if (!(await isObjectDirAsync(store))) continue
+            await classify(store, alternatesFile)
+            continue
+          }
+          if (!(await isObjectDirAsync(childPath))) continue
+          changedDirs += 1
+          await classify(childPath, alternatesFile)
+          continue
+        }
+        if (child.name === "git-super-retained-borrowers" && child.isDirectory()) {
+          // A registry the scan already read is compared by digest above; only a NEW one is classified here.
+          if (record.registries.has(childPath)) continue
+          await classifyRegistry(childPath)
+          continue
+        }
+        if (!child.isDirectory() || child.isSymbolicLink()) continue
+        if (DELTA_DISCOVERY_PRUNED.has(child.name) || depth + 1 > depthLimit) {
+          prunedDirs += 1
+          continue
+        }
+        queue.push({ path: childPath, depth: depth + 1 })
+      }
+      pending.push(...queue)
+    }
+    while (pending.length > 0 && stops.length === 0) {
+      const batch = pending.splice(0, workers)
+      await Promise.all(batch.map(visit))
+    }
+    const verdict = settled()
+    if (verdict !== undefined) return verdict
+    return { status: "unchanged", changedDirs, filesStatted, filesRead, discoveredStores, prunedDirs, walkedDirs }
   } catch (error) {
-    return changed(`estate delta could not be read: ${error instanceof Error ? error.message : String(error)}`)
+    return { status: "changed", detail: `estate delta could not be read: ${reason(error)}` }
   }
 }

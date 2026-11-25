@@ -22,7 +22,7 @@ import {
   type Dirent,
 } from "node:fs"
 import { lstat, open, readdir, readlink, realpath, rmdir, stat, unlink } from "node:fs/promises"
-import { createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS } from "./exclusive.ts"
+import { createExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS, reapStaleWriterLease } from "./exclusive.ts"
 import { tryAcquireFlock, type FlockHandle } from "@bearly/flock"
 import { fileLockHolders, formatLockHolders } from "@bearly/flock/holders"
 import { spawnSync } from "node:child_process"
@@ -1244,6 +1244,8 @@ export function acquireRemovalWriterLeases(
     skip?: readonly string[]
     /** Retained metadata is certified: never create a lease file or its parent. */
     existingOnly?: boolean
+    /** Called once per lease file reaped before it was taken; the caller reports it by name. */
+    onReapedLease?: (path: string, detail: string) => void
   }> = {},
 ): RemovalWriterLeases {
   const handles: FlockHandle[] = []
@@ -1306,11 +1308,23 @@ export function acquireRemovalWriterLeases(
     // opens existing paths, in stable order; a missing path stays a native ENOENT.
     const orderedPaths = existingOnly ? uniquePaths.sort() : [...existing, ...absent]
     for (const path of orderedPaths) {
-      const before = present(path) ? lstatSync(path) : null
-      const handle = tryAcquireFlock(
+      let before = present(path) ? lstatSync(path) : null
+      let handle = tryAcquireFlock(
         path,
         existingOnly ? { create: false, createParent: false, noFollow: true } : undefined,
       )
+      if (handle === null) {
+        // #33010 (@cto 2026-11-25): a lease whose recorded pid is dead and which holds no flock is reaped by name,
+        // then taken. Left in place it reads as "held" to every later caller — on 2026-11-25 one such file stopped
+        // the retained-store drain for an hour.
+        const reap = reapStaleWriterLease(path)
+        if (reap.reaped) {
+          options.onReapedLease?.(path, reap.detail)
+          before = null
+          createdPaths.push(path)
+          handle = tryAcquireFlock(path, existingOnly ? { createParent: false, noFollow: true } : undefined)
+        }
+      }
       if (handle === null) {
         const note = readFileSync(path, "utf8")
         const holder =

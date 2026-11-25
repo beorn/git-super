@@ -164,14 +164,15 @@ describe("chunked retained retirement (#34127)", () => {
     const result = await retireRetainedBatchInChunks(
       options({
         chunkSize: 2,
-        // A writer with no lease opens a borrower between the scan and the held window, which the delta must catch.
+        // A writer with no lease opens a borrower of a SELECTED entry between the scan and the held window, which
+        // the reference-scoped delta must catch (#33010 @cto 2026-11-25: a new store borrowing nothing selected is
+        // churn, and this one borrows an entry this chunk deletes).
         afterScan: () => {
-          const hand = join(fixtureRoot, "hand-clone")
-          mkdirSync(join(hand, "objects"), { recursive: true })
+          const [first] = readdirSync(root).sort() as [string]
           mkdirSync(join(fixtureRoot, "revived-owner", "objects", "info"), { recursive: true })
           writeFileSync(
             join(fixtureRoot, "revived-owner", "objects", "info", "alternates"),
-            `${join(hand, "objects")}\n`,
+            `${join(root, first, "modules", "vendor", "dep", "objects")}\n`,
           )
         },
       }),

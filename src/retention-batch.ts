@@ -27,6 +27,7 @@ import { CustodyIndexScope } from "./retention-custody.ts"
 import { lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs"
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { acquireFlockWithTimeout, type FlockHandle } from "@bearly/flock"
+import { reapStaleWriterLease } from "./exclusive.ts"
 import { DEFAULT_MUTATION_LOCK_WAIT_MS } from "./exclusive.ts"
 import {
   BATCH_ESTATE_BOUNDS,
@@ -109,6 +110,15 @@ export type BatchWindow = Readonly<{
   delta: "unchanged" | "changed"
   deltaMs: number
   holdMs: number
+  /** #33010 (@cto): what the delta cost, so its "< 10 s" target is visible on a real apply, not inferred. */
+  filesStatted: number
+  filesRead: number
+  /** Stores the scan never saw that the delta classified as churn: counted, never a stop. */
+  discoveredStores: number
+  /** Directories past the discovery depth or inside a pruned build output: not visited, and counted. */
+  prunedDirs: number
+  /** Directories the discovery walk read. */
+  walkedDirs: number
 }>
 
 export type RetentionBatchResult = Readonly<{
@@ -989,11 +999,25 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
   let next = 0
   if (candidates.length > 0) {
     const commonPath = join(common, "yrd-worktree-mutations", "writer.lock")
-    const commonLease: FlockHandle | null = acquireFlockWithTimeout(commonPath, DEFAULT_MUTATION_LOCK_WAIT_MS, {
-      create: false,
-      createParent: false,
-      noFollow: true,
-    })
+    const reportReapedLease = (path: string, detail: string): void => {
+      console.warn(`retention: ${detail} (${path})`)
+    }
+    const takeCommonLease = (create: boolean): FlockHandle | null =>
+      acquireFlockWithTimeout(commonPath, DEFAULT_MUTATION_LOCK_WAIT_MS, {
+        ...(create ? {} : { create: false }),
+        createParent: false,
+        noFollow: true,
+      })
+    let commonLease = takeCommonLease(false)
+    if (commonLease === null) {
+      // #33010 (@cto 2026-11-25): a lease whose recorded pid is dead and which no process holds a flock on is reaped
+      // by name before the batch gives up, never left to hold every later drain for an hour.
+      const reap = reapStaleWriterLease(commonPath)
+      if (reap.reaped) {
+        reportReapedLease(commonPath, reap.detail)
+        commonLease = takeCommonLease(true)
+      }
+    }
     if (commonLease === null) {
       return result(windows, `lease-held: common lease ${commonPath} is held; nothing more deleted`)
     }
@@ -1005,6 +1029,7 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
     const windowEntries: string[] = []
     let deltaStatus: BatchWindow["delta"] = "unchanged"
     let deltaMs = 0
+    let deltaCounts = { filesStatted: 0, filesRead: 0, discoveredStores: 0, prunedDirs: 0, walkedDirs: 0 }
     let stopped: string | undefined
     try {
       // Acquire outside owners BEFORE checking the delta; otherwise a leased writer could change an alternate
@@ -1015,9 +1040,22 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
           existingOnly: true,
           additionalGitDirs: leasedOwners,
           skip: [commonPath],
+          onReapedLease: reportReapedLease,
         }),
       )
-      const delta = estateDelta(record, scan)
+      // #33010 (@cto 2026-11-25): scoped by reference — only a changed or new alternates file that names an entry
+      // this window still deletes ends the batch, so unrelated churn (a queue worktree, a build clone) is counted
+      // and ignored instead of stopping every store on the host.
+      const delta = await estateDelta(record, scan, { selected: candidates.slice(next) })
+      if (delta.status === "unchanged") {
+        deltaCounts = {
+          filesStatted: delta.filesStatted,
+          filesRead: delta.filesRead,
+          discoveredStores: delta.discoveredStores,
+          prunedDirs: delta.prunedDirs,
+          walkedDirs: delta.walkedDirs,
+        }
+      }
       const coldChanged = coldOwnerChanged(cold)
       deltaMs = Math.round(monotonic() - heldFrom)
       if (delta.status === "changed" || coldChanged !== undefined) {
@@ -1039,6 +1077,7 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
               acquireRemovalWriterLeases(entry, undefined, {
                 existingOnly: true,
                 skip: [commonPath],
+                onReapedLease: reportReapedLease,
               }),
             )
           }
@@ -1134,7 +1173,13 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
       for (const lease of ownerLeases.reverse()) lease.release()
       commonLease.release()
     }
-    windows.push({ entries: windowEntries, delta: deltaStatus, deltaMs, holdMs: Math.round(monotonic() - heldFrom) })
+    windows.push({
+      entries: windowEntries,
+      delta: deltaStatus,
+      deltaMs,
+      holdMs: Math.round(monotonic() - heldFrom),
+      ...deltaCounts,
+    })
     if (stopped !== undefined) {
       for (const entry of candidates.slice(next)) {
         if (!rows.has(entry)) rows.set(entry, { entry, outcome: "kept", reason: stopped })

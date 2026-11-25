@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs"
+import { readFileSync, unlinkSync } from "node:fs"
 import { mkdir } from "node:fs/promises"
 import { join } from "node:path"
 import { tryAcquireFlock } from "@bearly/flock"
@@ -125,6 +125,62 @@ function describeLiveLockHolders(path: string): string {
   if ("unreadable" in file) return `holder unknown (${file.unreadable})`
   if (file.locks.every((lock) => lock.waiter)) return `holder: none found in the kernel lock table (${file.id})`
   return `holder: ${formatLockHolders(report)}`
+}
+
+/** How {@link reapStaleWriterLease} answers: reaped by name, or why it left the lease alone. */
+export type StaleLeaseReap =
+  | Readonly<{ reaped: true; pid: number; detail: string }>
+  | Readonly<{ reaped: false; why: string }>
+
+/**
+ * Reap a writer lease whose recorded pid is dead and which no process holds a flock on (#33010, @cto 2026-11-25).
+ *
+ * A lease file outlives a killed writer, and every later caller then reads it as "held" — on 2026-11-25 one such file
+ * (pid 2272903, dead, no flock in /proc/locks) kept the whole retained-store drain from deleting anything for an hour
+ * and was only cleared by hand. Both facts are required before anything is removed: the body's pid must be dead AND
+ * the kernel lock table must show no lock (and no waiter) on the file. A lease that cannot be attributed, a platform
+ * without a lock table, and an unreadable body are all left in place with the reason — a lease nobody can explain is
+ * not stale by this rule. The file is then unlinked, so the caller's next acquire creates it as its own.
+ */
+export function reapStaleWriterLease(path: string): StaleLeaseReap {
+  let body: string
+  try {
+    body = readFileSync(path, "utf8")
+  } catch (error) {
+    return { reaped: false, why: `cannot read ${path}: ${error instanceof Error ? error.message : String(error)}` }
+  }
+  let pid: unknown
+  try {
+    pid = (JSON.parse(body) as { pid?: unknown } | null)?.pid
+  } catch {
+    return { reaped: false, why: `${path} does not carry a writable lease body; not reaped` }
+  }
+  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) {
+    return { reaped: false, why: `${path} records no pid; not reaped` }
+  }
+  try {
+    process.kill(pid, 0)
+    return { reaped: false, why: `pid ${String(pid)} is alive` }
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code !== "ESRCH") return { reaped: false, why: `pid ${String(pid)} cannot be shown dead (${String(code)})` }
+  }
+  if (process.platform !== "linux") {
+    return { reaped: false, why: "kernel holder lookup unavailable on this platform" }
+  }
+  const holders = fileLockHolders([path], { self: process.pid })
+  if (holders.kind === "unknown") return { reaped: false, why: `locks unknown (${holders.reason})` }
+  const file = holders.files[0]
+  if (file === undefined) return { reaped: false, why: `${path} was not observed; not reaped` }
+  if ("absent" in file) return { reaped: false, why: `${path} vanished before it could be reaped` }
+  if ("unreadable" in file) return { reaped: false, why: file.unreadable }
+  if (file.locks.length > 0) return { reaped: false, why: `a flock is held: ${formatLockHolders(holders)}` }
+  try {
+    unlinkSync(path)
+  } catch (error) {
+    return { reaped: false, why: `cannot unlink ${path}: ${error instanceof Error ? error.message : String(error)}` }
+  }
+  return { reaped: true, pid, detail: `reaped stale writer lease pid ${String(pid)}, dead, no flock` }
 }
 
 /**

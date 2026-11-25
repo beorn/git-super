@@ -5,12 +5,16 @@
  * @consumer Yrd worktree mutation store
  */
 
+import { existsSync } from "node:fs"
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { describe, expect, test, vi } from "vitest"
 import { setTimeout as delay } from "node:timers/promises"
-import { acquireExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS } from "../src/exclusive.ts"
+import { spawn } from "node:child_process"
+import { tryAcquireFlock } from "@bearly/flock"
+import { fileLockHolders, formatLockHolders } from "@bearly/flock/holders"
+import { acquireExclusive, DEFAULT_MUTATION_LOCK_WAIT_MS, reapStaleWriterLease } from "../src/exclusive.ts"
 
 vi.mock("node:timers/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:timers/promises")>()
@@ -277,5 +281,66 @@ describe("exclusive writer policy", () => {
       vi.restoreAllMocks()
       await rm(dir, { recursive: true, force: true })
     }
+  })
+  // #33010 (@cto 2026-11-25): a lease file outlives a killed writer and then reads as "held" to every later caller —
+  // one such file (pid 2272903, dead, no flock) stopped the retained-store drain for an hour on 2026-11-25.
+  describe("reaping a stale writer lease", async () => {
+    const deadPid = async (): Promise<number> => {
+      const child = spawn("true", [], { stdio: "ignore" })
+      const pid = child.pid as number
+      await new Promise<void>((resolve) => child.once("exit", () => resolve()))
+      return pid
+    }
+    const lease = async (body: string): Promise<string> => {
+      const dir = await mkdtemp(join(tmpdir(), "git-super-reap-"))
+      const path = join(dir, "writer.lock")
+      await writeFile(path, body)
+      return path
+    }
+
+    test("reaps a lease whose recorded pid is dead and which holds no flock, naming pid and reason", async () => {
+      const pid = await deadPid()
+      const path = await lease(JSON.stringify({ pid, startedAt: new Date().toISOString(), holder: "git super push" }))
+      const reap = reapStaleWriterLease(path)
+      expect(reap).toEqual({
+        reaped: true,
+        pid,
+        detail: `reaped stale writer lease pid ${String(pid)}, dead, no flock`,
+      })
+      await expect(readFile(path, "utf8")).rejects.toThrow(/ENOENT/u)
+    })
+
+    test("leaves a lease whose recorded pid is alive alone", async () => {
+      const path = await lease(JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }))
+      const reap = reapStaleWriterLease(path)
+      expect(reap).toEqual({ reaped: false, why: `pid ${String(process.pid)} is alive` })
+      expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({ pid: process.pid })
+    })
+
+    test("leaves a lease it cannot attribute alone: an unreadable body is not stale by this rule", async () => {
+      const path = await lease("not json")
+      expect(reapStaleWriterLease(path)).toMatchObject({ reaped: false })
+      expect(await readFile(path, "utf8")).toBe("not json")
+    })
+
+    // The lock the file names can still be owned by a live descriptor (an exec'd child, a passed fd) even when the
+    // pid in the body is dead: that is a held lease, not a stale one.
+    test("leaves a lease alone while a live process holds its flock", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "git-super-reap-"))
+      const path = join(dir, "writer.lock")
+      const holder = tryAcquireFlock(path, { body: JSON.stringify({ pid: await deadPid() }) })
+      expect(holder).not.toBeNull()
+      try {
+        // procfs publishes the row just after the syscall returns, so wait for the kernel to show it.
+        await vi.waitFor(() => {
+          const shown = formatLockHolders(fileLockHolders([path], { self: process.pid }))
+          expect(shown).toContain("FLOCK")
+        })
+        expect(reapStaleWriterLease(path)).toMatchObject({ reaped: false, why: expect.stringContaining("flock") })
+        expect(existsSync(path)).toBe(true)
+      } finally {
+        holder?.release()
+      }
+    })
   })
 })

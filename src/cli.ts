@@ -34,7 +34,7 @@ import type { SuperMergeResult } from "./merge.ts"
 import type { GitSuperResult } from "./result.ts"
 import type { RetentionVerifyResult } from "./retention-verify.ts"
 import type { CompactRetainedRootReport } from "./retention-compact.ts"
-import { fragmentUseText, type RetentionBatchResult } from "./retention-batch.ts"
+import { fragmentUseText, type BatchWindow, type RetentionBatchResult } from "./retention-batch.ts"
 import type { RetentionChunkResult } from "./retention-chunks.ts"
 import { formatRetainedBytes, type RetainedRanking } from "./retention-bytes.ts"
 import type { PrivateStoreCandidateResult } from "./private-store-candidate.ts"
@@ -51,6 +51,16 @@ import {
   withGitEnvironment,
   type GitObjectContext,
 } from "./git.ts"
+
+/** #33010 (@cto): the window's own receipt, so the delta's "< 10 s" target is read off a real apply, not inferred. */
+function windowLine(window: BatchWindow): string {
+  return (
+    `lease hold ${String(window.holdMs)}ms; delta ${window.delta} ${String(window.deltaMs)}ms; ` +
+    `statted ${String(window.filesStatted)} read ${String(window.filesRead)}; ` +
+    `new stores ${String(window.discoveredStores)} walked ${String(window.walkedDirs)} pruned ${String(window.prunedDirs)}; ` +
+    `entries ${String(window.entries.length)}`
+  )
+}
 
 export type OutputSink = ProcessOutputSink &
   Readonly<{
@@ -1633,9 +1643,7 @@ async function writeResult(
     }
     for (const row of batch.rows) stdout.write(`${row.outcome} ${row.entry}: ${row.reason}\n`)
     for (const window of batch.windows) {
-      stdout.write(
-        `lease hold ${window.holdMs}ms; delta ${window.delta} ${window.deltaMs}ms; entries ${window.entries.length}\n`,
-      )
+      stdout.write(`${windowLine(window)}\n`)
     }
     if (batch.stopped !== undefined) stderr.write(`${batch.stopped}\n`)
   } else if (captured.node === retentionChunks) {
@@ -1649,11 +1657,7 @@ async function writeResult(
     )
     for (const row of chunks.rows) stdout.write(`${row.outcome} ${row.entry}: ${row.reason}\n`)
     for (const chunk of chunks.chunks) {
-      for (const window of chunk.windows) {
-        stdout.write(
-          `lease hold ${String(window.holdMs)}ms; delta ${window.delta} ${String(window.deltaMs)}ms; entries ${String(window.entries.length)}\n`,
-        )
-      }
+      for (const window of chunk.windows) stdout.write(`${windowLine(window)}\n`)
     }
     if (chunks.stopped !== undefined) stderr.write(`${chunks.stopped}\n`)
   } else if (captured.node === nodes.worktree.retention.enroll) {

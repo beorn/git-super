@@ -1258,9 +1258,35 @@ describe("retention retirement batch (#33010)", async () => {
     }
   })
 
-  // @cto dc77f630 condition 3: a writer that takes no lease (a hand-run clone) is caught by the delta, not the lease.
-  it("an alternates file written between scan and delta by a writer with no lease ends the batch with nothing deleted", async () => {
+  // @cto dc77f630 condition 3, rescoped by @cto 2026-11-25 (#33010): a writer that takes no lease (a hand-run
+  // clone) is caught by the delta, not the lease — and the delta stops only when the new borrower names an entry
+  // this window deletes. A clone borrowing the product's own submodule store is churn: nothing it borrows is going.
+  it("a lease-free clone borrowing a store this batch does not delete is churn, and the batch retires", async () => {
     const lender = join(common, "modules", "vendor", "dep", "objects")
+    const result = await retireRetainedBatch(
+      options({
+        apply: true,
+        afterScan: () => {
+          const objects = join(fixtureRoot, "hand-clone", ".git", "objects")
+          mkdirSync(join(objects, "info"), { recursive: true })
+          mkdirSync(join(objects, "pack"), { recursive: true })
+          writeFileSync(join(objects, "info", "alternates"), `${lender}\n`)
+        },
+      }),
+    )
+    expect(result.stopped).toBeUndefined()
+    expect(result.rows.map((row) => row.outcome)).toEqual(["retired", "retired", "retired"])
+    expect(result.windows).toEqual([
+      expect.objectContaining({ delta: "unchanged", discoveredStores: expect.any(Number) }),
+    ])
+    expect(existsSync(join(fixtureRoot, "hand-clone"))).toBe(true)
+  })
+
+  // The case the rescoped delta exists for: a borrower of a SELECTED entry can appear anywhere, so the window's
+  // bounded discovery walk must read it and stop before anything is deleted.
+  it("a lease-free clone borrowing a selected entry between scan and delta ends the batch with nothing deleted", async () => {
+    const [first] = readdirSync(root).sort() as [string]
+    const lender = join(root, first, "modules", "vendor", "dep", "objects")
     const result = await retireRetainedBatch(
       options({
         apply: true,

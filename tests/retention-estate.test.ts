@@ -173,9 +173,14 @@ describe("retention estate scan — gate 3 (#27443(b))", async () => {
   // #33010 (@cto dc77f630 conditions 1 and 3): a batch reuses one scan, so a lease-held delta must catch every
   // change to the SET of object dirs, alternates files and registries since the scan, including writes by a writer
   // that never takes the lease (a hand-run clone or worktree add).
+  // #33010 (@cto 2026-11-25): the lease-held delta is scoped BY REFERENCE, not by location. Every alternates file
+  // the scan recorded is stat'd, only a moved or new one is read, and the batch stops only when it names an entry
+  // this window still deletes. A new object directory that borrows nothing selected is churn: the queue-worktree and
+  // ghostty build clone that used to stop the batch for a 560 s walk of 10,132,305 directories on the live estate.
   describe("estate delta under the lease", async () => {
     const scene = async (): Promise<{
       namespace: string
+      lender: string
       record: EstateWalkRecord
       scan: Awaited<ReturnType<typeof scanEstate>>
     }> => {
@@ -183,28 +188,39 @@ describe("retention estate scan — gate 3 (#27443(b))", async () => {
       const lender = objectDir(namespace, "lender")
       borrow(objectDir(namespace, "borrower"), lender)
       objectDir(join(namespace, "deep", "repo"), ".git")
+      objectDir(namespace, "lendex")
       const record = newEstateWalkRecord()
       const scan = await scanEstate([namespace], [], DEFAULT_ESTATE_BOUNDS, Date.now, record)
       expect(scan.status).toBe("pass")
-      return { namespace, record, scan }
+      return { namespace, lender, record, scan }
     }
 
-    test("an untouched estate is unchanged, even when unrelated files were written", async () => {
-      const { namespace, record, scan } = await scene()
+    test("an untouched estate is unchanged, and says what it stat'd and what it pruned", async () => {
+      const { namespace, lender, record, scan } = await scene()
       writeFileSync(join(namespace, "deep", "build-output.txt"), "noise\n")
       mkdirSync(join(namespace, "deep", "node_modules", "pkg"), { recursive: true })
-      expect(estateDelta(record, scan)).toEqual({ status: "unchanged", changedDirs: 1 })
+      expect(await estateDelta(record, scan, { selected: [lender] })).toEqual({
+        status: "unchanged",
+        changedDirs: 0,
+        filesStatted: record.alternates.size,
+        filesRead: 0,
+        discoveredStores: 0,
+        prunedDirs: 1,
+        walkedDirs: expect.any(Number),
+      })
     })
 
-    test("an alternates file added between scan and delta ends the batch, naming the file", async () => {
-      const { namespace, record, scan } = await scene()
+    test("a new store borrowing a selected entry ends the batch, naming the alternates file", async () => {
+      const { namespace, lender, record, scan } = await scene()
       const repo = join(namespace, "deep", "repo", ".git", "objects")
-      borrow(repo, join(namespace, "lender", "objects"))
-      const delta = estateDelta(record, scan)
+      borrow(repo, lender)
+      const delta = await estateDelta(record, scan, { selected: [lender] })
       expect(delta.status).toBe("changed")
       expect(delta.status === "changed" && delta.detail).toContain(join(repo, "info", "alternates"))
     })
 
+    // The write keeps the byte length and resets mtime, so only the inode/ctime stamp can see it — and it still
+    // stops, because the line it now carries names a selected entry.
     test("a rewritten alternates file of the same length ends the batch by its change time", async () => {
       const { namespace, record, scan } = await scene()
       const file = join(namespace, "borrower", "objects", "info", "alternates")
@@ -212,12 +228,14 @@ describe("retention estate scan — gate 3 (#27443(b))", async () => {
       const stamp = statSync(file)
       writeFileSync(file, bytes.replace("lender", "lendex"))
       utimesSync(file, stamp.atime, stamp.mtime)
-      expect(estateDelta(record, scan).status).toBe("changed")
+      const delta = await estateDelta(record, scan, { selected: [join(namespace, "lendex")] })
+      expect(delta.status).toBe("changed")
+      expect(delta.status === "changed" && delta.detail).toContain(file)
     })
 
     // Accepted requirement: the reused scan detects every changed alternates declaration. A symlink's own
     // lstat cannot see writes to its target; a broken borrower can gain a valid loan while remaining broken.
-    test("an alternates symlink target gaining a surviving loan ends the batch", async () => {
+    test("an alternates symlink target gaining a loan into a selected entry ends the batch", async () => {
       const namespace = tmp("git-super-estate-delta-link-")
       const lender = objectDir(namespace, "lender")
       const borrower = objectDir(namespace, "borrower")
@@ -229,21 +247,25 @@ describe("retention estate scan — gate 3 (#27443(b))", async () => {
       expect(scan.status).toBe("pass")
       expect(scan.danglingAlternates).toHaveLength(1)
       writeFileSync(target, `${join(namespace, "gone", "objects")}\n${lender}\n`)
-      expect(estateDelta(record, scan).status).toBe("changed")
+      expect((await estateDelta(record, scan, { selected: [dirname(lender)] })).status).toBe("changed")
     })
 
-    test("a new repository in a new directory ends the batch", async () => {
-      const { namespace, record, scan } = await scene()
-      objectDir(join(namespace, "fresh", "clone"), ".git")
-      const delta = estateDelta(record, scan)
+    test("a new repository in a new directory is churn until it borrows a selected entry", async () => {
+      const { namespace, lender, record, scan } = await scene()
+      const clone = objectDir(join(namespace, "fresh", "clone"), ".git")
+      expect((await estateDelta(record, scan, { selected: [lender] })).status).toBe("unchanged")
+      borrow(clone, lender)
+      const delta = await estateDelta(record, scan, { selected: [lender] })
       expect(delta.status).toBe("changed")
-      expect(delta.status === "changed" && delta.detail).toContain(join(namespace, "fresh", "clone", ".git", "objects"))
+      expect(delta.status === "changed" && delta.detail).toContain(join(clone, "info", "alternates"))
     })
 
     test("a vanished object directory ends the batch", async () => {
-      const { namespace, record, scan } = await scene()
+      const { namespace, lender, record, scan } = await scene()
       rmSync(join(namespace, "deep", "repo", ".git"), { recursive: true })
-      expect(estateDelta(record, scan).status).toBe("changed")
+      const delta = await estateDelta(record, scan, { selected: [lender] })
+      expect(delta.status).toBe("changed")
+      expect(delta.status === "changed" && delta.detail).toContain("vanished")
     })
 
     // Live estate 2026-11-10: a worktree closed during the 7-minute walk made the whole batch scan unknown.
@@ -271,11 +293,28 @@ describe("retention estate scan — gate 3 (#27443(b))", async () => {
       )
     })
 
-    test("a store moved mid-walk into an already-read directory is caught by the delta", async () => {
-      const { namespace, record, scan } = await scene()
-      // After the scan read `deep`, a writer moves a new repository into it: deep's stamp moves.
-      objectDir(join(namespace, "deep", "moved-in"), ".git")
-      expect(estateDelta(record, scan).status).toBe("changed")
+    // The window no longer walks 10 M directories, so a store the scan never saw is found by the bounded discovery
+    // walk of the namespace root. Whatever it borrows decides whether it is churn.
+    test("a store moved into an already-read directory is found by discovery and ignored while it borrows nothing selected", async () => {
+      const { namespace, lender, record, scan } = await scene()
+      const moved = objectDir(join(namespace, "deep", "moved-in"), ".git")
+      const delta = await estateDelta(record, scan, { selected: [lender] })
+      expect(delta.status).toBe("unchanged")
+      expect(delta.status === "unchanged" && delta.discoveredStores).toBe(1)
+      borrow(moved, lender)
+      expect((await estateDelta(record, scan, { selected: [lender] })).status).toBe("changed")
+    })
+
+    // @cto 2026-11-25: a stat or read that fails on an alternates file is a stop naming that file, never a skip.
+    // A directory where the file was is a read failure any user gets (EISDIR), so this holds as root too.
+    test("an alternates file the window cannot read ends the batch by its name", async () => {
+      const { namespace, lender, record, scan } = await scene()
+      const file = join(namespace, "borrower", "objects", "info", "alternates")
+      rmSync(file)
+      mkdirSync(file)
+      const delta = await estateDelta(record, scan, { selected: [lender] })
+      expect(delta.status).toBe("changed")
+      expect(delta.status === "changed" && delta.detail).toContain(file)
     })
 
     test("a changed borrower registry record ends the batch", async () => {
@@ -289,7 +328,7 @@ describe("retention estate scan — gate 3 (#27443(b))", async () => {
       const scan = await scanEstate([namespace], [], DEFAULT_ESTATE_BOUNDS, Date.now, record)
       expect(scan.status).toBe("pass")
       writeFileSync(join(registry, "b.json"), JSON.stringify({ retained: join(namespace, "other"), manifest }))
-      expect(estateDelta(record, scan).status).toBe("changed")
+      expect((await estateDelta(record, scan, { selected: [] })).status).toBe("changed")
     })
   })
 
@@ -352,8 +391,8 @@ describe("retention estate scan — gate 3 (#27443(b))", async () => {
       for (const field of ["dirs", "alternates", "objectLinks", "registries"] as const) {
         expect([...concurrentRecord[field].entries()].sort()).toEqual([...serialRecord[field].entries()].sort())
       }
-      expect(estateDelta(concurrentRecord, concurrent).status).toBe("unchanged")
-      expect(estateDelta(serialRecord, serial).status).toBe("unchanged")
+      expect((await estateDelta(concurrentRecord, concurrent, { selected: [] })).status).toBe("unchanged")
+      expect((await estateDelta(serialRecord, serial, { selected: [] })).status).toBe("unchanged")
     })
 
     test("a directory the walk cannot list still ends the pass as unknown, at any worker count", async () => {
