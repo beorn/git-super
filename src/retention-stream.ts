@@ -422,10 +422,249 @@ export function assertStreamComplete(outcome: GitStreamOutcome, messages: Stream
 
 export const MAX_LINE_LENGTH = 1 << 20
 
+export interface GitLineFramerOptions extends GitStreamOptions {
+  /**
+   * Called once, when stdout crossed its byte cap, its line cap or the per-line bound. The owner must stop the
+   * process it is reading: the framer cannot signal what it did not spawn, and reporting `capped` without stopping
+   * the work would be the buffered failure this module exists to avoid.
+   */
+  readonly onCap?: () => void
+}
+
+/** What the framer cannot observe itself: the process's own result, proved by whoever ran it. */
+export interface GitFramerSettlement {
+  readonly code: number
+  /** The child's stderr as the host captured it; git warns there without a non-zero exit. */
+  readonly stderr?: string
+  readonly timedOut?: boolean
+  /** A settlement failure the host proved (a verdict, a signal, a stall, an unproven teardown). */
+  readonly failure?: string
+  /** Why writing the child's stdin stopped; the read is incomplete even when the child finished on the prefix. */
+  readonly stdinError?: string
+}
+
 /**
- * Spawns git and yields its stdout lines as they arrive, tracking bytes/lines for the caller's
- * cap and deadline checks. The child is a real process, so `capped` and `timedOut` actually stop
- * work instead of buffering an unbounded string first.
+ * The chunk-fed half of {@link gitLineStream}: bytes in, framed lines out, one outcome.
+ *
+ * It owns everything that decides what a line is and when a read is incomplete - the UTF-8 decoder across chunk
+ * boundaries, the byte/line/length bounds, the bounded line queue and its real backpressure - and nothing about
+ * where the bytes come from. {@link gitLineStream} feeds it from a child it spawned; yrd's `adaptProcessGit` feeds
+ * it the stdout a supervised host observes and settles it with that process's own result. One framing, so a
+ * stream past the host's capture limit stays complete instead of arriving as a hole.
+ */
+export interface GitLineFramer extends GitLineStream {
+  /**
+   * Feed bytes read from stdout. The promise resolves when the queue has room again, so a caller that awaits it
+   * stops reading the pipe and the child blocks on write: bounded memory, never a buffered copy.
+   */
+  write(chunk: Uint8Array): Promise<void>
+  /** No more stdout: flush an unterminated final record. The outcome also waits for {@link settle}. */
+  end(): Promise<void>
+  /** The process's own result. Ignored after {@link fail}, which already settles an incomplete read. */
+  settle(result: GitFramerSettlement): void
+  /** stdout could not be read: the read is incomplete whatever the child's exit says. */
+  fail(error: unknown): void
+  /** True once a framing bound was crossed; the owner must stop the process it is reading. */
+  readonly capped: boolean
+}
+
+export function createGitLineStream(options: GitLineFramerOptions = {}): GitLineFramer {
+  const QUEUE_LINES = RETENTION_STREAM_QUEUE_LINES
+  const decoder = new StringDecoder("utf8")
+  const separator = options.framing === "nul" ? "\0" : "\n"
+  const pending: string[] = []
+  let remainder = ""
+  let bytes = 0
+  let lines = 0
+  let capped = false
+  let timedOut = false
+  let readFailed = false
+  let ended = false
+  let processSettled = false
+  let stderr = ""
+  let stdinError: string | undefined
+  let queueHighWater = 0
+  let waiting: (() => void) | undefined
+  let draining: (() => void) | undefined
+  let resolveClose!: (outcome: GitStreamOutcome) => void
+  const closePromise = new Promise<GitStreamOutcome>((resolve) => {
+    resolveClose = resolve
+  })
+  let resolveDone!: () => void
+  const donePromise = new Promise<void>((resolve) => {
+    resolveDone = resolve
+  })
+
+  const wakeConsumer = (): void => {
+    if (waiting !== undefined) {
+      const resolve = waiting
+      waiting = undefined
+      resolve()
+    }
+  }
+  const wakeProducer = (): void => {
+    if (draining !== undefined) {
+      const resolve = draining
+      draining = undefined
+      resolve()
+    }
+  }
+  const push = (line: string): void => {
+    pending.push(line)
+    if (options.onQueueHighWater !== undefined && pending.length > queueHighWater) {
+      queueHighWater = pending.length
+      options.onQueueHighWater(queueHighWater)
+    }
+    wakeConsumer()
+  }
+  // Real backpressure: the producer awaits here while the queue is full, so the reader of the pipe stops pulling
+  // and the child blocks on write. `pause()`/`resume()` are no-ops under an async iterator.
+  const waitForCapacity = async (): Promise<void> => {
+    while (pending.length >= QUEUE_LINES) {
+      await new Promise<void>((resolve) => {
+        draining = resolve
+      })
+    }
+  }
+  const cap = (): void => {
+    if (capped) return
+    capped = true
+    options.onCap?.()
+  }
+  const pump = async (): Promise<void> => {
+    let index = remainder.indexOf(separator)
+    while (index !== -1 && !capped) {
+      const line = remainder.slice(0, index)
+      remainder = remainder.slice(index + 1)
+      if (line.length > MAX_LINE_LENGTH) {
+        cap()
+        return
+      }
+      if (line !== "" || options.framing === "nul") {
+        if (options.maxLines !== undefined && lines >= options.maxLines) {
+          cap()
+          return
+        }
+        lines += 1
+        push(options.framing === "nul" ? `${line}\0` : line)
+        if (pending.length >= QUEUE_LINES) await waitForCapacity()
+      }
+      index = remainder.indexOf(separator)
+    }
+    if (capped) return
+    if (remainder.length > MAX_LINE_LENGTH) {
+      cap()
+      return
+    }
+    if (pending.length >= QUEUE_LINES) await waitForCapacity()
+  }
+
+  const write = async (chunk: Uint8Array): Promise<void> => {
+    if (ended || capped) return
+    bytes += chunk.length
+    if (options.maxBytes !== undefined && bytes > options.maxBytes) {
+      cap()
+      return
+    }
+    remainder += decoder.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+    await pump()
+  }
+
+  const end = async (): Promise<void> => {
+    if (ended) return
+    if (!capped) {
+      const tail = remainder + decoder.end()
+      remainder = ""
+      if (tail !== "") {
+        if (tail.length > MAX_LINE_LENGTH) cap()
+        else if (options.maxLines !== undefined && lines >= options.maxLines) cap()
+        else {
+          await waitForCapacity()
+          lines += 1
+          push(tail)
+        }
+      }
+    }
+    ended = true
+    wakeConsumer()
+    resolveDone()
+  }
+
+  const outcomeOf = (code: number): GitStreamOutcome => ({
+    code,
+    bytes,
+    lines,
+    stderr,
+    timedOut,
+    capped,
+    ...(stdinError === undefined ? {} : { stdinError }),
+  })
+
+  const settle = (result: GitFramerSettlement): void => {
+    if (processSettled) return
+    processSettled = true
+    if (result.stderr !== undefined && result.stderr.trim() !== "") stderr = `${stderr}\n${result.stderr.trim()}`.trim()
+    if (result.timedOut === true) timedOut = true
+    if (result.stdinError !== undefined) stdinError = result.stdinError
+    if (result.failure !== undefined) stderr = `${stderr}\n${result.failure}`.trim()
+    // A stdin source that died mid-write, or a failure the host proved, makes the read incomplete even when the
+    // child then saw EOF and exited 0 on the prefix it got.
+    const truncated = readFailed || capped || timedOut || stdinError !== undefined || result.failure !== undefined
+    const code = result.code !== 0 ? result.code : truncated ? 1 : 0
+    resolveClose(outcomeOf(code))
+  }
+
+  const fail = (error: unknown): void => {
+    if (readFailed) return
+    readFailed = true
+    stderr = `${stderr}\nstdout read failed: ${error instanceof Error ? error.message : String(error)}`.trim()
+    ended = true
+    wakeConsumer()
+    resolveDone()
+    // The close/catch order must not turn a broken read into a clean one.
+    if (!processSettled) {
+      processSettled = true
+      resolveClose(outcomeOf(1))
+    }
+  }
+
+  const lineIterable = (async function* (): AsyncGenerator<string> {
+    for (;;) {
+      while (pending.length > 0) {
+        const line = pending.shift()
+        if (line === undefined) break
+        if (pending.length < QUEUE_LINES) wakeProducer()
+        yield line
+      }
+      if (ended) return
+      await new Promise<void>((resolve) => {
+        waiting = resolve
+      })
+    }
+  })()
+
+  return {
+    lines: lineIterable,
+    outcome: (async () => {
+      const settledOutcome = await closePromise
+      await donePromise
+      return settledOutcome
+    })(),
+    write,
+    end,
+    settle,
+    fail,
+    get capped() {
+      return capped
+    },
+  }
+}
+
+/**
+ * Spawns git and yields its stdout lines as they arrive, tracking bytes/lines for the caller's cap and deadline
+ * checks. The child is a real process, so `capped` and `timedOut` actually stop work instead of buffering an
+ * unbounded string first. The framing itself is {@link createGitLineStream}: this function only spawns, feeds and
+ * settles, so a supervised host can share the framing without spawning anything.
  */
 export function gitLineStream(args: readonly string[], options: GitStreamOptions = {}): GitLineStream {
   const child = spawn(options.executable ?? "git", [...args], {
@@ -440,22 +679,9 @@ export function gitLineStream(args: readonly string[], options: GitStreamOptions
       GIT_OPTIONAL_LOCKS: "0",
     },
   })
-  let bytes = 0
-  let lines = 0
-  let capped = false
   let timedOut = false
   let stderr = ""
   let stdinError: string | undefined
-  // EPIPE when git exits before reading (an empty or refused stdin) must not escape as an unhandled
-  // stream error: the child's own exit status is the reported outcome. Every OTHER stdin failure is
-  // recorded, because it means the child was fed less than the caller asked it to read - the same split
-  // src/process.ts makes, and the reason a truncated input can never pass as a complete one.
-  child.stdin?.on("error", (error: NodeJS.ErrnoException) => {
-    if (error.code !== "EPIPE") stdinError = `stdin failed: ${String(error)}`
-  })
-  child.stderr?.on("data", (chunk: Buffer) => {
-    if (stderr.length < 8192) stderr += chunk.toString("utf8")
-  })
   const kill = (): void => {
     try {
       child.kill("SIGKILL")
@@ -463,6 +689,20 @@ export function gitLineStream(args: readonly string[], options: GitStreamOptions
       // silent-fallback-allow: a child that already exited cannot be signalled; cap/deadline still reported
     }
   }
+  const framer = createGitLineStream({
+    ...options,
+    onCap: kill,
+  })
+  // EPIPE when git exits before reading (an empty or refused stdin) must not escape as an unhandled stream error:
+  // the child's own exit status is the reported outcome. Every OTHER stdin failure is recorded, because it means
+  // the child was fed less than the caller asked it to read - the same split src/process.ts makes, and the reason
+  // a truncated input can never pass as a complete one.
+  child.stdin?.on("error", (error: NodeJS.ErrnoException) => {
+    if (error.code !== "EPIPE") stdinError = `stdin failed: ${String(error)}`
+  })
+  child.stderr?.on("data", (chunk: Buffer) => {
+    if (stderr.length < 8192) stderr += chunk.toString("utf8")
+  })
   const stdinSource = options.stdin
   if (stdinSource !== undefined) {
     void (async (): Promise<void> => {
@@ -510,177 +750,39 @@ export function gitLineStream(args: readonly string[], options: GitStreamOptions
           Math.max(1, options.timeoutMs),
         )
 
-  let resolveClose!: (outcome: GitStreamOutcome) => void
-  const closePromise = new Promise<GitStreamOutcome>((resolve) => {
-    resolveClose = resolve
-  })
-  let resolveDone!: () => void
-  const donePromise = new Promise<void>((resolve) => {
-    resolveDone = resolve
-  })
-  const settle = (code: number): void => {
+  child.on("close", (code) => {
     if (timer !== undefined) clearTimeout(timer)
-    resolveClose({ code, bytes, lines, stderr, timedOut, capped, ...(stdinError === undefined ? {} : { stdinError }) })
-  }
-  child.on("close", (code) => settle(timedOut ? 1 : (code ?? 1)))
+    void framer.end().then(() => {
+      framer.settle({
+        code: timedOut ? 1 : (code ?? 1),
+        stderr,
+        ...(timedOut ? { timedOut: true } : {}),
+        ...(stdinError === undefined ? {} : { stdinError }),
+      })
+    })
+  })
   child.on("error", (error: Error) => {
     stderr = `${stderr}\n${error.message}`.trim()
-    settle(1)
+    void framer.end().then(() => {
+      framer.settle({ code: 1, stderr })
+    })
   })
 
   // The child's stdout is drained EAGERLY from spawn, before it can exit: a fast command such as
   // `cat-file --batch-all-objects` on a small store finishes within a tick, and starting the
   // stdout iteration only when the caller first pulls reads an already ended pipe and silently
   // yields nothing (measured: a lazy read lost the whole output in 30/30 trials, which dropped a
-  // whole store's OIDs from the proof). Decoded lines land in a bounded queue the caller drains;
-  // the reader stops pulling past the bound and resumes as the queue drains, so a slow consumer
-  // cannot grow the queue without limit.
-  const QUEUE_LINES = RETENTION_STREAM_QUEUE_LINES
-  const pending: string[] = []
-  let ended = false
-  let readFailed = false
-  let queueHighWater = 0
-  let waiting: (() => void) | undefined
-  let draining: (() => void) | undefined
-  const wakeConsumer = (): void => {
-    if (waiting !== undefined) {
-      const resolve = waiting
-      waiting = undefined
-      resolve()
-    }
-  }
-  const wakeProducer = (): void => {
-    if (draining !== undefined) {
-      const resolve = draining
-      draining = undefined
-      resolve()
-    }
-  }
-  const push = (line: string): void => {
-    pending.push(line)
-    if (options.onQueueHighWater !== undefined && pending.length > queueHighWater) {
-      queueHighWater = pending.length
-      options.onQueueHighWater(queueHighWater)
-    }
-    wakeConsumer()
-  }
-  // Real backpressure: the producer awaits here while the queue is full, so the async iterator
-  // stops pulling, the pipe fills, and git blocks on write. `pause()`/`resume()` are no-ops under
-  // an async iterator and would let the queue grow without bound.
-  const waitForCapacity = async (): Promise<void> => {
-    while (pending.length >= QUEUE_LINES) {
-      await new Promise<void>((resolve) => {
-        draining = resolve
-      })
-    }
-  }
+  // whole store's OIDs from the proof).
   void (async (): Promise<void> => {
-    const decoder = new StringDecoder("utf8")
-    let remainder = ""
-    const separator = options.framing === "nul" ? "\0" : "\n"
+    const source = options.stdout ?? (child.stdout as AsyncIterable<Buffer>)
     try {
-      const source = options.stdout ?? (child.stdout as AsyncIterable<Buffer>)
-      for await (const chunk of source) {
-        bytes += chunk.length
-        if (options.maxBytes !== undefined && bytes > options.maxBytes) {
-          capped = true
-          kill()
-          break
-        }
-        remainder += decoder.write(chunk)
-        let index = remainder.indexOf(separator)
-        while (index !== -1) {
-          const line = remainder.slice(0, index)
-          remainder = remainder.slice(index + 1)
-          if (line.length > MAX_LINE_LENGTH) {
-            capped = true
-            kill()
-            break
-          }
-          if (line !== "" || options.framing === "nul") {
-            if (options.maxLines !== undefined && lines >= options.maxLines) {
-              capped = true
-              kill()
-              break
-            }
-            lines += 1
-            push(options.framing === "nul" ? `${line}\0` : line)
-            if (capped) break
-            if (pending.length >= QUEUE_LINES) await waitForCapacity()
-          }
-          index = remainder.indexOf(separator)
-        }
-        if (capped) break
-        if (remainder.length > MAX_LINE_LENGTH) {
-          capped = true
-          kill()
-          break
-        }
-        if (pending.length >= QUEUE_LINES) await waitForCapacity()
-      }
-      if (!capped) {
-        const tail = remainder + decoder.end()
-        if (tail !== "") {
-          if (tail.length > MAX_LINE_LENGTH) {
-            capped = true
-            kill()
-            return
-          }
-          if (options.maxLines !== undefined && lines >= options.maxLines) {
-            capped = true
-            kill()
-            return
-          }
-          if (pending.length >= QUEUE_LINES) await waitForCapacity()
-          lines += 1
-          push(tail)
-        }
-      }
-    } finally {
-      ended = true
-      wakeConsumer()
-      resolveDone()
-    }
-  })().catch((error: unknown) => {
-    // A stdout read failure is never a silent short read: it lands in `stderr` and forces a
-    // non-zero code whatever the close/catch order, so the caller maps the source to `unknown`
-    // instead of trusting a partial list.
-    readFailed = true
-    stderr = `${stderr}\nstdout read failed: ${error instanceof Error ? error.message : String(error)}`.trim()
-    ended = true
-    wakeConsumer()
-    resolveDone()
-    settle(1)
-  })
-
-  const lineIterable = (async function* (): AsyncGenerator<string> {
-    for (;;) {
-      while (pending.length > 0) {
-        const line = pending.shift()
-        if (line === undefined) break
-        if (pending.length < QUEUE_LINES) wakeProducer()
-        yield line
-      }
-      if (ended) return
-      await new Promise<void>((resolve) => {
-        waiting = resolve
-      })
+      for await (const chunk of source) await framer.write(chunk)
+    } catch (error) {
+      framer.fail(error)
     }
   })()
 
-  return {
-    lines: lineIterable,
-    outcome: (async () => {
-      const settled = await closePromise
-      await donePromise
-      // A stdin source that died mid-write makes the read incomplete even when the child then saw EOF and
-      // exited 0 on the prefix it got: the outcome must still fail, or `assertStreamComplete` reads a
-      // truncated input as a clean one.
-      const truncated = readFailed || capped || timedOut || stdinError !== undefined
-      const code = settled.code !== 0 ? settled.code : truncated ? 1 : 0
-      return { code, bytes, lines, stderr, timedOut, capped, ...(stdinError === undefined ? {} : { stdinError }) }
-    })(),
-  }
+  return framer
 }
 
 export interface MergeSource {
