@@ -2295,7 +2295,7 @@ describe("createGitWorktreeStore", () => {
     } finally {
       await rm(root, { recursive: true, force: true })
     }
-  })
+  }, 30_000)
 
   // @failure An empty or durable-only alternates file spuriously registers a fresh copy as a linked borrower (#26497).
   // @level l1

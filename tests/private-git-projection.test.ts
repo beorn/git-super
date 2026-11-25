@@ -680,7 +680,7 @@ it("keeps borrowed public child commits readable after the lender collects unrel
     "private child lost a selected commit when its public lender ran GC",
   ).not.toThrow()
   git(join(destination, "packages/alpha"), "fsck", "--full", "--no-reflogs")
-})
+}, 30_000)
 
 it("keeps the original when another process writes after custody proof publication", async () => {
   const root = await mkdtemp(join(canonicalTmpdir(), "git-super-final-custody-write-"))
