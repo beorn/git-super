@@ -134,8 +134,10 @@ describe("danglingRefs", () => {
         )
       },
     }
+    // Assert the adapter's own contract, not gitomic's argv: gitomic adds --buffer in some builds, so the
+    // exact args are not git-super's to pin (CI and a local install disagreed on it, 2026-11-25).
     await expect(danglingRefs(stub, repository)).rejects.toThrow(
-      `git cat-file --batch-check=%(objectname) %(objecttype) failed (1) in ${repository}: object database unavailable`,
+      /git cat-file --batch-check=.* failed \(1\) in \/missing-object-store: object database unavailable/,
     )
   })
 })
