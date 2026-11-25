@@ -24,6 +24,21 @@ import { shellQuote } from "./shell-command.ts"
 import { gitLineStream, type GitLineStream } from "./retention-stream.ts"
 
 export {
+  assertStreamComplete,
+  createGitLineStream,
+  gitLineStream,
+  MAX_LINE_LENGTH,
+  RETENTION_STREAM_QUEUE_LINES,
+  type GitFramerSettlement,
+  type GitLineFramer,
+  type GitLineFramerOptions,
+  type GitLineStream,
+  type GitStreamOptions,
+  type GitStreamOutcome,
+  type StreamFaultMessages,
+} from "./retention-stream.ts"
+
+export {
   applyGitObjectContext,
   cleanGitEnvironment,
   cleanGitRepositoryEnvironment,
