@@ -110,7 +110,7 @@ describe("exclusive writer policy", () => {
       })
       const startedAt = Date.now()
       await expect(acquireExclusive(dir, { timeoutMs: 25 }, "second mutation")).rejects.toThrow(
-        /lock is busy after \d+ms \(timeout=25ms; live holder: .*?; recorded note, not authority: holder=first mutation; age=\d+ms;.*operation=second mutation/u,
+        /lock is busy after \d+ms \(timeout=25ms; live holder(?:: .*?| unknown \(.*?\)); recorded note, not authority: holder=first mutation; age=\d+ms;.*operation=second mutation/u,
       )
       expect(Date.now() - startedAt).toBeGreaterThanOrEqual(25)
     } finally {
@@ -302,6 +302,12 @@ describe("exclusive writer policy", () => {
       const pid = await deadPid()
       const path = await lease(JSON.stringify({ pid, startedAt: new Date().toISOString(), holder: "git super push" }))
       const reap = reapStaleWriterLease(path)
+      if (process.platform !== "linux") {
+        // Without procfs there is no kernel holder proof, so a dead pid alone must never be treated as stale.
+        expect(reap).toEqual({ reaped: false, why: "kernel holder lookup unavailable on this platform" })
+        expect(await readFile(path, "utf8")).toContain(String(pid))
+        return
+      }
       expect(reap).toEqual({
         reaped: true,
         pid,
@@ -331,6 +337,12 @@ describe("exclusive writer policy", () => {
       const holder = tryAcquireFlock(path, { body: JSON.stringify({ pid: await deadPid() }) })
       expect(holder).not.toBeNull()
       try {
+        if (process.platform !== "linux") {
+          // The flock is real, but only procfs can show it; the contract on this platform is the same refusal.
+          expect(reapStaleWriterLease(path)).toMatchObject({ reaped: false, why: expect.stringContaining("kernel holder") })
+          expect(existsSync(path)).toBe(true)
+          return
+        }
         // procfs publishes the row just after the syscall returns, so wait for the kernel to show it.
         await vi.waitFor(() => {
           const shown = formatLockHolders(fileLockHolders([path], { self: process.pid }))
