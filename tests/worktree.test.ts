@@ -3719,3 +3719,62 @@ describe("submodule materialization under host load", () => {
     }
   })
 })
+
+describe("store.materializeSubmodules checkoutOmissions (hh#37605)", () => {
+  /**
+   * @failure A landing tree materialized with an omission still checks out the omitted component directory, so every
+   * landing pays its full size again (hh /hh/dev-rev: 6.2 GB of vendor/terminfo.dev/content per tree), or the
+   * omission also drops the component's other files.
+   * @level l1
+   * @consumer hh shared-main updater materializeLandingTree (/hh/dev-rev landing trees)
+   */
+  it("leaves the named directory out of a component's fresh checkout and keeps the rest", async () => {
+    const root = await mkdtemp(join(tmpdir(), "git-super-omit-"))
+    const subRemote = join(root, "sub-remote.git")
+    const repo = join(root, "owner")
+    const tree = join(root, "landing")
+    try {
+      git(root, ["init", "-q", "--bare", "-b", "main", subRemote])
+      const subWork = join(root, "sub-work")
+      git(root, ["clone", "-q", subRemote, subWork])
+      git(subWork, ["config", "user.email", "test@example.com"])
+      git(subWork, ["config", "user.name", "Test"])
+      await mkdir(join(subWork, "content", "deep"), { recursive: true })
+      await mkdir(join(subWork, "src"), { recursive: true })
+      await writeFile(join(subWork, "content", "deep", "data.json"), "{}\n")
+      await writeFile(join(subWork, "src", "main.ts"), "export {}\n")
+      await writeFile(join(subWork, "package.json"), "{}\n")
+      git(subWork, ["add", "."])
+      git(subWork, ["commit", "-q", "-m", "init sub"])
+      git(subWork, ["push", "-q", "origin", "main"])
+
+      git(root, ["init", "-q", "-b", "main", repo])
+      git(repo, ["config", "user.email", "test@example.com"])
+      git(repo, ["config", "user.name", "Test"])
+      await writeFile(join(repo, "root.txt"), "root\n")
+      git(repo, ["add", "root.txt"])
+      git(repo, ["commit", "-q", "-m", "init root"])
+      git(repo, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", subRemote, "vendor/sub"])
+      git(repo, ["commit", "-q", "-m", "add submodule"])
+
+      const store = createLocalGitWorktreeStore({ repo })
+      await store.add({ kind: "detached", path: tree, ref: "HEAD" })
+      await store.materializeSubmodules(tree, { checkoutOmissions: new Map([["vendor/sub", ["content"]]]) })
+
+      const present = async (path: string): Promise<boolean> =>
+        fsPromises.access(path).then(
+          () => true,
+          () => false,
+        )
+      expect(await present(join(tree, "vendor/sub/content"))).toBe(false)
+      expect(await readFile(join(tree, "vendor/sub/src/main.ts"), "utf8")).toBe("export {}\n")
+      expect(await readFile(join(tree, "vendor/sub/package.json"), "utf8")).toBe("{}\n")
+      // The omission is a sparse checkout, so the content comes back on demand without a new tree.
+      git(join(tree, "vendor/sub"), ["sparse-checkout", "disable"])
+      expect(await readFile(join(tree, "vendor/sub/content/deep/data.json"), "utf8")).toBe("{}\n")
+    } finally {
+      // raw-delete-allow: root is this test's fresh mkdtemp fixture, never a caller-supplied worktree.
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+})
