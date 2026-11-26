@@ -2050,12 +2050,13 @@ export type RemoteRedundancyOutcome =
   | Readonly<{ status: "unproven"; detail: string }>
 
 /**
- * The most advertised refs one tip's ancestry is asked of before the fast path gives up. A tip past the bound falls
- * back to the witness and fsck proof it had before, so the bound can only cost time, never correctness. Measured
- * 2026-11-23: a store can advertise thousands of archive refs (terminfo.dev answered 4,458), so the bound is generous
- * and the candidates are ranked - a same-named branch is asked first, which is where a moved tip is published.
+ * How many advertised tips ONE `rev-list --not` walk carries. Every carried candidate is asked, chunk by chunk, so the
+ * proof covers the whole advertisement and a missing proof walks every ref (@cto 2026-11-26, #34127). The old bound
+ * stopped at the first 64 and reported the tip unproven, which cost an ENTRY its fast path: a 50-entry sample found
+ * both of its unproven components were reachable refs ranked past 64 (4,578 and 7,662 advertised), and one unproven
+ * component sends the whole entry to a witness fsck that measured 840 s of a 960 s batch budget.
  */
-const MAX_ANCESTRY_CANDIDATES = 64
+const ANCESTRY_WALK_CHUNK = 512
 
 /**
  * How many advertised tips one presence read carries. `rev-list --stdin` is not available to the injected runner, so
@@ -2299,12 +2300,12 @@ export async function proveRemoteRedundancy(
         for (const candidate of order) {
           if (await carriedHere(candidate[0], candidate[1])) carried.push(candidate)
         }
-        const allowed = carried.slice(0, MAX_ANCESTRY_CANDIDATES)
-        // ONE walk answers "does any advertised ref reach this tip" for the whole candidate set. The loop it replaces
-        // asked `merge-base --is-ancestor` per candidate and so paid the full bound even when no proof existed, which
-        // is the case for nearly every entry; the ordered loop stays only to NAME the proving ref, and stops at the
-        // first positive answer exactly as it always did.
-        if (allowed.length > 0) {
+        // ONE walk per chunk answers "does any advertised ref in this chunk reach the tip", so EVERY carried
+        // candidate is asked and a missing proof walks the whole advertisement. The chunk that answers is then walked
+        // in rank order to NAME the proving ref, which is what the receipt reports.
+        let proving: readonly (readonly [string, string])[] | undefined
+        for (let index = 0; index < carried.length && proving === undefined; index += ANCESTRY_WALK_CHUNK) {
+          const chunk = carried.slice(index, index + ANCESTRY_WALK_CHUNK)
           const anyProof = await storeRun(
             [
               `--git-dir=${gitDir}`,
@@ -2312,7 +2313,7 @@ export async function proveRemoteRedundancy(
               "--max-count=1",
               tip,
               "--not",
-              ...allowed.map(([, candidateTip]) => candidateTip),
+              ...chunk.map(([, candidateTip]) => candidateTip),
             ],
             budget(),
           )
@@ -2321,35 +2322,31 @@ export async function proveRemoteRedundancy(
               `${label}: the advertised refs could not be walked against ${tip} (${anyProof.stderr.trim() || `exit ${String(anyProof.code)}`}); the tip is kept, never proven`,
             )
           }
-          // An empty walk excluded every commit, so at least one candidate reaches the tip.
-          if (anyProof.stdout.trim() === "") {
-            for (const [candidateRef, candidateTip] of allowed) {
-              const answer = await storeRun(
-                [`--git-dir=${gitDir}`, "merge-base", "--is-ancestor", tip, candidateTip],
-                budget(),
-              )
-              if (answer.stderr.trim() === "" && answer.code === 0) {
-                remoteRef = candidateRef
-                break
-              }
-              if (answer.stderr.trim() !== "" || answer.code !== 1) {
-                return unproven(
-                  `${label}: merge-base --is-ancestor ${tip} ${candidateTip} answered ${String(answer.code)} (${answer.stderr.trim() || "no stderr"}); the tip is kept, never proven`,
-                )
-              }
+          // An empty walk excluded every commit, so at least one candidate in this chunk reaches the tip.
+          if (anyProof.stdout.trim() === "") proving = chunk
+        }
+        if (proving !== undefined) {
+          for (const [candidateRef, candidateTip] of proving) {
+            const answer = await storeRun(
+              [`--git-dir=${gitDir}`, "merge-base", "--is-ancestor", tip, candidateTip],
+              budget(),
+            )
+            if (answer.stderr.trim() === "" && answer.code === 0) {
+              remoteRef = candidateRef
+              break
             }
-            // The walk says a proof exists among these refs but no single one reproduces it: unknown, never redundant.
-            if (remoteRef === undefined) {
+            if (answer.stderr.trim() !== "" || answer.code !== 1) {
               return unproven(
-                `${label}: the walk proved ${tip} reachable from the advertised refs together, but no single advertised ref reaches it; the tip is kept, never proven`,
+                `${label}: merge-base --is-ancestor ${tip} ${candidateTip} answered ${String(answer.code)} (${answer.stderr.trim() || "no stderr"}); the tip is kept, never proven`,
               )
             }
           }
-        }
-        if (remoteRef === undefined && carried.length > MAX_ANCESTRY_CANDIDATES) {
-          return unproven(
-            `${label}: ${refs.join(", ")} at ${tip} was asked of the first ${String(MAX_ANCESTRY_CANDIDATES)} of ${String(carried.length)} advertised ref(s) only; the entry keeps its witness proof`,
-          )
+          // The walk says a proof exists among these refs but no single one reproduces it: unknown, never redundant.
+          if (remoteRef === undefined) {
+            return unproven(
+              `${label}: the walk proved ${tip} reachable from the advertised refs together, but no single advertised ref reaches it; the tip is kept, never proven`,
+            )
+          }
         }
       }
       if (remoteRef === undefined) {

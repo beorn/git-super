@@ -238,4 +238,36 @@ describe("retention redundancy against a live remote snapshot (#37792)", () => {
     if (outcome.status !== "unproven") return
     expect(outcome.detail).toContain("names a blob")
   })
+
+  // @cto 2026-11-26: the whole advertisement is asked, so a proving ref that ranks past the old 64-candidate bound
+  // still proves. Measured on the estate: both unproven components in a 50-entry sample were exactly this case
+  // ("first 64 of 4,578" and "first 64 of 7,662"), and one unprovable component sends its entry to an 840 s fsck.
+  it("proves a tip whose proving ref ranks past the old 64-candidate bound", async () => {
+    const fixture = storeFor("full-walk")
+    // An unrelated commit the store also holds, so all 80 side refs are real, askable candidates.
+    git(fixture.remote, ["checkout", "-q", "--orphan", "side"])
+    writeFileSync(join(fixture.remote, "side.ts"), "export const side = 1\n")
+    git(fixture.remote, ["add", "side.ts"])
+    git(fixture.remote, ["commit", "-q", "-m", "unrelated"])
+    const orphan = git(fixture.remote, ["rev-parse", "HEAD"])
+    git(fixture.remote, ["checkout", "-q", "main"])
+    for (let index = 0; index < 80; index += 1) {
+      git(fixture.remote, ["update-ref", `refs/heads/side-${String(index)}`, orphan])
+    }
+    // The tip is advertised ONLY under the last-ranked namespace, behind 80 branches that do not reach it.
+    git(fixture.remote, ["update-ref", "refs/remotes/upstream/main", fixture.second])
+    git(fixture.remote, ["update-ref", "-d", "refs/heads/main"])
+    git(fixture.store, ["update-ref", "refs/heads/main", fixture.first])
+    git(fixture.store, ["fetch", "-q", "origin", "refs/heads/side-0:refs/heads/side-0"])
+    const outcome = await prove(fixture.store)
+    expect(outcome.status).toBe("redundant")
+    if (outcome.status !== "redundant") return
+    // The side branch fetched into the store proves too; the one under test is the tip behind the 80 candidates.
+    expect(outcome.proof.reached).toEqual(
+      expect.arrayContaining([
+        { ref: "refs/heads/main", tip: fixture.first, remoteRef: "refs/remotes/upstream/main" },
+      ]),
+    )
+    expect(outcome.proof.advertisedRefs).toBeGreaterThan(64)
+  })
 })
