@@ -60,6 +60,31 @@ function tmp(prefix: string): string {
   return path
 }
 
+// 34127 (@cto 84ff4789): the witness presence walk is a real git child in every fixture, and a test that fakes the
+// fragment walk's output must not answer for it — otherwise the store is judged on the fake's lines instead of its bytes.
+const fragmentWalks =
+  (fake: GitStreamFactory): GitStreamFactory =>
+  (args, options) =>
+    args.includes("--stdin") ? defaultGitStream(args, options) : fake(args, options)
+
+// 34127 (@cto 84ff4789): "the store was health-checked" now means the unique-object walk (a stream child) or, for a store
+// whose only durable ref names a tree or a blob, its `cat-file -e` presence check (a run child). Other custody reads use
+// the `^{commit}` peel, so an unpeeled `cat-file -e` here is exactly this walk's presence check.
+const healthReads = (sink: string[]): Readonly<{ run: GitRun; stream: GitStreamFactory }> => ({
+  run: (args, options) => {
+    const at = args.indexOf("-e")
+    const oid = at === -1 ? undefined : args[at + 1]
+    if (args.includes("cat-file") && oid !== undefined && !oid.startsWith("-") && !oid.includes("^")) {
+      sink.push(args.find((arg) => arg.startsWith("--git-dir="))!.slice(10))
+    }
+    return defaultGitRun(args, options)
+  },
+  stream: (args, options) => {
+    if (args.includes("--missing=print")) sink.push(args.find((arg) => arg.startsWith("--git-dir="))!.slice(10))
+    return defaultGitStream(args, options)
+  },
+})
+
 const environment: NodeJS.ProcessEnv = {
   ...process.env,
   GIT_AUTHOR_NAME: "Gate5",
@@ -229,14 +254,14 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     let drained = false
     const scan = await scanCustody(store.root, [component], [join(store.root, ".git", "objects")], [], {
       sidecarDir,
-      stream: () => ({
+      stream: fragmentWalks(() => ({
         lines: (async function* () {
           yield "partial"
           yield store.head
           drained = true
         })(),
         outcome: Promise.resolve({ ...outcome, bytes: 48, lines: 2 }),
-      }),
+      })),
     })
     expect(scan.status).toBe(status)
     expect(scan.detail).toContain(detail)
@@ -252,7 +277,7 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     let highWater = 0
     const scan = await scanCustody(store.root, [component], [join(store.root, ".git", "objects")], [], {
       sidecarDir,
-      stream: () =>
+      stream: fragmentWalks(() =>
         gitLineStream(["--version"], {
           onQueueHighWater: (depth) => {
             highWater = Math.max(highWater, depth)
@@ -262,6 +287,7 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
             throw new Error("injected stdout read failure after queue")
           })(),
         }),
+      ),
     })
     expect(scan.status).toBe("blocked")
     expect(scan.detail).toContain("failed in witness store")
@@ -565,17 +591,22 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     "blocked",
   ])("one shared witness index serves two members exactly as two separate builds do: %s (#35062)", async (kind) => {
     const fixture = custodyCase(kind)
+    // 34127 (@cto 84ff4789): the store health read is the pointed unique-object walk, not a whole-store fsck, so this
+    // counts the walk's own child. One per store per build, never per member, is what the shared index must show.
     let fsck = 0
-    const run: GitRun = (args, options) => {
-      if (args.includes("fsck")) fsck += 1
-      return defaultGitRun(args, options)
+    const stream: GitStreamFactory = (args, options) => {
+      if (args.includes("--missing=print")) fsck += 1
+      return defaultGitStream(args, options)
     }
     const halves = [fixture.atRisk.filter((_, at) => at % 2 === 0), fixture.atRisk.filter((_, at) => at % 2 === 1)]
     const separate: CustodyScan[] = []
     for (const half of halves) {
       const sidecarDir = tmp("git-super-custody-separate-sidecars-")
       separate.push(
-        await scanCustody(fixture.root, [await componentOf(half, sidecarDir)], fixture.stores, [], { sidecarDir, run }),
+        await scanCustody(fixture.root, [await componentOf(half, sidecarDir)], fixture.stores, [], {
+          sidecarDir,
+          stream,
+        }),
       )
     }
     const separateFsck = fsck
@@ -587,7 +618,7 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
       shared.push(
         await scanCustody(fixture.root, [await componentOf(half, sidecarDir)], fixture.stores, [], {
           sidecarDir,
-          run,
+          stream,
           indexScope,
         }),
       )
@@ -595,7 +626,7 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     const zeroDir = tmp("git-super-custody-shared-zero-")
     const zero = await scanCustody(fixture.root, [await componentOf([], zeroDir)], fixture.stores, [], {
       sidecarDir: zeroDir,
-      run,
+      stream,
       indexScope,
     })
     const stores = new Set(fixture.stores.map((store) => realpathSync(store))).size
@@ -810,7 +841,7 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
       bounds: { ...DEFAULT_CUSTODY_BOUNDS, reachableMs },
       clock: () => clock,
       deadline,
-      stream(args, options) {
+      stream: fragmentWalks(function (args, options) {
         if (!(args.includes("rev-list") && args.includes("--objects"))) return defaultGitStream(args, options)
         // The child runs until its (clamped) timeout and is killed there.
         clock += options?.timeoutMs ?? 0
@@ -818,7 +849,7 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
           lines: (async function* () {})(),
           outcome: Promise.resolve({ code: 1, bytes: 0, lines: 0, stderr: "", timedOut: true, capped: false }),
         }
-      },
+      }),
     })
     expect(scan.status).toBe("unknown")
     expect(scan.detail).toContain(says)
@@ -932,14 +963,27 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     const store = repoWithCommit("git-super-custody-")
     const sidecarDir = tmp("git-super-custody-sidecars-")
     const component = await componentOf([store.head], sidecarDir, "owned")
-    const broken: GitRun = (args, options) =>
-      args.includes("fsck") ? { code: 1, stdout: "", stderr: "missing blob" } : defaultGitRun(args, options)
+    // 34127 (@cto 84ff4789): the store health read is the unique-object walk, so the broken store is a walk that fails.
+    const broken: GitStreamFactory = (args, options) =>
+      args.includes("--missing=print")
+        ? {
+            lines: (async function* () {})(),
+            outcome: Promise.resolve({
+              code: 1,
+              bytes: 0,
+              lines: 0,
+              stderr: "missing blob",
+              timedOut: false,
+              capped: false,
+            }),
+          }
+        : defaultGitStream(args, options)
     const scan = await scanCustody(store.root, [component], [join(store.root, ".git", "objects")], [], {
       sidecarDir,
-      run: broken,
+      stream: broken,
     })
     expect(scan.status).toBe("blocked")
-    expect(scan.detail).toContain("fsck --connectivity-only failed")
+    expect(scan.detail).toContain("rev-list --objects --missing=print")
     expect(scan.detail).toContain("unreadable witness store(s) excluded")
   })
 
@@ -954,16 +998,26 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     git(clone, ["clone", "-q", "--no-hardlinks", store.root, "work"])
     const cloneGitDir = join(clone, "work", ".git")
     const flag = "--git-dir=" + cloneGitDir
-    const broken: GitRun = (args, options) =>
-      args.includes("fsck") && args.some((arg) => arg.includes(flag))
-        ? { code: 1, stdout: "", stderr: "fatal: not a git repository" }
-        : defaultGitRun(args, options)
+    const broken: GitStreamFactory = (args, options) =>
+      args.includes("--missing=print") && args.some((arg) => arg.includes(flag))
+        ? {
+            lines: (async function* () {})(),
+            outcome: Promise.resolve({
+              code: 1,
+              bytes: 0,
+              lines: 0,
+              stderr: "fatal: not a git repository",
+              timedOut: false,
+              capped: false,
+            }),
+          }
+        : defaultGitStream(args, options)
     const scan = await scanCustody(
       store.root,
       [component],
       [join(store.root, ".git", "objects"), join(cloneGitDir, "objects")],
       [],
-      { sidecarDir, run: broken },
+      { sidecarDir, stream: broken },
     )
     expect(scan.status, scan.detail).toBe("pass")
     expect(scan.detail).toContain("unreadable witness store(s) excluded")
@@ -976,10 +1030,20 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
   test("a shared witness index built once names the same corrupt stores to the next member without re-fscking", async () => {
     const fixture = custodyCase("shared history")
     let fsck = 0
-    const broken: GitRun = (args, options) => {
-      if (!args.includes("fsck")) return defaultGitRun(args, options)
+    const broken: GitStreamFactory = (args, options) => {
+      if (!args.includes("--missing=print")) return defaultGitStream(args, options)
       fsck += 1
-      return { code: 1, stdout: "", stderr: "missing blob" }
+      return {
+        lines: (async function* () {})(),
+        outcome: Promise.resolve({
+          code: 1,
+          bytes: 0,
+          lines: 0,
+          stderr: "missing blob",
+          timedOut: false,
+          capped: false,
+        }),
+      }
     }
     const indexScope = new CustodyIndexScope(tmp("git-super-custody-failed-build-"))
     const scans: CustodyScan[] = []
@@ -989,7 +1053,7 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
       scans.push(
         await scanCustody(fixture.root, [await componentOf([oid], sidecarDir)], fixture.stores, [], {
           sidecarDir,
-          run: broken,
+          stream: broken,
           indexScope,
         }),
       )
@@ -998,7 +1062,7 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     expect(scans.map((scan) => scan.status)).toEqual(["blocked", "blocked"])
     const excluded = (detail: string): string => detail.slice(detail.indexOf("2 unreadable witness store(s)"))
     expect(excluded(scans[1]!.detail)).toBe(excluded(scans[0]!.detail))
-    expect(scans[0]!.detail).toContain("fsck --connectivity-only failed")
+    expect(scans[0]!.detail).toContain("rev-list --objects --missing=print")
     expect(fscksAfter[0]).toBeGreaterThan(0)
     expect(fscksAfter[1]).toBe(fscksAfter[0])
     // A fresh scope (the held window, a later run) builds again and sees the recovery (@cto 0606 §2).
@@ -1062,17 +1126,22 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     const clock = (): number => now
     let fscks = 0
     let cutting = true
-    const cutRun: GitRun = async (args, runOptions) => {
-      if (!args.includes("fsck")) return defaultGitRun(args, runOptions)
+    const cutStream: GitStreamFactory = (args, options) => {
+      if (!args.includes("--missing=print")) return defaultGitStream(args, options)
       fscks += 1
-      return cutting ? { code: 0, stdout: "", stderr: "", timedOut: true } : defaultGitRun(args, runOptions)
+      return cutting
+        ? {
+            lines: (async function* () {})(),
+            outcome: Promise.resolve({ code: 0, bytes: 0, lines: 0, stderr: "", timedOut: true, capped: false }),
+          }
+        : defaultGitStream(args, options)
     }
     const indexScope = new CustodyIndexScope(tmp("git-super-custody-fsck-deadline-index-"))
     const runScope = new CustodyRunScope(tmp("git-super-custody-fsck-deadline-fragments-"))
     const cutDir = tmp("git-super-custody-fsck-deadline-cut-")
     const first = await scanCustody(fixture.root, [await componentOf([fixture.atRisk[0]!], cutDir)], stores, [], {
       sidecarDir: cutDir,
-      run: cutRun,
+      stream: cutStream,
       clock,
       deadline: now + 1_000,
       indexScope,
@@ -1088,7 +1157,7 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     const provedDir = tmp("git-super-custody-fsck-deadline-proved-")
     const second = await scanCustody(fixture.root, [await componentOf([fixture.atRisk[0]!], provedDir)], stores, [], {
       sidecarDir: provedDir,
-      run: cutRun,
+      stream: cutStream,
       clock,
       deadline: now + 600_000,
       indexScope,
@@ -1103,10 +1172,20 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     const brokenStore = fixture.stores[1]
     expect(brokenStore).toBeDefined()
     const brokenFlag = "--git-dir=" + dirname(brokenStore as string)
-    const broken: GitRun = (args, options) =>
-      args.includes("fsck") && args.some((arg) => arg.includes(brokenFlag))
-        ? { code: 1, stdout: "", stderr: "missing blob" }
-        : defaultGitRun(args, options)
+    const broken: GitStreamFactory = (args, options) =>
+      args.includes("--missing=print") && args.some((arg) => arg.includes(brokenFlag))
+        ? {
+            lines: (async function* () {})(),
+            outcome: Promise.resolve({
+              code: 1,
+              bytes: 0,
+              lines: 0,
+              stderr: "missing blob",
+              timedOut: false,
+              capped: false,
+            }),
+          }
+        : defaultGitStream(args, options)
     const scanAt = async (ahead: string): Promise<CustodyScan> => {
       const sidecarDir = tmp("git-super-witness-order-member-")
       const oid = fixture.atRisk[0]
@@ -1115,7 +1194,7 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
       try {
         return await scanCustody(fixture.root, [await componentOf([oid as string], sidecarDir)], fixture.stores, [], {
           sidecarDir,
-          run: broken,
+          stream: broken,
           indexScope: new CustodyIndexScope(tmp("git-super-witness-order-index-")),
         })
       } finally {
@@ -1140,17 +1219,18 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
       const empty = realpathSync(tmp("git-super-custody-nonwitness-empty-"))
       git(empty, ["init", "-q", "--bare"])
       const fsckIn: string[] = []
-      const counting: GitRun = (args, options) => {
-        if (args.includes("fsck")) fsckIn.push(args.find((arg) => arg.startsWith("--git-dir="))!.slice(10))
-        return defaultGitRun(args, options)
-      }
+      const counting = healthReads(fsckIn)
       const stores = [
         join(empty, "objects"),
         ...(kind === "a valid survivor witnesses" ? [join(survivor.root, ".git", "objects")] : []),
       ]
       const sidecarDir = tmp("git-super-custody-nonwitness-sidecars-")
       const component = await componentOf([survivor.head], sidecarDir, "owned", { [survivor.head]: "commit" })
-      const scan = await scanCustody(survivor.root, [component], stores, [], { sidecarDir, run: counting })
+      const scan = await scanCustody(survivor.root, [component], stores, [], {
+        sidecarDir,
+        run: counting.run,
+        stream: counting.stream,
+      })
       expect(scan.detail).toContain(`1 witness store(s) with no admitted durable refs; fsck not run: ${empty}`)
       expect(fsckIn).not.toContain(empty)
       expect(scan.witnesses.map((witness) => witness.store)).not.toContain(join(empty, "objects"))
@@ -1179,15 +1259,13 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
       git(holder, ["tag", `only-${kind}`, root])
       expect(git(holder, ["for-each-ref", "--format=%(refname) %(objecttype)"])).toBe(`refs/tags/only-${kind} ${kind}`)
       const fsckIn: string[] = []
-      const counting: GitRun = (args, options) => {
-        if (args.includes("fsck")) fsckIn.push(args.find((arg) => arg.startsWith("--git-dir="))!.slice(10))
-        return defaultGitRun(args, options)
-      }
+      const counting = healthReads(fsckIn)
       const sidecarDir = tmp("git-super-custody-noncommit-only-sidecars-")
       const component = await componentOf([root], sidecarDir, "owned", { [root]: kind })
       const scan = await scanCustody(holder, [component], [join(holder, ".git", "objects")], [], {
         sidecarDir,
-        run: counting,
+        run: counting.run,
+        stream: counting.stream,
       })
       expect(scan.status, scan.detail).toBe("pass")
       expect(scan.witnesses).toEqual([expect.objectContaining({ ref: `refs/tags/only-${kind}`, tip: root })])
@@ -1207,15 +1285,13 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     git(primary, ["update-ref", "-d", "refs/heads/main"])
     expect(git(primary, ["for-each-ref", "refs/heads", "refs/tags"])).toBe("")
     const fsckIn: string[] = []
-    const counting: GitRun = (args, options) => {
-      if (args.includes("fsck")) fsckIn.push(args.find((arg) => arg.startsWith("--git-dir="))!.slice(10))
-      return defaultGitRun(args, options)
-    }
+    const counting = healthReads(fsckIn)
     const sidecarDir = tmp("git-super-custody-nonwitness-published-sidecars-")
     const component = { ...(await componentOf([landed], sidecarDir, "reflog logs/HEAD")), gitDir: join(work, ".git") }
     const scan = await scanCustody(work, [component], [join(primary, ".git", "objects")], [], {
       sidecarDir,
-      run: counting,
+      run: counting.run,
+      stream: counting.stream,
       witnessPolicy: { targetBranch: "main" },
     })
     expect(scan.status, scan.detail).toBe("pass")
@@ -1253,8 +1329,84 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     rmSync(join(gitDir, "objects", blob.slice(0, 2), blob.slice(2)), { force: true })
     const scan = await scanCustody(store.root, [component], [join(gitDir, "objects")], [], { sidecarDir })
     expect(scan.status).toBe("blocked")
-    expect(scan.detail).toContain("fsck --connectivity-only failed")
+    // 34127 (@cto 84ff4789): a blob the origin copy also reaches is the origin proof's business, so the presence walk
+    // stays quiet and the fragment walk is what names the store unreadable. Either way it is excluded, never custody.
+    expect(scan.detail).toContain("unreadable witness store(s) excluded")
+    expect(scan.detail).toContain("missing blob")
     expect(scan.detail).not.toContain("cannot chdir")
+  })
+
+  /**
+   * 34127 (@cto 84ff4789): the store health read is the pointed unique-object walk, never a whole-store
+   * `fsck --connectivity-only` — that spent 840 s of one entry's 960 s budget on the live estate's 213k-object store.
+   * What needs a second copy is only what origin does not publish, so the walk negates every fetched copy and emits the
+   * unique closure alone. This fixture is a full mirror plus ONE local-only commit: its walk may emit that commit's
+   * handful of objects and nothing else.
+   */
+  async function presenceFixture(prefix: string): Promise<{
+    primary: string
+    gitDir: string
+    unique: string
+    remoteHead: string
+  }> {
+    const { remote, work, primary } = publishedStores(prefix)
+    writeFileSync(join(work, "b.txt"), "beta\n")
+    git(work, ["add", "b.txt"])
+    git(work, ["commit", "-q", "-m", "second"])
+    git(work, ["push", "-q", remote, "main"])
+    git(primary, ["pull", "-q", "--ff-only", "origin", "main"])
+    const remoteHead = git(primary, ["rev-parse", "refs/remotes/origin/main"])
+    writeFileSync(join(primary, "local.txt"), "only here\n")
+    git(primary, ["add", "local.txt"])
+    git(primary, ["commit", "-q", "-m", "unpublished"])
+    const unique = git(primary, ["rev-parse", "HEAD"])
+    return { primary, gitDir: join(primary, ".git"), unique, remoteHead }
+  }
+
+  test("a witness store proves through its unique-object walk, never a whole-store fsck", async () => {
+    const fixture = await presenceFixture("git-super-custody-presence-")
+    const sidecarDir = tmp("git-super-custody-presence-sidecars-")
+    const component = await componentOf([fixture.unique], sidecarDir, "owned", { [fixture.unique]: "commit" })
+    let input = ""
+    let emitted = 0
+    const stream: GitStreamFactory = (args, options) => {
+      if (!args.includes("--missing=print")) return defaultGitStream(args, options)
+      input = typeof options?.stdin === "string" ? options.stdin : ""
+      const inner = defaultGitStream(args, options)
+      return {
+        lines: (async function* () {
+          for await (const line of inner.lines) {
+            emitted += 1
+            yield line
+          }
+        })(),
+        outcome: inner.outcome,
+      }
+    }
+    const scan = await scanCustody(fixture.primary, [component], [join(fixture.gitDir, "objects")], [], {
+      sidecarDir,
+      stream,
+    })
+    expect(scan.status, scan.detail).toBe("pass")
+    // Origin's own ref is negated, the local durable tip is a root, and the walk stops at the unique closure.
+    expect(input).toContain(`^${fixture.remoteHead}`)
+    expect(input).toContain(fixture.unique)
+    expect(emitted).toBeGreaterThan(0)
+    expect(emitted).toBeLessThan(20)
+  })
+
+  test("a witness store missing one of its own unique blobs is named and stays unproven", async () => {
+    const fixture = await presenceFixture("git-super-custody-presence-missing-")
+    const blob = git(fixture.primary, ["rev-parse", "HEAD:local.txt"])
+    rmSync(join(fixture.gitDir, "objects", blob.slice(0, 2), blob.slice(2)), { force: true })
+    const sidecarDir = tmp("git-super-custody-presence-missing-sidecars-")
+    const component = await componentOf([fixture.unique], sidecarDir, "owned", { [fixture.unique]: "commit" })
+    const scan = await scanCustody(fixture.primary, [component], [join(fixture.gitDir, "objects")], [], { sidecarDir })
+    expect(scan.status, scan.detail).toBe("blocked")
+    expect(scan.detail).toContain("unreadable witness store(s) excluded")
+    expect(scan.detail).toContain("is missing")
+    expect(scan.detail).toContain(realpathSync(fixture.gitDir))
+    expect(scan.missing.map((target) => target.oid)).toContain(fixture.unique)
   })
 
   test("a failed core.worktree probe is unknown, never read as absence (#34920)", async () => {
@@ -1408,26 +1560,28 @@ describe("retention custody scan — gate 5 (#27443(b))", () => {
     }
   })
 
-  test("fsck gets the custody bound as a hard child deadline, so a hung git is unknown, not a block", async () => {
+  test("the unique-object walk gets the custody bound as a hard child deadline, so a hung git is unknown, not a block", async () => {
     const store = repoWithCommit("git-super-custody-")
     const sidecarDir = tmp("git-super-custody-sidecars-")
     const component = await componentOf([store.head], sidecarDir, "owned")
-    const seen: Array<{ args: readonly string[]; timeoutMs: number | undefined }> = []
-    const running: GitRun = (args, options) => {
-      seen.push({ args, timeoutMs: options?.timeoutMs })
-      if (args.includes("fsck")) {
-        return { code: 1, stdout: "", stderr: "git fsck timed out after 300000 ms", timedOut: true }
+    let bound: number | undefined
+    const hanging: GitStreamFactory = (args, options) => {
+      if (!args.includes("--missing=print")) return defaultGitStream(args, options)
+      bound = options?.timeoutMs
+      // The child runs until its bound and is killed there: a proof limit, never corruption of the store.
+      return {
+        lines: (async function* () {})(),
+        outcome: Promise.resolve({ code: 1, bytes: 0, lines: 0, stderr: "", timedOut: true, capped: false }),
       }
-      return defaultGitRun(args, options)
     }
     const scan = await scanCustody(store.root, [component], [join(store.root, ".git", "objects")], [], {
       sidecarDir,
-      run: running,
+      stream: hanging,
     })
     expect(scan.status).toBe("unknown")
-    expect(scan.detail).toContain("fsck")
-    const fsck = seen.find((entry) => entry.args.includes("fsck"))
-    expect(fsck?.timeoutMs).toBe(300_000)
+    expect(scan.detail).toContain("unique-object walk")
+    expect(scan.detail).toContain("300000 ms")
+    expect(bound).toBe(300_000)
   })
 
   test("a witness for-each-ref that exits 0 with stderr is unknown, never custody", async () => {
@@ -2005,27 +2159,35 @@ describe("retention custody scan — mirror-head ancestry (#37792)", () => {
     }
   }
 
-  function countingRun(): { run: GitRun; fscks: string[] } {
+  // 34127 (@cto 84ff4789): the store health read is the unique-object walk (a stream child), so "was this store read"
+  // counts that child, and a store whose only durable ref names a tree or blob counts its `cat-file -e` presence check.
+  function countingRun(): { run: GitRun; stream: GitStreamFactory; fscks: string[] } {
     const fscks: string[] = []
     const run: GitRun = (args, options = {}) => {
-      if (args.includes("fsck")) fscks.push(args.join(" "))
+      const at = args.indexOf("-e")
+      const peeled = args.includes("cat-file") && at !== -1 && args[at + 1]?.includes("^") === true
+      if (args.includes("cat-file") && at !== -1 && !peeled) fscks.push(args.join(" "))
       return defaultGitRun(args, options)
     }
-    return { run, fscks }
+    const stream: GitStreamFactory = (args, options) => {
+      if (args.includes("--missing=print")) fscks.push(args.join(" "))
+      return defaultGitStream(args, options)
+    }
+    return { run, stream, fscks }
   }
 
   test("an ancestor head proves custody without fscking the mirror", async () => {
     const fixture = ancestryFixture("git-super-ancestry-proves-")
     const sidecarDir = tmp("git-super-ancestry-proves-sidecars-")
     const component = await componentOf([fixture.head], sidecarDir)
-    const { run, fscks } = countingRun()
+    const { run, stream, fscks } = countingRun()
     const scan = await scanCustody(fixture.componentRoot, [component], [fixture.mirrorObjects], [], {
       sidecarDir,
       run,
+      stream,
       witnessPolicy: { targetBranch: "main" },
       environmentHeads: { [component.component]: [fixture.head] },
     })
-    console.error("DETAIL " + scan.detail)
     expect(scan.status).toBe("pass")
     expect(scan.reachability).toHaveLength(1)
     expect(scan.reachability?.[0]?.tip).toBe(fixture.head)
@@ -2050,10 +2212,11 @@ describe("retention custody scan — mirror-head ancestry (#37792)", () => {
     expect(() => git(primary, ["cat-file", "-e", tip])).toThrow()
     const sidecarDir = tmp("git-super-ancestry-stale-sidecars-")
     const component = await componentOf([head], sidecarDir, "owned", { [head]: "commit" })
-    const { run, fscks } = countingRun()
+    const { run, stream, fscks } = countingRun()
     const scan = await scanCustody(primary, [component], [join(mirror, "objects")], [], {
       sidecarDir,
       run,
+      stream,
       witnessPolicy: { targetBranch: "main" },
       environmentHeads: { ".git": [head] },
     })
@@ -2071,10 +2234,11 @@ describe("retention custody scan — mirror-head ancestry (#37792)", () => {
     const unpublished = git(fixture.componentRoot, ["rev-parse", "HEAD"])
     const sidecarDir = tmp("git-super-ancestry-ahead-sidecars-")
     const component = await componentOf([unpublished], sidecarDir)
-    const { run, fscks } = countingRun()
+    const { run, stream, fscks } = countingRun()
     const scan = await scanCustody(fixture.componentRoot, [component], [fixture.mirrorObjects], [], {
       sidecarDir,
       run,
+      stream,
       witnessPolicy: { targetBranch: "main" },
       environmentHeads: { [component.component]: [unpublished] },
     })
@@ -2215,7 +2379,7 @@ describe("retention custody scan — mirror-head ancestry (#37792)", () => {
     git(tmp("git-super-ancestry-foreign-parent-"), ["clone", "-q", "--bare", other.remote, foreign])
     const sidecarDir = tmp("git-super-ancestry-foreign-sidecars-")
     const component = await componentOf([fixture.head], sidecarDir)
-    const { run, fscks } = countingRun()
+    const { run, stream, fscks } = countingRun()
     const scan = await scanCustody(
       fixture.componentRoot,
       [component],
@@ -2224,6 +2388,7 @@ describe("retention custody scan — mirror-head ancestry (#37792)", () => {
       {
         sidecarDir,
         run,
+        stream,
         witnessPolicy: { targetBranch: "main" },
         environmentHeads: { [component.component]: [fixture.head] },
       },
@@ -2342,13 +2507,13 @@ describe("retention custody scan — head closure and fetched refs (#37792)", ()
     // Proves the comparison bites: the default reading subtracts tips, the truncated one subtracts none.
     const subtractSizes = { full: 0, none: 0 }
     const counting = (key: "full" | "none"): GitStreamFactory => {
-      return (args, streamOptions) => {
+      return fragmentWalks((args, streamOptions) => {
         if (args.includes("rev-list") && args.includes("--objects")) {
           const at = args.indexOf("--not")
           subtractSizes[key] = Math.max(subtractSizes[key], at === -1 ? 0 : args.length - at - 1)
         }
         return defaultGitStream(args, streamOptions)
-      }
+      })
     }
     const full = await scanCustody(primary, [component], stores, [], { sidecarDir, stream: counting("full") })
     expect(full.status).toBe("pass")
@@ -2397,13 +2562,13 @@ describe("retention custody scan — head closure and fetched refs (#37792)", ()
     const stores = [join(primary, ".git", "objects")]
     const subtractSizes = { full: 0, partial: 0 }
     const counting = (key: "full" | "partial"): GitStreamFactory => {
-      return (args, streamOptions) => {
+      return fragmentWalks((args, streamOptions) => {
         if (args.includes("rev-list") && args.includes("--objects")) {
           const at = args.indexOf("--not")
           subtractSizes[key] = Math.max(subtractSizes[key], at === -1 ? 0 : args.length - at - 1)
         }
         return defaultGitStream(args, streamOptions)
-      }
+      })
     }
     const full = await scanCustody(primary, [component], stores, [], { sidecarDir, stream: counting("full") })
     const partial = await scanCustody(primary, [component], stores, [], {
@@ -2498,7 +2663,7 @@ describe("retention custody scan — head closure and fetched refs (#37792)", ()
     // Measure the widest single walk under each reading, so the cap below is a measured number, not a guess.
     const peak = { full: 0, none: 0 }
     const measuring = (key: "full" | "none"): GitStreamFactory => {
-      return (args, streamOptions) => {
+      return fragmentWalks((args, streamOptions) => {
         const inner = defaultGitStream(args, streamOptions)
         if (!(args.includes("rev-list") && args.includes("--objects"))) return inner
         return {
@@ -2512,7 +2677,7 @@ describe("retention custody scan — head closure and fetched refs (#37792)", ()
           })(),
           outcome: inner.outcome,
         }
-      }
+      })
     }
     const full = await scanCustody(primary, [component], stores, [], { sidecarDir, stream: measuring("full") })
     const none = await scanCustody(primary, [component], stores, [], {
