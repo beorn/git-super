@@ -23,6 +23,7 @@ import {
   renameSync,
   rmSync,
   statSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs"
 import { tmpdir } from "node:os"
@@ -134,6 +135,8 @@ beforeEach(() => {
   rmSync(join(fixtureRoot, "revived-owner"), { recursive: true, force: true })
   rmSync(join(common, "modules", "retained-batch"), { recursive: true, force: true })
   rmSync(join(fixtureRoot, "graph-witness"), { recursive: true, force: true })
+  // raw-delete-allow: the .retired fixtures this file creates under its own mkdtemp fixture root.
+  rmSync(join(fixtureRoot, ".retired"), { recursive: true, force: true })
   for (const name of ["owner-list-a", "owner-list-b", "store-a", "store-b", "store-x"]) {
     rmSync(join(fixtureRoot, name), { recursive: true, force: true })
   }
@@ -1770,4 +1773,195 @@ describe("retention retirement batch (#33010)", async () => {
     expect(row?.reason).not.toContain("nothing-unpublished")
     expect(result.cheapGate).toMatchObject({ live: 0, fallThrough: 1 })
   })
+})
+
+// #34127 (@chief ce94a977, @cto 6817f70d + GO b682a7ed): `<namespace>/.retired/<date>` is the retained arm's own
+// already-retired output. It stays scanned, so a borrower edge out of it still counts, but its object directories are
+// never leased owners and never "unproved": they are a named exclusion. A dated directory whose name AND mtime are
+// both older than the age limit, with no borrower from outside, is deleted by the same batch, one entry at a time.
+describe("retired-namespace ageing (#34127)", () => {
+  const DAY = 24 * 60 * 60 * 1000
+  const AGE = 7 * DAY
+  const dateName = (at: number): string => new Date(at).toISOString().slice(0, 10)
+  /** A real object store under `.retired/<name>`, with the dated directory's mtime set last. */
+  function retiredStore(name: string, mtime: number, store = "store"): { dir: string; objects: string } {
+    const dir = join(fixtureRoot, ".retired", name)
+    const objects = join(dir, store, "objects")
+    mkdirSync(join(objects, "pack"), { recursive: true })
+    mkdirSync(join(objects, "info"), { recursive: true })
+    utimesSync(dir, new Date(mtime), new Date(mtime))
+    return { dir, objects }
+  }
+  function borrow(borrowerObjects: string, lenderObjects: string): void {
+    const alternates = join(borrowerObjects, "info", "alternates")
+    const declared = existsSync(alternates) ? readFileSync(alternates, "utf8") : ""
+    writeFileSync(alternates, `${declared}${declared === "" || declared.endsWith("\n") ? "" : "\n"}${lenderObjects}\n`)
+  }
+  const row = (result: Awaited<ReturnType<typeof retireRetainedBatch>>, dir: string) =>
+    result.retiredAged?.find((entry) => entry.path === dir)
+
+  it("leaves a .retired lender out of the owner proof, names it, and keeps it while an outside store borrows it", async () => {
+    const old = eligible.getTime() - AGE - DAY
+    const lender = retiredStore(dateName(old), old)
+    const borrower = join(root, readdirSync(root).sort()[0] as string)
+    borrow(join(borrower, "modules", "vendor", "dep", "objects"), lender.objects)
+    const dry = await retireRetainedBatch(options({ retiredMaxAgeMs: AGE }))
+    expect(readFileSync(dry.owners!.unprovedList, "utf8")).not.toContain(lender.objects)
+    expect(dry.owners?.retiredExcluded).toBe(1)
+    expect(readFileSync(dry.owners!.leaseMissingList, "utf8")).not.toContain(".retired")
+    expect(readFileSync(dry.owners!.retiredExcludedList, "utf8")).toBe(`${lender.objects}\n`)
+    // The lender is not an unleased or unproved owner, so the borrower is never held as identity-unknown for it (its
+    // edited alternates still fail its own copy-manifest gate, which is the fixture, not the rule under test).
+    expect(dry.owners?.identityUnknownEntries).toBe(0)
+    expect(dry.rows.find((entry) => entry.entry === borrower)?.reason ?? "").not.toContain("identity-unknown")
+    expect(row(dry, lender.dir)?.outcome).toBe("kept")
+    expect(row(dry, lender.dir)?.reason).toContain(borrower)
+    await retireRetainedBatch(options({ apply: true, retiredMaxAgeMs: AGE }))
+    expect(existsSync(lender.dir)).toBe(true)
+  })
+
+  it("deletes an aged entry with no borrower, and keeps young, recently touched and undated ones by name", async () => {
+    const now = eligible.getTime()
+    const aged = retiredStore(dateName(now - AGE - DAY), now - AGE - DAY)
+    const youngName = retiredStore(dateName(now - DAY), now - AGE - DAY)
+    const touched = retiredStore(dateName(now - AGE - 2 * DAY), now - DAY)
+    const undated = retiredStore("misc", now - AGE - DAY)
+    writeFileSync(join(aged.objects, "pack", "old.pack"), "x".repeat(65_536))
+    utimesSync(aged.dir, new Date(now - AGE - DAY), new Date(now - AGE - DAY))
+    const dry = await retireRetainedBatch(options({ retiredMaxAgeMs: AGE }))
+    expect(row(dry, aged.dir)?.outcome).toBe("would-retire")
+    expect(row(dry, aged.dir)?.bytes).toBe(allocatedBytes(aged.dir))
+    expect(existsSync(aged.dir)).toBe(true)
+    expect(row(dry, youngName.dir)).toMatchObject({ outcome: "kept" })
+    expect(row(dry, youngName.dir)?.reason).toContain("name date")
+    expect(row(dry, touched.dir)).toMatchObject({ outcome: "kept" })
+    expect(row(dry, touched.dir)?.reason).toContain("mtime")
+    expect(row(dry, undated.dir)).toMatchObject({ outcome: "skipped" })
+    expect(row(dry, undated.dir)?.reason).toContain("no date")
+    const applied = await retireRetainedBatch(options({ apply: true, retiredMaxAgeMs: AGE }))
+    expect(row(applied, aged.dir)?.outcome).toBe("retired")
+    expect(existsSync(aged.dir)).toBe(false)
+    for (const kept of [youngName.dir, touched.dir, undated.dir]) expect(existsSync(kept)).toBe(true)
+  })
+
+  it("a borrow between two .retired entries frees both only when both are aged", async () => {
+    const now = eligible.getTime()
+    const oldA = retiredStore(dateName(now - AGE - DAY), now - AGE - DAY, "a")
+    const oldB = retiredStore(dateName(now - AGE - DAY), now - AGE - DAY, "b")
+    borrow(oldA.objects, oldB.objects)
+    utimesSync(oldA.dir, new Date(now - AGE - DAY), new Date(now - AGE - DAY))
+    const youngC = retiredStore(dateName(now - DAY), now - DAY, "c")
+    const oldD = retiredStore(dateName(now - AGE - 3 * DAY), now - AGE - 3 * DAY, "d")
+    borrow(youngC.objects, oldD.objects)
+    utimesSync(youngC.dir, new Date(now - DAY), new Date(now - DAY))
+    const dry = await retireRetainedBatch(options({ retiredMaxAgeMs: AGE }))
+    expect(row(dry, oldA.dir)?.outcome, JSON.stringify(dry.retiredAged)).toBe("would-retire")
+    expect(row(dry, oldB.dir)?.outcome).toBe("would-retire")
+    expect(row(dry, oldD.dir)?.outcome).toBe("kept")
+    expect(row(dry, oldD.dir)?.reason).toContain(youngC.dir)
+  })
+
+  // @cto 59e3069c: the case the fixed point exists for. Both are dated past the limit, but the borrower was touched
+  // recently, so it is kept by mtime; its borrow edge survives, so its lender must be kept with it.
+  it("an old-named borrower kept by a recent mtime keeps its aged lender", async () => {
+    const now = eligible.getTime()
+    const touched = retiredStore(dateName(now - AGE - 2 * DAY), now - DAY, "touched")
+    const lender = retiredStore(dateName(now - AGE - 3 * DAY), now - AGE - 3 * DAY, "lender")
+    borrow(touched.objects, lender.objects)
+    // A chain past it: touched -> mid -> far -> farthest, sorted farthest first. One pass drops only mid from the
+    // deletable set; the final check then keeps far (its borrower mid is kept) but would delete farthest, whose borrower
+    // far still sat in the stale set. Only the fixed point keeps the whole chain.
+    const mid = retiredStore(dateName(now - AGE - 4 * DAY), now - AGE - 4 * DAY, "mid")
+    const far = retiredStore(dateName(now - AGE - 5 * DAY), now - AGE - 5 * DAY, "far")
+    borrow(touched.objects, mid.objects)
+    borrow(mid.objects, far.objects)
+    const farthest = retiredStore(dateName(now - AGE - 6 * DAY), now - AGE - 6 * DAY, "farthest")
+    borrow(far.objects, farthest.objects)
+    utimesSync(touched.dir, new Date(now - DAY), new Date(now - DAY))
+    utimesSync(mid.dir, new Date(now - AGE - 4 * DAY), new Date(now - AGE - 4 * DAY))
+    utimesSync(far.dir, new Date(now - AGE - 5 * DAY), new Date(now - AGE - 5 * DAY))
+    const applied = await retireRetainedBatch(options({ apply: true, retiredMaxAgeMs: AGE }))
+    expect(row(applied, touched.dir)?.outcome, JSON.stringify(applied.retiredAged)).toBe("kept")
+    expect(row(applied, touched.dir)?.reason).toContain("mtime")
+    expect(row(applied, lender.dir)?.outcome).toBe("kept")
+    expect(row(applied, lender.dir)?.reason).toContain(touched.dir)
+    expect(row(applied, mid.dir)?.reason).toContain(touched.dir)
+    expect(row(applied, far.dir)?.outcome).toBe("kept")
+    expect(row(applied, far.dir)?.reason).toContain(mid.dir)
+    expect(row(applied, farthest.dir)?.outcome).toBe("kept")
+    expect(row(applied, farthest.dir)?.reason).toContain(far.dir)
+    for (const kept of [lender, mid, far, farthest]) expect(existsSync(kept.dir)).toBe(true)
+  })
+
+  it("does no ageing when the caller sets no age limit", async () => {
+    const old = eligible.getTime() - AGE - DAY
+    const aged = retiredStore(dateName(old), old)
+    const result = await retireRetainedBatch(options({ apply: true }))
+    expect(result.retiredAged).toBeUndefined()
+    expect(existsSync(aged.dir)).toBe(true)
+  })
+  // Commander and the command node's param schema each drop a key they do not know; only a CLI run proves the 7-day
+  // limit reaches the batch.
+  it("a batch that stops before ageing names every .retired directory as skipped, and deletes none", async () => {
+    const now = eligible.getTime()
+    const aged = retiredStore(dateName(now - AGE - DAY), now - AGE - DAY)
+    const result = await retireRetainedBatch({
+      ...options(),
+      apply: true,
+      retiredMaxAgeMs: AGE,
+      proofDeadlineMs: 1,
+    })
+    expect(result.stopped).toBeDefined()
+    expect(row(result, aged.dir)).toMatchObject({ outcome: "skipped" })
+    expect(row(result, aged.dir)?.reason).toContain("the batch stopped first")
+    expect(existsSync(aged.dir)).toBe(true)
+  }, 120_000)
+
+  it("the CLI ages .retired at 7 days, in the single and the chunked verb", async () => {
+    const now = Date.now()
+    for (const chunked of [false, true]) {
+      const aged = retiredStore(dateName(now - AGE - 2 * DAY), now - AGE - 2 * DAY)
+      const young = retiredStore(dateName(now - AGE + 2 * DAY), now - AGE - 2 * DAY)
+      let output = ""
+      let errors = ""
+      const code = await runCli(
+        [
+          "--repo",
+          dirname(common),
+          "--json",
+          "worktree",
+          "retention",
+          "retire-batch",
+          "--root",
+          root,
+          "--common",
+          common,
+          "--namespace",
+          fixtureRoot,
+          "--artifact-dir",
+          join(fixtureRoot, "artifacts"),
+          ...(chunked ? ["--chunk-size", "1"] : []),
+          ...readdirSync(root)
+            .sort()
+            .map((name) => join(root, name)),
+        ],
+        {
+          write: (value) => {
+            output += value
+          },
+        },
+        {
+          write: (value) => {
+            errors += value
+          },
+        },
+      )
+      expect(code, errors).toBe(0)
+      const report = JSON.parse(output) as RetentionBatchResult
+      expect(row(report, aged.dir)?.outcome, `chunked=${String(chunked)}: ${output.slice(0, 400)}`).toBe("would-retire")
+      expect(row(report, young.dir)?.outcome).toBe("kept")
+      // raw-delete-allow: the .retired fixtures this test created under its own mkdtemp fixture root.
+      rmSync(join(fixtureRoot, ".retired"), { recursive: true, force: true })
+    }
+  }, 120_000)
 })

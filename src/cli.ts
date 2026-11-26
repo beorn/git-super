@@ -34,7 +34,7 @@ import type { SuperMergeResult } from "./merge.ts"
 import type { GitSuperResult } from "./result.ts"
 import type { RetentionVerifyResult } from "./retention-verify.ts"
 import type { CompactRetainedRootReport } from "./retention-compact.ts"
-import { fragmentUseText, type BatchWindow, type RetentionBatchResult } from "./retention-batch.ts"
+import { fragmentUseText, RETIRED_MAX_AGE_MS, type BatchWindow, type RetentionBatchResult } from "./retention-batch.ts"
 import type { RetentionChunkResult } from "./retention-chunks.ts"
 import { formatRetainedBytes, type RetainedRanking } from "./retention-bytes.ts"
 import type { PrivateStoreCandidateResult } from "./private-store-candidate.ts"
@@ -1040,6 +1040,7 @@ async function runInvocation(
             ...(chunkSize === undefined ? {} : { chunkSize }),
             ...(options.cursorFile === undefined ? {} : { cursorFile: options.cursorFile }),
             deadlineMs: totalSeconds * 1000,
+            retiredMaxAgeMs: RETIRED_MAX_AGE_MS,
           },
           json: globals.json === true,
           nul: false,
@@ -1057,6 +1058,7 @@ async function runInvocation(
           ...(options.apply === true ? { apply: true } : {}),
           ...(options.custodyTargetBranch === undefined ? {} : { targetBranch: options.custodyTargetBranch }),
           proofDeadlineMs: proofSeconds * 1000,
+          retiredMaxAgeMs: RETIRED_MAX_AGE_MS,
         },
         json: globals.json === true,
         nul: false,

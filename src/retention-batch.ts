@@ -24,7 +24,16 @@
  */
 import { measureRetainedBytes } from "./retention-bytes.ts"
 import { CustodyIndexScope } from "./retention-custody.ts"
-import { lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs"
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs"
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { acquireFlockWithTimeout, type FlockHandle } from "@bearly/flock"
 import { reapStaleWriterLease } from "./exclusive.ts"
@@ -96,7 +105,29 @@ export type RetentionBatchOptions = Readonly<{
    * entry; the production CLI never sets it, and a case proving the expensive path does.
    */
   fullProof?: boolean
+  /**
+   * #34127 (@chief ce94a977, @cto b682a7ed): set, the batch ages `<namespace root>/.retired/<YYYY-MM-DD>` — the retained
+   * arm's own already-retired output. A dated directory whose name date AND mtime are both older than this, with no
+   * borrower outside the aged set, is deleted; every other one is kept or skipped by name. Absent, nothing is aged. The
+   * chunk driver sets it on its first chunk only, so one run ages once.
+   */
+  retiredMaxAgeMs?: number
 }>
+
+/** One `.retired/<date>` directory's ageing verdict (#34127). */
+export type RetiredAgedRow = Readonly<{
+  path: string
+  outcome: "would-retire" | "retired" | "kept" | "skipped" | "failed"
+  reason: string
+  /** Allocated bytes, measured before the delete, on would-retire and retired rows (each hard-linked file counted once). */
+  bytes?: number
+}>
+
+/** The retained arm's already-retired output under each namespace root (#34127). */
+export const RETIRED_DIR = ".retired"
+/** How old a `.retired/<date>` directory must be, by name and by mtime, before the CLI's batch ages it (@chief ce94a977). */
+export const RETIRED_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
+const RETIRED_DATE_NAME = /^\d{4}-\d{2}-\d{2}$/u
 
 export type BatchRow = Readonly<{
   entry: string
@@ -206,6 +237,13 @@ export type RetentionBatchResult = Readonly<{
     /** Every live owner with no existing writer lease, one path per line, sorted (#34960). */
     leaseMissingList: string
     /**
+     * #34127 (@chief ce94a977): object directories under `<namespace>/.retired/`, left out of leasing and of
+     * {@link unproved} because they are already-retired data; still scanned, so a borrower edge out of them counts.
+     */
+    retiredExcluded: number
+    /** Those directories, one path per line, sorted. */
+    retiredExcludedList: string
+    /**
      * #34127 (@chief 2026-11-21 14:20): an object directory with no proved Git owner is a reported skip, never a batch
      * stop. This is how many selected entries were kept because they borrow objects from one; none of them is deleted.
      */
@@ -253,6 +291,8 @@ export type RetentionBatchResult = Readonly<{
    * gates, and `ms` the sum of each entry's own cost — the figure #38198's acceptance asks for per entry.
    */
   cheapGate?: Readonly<{ live: number; fallThrough: number; ms: number }>
+  /** #34127: each `.retired/<date>` directory's verdict; absent when the caller set no {@link RetentionBatchOptions.retiredMaxAgeMs}. */
+  retiredAged?: readonly RetiredAgedRow[]
 }>
 
 /**
@@ -265,6 +305,93 @@ export function fragmentUseText(fragments: Readonly<{ walked: number; reused: nu
   return `fragments ${String(fragments.walked)} walked / ${String(fragments.reused)} reused (${String(
     Math.round((fragments.reused / total) * 100),
   )}% reuse)`
+}
+
+/**
+ * #34127 (@cto b682a7ed): age `.retired/<date>` directories. Both the name date and the mtime must be older than the
+ * limit; a name that is not a date is skipped by name, never deleted. Deletable is a fixed point: an aged directory goes
+ * only when every store borrowing from it sits inside another deletable one, so two aged directories that borrow from
+ * each other both go, and a kept borrower keeps its lender. Per entry: one failure never stops the next.
+ */
+async function ageRetiredNamespace(input: {
+  retiredRoots: readonly string[]
+  borrowers: readonly EstateBorrower[]
+  clockMs: number
+  maxAgeMs: number
+  apply: boolean
+}): Promise<RetiredAgedRow[]> {
+  const days = `${String(Math.round(input.maxAgeMs / 86_400_000))} d`
+  const rows = new Map<string, RetiredAgedRow>()
+  const aged: string[] = []
+  for (const retiredRoot of input.retiredRoots) {
+    for (const name of readdirSync(retiredRoot).sort()) {
+      const path = join(retiredRoot, name)
+      const stat = lstatSync(path)
+      if (!stat.isDirectory()) {
+        rows.set(path, { path, outcome: "skipped", reason: "not a directory; only dated directories are aged" })
+        continue
+      }
+      const nameMs = RETIRED_DATE_NAME.test(name) ? Date.parse(`${name}T00:00:00Z`) : Number.NaN
+      if (Number.isNaN(nameMs)) {
+        rows.set(path, {
+          path,
+          outcome: "skipped",
+          reason: `no date in its name (${name}); an undated entry is never aged`,
+        })
+      } else if (input.clockMs - nameMs <= input.maxAgeMs) {
+        rows.set(path, { path, outcome: "kept", reason: `name date ${name} is within ${days}` })
+      } else if (input.clockMs - stat.mtimeMs <= input.maxAgeMs) {
+        rows.set(path, {
+          path,
+          outcome: "kept",
+          reason: `mtime ${new Date(stat.mtimeMs).toISOString()} is within ${days}`,
+        })
+      } else aged.push(path)
+    }
+  }
+  const deletable = new Set(aged)
+  const outsideBorrower = (path: string) =>
+    input.borrowers.find(
+      (edge) =>
+        within(path, edge.target) &&
+        !within(path, edge.borrower) &&
+        ![...deletable].some((other) => other !== path && within(other, edge.borrower)),
+    )
+  for (let changed = true; changed;) {
+    changed = false
+    for (const path of deletable) {
+      if (outsideBorrower(path) === undefined) continue
+      deletable.delete(path)
+      changed = true
+    }
+  }
+  for (const path of aged) {
+    const edge = outsideBorrower(path)
+    if (edge !== undefined) {
+      rows.set(path, {
+        path,
+        outcome: "kept",
+        reason: `aged past ${days}, but ${edge.borrower} still borrows from ${edge.target}`,
+      })
+    } else {
+      const measured = await measureRetainedBytes([path])
+      const bytes = measured.bytes + (measured.sharedBytes ?? 0)
+      const reason = `name date and mtime older than ${days}; no live borrower${measured.unreadable === 0 ? "" : `; ${String(measured.unreadable)} path(s) unreadable, so bytes understate it`}`
+      if (!input.apply) {
+        rows.set(path, { path, outcome: "would-retire", reason, bytes })
+        continue
+      }
+      try {
+        // raw-delete-allow: a dated .retired directory this pass just proved past the age limit by name and mtime with
+        // no live borrower (@cto b682a7ed); git-super carries no removely dependency, as with the retained-entry delete.
+        rmSync(path, { recursive: true, force: false })
+        rows.set(path, { path, outcome: "retired", reason, bytes })
+      } catch (error) {
+        rows.set(path, { path, outcome: "failed", reason: error instanceof Error ? error.message : String(error) })
+      }
+    }
+  }
+  return [...rows.values()].sort((left, right) => (left.path < right.path ? -1 : 1))
 }
 
 function within(root: string, path: string): boolean {
@@ -607,6 +734,26 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
     excluded: scan.danglingAlternates.length,
   }
   const ownerSummary: { current?: RetentionBatchResult["owners"] } = {}
+  // #34127: `.retired` stays inside the scan; these roots only steer leasing and ageing.
+  const retiredRoots = [
+    ...new Set(
+      options.namespaceRoots
+        .filter((namespace) => existsSync(namespace))
+        .map((namespace) => join(realpathSync(namespace), RETIRED_DIR))
+        .filter((retiredRoot) => existsSync(retiredRoot)),
+    ),
+  ].sort()
+  const retiredSummary: { current?: readonly RetiredAgedRow[] } = {}
+  const ageRetired = async (): Promise<void> => {
+    if (options.retiredMaxAgeMs === undefined) return
+    retiredSummary.current = await ageRetiredNamespace({
+      retiredRoots,
+      borrowers: scan.borrowers,
+      clockMs: (options.clock ?? new Date()).getTime(),
+      maxAgeMs: options.retiredMaxAgeMs,
+      apply,
+    })
+  }
   const byteSummary: { current?: Awaited<ReturnType<typeof measureRetainedBytes>> } = {}
   const evidenceSummary: { current?: Awaited<ReturnType<typeof measureRetainedBytes>> } = {}
   // The byte total is a measurement of the trees being removed, taken once the rows are final: it is the number an
@@ -698,6 +845,22 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
         }),
     scan: scanSummary,
     ...(ownerSummary.current === undefined ? {} : { owners: ownerSummary.current }),
+    ...(options.retiredMaxAgeMs === undefined
+      ? {}
+      : {
+          // A batch that stopped first never aged: each directory says so by name, rather than the list going missing.
+          retiredAged:
+            retiredSummary.current ??
+            retiredRoots.flatMap((retiredRoot) =>
+              readdirSync(retiredRoot)
+                .sort()
+                .map((name) => ({
+                  path: join(retiredRoot, name),
+                  outcome: "skipped" as const,
+                  reason: `not aged: the batch stopped first (${stopped ?? "before its scan"})`,
+                })),
+            ),
+        }),
     ...(byteSummary.current === undefined
       ? {}
       : {
@@ -860,11 +1023,16 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
   // missing lease file keeps the entry (retire never creates one), so the dry run names them up front.
   const owners = new Set<string>([common])
   const unproved: string[] = []
+  const retiredExcluded: string[] = []
   for (const objects of [
     ...passScan.objectDirs,
     ...passScan.borrowers.filter((edge) => basename(edge.borrower) === "objects").map((edge) => edge.borrower),
   ]) {
     if (entries.some((entry) => within(entry, objects))) continue
+    if (retiredRoots.some((retiredRoot) => within(retiredRoot, objects))) {
+      if (!retiredExcluded.includes(objects)) retiredExcluded.push(objects)
+      continue
+    }
     const owner = dirname(objects)
     if (lstatSync(join(owner, "objects"), { throwIfNoEntry: false }) === undefined) {
       unproved.push(objects)
@@ -900,10 +1068,12 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
   mkdirSync(ownerListDir, { recursive: true })
   const unprovedList = join(ownerListDir, "unproved.txt")
   const leaseMissingList = join(ownerListDir, "lease-missing.txt")
+  const retiredExcludedList = join(ownerListDir, "retired-excluded.txt")
   const identityUnknownList = join(ownerListDir, "identity-unknown-entries.txt")
   const lines = (paths: readonly string[]): string => (paths.length === 0 ? "" : `${[...paths].sort().join("\n")}\n`)
   writeFileSync(unprovedList, lines(unproved))
   writeFileSync(leaseMissingList, lines(leaseMissing))
+  writeFileSync(retiredExcludedList, lines(retiredExcluded))
   // #34127 (@chief 2026-11-21 14:20): an object directory with no proved Git owner is a REPORTED SKIP, never a batch
   // stop and never deleted. Only the entries that borrow objects from it lose their proof: its owner cannot be leased,
   // so it could move inside the held window. No other entry is affected — deleting a retained store under this root
@@ -955,6 +1125,8 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
     ...(unproved[0] === undefined ? {} : { unprovedExample: unproved[0] }),
     unprovedList,
     leaseMissingList,
+    retiredExcluded: retiredExcluded.length,
+    retiredExcludedList,
     identityUnknownEntries: identityUnknown.size,
     identityUnknownList,
     ...(unproved.length === 0 ? {} : { identityUnknownBytes: unprovedBytes.bytes }),
@@ -995,6 +1167,7 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
     }
     await measurePlannedBytes()
     const stops = [ownerStop, deadlineStop].filter((stop): stop is string => stop !== undefined)
+    if (stops.length === 0) await ageRetired()
     return result([], stops.length === 0 ? undefined : stops.join("; "))
   }
   if (ownerStop !== undefined) {
@@ -1221,5 +1394,6 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
     }
   }
   await measurePlannedBytes()
+  await ageRetired()
   return result(windows)
 }

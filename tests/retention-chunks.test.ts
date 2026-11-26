@@ -10,7 +10,17 @@
  * @reach fs-walk <fixture-only: estate scans visit mkdtempSync(tmpdir()) Git repositories>
  */
 import { execFileSync } from "node:child_process"
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { tryAcquireFlock } from "@bearly/flock"
@@ -88,6 +98,8 @@ beforeEach(() => {
   rmSync(root, { recursive: true, force: true })
   cpSync(pristine, root, { recursive: true })
   rmSync(join(fixtureRoot, "artifacts"), { recursive: true, force: true })
+  // raw-delete-allow: the .retired fixtures this file creates under its own mkdtemp fixture root.
+  rmSync(join(fixtureRoot, ".retired"), { recursive: true, force: true })
 })
 
 function options(extra: Partial<RetentionChunkOptions> = {}): RetentionChunkOptions {
@@ -118,6 +130,20 @@ describe("chunked retained retirement (#34127)", () => {
     expect(result.nextCursor).toBeNull()
     expect(result.chunks).toHaveLength(3)
     expect(readdirSync(root)).toHaveLength(0)
+  }, 120_000)
+
+  // #34127 (@cto b682a7ed): one run ages `.retired` once. Every chunk is a separate batch, so only the first is given the
+  // age limit; the run reports that chunk's verdicts, one row per directory.
+  it("ages .retired in the first chunk only and reports its rows once", async () => {
+    const old = eligible.getTime() - 8 * 24 * 60 * 60 * 1000
+    const aged = join(fixtureRoot, ".retired", new Date(old).toISOString().slice(0, 10))
+    mkdirSync(join(aged, "logs"), { recursive: true })
+    utimesSync(aged, new Date(old), new Date(old))
+    const result = await retireRetainedBatchInChunks(options({ retiredMaxAgeMs: 7 * 24 * 60 * 60 * 1000 }))
+    expect(result.chunks).toHaveLength(3)
+    expect(result.retiredAged).toEqual([expect.objectContaining({ path: aged, outcome: "retired" })])
+    expect(result.chunks.slice(1).map((chunk) => chunk.retiredAged)).toEqual([undefined, undefined])
+    expect(existsSync(aged)).toBe(false)
   }, 120_000)
 
   it("a deadline between two chunks keeps what it already retired and names the rest", async () => {

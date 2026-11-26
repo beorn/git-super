@@ -65,7 +65,15 @@ export type RetentionEnrollParams = Readonly<{ root: string; common: string; app
 export type RetentionCompactParams = Readonly<{ root: string; dryRun?: boolean; limit?: number }>
 export type RetentionBatchParams = Pick<
   RetentionBatchOptions,
-  "entries" | "root" | "common" | "namespaceRoots" | "artifactDir" | "apply" | "proofDeadlineMs" | "targetBranch"
+  | "entries"
+  | "root"
+  | "common"
+  | "namespaceRoots"
+  | "artifactDir"
+  | "apply"
+  | "proofDeadlineMs"
+  | "targetBranch"
+  | "retiredMaxAgeMs"
 >
 export type RetentionRankParams = Readonly<{ entries: readonly string[]; root: string; deadlineMs: number }>
 export type RetentionChunksParams = Pick<
@@ -78,6 +86,7 @@ export type RetentionChunksParams = Pick<
   | "apply"
   | "chunkSize"
   | "cursorFile"
+  | "retiredMaxAgeMs"
   | "deadlineMs"
   | "targetBranch"
 >
@@ -496,6 +505,16 @@ const retentionRetire = commandNode<CommandContext, RetentionRetireParams, GitSu
   run: (_context, input) => retireRetainedEntry(input),
 })
 
+/** #34127: the `.retired` age limit, carried through both batch verbs' params; absent, nothing is aged. */
+function retiredMaxAge(input: Readonly<Record<string, unknown>>): { retiredMaxAgeMs?: number } {
+  const age = input.retiredMaxAgeMs
+  if (age === undefined) return {}
+  if (typeof age !== "number" || !Number.isFinite(age) || age <= 0) {
+    throw new Error("retire-batch retiredMaxAgeMs must be a positive number of milliseconds")
+  }
+  return { retiredMaxAgeMs: age }
+}
+
 const retentionBatch = commandNode<CommandContext, RetentionBatchParams, RetentionBatchResult>({
   title: "Retire selected retained entries on one estate scan",
   description:
@@ -521,6 +540,7 @@ const retentionBatch = commandNode<CommandContext, RetentionBatchParams, Retenti
       ...(held.custodyTargetBranch === undefined ? {} : { targetBranch: held.custodyTargetBranch }),
       ...(input.apply === true ? { apply: true } : {}),
       ...(deadline === undefined ? {} : { proofDeadlineMs: deadline as number }),
+      ...retiredMaxAge(input),
     }
   }),
   run: (_context, input) => retireRetainedBatch(input),
@@ -568,6 +588,7 @@ export const retentionChunks = commandNode<CommandContext, RetentionChunksParams
       ...(chunkSize === undefined ? {} : { chunkSize: chunkSize as number }),
       ...(input.cursorFile === undefined ? {} : { cursorFile: input.cursorFile as string }),
       ...(deadline === undefined ? {} : { deadlineMs: deadline as number }),
+      ...retiredMaxAge(input),
     }
   }),
   run: (_context, input) => retireRetainedBatchInChunks(input),

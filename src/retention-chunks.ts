@@ -65,6 +65,8 @@ export type RetentionChunkResult = Readonly<{
   bytesEvidence: number
   bytesSharedLinked?: number
   bytesUnreadable?: number
+  /** #34127: the `.retired/<date>` verdicts, from the first chunk, which alone ages; absent when no age limit was set. */
+  retiredAged?: RetentionBatchResult["retiredAged"]
 }>
 
 const DEFAULT_CHUNK_SIZE = 50
@@ -144,8 +146,11 @@ export async function retireRetainedBatchInChunks(options: RetentionChunkOptions
     const chunksLeft = Math.ceil((ordered.length - at) / chunkSize)
     // Fair share of what is left, never less than a chunk can use, never more than the whole remainder.
     const chunkBudget = Math.min(left, Math.max(MIN_CHUNK_MS, Math.floor(left / chunksLeft)))
+    // #34127: only the first chunk ages `.retired`, so one run ages once and reports one row per directory.
+    const { retiredMaxAgeMs, ...perChunk } = options
     const chunk = await retireRetainedBatch({
-      ...options,
+      ...perChunk,
+      ...(chunks.length === 0 && retiredMaxAgeMs !== undefined ? { retiredMaxAgeMs } : {}),
       entries: slice,
       proofDeadlineMs: chunkBudget,
     })
@@ -190,5 +195,6 @@ export async function retireRetainedBatchInChunks(options: RetentionChunkOptions
     ...(bytesSharedLinked === 0 ? {} : { bytesSharedLinked }),
     ...(bytesUnreadable === 0 ? {} : { bytesUnreadable }),
     ...(stopped === undefined ? {} : { stopped }),
+    ...(chunks[0]?.retiredAged === undefined ? {} : { retiredAged: chunks[0].retiredAged }),
   }
 }
