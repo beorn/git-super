@@ -16,6 +16,7 @@ import { spawn } from "node:child_process"
 import { createHash } from "node:crypto"
 import { createReadStream } from "node:fs"
 import {
+  appendFileSync,
   closeSync,
   existsSync,
   linkSync,
@@ -531,6 +532,18 @@ export function createGitLineStream(options: GitLineFramerOptions = {}): GitLine
     capped = true
     options.onCap?.()
   }
+  // One drainer at a time. `write` and `end` both split the same remainder, and a child's 'close' arrives while a
+  // suspended write's pump is still mid-drain; letting both run over that remainder is what joined a record onto its
+  // neighbour's size field and what left one of the two capacity waiters unresolved. Every drain joins this chain.
+  let pumpChain: Promise<void> = Promise.resolve()
+  const drain = (): Promise<void> => {
+    const next = pumpChain.then(pump)
+    pumpChain = next.then(
+      () => undefined,
+      () => undefined,
+    )
+    return next
+  }
   const pump = async (): Promise<void> => {
     let index = remainder.indexOf(separator)
     while (index !== -1 && !capped) {
@@ -566,16 +579,25 @@ export function createGitLineStream(options: GitLineFramerOptions = {}): GitLine
       cap()
       return
     }
+    const streamDump = process.env.GIT_SUPER_STREAM_DUMP
+    if (streamDump !== undefined) {
+      appendFileSync(`${streamDump}.idx`, `${bytes - chunk.length}\t${chunk.length}\n`)
+      appendFileSync(`${streamDump}.bin`, chunk)
+    }
     remainder += decoder.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
-    await pump()
+    await drain()
   }
 
   const end = async (): Promise<void> => {
     if (ended) return
     if (!capped) {
-      const tail = remainder + decoder.end()
+      // The decoder's remainder joins the stream before the LAST drain, so the tail is split like every other
+      // record instead of being pushed whole.
+      remainder += decoder.end()
+      await drain()
+      const tail = remainder
       remainder = ""
-      if (tail !== "") {
+      if (!capped && tail !== "") {
         if (tail.length > MAX_LINE_LENGTH) cap()
         else if (options.maxLines !== undefined && lines >= options.maxLines) cap()
         else {

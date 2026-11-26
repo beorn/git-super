@@ -135,4 +135,23 @@ describe("createGitLineStream", () => {
     expect(failed.stderr).toContain("process verdict SIGNALED")
     expect(() => assertStreamComplete(failed, MESSAGES)).toThrow("failed")
   })
+
+  test("end() during backpressure splits pending records instead of pushing them joined", async () => {
+    // A child's 'close' arrives while a write's pump is still suspended on a full queue, so the remainder still holds
+    // newline-terminated records. Flushing that remainder whole pushed several records as ONE line (seen in the wild
+    // as `cat-file` reporting the size field as "3473\n<next record's oid>"), and two independent capacity waiters
+    // could leave one of them unresolved. One drainer at a time keeps both properties.
+    const total = RETENTION_STREAM_QUEUE_LINES + 300
+    const text = `${Array.from({ length: total }, (_, index) => `oid${String(index).padStart(6, "0")} blob 1`).join("\n")}\n`
+    const framer = createGitLineStream()
+    const collected = collect(framer.lines)
+    const writing = framer.write(bytes(text))
+    await framer.end()
+    framer.settle({ code: 0 })
+    await writing
+    const lines = await collected
+    expect(lines).toHaveLength(total)
+    expect(lines.filter((line) => line.includes("\n"))).toEqual([])
+    expect((await framer.outcome).code).toBe(0)
+  })
 })
