@@ -1727,6 +1727,12 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
         hooks?: WorktreeHookPolicy
         /** Literal root-relative paths left empty and uninitialized: no init, store or gitfile. */
         excludedSubmodules?: readonly string[]
+        /**
+         * Directories left out of a component's fresh checkout (sparse, set before its first checkout), keyed by the
+         * component's root-relative path; the same rule `worktree add --omit` applies. hh#37605: landing trees omit
+         * vendor/terminfo.dev's 6.2 GB of content.
+         */
+        checkoutOmissions?: ReadonlyMap<string, readonly string[]>
       }> = {},
     ): Promise<void> {
       const materializeProcess = configuredProcess(materializeOptions.hooks)
@@ -1739,6 +1745,9 @@ export function createGitWorktreeStore(options: GitWorktreeStoreOptions) {
           ...(materializeOptions.excludedSubmodules === undefined
             ? {}
             : { excludedSubmodules: materializeOptions.excludedSubmodules }),
+          ...(materializeOptions.checkoutOmissions === undefined
+            ? {}
+            : { checkoutOmissions: materializeOptions.checkoutOmissions }),
         },
         { timeoutMs: timeouts.materialize },
       )
