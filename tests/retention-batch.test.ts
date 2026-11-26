@@ -721,7 +721,9 @@ describe("retention retirement batch (#33010)", async () => {
     const entry = await witnessEntry("fragment-witness-cut")
     const slowWalk: GitStreamFactory = (args, streamOptions = {}) => {
       const inner = defaultGitStream(args, streamOptions)
-      if (!(args.includes("rev-list") && args.includes("--objects"))) return inner
+      // 34127 (@cto 84ff4789): the store health read is the unique-object walk (`--stdin`), a different child from the
+      // fragment walk this row cuts. Only the fragment walk stays slow.
+      if (!(args.includes("rev-list") && args.includes("--objects")) || args.includes("--stdin")) return inner
       return {
         lines: (async function* () {
           await new Promise((resolve) => setTimeout(resolve, 4000))
