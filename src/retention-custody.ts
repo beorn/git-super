@@ -2058,6 +2058,13 @@ export type RemoteRedundancyOutcome =
 const MAX_ANCESTRY_CANDIDATES = 64
 
 /**
+ * How many advertised tips one presence read carries. `rev-list --stdin` is not available to the injected runner, so
+ * the oids ride in argv; a chunk keeps one argument list far inside the platform limit while a store advertising
+ * thousands of refs still pays a handful of reads rather than one per candidate.
+ */
+const PRESENCE_CHUNK = 512
+
+/**
  * A remote configured as a path is relative to the store that configures it, so two stores naming the same remote
  * differently still share one snapshot; a scheme or scp-style URL is already absolute.
  */
@@ -2221,55 +2228,127 @@ export async function proveRemoteRedundancy(
   const advertised = [...snapshot.refs].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
   // The default branch is where a published tip is most likely to be found, so it is asked first.
   // Ranked so the answer is usually found early: an advertised ref bearing the SAME NAME as a local ref is asked
-  // first (a branch pushed under its own name has merely moved), then the default branches, then branches, tags and
-  // every other namespace. The order decides only how many refs are tried, never which ones may prove.
+  // first (a branch pushed under its own name has merely moved), then the default branches, then every other branch,
+  // then tags, then the remaining namespaces, and LAST the namespaces that are themselves copies of somebody else's
+  // publication (@cto 2026-11-25: entry's own branch tips, heads, tags, refs/remotes/*, refs/gitomic/fetched/*).
+  // The order decides only how soon a positive proof is met, never which refs may prove: an unproven tip walks the
+  // whole candidate set either way.
   const rank = (ref: string): number => {
     if (ref === "refs/heads/main" || ref === "refs/heads/master") return 0
     if (ref.startsWith("refs/heads/")) return 1
     if (ref.startsWith("refs/tags/")) return 2
+    if (ref.startsWith("refs/remotes/")) return 4
+    if (ref.startsWith("refs/gitomic/fetched/")) return 5
     return 3
   }
   const ranked = [...advertised].sort((a, b) => rank(a[0]) - rank(b[0]) || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
   const advertisedByName = new Map(advertised)
   const exact = new Map<string, string>()
   for (const [ref, tip] of advertised) if (!exact.has(tip)) exact.set(tip, ref)
+  // Does this store hold the advertised tip, so ancestry can be asked of it? ONE batched read answers that for every
+  // candidate at once; the per-candidate `cat-file -e` it replaces cost one process per ref per local tip, which on a
+  // store advertising thousands of refs across eighteen components was gate 5's entire cost (@cto 2026-11-25, #34127).
+  const carriedTips = new Set<string>()
+  let carriedRead = false
+  const readCarried = async (): Promise<ReadonlySet<string>> => {
+    if (carriedRead) return carriedTips
+    const candidates = [...new Set(advertised.map(([, candidateTip]) => candidateTip))]
+    for (let index = 0; index < candidates.length; index += PRESENCE_CHUNK) {
+      const chunk = candidates.slice(index, index + PRESENCE_CHUNK)
+      const listed = await storeRun(
+        [`--git-dir=${gitDir}`, "rev-list", "--no-walk=unsorted", "--ignore-missing", ...chunk],
+        budget(),
+      )
+      if (listed.stderr.trim() !== "" || listed.code !== 0) {
+        throw new Error(
+          `${label}: ${String(chunk.length)} advertised tip(s) could not be read for presence (${listed.stderr.trim() || `exit ${String(listed.code)}`})`,
+        )
+      }
+      for (const line of listed.stdout.split("\n")) if (line.trim() !== "") carriedTips.add(line.trim())
+    }
+    carriedRead = true
+    return carriedTips
+  }
+  const tagCarried = new Map<string, boolean>()
+  /** `candidateTip` resolvable to a commit in this store: a missing object is skipped, never asked, exactly as before. */
+  const carriedHere = async (ref: string, candidateTip: string): Promise<boolean> => {
+    // The batch cannot answer for a ref that names a tag OBJECT, because the walk prints the peel and not the object
+    // id. Tagged candidates are asked one at a time and cached per tip; they rank early, so the answer is usually the
+    // first one asked.
+    if (ref.startsWith("refs/tags/")) {
+      const known = tagCarried.get(candidateTip)
+      if (known !== undefined) return known
+      const present = await storeRun([`--git-dir=${gitDir}`, "cat-file", "-e", `${candidateTip}^{commit}`], budget())
+      const answer = present.code === 0 && present.stderr.trim() === ""
+      tagCarried.set(candidateTip, answer)
+      return answer
+    }
+    return (await readCarried()).has(candidateTip)
+  }
   try {
     const reached: Array<Readonly<{ ref: string; tip: string; remoteRef: string }>> = []
     for (const [tip, refs] of [...named].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
       let remoteRef = exact.get(tip)
       if (remoteRef === undefined) {
-        let asked = 0
         // The same-named advertised ref first, then the ranked list, each asked at most once.
         const sameName = refs
           .map((ref) => [ref, advertisedByName.get(ref)] as const)
           .filter((entry): entry is readonly [string, string] => entry[1] !== undefined)
         const order = [...sameName, ...ranked.filter(([ref]) => !refs.includes(ref))]
-        for (const [candidateRef, candidateTip] of order) {
-          if (asked >= MAX_ANCESTRY_CANDIDATES) break
-          // A tip the advertisement reaches is ancestry of the advertised commit; the object has to be here to ask.
-          const present = await storeRun(
-            [`--git-dir=${gitDir}`, "cat-file", "-e", `${candidateTip}^{commit}`],
+        const carried: Array<readonly [string, string]> = []
+        for (const candidate of order) {
+          if (await carriedHere(candidate[0], candidate[1])) carried.push(candidate)
+        }
+        const allowed = carried.slice(0, MAX_ANCESTRY_CANDIDATES)
+        // ONE walk answers "does any advertised ref reach this tip" for the whole candidate set. The loop it replaces
+        // asked `merge-base --is-ancestor` per candidate and so paid the full bound even when no proof existed, which
+        // is the case for nearly every entry; the ordered loop stays only to NAME the proving ref, and stops at the
+        // first positive answer exactly as it always did.
+        if (allowed.length > 0) {
+          const anyProof = await storeRun(
+            [
+              `--git-dir=${gitDir}`,
+              "rev-list",
+              "--max-count=1",
+              tip,
+              "--not",
+              ...allowed.map(([, candidateTip]) => candidateTip),
+            ],
             budget(),
           )
-          if (present.code !== 0 || present.stderr.trim() !== "") continue
-          asked += 1
-          const answer = await storeRun(
-            [`--git-dir=${gitDir}`, "merge-base", "--is-ancestor", tip, candidateTip],
-            budget(),
-          )
-          if (answer.stderr.trim() === "" && answer.code === 0) {
-            remoteRef = candidateRef
-            break
-          }
-          if (answer.stderr.trim() !== "" || answer.code !== 1) {
+          if (anyProof.stderr.trim() !== "" || anyProof.code !== 0) {
             return unproven(
-              `${label}: merge-base --is-ancestor ${tip} ${candidateTip} answered ${String(answer.code)} (${answer.stderr.trim() || "no stderr"}); the tip is kept, never proven`,
+              `${label}: the advertised refs could not be walked against ${tip} (${anyProof.stderr.trim() || `exit ${String(anyProof.code)}`}); the tip is kept, never proven`,
             )
           }
+          // An empty walk excluded every commit, so at least one candidate reaches the tip.
+          if (anyProof.stdout.trim() === "") {
+            for (const [candidateRef, candidateTip] of allowed) {
+              const answer = await storeRun(
+                [`--git-dir=${gitDir}`, "merge-base", "--is-ancestor", tip, candidateTip],
+                budget(),
+              )
+              if (answer.stderr.trim() === "" && answer.code === 0) {
+                remoteRef = candidateRef
+                break
+              }
+              if (answer.stderr.trim() !== "" || answer.code !== 1) {
+                return unproven(
+                  `${label}: merge-base --is-ancestor ${tip} ${candidateTip} answered ${String(answer.code)} (${answer.stderr.trim() || "no stderr"}); the tip is kept, never proven`,
+                )
+              }
+            }
+            // The walk says a proof exists among these refs but no single one reproduces it: unknown, never redundant.
+            if (remoteRef === undefined) {
+              return unproven(
+                `${label}: the walk proved ${tip} reachable from the advertised refs together, but no single advertised ref reaches it; the tip is kept, never proven`,
+              )
+            }
+          }
         }
-        if (remoteRef === undefined && ranked.length > MAX_ANCESTRY_CANDIDATES) {
+        if (remoteRef === undefined && carried.length > MAX_ANCESTRY_CANDIDATES) {
           return unproven(
-            `${label}: ${refs.join(", ")} at ${tip} was asked of the first ${String(MAX_ANCESTRY_CANDIDATES)} of ${String(ranked.length)} advertised ref(s) only; the entry keeps its witness proof`,
+            `${label}: ${refs.join(", ")} at ${tip} was asked of the first ${String(MAX_ANCESTRY_CANDIDATES)} of ${String(carried.length)} advertised ref(s) only; the entry keeps its witness proof`,
           )
         }
       }
@@ -2647,9 +2726,9 @@ async function runCustody(
     if (identity.own !== undefined) componentOwnByComponent.set(component.component, identity.own)
     const head = await componentRun([`--git-dir=${componentGitDir}`, "symbolic-ref", "-q", "HEAD"], {})
     // Exit 1 is a detached HEAD: no branch is checked out, and no branch can be this entry's own proof anyway.
-    if (head.code === 0 && head.stdout.trim() !== "")
+    if (head.code === 0 && head.stdout.trim() !== "") {
       componentHeadRefByComponent.set(component.component, head.stdout.trim())
-    else if (head.code !== 1 && identity.own !== undefined) {
+    } else if (head.code !== 1 && identity.own !== undefined) {
       // A repository that answered its own identity but not its HEAD is a store to name, never one to guess about. A
       // store that answered NEITHER is unreadable, and the vanished/corrupt paths below name it with its structure.
       throw new UnknownError(

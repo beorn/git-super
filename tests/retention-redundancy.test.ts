@@ -156,6 +156,56 @@ describe("retention redundancy against a live remote snapshot (#37792)", () => {
     expect(outcome.detail).toContain("reachable from none")
   })
 
+  // @cto 2026-11-25: the order decides how soon a proof is met, never whether it is met. The same fixture proves the
+  // same tip with the proving ref ranked first (refs/heads/main) and ranked last (refs/remotes/upstream/main), each
+  // behind an unrelated branch that ranks ahead of it.
+  it("reaches the same verdict whichever end of the order the proving ref sits at", async () => {
+    const early = storeFor("ordered-early")
+    const late = storeFor("ordered-late")
+    for (const fixture of [early, late]) {
+      // An advertised branch ranked ahead of everything, holding a commit that cannot reach the tip.
+      git(fixture.remote, ["checkout", "-q", "--orphan", "side"])
+      writeFileSync(join(fixture.remote, "side.ts"), "export const side = 1\n")
+      git(fixture.remote, ["add", "side.ts"])
+      git(fixture.remote, ["commit", "-q", "-m", "unrelated"])
+      git(fixture.remote, ["checkout", "-q", "main"])
+      // The store holds its own branch one commit behind the advertised tip, so only ancestry can prove it.
+      git(fixture.store, ["update-ref", "refs/heads/main", fixture.first])
+    }
+    // The late fixture advertises the tip ONLY under the last-ranked namespace.
+    git(late.remote, ["update-ref", "refs/remotes/upstream/main", late.second])
+    git(late.remote, ["update-ref", "-d", "refs/heads/main"])
+    const earlyOutcome = await prove(early.store)
+    const lateOutcome = await prove(late.store)
+    expect(earlyOutcome.status).toBe("redundant")
+    expect(lateOutcome.status).toBe("redundant")
+    if (earlyOutcome.status !== "redundant" || lateOutcome.status !== "redundant") return
+    expect(earlyOutcome.proof.reached).toEqual([
+      { ref: "refs/heads/main", tip: early.first, remoteRef: "refs/heads/main" },
+    ])
+    expect(lateOutcome.proof.reached).toEqual([
+      { ref: "refs/heads/main", tip: late.first, remoteRef: "refs/remotes/upstream/main" },
+    ])
+  })
+
+  // @cto 2026-11-25: a tip nothing reaches is answered only after EVERY candidate is walked, so the verdict stays
+  // unknown and the entry keeps its witness proof — never a partial walk reported as "no proof exists".
+  it("walks every advertised ref before leaving a tip with no proving ref unproven", async () => {
+    const fixture = storeFor("ordered-nothing")
+    writeFileSync(join(fixture.store, "local.ts"), "export const local = 1\n")
+    git(fixture.store, ["add", "local.ts"])
+    git(fixture.store, ["commit", "-q", "-m", "local only"])
+    for (let index = 0; index < 40; index += 1) {
+      git(fixture.remote, ["update-ref", `refs/heads/side-${String(index)}`, fixture.second])
+    }
+    const outcome = await prove(fixture.store)
+    expect(outcome.status).toBe("unproven")
+    if (outcome.status !== "unproven") return
+    expect(outcome.detail).toContain("reachable from none")
+    // "reachable from none of N" is the full walk; the truncated bound reads "was asked of the first 64".
+    expect(outcome.detail).not.toContain("only;")
+  })
+
   // @cto 1a773179: reachability is asked of the snapshot, "never the store's frozen refs/remotes".
   it("does not let a frozen refs/remotes entry decide redundancy", async () => {
     const fixture = storeFor("redundant-frozen")
