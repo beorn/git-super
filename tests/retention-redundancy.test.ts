@@ -264,9 +264,7 @@ describe("retention redundancy against a live remote snapshot (#37792)", () => {
     if (outcome.status !== "redundant") return
     // The side branch fetched into the store proves too; the one under test is the tip behind the 80 candidates.
     expect(outcome.proof.reached).toEqual(
-      expect.arrayContaining([
-        { ref: "refs/heads/main", tip: fixture.first, remoteRef: "refs/remotes/upstream/main" },
-      ]),
+      expect.arrayContaining([{ ref: "refs/heads/main", tip: fixture.first, remoteRef: "refs/remotes/upstream/main" }]),
     )
     expect(outcome.proof.advertisedRefs).toBeGreaterThan(64)
   })

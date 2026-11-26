@@ -50,7 +50,11 @@ export interface CustodyBounds {
   readonly maxReachableOids: number
   /** 300 s per survivor graph in the contract's initial pass. */
   readonly reachableMs: number
-  /** 300 s per cached witness `fsck --full` in the contract's initial pass. */
+  /**
+   * 300 s per cached witness store health read in the contract's initial pass. 34127 (@cto 84ff4789): the read is the
+   * unique-object `rev-list --objects --missing=print` walk, which measures in tenths of a second on the store a
+   * whole-store `fsck --connectivity-only` spent 840 s on.
+   */
   readonly fsckMs: number
 }
 export const DEFAULT_CUSTODY_BOUNDS: CustodyBounds = {
@@ -320,7 +324,7 @@ export class CustodyRunScope {
    */
   readonly fscks = new Map<
     string,
-    Readonly<{ ok: true } | { ok: false; detail: string; timedOut?: boolean; deadlineCut?: boolean }>
+    Readonly<{ ok: true } | { ok: false; detail: string; timedOut?: boolean; deadlineCut?: boolean; limit?: boolean }>
   >()
   /** 37854: ref fragments by store, format, tip and subtracted set — the walk's result, never a proof decision. */
   readonly fragments = new Map<string, SidecarRef>()
@@ -353,6 +357,11 @@ const HEX40 = /^[0-9a-f]{40}$/u
 const DURABLE_REF = /^refs\/(?:heads|tags)\//u
 const PIN_REF = /^refs\/git-super\/pins\//u
 const MISSING_INLINE = 100
+/**
+ * 34127: the unique-object walk is capped on its own line count, never on `bounds.maxReachableOids` — that bound sizes a
+ * FRAGMENT walk, and a caller tightening it to compare fragment widths must not change whether a store witnesses.
+ */
+const PRESENCE_MAX_LINES = 4_000_000
 
 class UnknownError extends Error {
   constructor(message: string) {
@@ -1073,8 +1082,9 @@ async function independentRefs(
  */
 type WitnessStoreRead =
   /**
-   * 34127 (@cto turn58): `fsckMs` is the span the read had already spent when it died, so a cut inside its fsck is not
-   * reported as 0. Absent when the read died before the fsck started (or outside it).
+   * 34127 (@cto turn58): `fsckMs` is the span the read had already spent when it died, so a cut inside its store health
+   * read is not reported as 0. Absent when the read died before that read started (or outside it). 34127 (@cto
+   * 84ff4789): the health read is the unique-object walk (`witnessPresence`), not a whole-store fsck.
    */
   | { readonly kind: "fatal"; readonly error: unknown; readonly fsckMs?: number }
   | { readonly kind: "corrupt"; readonly gitDir: string; readonly detail: string }
@@ -1091,7 +1101,7 @@ type WitnessStoreRead =
       readonly unsubtracted: string
       readonly unscoped?: string
       readonly published?: Readonly<{ store: string; tip: string; repo: string; remote: string }>
-      /** True when `fsck --connectivity-only` covered this store for the entry. */
+      /** True when the unique-object walk covered this store for the entry (@cto 84ff4789; was `fsck --connectivity-only`). */
       readonly fsck: boolean
       readonly fsckMs: number
       /**
@@ -1110,9 +1120,91 @@ type WitnessStoreRead =
       readonly alternateStores: readonly string[]
     }
 
+/**
+ * 34127 (@cto 84ff4789): a witness store answers only for the objects origin does not already hold. A whole-store
+ * `fsck --connectivity-only` spent 840 s of one entry's budget on a 213k-object store, while the objects that actually
+ * need a second copy are this store's UNIQUE ones: reachable from a durable ref here and from no fetched copy of what
+ * origin publishes. `rev-list --objects --missing=print` over exactly those roots, with every fetched namespace
+ * negated, walks that closure in seconds (47 objects, 0.09 s on the store that timed out, against 840 s of fsck) and
+ * answers the only question custody asks: does this store hold every object its own durable refs name? A `?` line is
+ * an object it claims and does not hold, so it cannot witness; everything origin publishes is the origin proof's
+ * business, already paid for.
+ */
+async function witnessPresence(
+  storeStream: GitStreamFactory,
+  storeRun: GitRun,
+  gitDir: string,
+  durable: readonly WitnessRef[],
+  listed: readonly WitnessRef[],
+  bounds: CustodyBounds,
+  deadline: number | undefined,
+  clock: () => number,
+): Promise<{ ok: true } | { ok: false; detail: string; timedOut?: boolean; deadlineCut?: boolean; limit?: boolean }> {
+  const requested = bounds.fsckMs
+  const left = deadline === undefined ? Number.POSITIVE_INFINITY : deadline - clock()
+  const timeoutMs = Math.min(requested, left)
+  const roots = durable.filter((entry) => entry.objectType !== "tree" && entry.objectType !== "blob")
+  // A durable ref that names a tree or a blob has no walk of its own: presence is the whole question.
+  for (const entry of durable) {
+    if (entry.objectType !== "tree" && entry.objectType !== "blob") continue
+    const present = await storeRun([`--git-dir=${gitDir}`, "cat-file", "-e", entry.tip], { timeoutMs })
+    if (present.code !== 0) {
+      return { ok: false, detail: `witness store ${gitDir} does not hold ${entry.ref} (${entry.tip})` }
+    }
+  }
+  if (roots.length === 0) return { ok: true }
+  // Everything this store holds under a fetched namespace is a copy of what somebody else publishes, so those roots are
+  // negated: the walk then emits the unique closure alone instead of the whole mirror's history.
+  const input = [
+    ...roots.map((entry) => entry.tip),
+    ...listed.filter((entry) => fetchedNamespace(entry.ref) !== undefined).map((entry) => `^${entry.tip}`),
+  ]
+  const lineStream = storeStream(
+    [`--git-dir=${gitDir}`, "rev-list", "--objects", "--missing=print", "--no-object-names", "--stdin"],
+    { timeoutMs, maxLines: PRESENCE_MAX_LINES, stdin: `${input.join("\n")}\n` },
+  )
+  const missing: string[] = []
+  let missingCount = 0
+  for await (const line of lineStream.lines) {
+    if (!line.startsWith("?")) continue
+    missingCount += 1
+    if (missing.length < MISSING_INLINE) missing.push(line.slice(1))
+  }
+  const outcome = await lineStream.outcome
+  if (outcome.timedOut === true) {
+    // A kill the shared deadline ordered is the schedule, never a verdict about the store.
+    const detail =
+      left <= requested
+        ? `shared proof deadline is exhausted during the unique-object walk in witness store ${gitDir}`
+        : `the unique-object walk in witness store ${gitDir} did not finish within ${bounds.fsckMs} ms`
+    return { ok: false, detail, timedOut: true, ...(left <= requested ? { deadlineCut: true } : {}) }
+  }
+  if (outcome.capped === true) {
+    return {
+      ok: false,
+      limit: true,
+      detail: `the unique-object walk in witness store ${gitDir} exceeded ${PRESENCE_MAX_LINES} objects`,
+    }
+  }
+  if (outcome.code !== 0 || outcome.stderr.trim() !== "") {
+    return {
+      ok: false,
+      detail: `rev-list --objects --missing=print in witness store ${gitDir} answered exit ${String(outcome.code)}: ${outcome.stderr.trim() === "" ? "no diagnostic" : outcome.stderr.trim()}`,
+    }
+  }
+  if (missingCount > 0) {
+    return {
+      ok: false,
+      detail: `witness store ${gitDir} is missing ${String(missingCount)} object(s) its own durable refs name, e.g. ${missing.join(", ")}`,
+    }
+  }
+  return { ok: true }
+}
+
 async function readWitnessStore(
   store: string,
   run: GitRun,
+  stream: GitStreamFactory,
   bounds: CustodyBounds,
   removal: readonly string[],
   witnessPolicy: Readonly<{ targetBranch: string }> | undefined,
@@ -1134,6 +1226,7 @@ async function readWitnessStore(
     // #34920: a witness store whose recorded core.worktree is gone is read detached (see worktreeGone).
     const detached = await worktreeGone(gitDir, run)
     const storeRun = atStore(run, gitDir, detached)
+    const storeStream = atStoreStream(stream, gitDir, detached)
     const format = await objectFormat(gitDir, storeRun)
     if (format.status !== "ok") {
       if (format.vanished !== undefined) throw new VanishedStoreError(format.vanished, format.detail)
@@ -1247,8 +1340,9 @@ async function readWitnessStore(
     // root, and stays in every estate, owner and delta fact.
     if (durable.length === 0) return { kind: "nonWitness", gitDir }
     let fsck = false
-    // 37792 (@cto 2026-11-22): the witness proof asks whether this environment's objects survive, not whether every
-    // blob parses, so store health is `fsck --connectivity-only`. The entry-relevant proof is the head closure below.
+    // 34127 (@cto 84ff4789): a store proves only what origin does not already hold, so its health check is the
+    // pointed unique-object walk below, never a whole-store `fsck --connectivity-only` (840 s of one entry's budget on
+    // a 213k-object store). The entry-relevant proof stays the head closure that follows.
     if (!skipFsck && (repo === undefined || !skipFsckRepos.has(repo))) {
       fsck = true
       let verdict = runScope?.fscks.get(gitDir)
@@ -1257,38 +1351,21 @@ async function readWitnessStore(
         if (deadline !== undefined && clock() >= deadline) {
           throw new ProofDeadlineError("shared proof deadline is exhausted")
         }
-        const fsckStarted = clock()
-        const result = await storeRun([`--git-dir=${gitDir}`, "fsck", "--connectivity-only", "--no-progress"], {
-          timeoutMs: bounds.fsckMs,
-        })
-        fsckMs = clock() - fsckStarted
-        // 37792 (@cto 2026-11-22): a missing object is named from stdout, where `fsck --connectivity-only` reports it.
-        const broken = result.stdout
-          .split("\n")
-          .filter((line) => /^(?:missing|broken|error)\b/u.test(line))
-          .slice(0, MISSING_INLINE)
-        verdict =
-          // A child this runner killed did not answer, whatever code it was reported with; only a complete read is ok.
-          result.code === 0 && result.stderr.trim() === "" && result.timedOut !== true
-            ? { ok: true }
-            : {
-                ok: false,
-                // A kill the shared deadline ordered is named as the schedule, never as a failure of the store.
-                detail:
-                  result.sharedDeadlineCut === true
-                    ? `shared proof deadline is exhausted during fsck --connectivity-only in witness store ${gitDir}`
-                    : `fsck --connectivity-only failed in witness store ${gitDir}: ${result.stderr.trim() || broken.join("; ") || "exit " + String(result.code)}`,
-                timedOut: result.timedOut === true,
-                ...(result.sharedDeadlineCut === true ? { deadlineCut: true } : {}),
-              }
+        const presenceStarted = clock()
+        try {
+          verdict = await witnessPresence(storeStream, storeRun, gitDir, durable, listed, bounds, deadline, clock)
+        } finally {
+          fsckMs = clock() - presenceStarted
+        }
         // 37792 (@cto 2026-11-22 9573ed64): publish only an answer about the store. A health check the shared deadline
         // cut says when the budget ran out, so it is not remembered - the next entry spends its own remaining time.
         if (!("deadlineCut" in verdict)) runScope?.fscks.set(gitDir, verdict)
       }
-      // A store killed at its own fsck bound is a proof limit, not corruption; only an answer that reports objects it
-      // cannot read excludes the store.
+      // A store killed at its own bound, or one whose walk hit its cap, is a proof limit; only an answer that reports
+      // objects the store's own durable refs name and it does not hold excludes the store.
       if (!verdict.ok) {
         if (verdict.deadlineCut === true) throw new ProofDeadlineError(verdict.detail)
+        if (verdict.limit === true) throw new UnknownError(verdict.detail)
         throw verdict.timedOut === true ? new UnknownError(verdict.detail) : new CorruptStoreError(verdict.detail)
       }
     }
@@ -1450,6 +1527,7 @@ async function indexWitnessStoresReported(
       readWitnessStore(
         store,
         run,
+        stream,
         bounds,
         removal,
         witnessPolicy,
@@ -1726,7 +1804,9 @@ function vanishedDetail(stores: ReadonlyArray<string>): string {
 
 /** 37792 (@cto 2026-11-22): the store-health command and count the receipt carries beside the head closure. */
 function storeHealthDetail(stores: ReadonlyArray<string>): string {
-  return stores.length === 0 ? "" : `; store health: fsck --connectivity-only ok on ${String(stores.length)} store(s)`
+  return stores.length === 0
+    ? ""
+    : `; store health: the unique-object walk found no missing object on ${String(stores.length)} store(s)`
 }
 
 /** 37792 (@cto 2026-11-22): the entry-relevant closure check, named with its command and counts. */
