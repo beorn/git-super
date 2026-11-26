@@ -16,6 +16,7 @@ import { spawn } from "node:child_process"
 import { createHash } from "node:crypto"
 import { createReadStream } from "node:fs"
 import {
+  appendFileSync,
   closeSync,
   existsSync,
   linkSync,
@@ -531,6 +532,18 @@ export function createGitLineStream(options: GitLineFramerOptions = {}): GitLine
     capped = true
     options.onCap?.()
   }
+  // One drainer at a time. `write` and `end` both split the same remainder, and a child's 'close' arrives while a
+  // suspended write's pump is still mid-drain; letting both run over that remainder is what joined a record onto its
+  // neighbour's size field and what left one of the two capacity waiters unresolved. Every drain joins this chain.
+  let pumpChain: Promise<void> = Promise.resolve()
+  const drain = (): Promise<void> => {
+    const next = pumpChain.then(pump)
+    pumpChain = next.then(
+      () => undefined,
+      () => undefined,
+    )
+    return next
+  }
   const pump = async (): Promise<void> => {
     let index = remainder.indexOf(separator)
     while (index !== -1 && !capped) {
@@ -566,24 +579,46 @@ export function createGitLineStream(options: GitLineFramerOptions = {}): GitLine
       cap()
       return
     }
+    const streamDump = process.env.GIT_SUPER_STREAM_DUMP
+    if (streamDump !== undefined) {
+      appendFileSync(`${streamDump}.idx`, `${bytes - chunk.length}\t${chunk.length}\n`)
+      appendFileSync(`${streamDump}.bin`, chunk)
+    }
     remainder += decoder.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+    await drain()
+  }
+
+  // The final drain runs IN the chain: a chunk already handed to write() appends and queues its drain synchronously,
+  // so queuing after it means its records are split before the unterminated tail is flushed, never joined onto it.
+  const drainTail = async (): Promise<void> => {
     await pump()
+    if (capped) return
+    const tail = remainder
+    remainder = ""
+    if (tail === "") return
+    if (tail.length > MAX_LINE_LENGTH) {
+      cap()
+      return
+    }
+    if (options.maxLines !== undefined && lines >= options.maxLines) {
+      cap()
+      return
+    }
+    await waitForCapacity()
+    lines += 1
+    push(tail)
   }
 
   const end = async (): Promise<void> => {
     if (ended) return
     if (!capped) {
-      const tail = remainder + decoder.end()
-      remainder = ""
-      if (tail !== "") {
-        if (tail.length > MAX_LINE_LENGTH) cap()
-        else if (options.maxLines !== undefined && lines >= options.maxLines) cap()
-        else {
-          await waitForCapacity()
-          lines += 1
-          push(tail)
-        }
-      }
+      remainder += decoder.end()
+      const next = pumpChain.then(drainTail)
+      pumpChain = next.then(
+        () => undefined,
+        () => undefined,
+      )
+      await next
     }
     ended = true
     wakeConsumer()
