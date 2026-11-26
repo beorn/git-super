@@ -16,7 +16,6 @@ import { spawn } from "node:child_process"
 import { createHash } from "node:crypto"
 import { createReadStream } from "node:fs"
 import {
-  appendFileSync,
   closeSync,
   existsSync,
   linkSync,
@@ -578,11 +577,6 @@ export function createGitLineStream(options: GitLineFramerOptions = {}): GitLine
     if (options.maxBytes !== undefined && bytes > options.maxBytes) {
       cap()
       return
-    }
-    const streamDump = process.env.GIT_SUPER_STREAM_DUMP
-    if (streamDump !== undefined) {
-      appendFileSync(`${streamDump}.idx`, `${bytes - chunk.length}\t${chunk.length}\n`)
-      appendFileSync(`${streamDump}.bin`, chunk)
     }
     remainder += decoder.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
     await drain()
