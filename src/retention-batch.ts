@@ -103,6 +103,14 @@ export type BatchRow = Readonly<{
   outcome: "would-retire" | "retired" | "kept" | "failed" | "not-reached"
   reason: string
   evidence?: string
+  /**
+   * 34127 (@cto 2026-11-26): milliseconds per gate for the pass that decided this row, under the names the certificate
+   * uses, plus the custody walk's own nested phases (witnessFsck, refGraph, ...) under their own names. A gate the pass
+   * never reached is ABSENT, never zero, so "not evaluated" and "took no time" stay different answers.
+   */
+  gates?: Readonly<Record<string, number>>
+  /** Milliseconds spent removing the entry and cleaning up its pointers; absent when nothing was deleted. */
+  deleteMs?: number
 }>
 
 export type BatchWindow = Readonly<{
@@ -632,7 +640,18 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
     else cheapTotals.fallThrough += 1
     cheapTotals.ms += proof.cheapGate.ms
   }
-  const result = (windows: BatchWindow[], stopped?: string): RetentionBatchResult => ({
+  // 34127 (@cto 2026-11-26): one gate's milliseconds, from the pass that decided the row plus that entry's custody
+  // sub-phases. Undefined when the pass recorded neither, so a row never claims a timing it did not measure.
+  const gateTimings = (
+    proof: RetentionVerifyResult | undefined,
+    subphases: ReadonlyMap<string, number> | undefined,
+  ): Readonly<Record<string, number>> | undefined => {
+    const measured: Record<string, number> = {}
+    for (const gate of proof?.gates ?? []) if (gate.ms !== undefined) measured[gate.gate] = gate.ms
+    for (const [phase, ms] of subphases ?? []) measured[phase] = Math.round(ms)
+    return Object.keys(measured).length === 0 ? undefined : measured
+  }
+  const batchResult = (windows: BatchWindow[], stopped?: string): RetentionBatchResult => ({
     apply,
     ...(cheapTotals.live + cheapTotals.fallThrough === 0 ? {} : { cheapGate: { ...cheapTotals } }),
     warnings,
@@ -700,6 +719,16 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
       ? {}
       : { stopped, stoppedKind: stopKind(stopped) as NonNullable<RetentionBatchResult["stoppedKind"]> }),
   })
+  // 34127 (@cto 2026-11-26): every row names what each gate cost, from the preliminary pass when nothing else decided
+  // it, so the slow gate is named by every run's own JSON rather than by a hand profile after the fact.
+  const result = (windows: BatchWindow[], stopped?: string): RetentionBatchResult => {
+    for (const [entry, row] of rows) {
+      if (row.gates !== undefined) continue
+      const gates = gateTimings(preliminary.get(entry), timings.get(entry)?.subphases)
+      if (gates !== undefined) rows.set(entry, { ...row, gates })
+    }
+    return batchResult(windows, stopped)
+  }
   if (scan.status === "unknown") {
     const reason = `incomplete: the batch estate scan is unknown: ${scan.detail}`
     for (const entry of entries) rows.set(entry, { entry, outcome: "kept", reason })
@@ -1145,6 +1174,8 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
                 entry,
                 outcome: "failed",
                 reason: `${error instanceof Error ? error.message : String(error)}; ${phase} failed; actual entry state: ${state}; no retry`,
+                gates: gateTimings(held, timings.get(entry)?.subphases) ?? {},
+                deleteMs: Math.round(monotonic() - entryStarted),
               })
               stopped = `retirement-partial at ${entry}; the batch deleted nothing more`
               break
@@ -1159,6 +1190,8 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
                   ? "absence verified"
                   : `absence verified; retired with no content or custody gate: ${held.cheapGate.reason} (${String(held.cheapGate.ms)} ms)`,
               evidence: after.path,
+              gates: gateTimings(held, timings.get(entry)?.subphases) ?? {},
+              deleteMs: Math.round(monotonic() - entryStarted),
             })
           }
           lastEntryMs = monotonic() - entryStarted

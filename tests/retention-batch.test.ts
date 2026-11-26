@@ -223,6 +223,27 @@ describe("retention retirement batch (#33010)", async () => {
     expect(result.warnings).toEqual([])
   })
 
+  // 34127 (@cto 2026-11-26): every row names what each gate cost, so the slow gate is named by the run's own JSON
+  // rather than by a hand profile afterwards. A gate the pass never reached is absent, never reported as zero.
+  it("carries measured milliseconds per gate, and the delete, on every retired row", async () => {
+    const entries = readdirSync(root)
+      .sort()
+      .slice(0, 2)
+      .map((name) => join(root, name))
+    const result = await retireRetainedBatch(options({ entries, apply: true }))
+    const retired = result.rows.filter((row) => row.outcome === "retired")
+    expect(retired).toHaveLength(2)
+    for (const row of retired) {
+      const gates = row.gates ?? {}
+      expect(Object.keys(gates).length).toBeGreaterThan(0)
+      for (const ms of Object.values(gates)) expect(typeof ms).toBe("number")
+      expect(Object.values(gates).every((ms) => Number.isFinite(ms) && ms >= 0)).toBe(true)
+      // The gate that decides a retirement is the one an operator reads first, and it is always measured.
+      expect(typeof gates["positive-custody"]).toBe("number")
+      expect(typeof row.deleteMs).toBe("number")
+    }
+  })
+
   // AC33010: linking is an allocation optimization; a copy fallback keeps the same outcome and names its cost.
   it("shared batch link fallback preserves outcomes and emits one typed warning", async () => {
     const originalLink = vi.mocked(linkSync).getMockImplementation()!

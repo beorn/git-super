@@ -108,6 +108,12 @@ export type RetentionGateResult = Readonly<{
   message: string
   path?: string
   remedy?: string
+  /**
+   * 34127 (@cto 2026-11-26): milliseconds this pass spent reaching this gate's verdict, measured from the previous
+   * verdict (or the pass start). Gates run in order and every push ends one, so the span is that gate's own cost.
+   * Absent on a gate the pass never reached, which is not the same answer as zero.
+   */
+  ms?: number
 }>
 
 /**
@@ -626,6 +632,9 @@ async function evaluateRetainedEntry(
   }
   options.entryTimings?.({ kind: "enter", phase: currentPhase, ms: 0, claimsPhase: !deadlinePassed() })
   const gates: RetentionGateResult[] = []
+  // 34127 (@cto 2026-11-26): the boundary the next gate's cost is measured from, so a slow gate is named by the run's
+  // own receipt instead of found by hand afterwards.
+  let gateBoundary = startedAt
   const reasons: string[] = []
   const declaredNamespaceRoots = [...(options.namespaceRoots ?? [])]
   const result: {
@@ -666,7 +675,9 @@ async function evaluateRetainedEntry(
   let cheapPass = false
 
   const push = (gate: RetentionGateResult): void => {
-    gates.push(gate)
+    const now = monotonic()
+    gates.push({ ...gate, ms: Math.max(0, now - gateBoundary) })
+    gateBoundary = now
     if (gate.status !== "pass") {
       reasons.push(`gate ${GATE_ORDER.indexOf(gate.gate) + 1} ${gate.gate}: ${gate.message}`)
     }
