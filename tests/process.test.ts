@@ -1,3 +1,10 @@
+/**
+ * @failure GitSuper loses bytes, process state, or protocol evidence when delegating Git.
+ * @level l2
+ * @consumer GitSuper CLI and selected Git process callers
+ * @reach fs-walk <fixture-only: temporary Git repositories and executables>
+ * @testonly none
+ */
 import { afterEach, describe, expect, onTestFailed, test, vi } from "vitest"
 import { createLogger } from "loggily"
 import {
