@@ -1323,9 +1323,10 @@ describe("git super merge", () => {
         code: "gitlink-compose-refused",
         subject: expect.stringContaining("packages/alpha"),
         evidence: expect.stringContaining(`merge-tree --write-tree ${refusedMain} ${unpublished}`),
-        // 38894: the cure names the pin to re-cut onto, and claims no merge the
-        // code will not perform.
-        next: `The pin forked below the base and does not merge cleanly; re-cut onto ${refusedMain} and submit again.`,
+        // 38894: the cure names the pin to re-cut onto and the merge that produces it,
+        // and claims no merge the code will not perform. 28360: a conflicted pin is
+        // still the author's own re-cut.
+        next: `Merge the submodule's own main into the submodule commit, re-cut onto ${refusedMain}, and submit again.`,
         owner: "the caller",
       },
     })

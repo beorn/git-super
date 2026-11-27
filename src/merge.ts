@@ -3147,7 +3147,9 @@ function composeRefused(
   // merge conflicts" in both cases, which the code never did.
   const advice = reasons.some((reason) => reason.includes("rewound:"))
     ? `Submodule main was rewound away from the recorded base, so this pin cannot be merged onto it; re-cut onto ${onto} and submit again.`
-    : `The pin forked below the base and does not merge cleanly; re-cut onto ${onto} and submit again.`
+    : // 28360: a conflicted pin still needs ITS OWN re-cut, and the remedy names
+      // the merge that produces it rather than only the pin it must land on.
+      `Merge the submodule's own main into the submodule commit, re-cut onto ${onto}, and submit again.`
   return obviousDetail(
     "gitlink-compose-refused",
     `Merge ${target} ${claim}, and the diverged submodule could not be merged: ${reasons.join("; ")}; no commit was written.${stageEvidence ? ` ${stageEvidence}` : ""}`,
