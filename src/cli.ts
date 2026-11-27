@@ -19,8 +19,8 @@ import {
   type RetentionBatchParams,
   type RetentionRankParams,
   type RetentionChunksParams,
-  retentionChunks,
-  retentionRank,
+  type retentionChunks,
+  type retentionRank,
   type RetentionVerifyParams,
   type RetentionRetireParams,
   type StatusParams,
@@ -499,10 +499,13 @@ async function runInvocation(
     // unreachable (2026-09-10, @i/1-instruments/24411).
     return 2
   }
-  const [{ Command: CliCommand, CommanderError }, { commands }] = await Promise.all([
+  // Enriched command dependencies can initialize Bun's stdout stream. Load
+  // them after native delegation so execve inherits the original descriptor.
+  const [{ Command: CliCommand, CommanderError }, commandNodes] = await Promise.all([
     import("@silvery/commander"),
     import("./commands.ts"),
   ])
+  const { commands, retentionChunks, retentionRank } = commandNodes
   let captured: CapturedInvocation | undefined
   let usage: string | undefined
   const program = new CliCommand("git super")
@@ -1322,7 +1325,7 @@ async function runInvocation(
     await protocol?.refuse("unjudged", message)
     return 2
   }
-  await writeResult(captured, result, stdout, stderr, commands)
+  await writeResult(captured, result, stdout, stderr, commandNodes)
   if (
     captured.node === commands.diff &&
     (result as SuperDiffResult).notCompared.some(({ reason }) => reason === "unreadable")
@@ -1425,7 +1428,7 @@ async function writeResult(
   result: Awaited<ReturnType<typeof commandResult>>,
   stdout: OutputSink,
   stderr: OutputSink,
-  nodes: typeof commands,
+  { commands: nodes, retentionChunks, retentionRank }: typeof import("./commands.ts"),
 ): Promise<void> {
   if (
     captured.node === nodes.diff ||
