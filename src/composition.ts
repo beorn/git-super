@@ -196,7 +196,9 @@ async function ownChangeBase(
   if (await isAncestor(context, store, resolution.baseSha, resolution.incomingSha)) return resolution.baseSha
   const shared = await runGit(context, store, ["merge-base", resolution.currentSha, resolution.incomingSha])
   if (shared.code === 1 && settled(shared)) {
-    throw new Error(`'${resolution.path}' pin ${resolution.incomingSha} shares no history with main ${resolution.currentSha}`)
+    throw new Error(
+      `'${resolution.path}' pin ${resolution.incomingSha} shares no history with main ${resolution.currentSha}`,
+    )
   }
   if (!settled(shared) || shared.code !== 0) throw new Error(gitDetail(shared))
   return objectId(shared.stdout, "find a merge base")
