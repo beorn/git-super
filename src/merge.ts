@@ -2884,11 +2884,13 @@ async function composeGitlinks(
   if (executed.status === "refused") {
     const { detail, kind, operation, path } = executed.failure
     if (kind === "unavailable") return { failure: composeUnavailable(root, [path], operation, detail) }
+    const targeted = settled.resolutions.find((resolution) => resolution.path === path)
     return {
       failure: composeRefused({
         entries,
         evidence: evidence.componentMerge(path),
         head,
+        ours: targeted !== undefined && targeted.kind === "compose" ? targeted.currentSha : undefined,
         paths,
         rootConflict,
         reasons: [
@@ -3124,6 +3126,7 @@ function composeRefused(
     entries: readonly IndexEntry[]
     evidence: string
     head: string
+    ours: string | undefined
     paths: readonly string[]
     reasons: readonly string[]
     rootConflict: boolean
@@ -3131,16 +3134,25 @@ function composeRefused(
     target: string
   }>,
 ): GitResultDetail {
-  const { entries, evidence, head, paths, reasons, rootConflict, stageEvidence, target } = refusal
+  const { entries, evidence, head, ours, paths, reasons, rootConflict, stageEvidence, target } = refusal
   const located = paths.map((path) => JSON.stringify(path)).join(", ")
   const claim = rootConflict
     ? `conflicts with current HEAD ${head} at ${located}`
     : `moves ${located} to a pin off its submodule main`
+  const onto = ours ?? "current submodule main"
+  // Each refusal names the cure the submitter can execute, and nothing else
+  // (38894, @cto 2026-11-27). A rewound base cannot be merged onto at all; a pin
+  // that only forked below the base fails on its own conflicting paths. The
+  // advice used to promise "a diverged submodule is merged here unless its own
+  // merge conflicts" in both cases, which the code never did.
+  const advice = reasons.some((reason) => reason.includes("rewound:"))
+    ? `Submodule main was rewound away from the recorded base, so this pin cannot be merged onto it; re-cut onto ${onto} and submit again.`
+    : `The pin forked below the base and does not merge cleanly; re-cut onto ${onto} and submit again.`
   return obviousDetail(
     "gitlink-compose-refused",
     `Merge ${target} ${claim}, and the diverged submodule could not be merged: ${reasons.join("; ")}; no commit was written.${stageEvidence ? ` ${stageEvidence}` : ""}`,
     evidence,
-    "Merge the submodule's own main into the submodule commit, re-record the gitlink, and submit again; a diverged submodule is merged here unless its own merge conflicts.",
+    advice,
     "the caller",
     {
       objectIds: [...new Set([head, target, ...entries.map((entry) => entry.oid)])],

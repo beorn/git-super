@@ -164,7 +164,12 @@ export async function findSubmoduleCompositionOverlaps(
     const store = options.inject.storeForOrigin(resolution.origin)
     if (store.length === 0) throw new Error(`store locator returned an empty path for '${resolution.path}'`)
     const current = await changedPaths(context, store, resolution.baseSha, resolution.currentSha)
-    const incoming = await changedPaths(context, store, resolution.baseSha, resolution.incomingSha)
+    const incoming = await changedPaths(
+      context,
+      store,
+      await ownChangeBase(context, store, resolution),
+      resolution.incomingSha,
+    )
     const both = new Set(incoming)
     overlaps.push({
       path: resolution.path,
@@ -173,6 +178,28 @@ export async function findSubmoduleCompositionOverlaps(
     })
   }
   return overlaps
+}
+
+/**
+ * The commit the pin's own change set is measured from.
+ *
+ * The recorded base whenever the pin contains it. A pin that forked BELOW the
+ * recorded base contains neither, and measuring it from that base would read
+ * every commit main made as an edit of the pin's — an overlap nobody made
+ * (38894). Such a pin is measured from the true merge base instead.
+ */
+async function ownChangeBase(
+  context: GitContext,
+  store: string,
+  resolution: SubmoduleCommitResolution,
+): Promise<string> {
+  if (await isAncestor(context, store, resolution.baseSha, resolution.incomingSha)) return resolution.baseSha
+  const shared = await runGit(context, store, ["merge-base", resolution.currentSha, resolution.incomingSha])
+  if (shared.code === 1 && settled(shared)) {
+    throw new Error(`'${resolution.path}' pin ${resolution.incomingSha} shares no history with main ${resolution.currentSha}`)
+  }
+  if (!settled(shared) || shared.code !== 0) throw new Error(gitDetail(shared))
+  return objectId(shared.stdout, "find a merge base")
 }
 
 /** Construct deterministic two-parent composition commits without publishing refs. */
@@ -226,35 +253,36 @@ async function composeSubmoduleCommit(
     await requiredGit(context, store, ["cat-file", "-e", `${resolution.currentSha}^{commit}`], operation)
     await requiredGit(context, store, ["cat-file", "-e", `${resolution.incomingSha}^{commit}`], operation)
 
-    // Every object is present (verified above), so a side that does not descend
-    // from the base is a REWIND that side made, not an environment the queue
-    // cannot judge. Merging onto it would silently re-apply what was rewound:
-    // with no overlap gate in front (24977), merge-tree alone would call such a
-    // pair clean. It goes back to its author named, never as "cannot judge".
+    // Every object is present (verified above). A base the submodule MAIN does
+    // not descend from is a rewind main made, and merging a pin onto it would
+    // silently re-apply what was rewound: with no overlap gate in front (24977),
+    // merge-tree alone would call such a pair clean. It goes back to its author
+    // named, never as "cannot judge".
+    //
+    // Only main's side is judged here (38894, @cto 2026-11-27). When the base
+    // reaches main, main only advanced; a pin that forked below the base is
+    // older, not rewound, and a three-way merge from the true merge base keeps
+    // every commit main holds. That merge decides it below, and its own conflict
+    // refusal names the paths that need a re-cut.
     operation = "verify the planned merge base"
-    for (const [side, parent] of [
-      ["main", resolution.currentSha],
-      ["change", resolution.incomingSha],
-    ] as const) {
-      if (!(await isAncestor(context, store, resolution.baseSha, parent))) {
-        // Two histories with nothing in common cannot be judged at all (@cto 7645ec3a).
-        const shared = await runGit(context, store, ["merge-base", resolution.baseSha, parent])
-        if (shared.code === 1 && settled(shared)) {
-          return refused(
-            "unavailable",
-            resolution.path,
-            operation,
-            `planned base '${resolution.baseSha}' is not an ancestor of parent '${parent}'`,
-          )
-        }
-        if (!settled(shared) || shared.code !== 0) throw new Error(gitDetail(shared))
+    if (!(await isAncestor(context, store, resolution.baseSha, resolution.currentSha))) {
+      // Two histories with nothing in common cannot be judged at all (@cto 7645ec3a).
+      const shared = await runGit(context, store, ["merge-base", resolution.baseSha, resolution.currentSha])
+      if (shared.code === 1 && settled(shared)) {
         return refused(
-          "conflict",
+          "unavailable",
           resolution.path,
           operation,
-          `rewound: the ${side} pin ${parent} does not descend from the base ${resolution.baseSha}`,
+          `planned base '${resolution.baseSha}' is not an ancestor of parent '${resolution.currentSha}'`,
         )
       }
+      if (!settled(shared) || shared.code !== 0) throw new Error(gitDetail(shared))
+      return refused(
+        "conflict",
+        resolution.path,
+        operation,
+        `rewound: the main pin ${resolution.currentSha} does not descend from the base ${resolution.baseSha}`,
+      )
     }
 
     operation = "find a merge base"
@@ -280,7 +308,8 @@ async function composeSubmoduleCommit(
     const tree = objectId(merged.stdout.split(/\r?\n/u)[0] ?? "", operation)
 
     operation = "read caller-selected overlap evidence"
-    const reviewedBlobs = await readBothChangedBlobs(context, store, resolution, tree, options.reviewPath)
+    const pinBase = await ownChangeBase(context, store, resolution)
+    const reviewedBlobs = await readBothChangedBlobs(context, store, resolution, pinBase, tree, options.reviewPath)
 
     operation = "create the composition commit"
     const sha = await createCompositionCommit(context, store, resolution, tree, options.commit)
@@ -370,12 +399,13 @@ async function readBothChangedBlobs(
   context: GitContext,
   store: string,
   resolution: SubmoduleCommitResolution,
+  pinBase: string,
   tree: string,
   include: ((path: string) => boolean) | undefined,
 ): Promise<SubmoduleReviewedBlob[]> {
   if (include === undefined) return []
   const current = await changedPaths(context, store, resolution.baseSha, resolution.currentSha)
-  const incoming = new Set(await changedPaths(context, store, resolution.baseSha, resolution.incomingSha))
+  const incoming = new Set(await changedPaths(context, store, pinBase, resolution.incomingSha))
   const paths = current.filter((path) => incoming.has(path) && include(path)).toSorted(compareText)
   const reviewed: SubmoduleReviewedBlob[] = []
   for (const path of paths) {

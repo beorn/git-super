@@ -1323,7 +1323,9 @@ describe("git super merge", () => {
         code: "gitlink-compose-refused",
         subject: expect.stringContaining("packages/alpha"),
         evidence: expect.stringContaining(`merge-tree --write-tree ${refusedMain} ${unpublished}`),
-        next: expect.stringContaining("Merge the submodule's own main"),
+        // 38894: the cure names the pin to re-cut onto, and claims no merge the
+        // code will not perform.
+        next: `The pin forked below the base and does not merge cleanly; re-cut onto ${refusedMain} and submit again.`,
         owner: "the caller",
       },
     })
@@ -3256,14 +3258,16 @@ describe("git super merge", () => {
   })
 
   /**
-   * The CHANGE side of the same gate. Here the candidate's pin forks BELOW the
-   * base the change recorded while main advances from that base: base is an
-   * ancestor of ours and NOT an ancestor of theirs. Composing would silently
-   * keep what the candidate dropped, so the pair goes back to its author with
-   * the side named, exactly as the main-side row above does.
+   * The CHANGE side, when main only advanced (38894, @cto 2026-11-27). The pin
+   * forked BELOW the base the change recorded, and main advanced from that base,
+   * so base is an ancestor of ours and NOT of theirs. This is the production
+   * shape from the 17:00 window (km: base 596b3880, ours 9acef010, a pin forked
+   * at 00febc7f carrying its own commit). That pin is older, not rewound: a
+   * three-way merge from the TRUE merge base keeps every commit main holds, so
+   * it merges, and the composed pin has both sides as parents.
    */
-  it("sends a candidate pin that does not contain its recorded base back to its author (24977)", async () => {
-    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-rewound-change-"))
+  it("merges a pin that forked below its recorded base when main only advanced (38894)", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-below-base-merge-"))
     roots.push(fixtureRoot)
     const fixture = createProductFixture(fixtureRoot)
     const below = git(fixture.alpha, "rev-parse", "HEAD")
@@ -3274,11 +3278,12 @@ describe("git super merge", () => {
     git(fixture.product, "add", "packages/alpha")
     git(fixture.product, "commit", "-q", "-m", "pin alpha at base")
 
-    // The candidate forks BELOW the base, so it never contains it.
+    // The candidate forks BELOW the base, so it never contains it, and edits a
+    // file main does not touch, so the composition is clean.
     const authoring = join(fixtureRoot, "alpha-authoring")
     git(fixtureRoot, "clone", "-q", fixture.alpha, authoring)
     git(authoring, "checkout", "-q", below)
-    const theirs = advanceRepository(authoring, "alpha.ts", "export const alpha = 'theirs'\n")
+    const theirs = advanceRepository(authoring, "beta.ts", "export const beta = 'theirs'\n")
     git(authoring, "push", "-q", "origin", `${theirs}:refs/git-super/pins/${theirs}`)
     git(fixture.product, "switch", "-q", "-c", "candidate-below-the-base")
     git(fixture.product, "update-index", "--add", "--cacheinfo", `160000,${theirs},packages/alpha`)
@@ -3300,9 +3305,68 @@ describe("git super merge", () => {
 
     const result = await superMerge({ repo: fixture.product, commit: candidate })
 
+    expect(result).toMatchObject({ state: "updated", partial: false })
+    expect(git(fixture.product, "rev-parse", "HEAD")).not.toBe(headBefore)
+    const settled = result.gitlinks.find((row) => row.path === "packages/alpha")
+    expect(settled).toMatchObject({ path: "packages/alpha", state: "merged" })
+    const composed = git(fixture.product, "rev-parse", "HEAD:packages/alpha")
+    // The composed pin is a merge of both sides, so every commit ours held
+    // survives and the pin's own commit is carried with it.
+    expect(git(child, "rev-list", "--parents", "-n", "1", composed).split(" ")).toHaveLength(3)
+    expect(() => git(child, "merge-base", "--is-ancestor", current, composed)).not.toThrow()
+    expect(() => git(child, "merge-base", "--is-ancestor", theirs, composed)).not.toThrow()
+    expect(git(child, "show", `${composed}:alpha.ts`)).toBe("export const alpha = 'current'")
+    expect(git(child, "show", `${composed}:beta.ts`)).toBe("export const beta = 'theirs'")
+    expect(git(fixture.product, "status", "--porcelain=v1")).toBe("")
+  })
+
+  /**
+   * The same below-the-base pin, this time editing the file main edited. The
+   * merge is attempted (38894) and refuses on its own conflict, naming the path
+   * and the pin the author must re-cut onto.
+   */
+  it("refuses a below-the-base pin that conflicts, naming the path and the pin to re-cut onto (38894)", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "git-super-merge-below-base-conflict-"))
+    roots.push(fixtureRoot)
+    const fixture = createProductFixture(fixtureRoot)
+    const below = git(fixture.alpha, "rev-parse", "HEAD")
+    const base = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 'base'\n")
+    const child = join(fixture.product, "packages/alpha")
+    git(child, "fetch", "-q", "origin")
+    git(child, "checkout", "-q", base)
+    git(fixture.product, "add", "packages/alpha")
+    git(fixture.product, "commit", "-q", "-m", "pin alpha at base")
+
+    const authoring = join(fixtureRoot, "alpha-authoring")
+    git(fixtureRoot, "clone", "-q", fixture.alpha, authoring)
+    git(authoring, "checkout", "-q", below)
+    const theirs = advanceRepository(authoring, "alpha.ts", "export const alpha = 'theirs'\n")
+    git(authoring, "push", "-q", "origin", `${theirs}:refs/git-super/pins/${theirs}`)
+    git(fixture.product, "switch", "-q", "-c", "candidate-below-the-base-conflicting")
+    git(fixture.product, "update-index", "--add", "--cacheinfo", `160000,${theirs},packages/alpha`)
+    git(fixture.product, "commit", "-q", "-m", "pin alpha below the base")
+    const candidate = git(fixture.product, "rev-parse", "HEAD")
+
+    git(fixture.product, "switch", "-q", "main")
+    const current = advanceRepository(fixture.alpha, "alpha.ts", "export const alpha = 'current'\n")
+    git(child, "fetch", "-q", "origin")
+    git(child, "checkout", "-q", current)
+    git(fixture.product, "add", "packages/alpha")
+    git(fixture.product, "commit", "-q", "-m", "advance alpha past the base")
+    const headBefore = git(fixture.product, "rev-parse", "HEAD")
+    git(child, "fetch", "-q", "origin", `refs/git-super/pins/${theirs}`)
+    expect(() => git(child, "merge-base", "--is-ancestor", base, current)).not.toThrow()
+    expect(() => git(child, "merge-base", "--is-ancestor", base, theirs)).toThrow()
+
+    const result = await superMerge({ repo: fixture.product, commit: candidate })
+
     expect(result).toMatchObject({ state: "failed", partial: false, detail: { code: "gitlink-compose-refused" } })
-    // 24977: the same gate, the other side, named by name.
-    expect(result.detail?.message).toContain(`rewound: the change pin ${theirs} does not descend from the base ${base}`)
+    const message = result.detail?.message ?? ""
+    // The conflict is named, and the cure names the pin to re-cut onto.
+    expect(message).toContain("content conflict in: alpha.ts")
+    expect(message).toContain(`re-cut onto ${current}`)
+    // A merged-anyway claim would be the old lie (38894).
+    expect(message).not.toContain("a diverged submodule is merged here")
     expect(git(fixture.product, "rev-parse", "HEAD")).toBe(headBefore)
     expect(git(fixture.product, "status", "--porcelain=v1")).toBe("")
   })
