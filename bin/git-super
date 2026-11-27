@@ -5,5 +5,16 @@ if (typeof Bun === "undefined") {
   process.exitCode = 2
 } else {
   const { runCli } = await import("../src/cli.ts")
-  process.exitCode = await runCli(process.argv.slice(2), process.stdout, process.stderr, true)
+  // Bun makes a stdio descriptor nonblocking when its stream is first accessed.
+  // A native Git delegation inherits the descriptors through execve, so defer access until the CLI uses a sink.
+  const outputSink = (name) => ({
+    write: (value) => process[name].write(value),
+    get isTTY() {
+      return process[name].isTTY
+    },
+    get columns() {
+      return process[name].columns
+    },
+  })
+  process.exitCode = await runCli(process.argv.slice(2), outputSink("stdout"), outputSink("stderr"), true)
 }

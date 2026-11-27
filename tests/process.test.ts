@@ -369,6 +369,57 @@ process.exitCode = 19
     },
   )
 
+  // @failure: native Git silently drops index records when delegation leaves stdout nonblocking.
+  // @level l1; @consumer root-v1 custody reads; existing byte tests do not fill the output pipe.
+  test("delegated CLI preserves a large native index listing with root-v1 control", async () => {
+    const root = mkdtempSync(join(canonicalTmpdir(), "git-super-large-index-"))
+    roots.push(root)
+    createRepository(root, "base", "contents\n")
+    const executable = processPort.nativeGitExecutable()
+    const blob = git(root, "rev-parse", "HEAD:base")
+    const directory = "a".repeat(180)
+    const entries = Array.from({ length: 70_000 }, (_, index) => `100644 ${blob}\t${directory}/${index}.txt\n`).join("")
+    const staged = Bun.spawnSync([executable, "update-index", "--index-info"], {
+      cwd: root,
+      stdin: new Blob([entries]),
+    })
+    expect(staged.exitCode, staged.stderr.toString()).toBe(0)
+
+    const args = ["ls-files", "--stage", "-z"]
+    const native = Bun.spawnSync([executable, ...args], { cwd: root })
+    expect(native.exitCode, native.stderr.toString()).toBe(0)
+    expect(native.stdout.byteLength).toBeGreaterThan(16 * 1024 * 1024)
+
+    const child = Bun.spawn(
+      [process.execPath, join(import.meta.dirname, "../bin/git-super"), "--protocol-fd=3", ...args],
+      {
+        cwd: root,
+        stdio: ["ignore", "pipe", "pipe", "pipe"],
+      },
+    )
+    const fd = child.stdio[3]
+    if (typeof fd !== "number") throw new Error("Test did not open the requested control descriptor")
+    writeSync(fd, JSON.stringify({ version: 1, token: "large-index" }) + "\n")
+    const stderr = new Response(child.stderr).text()
+    const control = await new Response(Bun.file(fd).stream()).text()
+    // Wait for Git to start writing before pausing the reader, regardless of subprocess startup time.
+    const reader = child.stdout.getReader()
+    const hash = new Bun.CryptoHasher("sha256")
+    let bytes = 0
+    for (let chunk = await reader.read(); !chunk.done; chunk = await reader.read()) {
+      // A nonblocking writer can drop output and exit while the reader waits.
+      if (bytes === 0) await Promise.race([child.exited, Bun.sleep(100)])
+      bytes += chunk.value.byteLength
+      hash.update(chunk.value)
+    }
+    reader.releaseLock()
+    const [exit, diagnostics] = await Promise.all([child.exited, stderr])
+    expect(control).toBe(JSON.stringify({ version: 1, token: "large-index", ready: true }) + "\n")
+    expect(exit, diagnostics).toBe(0)
+    expect(bytes).toBe(native.stdout.byteLength)
+    expect(hash.digest("hex")).toBe(Bun.CryptoHasher.hash("sha256", native.stdout, "hex"))
+  })
+
   test("an explicitly requested missing control endpoint fails before native execution", () => {
     const result = Bun.spawnSync(
       [process.execPath, join(import.meta.dirname, "../bin/git-super"), "--protocol-fd=3", "--version"],
