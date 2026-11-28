@@ -2259,6 +2259,54 @@ describe("retention verify cheap gate (#38246)", () => {
     expect(proof.reasons[0]).toContain("gates 2-6 skipped")
   })
 
+  /**
+   * @failure #33010 (@cto 5d68de61): the cheap gate returned before gate 3, so a published copy retired while a survivor
+   *          still borrowed from it, or while its own store alternated into a path that is gone (@dev/luna5's audit found
+   *          411 live entries of that kind). "Nothing unpublished" is not "nothing borrows this": each sends the entry to
+   *          the full gates, where gate 3 keeps it.
+   */
+  it.each(["a survivor borrows into it", "its own store alternates into a path that is gone"])(
+    "a published copy takes the full gates, and is kept, when %s",
+    async (shape) => {
+      const scanned = await scanEstate([fixtureRoot as string], [base.entry], undefined, Date.now)
+      const entryReal = realpathSync(base.entry)
+      const store = join(entryReal, "modules", "vendor", "dep", "objects")
+      const gone = join(fixtureRoot as string, "removed-worktree", "objects")
+      const estate =
+        shape === "a survivor borrows into it"
+          ? {
+              ...scanned,
+              status: "blocked" as const,
+              survivorIntoRemoval: [{ borrower: join(fixtureRoot as string, "outside", "objects"), target: store }],
+              detail: `1 survivor borrower(s) into ${entryReal}`,
+            }
+          : {
+              ...scanned,
+              danglingAlternates: [
+                { store, alternatesFile: join(store, "info", "alternates"), line: gone, target: gone },
+              ],
+            }
+      const proof = await inspectRetainedEntryInBatch(
+        {
+          entry: base.entry,
+          root: base.root,
+          namespaceRoots: [fixtureRoot as string],
+          artifactDir: base.artifactDir,
+          allowTemporaryArtifactDir: true,
+          clock: eligible(),
+          gitRun: published,
+        },
+        estate,
+        [base.entry],
+      )
+      expect(proof.cheapGate).toBeUndefined()
+      expect(proof.verdict).not.toBe("candidate")
+      expect(proof.gates.find((gate) => gate.gate === "estate-inventory")?.status, JSON.stringify(proof.reasons)).toBe(
+        "blocked",
+      )
+    },
+  )
+
   it("falls through to the full gates when a store holds a stash", async () => {
     const run: typeof defaultGitRun = (args, options) => {
       const result = published(args, options)

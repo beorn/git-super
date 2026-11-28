@@ -622,6 +622,11 @@ export type EstateDelta =
       prunedDirs: number
       /** Directories the discovery walk read. */
       walkedDirs: number
+      /**
+       * Recorded stores outside every selected entry that vanished since the scan (#33010, @cto c9e2666a): counted,
+       * not stopped. A gone store lends and borrows nothing; one that moved is classified at its new path by discovery.
+       */
+      vanishedStores: number
     }>
   | Readonly<{ status: "changed"; detail: string }>
 
@@ -684,6 +689,7 @@ export async function estateDelta(
     let discoveredStores = 0
     let prunedDirs = 0
     let walkedDirs = 0
+    let vanishedStores = 0
     const absentNow = new Set<string>()
     // 1. Every alternates file the scan recorded: one stat each, and a read only when its stamp moved or it
     //    appeared after the scan. A changed line that names nothing selected is churn (#33010 @cto).
@@ -717,16 +723,22 @@ export async function estateDelta(
     })
     if (settled() !== undefined) return settled() as EstateDelta
     // 2. A recorded store that is gone. Every store whose alternates file exists now was proved to exist by that
-    //    stat; the rest get one lstat, so a lender or witness store that vanished between the scan and the window
-    //    still ends the batch by name.
+    //    stat; the rest get one lstat. #33010 (@cto c9e2666a): a gone store OUTSIDE every selected entry lends and
+    //    borrows nothing now, so it is counted, not a stop (yrd-submit candidate worktrees and closed environments
+    //    come and go all night); one that moved is classified at its new path by discovery (step 4), and one that
+    //    reappears before a delete is caught by that entry's held re-verification. A gone store INSIDE a selected
+    //    entry means the entry itself changed under the window, and that still ends the batch by name.
     await inPool([...absentNow], async (store) => {
       const now = await lstatAsync(store).catch((error: unknown) => {
         if (absent(error)) return undefined
         throw error
       })
-      if (now?.isDirectory() !== true) {
-        stop(`object directory ${store} vanished or is no longer a directory since the scan`)
+      if (now?.isDirectory() === true) return
+      if (!borrowerInsideSelection(store)) {
+        vanishedStores += 1
+        return
       }
+      stop(`object directory ${store} inside a selected entry vanished or is no longer a directory since the scan`)
     })
     if (settled() !== undefined) return settled() as EstateDelta
     // 3. `objects` links and borrower registries: a few thousand at most, and a redirect or a new registration is a
@@ -865,7 +877,16 @@ export async function estateDelta(
     }
     const verdict = settled()
     if (verdict !== undefined) return verdict
-    return { status: "unchanged", changedDirs, filesStatted, filesRead, discoveredStores, prunedDirs, walkedDirs }
+    return {
+      status: "unchanged",
+      changedDirs,
+      filesStatted,
+      filesRead,
+      discoveredStores,
+      prunedDirs,
+      walkedDirs,
+      vanishedStores,
+    }
   } catch (error) {
     return { status: "changed", detail: `estate delta could not be read: ${reason(error)}` }
   }

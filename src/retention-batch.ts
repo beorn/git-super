@@ -158,6 +158,13 @@ export type BatchWindow = Readonly<{
   prunedDirs: number
   /** Directories the discovery walk read. */
   walkedDirs: number
+  /** #33010 (@cto a6752202): recorded stores outside the selection that vanished since the scan: counted, not a stop. */
+  vanishedStores: number
+  /**
+   * #33010 (@cto a6752202): outside owners whose Git directory was gone when the window took its leases, by path. A
+   * gone owner can move no lender, so it is named here and left out of the lease set instead of ending the batch.
+   */
+  vanishedOwners: readonly string[]
 }>
 
 export type RetentionBatchResult = Readonly<{
@@ -278,8 +285,10 @@ export type RetentionBatchResult = Readonly<{
    * `deadline` and `budget` are TIME stops: the work that finished is real, the remainder is named, and the run is a
    * success with a remainder. `stop` is a condition that must be acted on — a shifted census, a held lease, a partial
    * retirement, an unreadable estate — and a batch that ends that way fails. Read beside `stopped`, never instead of it.
+   * `shifted` (#33010, @cto c9e2666a) is the census-shifted condition on its own: the batch still fails, but the chunk
+   * driver re-proves the entries it kept once, on a fresh scan, rather than ending every remaining chunk.
    */
-  stoppedKind?: "deadline" | "budget" | "stop"
+  stoppedKind?: "deadline" | "budget" | "shifted" | "stop"
   /**
    * 34127 (@cto 2026-11-24): the entries this batch's preliminary pass proved ready to retire, in borrower order. The
    * chunk driver subtracts what it retired to report "proved but unreached", so a deadline cut names the work it cost.
@@ -778,6 +787,7 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
     if (message === undefined) return undefined
     if (message.startsWith("proof-deadline")) return "deadline"
     if (message.startsWith("lease budget")) return "budget"
+    if (message.startsWith("census-shifted")) return "shifted"
     return "stop"
   }
   const cheapTotals = { live: 0, fallThrough: 0, ms: 0 }
@@ -1231,7 +1241,22 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
     const windowEntries: string[] = []
     let deltaStatus: BatchWindow["delta"] = "unchanged"
     let deltaMs = 0
-    let deltaCounts = { filesStatted: 0, filesRead: 0, discoveredStores: 0, prunedDirs: 0, walkedDirs: 0 }
+    let deltaCounts = {
+      filesStatted: 0,
+      filesRead: 0,
+      discoveredStores: 0,
+      prunedDirs: 0,
+      walkedDirs: 0,
+      vanishedStores: 0,
+    }
+    // #33010 (@cto c9e2666a, a6752202): an outside owner whose Git directory is gone now (a yrd-submit candidate
+    // worktree, a closed environment) can move no lender, so it is named and left out of the lease set instead of
+    // ending the batch on realpath's ENOENT. The common owner stays required. An owner that reappears with a loan into
+    // an entry before its delete is caught by that entry's held re-verification, as any new borrower is.
+    const vanishedOwners = leasedOwners.filter(
+      (owner) => owner !== common && lstatSync(owner, { throwIfNoEntry: false }) === undefined,
+    )
+    const presentOwners = leasedOwners.filter((owner) => !vanishedOwners.includes(owner))
     let stopped: string | undefined
     try {
       // Acquire outside owners BEFORE checking the delta; otherwise a leased writer could change an alternate
@@ -1240,7 +1265,7 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
       ownerLeases.push(
         acquireRemovalWriterLeases(first, undefined, {
           existingOnly: true,
-          additionalGitDirs: leasedOwners,
+          additionalGitDirs: presentOwners,
           skip: [commonPath],
           onReapedLease: reportReapedLease,
         }),
@@ -1256,6 +1281,7 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
           discoveredStores: delta.discoveredStores,
           prunedDirs: delta.prunedDirs,
           walkedDirs: delta.walkedDirs,
+          vanishedStores: delta.vanishedStores,
         }
       }
       const coldChanged = coldOwnerChanged(cold)
@@ -1385,6 +1411,7 @@ export async function retireRetainedBatch(options: RetentionBatchOptions): Promi
       deltaMs,
       holdMs: Math.round(monotonic() - heldFrom),
       ...deltaCounts,
+      vanishedOwners,
     })
     if (stopped !== undefined) {
       for (const entry of candidates.slice(next)) {

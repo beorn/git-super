@@ -207,6 +207,7 @@ describe("retention estate scan — gate 3 (#27443(b))", async () => {
         discoveredStores: 0,
         prunedDirs: 1,
         walkedDirs: expect.any(Number),
+        vanishedStores: 0,
       })
     })
 
@@ -260,12 +261,25 @@ describe("retention estate scan — gate 3 (#27443(b))", async () => {
       expect(delta.status === "changed" && delta.detail).toContain(join(clone, "info", "alternates"))
     })
 
-    test("a vanished object directory ends the batch", async () => {
+    /**
+     * @failure #33010 (@cto c9e2666a): yrd-submit candidate worktrees and closed environments vanish during a window
+     *          all night; a vanished store outside the selection ending the batch retired 0 of 14 on three of seven
+     *          applies. A gone store lends and borrows nothing, so it is counted, not a stop.
+     */
+    test("a vanished object directory outside the selection is counted churn, not a stop", async () => {
       const { namespace, lender, record, scan } = await scene()
       rmSync(join(namespace, "deep", "repo", ".git"), { recursive: true })
       const delta = await estateDelta(record, scan, { selected: [lender] })
+      expect(delta).toMatchObject({ status: "unchanged", vanishedStores: 1 })
+    })
+
+    test("a vanished object directory inside a selected entry still ends the batch, naming it", async () => {
+      const { namespace, record, scan } = await scene()
+      const store = join(namespace, "deep", "repo", ".git")
+      rmSync(store, { recursive: true })
+      const delta = await estateDelta(record, scan, { selected: [join(namespace, "deep")] })
       expect(delta.status).toBe("changed")
-      expect(delta.status === "changed" && delta.detail).toContain("vanished")
+      expect(delta.status === "changed" && delta.detail).toContain("inside a selected entry vanished")
     })
 
     // Live estate 2026-11-10: a worktree closed during the 7-minute walk made the whole batch scan unknown.

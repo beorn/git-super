@@ -1204,41 +1204,60 @@ describe("retention retirement batch (#33010)", async () => {
   // AC #35062 (@cto 35062-vanished-witness-go-0445): custody now drops a witness store that is gone by ENOENT, but the
   // held phase is unchanged. A witness store outside every entry that existed at the scan and is removed before the
   // lease window still ends the batch through the estate delta, and nothing is deleted.
-  it("a witness store removed after the scan still ends the batch at the held estate delta", async () => {
-    const dependency = join(fixtureRoot, "dependency")
-    const { entries, branches } = await atRiskEntries(["risk-c"])
-    const spare = join(fixtureRoot, "spare-witness")
-    git(fixtureRoot, ["clone", "-q", "--no-local", dependency, spare])
-    const spareStore = join(spare, ".git", "objects")
-    const retainUntil = entries.map((entry) =>
-      Date.parse(
-        (JSON.parse(readFileSync(join(entry, "manifest.json"), "utf8")) as { retainUntil: string }).retainUntil,
-      ),
-    )
-    try {
-      const result = await retireRetainedBatch(
-        options({
-          apply: true,
-          clock: new Date(Math.max(eligible.getTime(), ...retainUntil) + 1000),
-          afterScan: () => rmSync(spare, { recursive: true, force: true }),
-        }),
-      )
-      expect(result.stopped).toContain("census-shifted")
-      expect(result.stopped).toContain("vanished")
-      expect(result.stopped).toContain("spare-witness")
-      expect(
-        result.rows.every((row) => row.outcome === "kept"),
-        JSON.stringify(result.rows),
-      ).toBe(true)
-      for (const entry of entries) expect(existsSync(entry)).toBe(true)
-      expect(existsSync(spareStore)).toBe(false)
-    } finally {
-      rmSync(spare, { recursive: true, force: true })
+  /**
+   * @failure #33010 (@cto c9e2666a, a6752202): a vanished store outside the selection is no longer a delta stop, so the
+   *          witness an entry's custody proof leaned on can disappear without ending the batch. The entry's held
+   *          re-verification builds its witness index from fresh reads, so it must keep the entry; if it did not, that
+   *          exemption would delete the only copy.
+   */
+  it.each(["stays", "vanishes after the scan"])(
+    "an entry whose only witness is an outside clone: the clone %s, and the held proof decides",
+    async (arm) => {
+      const dependency = join(fixtureRoot, "dependency")
+      const { entries, branches } = await atRiskEntries(["risk-c"])
+      const [riskC] = entries as [string]
+      const spare = join(fixtureRoot, "spare-witness")
+      git(fixtureRoot, ["clone", "-q", "--no-local", dependency, spare])
+      const spareStore = join(spare, ".git", "objects")
+      // The clone holds risk-c's commit as its own branch; the dependency no longer does, so the clone is its only witness.
       for (const branch of branches) {
-        if (git(dependency, ["branch", "--list", branch]) !== "") git(dependency, ["branch", "-q", "-D", branch])
+        git(spare, ["branch", "-q", branch, `origin/${branch}`])
+        git(dependency, ["branch", "-q", "-D", branch])
       }
-    }
-  }, 180_000)
+      const retainUntil = entries.map((entry) =>
+        Date.parse(
+          (JSON.parse(readFileSync(join(entry, "manifest.json"), "utf8")) as { retainUntil: string }).retainUntil,
+        ),
+      )
+      try {
+        const result = await retireRetainedBatch(
+          options({
+            apply: true,
+            clock: new Date(Math.max(eligible.getTime(), ...retainUntil) + 1000),
+            ...(arm === "stays" ? {} : { afterScan: () => rmSync(spare, { recursive: true, force: true }) }),
+          }),
+        )
+        const row = result.rows.find((candidate) => candidate.entry === riskC)
+        if (arm === "stays") {
+          // Control: with its witness in place the entry retires, so the clone really is what its proof rests on.
+          expect(row?.outcome, JSON.stringify(result.rows)).toBe("retired")
+          return
+        }
+        // The delta counts the vanished clone and does not stop; the held re-verification, reading fresh, keeps risk-c.
+        expect(result.windows[0], JSON.stringify(result.windows)).toMatchObject({ delta: "unchanged" })
+        expect(result.windows.reduce((sum, window) => sum + window.vanishedStores, 0)).toBeGreaterThan(0)
+        expect(row?.outcome, JSON.stringify(result.rows)).toBe("kept")
+        expect(existsSync(riskC)).toBe(true)
+        expect(existsSync(spareStore)).toBe(false)
+      } finally {
+        rmSync(spare, { recursive: true, force: true })
+        for (const branch of branches) {
+          if (git(dependency, ["branch", "--list", branch]) !== "") git(dependency, ["branch", "-q", "-D", branch])
+        }
+      }
+    },
+    180_000,
+  )
 
   // Accepted requirement: a bounded lease ends with named remaining entries; the old multi-window loop
   // mistakes its own first deletion for an outsider's estate change when it reuses the original scan.
@@ -1346,7 +1365,7 @@ describe("retention retirement batch (#33010)", async () => {
       options({ apply: true, afterScan: () => rmSync(vanishing, { recursive: true, force: true }) }),
     )
     expect(result.stopped).toContain("census-shifted")
-    expect(result.stopped).toContain(`object directory ${vanishing} vanished`)
+    expect(result.stopped).toContain(`object directory ${vanishing} inside a selected entry vanished`)
     expect(result.stopped).not.toContain("identity-unknown")
     expect(
       result.rows.every((row) => row.outcome === "kept"),

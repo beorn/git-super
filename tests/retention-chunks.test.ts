@@ -17,12 +17,13 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   utimesSync,
   writeFileSync,
 } from "node:fs"
 import { tmpdir } from "node:os"
-import { dirname, join } from "node:path"
+import { basename, dirname, join } from "node:path"
 import { tryAcquireFlock } from "@bearly/flock"
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest"
 import { runCli } from "../src/cli.ts"
@@ -186,25 +187,100 @@ describe("chunked retained retirement (#34127)", () => {
     expect(readdirSync(root), "a dry run deletes nothing").toHaveLength(3)
   }, 120_000)
 
-  it("a condition stop fails the run and deletes nothing in that chunk", async () => {
+  /**
+   * @failure #33010 (@cto c9e2666a): one census shift ended every remaining chunk, so on a host where yrd-submit
+   *          worktrees come and go all night a run retired 0. The shifted chunk is now re-proved ONCE on a fresh scan:
+   *          that scan sees the new borrower, keeps the entry it borrows, and the rest retire on their own fresh proofs.
+   */
+  it("a census shift re-proves its chunk once on a fresh scan, keeping the borrowed entry and retiring the rest", async () => {
+    const [first] = readdirSync(root).sort() as [string]
     const result = await retireRetainedBatchInChunks(
       options({
         chunkSize: 2,
         // A writer with no lease opens a borrower of a SELECTED entry between the scan and the held window, which
         // the reference-scoped delta must catch (#33010 @cto 2026-11-25: a new store borrowing nothing selected is
         // churn, and this one borrows an entry this chunk deletes).
+        // Written once, after the first scan: the re-proof's fresh scan finds it already there, as a real borrower is.
         afterScan: () => {
-          const [first] = readdirSync(root).sort() as [string]
-          mkdirSync(join(fixtureRoot, "revived-owner", "objects", "info"), { recursive: true })
-          writeFileSync(
-            join(fixtureRoot, "revived-owner", "objects", "info", "alternates"),
-            `${join(root, first, "modules", "vendor", "dep", "objects")}\n`,
-          )
+          const alternates = join(fixtureRoot, "revived-owner", "objects", "info", "alternates")
+          if (existsSync(alternates)) return
+          mkdirSync(dirname(alternates), { recursive: true })
+          writeFileSync(alternates, `${join(root, first, "modules", "vendor", "dep", "objects")}\n`)
         },
       }),
     )
+    expect(result.chunks[0]?.stoppedKind, JSON.stringify(result.chunks.map((chunk) => chunk.stopped))).toBe("shifted")
+    expect(result.reproved).toBe(2)
+    // The fresh scan sees the revived owner borrowing `first`: kept, and still on disk. The others retire.
+    expect(result.rows.find((row) => row.entry === join(root, first))?.outcome, JSON.stringify(result.rows)).toBe(
+      "kept",
+    )
+    expect(
+      readdirSync(root),
+      JSON.stringify(result.rows.map((row) => [basename(row.entry), row.outcome, row.reason.slice(0, 200)])),
+    ).toEqual([first])
+    expect(result.retired).toBe(2)
+    // Each entry is counted once, its re-proof replacing the row the shift left.
+    expect(result.examined).toBe(3)
+    expect(new Set(result.rows.map((row) => row.entry)).size).toBe(result.rows.length)
+  }, 120_000)
+
+  // A shift is the only stop a chunk re-proves; any other condition (here the common owner's writer lease file is gone,
+  // so the window cannot exclude writers) still ends the run before anything is deleted.
+  it("a condition stop other than a shift still ends the run", async () => {
+    const lock = join(common, "yrd-worktree-mutations", "writer.lock")
+    const aside = `${lock}.aside`
+    renameSync(lock, aside)
+    let result
+    try {
+      result = await retireRetainedBatchInChunks(options())
+    } finally {
+      renameSync(aside, lock)
+    }
+    expect(
+      result.chunks.map((chunk) => chunk.stoppedKind),
+      JSON.stringify(result.chunks.map((chunk) => chunk.stopped)),
+    ).toEqual(["stop"])
+    expect(result.stopped).toContain("lease-missing")
     expect(result.retired).toBe(0)
-    expect(result.chunks.some((chunk) => chunk.stoppedKind === "stop")).toBe(true)
     expect(readdirSync(root)).toHaveLength(3)
   }, 120_000)
+})
+
+describe("an outside borrower keeps its lender on the cheap gate (#33010, @cto 5d68de61)", () => {
+  /**
+   * @failure #33010: the #38246 cheap gate returned before gate 3, so an entry whose heads were all published retired
+   *          while an outside store's alternates still named a store inside it, leaving that borrower dangling. Found on
+   *          base d8bb979 with a bare objects tree; @cto asked for a real Git directory borrower as well.
+   */
+  it.each(["a bare objects tree", "a real Git directory"])(
+    "a borrower that is %s, present at scan time, keeps the entry it borrows from; the rest retire",
+    async (shape) => {
+      const [first] = readdirSync(root).sort() as [string]
+      const lent = join(root, first, "modules", "vendor", "dep", "objects")
+      const owner = join(fixtureRoot, "outside-borrower")
+      if (shape === "a real Git directory") {
+        git(fixtureRoot, ["init", "-q", owner])
+      } else {
+        mkdirSync(join(owner, "objects", "pack"), { recursive: true })
+      }
+      const store = shape === "a real Git directory" ? join(owner, ".git", "objects") : join(owner, "objects")
+      mkdirSync(join(store, "info"), { recursive: true })
+      writeFileSync(join(store, "info", "alternates"), `${lent}\n`)
+      try {
+        const result = await retireRetainedBatchInChunks(options({ chunkSize: 3 }))
+        const row = result.rows.find((candidate) => candidate.entry === join(root, first))
+        expect(row?.outcome, JSON.stringify(result.rows.map((r) => [basename(r.entry), r.outcome, r.reason]))).toBe(
+          "kept",
+        )
+        expect(row?.reason).toContain(store)
+        expect(existsSync(lent)).toBe(true)
+        expect(readdirSync(root)).toEqual([first])
+        expect(result.retired).toBe(2)
+      } finally {
+        rmSync(owner, { recursive: true, force: true })
+      }
+    },
+    120_000,
+  )
 })

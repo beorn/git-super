@@ -854,7 +854,18 @@ async function evaluateRetainedEntry(
   // are not paid for. `unpublished` and `unknown` fall through to the full gates exactly as before, which keeps the
   // byte-evidence path for every store the predicate cannot read. One answer, one implementation: the rule itself lives
   // in nothing-unpublished.ts with its tests, not here.
-  if (context !== undefined && !context.audit && !legacy && options.fullProof !== true && proof.retained !== null) {
+  // #33010 (@cto 5d68de61): the cheap gate answers "nothing unpublished", never "nothing borrows this". A survivor that
+  // borrows into the entry, an estate the scan could not prove, or a store of its own whose alternates name a path that
+  // is gone (a broken store is never retired), sends it to the full gates, where gate 3 keeps it.
+  if (
+    context !== undefined &&
+    !context.audit &&
+    !legacy &&
+    options.fullProof !== true &&
+    proof.retained !== null &&
+    context.estate.status === "pass" &&
+    !context.estate.danglingAlternates.some((line) => inside(entryReal, line.store))
+  ) {
     const cheapStarted = monotonic()
     const verdict = await nothingUnpublished({
       git: predicateGit(options.gitRun ?? defaultGitRun),
