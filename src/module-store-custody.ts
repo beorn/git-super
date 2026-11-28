@@ -256,10 +256,17 @@ function remoteDurableTips(
 /** A ref that could hold work, and the name its commit is archived under. */
 type LocalRef = Readonly<{ source: string; label: string }>
 
-function localPinNames(gitDir: string, refs: readonly LocalRef[]): ReadonlySet<string> {
+function localPinNames(gitDir: string, remote: string, refs: readonly LocalRef[]): ReadonlySet<string> {
   if (refs.length === 0) return new Set()
   const input = refs.map(({ source }) => `${source}\n`).join("")
-  const tips = storeGit(gitDir, ["rev-list", "--no-walk=unsorted", "--stdin"], STORE_TIMEOUT_MS, input)
+  const args = ["rev-list", "--no-walk=unsorted", "--stdin"]
+  let tips = storeGit(gitDir, args, STORE_TIMEOUT_MS, input)
+  if (tips.status === 128) {
+    // Git exits 128 when it cannot resolve a missing tip. The existing remote read can
+    // hydrate published objects. Require every local tip to resolve before comparing pins.
+    remoteDurableTips(gitDir, remote, new Set())
+    tips = storeGit(gitDir, args, STORE_TIMEOUT_MS, input)
+  }
   if (tips.status !== 0) {
     throw new Error(
       `module store ${gitDir} could not resolve its local commit tips (${tips.stderr.trim()}); worktree preserved`,
@@ -359,7 +366,7 @@ export function moduleStoreValue(gitDir: string): Readonly<{
   const durable =
     remote === undefined
       ? { tips: [], archiveRefs: [] }
-      : remoteDurableTips(gitDir, remote, localPinNames(gitDir, local))
+      : remoteDurableTips(gitDir, remote, localPinNames(gitDir, remote, local))
   const exclusions = durable.tips
   const valueCommits = count(
     gitDir,

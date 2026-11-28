@@ -165,6 +165,35 @@ describe("slot module store custody", () => {
     ])
   })
 
+  test("a missing local tip is hydrated from its remote before counting value", async () => {
+    const slot = await linkedSlot(fixtureRoot("module-missing-published-tip"))
+    const store = join(slot.modules, "packages/alpha")
+    const published = advanceRepository(slot.fixture.alpha, "alpha.ts", "export const alpha = 7\n")
+    dropAlphaFromHead(slot.linked)
+    // The slot records a commit whose bytes are currently available only from its remote.
+    writeFileSync(join(store, "HEAD"), `${published}\n`)
+    expect(() => storeGitOutput(slot.fixture.product, store, "cat-file", "-e", published)).toThrow()
+
+    expect(moduleStoreValue(store)).toMatchObject({
+      defaultBranch: "main",
+      head: published.slice(0, 12),
+      valueCommits: 0,
+    })
+    expect(storeGitOutput(slot.fixture.product, store, "cat-file", "-t", published)).toBe("commit")
+  })
+
+  test("a missing local tip that cannot be recovered still preserves the worktree", async () => {
+    const slot = await linkedSlot(fixtureRoot("module-missing-local-tip"))
+    const store = join(slot.modules, "packages/alpha")
+    dropAlphaFromHead(slot.linked)
+    const unavailable = "a".repeat(slot.fixture.alphaBase.length)
+    writeFileSync(join(store, "HEAD"), `${unavailable}\n`)
+
+    await expect(slot.store.remove(slot.linked)).rejects.toThrow(/could not resolve its local commit tips/)
+    expect(existsSync(slot.linked)).toBe(true)
+    expect(existsSync(store)).toBe(true)
+  })
+
   test("a remote whose default branch is master is measured against master, not a local main (row 1)", async () => {
     const slot = await linkedSlot(fixtureRoot("module-remote-master"))
     const tip = localCommit(slot.child)
