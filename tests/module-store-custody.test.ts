@@ -16,6 +16,7 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFi
 import { join, relative } from "node:path"
 import { afterEach, describe, expect, test, vi } from "vitest"
 import { describeModuleStores, inspectModuleStores, moduleStoreValue } from "../src/module-store-custody.ts"
+import { pinRef } from "../src/objects.ts"
 import { superStatus } from "../src/status.ts"
 import { createLocalGitWorktreeStore } from "../src/worktree.ts"
 import { advanceRepository, canonicalTmpdir, createProductFixture, git } from "./fixture.ts"
@@ -106,7 +107,7 @@ describe("slot module store custody", () => {
       expect.objectContaining({ name: "packages/alpha", valueCommits: 1, remote: "origin", head: tip.slice(0, 12) }),
     ])
     expect(describeModuleStores(inventory.stores)).toEqual([
-      `module store packages/alpha at ${join(slot.modules, "packages/alpha")} holds 1 commit(s) outside compared refs (origin default main, existing archive refs and available tags), HEAD ${tip.slice(0, 12)}`,
+      `module store packages/alpha at ${join(slot.modules, "packages/alpha")} holds 1 commit(s) outside compared refs (origin default main, existing archive refs, available tags and matching GitSuper pins), HEAD ${tip.slice(0, 12)}`,
     ])
   })
 
@@ -119,7 +120,7 @@ describe("slot module store custody", () => {
       expect.objectContaining({ name: "packages/alpha", valueCommits: 0, remote: "origin" }),
     ])
     expect(describeModuleStores(inventory.stores)).toEqual([
-      `module store packages/alpha released: origin default main, existing archive refs and available tags, 0 commits outside compared refs, HEAD ${tip.slice(0, 12)}`,
+      `module store packages/alpha released: origin default main, existing archive refs, available tags and matching GitSuper pins, 0 commits outside compared refs, HEAD ${tip.slice(0, 12)}`,
     ])
     await slot.store.remove(slot.linked)
     expect(existsSync(slot.linked)).toBe(false)
@@ -160,7 +161,7 @@ describe("slot module store custody", () => {
     expect(storeGitOutput(slot.fixture.product, store, "cat-file", "-t", beyond)).toBe("commit")
     expect(storeGitOutput(slot.fixture.product, store, "rev-parse", "refs/remotes/origin/main")).toBe(stale)
     expect(describeModuleStores(inventory.stores)).toEqual([
-      `module store packages/alpha released: origin default main, existing archive refs and available tags, 0 commits outside compared refs, HEAD ${tip.slice(0, 12)}`,
+      `module store packages/alpha released: origin default main, existing archive refs, available tags and matching GitSuper pins, 0 commits outside compared refs, HEAD ${tip.slice(0, 12)}`,
     ])
   })
 
@@ -175,7 +176,7 @@ describe("slot module store custody", () => {
       expect.objectContaining({ name: "packages/alpha", valueCommits: 0, defaultBranch: "master" }),
     ])
     expect(describeModuleStores(inventory.stores)).toEqual([
-      `module store packages/alpha released: origin default master, existing archive refs and available tags, 0 commits outside compared refs, HEAD ${tip.slice(0, 12)}`,
+      `module store packages/alpha released: origin default master, existing archive refs, available tags and matching GitSuper pins, 0 commits outside compared refs, HEAD ${tip.slice(0, 12)}`,
     ])
   })
 
@@ -206,7 +207,7 @@ describe("slot module store custody", () => {
     const inventory = inspectModuleStores(slot.linked, slot.gitDir)
     expect(inventory.stores).toEqual([expect.objectContaining({ name: "packages/alpha", valueCommits: 0 })])
     expect(describeModuleStores(inventory.stores)).toEqual([
-      `module store packages/alpha released: origin default main, existing archive refs and available tags, 0 commits outside compared refs, HEAD ${tip.slice(0, 12)}`,
+      `module store packages/alpha released: origin default main, existing archive refs, available tags and matching GitSuper pins, 0 commits outside compared refs, HEAD ${tip.slice(0, 12)}`,
     ])
   })
 
@@ -307,7 +308,7 @@ describe("slot module store custody", () => {
       sunk.linked,
     )
     expect(sink.filter((line) => line.startsWith("module store"))).toEqual([
-      `module store packages/alpha released: origin default main, existing archive refs and available tags, 0 commits outside compared refs, HEAD ${sunkTip.slice(0, 12)}\n`,
+      `module store packages/alpha released: origin default main, existing archive refs, available tags and matching GitSuper pins, 0 commits outside compared refs, HEAD ${sunkTip.slice(0, 12)}\n`,
     ])
   })
 
@@ -336,7 +337,7 @@ describe("slot module store custody", () => {
     expect(existsSync(slot.gitDir)).toBe(false)
     expect(await slot.store.inspect(live)).toEqual(expect.objectContaining({ registered: true }))
     expect(sink.filter((line) => line.startsWith("module store"))).toEqual([
-      `module store packages/alpha released: origin default main, existing archive refs and available tags, 0 commits outside compared refs, HEAD ${tip.slice(0, 12)}\n`,
+      `module store packages/alpha released: origin default main, existing archive refs, available tags and matching GitSuper pins, 0 commits outside compared refs, HEAD ${tip.slice(0, 12)}\n`,
     ])
   })
 
@@ -561,6 +562,25 @@ describe("slot module store custody", () => {
     expect(message).toContain("has no included parent identity")
   })
 
+  test("an empty checkout with an exact published GitSuper pin passes removal admission", async () => {
+    const slot = await linkedSlot(fixtureRoot("module-status-pin"))
+    const tip = localCommit(slot.child)
+    const ref = pinRef(tip)
+    const module = join(slot.modules, "packages/alpha")
+
+    git(slot.child, "update-ref", ref, tip)
+    expect(moduleStoreValue(module).valueCommits).toBe(1)
+    git(slot.child, "push", "-q", "origin", `${slot.fixture.alphaBase}:${ref}`)
+    expect(moduleStoreValue(module).valueCommits).toBe(1)
+
+    git(slot.child, "push", "-q", "origin", `${tip}:${ref}`)
+    rmSync(slot.child, { recursive: true, force: true })
+    const inspection = await slot.store.inspectRemoval(slot.linked)
+    expect(inspection.uninitializedSubmodules).toContain("packages/alpha")
+    await slot.store.remove(slot.linked)
+    expect(existsSync(slot.linked)).toBe(false)
+  })
+
   test("an empty checkout whose store is on remote main holds nothing; a local commit there still refuses (30563)", async () => {
     const pushed = createProductFixture(fixtureRoot("module-status-pushed"))
     const pushedChild = join(pushed.product, "packages/alpha")
@@ -599,7 +619,7 @@ describe("slot module store custody", () => {
     expect(stopped.uninitializedSubmodules).toEqual([])
     expect(stopped.submoduleProblems).toHaveLength(1)
     expect(stopped.submoduleProblems[0]!.reason).toContain(
-      "holds 1 commit(s) that neither its remote's default branch nor any archive ref there holds (remote origin main)",
+      "holds 1 commit(s) outside its remote default branch, archive refs, available tags and matching GitSuper pins (remote origin main)",
     )
     expect(stopped.submoduleProblems[0]!.reason).toContain("submodule update --init packages/alpha")
   })

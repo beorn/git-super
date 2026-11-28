@@ -1,12 +1,13 @@
 import { existsSync, lstatSync, readdirSync, type Dirent } from "node:fs"
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path"
 import { tryGit, withGitTimeout } from "./git.ts"
+import { pinRef } from "./objects.ts"
 
 /**
  * A module repository under a slot's own `<git-dir>/modules/`, which removal destroys with the slot, and the
  * commits outside the remote coverage this reader compares. The remote's default branch, existing archive
- * refs and available tags are read from the remote itself, never its stale local tracking copies. A positive
- * count preserves the store for its owner's value call; removal does not create archive refs.
+ * refs, available tags and matching GitSuper pins are read from the remote itself. A positive count preserves
+ * the store for its owner's value call; removal does not create archive refs.
  */
 export type ModuleStore = Readonly<{
   /** The store's path relative to `modules/`: git's own submodule name, or the path default. */
@@ -18,7 +19,7 @@ export type ModuleStore = Readonly<{
   remote?: string
   /** The remote's default branch the value was measured against, when its HEAD names one. */
   defaultBranch?: string
-  /** Commits outside the compared remote default, existing archive refs and available tags. */
+  /** Commits outside the compared remote refs. */
   valueCommits: number
   /** The refs holding those commits, with labels identifying their local source. */
   refs: readonly Readonly<{ source: string; label: string }>[]
@@ -165,14 +166,17 @@ function missingObjects(gitDir: string, shas: readonly string[]): string[] {
  * store lacks are fetched first, because reachability needs them. Tags are never fetched: a tag tip the store
  * lacks is left out, so the work it would cover still counts as value. A remote that cannot be read stops
  * removal, with no fallback to the local copies.
+ * GitSuper publishes permanent pins named for the exact commit they hold. Query only the pins for local tips:
+ * those objects are already here, so this adds neither a remote-wide pin listing nor any pin fetches.
  */
 function remoteDurableTips(
   gitDir: string,
   remote: string,
+  pinNames: ReadonlySet<string>,
 ): Readonly<{ defaultBranch?: string; tips: string[]; archiveRefs: string[] }> {
   const listed = storeGit(
     gitDir,
-    ["ls-remote", "--symref", remote, "HEAD", "refs/archive/*", "refs/tags/*"],
+    ["ls-remote", "--symref", remote, "HEAD", "refs/archive/*", "refs/tags/*", ...pinNames],
     REMOTE_READ_TIMEOUT_MS,
   )
   if (listed.status !== 0) {
@@ -184,6 +188,7 @@ function remoteDurableTips(
   let headTip: string | undefined
   const archive = new Map<string, string>()
   const tags = new Map<string, string>()
+  const pins: string[] = []
   for (const line of listed.stdout.split("\n")) {
     if (line.trim() === "") continue
     const [, target, symrefName] = /^ref: (\S+)\t(\S+)$/u.exec(line) ?? []
@@ -200,6 +205,7 @@ function remoteDurableTips(
     // The `HEAD` pattern also matches every ref ending in `/HEAD`; only the remote's own HEAD is its default branch.
     if (ref === "HEAD") headTip = sha
     else if (ref.startsWith("refs/archive/")) archive.set(ref, sha)
+    else if (pinNames.has(ref) && ref === pinRef(sha)) pins.push(sha)
     else if (ref.startsWith("refs/tags/")) {
       // An annotated tag lists its tag object, then its commit under `^{}`; the commit is what counts.
       const peeled = ref.endsWith("^{}")
@@ -242,13 +248,25 @@ function remoteDurableTips(
   const absentTags = new Set(missingObjects(gitDir, tagTips))
   return {
     ...(defaultBranch === undefined ? {} : { defaultBranch }),
-    tips: [...new Set([...tips, ...tagTips.filter((sha) => !absentTags.has(sha))])],
+    tips: [...new Set([...tips, ...tagTips.filter((sha) => !absentTags.has(sha)), ...pins])],
     archiveRefs: [...archive.keys()],
   }
 }
 
 /** A ref that could hold work, and the name its commit is archived under. */
 type LocalRef = Readonly<{ source: string; label: string }>
+
+function localPinNames(gitDir: string, refs: readonly LocalRef[]): ReadonlySet<string> {
+  if (refs.length === 0) return new Set()
+  const input = refs.map(({ source }) => `${source}\n`).join("")
+  const tips = storeGit(gitDir, ["rev-list", "--no-walk=unsorted", "--stdin"], STORE_TIMEOUT_MS, input)
+  if (tips.status !== 0) {
+    throw new Error(
+      `module store ${gitDir} could not resolve its local commit tips (${tips.stderr.trim()}); worktree preserved`,
+    )
+  }
+  return new Set(tips.stdout.split("\n").filter(Boolean).map(pinRef))
+}
 
 /**
  * The store's own refs that could hold work: HEAD, every branch, every tag, every local archive ref (it dies with
@@ -326,8 +344,8 @@ function count(gitDir: string, wants: readonly string[], exclusions: readonly st
 /**
  * The one value predicate removal and #30563's status check share (operator 2026-10-21): the commits a store's
  * own refs hold that are not reachable from its remote's default branch, any `refs/archive/*` or any `refs/tags/*`
- * on that remote, all read from the remote now. A store with no remote has nothing proving its bytes exist elsewhere,
- * so every commit it holds counts as value.
+ * or its local tips' exact published pins on that remote, all read from the remote now. A store with no remote
+ * has nothing proving its bytes exist elsewhere, so every commit it holds counts as value.
  */
 export function moduleStoreValue(gitDir: string): Readonly<{
   valueCommits: number
@@ -337,9 +355,12 @@ export function moduleStoreValue(gitDir: string): Readonly<{
   head?: string
 }> {
   const remote = storeRemote(gitDir)
-  const durable = remote === undefined ? { tips: [], archiveRefs: [] } : remoteDurableTips(gitDir, remote)
-  const exclusions = durable.tips
   const local = localRefs(gitDir)
+  const durable =
+    remote === undefined
+      ? { tips: [], archiveRefs: [] }
+      : remoteDurableTips(gitDir, remote, localPinNames(gitDir, local))
+  const exclusions = durable.tips
   const valueCommits = count(
     gitDir,
     local.map((ref) => ref.source),
@@ -593,7 +614,7 @@ export function describeModuleStores(stores: readonly ModuleStore[]): string[] {
     const compared =
       store.remote === undefined
         ? "no remote refs (store has no remote)"
-        : `${store.remote} ${store.defaultBranch === undefined ? "no default branch" : `default ${store.defaultBranch}`}, existing archive refs and available tags`
+        : `${store.remote} ${store.defaultBranch === undefined ? "no default branch" : `default ${store.defaultBranch}`}, existing archive refs, available tags and matching GitSuper pins`
     if (store.valueCommits === 0) {
       return `module store ${store.name} released: ${compared}, 0 commits outside compared refs${head}`
     }
