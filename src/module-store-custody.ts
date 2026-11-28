@@ -503,11 +503,7 @@ export function assertModuleRefsRecoverable(checkout: string, gitDir: string): v
   let mirrors = 0
   for (const store of referencedModuleStores(checkout)) {
     const surviving = join(survivors, relative(modules, store))
-    const listing = readGit(
-      checkout,
-      [`--git-dir=${store}`, "for-each-ref", "--format=%(objectname) %(refname)"],
-      `the refs of module store ${store}`,
-    )
+    const listing = storeGit(store, ["for-each-ref", "--format=%(objectname) %(refname)"])
     if (listing.status !== 0) {
       throw new Error(
         `${checkout} removal refused: the refs of its module store ${store} could not be read ` +
@@ -530,10 +526,9 @@ export function assertModuleRefsRecoverable(checkout: string, gitDir: string): v
       }
       continue
     }
-    const probe = readGit(
-      checkout,
-      [`--git-dir=${surviving}`, "cat-file", "--batch-check=%(objectname)"],
-      `the objects of surviving module store ${surviving}`,
+    const probe = storeGit(
+      surviving,
+      ["cat-file", "--batch-check=%(objectname)"],
       STORE_TIMEOUT_MS,
       `${candidates.map(({ sha }) => sha).join("\n")}\n`,
     )
